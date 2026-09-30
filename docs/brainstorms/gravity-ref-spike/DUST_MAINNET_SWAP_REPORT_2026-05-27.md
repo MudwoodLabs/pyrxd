@@ -110,13 +110,13 @@ but the `{` `}` `[` `]` `"` chars are still shell-special remotely.
 
 **Fixed:** quote each remote token with `shlex.quote` before joining (and
 collapse the JSON separators too). `get_utxos` now returns the covenant UTXO
-correctly on `tr`; `getrawtransaction`/`getblockcount` still work. Verified by
+correctly on the maintainer's node host; `getrawtransaction`/`getblockcount` still work. Verified by
 direct shim invocation.
 
 ### Bug 4 — `carve_fee_input` hardcoded fee below mainnet relayfee
 
 The fee-carve helper defaulted to 2,000,000 photons internal fee. The carve
-tx is ~225 bytes; the `tr` node runs `relayfee=0.10 RXD/kB` → min fee
+tx is ~225 bytes; the maintainer's node runs `relayfee=0.10 RXD/kB` → min fee
 **2,250,000 photons**. The default was below the floor → `min relay fee not
 met (code 66)` → covenant-spend fee-input carving fails → taker can't claim.
 

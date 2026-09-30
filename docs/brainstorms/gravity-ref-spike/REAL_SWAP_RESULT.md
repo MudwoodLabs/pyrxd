@@ -275,7 +275,7 @@ is a deliberate, recorded scope decision, not an omission.
   consensus conservation backstop (RXD especially), so the covenant body is the sole
   guarantor there.
 
-Operational lessons applied: per-kB relay fee (0.10 RXD/kB on the tr node, size×rate);
+Operational lessons applied: per-kB relay fee (0.10 RXD/kB on the maintainer's node, size×rate);
 minimal-pushed CSV operands; multi-function selector dispatch; hash-compare output pin;
 CSPRNG keys only (no hand-written keys, per the prior weak-key incident).
 

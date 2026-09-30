@@ -45,7 +45,7 @@ into the same app or receiver changes nothing.
 ## Prerequisites
 
 - A `--records-dir` of `SwapRecord` JSON files (what the coordinator persists per swap).
-- An RXD source: `--rxd-electrumx-url wss://…` (or an ssh-tr radiant-cli backend).
+- An RXD source: `--rxd-electrumx-url wss://…` (or your own node's radiant-cli over ssh: `--rxd-backend ssh-tr --ssh-host <your node host> --ssh-container <your node container>`, both required).
 - BTC depth + claim detection: defaults to mempool.space / Esplora (`--mempool-base-url`, `--quorum`).
 - Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). The finality gate also needs the
   chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes

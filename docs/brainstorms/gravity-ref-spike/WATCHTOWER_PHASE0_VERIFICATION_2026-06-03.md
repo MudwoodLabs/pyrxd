@@ -23,7 +23,7 @@ The counter-leg verdict is built with the existing adapter `CounterClaimFinality
 ## 3. RXD data sources — SINGLE-SOURCE today (v2 quorum blocker; v1 corroboration flag)
 
 Confirmed: BTC has `MultiSourceBtcDataSource` + `MultiSourceBtcFundingReader` ([network/bitcoin.py:723,1056](../../../src/pyrxd/network/bitcoin.py#L723)), but **there is no Radiant/RXD multi-source class**. RXD height/confirmations come from a single source:
-- `getblockcount` over the single ssh-tr node ([scripts/radiant_mainnet_chainio.py:135](../../../scripts/radiant_mainnet_chainio.py#L135), [scripts/_dust_swap_shared.py:203](../../../scripts/_dust_swap_shared.py#L203)), or
+- `getblockcount` over the single node reached over ssh ([scripts/radiant_mainnet_chainio.py:135](../../../scripts/radiant_mainnet_chainio.py#L135), [scripts/_dust_swap_shared.py:203](../../../scripts/_dust_swap_shared.py#L203)), or
 - one `ElectrumXClient.get_tip_height` ([network/electrumx.py:378](../../../src/pyrxd/network/electrumx.py#L378)); `RxinDexerClient.__init__(self, client: ElectrumXClient)` wraps exactly one client ([network/rxindexer.py:72](../../../src/pyrxd/network/rxindexer.py#L72)).
 
 → **v1 (alert-only):** RXD-derived pages carry a `low_corroboration` flag; a poisoned RXD read causes a false *page*, not a false broadcast — acceptable. **v2 (autonomous):** a ≥2 independent RXD source quorum is a HARD blocker before any RXD-finality-driven broadcast. `ChainTracker` ([network/chaintracker.py](../../../src/pyrxd/network/chaintracker.py)) is BTC-header-only and cannot supply RXD burial.

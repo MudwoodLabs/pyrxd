@@ -60,8 +60,14 @@ def grief_run():
     return _load("eth_swap_grief_run")
 
 
-def _sepolia_dust_args(mod, monkeypatch, *extra: str) -> argparse.Namespace:
-    monkeypatch.setattr(sys, "argv", ["eth_swap_run.py", "--stage", "sepolia-dust", "--i-accept-dust-loss", *extra])
+#: Placeholder node flags: every run that reaches the mainnet node requires them (no default).
+_NODE_FLAGS = ("--rxd-ssh-host", "node.example.com", "--rxd-container", "radiant-node")
+
+
+def _sepolia_dust_args(mod, monkeypatch, *extra: str, node=_NODE_FLAGS) -> argparse.Namespace:
+    monkeypatch.setattr(
+        sys, "argv", ["eth_swap_run.py", "--stage", "sepolia-dust", "--i-accept-dust-loss", *node, *extra]
+    )
     args = mod._args()
     assert not mod._token_leg_is_real(args), "this pins the throwaway-token branch of _policy"
     return args
@@ -124,8 +130,8 @@ def test_the_sepolia_dust_stage_passes_the_measured_fast_tail_into_its_policy(et
     assert policy.is_measured is False  # still the throwaway-token (estimated) branch
 
 
-def _grief_args(mod, monkeypatch, *extra: str) -> argparse.Namespace:
-    monkeypatch.setattr(sys, "argv", ["eth_swap_grief_run.py", "--i-accept-dust-loss", *extra])
+def _grief_args(mod, monkeypatch, *extra: str, node=_NODE_FLAGS) -> argparse.Namespace:
+    monkeypatch.setattr(sys, "argv", ["eth_swap_grief_run.py", "--i-accept-dust-loss", *node, *extra])
     return mod._parse() if hasattr(mod, "_parse") else mod._args()
 
 
@@ -280,7 +286,7 @@ def test_every_mainnet_script_that_reaches_the_taker_gate_asks_at_least_two_oper
     from pyrxd.gravity.radiant_leg import RadiantChainIO
     from pyrxd.network.source_identity import source_key
 
-    node = shim.SshTrRadiantClient()
+    node = shim.SshTrRadiantClient(ssh_host="node.example.com", container="radiant-node")
     ops = counted_operators(RadiantChainIO(node, proof_client=shim.mainnet_proof_client()).configured_depth_operators())
     assert str(source_key(node._ssh_host)) in ops and len(ops) >= MIN_REPORTING_OPERATORS + 1, ops
 
@@ -370,5 +376,94 @@ def test_each_mainnet_script_parses_the_flag_into_its_args(eth_run, grief_run, m
     dust = _load("dust_swap_run")
     assert dust._parse_args(["--stage", "dry-run", *flag]).accept_single_operator_up_to == 1500 * 10**8
     resume = _load("dust_swap_resume")
-    got = resume._parse_args(["--keys-out", "k", "--btc-htlc-funding-txid", "ab" * 32, *flag])
+    got = resume._parse_args(["--keys-out", "k", "--btc-htlc-funding-txid", "ab" * 32, *_NODE_FLAGS, *flag])
     assert got.accept_single_operator_up_to == 1500 * 10**8
+
+
+# --------------------------------------------------------------------------- the node host is the user's
+
+
+def test_the_node_shims_have_no_default_host_or_container():
+    """The ssh shim and the REST REF-gate adapter are public code: neither may default to any one
+    operator's host or container. Both refuse to construct without them, and refuse a value that
+    would be read as an option once it reaches the ssh/docker argv."""
+    import inspect
+
+    shim = _load("radiant_mainnet_chainio")
+    ref = _load("_glyph_ref_http")
+    for cls, params in ((shim.SshTrRadiantClient, ("ssh_host", "container")), (ref.SshTrHttpRefAdapter, ("ssh_host",))):
+        sig = inspect.signature(cls.__init__)
+        for name in params:
+            assert sig.parameters[name].default is inspect.Parameter.empty, f"{cls.__name__}.{name} has a default"
+    with pytest.raises(TypeError):
+        shim.SshTrRadiantClient()
+    for host, container in (("", "radiant-node"), ("node.example.com", ""), ("-oProxyCommand=x", "c"), ("h", "-u")):
+        with pytest.raises(ValidationError):
+            shim.SshTrRadiantClient(ssh_host=host, container=container)
+    client = shim.SshTrRadiantClient(ssh_host="node.example.com", container="radiant-node")
+    argv = client._cli_argv("getblockcount")
+    assert argv[3] == "node.example.com" and "radiant-node" in argv[4], argv
+
+
+def _node_client_calls() -> dict[str, list[ast.Call]]:
+    """Every ``SshTrRadiantClient(...)`` / ``SshTrHttpRefAdapter(...)`` construction in ``scripts/`` —
+    derived from the source."""
+    out: dict[str, list[ast.Call]] = {}
+    for path in sorted(_SCRIPTS.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls = _calls(tree, "SshTrRadiantClient") + _calls(tree, "SshTrHttpRefAdapter")
+        if calls:
+            out[path.stem] = calls
+    return out
+
+
+def test_every_script_names_the_node_it_reaches_from_the_command_line():
+    """Every construction of the node shim (and of the REST adapter) in ``scripts/`` passes the host
+    — and, for the shim, the container — explicitly, from the parsed flags: none relies on a
+    default and none spells a host literal. The set is derived, with a known member."""
+    calls = _node_client_calls()
+    assert {"dust_swap_run", "eth_swap_run", "eth_swap_grief_run", "dust_swap_resume", "dmint_v2_mainnet_run"} <= set(
+        calls
+    ), sorted(calls)
+    checked = 0
+    for name, found in calls.items():
+        for call in found:
+            kws = {kw.arg: kw.value for kw in call.keywords}
+            need = ("ssh_host", "container") if _callee(call) == "SshTrRadiantClient" else ("ssh_host",)
+            for k in need:
+                assert k in kws, f"{name}:{call.lineno}: {_callee(call)} without {k}="
+                assert not isinstance(kws[k], ast.Constant), f"{name}:{call.lineno}: {k} is a literal"
+            checked += 1
+    assert checked >= len(calls)
+
+
+def test_each_mainnet_script_refuses_at_startup_without_the_node_flags(eth_run, grief_run, monkeypatch, capsys):
+    """Through each script's OWN parser: a run that reaches the mainnet node exits at startup with a
+    message naming the missing flag; a run that does not reach it (a dry run) is not refused."""
+    dust = _load("dust_swap_run")
+    resume = _load("dust_swap_resume")
+    dmint = _load("dmint_v2_mainnet_run")
+    payouts = ("--btc-claim-payout", "51", "--btc-refund-payout", "51")
+    refusals = [
+        lambda: _sepolia_dust_args(eth_run, monkeypatch, node=()),
+        lambda: _sepolia_dust_args(eth_run, monkeypatch, node=_NODE_FLAGS[:2]),
+        lambda: _grief_args(grief_run, monkeypatch, node=()),
+        lambda: dust._parse_args(["--stage", "dust", *payouts]),
+        lambda: resume._parse_args(["--keys-out", "k", "--btc-htlc-funding-txid", "ab" * 32]),
+        lambda: dmint._parse_args(["prepare"]),
+    ]
+    for refuse in refusals:
+        with pytest.raises(SystemExit):
+            refuse()
+        err = capsys.readouterr().err
+        assert "--rxd-container" in err, err
+    # the partially-supplied case names only what is missing
+    with pytest.raises(SystemExit):
+        _sepolia_dust_args(eth_run, monkeypatch, node=_NODE_FLAGS[2:])
+    err = capsys.readouterr().err
+    assert "--rxd-ssh-host is required" in err, err
+    # honest paths
+    assert dust._parse_args(["--stage", "dry-run"]).rxd_ssh_host == ""
+    assert dust._parse_args(["--stage", "dust", *payouts, *_NODE_FLAGS]).rxd_container == "radiant-node"
+    assert _sepolia_dust_args(eth_run, monkeypatch).rxd_ssh_host == "node.example.com"
+    assert dmint._parse_args(["prepare", *_NODE_FLAGS]).rxd_ssh_host == "node.example.com"

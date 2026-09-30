@@ -20,7 +20,12 @@ Examples:
   python scripts/eth_swap_run.py --stage dry-run
   python scripts/eth_swap_run.py --stage sepolia-dust --i-accept-dust-loss \
       --eth-rpc-url https://sepolia.infura.io/v3/KEY --eth-key-file ~/.swap-eth-key \
-      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet gravity
+      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet gravity \
+      --rxd-ssh-host <your node host> --rxd-container <your node container> \
+      --rxd-block-interval-fast-s <measured p10 s>
+
+--rxd-ssh-host and --rxd-container are REQUIRED on stage=sepolia-dust (no default); the host is also
+where the RXinDexer REST REF gate is reached.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
     add_eth_key_arguments,
+    add_rxd_node_args,
     add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
@@ -54,6 +60,7 @@ from _dust_swap_shared import (
     funding_bound_from_args,
     merge_into_mode_600,
     read_own_private_file,
+    require_rxd_node_args,
     resolve_eth_key_file,
     rxd_blockcount,
     scan_covenant_fund_height,
@@ -1106,7 +1113,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     }
     report = StepReport("sepolia-dust", provenance)
 
-    rxd_client = SshTrRadiantClient(rpcwallet=args.rxd_wallet)
+    rxd_client = SshTrRadiantClient(ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=args.rxd_wallet)
     minted = None
     if args.asset_variant == "nft":
         if args.nft_reuse_reveal_txid:
@@ -1588,10 +1595,15 @@ def _args() -> argparse.Namespace:
     ap.add_argument(
         "--rxd-indexer-ws",
         default="",
-        help="OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api over ssh-tr",
+        help=(
+            "OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api "
+            "over ssh to --rxd-ssh-host"
+        ),
     )
     ap.add_argument("--rxd-indexer-insecure", action="store_true", help="allow a non-TLS RXinDexer ws")
-    ap.add_argument("--rxd-ssh-host", default="tr", help="ssh host for the RXinDexer REST REF gate (default tr)")
+    # --rxd-ssh-host (also the RXinDexer REST REF gate's ssh host) and --rxd-container: required on
+    # stage=sepolia-dust, which reaches the mainnet node; no default.
+    add_rxd_node_args(ap)
     ap.add_argument("--rxd-api-base", default="http://127.0.0.1:8000", help="RXinDexer REST api base on the ssh host")
     ap.add_argument(
         "--nft-reuse-reveal-txid", default="", help="reuse an already-minted NFT at this reveal txid (skip minting)"
@@ -1661,6 +1673,8 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--report-out", default="~/.eth_swap_report.json")
     ap.add_argument("--keys-out", default="~/.eth_swap_run_keys.json")
     args = ap.parse_args()
+    if args.stage == "sepolia-dust":
+        require_rxd_node_args(ap, args)
     resolve_eth_key_file(args)
     # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);

@@ -207,7 +207,7 @@ byte-for-byte (the two implementations are equivalent for the
 **Success criteria:**
 - [x] Gravity + preimage + trade + red-team suites green (199 passed). `task ci` not yet run end-to-end on this branch — pending before PR.
 - [x] Coverage for `gravity/transactions.py` holds (91%); the refactored adapter is exercised by the new tests.
-- [x] Live cross-check against the mainnet node on `tr`: refactored adapter ran on the real on-chain ref-bearing output in tx `dac1e2df...` (8104 confs).
+- [x] Live cross-check against the mainnet node on the maintainer's node host: refactored adapter ran on the real on-chain ref-bearing output in tx `dac1e2df...` (8104 confs).
 - [ ] One PR. Title: `refactor(gravity): de-duplicate _compute_hash_output_hashes`. (Regtest fixture-capture harness deferred with the Phase-2 covenant work — see deferred item above.)
 
 **Estimated effort:** 1–2 days (spike-revised down from 3–5: the

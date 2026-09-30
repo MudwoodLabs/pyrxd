@@ -85,6 +85,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `None` (the user override of that threshold; see Security), and, for the negotiation-time check
   only, `early_slack_s` 3600 and `early_work_margin` 2.0. The defaults other than `surge_factor`
   and `dust_threshold_photons` await the maintainer's sign-off.
+- **The operator scripts no longer default to any one operator's node.**
+  `scripts/radiant_mainnet_chainio.py:SshTrRadiantClient` and `scripts/_glyph_ref_http.py:SshTrHttpRefAdapter`
+  take `ssh_host` (and the shim `container`) with no default, charset-checked as the watchtower's
+  reader checks them. `dust_swap_run.py` (broadcast stages), `dust_swap_resume.py`,
+  `eth_swap_run.py --stage sepolia-dust` (whose `--rxd-ssh-host` had a default) and
+  `eth_swap_grief_run.py` take `--rxd-ssh-host` and `--rxd-container` and refuse at startup
+  without them, naming the missing flag; `dmint_v2_mainnet_run.py` takes both as required flags.
 - **`ElectrumXClient.source_keys`** lists every operator group among a client's URLs, and
   **`ElectrumXClient.per_source_clients()`** returns one new client per group. A client over
   several operators' URLs races them, so one reply from it cannot say which operator sent it;

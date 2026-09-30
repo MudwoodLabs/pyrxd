@@ -197,7 +197,7 @@ raising `ValidationError`, byte-length asserts). Pin these, don't leave them as 
 - BTC wallet primitives: `src/pyrxd/btc_wallet/keys.py:123` `generate_keypair` (CSPRNG), bech32m encoder `:319`, BIP341 **key-path-only** P2TR tweak `:205` `_taproot_tweak`, tx scaffolding `payment.py:60-248`.
 - Session/orchestration shells: `maker.py:130`, `trade.py:117` (adapt; drop the SPV proof step).
 - Carrier-value fee-reserve pattern: `transactions.py:257-290`.
-- Spike-harness conventions + `tr` node access + recoverable-asset rule: `gravity-ref-spike/*.py`, `BTC_RECOVERY.md`.
+- Spike-harness conventions + access to the maintainer's node + recoverable-asset rule: `gravity-ref-spike/*.py`, `BTC_RECOVERY.md`.
 
 **NEW** (after deepen-review simplifications — concrete classes, fuse not generator, gravity/ not swap/):
 - `src/pyrxd/btc_wallet/taproot.py` — the largest new chunk. Existing P2TR is
@@ -282,7 +282,7 @@ separate BTC-peg work). Remove the `trade.py:40` SPV import from the swap path.
 #### Phase 2 — Radiant HTLC covenant (`fuse_htlc_covenant.py`; Phase-0 CSV gate folded in here)
 - **Gate (was Phase 0): prove `tx.age`/CSV spends on Radiant mainnet** before building the
   refund route — compile a minimal `require(tx.age >= N)` covenant, prove a CSV refund
-  spends on the `tr` node (`testmempoolaccept` → broadcast → confirm) **and** a premature
+  spends on the maintainer's node (`testmempoolaccept` → broadcast → confirm) **and** a premature
   refund (before `tx.age` matures, with v2 tx + nSequence per BIP68) is **rejected**. Pair
   with a CLTV-absolute fallback (Boltz uses CLTV). Freeze the both-legs clock-unit decision
   here. If CSV doesn't spend, fall back to CLTV. (deepen M1: the negative is required, not

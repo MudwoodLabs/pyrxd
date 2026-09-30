@@ -25,7 +25,7 @@ config) and land in an argv, so they are charset-validated at construction. See
 
 ``get_transaction_verbose`` calls ``getrawtransaction <txid> true``, which requires the
 node to resolve the tx (txindex, or the covenant tx otherwise known) — the same call the
-dust runs used for covenant confirmations, so it is proven against ``tr``.
+dust runs used for covenant confirmations, so it is proven against the maintainer's node host.
 """
 
 from __future__ import annotations

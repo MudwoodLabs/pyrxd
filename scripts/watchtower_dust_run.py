@@ -393,7 +393,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     print(f"      --refund-spk {state['refund_spk']} \\")
     print(f"      --autonomous-refund-cap-sats {min(int(state['btc_sats']) + 1, 10_000)} \\")
     print("      --accept-single-source \\")
-    print("      --rxd-backend ssh-tr \\")
+    print("      --rxd-backend ssh-tr --ssh-host <your node host> --ssh-container <your node container> \\")
     print("      --measured --poll-interval-s 30 --heartbeat-file ~/.pyrxd/watchtower/heartbeat")
     print()
     print("  The daemon holds NO key; it broadcasts the pre-signed sidecar once the BTC funding buries")

@@ -90,6 +90,40 @@ def add_single_operator_override_arg(ap: argparse.ArgumentParser) -> None:
     )
 
 
+#: The flags naming the user's own mainnet Radiant node, reached as
+#: ``ssh <host> 'docker exec <container> radiant-cli ...'``. REQUIRED wherever a script reaches the
+#: node: there is no default, because these scripts are public and must not name any one operator's
+#: host or container.
+RXD_NODE_FLAGS = ("--rxd-ssh-host", "--rxd-container")
+
+
+def add_rxd_node_args(ap: argparse.ArgumentParser) -> None:
+    """Add ``--rxd-ssh-host`` and ``--rxd-container`` (no defaults; see :func:`require_rxd_node_args`)."""
+    ap.add_argument(
+        "--rxd-ssh-host",
+        default="",
+        metavar="HOST",
+        help="REQUIRED where the run reaches mainnet: the ssh destination (host alias) of your mainnet Radiant node host",
+    )
+    ap.add_argument(
+        "--rxd-container",
+        default="",
+        metavar="CONTAINER",
+        help="REQUIRED where the run reaches mainnet: the docker container on that host running the node's radiant-cli",
+    )
+
+
+def require_rxd_node_args(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse at startup, naming each missing flag, unless both node flags were given."""
+    missing = [flag for flag in RXD_NODE_FLAGS if not getattr(args, flag[2:].replace("-", "_"))]
+    if missing:
+        ap.error(
+            f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} required: this run reaches your mainnet "
+            "Radiant node as `ssh <host> 'docker exec <container> radiant-cli ...'`, and there is no default host "
+            "or container"
+        )
+
+
 def funding_bound_from_args(args: argparse.Namespace) -> ElapsedBoundPolicy:
     """The coordinator's ``funding_bound``: the shipped defaults, with the user override from
     ``--accept-single-operator-up-to`` when given (printed, so the run's output says so)."""

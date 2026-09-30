@@ -106,7 +106,7 @@ detail; read it through the lens of the mandates above.
 
 ## Spike results (2026-05-20) — opcodes confirmed, FT-amount question RESOLVED
 
-Read-only spike against pyrxd source + the live mainnet node on `tr`,
+Read-only spike against pyrxd source + the live mainnet node on the maintainer's node host,
 before writing any bytecode:
 
 1. **All required opcodes exist** ([constants.py:285-320](../../src/pyrxd/constants.py#L285)):
@@ -138,7 +138,7 @@ before writing any bytecode:
    photon value, and `OP_TXOUTPUTCOUNT` must clamp so no sibling FT
    output siphons the rest.
 
-3. **`testmempoolaccept` path confirmed available** on `tr` (node
+3. **`testmempoolaccept` path confirmed available** on the maintainer's node host (node
    synced, wallet funded ~180 RXD) for the negative-case-rejection
    proofs the mandates require.
 

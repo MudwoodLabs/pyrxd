@@ -82,7 +82,7 @@ async def test_include_node_combines_with_electrumx_for_quorum():
         "--ssh-host",
         "node.example.com",
         "--ssh-container",
-        "radiant-mainnet",
+        "radiant-node",
     )
     assert isinstance(src, MultiSourceRxdChainSource)
     assert corr is True
@@ -96,7 +96,7 @@ async def test_ssh_only_is_single_source():
         "--ssh-host",
         "node.example.com",
         "--ssh-container",
-        "radiant-mainnet",
+        "radiant-node",
     )
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False

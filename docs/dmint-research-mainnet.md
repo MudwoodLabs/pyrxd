@@ -22,7 +22,7 @@ without decoding the token's reveal CBOR payload.
   `{"code":-32601,"message":"unknown method \"dmint.get_contracts\""}` —
   the public ElectrumX has not shipped those extensions, so the MCP-tool
   path was a dead end for this session.
-- **Direct node access**: fell back to the `radiant-mainnet` container
+- **Direct node access**: fell back to the maintainer's mainnet node container
   on the VPS (block height 422,868 at query time). Scanned `getblock …
   2` from tip backward looking for scriptPubKey outputs that contain the
   dMint epilogue fingerprint `dec0e9aa76e378e4` (the opcodes

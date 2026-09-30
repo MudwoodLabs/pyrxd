@@ -35,6 +35,7 @@ import subprocess
 from typing import Any
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
+from pyrxd.gravity.watch.sshtr import _validate_argv_token
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
 from pyrxd.network.registry import default_endpoints
 from pyrxd.network.source_identity import source_key
@@ -58,16 +59,21 @@ class SshTrRadiantClient:
     Parameters
     ----------
     ssh_host:
-        The ssh alias for the mainnet Radiant host (default "tr").
+        REQUIRED: the ssh destination (host alias) of YOUR mainnet Radiant node host. No default:
+        this file is public, and must not name any one operator's host.
     container:
-        The docker container running the mainnet node (default "radiant-mainnet").
+        REQUIRED: the docker container on that host that runs the mainnet node's ``radiant-cli``.
+        No default, for the same reason.
+
+    Both reach an ssh/docker argv, so both are charset-checked at construction (the watchtower's
+    ``pyrxd.gravity.watch.sshtr`` rule: a leading ``-`` would be read as an option).
     rpcwallet:
         Optional wallet name for wallet RPCs.
     ssh_timeout_s:
         Per-call timeout for the ssh subprocess.
     """
 
-    # F-010: this shim ONLY targets the mainnet node (container 'radiant-mainnet'); the
+    # F-010: this shim ONLY targets a mainnet node (the one the user names); the
     # RXD audit-gate network is therefore always mainnet — never a free CLI choice. The
     # runner pins the leg/keys network to this so a --rxd-network flag cannot disable
     # require_audit_cleared while still broadcasting real value to mainnet.
@@ -76,13 +82,13 @@ class SshTrRadiantClient:
     def __init__(
         self,
         *,
-        ssh_host: str = "tr",
-        container: str = "radiant-mainnet",
+        ssh_host: str,
+        container: str,
         rpcwallet: str | None = None,
         ssh_timeout_s: int = 30,
     ) -> None:
-        self._ssh_host = ssh_host
-        self._container = container
+        self._ssh_host = _validate_argv_token(ssh_host, "ssh_host")
+        self._container = _validate_argv_token(container, "container")
         self._rpcwallet = rpcwallet
         self._timeout = ssh_timeout_s
         self._spk_by_hash: dict[bytes, bytes] = {}
@@ -188,8 +194,8 @@ class SshTrRadiantClient:
         builder, broadcast, return the fee output as input 0. Targets the wallet named
         by rpcwallet, or the single loaded (often unnamed) wallet if rpcwallet is empty.
 
-        Default ``fee_photons`` covers the carve tx's OWN relay fee (the tr mainnet
-        node runs relayfee 0.10 RXD/kB; a ~340-byte carve needs >= 3.4M photons).
+        Default ``fee_photons`` covers the carve tx's OWN relay fee (the mainnet
+        node the dust runs used runs relayfee 0.10 RXD/kB; a ~340-byte carve needs >= 3.4M photons).
         ``amount_photons`` is what the carved UTXO holds — that becomes the fee paid
         BY the covenant spend, which is far larger (~11 KB) and needs ~100M+ photons
         at the same rate. Caller picks both.

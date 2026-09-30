@@ -19,7 +19,9 @@ still runs (eth_timeout > rxd_refund_open + margin); we just size the margin for
 Example:
   python scripts/eth_swap_grief_run.py --i-accept-dust-loss \
       --eth-rpc-url https://gateway.tenderly.co/public/sepolia --eth-key-file ~/.swap-taker-eth-key \
-      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet ''
+      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet '' \
+      --rxd-ssh-host <your node host> --rxd-container <your node container> \
+      --rxd-block-interval-fast-s <measured p10 s>
 """
 
 from __future__ import annotations
@@ -37,11 +39,13 @@ from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
     add_eth_key_arguments,
+    add_rxd_node_args,
     add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
     funding_bound_from_args,
     merge_into_mode_600,
+    require_rxd_node_args,
     resolve_eth_key_file,
     wait_for_covenant_funding,
 )
@@ -145,7 +149,7 @@ async def run(args) -> None:
         eth_timeout=eth_timeout,
         network="sepolia",
     )
-    rxd_client = SshTrRadiantClient(rpcwallet=args.rxd_wallet)
+    rxd_client = SshTrRadiantClient(ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=args.rxd_wallet)
     rxd_client.register_spk(cov.funded_spk)
     rxd_leg = RadiantCovenantLeg(
         network=rxd_network,
@@ -280,7 +284,9 @@ def _args():
     ap.add_argument("--keys-out", default="~/.eth_grief_run_keys.json")
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
     add_single_operator_override_arg(ap)
+    add_rxd_node_args(ap)
     args = ap.parse_args()
+    require_rxd_node_args(ap, args)
     resolve_eth_key_file(args)
     return args
 

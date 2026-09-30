@@ -218,11 +218,11 @@ def test_the_node_hook_asks_getblockcount_and_getblockhash() -> None:
         assert kwargs["check"] is True
         return Done("12345" if argv[-1] == "getblockcount" else A.upper())
 
-    tip, got = refresh.node_hashes(["ssh", "tr", "radiant-cli"], [0, 2016], run=run)
+    tip, got = refresh.node_hashes(["ssh", "node.example.com", "radiant-cli"], [0, 2016], run=run)
     assert tip == 12345
     assert got == {0: A, 2016: A}
-    assert calls[0] == ["ssh", "tr", "radiant-cli", "getblockcount"]
-    assert calls[1] == ["ssh", "tr", "radiant-cli", "getblockhash", "0"]
+    assert calls[0] == ["ssh", "node.example.com", "radiant-cli", "getblockcount"]
+    assert calls[1] == ["ssh", "node.example.com", "radiant-cli", "getblockhash", "0"]
 
 
 # --------------------------------------------------------------------------- the last interval's work
@@ -284,6 +284,6 @@ def test_the_node_interval_hook_asks_getblockhash_then_the_raw_header() -> None:
             return Done(A)
         return Done("ab" * 80)
 
-    got = refresh.node_interval(["ssh", "tr", "radiant-cli"], 10, 12, run=run)
+    got = refresh.node_interval(["ssh", "node.example.com", "radiant-cli"], 10, 12, run=run)
     assert got == {10: bytes.fromhex("ab" * 80), 11: bytes.fromhex("ab" * 80), 12: bytes.fromhex("ab" * 80)}
     assert ["getblockheader", A, "false"] in calls and ["getblockhash", "11"] in calls

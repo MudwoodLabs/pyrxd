@@ -204,5 +204,5 @@ extended to carry the ref opcode + 36-byte ref + FT fingerprint.
 The plan estimates were updated to the spike-revised column. Phase 2
 proceeds: draft the FT + NFT covenant templates (Radiant-only, no BTC
 half yet), validate lock → release → forfeit against the mainnet node
-on `tr`, and record benchmark vectors. Ref-conservation validation on
+on the maintainer's node host, and record benchmark vectors. Ref-conservation validation on
 a real spend remains the dominant unknown.

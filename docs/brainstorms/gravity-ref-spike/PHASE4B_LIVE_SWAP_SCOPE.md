@@ -10,7 +10,7 @@ Radiant leg is mainnet-proven; the BTC leg is BIP341-vector-validated but never 
 
 ## The hard dependency this phase introduces (absent in Phases 1–3)
 
-- **Real Bitcoin funds + a broadcast path.** `tr` is Radiant-only; there is no BTC node.
+- **Real Bitcoin funds + a broadcast path.** The maintainer's node host is Radiant-only; there is no BTC node.
   pyrxd's BTC data sources (`network/bitcoin.py` MempoolSpaceSource/BlockstreamSource) are
   **read-only** (headers/tx/merkle for SPV) — there is **no Bitcoin broadcast method**.
 - The earlier BTC sweeps proved `POST https://mempool.space/api/tx` (and the signet/testnet4
@@ -41,7 +41,7 @@ margin policy already requires a measured value in real-value mode).
    duck-typed surface (Phase 4a already defines the method names): BTC `fund/claim/refund/
    scrape_secret/derive_funding_scriptpubkey` (taproot.py exists — wire broadcast + UTXO
    fetch); Radiant `expected_covenant_scriptpubkey/covenant_outpoint/claim_asset/refund_asset`
-   (wrap build_htlc_claim/refund + the tr node).
+   (wrap build_htlc_claim/refund + the maintainer's node).
 3. **A real indexer for the REF-authenticity gate** (H4): RXinDexer or a node-backed check
    that the genesis txid:vout + payload hash + `gly` marker resolve — fail-closed if down.
 4. **The measured margin** (C2/C3): derive from observed mainnet BTC inter-block distribution

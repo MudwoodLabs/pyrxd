@@ -11,7 +11,8 @@ gate). Confirms before each irreversible broadcast.
 
 Only valid when BOTH legs are already funded + confirmed (BTC HTLC + RXD covenant).
 Reads the BTC locator from the confirmed HTLC funding tx; reads the covenant UTXO via
-the ssh-tr shim. p is loaded from the keys file (single-operator trust domain).
+the ssh-tr shim, on the node named by the REQUIRED --rxd-ssh-host / --rxd-container (no default).
+p is loaded from the keys file (single-operator trust domain).
 """
 
 from __future__ import annotations
@@ -52,10 +53,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
     CapturingBroadcaster,
     SshTrFeeSource,
+    add_rxd_node_args,
     add_single_operator_override_arg,
     confirm,
     funding_bound_from_args,
     measured_margin_from_mainnet,
+    require_rxd_node_args,
     rxd_blockcount,
     validated_resume_deadline_s,
 )
@@ -148,7 +151,9 @@ async def resume(args) -> None:
     _btc_bcast = MempoolSpaceBroadcaster(base_url=_MAINNET_BTC_API)
     btc_broadcaster = CapturingBroadcaster(_btc_bcast)
     btc_chain_reader = MempoolSpaceSource(base_url=_MAINNET_BTC_API)
-    rxd_client = SshTrRadiantClient(rpcwallet=keys.get("rxd_wallet", ""))
+    rxd_client = SshTrRadiantClient(
+        ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=keys.get("rxd_wallet", "")
+    )
     rxd_client.register_spk(cov.funded_spk)
 
     # ---- reconstruct the BTC locator from the CONFIRMED on-chain HTLC funding tx ----
@@ -381,6 +386,7 @@ def _parse_args(argv):
         ),
     )
     add_single_operator_override_arg(ap)
+    add_rxd_node_args(ap)
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument(
         "--resume-deadline-s",
@@ -393,7 +399,9 @@ def _parse_args(argv):
         "the loop past t_rxd (red-team finding 2B). Operator-supplied values are capped "
         "to the same upper bound and must be finite + positive (no inf/nan footgun).",
     )
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    require_rxd_node_args(ap, args)
+    return args
 
 
 if __name__ == "__main__":

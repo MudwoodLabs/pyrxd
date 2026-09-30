@@ -21,7 +21,7 @@ parent: docs/plans/2026-05-25-feat-gravity-htlc-concrete-legs-plan.md
   (chain=main, block ~432607). `scantxoutset` available (covenant-UTXO discovery works);
   `relayfee = 0.10 RXD/kB` (10× regtest — size fees as size_bytes × 0.10/1000, NOT flat;
   ~per memory project_radiant_relay_fee_per_kb).
-- **Bitcoin mainnet:** NO node anywhere (no local `bitcoin-cli`, none on `tr`). The proven
+- **Bitcoin mainnet:** NO node anywhere (no local `bitcoin-cli`, none on the maintainer's node host). The proven
   path (prior sweeps, PHASE4B_LIVE_SWAP_SCOPE) is **mempool.space HTTP**: reads via the
   existing `MempoolSpaceSource`; broadcast via `POST https://mempool.space/api/tx`.
 - **Code gaps (the real blockers — pure software, no funds):**
@@ -131,7 +131,7 @@ dump, with the P-SAFE-1 provenance block prepended. NEVER logs p.
 
 1. **P-SAFE-1 + P-SAFE-2 + P-TRANSPORT shims + P-REPORT built/wired, `task ci` green**, zero value.
 2. **Mainnet DRY-RUN (no broadcast):** build the real txs; `testmempoolaccept` the RXD covenant +
-   spends against `tr`; BTC = local build + read-only mempool.space fee/address/UTXO sanity (NOT a
+   spends against the maintainer's node; BTC = local build + read-only mempool.space fee/address/UTXO sanity (NOT a
    consensus rehearsal — see asymmetry above). Produce the report. **Confirm with operator.**
 3. **SIGNET cross-chain — MANDATORY gate, not "recommended" (security/arch):** real BTC signet (free
    faucet) ↔ RXD mainnet (small recoverable). The FIRST time the new broadcaster + P-SAFE-2 serializer
@@ -148,7 +148,7 @@ dump, with the P-SAFE-1 provenance block prepended. NEVER logs p.
    `pre_btc_lock_check` (REF auth [RXD variant ⇒ no-op] + H freshness + margin + promised params).
 2. Taker `taker_funds_btc` → broadcasts the P2TR HTLC on BTC mainnet (mempool.space). Gate BTC_LOCKED
    on N-conf. **CONFIRM before broadcast.**
-3. Maker locks the RXD covenant on `tr`; taker `post_asset_lock_revalidate` (on-chain SPK == expected,
+3. Maker locks the RXD covenant on the maintainer's node; taker `post_asset_lock_revalidate` (on-chain SPK == expected,
    else PARAMS_MISMATCH → refund BTC). **CONFIRM before broadcast.**
 4. **MONITORING OBLIGATION (security MUST — the most likely real loss path):** from BOTH_LOCKED until
    the swap resolves, the taker side MUST poll `maybe_refund_asset_on_maker_stall` on a cadence well

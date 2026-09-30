@@ -18,11 +18,14 @@ Stages:
   mine         carve funding, build+mine the mint, testmempoolaccept (NO send)
   send-mint    broadcast the mint, verify recreation + reward
 
-Run with: PYTHONPATH=<redesign-src>:<repo>/scripts python scripts/dmint_v2_mainnet_run.py <stage>
+Run with: PYTHONPATH=<redesign-src>:<repo>/scripts python scripts/dmint_v2_mainnet_run.py <stage> \
+    --rxd-ssh-host <your node host> --rxd-container <your node container>
+(both REQUIRED: the node is reached as ``ssh <host> 'docker exec <container> radiant-cli ...'``).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import secrets
@@ -84,8 +87,14 @@ _GENESIS_CARVE = 30_000_000  # 0.30 RXD per genesis UTXO (covers contract+deploy
 _FUNDING_CARVE = 30_000_000  # 0.30 RXD funding UTXO (covers reward + mint fee + change)
 
 
+#: The user's own mainnet node: ``(ssh host, docker container)``, from the REQUIRED command-line flags.
+_NODE: tuple[str, str] | None = None
+
+
 def _client() -> SshTrRadiantClient:
-    return SshTrRadiantClient()  # tr / radiant-mainnet / default wallet
+    if _NODE is None:
+        raise SystemExit("--rxd-ssh-host and --rxd-container are required (your mainnet node's host and container)")
+    return SshTrRadiantClient(ssh_host=_NODE[0], container=_NODE[1])  # the default wallet
 
 
 def _accepts(c: SshTrRadiantClient, raw_hex: str) -> dict:
@@ -421,8 +430,20 @@ def send_mint() -> None:
 
 _STAGES = {"prepare": prepare, "send-deploy": send_deploy, "mine": mine, "send-mint": send_mint}
 
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="First mainnet V2 dMint deploy + PoW mint (staged).")
+    ap.add_argument("stage", choices=list(_STAGES))
+    ap.add_argument(
+        "--rxd-ssh-host", required=True, help="the ssh destination (host alias) of your mainnet Radiant node host"
+    )
+    ap.add_argument(
+        "--rxd-container", required=True, help="the docker container on that host running the node's radiant-cli"
+    )
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in _STAGES:
-        print(f"usage: {sys.argv[0]} {{{'|'.join(_STAGES)}}}", file=sys.stderr)
-        sys.exit(2)
-    _STAGES[sys.argv[1]]()
+    _args = _parse_args(sys.argv[1:])
+    _NODE = (_args.rxd_ssh_host, _args.rxd_container)
+    _STAGES[_args.stage]()
