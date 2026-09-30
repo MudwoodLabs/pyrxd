@@ -624,8 +624,8 @@ class RadiantCovenantLeg:
            (:meth:`_build_covenant` — amount, H, ``t_rxd`` CSV, both dest hashes, the asset REF),
            never taken from anything the maker advertises;
         2. that exact SPK holds a funded UTXO, and its ON-CHAIN value equals
-           ``terms.radiant_amount`` — an unfunded SPK, a mis-valued one, and an ambiguous UTXO set
-           all raise (:meth:`RadiantChainIO.find_covenant_utxo`);
+           ``terms.radiant_amount`` — an unfunded SPK and a mis-valued one raise; SEVERAL matches do
+           not (the earliest-confirmed is selected: :meth:`RadiantChainIO.find_covenant_utxo`);
         3. the funding is buried ``min_confirmations`` deep. "Funded" alone is NOT enough:
            ElectrumX ``listunspent`` includes MEMPOOL outputs, so a maker can fund with a
            replaceable transaction, wait for the taker's lock, then double-spend the funding away
