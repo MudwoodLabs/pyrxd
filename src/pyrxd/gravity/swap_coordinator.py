@@ -2074,7 +2074,7 @@ class SwapCoordinator:
                 "be PROVED on chain; fail-closed (refuse to fund the counter leg). Wire a "
                 "RadiantCovenantLeg, or a leg exposing that read."
             )
-        chain = radiant_chain_for_leg(self.radiant_leg)
+        chain = radiant_chain_for_leg(self.radiant_leg, counter_leg=self.counter_leg)
         mp = self.config.margin_policy
         expected_spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms))
         value_at_stake = self._funding_value_at_stake_photons(terms)

@@ -196,6 +196,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
     With no value to size `k` from, the lock is refused. Regtest runs the same proof against its
     genesis, with no value term. A refusal names `k`, the value, `C` and what was proved;
+  - the chain is chosen from BOTH legs: a Radiant leg tagged for a test network (or untagged)
+    beside a counter leg that moves real value is refused, never proved against regtest. A BTC leg
+    moves value by its tag; an EVM leg by the chain id it signs for (`EthLeg.chain_id`, new), unless
+    that is a known testnet or a local development chain (31337);
   - the gate links at most 20,160 headers above the newest checkpoint (the pages and
     `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
   - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the

@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 import websockets
 
+from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg, BtcUtxo, FundingPolicy
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.gravity import funding_spv
 from pyrxd.gravity.funding_spv import (
@@ -494,18 +495,109 @@ def test_a_value_bearing_swap_with_nothing_to_size_k_from_refuses():
     ) == (2, 0)
 
 
-def test_the_value_bearing_network_is_mainnet_and_has_no_opt_out():
-    class _Leg:
-        def __init__(self, network):
+class _Leg:
+    def __init__(self, network=None, chain_id=None):
+        if network is not None:
             self.network = network
+        if chain_id is not None:
+            self.chain_id = chain_id
 
+
+def test_the_value_bearing_network_is_mainnet_and_has_no_opt_out():
     for tag in ("bc", "rxd", "mainnet", "anything-not-cleared"):
-        assert radiant_chain_for_leg(_Leg(tag)).value_bearing is True
-        assert radiant_chain_for_leg(_Leg(tag)).checkpoints == funding_spv.CHECKPOINTS["mainnet"]
-    assert radiant_chain_for_leg(_Leg("bcrt")) is funding_spv.REGTEST_CHAIN
-    assert radiant_chain_for_leg(object()) is funding_spv.REGTEST_CHAIN
+        for counter in (_Leg("bcrt"), _Leg("bc"), object()):
+            assert radiant_chain_for_leg(_Leg(tag), counter_leg=counter).value_bearing is True
+            assert (
+                radiant_chain_for_leg(_Leg(tag), counter_leg=counter).checkpoints == funding_spv.CHECKPOINTS["mainnet"]
+            )
+    assert radiant_chain_for_leg(_Leg("bcrt"), counter_leg=_Leg("bcrt")) is funding_spv.REGTEST_CHAIN
+    assert radiant_chain_for_leg(object(), counter_leg=object()) is funding_spv.REGTEST_CHAIN
     with pytest.raises(MakerFundingNotVerified, match="no Radiant chain parameters"):
-        radiant_chain_for_leg(_Leg("tb"))
+        radiant_chain_for_leg(_Leg("tb"), counter_leg=_Leg("tb"))
+
+
+@pytest.mark.parametrize("rxd_leg", [_Leg("bcrt"), _Leg("regtest"), _Leg(""), object()])
+@pytest.mark.parametrize(
+    "counter",
+    [
+        _Leg("bc"),
+        _Leg("anything-not-cleared"),
+        _Leg("mainnet", chain_id=1),
+        _Leg("anvil", chain_id=8453),  # Base: the chain id decides, not the tag
+        _Leg("sepolia", chain_id=137),  # a chain id pyrxd does not know counts as value-bearing
+    ],
+)
+def test_a_value_bearing_counter_leg_never_selects_the_test_chain(rxd_leg, counter):
+    """A swap that locks real value on the counter leg is never proved against a test chain, whatever
+    the Radiant leg is tagged: the configuration is refused, with the reason."""
+    with pytest.raises(MakerFundingNotVerified, match="the counter leg moves real value .* test network"):
+        radiant_chain_for_leg(rxd_leg, counter_leg=counter)
+
+
+@pytest.mark.parametrize(
+    "counter",
+    [
+        _Leg("bcrt"),
+        _Leg("tb"),
+        _Leg("signet"),
+        object(),
+        _Leg("anvil", chain_id=31337),
+        _Leg("mainnet", chain_id=11155111),
+    ],
+)
+def test_test_counter_legs_with_a_regtest_radiant_leg_still_select_regtest(counter):
+    """The honest test configuration — both legs on test networks — keeps working."""
+    assert radiant_chain_for_leg(_Leg("bcrt"), counter_leg=counter) is funding_spv.REGTEST_CHAIN
+
+
+def test_the_eth_leg_exposes_the_chain_id_it_signs_for():
+    """The chain-id half of the rule reads ``EthLeg.chain_id``; without it an EVM leg would fall back
+    to its tag, which cannot say whether the chain carries value."""
+    from pyrxd.gravity.eth_leg import EthLeg
+
+    class _Inner:
+        chain_id = 1
+
+    leg = EthLeg.__new__(EthLeg)
+    leg._leg = _Inner()
+    assert leg.chain_id == 1
+
+
+@pytest.mark.parametrize("rxd_tag", ["bcrt", ""])
+async def test_a_mainnet_btc_counter_leg_with_a_regtest_radiant_leg_is_refused(rxd_tag):
+    """A real ``BitcoinTaprootLeg`` on mainnet (``"bc"``) beside a Radiant leg tagged regtest (or
+    untagged), over a server serving a complete regtest chain for the funding. The gate refuses the
+    configuration; nothing is broadcast."""
+    terms = _ab_terms(400)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6)
+    btc_view = A._BtcChainView()
+    btc_leg = BitcoinTaprootLeg(
+        network="bc",
+        taker_keypair=generate_keypair("bc"),
+        funding_utxo=BtcUtxo(txid=A._BTC_FUNDING_TXID, vout=0, value=terms.btc_sats * 3),
+        maker_claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
+        broadcaster=btc_view,
+        funding_reader=btc_view,
+        refund_to_scriptpubkey=b"\x00\x14" + os.urandom(20),
+        claim_to_scriptpubkey=b"\x00\x14" + os.urandom(20),
+        policy=FundingPolicy(fee_sats=500, min_confirmations=1),
+        maker_claim_privkey=None,
+    )
+    coord = SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        counter_leg=btc_leg,
+        radiant_leg=_real_leg(view, network=rxd_tag),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(), accept_nondurable_seen=True),
+    )
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is False
+    assert "the counter leg moves real value (network 'bc')" in gate.reason, gate.reason
+    with pytest.raises(ValidationError, match="counter leg moves real value"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert btc_view.broadcasts == []
+    assert coord.last_maker_funding is None
 
 
 def test_the_freshness_cap_is_a_parameter_defaulting_to_the_pages_value():

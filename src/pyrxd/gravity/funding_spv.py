@@ -98,6 +98,7 @@ from typing import Any
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.constants import GENESIS_BLOCK_HASHES
+from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS
 from pyrxd.glyph.mark_block import (
     FLOOR_WORK_DIVISOR,
     MAX_HEADERS_PER_REQUEST,
@@ -115,6 +116,7 @@ from pyrxd.transaction.transaction import Transaction
 
 __all__ = [
     "FORGERY_COST_FACTOR",
+    "LOCAL_DEVNET_CHAIN_IDS",
     "MAX_HEADERS_FROM_CHECKPOINT_SDK",
     "MIN_FUNDING_CONFIRMATIONS",
     "MakerFundingEvidence",
@@ -195,25 +197,68 @@ REGTEST_CHAIN = RadiantChain(
 
 _REGTEST_TAGS = frozenset({"bcrt", "regtest"})
 
+#: EIP-155 chain ids of local development chains, which hold nothing: anvil's and hardhat's default.
+LOCAL_DEVNET_CHAIN_IDS = frozenset({31337})
 
-def radiant_chain_for_leg(leg: Any) -> RadiantChain:
-    """The Radiant network a coordinator's Radiant leg reads, by its ``network`` tag.
+_EVM_TESTNET_CHAIN_IDS = frozenset(c.chain_id for c in KNOWN_EVM_CHAINS.values() if c.is_testnet)
 
-    The same partition :func:`pyrxd.gravity.swap_coordinator._leg_is_value_bearing` draws: a
-    non-empty tag outside :data:`~pyrxd.btc_wallet.htlc_leg.AUDIT_CLEARED_NETWORKS` moves real value,
-    and is Radiant mainnet — there is no other value-bearing Radiant network, and no tag that
-    selects a weaker check for one. The regtest tags (and a leg with no tag, which is a test fake)
-    are regtest. Any other cleared tag has no chain parameters in pyrxd, and refuses.
+
+def _counter_leg_value(leg: Any) -> str | None:
+    """What makes the counter leg value-bearing, as a phrase for a refusal — or ``None`` if nothing.
+
+    An EVM leg (one exposing an int ``chain_id``) is judged by the chain it signs for: value-bearing
+    unless that is a testnet in :data:`~pyrxd.eth_wallet.chains.KNOWN_EVM_CHAINS` or a local
+    development chain (:data:`LOCAL_DEVNET_CHAIN_IDS`). Its ``network`` tag cannot answer this — every
+    EVM tag reads as uncleared (see :mod:`pyrxd.eth_wallet.chains`) — while EIP-155 makes a
+    signature for one chain id invalid on every other. An unknown chain id counts as value-bearing.
+    Any other leg is judged by the tag partition
+    :func:`pyrxd.gravity.swap_coordinator._leg_is_value_bearing` draws; a leg with neither is a test
+    fake.
+    """
+    chain_id = getattr(leg, "chain_id", None)
+    if isinstance(chain_id, int) and not isinstance(chain_id, bool):
+        if chain_id in LOCAL_DEVNET_CHAIN_IDS or chain_id in _EVM_TESTNET_CHAIN_IDS:
+            return None
+        return f"EVM chain id {chain_id}"
+    net = getattr(leg, "network", None)
+    if isinstance(net, str) and net and net not in AUDIT_CLEARED_NETWORKS:
+        return f"network {net!r}"
+    return None
+
+
+def radiant_chain_for_leg(leg: Any, *, counter_leg: Any) -> RadiantChain:
+    """The Radiant network the maker's funding is proved on, for a swap with these two legs.
+
+    The Radiant leg's ``network`` tag, by the partition
+    :func:`pyrxd.gravity.swap_coordinator._leg_is_value_bearing` draws: a non-empty tag outside
+    :data:`~pyrxd.btc_wallet.htlc_leg.AUDIT_CLEARED_NETWORKS` moves real value, and is Radiant
+    mainnet — there is no other value-bearing Radiant network. The regtest tags (and a leg with no
+    tag, which is a test fake) are regtest; any other cleared tag has no chain parameters in pyrxd,
+    and refuses.
+
+    The COUNTER leg decides too, because it is what the taker is about to lock. When it moves real
+    value (:func:`_counter_leg_value`) and the Radiant leg names a test network, this REFUSES: the
+    proof would be anchored to regtest's genesis with no value term. So no tag on either leg selects
+    a weaker check than mainnet's for a swap in which real value is locked.
     """
     net = getattr(leg, "network", None)
-    if not isinstance(net, str) or not net or net in _REGTEST_TAGS:
-        return REGTEST_CHAIN
-    if net in AUDIT_CLEARED_NETWORKS:
+    if isinstance(net, str) and net and net not in AUDIT_CLEARED_NETWORKS:
+        return MAINNET_CHAIN
+    if isinstance(net, str) and net and net not in _REGTEST_TAGS:
         raise MakerFundingNotVerified(
             f"pyrxd has no Radiant chain parameters for the test network tag {net!r}, so the maker's "
             "funding cannot be proved there; use a regtest ('bcrt') or mainnet leg"
         )
-    return MAINNET_CHAIN
+    counter_value = _counter_leg_value(counter_leg)
+    if counter_value is not None:
+        tagged = f"tagged {net!r}" if isinstance(net, str) and net else "untagged"
+        raise MakerFundingNotVerified(
+            f"the counter leg moves real value ({counter_value}) but the Radiant leg is {tagged}, "
+            "a test network: the maker's funding "
+            "would be proved against a test chain, which proves nothing about value. Tag the Radiant leg "
+            "for mainnet, or run both legs on test networks"
+        )
+    return REGTEST_CHAIN
 
 
 def block_subsidy_photons(height: int, chain: RadiantChain) -> int:
