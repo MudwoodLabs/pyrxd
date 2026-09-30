@@ -14,8 +14,9 @@ the name judgement reads its depth and hands that same anchor, verified, to the 
 (``records[i].name_at_mark.anchor`` is that anchor). VERIFIED prints this module's claim; any other
 outcome falls back to the endpoint's-word wording with the reason; CONTRADICTED exits 2 with its
 reason, as a binding failure does. What form 2 reads from its SECOND endpoint (the mark's height
-again, and every chain step's) is not verified, and neither ``glyph inspect`` nor the ``/verify/``
-and ``/inspect/`` pages call it yet (phase 3).
+again, and every chain step's) is not verified, and ``glyph inspect`` does not call it. The
+``/verify/`` and ``/inspect/`` pages do, for their one anchor, through ``glue.verify_mark_block``,
+which drives :func:`verify_with_fetched` — the sequence and decision the CLI's helper uses too.
 
 WHAT ``VERIFIED`` CLAIMS, per level. Both levels first require that the transaction's raw bytes
 (more than 64 of them) hash to its txid and that its merkle branch (SHA-256d, like Bitcoin's) leads
@@ -97,12 +98,18 @@ __all__ = [
     "FLOOR_WORK_DIVISOR",
     "MAX_HEADERS_FROM_CHECKPOINT",
     "MAX_HEADERS_PER_REQUEST",
+    "NOTHING_AGAINST_THE_MARK",
     "NOT_VERIFIED",
     "VERIFIED",
+    "BlockFetch",
     "BlockFetchPlan",
     "BlockVerification",
+    "block_fetches",
+    "contradicted_sentence",
+    "could_not_fetch",
     "plan_block_verification",
     "verify_mark_block",
+    "verify_with_fetched",
 ]
 
 VERIFIED = "VERIFIED"
@@ -571,3 +578,150 @@ def _verify(
             f"replies would leave it."
         )
     return claim
+
+
+# ── ONE FETCH ORDER, ONE SET OF SENTENCES, for every surface ────────────────────────────────────
+#
+# ``pyrxd verify`` fetches with an async client; the browser pages fetch with a WebSocket in
+# JavaScript and hand the answers to a SYNCHRONOUS Python bridge. Both walk the same sequence
+# (:func:`block_fetches`) and decide through the same function (:func:`verify_with_fetched`), so
+# the order, what counts as "could not be fetched", and every sentence a reader sees come from
+# here once — the CLI and the pages cannot word the same outcome two ways.
+
+#: What each fetch is called in a "could not be fetched" reason.
+MERKLE_FETCH = "the transaction's merkle branch"
+COINBASE_FETCH = "the block's coinbase merkle branch"
+
+
+def _headers_fetch(start: int, count: int) -> str:
+    return f"the block headers {start}-{start + count - 1}"
+
+
+@dataclass(frozen=True)
+class BlockFetch:
+    """One ElectrumX request :func:`verify_with_fetched` still needs, and how to name it.
+
+    ``key`` is ``"merkle"``, ``"coinbase"`` or ``"headers:<start>:<count>"``: the name the answer
+    is handed back under. ``method`` and ``params`` are the JSON-RPC call, exactly — the caller
+    only sends it. ``what`` names it in a reason.
+    """
+
+    key: str
+    method: str
+    params: tuple[Any, ...]
+    what: str
+
+
+def block_fetches(plan: BlockFetchPlan, txid: str) -> tuple[BlockFetch, ...]:
+    """Every request *plan* needs, in the order they are made: the transaction's merkle branch,
+    the block's coinbase branch (which pins the tree's depth), then each header range in the
+    plan's order. Empty when the plan has a reason (nothing fetched could verify)."""
+    if plan.reason is not None or plan.height is None:
+        return ()
+    h = plan.height
+    out = [
+        BlockFetch("merkle", "blockchain.transaction.get_merkle", (txid, h), MERKLE_FETCH),
+        BlockFetch("coinbase", "blockchain.transaction.id_from_pos", (h, 0, True), COINBASE_FETCH),
+    ]
+    for start, count in plan.header_ranges:
+        out.append(
+            BlockFetch(
+                f"headers:{start}:{count}", "blockchain.block.headers", (start, count), _headers_fetch(start, count)
+            )
+        )
+    return tuple(out)
+
+
+def could_not_fetch(what: str, *, source: Any, detail: Any, height: Any) -> BlockVerification:
+    """NOT VERIFIED because *what* could not be fetched from *source* — a server that lacks the
+    method, a request that timed out, a reply refused as malformed. Never a finding against the
+    mark: the height falls back to the endpoint's word, with this reason. *source* and *detail*
+    are sanitised here, for every surface."""
+    from ._inspect_core import _sanitize_display_string  # lazy: this module stays import-light
+
+    return BlockVerification(
+        state=NOT_VERIFIED,
+        claim=None,
+        reason=f"{what} could not be fetched from {_sanitize_display_string(str(source))}: "
+        f"{_sanitize_display_string(str(detail))}",
+        height=height if _is_height(height) else None,
+    )
+
+
+def verify_with_fetched(
+    *,
+    txid: Any,
+    raw_tx: Any,
+    height: Any,
+    blockhash: Any,
+    min_confirmations: int,
+    source: Any,
+    fetched: Mapping[str, Any],
+    failed: Mapping[str, Any],
+    network: str = "mainnet",
+    checkpoints: Sequence[tuple[int, str]] | None = None,
+) -> BlockVerification | BlockFetch:
+    """The next :class:`BlockFetch` still needed, or the outcome once nothing is.
+
+    SYNCHRONOUS AND NEVER SUSPENDS: the browser bridge calls it without an event loop, once per
+    answer, and the CLI calls it in a loop around its own awaited fetches.
+
+    *fetched* maps a :attr:`BlockFetch.key` to the PARSED answer — a
+    :class:`~pyrxd.spv.radiant.TxMerkleBranch` for ``merkle``, the dict
+    :func:`~pyrxd.spv.radiant.coinbase_branch_from_reply` returns for ``coinbase``, the list of
+    80-byte headers :func:`~pyrxd.spv.radiant.block_headers_from_reply` returns for a range.
+    *failed* maps a key to why that fetch failed. The requests are walked in
+    :func:`block_fetches` order and the FIRST that failed ends it: :func:`could_not_fetch`, naming
+    *source*. When the plan says nothing can verify (no checkpoints, too far past the newest one),
+    or there is no txid, nothing is asked for and the verifier states the reason.
+    """
+
+    def outcome(merkle: Any = None, coinbase: Any = None, headers: Any = None) -> BlockVerification:
+        return verify_mark_block(
+            txid=txid,
+            raw_tx=raw_tx,
+            height=height,
+            merkle=merkle,
+            coinbase_merkle=coinbase,
+            headers=headers or {},
+            min_confirmations=min_confirmations,
+            blockhash=blockhash,
+            network=network,
+            checkpoints=checkpoints,
+        )
+
+    plan = plan_block_verification(
+        height=height, min_confirmations=min_confirmations, network=network, checkpoints=checkpoints
+    )
+    if plan.reason is not None or not txid:
+        return outcome()
+    merkle = coinbase = None
+    headers: dict[int, bytes] = {}
+    for step in block_fetches(plan, str(txid)):
+        if step.key in failed:
+            return could_not_fetch(step.what, source=source, detail=failed[step.key], height=height)
+        if step.key not in fetched:
+            return step
+        got = fetched[step.key]
+        if step.key == "merkle":
+            merkle = got
+        elif step.key == "coinbase":
+            coinbase = got
+        else:
+            start = step.params[0]
+            for i, header in enumerate(got or ()):
+                headers.setdefault(start + i, header)
+    return outcome(merkle, coinbase, headers)
+
+
+#: Said beside every CONTRADICTED outcome, on every surface: an honest mark served by a confused or
+#: lying server gets one too.
+NOTHING_AGAINST_THE_MARK = (
+    "this says nothing against the mark itself, only that the server's own proof does not support "
+    "the height it reported"
+)
+
+
+def contradicted_sentence(height: Any, source: Any, reason: Any) -> str:
+    """Why no block is reported for a CONTRADICTED outcome — one sentence for the CLI and the pages."""
+    return f"the block proof {source or 'the endpoint'} served contradicts the height reported for the mark (block {height}): {reason}"

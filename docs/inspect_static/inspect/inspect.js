@@ -84,6 +84,7 @@ let pySpentBinding = null;  // glue.spent_output_bindings(txid, raw_hex, prevs_j
 // three is reimplemented here, which is the point of routing them through Python
 // at all rather than doing the obvious one-liners in JS.
 let pyMarkAnchor = null;      // glue.mark_anchor(txid, verbose_json, tip, headers_json) -> dict
+let pyVerifyMarkBlock = null; // glue.verify_mark_block(txid, raw_hex, anchor_json, fetched_json) -> dict
 let pyFileCheckPlan = null;   // glue.file_check_plan(algorithm_id) -> dict
 let pyJudgeFileDigest = null; // glue.judge_file_digest(expected, computed, algo) -> dict
 
@@ -182,6 +183,7 @@ async function boot() {
   pyGlueFetch = runtime.bridges.inspectTxidWithRaw;
   pySpentBinding = runtime.bridges.spentOutputBindings;
   pyMarkAnchor = runtime.bridges.markAnchor;
+  pyVerifyMarkBlock = runtime.bridges.verifyMarkBlock;
   pyFileCheckPlan = runtime.bridges.fileCheckPlan;
   pyJudgeFileDigest = runtime.bridges.judgeFileDigest;
 
@@ -1175,10 +1177,12 @@ function verdictBlock(label, status, meaning, detail) {
 // unreadable depth rather than reading it as zero, and BINDS the height to the server's
 // own header — the height shown is the one whose header hashes to the block the server's
 // node names (`resolveMarkAnchor` in shared.js fetches the headers it asks for). What is
-// rendered here is that result plus the caveat it carries, which says exactly that much and
-// no more: the height was checked against the endpoint ITSELF, and nothing checks
-// proof-of-work or merkle inclusion. When no header binds it, there is no height here at
-// all — only the reason, in the `!anchor.resolved` branch.
+// rendered here is that result plus the caveat it carries, which says exactly what was checked.
+// Drawn first, that is the endpoint checked against ITSELF; once the block proof has run
+// (`proveMarkBlock`, `glue.verify_mark_block`) it is the verifier's claim when the block
+// VERIFIED, or the endpoint's word with the reason it did not. When no header binds the height,
+// or the proof contradicts it, there is no height here at all — only the reason, in the
+// `!anchor.resolved` branch.
 function appendAnchor(dl, caveats, anchor, anchorReason) {
   if (!anchor) {
     // NOT a warning. Nothing went wrong: this input never had a transaction to look
@@ -1205,11 +1209,38 @@ function appendAnchor(dl, caveats, anchor, anchorReason) {
     ));
     return;
   }
+  // VERIFIED only when Python says so AND carries the outcome — `height_is_verified` is set by
+  // `with_block_verification` for a VERIFIED outcome alone, the field `pyrxd verify` reads.
+  const bv = anchor.block_verification && typeof anchor.block_verification === "object"
+    ? anchor.block_verification
+    : null;
+  if (anchor.height_is_verified === true && bv !== null && bv.state === "VERIFIED") {
+    const proved = anchor.verified_confirmations;
+    const differs = proved !== anchor.confirmations;
+    dl.appendChild(kv(
+      "block",
+      `${anchor.height} — VERIFIED, at least ${proved} confirmation(s) verified` +
+      (differs ? ` (the server reports ${anchor.confirmations})` : ""),
+    ));
+    // The claim is the verifier's own sentence, whole (`anchor.caveat`); it replaces the
+    // endpoint's-word caveat, which would contradict it on this card.
+    caveats.push(`Verified: ${anchor.caveat} The proof was fetched from ${bv.source || anchor.source}.`);
+    caveats.push(`Depth: at least ${proved} confirmation(s) verified here. ${anchor.no_depth_policy}.`);
+    return;
+  }
   dl.appendChild(kv("block", `${anchor.height} — ${anchor.confirmations} confirmation(s) deep`));
   // The caveat is COLLECTED, not appended here: it qualifies the row above and has to
   // be rendered after the field list, not before it. Printed first it read as a
   // preamble to a block nobody had been shown yet.
   caveats.push(`About that block: ${anchor.caveat}. The source is ${anchor.source}.`);
+  // Why the block proof did not do better, in Python's words (`reason`) or the page's own when it
+  // never reached Python's verdict (`block_proof_problem`); while it runs, that it is running.
+  const why = (bv && bv.reason) || anchor.block_proof_problem;
+  if (why) {
+    caveats.push(`Not verified here: ${why}.`);
+  } else if (anchor.block_proof_pending) {
+    caveats.push("Checking this block against the checkpoints pyrxd ships…");
+  }
   caveats.push(`Depth: ${anchor.confirmations} confirmation(s). ${anchor.no_depth_policy}.`);
 }
 
@@ -2768,13 +2799,40 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   // two to bind the height), and an ordinary transfer has nothing to gain from them.
   // `superseded` goes in too: the lookup checks it after each header wait and stops
   // fetching once the reader has moved on.
+  let anchor = null;
   if (carriesAMark(result)) {
     statusEl.textContent = "placing the mark in a block…";
-    result.payload.mark_anchor = await resolveMarkAnchor(pyMarkAnchor, txid, superseded);
+    anchor = await resolveMarkAnchor(pyMarkAnchor, txid, superseded);
+    result.payload.mark_anchor = anchor;
     if (superseded()) return;
   }
 
+  // THE BLOCK IS DRAWN FIRST, as the server's word, and verified AFTER — the proof costs more
+  // round trips and a few seconds of Python on this thread, and must never hold the card back.
+  const verifiable = Boolean(
+    pyVerifyMarkBlock && anchor && anchor.resolved && anchor.height !== null && anchor.height !== undefined,
+  );
+  if (verifiable) anchor.block_proof_pending = true;
   renderResult(result);
+  if (!verifiable) return;
+
+  statusEl.textContent = "verifying the block…";
+  const answer = await proveMarkBlock(pyVerifyMarkBlock, txid, rawHex, anchor, superseded);
+  if (superseded()) return;
+  let settled;
+  if (answer && answer.anchor) {
+    settled = answer.anchor;
+  } else {
+    settled = Object.assign({}, anchor);
+    delete settled.block_proof_pending;
+    if (answer && answer.reason) settled.block_proof_problem = answer.reason;
+  }
+  result.payload.mark_anchor = settled;
+  // REDRAWN WHOLE, card and JSON drawer together, so the two cannot describe the block
+  // differently. (A file comparison started in the few seconds before this lands is redrawn
+  // empty; the file can be chosen again.)
+  renderResult(result);
+  statusEl.textContent = "";
 }
 
 // ---------------------------------------------------------------------

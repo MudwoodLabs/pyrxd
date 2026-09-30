@@ -43,12 +43,18 @@
 //                      serves (any other height is refused), the tip, the depth
 //            "interleave"?: "clear" | {"classify": {"text", "result"}}, — what the reader does
 //                      while the fetch is still waiting on the server
-//            "interleave_on_request"?: n} — do it when the server receives its n-th request
+//            "interleave_on_request"?: n, — do it when the server receives its n-th request
 //                      (every method counted), instead of during the first fetch
+//            "verify_python"?: path, "checkpoints"?: [[h, hash], …], "proof"?: {…}}
+//                      — the block PROOF the page runs after drawing: the REAL
+//                      glue.verify_mark_block as `pyVerifyMarkBlock` (absent: none, as before),
+//                      the mainnet checkpoints that subprocess uses, and the proof requests'
+//                      answers (proof_server.mjs)
 //   stdout: {"requested": [txid, …],        — every raw-transaction fetch, in order
 //            "glue_calls": [[arg, …], …],   — every call to the classifier bridge, verbatim
 //            "binding_calls": [[arg, …], …], — every call to the binding bridge, verbatim
 //            "anchor_calls": [[arg, …], …],  — every call to the block-lookup bridge, verbatim
+//            "verify_calls": [[arg, …], …],  — every call to the block-proof bridge, verbatim
 //            "server_log": [[method, params], …], — every request the server received, in order
 //            "rendered": "…",               — the result block's text, one node per line
 //            "status": "…",                 — the fetch-row status text when it finished
@@ -60,6 +66,7 @@ import { fileURLToPath } from "node:url";
 import { webcrypto } from "node:crypto";
 import vm from "node:vm";
 import { makeGlueSubprocessBridge } from "./glue_subprocess_bridge.mjs";
+import { answerProof } from "./proof_server.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SHARED_JS = resolve(HERE, "../../docs/inspect_static/inspect/shared.js");
@@ -150,6 +157,13 @@ function makeServer(table, requested, hooks) {
       hooks.count += 1;
       hooks.log.push([req.method, req.params]);
       if (hooks.onRequest) hooks.onRequest(hooks.count, req);
+      const proof = answerProof(hooks.proof, req.method, req.params);
+      if (proof && proof.hang) return;
+      if (proof) {
+        const frame = proof.error ? { id: req.id, error: proof.error } : { id: req.id, result: proof.result };
+        setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
+        return;
+      }
       if (req.method === "blockchain.headers.subscribe") {
         const frame = { id: req.id, result: { height: hooks.tip, hex: "" } };
         setTimeout(() => this.dispatch("message", { data: JSON.stringify(frame) }), 0);
@@ -207,6 +221,7 @@ async function main() {
   const glueCalls = [];
   const bindingCalls = [];
   const anchorCalls = [];
+  const verifyCalls = [];
   const hooks = {
     count: 0,
     log: [],
@@ -215,6 +230,7 @@ async function main() {
     tip: spec.tip ?? 460572,
     blockhash: spec.blockhash,
     headers: spec.headers || {},
+    proof: spec.proof,
   };
   const document = {
     createElement: (tag) => new StubElement(tag),
@@ -275,8 +291,15 @@ async function main() {
   sandbox.__anchor_recorder__ = spec.anchor_python
     ? makeGlueSubprocessBridge(spec.anchor_python, GLUE_DIR, anchorCalls)
     : recorder(anchorCalls, spec.anchor_returns || [], "anchor result");
+  sandbox.__verify_bridge__ = spec.verify_python
+    ? makeGlueSubprocessBridge(spec.verify_python, GLUE_DIR, verifyCalls, {
+      fn: "verify_mark_block",
+      checkpoints: spec.checkpoints,
+    })
+    : null;
   vm.runInContext(
-    "pyGlueFetch = __recorder__; pySpentBinding = __binding_recorder__; pyMarkAnchor = __anchor_recorder__;",
+    "pyGlueFetch = __recorder__; pySpentBinding = __binding_recorder__; pyMarkAnchor = __anchor_recorder__; " +
+    "pyVerifyMarkBlock = __verify_bridge__;",
     sandbox,
   );
 
@@ -332,6 +355,7 @@ async function main() {
     glue_calls: glueCalls,
     binding_calls: bindingCalls,
     anchor_calls: anchorCalls,
+    verify_calls: verifyCalls,
     server_log: hooks.log,
     rendered: renderedLines(resultBlock),
     status: status.textContent,

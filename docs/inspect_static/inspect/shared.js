@@ -523,6 +523,7 @@ _pyrxd_version_blob = (
       spentOutputBinding: glue.spent_output_binding,
       spentOutputBindings: glue.spent_output_bindings,
       markAnchor: glue.mark_anchor,
+      verifyMarkBlock: glue.verify_mark_block,
       fileCheckPlan: glue.file_check_plan,
       judgeFileDigest: glue.judge_file_digest,
       // Not a per-check bridge: called once, just below, to hand the Python side
@@ -931,6 +932,140 @@ async function resolveMarkAnchor(markAnchorBridge, txid, superseded) {
     return {
       resolved: false,
       reason: `could not read the block: ${stripControlChars(String((err && err.message) || err))}`,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------
+// The mark's block, VERIFIED — after it is drawn, never before
+// ---------------------------------------------------------------------
+
+// A safety stop on the proof loop below, NOT the rule. Which requests are made, in what order, is
+// `pyrxd.glyph.mark_block.verify_with_fetched`'s to decide (through `glue.verify_mark_block`): the
+// transaction's merkle branch, the block's coinbase branch, then at most three header ranges at
+// this page's floor. This only ends a loop that would otherwise keep asking;
+// `tests/web/test_block_proof_on_the_pages.py` checks it is never smaller than what the rule can ask.
+const MAX_BLOCK_PROOF_REQUESTS = 8;
+
+// ElectrumX's `blockchain.block.headers` serves at most this many per call.
+const MAX_HEADERS_PER_REQUEST = 2016;
+
+// The only requests the proof loop will send, whatever the bridge asks for.
+const BLOCK_PROOF_METHODS = new Set([
+  "blockchain.transaction.get_merkle",
+  "blockchain.transaction.id_from_pos",
+  "blockchain.block.headers",
+]);
+
+const HEX64_RE = /^[0-9a-fA-F]{64}$/;
+
+// A merkle branch as ElectrumX sends one: at most 32 levels of 32-byte hex hashes.
+function isMerkleList(value) {
+  return Array.isArray(value) && value.length <= 32 && value.every((h) => typeof h === "string" && HEX64_RE.test(h));
+}
+
+// EVERY PROOF REPLY IS UNTRUSTED SERVER INPUT, bounded here before it is handed on: its shape, and
+// for headers the one length that matters (160 hex characters per header, no more than were asked
+// for, at most 2016). Python reads each again, with the readers `pyrxd verify`'s client uses, so a
+// reply refused there is refused in the CLI's words; this is the page's own guard on what it holds.
+function checkProofReply(method, params, result) {
+  const isObject = result !== null && typeof result === "object" && !Array.isArray(result);
+  if (!isObject) throw wireError("malformed", "the server's proof answer is not an object");
+  if (method === "blockchain.transaction.get_merkle") {
+    if (!Number.isInteger(result.block_height) || result.block_height < 0) {
+      throw wireError("malformed", "the server's merkle answer has no usable block height");
+    }
+    if (!isMerkleList(result.merkle)) throw wireError("malformed", "the server's merkle branch is not a list of hashes");
+    if (!Number.isInteger(result.pos) || result.pos < 0) {
+      throw wireError("malformed", "the server's merkle answer has no usable position");
+    }
+    return;
+  }
+  if (method === "blockchain.transaction.id_from_pos") {
+    if (typeof result.tx_hash !== "string" || !HEX64_RE.test(result.tx_hash)) {
+      throw wireError("malformed", "the server's coinbase answer has no usable transaction hash");
+    }
+    if (!isMerkleList(result.merkle)) throw wireError("malformed", "the server's coinbase branch is not a list of hashes");
+    return;
+  }
+  // blockchain.block.headers
+  const asked = params[1];
+  if (!Number.isInteger(result.count) || result.count < 0 || result.count > asked || result.count > MAX_HEADERS_PER_REQUEST) {
+    throw wireError("malformed", `the server returned a header count that is not 0 to ${asked}`);
+  }
+  if (typeof result.hex !== "string" || result.hex.length !== BLOCK_HEADER_HEX_LEN * result.count || !/^[0-9a-fA-F]*$/.test(result.hex)) {
+    throw wireError("malformed", `the server's headers are not ${result.count} 80-byte headers`);
+  }
+}
+
+// One proof request, by LITERAL method name: every request either page sends names its method in
+// the source, so what the pages can ask a server is readable there (and checked, in
+// `tests/web/test_the_marker_banner_agrees_with_the_token_row.py`).
+function sendProofRequest(method, params) {
+  if (method === "blockchain.transaction.get_merkle") return electrumxRpc("blockchain.transaction.get_merkle", params);
+  if (method === "blockchain.transaction.id_from_pos") return electrumxRpc("blockchain.transaction.id_from_pos", params);
+  if (method === "blockchain.block.headers") return electrumxRpc("blockchain.block.headers", params);
+  return Promise.reject(wireError("malformed", `this page does not send ${stripControlChars(String(method))}`));
+}
+
+// Verify the block `resolveMarkAnchor` placed the mark in — the check `pyrxd verify` runs.
+//
+// PYTHON CHOOSES, THIS LOOP ONLY FETCHES. `glue.verify_mark_block` answers `{needs: {key, method,
+// params}}` — the next ElectrumX request `verify_with_fetched` needs, in its order — until it has
+// everything, then `{needs: null, anchor}`: the anchor as `mark_anchor` gave it, with the
+// verification applied, every sentence of it from Python. `rawHex` is the transaction the page
+// already fetched and hash-checked (`fetchRawTxFromElectrumx`); it is passed, not fetched again.
+//
+// APPENDED, NEVER BLOCKING: a page draws the block first, and calls this after. Returns null when
+// there is nothing to verify (no bridge, no block) or the reader moved on (`superseded`) — the page
+// then keeps what it drew. Never throws: a failure is `{needs: null, anchor: null, reason}`, and
+// the page adds the reason to what it drew.
+async function proveMarkBlock(verifyBridge, txid, rawHex, anchor, superseded) {
+  const stale = typeof superseded === "function" ? superseded : () => false;
+  if (!verifyBridge || !anchor || !anchor.resolved || anchor.height === null || anchor.height === undefined) {
+    return null;
+  }
+  // The page's own "still checking" marker is not part of the answer it hands back.
+  const given = Object.assign({}, anchor);
+  delete given.block_proof_pending;
+  const anchorJson = JSON.stringify(given);
+  const fetched = { replies: {}, errors: {} };
+  const has = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+  try {
+    for (let asked = 0; ; asked += 1) {
+      const answer = fromPy(verifyBridge(txid, rawHex, anchorJson, JSON.stringify(fetched)));
+      const need = answer ? answer.needs : null;
+      if (!need) return answer || { needs: null, anchor: null, reason: "the block could not be verified here" };
+      const { key, method, params } = need;
+      if (
+        asked >= MAX_BLOCK_PROOF_REQUESTS ||
+        typeof key !== "string" || !BLOCK_PROOF_METHODS.has(method) || !Array.isArray(params) ||
+        has(fetched.replies, key) || has(fetched.errors, key) ||
+        (method === "blockchain.block.headers" &&
+          !(Number.isInteger(params[1]) && params[1] >= 1 && params[1] <= MAX_HEADERS_PER_REQUEST))
+      ) {
+        // Asked for something it cannot want, the same thing twice, or more than the rule can ask:
+        // stop rather than loop, and say so. The block stays as drawn.
+        return {
+          needs: null,
+          anchor: null,
+          reason: `this page stopped after ${asked} block-proof request(s) without an answer, so the block was not verified here`,
+        };
+      }
+      try {
+        const result = await sendProofRequest(method, params);
+        checkProofReply(method, params, result);
+        fetched.replies[key] = result;
+      } catch (err) {
+        fetched.errors[key] = stripControlChars(String((err && err.message) || err)).slice(0, 160);
+      }
+      if (stale()) return null;
+    }
+  } catch (err) {
+    return {
+      needs: null,
+      anchor: null,
+      reason: `the block could not be verified here: ${stripControlChars(String((err && err.message) || err))}`,
     };
   }
 }

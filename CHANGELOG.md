@@ -9,8 +9,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **`pyrxd.glyph.mark_block.verify_mark_block`, which checks the block a HashMark is in.**
-  `pyrxd verify` calls it (see Changed below); the `/verify/` and `/inspect/` pages do not yet,
-  and still report the height as the endpoint's word (#799, phase 3). The verifier checks that
+  `pyrxd verify` calls it, and so do the `/verify/` and `/inspect/` pages (see Changed below). The verifier checks that
   the transaction's merkle branch leads to the merkle root of the header served for its height,
   and that the branch is as deep as the block's tree, which the coinbase's own branch (checked
   against the same root) states. Radiant allows 64-byte transactions, so without that pin a
@@ -87,12 +86,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     judgement reads its depth, so a mark proved at or past the floor is not judged "too shallow"
     for the name on the endpoint's lower figure, and the name's detail says whose depth it used
     when the two differ. The name's chain-step heights are still the two endpoints' word.
-    `glyph inspect --wave-name` and the pages' JSON carry the same three keys, with
-    `verified_confirmations` and `block_verification` null: they are not verified, and their
-    caveats are unchanged.
+    `glyph inspect --wave-name` carries the same three keys, with `verified_confirmations` and
+    `block_verification` null: it does not verify, and its caveats are unchanged.
   - A mark whose block, plus the confirmations asked for, reaches more than 4,032 blocks past
     this pyrxd's newest checkpoint cannot be verified by it and reports `CONFIRMED` with that
     reason; newer checkpoints come with newer releases.
+- **The `/verify/` and `/inspect/` pages verify the mark's block too** (#799, phase 3). The block
+  is drawn first, as the server's word with its caveat; the page then fetches the merkle branch,
+  the coinbase branch and the header ranges that `glue.verify_mark_block` asks for, and verifies
+  them with the transaction it already fetched and hash-checked. The fetch order, the decision
+  and every sentence come from the same Python the CLI uses
+  (`pyrxd.glyph.mark_block.verify_with_fetched`, and the reply readers now in
+  `pyrxd.spv.radiant`), so for the same server answers the page and `pyrxd verify` give the same
+  state, claim, reason and proved depth.
+  - VERIFIED shows the verifier's claim in place of the endpoint's-word caveat, the proved depth,
+    and the server's confirmation count beside it, labelled as the server's. The pages' floor is
+    one confirmation, so above the newest checkpoint they prove the block itself; at or below it,
+    the proved depth runs to the newest checkpoint.
+  - A block that does not verify stays on screen as the server's word, with "Not verified here:"
+    and the reason. A proof that contradicts the height shows no block number, with the reason.
+  - The page's anchor JSON now carries `block_verification`, `verified_confirmations` and, when
+    VERIFIED, the verifier's claim as `caveat`. The pages link at most 4,032 headers past the
+    newest checkpoint, as the CLI does.
+- **With `--wave-name`, the form-2 caveat no longer says the mark's height is unverified when
+  the block line says it is VERIFIED** (#806). When the mark's block verified, its sentence about
+  the mark's height says the height was verified by pyrxd; its sentences about the name's
+  chain-step heights still say they are the endpoints' word. A form-2 verdict that degrades now
+  carries the same caveat the block line does (the claim, or the inclusion-only caveat) in its
+  `name_at_mark.caveat`. `glyph inspect --wave-name` does not verify the block, so its caveat is
+  unchanged.
 
 ### Deprecated
 

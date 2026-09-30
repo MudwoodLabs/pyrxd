@@ -14,8 +14,9 @@ checkpoint made from a fixture header's own hash (``_checkpoint``), which exerci
 linkage to a checkpoint above the mark, and proof-of-work from one below it — on real headers.
 The shipped table itself is used, unpatched, in the degrade test for a mark it cannot reach.
 
-WHAT IS NOT PROVED HERE: that the pages verify anything (phase 3 of #799), or that a live server
-answers these RPCs this way today (the fixture was captured 2026-09-30).
+WHAT IS NOT PROVED HERE: what the pages draw (``tests/web/test_block_proof_on_the_pages.py``
+checks that, against these same fixture replies), or that a live server answers these RPCs this
+way today (the fixture was captured 2026-09-30).
 """
 
 from __future__ import annotations
@@ -952,3 +953,117 @@ def test_header_bound_names_the_block_the_endpoint_named(monkeypatch, tmp_path, 
     assert anchor["blockhash"] == C.hash_at(C.height)
     assert (bv["named_blockhash"] is not None) is reorganised
     assert (anchor["blockhash"] == radiant_block_hash(single)) is not reorganised
+
+
+# ── #806: the name's form-2 caveat and the block line agree, on one screen ─────────────────────
+#
+# The name section's caveat carried "block heights — the mark's and every chain step's — ... are
+# NOT verified ... Nothing checks proof-of-work or merkle inclusion" beside `block: VERIFIED ...
+# merkle inclusion proved`. Its sentence about the MARK's height now follows the one predicate the
+# block line follows; its sentences about the chain STEPS' heights stay the endpoints' word.
+
+
+def _unverified_form2_caveat(nam: dict) -> str:
+    from pyrxd.glyph.wave_identity import _corroborated_caveat
+
+    return _corroborated_caveat(nam["heights"]["agreed_by"], mark_header_bound=True)
+
+
+@pytest.mark.parametrize("state", ["VERIFIED", "NOT VERIFIED"])
+def test_806_the_name_caveat_and_the_block_line_agree_under_verify(monkeypatch, tmp_path, state: str) -> None:
+    _checkpoint(monkeypatch, C, C.tip)
+
+    def a() -> ElectrumXClient:
+        return _server(C) if state == "VERIFIED" else _server(C, **_NO_MERKLE)
+
+    r = _run_name(monkeypatch, tmp_path, a(), _indexer(C), json_out=False)
+    assert r.exit_code == 0, r.output
+    out = json.loads(_run_name(monkeypatch, tmp_path, a(), _indexer(C)).output)
+    nam = out["records"][0]["name_at_mark"]
+    assert nam["form"] == 2 and out["checks"]["name"]["state"] == "ESTABLISHED", "the premise: a form-2 caveat"
+    assert out["mark_anchor"]["block_verification"]["state"] == state, "the premise: the block's state"
+    text = _flat(r.output)
+    caveat = _flat(nam["caveat"])
+    assert f"({caveat})" in text, "the name's caveat is not on the screen the block line is on"
+    if state == "VERIFIED":
+        assert "block: VERIFIED" in text
+        assert "The mark's height is also VERIFIED by pyrxd" in caveat
+        assert "The chain steps' heights are NOT verified" in caveat, "the step heights are still the endpoints' word"
+        # Nothing on the screen says the MARK's height is unverified.
+        assert "and are NOT verified" not in caveat
+        assert "Nothing checks proof-of-work or merkle inclusion" not in text
+        assert "pyrxd checks no" not in text
+    else:
+        assert "block: CONFIRMED" in text and "not verified:" in text
+        assert caveat == _flat(_unverified_form2_caveat(nam)), "the unverified caveat changed"
+        assert "VERIFIED by pyrxd" not in text
+
+
+def test_806_glyph_inspect_keeps_the_unverified_caveat_because_it_verifies_nothing(monkeypatch, tmp_path) -> None:
+    """``glyph inspect --wave-name`` does not verify the block (only ``pyrxd verify`` does), so its
+    name caveat must still say the mark's height is not verified — and nothing on its screen may
+    say otherwise. The shared wording must not leak the verified sentence here."""
+    _checkpoint(monkeypatch, C, C.tip)
+    _name_walk(monkeypatch, C)
+    a, b = _server(C), _indexer(C)
+    monkeypatch.setattr(CliContext, "make_client", lambda self: a)
+    monkeypatch.setattr(glyph_inspect, "_endpoint_pair", lambda ctx: (a, A_URL, b, B_URL))
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
+    args = ["glyph", "inspect", C.txid, "--fetch", "--wave-name", f"{WAVE_LABEL}.rxd", "--min-confirmations", "6"]
+    r = CliRunner().invoke(cli, [*head, *args])
+    assert r.exit_code == 0, r.output
+    rj = CliRunner().invoke(cli, [*head, "--json", *args])
+    payload = json.loads(rj.output)
+    (nam,) = [row["hashmark"]["name_at_mark"] for row in payload["outputs"] if row.get("hashmark")]
+    assert nam["form"] == 2, "the premise: a form-2 caveat"
+    assert nam["anchor"]["block_verification"] is None, "the premise: glyph inspect verified nothing"
+    text = _flat(r.output)
+    assert f"({_flat(_unverified_form2_caveat(nam))})" in text
+    assert "VERIFIED by pyrxd" not in text
+    assert not {m for s in (a, b) for m, _ in s.calls} & _BLOCK_RPCS
+
+
+def test_806_a_degraded_name_verdict_carries_the_marks_own_caveat() -> None:
+    """A form-2 verdict that DEGRADES hands the anchor's caveat on as its own (``--json``'s
+    ``name_at_mark.caveat``). ``with_proven_depth`` gives it the caveat the block line has: the
+    claim when proved, the inclusion-only caveat when the branch passed but the height did not
+    verify, and the endpoint's-word caveat otherwise."""
+    from pyrxd.glyph.mark_anchor import MarkAnchor, with_proven_depth
+    from pyrxd.glyph.mark_block import BlockVerification
+    from pyrxd.glyph.wave_identity import judge_name_at_mark
+
+    base = MarkAnchor(
+        txid=C.txid,
+        height=C.height,
+        confirmations=9,
+        min_confirmations=6,
+        source="wss://one.invalid/",
+        caveat=BOUND_CAVEAT,
+        header_bound=True,
+        blockhash=C.hash_at(C.height),
+    )
+    proved = BlockVerification(
+        state="VERIFIED",
+        claim="THE CLAIM.",
+        reason=None,
+        height=C.height,
+        verified_depth=9,
+        steps=(("merkle", "passed"),),
+    )
+    inclusion = BlockVerification(
+        state="NOT VERIFIED", claim=None, reason="r", height=C.height, steps=(("merkle", "passed"),)
+    )
+    nothing = BlockVerification(state="NOT VERIFIED", claim=None, reason="r", height=C.height)
+    for verification, caveat in ((proved, "THE CLAIM."), (inclusion, INCLUSION_ONLY_CAVEAT), (nothing, BOUND_CAVEAT)):
+        anchor = with_proven_depth(base, verification)
+        assert anchor.caveat == caveat
+        # One source for both the binding and the block: the judge degrades on its second rule.
+        verdict = judge_name_at_mark(
+            ref="ab" * 32 + ":1",
+            name="alice.rxd",
+            binding_source=anchor.source,
+            anchor=anchor,
+            walk=None,  # type: ignore[arg-type]  # never reached: the verdict degrades first
+            height_reports=[],
+        )
+        assert verdict.form == 1 and verdict.caveat == caveat
