@@ -25,8 +25,20 @@ to the merkle root in the header served for its height.
 * **work** — ``H`` is above the newest checkpoint ``C``. The headers ``C+1 .. H`` (and above, for
   burial) are linked hash by hash to ``C``'s header, whose hash must equal the shipped one, and
   EACH must (a) hash at or below the target its own nBits states and (b) state a target whose work
-  is at least :data:`FLOOR_WORK_DIVISOR`-th of ``C``'s. A server lying about the height would have
-  had to mine those headers at that difficulty.
+  is at least :data:`FLOOR_WORK_DIVISOR`-th of ``C``'s.
+
+  WHAT THAT COSTS A LIAR — not the work of every header since ``C``. A server placing the
+  transaction at a false height ``H`` can serve the REAL headers ``C+1 .. H-1`` unchanged; it has
+  to mine only the header at ``H`` (whose merkle root commits to the transaction) and one on top of
+  it for each further confirmation checked: ``min_confirmations`` headers from ``H`` up, each at
+  or above the floor. The cost is set by ``min_confirmations`` and the floor, not by how far ``H``
+  sits above ``C``. (The low-work test in ``tests/test_mark_block_verification.py`` builds exactly
+  this forgery: real headers to 460,580, one mined header on top.)
+
+  FOR A CALLER THAT GATES FUNDS on this (the planned swap taker gate, "phase 2b"): a single
+  forged confirmation costs one floor-level header, so the required ``min_confirmations`` MUST
+  scale with the value at risk, and the refusal must say what it required. The default of this
+  module is the mark path's, where a wrong answer misleads but moves nothing.
 
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
 nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
@@ -463,7 +475,9 @@ def _verify(
             f"that header is linked hash by hash to block {newest_h}, a checkpoint shipped with pyrxd, "
             f"through {height - newest_h} header(s), each meeting its own proof-of-work target and carrying "
             f"at least 2^{facts['floor_work_log2']} expected hash evaluations. A server lying about this "
-            f"height would have had to mine those headers. pyrxd does not check that they are Radiant's "
-            f"most-work chain, or that each difficulty is the one Radiant's rules require."
+            f"height could reuse the real headers below it; it would have had to mine the "
+            f"{facts['verified_depth']} header(s) from block {height} up, at that work or more. pyrxd does "
+            f"not check that they are Radiant's most-work chain, or that each difficulty is the one "
+            f"Radiant's rules require."
         )
     return claim

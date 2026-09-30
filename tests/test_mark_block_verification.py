@@ -141,6 +141,12 @@ def test_above_the_newest_checkpoint_the_block_is_verified_by_work(m: Mark) -> N
     assert v.floor_work_log2 == floor.bit_length() - 1
     assert "through 8 header(s)" in (v.claim or "")
     assert "does not check that they are Radiant's most-work chain" in (v.claim or "")
+    # What a liar must mine is the headers from H up, not the 8 since the checkpoint: it can
+    # serve the real ones below H (the mined-forgery test below does exactly that).
+    assert (
+        f"could reuse the real headers below it; it would have had to mine the 1 header(s) from block {m.height} up"
+        in (v.claim or "")
+    )
     assert _step(v, "proof_of_work") == _step(v, "floor") == "passed"
 
 
@@ -148,6 +154,7 @@ def test_above_the_newest_checkpoint_the_block_is_verified_by_work(m: Mark) -> N
 def test_burial_above_the_mark_is_linked_and_counted(m: Mark) -> None:
     v = m.run(m.cp(m.start), min_confirmations=9)
     assert v.state == VERIFIED and v.verified_depth == 9 and v.linked_headers == 17
+    assert f"mine the 9 header(s) from block {m.height} up" in (v.claim or "")
 
 
 def test_a_merkle_branch_object_and_a_raw_reply_are_the_same_input() -> None:

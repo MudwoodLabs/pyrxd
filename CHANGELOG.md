@@ -19,7 +19,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Above the newest checkpoint**, it links through at most 4,032 headers. Each must meet the
     target its own nBits states and carry at least 1/16 of the checkpoint's work. It does not
     check that these headers are on the most-work chain, or that each nBits is what Radiant's
-    difficulty rules require.
+    difficulty rules require. A lying server can reuse the real headers below the claimed
+    height and mine only the headers checked from that height up, so what this level costs a
+    liar is set by `min_confirmations` and the floor, not by the distance from the checkpoint.
   - It returns `VERIFIED`, `NOT VERIFIED` or `CONTRADICTED`, each with a reason. It never raises
     on server data.
 
