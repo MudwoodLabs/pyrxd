@@ -969,19 +969,30 @@ def _unverified_form2_caveat(nam: dict) -> str:
     return _corroborated_caveat(nam["heights"]["agreed_by"], mark_header_bound=True)
 
 
-@pytest.mark.parametrize("state", ["VERIFIED", "NOT VERIFIED"])
+_SHORT_HEADERS = {"blockchain.block.headers": lambda p: _headers_reply(C.headers, p[0], 1)}
+
+
+@pytest.mark.parametrize("state", ["VERIFIED", "NOT VERIFIED", "INCLUSION ONLY"])
 def test_806_the_name_caveat_and_the_block_line_agree_under_verify(monkeypatch, tmp_path, state: str) -> None:
+    """``INCLUSION ONLY``: the headers are served short, so the merkle branch is checked and PASSES
+    while the height does not verify. The block line then says the branch leads to the header
+    served (``INCLUSION_ONLY_CAVEAT``), and the name's caveat must not say nothing checks merkle
+    inclusion beside it."""
     _checkpoint(monkeypatch, C, C.tip)
 
     def a() -> ElectrumXClient:
-        return _server(C) if state == "VERIFIED" else _server(C, **_NO_MERKLE)
+        if state == "VERIFIED":
+            return _server(C)
+        return _server(C, **(_SHORT_HEADERS if state == "INCLUSION ONLY" else _NO_MERKLE))
 
     r = _run_name(monkeypatch, tmp_path, a(), _indexer(C), json_out=False)
     assert r.exit_code == 0, r.output
     out = json.loads(_run_name(monkeypatch, tmp_path, a(), _indexer(C)).output)
     nam = out["records"][0]["name_at_mark"]
     assert nam["form"] == 2 and out["checks"]["name"]["state"] == "ESTABLISHED", "the premise: a form-2 caveat"
-    assert out["mark_anchor"]["block_verification"]["state"] == state, "the premise: the block's state"
+    bv = out["mark_anchor"]["block_verification"]
+    assert bv["state"] == ("NOT VERIFIED" if state == "INCLUSION ONLY" else state), "the premise: the block's state"
+    assert (dict(bv["steps"]).get("merkle") == "passed") is (state != "NOT VERIFIED"), "the premise: the merkle step"
     text = _flat(r.output)
     caveat = _flat(nam["caveat"])
     assert f"({caveat})" in text, "the name's caveat is not on the screen the block line is on"
@@ -993,6 +1004,17 @@ def test_806_the_name_caveat_and_the_block_line_agree_under_verify(monkeypatch, 
         assert "and are NOT verified" not in caveat
         assert "Nothing checks proof-of-work or merkle inclusion" not in text
         assert "pyrxd checks no" not in text
+    elif state == "INCLUSION ONLY":
+        assert "block: CONFIRMED" in text and "not verified:" in text
+        # The block line and the name's caveat say the SAME thing about the mark's height: the
+        # one constant, whole, in both.
+        assert out["mark_anchor"]["caveat"] == INCLUSION_ONLY_CAVEAT
+        assert _flat(INCLUSION_ONLY_CAVEAT) in caveat
+        assert text.count(_flat(INCLUSION_ONLY_CAVEAT)) >= 2, "the block line and the name's caveat"
+        assert "Nothing checks proof-of-work or merkle inclusion" not in text
+        assert "pyrxd checks no" not in text
+        assert "VERIFIED by pyrxd" not in text
+        assert "chain steps' proof-of-work or merkle inclusion" in caveat, "the steps are still unchecked"
     else:
         assert "block: CONFIRMED" in text and "not verified:" in text
         assert caveat == _flat(_unverified_form2_caveat(nam)), "the unverified caveat changed"

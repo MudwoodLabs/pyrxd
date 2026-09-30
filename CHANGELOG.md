@@ -116,9 +116,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **With `--wave-name`, the form-2 caveat no longer says the mark's height is unverified when
   the block line says it is VERIFIED** (#806). When the mark's block verified, its sentence about
   the mark's height says the height was verified by pyrxd; its sentences about the name's
-  chain-step heights still say they are the endpoints' word. A form-2 verdict that degrades now
-  carries the same caveat the block line does (the claim, or the inclusion-only caveat) in its
-  `name_at_mark.caveat`. `glyph inspect --wave-name` does not verify the block, so its caveat is
+  chain-step heights still say they are the endpoints' word. When the block did not verify but
+  its merkle branch was checked and passed (headers served short, say), the caveat's sentence
+  about the mark's block is the block line's own inclusion-only caveat, and "nothing checks
+  proof-of-work or merkle inclusion" is said of the chain steps alone. A form-2 verdict that
+  degrades now carries the same caveat the block line does (the claim, or the inclusion-only
+  caveat) in its `name_at_mark.caveat`. `glyph inspect --wave-name` does not verify the block, so its caveat is
   unchanged.
 
 ### Deprecated
