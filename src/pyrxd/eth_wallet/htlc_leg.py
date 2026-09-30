@@ -15,9 +15,11 @@ Key handling (HARD): the signing key is :class:`PrivateKeyMaterial`; its raw byt
 fed to the signer at the call site and never persisted as an ``eth_account`` object.
 
 Security gates enforced here (off-chain, per the security review):
-  * pre-fund: ``eth_getCode`` runtime-bytecode == the committed artifact's, the
-    contract immutables (hashlock/claimant/refundee/timeout) == negotiated, and the
-    funded balance >= the negotiated amount. Run inside the funder's own ``fund()``, and again
+  * pre-fund: ``eth_getCode`` runtime-bytecode == the runtime EXPECTED for the negotiated
+    terms — the committed artifact with each negotiated immutable substituted into EVERY one of
+    its ``immutableReferences`` offsets, compared for EXACT byte equality (no masking). The
+    contract immutables (hashlock/claimant/refundee/timeout) are ALSO read back == negotiated,
+    and the funded balance >= the negotiated amount. Run inside the funder's own ``fund()``, and again
     on the maker's side before the maker reveals p (the maker's RXD lock precedes both).
     The balance is a LOWER BOUND on purpose — anyone can force-send wei to a contract
     (selfdestruct/coinbase), so an ``== expected`` check is griefable into a permanent
@@ -85,6 +87,16 @@ def _b(v: Any) -> bytes:
 def _addr(v: Any) -> str:
     """Normalise an address-ish value to a lowercase hex string for comparison."""
     return str(v or "").lower()
+
+
+def _addr_word(v: str) -> bytes:
+    """A 20-byte EVM address right-aligned in a 32-byte word — the exact shape Solidity splices for
+    an ``address``/``address payable`` immutable (12 zero bytes + the 20 address bytes)."""
+    s = str(v)
+    raw = bytes.fromhex(s[2:] if s.startswith("0x") else s)
+    if len(raw) != 20:
+        raise ValidationError(f"address must be 20 bytes, got {len(raw)}")
+    return b"\x00" * 12 + raw
 
 
 def create_address(sender: str, nonce: int) -> str:
@@ -348,29 +360,78 @@ class EthHtlcContractLeg:
     # These are intentionally thin and are validated by the Phase-4 Sepolia proof, not by
     # offline unit tests (which cover the pure layer above). Each documents its contract.
 
-    def _runtime_code_matches(self, on_chain: bytes) -> bool:
-        """Compare on-chain runtime to the committed artifact, masking committed-zero bytes.
+    def _immutable_values(self, locator: EthHtlcLocator) -> dict[str, bytes]:
+        """The 32-byte word each named immutable MUST hold, from the NEGOTIATED terms.
 
-        Solidity splices ``immutable`` values (hashlock/claimant/refundee/timeout)
-        directly into the runtime bytecode at deploy time; the committed ``bin-runtime``
-        carries zero-placeholders there, so a byte-exact compare always fails. We require
-        the same length and a byte-match everywhere the committed code is NON-zero.
-
-        HONESTY / LIMITATION (audit eth_leg_web3 LOW): this masks EVERY committed-zero
-        position, which is a SUPERSET of the immutable slots — legitimate zero logic bytes
-        (STOP, PUSH1 0x00, leading-zero PUSH operands, metadata padding) are therefore NOT
-        verified, so this gate alone does not fully prove "no modified logic". The meaningful
-        binding is the immutables-checked-by-getter step in :meth:`verify_funded`; a precise
-        compare that masks ONLY the artifact's ``immutableReferences`` offset ranges (and
-        byte-matches every other position, zeros included) is a hardening follow-up that
-        requires the injected artifact to carry ``immutableReferences``. Not exploitable in
-        the current self-deploy wiring (the taker deploys its own contract), but the advertised
-        "no attacker contract" strength is bounded by this until the slot-accurate compare lands.
+        These are the values the correctly-funded contract commits to; :meth:`_expected_runtime`
+        splices them into every ``immutableReferences`` offset so the whole runtime is verified by
+        exact equality (no masking). The token leg overrides this to add ``token`` + ``amount``.
+        An address is right-aligned in its 32-byte word (12 zero bytes + 20 address bytes), a
+        ``uint`` is big-endian — the exact encodings Solidity splices, verified byte-for-byte
+        against a real honest deploy by the Anvil honest-path test.
         """
-        expected = self.expected_runtime_code
-        if len(on_chain) != len(expected):
-            return False
-        return all(e == o for e, o in zip(expected, on_chain) if e != 0)
+        return {
+            "hashlock": locator.hashlock_bytes,
+            "claimant": _addr_word(locator.claimant),
+            "refundee": _addr_word(locator.refundee),
+            "timeout": int(locator.timeout).to_bytes(32, "big"),
+        }
+
+    def _expected_runtime(self, locator: EthHtlcLocator) -> bytes:
+        """The EXACT runtime a correctly-deployed contract for ``locator``'s terms must carry.
+
+        Slot-accurate, fail-closed replacement for the old value-masked compare (which wildcarded
+        EVERY committed-zero byte — a superset of the immutable slots — and so verified neither
+        the logic bytes that happen to be zero NOR, critically, that ALL copies of an immutable
+        agree). Solidity splices each immutable into 2–3 SEPARATE runtime offsets; a getter reads
+        one copy while ``claim()``/``refund()`` read another, so the masked compare let a hostile
+        deployer set the getter copy to the negotiated ``claimant`` (passing the getter bind in
+        :meth:`verify_funded`) and the ``claim()`` copy to an attacker — draining the funded ETH to
+        the attacker while every off-chain gate passed. Proven end-to-end on Anvil.
+
+        The fix substitutes the negotiated value into EVERY ``immutableReferences`` offset for each
+        immutable and requires the on-chain code to equal the result EXACTLY — no byte anywhere is
+        wildcarded, so no logic byte and no immutable copy is left unverified.
+
+        Fail closed if the artifact lacks ``immutableReferences`` or the ``immutable_names`` map
+        that pairs each reference id with the negotiated value it must hold: without them a
+        slot-accurate expected runtime cannot be built, and the value-masked fallback is exactly
+        the hole this closes.
+        """
+        refs = self._artifact.get("immutableReferences")
+        if not refs:
+            raise ValidationError(
+                "artifact lacks 'immutableReferences'; cannot build a slot-accurate expected "
+                "runtime and refusing to fall back to a value-masked compare (the hole that let a "
+                "hostile deployer forge one immutable copy). Rebuild the artifact with immutable refs."
+            )
+        names = self._artifact.get("immutable_names")
+        if not names:
+            raise ValidationError(
+                "artifact lacks 'immutable_names' (the {reference-id: immutable-name} map); cannot "
+                "know which negotiated value each immutableReferences id must hold. Fail closed."
+            )
+        values = self._immutable_values(locator)
+        out = bytearray(self.expected_runtime_code)
+        for ref_id, offsets in refs.items():
+            name = names.get(str(ref_id))
+            if name is None:
+                raise ValidationError(f"immutableReferences id {ref_id!r} has no entry in immutable_names; fail closed")
+            if name not in values:
+                raise ValidationError(
+                    f"immutable {name!r} (ref id {ref_id!r}) has no negotiated value on this leg; fail closed"
+                )
+            word = values[name]
+            if len(word) != 32:
+                raise ValidationError(f"immutable {name!r} value must be 32 bytes, got {len(word)}")
+            for ref in offsets:
+                start, length = ref["start"], ref["length"]
+                if length != 32:
+                    raise ValidationError(f"immutable {name!r} slot length {length} != 32; fail closed")
+                if start + 32 > len(out):
+                    raise ValidationError(f"immutable {name!r} slot at {start} is out of range; fail closed")
+                out[start : start + 32] = word
+        return bytes(out)
 
     async def verify_funded(
         self,
@@ -386,8 +447,10 @@ class EthHtlcContractLeg:
         lock RXD):
 
         1. chain id matches;
-        2. deployed runtime logic == the committed artifact's (immutable slots masked —
-           no attacker contract / no modified logic);
+        2. deployed runtime == the runtime expected for the negotiated terms, by EXACT byte
+           equality after substituting each negotiated immutable into every immutableReferences
+           offset (no attacker contract, no modified logic, and no forged immutable copy the
+           getters cannot see — see :meth:`_expected_runtime`);
         3. the contract IMMUTABLES (hashlock/claimant/refundee/timeout) read back via
            the getters == the negotiated terms in the locator (the meaningful binding
            check — proves the contract releases on the right secret to the right party
@@ -417,10 +480,11 @@ class EthHtlcContractLeg:
                 "NOT YET FINALIZED — compare against 'latest' and retry once it buries. Empty code "
                 "at a checkpoint is not evidence of a wrong or attacker contract."
             )
-        if not self._runtime_code_matches(code):
+        if bytes(code) != self._expected_runtime(locator):
             raise ValidationError(
-                f"on-chain runtime logic at {locator.contract_address} does not match the committed "
-                f"EthHtlc artifact ({len(code)} bytes present, but different) — wrong/attacker contract"
+                f"on-chain runtime at {locator.contract_address} does not EXACTLY equal the runtime "
+                f"expected for the negotiated terms ({len(code)} bytes present, but different) — "
+                "wrong/attacker contract, or an immutable copy the getters cannot see was forged"
             )
         # Read immutables back by value and bind them to the negotiated terms.
         #

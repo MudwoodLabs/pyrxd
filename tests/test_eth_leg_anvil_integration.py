@@ -33,6 +33,7 @@ if shutil.which("anvil") is None:  # pragma: no cover - environment gate
     pytest.skip("anvil binary not available", allow_module_level=True)
 
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
@@ -175,6 +176,51 @@ async def test_verify_funded_rejects_wrong_amount(anvil_url):
         await rpc.close()
 
 
+async def test_forged_immutable_copy_is_rejected_by_verify_funded(anvil_url):
+    """FUND-SAFETY regression (proven exploit → fix). Solidity splices each immutable into 2–3
+    SEPARATE runtime offsets; ``claimant`` (ref id 6) has copies at 1224 and 1418. The getter — and
+    therefore verify_funded's claimant() bind — reads 1418, while ``claim()``'s value send reads
+    1224. The old value-masked compare wildcarded every committed-zero byte and never checked the
+    copies agreed, so a hostile TAKER could deploy a runtime with 1418=maker (getter honest) and
+    1224=attacker: verify_funded passed, then claim(p) drained the whole balance to the attacker
+    while revealing p (handing the taker the RXD leg too).
+
+    Here: deploy the honest contract, read its real spliced runtime, forge ONLY the 1224 copy, place
+    it at a fresh address via anvil_setCode + fund it, then run the MAKER's real verify_funded. The
+    slot-exact compare must REJECT it (before the fix, verify_funded passed and the maker was robbed)."""
+    from eth_utils import to_checksum_address
+
+    rpc, taker, maker = _legs(anvil_url)
+    try:
+        _p, h = _secret()
+        timeout = await _now_plus(rpc, 3600)
+        honest = await taker.fund(
+            hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_AMOUNT_WEI
+        )
+        runtime = bytearray(await rpc.get_code(honest.contract_address))
+        attacker = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"  # taker's own second address
+        runtime[1224 : 1224 + 32] = b"\x00" * 12 + bytes.fromhex(attacker[2:])  # forge the claim() copy only
+        faddr = to_checksum_address("0x" + "c0de" * 10)
+        await rpc.w3.provider.make_request("anvil_setCode", [faddr, "0x" + bytes(runtime).hex()])
+        await rpc.w3.provider.make_request("anvil_setBalance", [faddr, hex(_AMOUNT_WEI)])
+        forged_loc = EthHtlcLocator(
+            chain_id=_CHAIN_ID,
+            contract_address=faddr,
+            deploy_tx_hash="0x" + "00" * 32,
+            hashlock="0x" + h.hex(),
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=timeout,
+            amount_wei=_AMOUNT_WEI,
+        )
+        # The getter copy (1418) is still the honest maker, so every immutable-by-getter bind passes;
+        # only the exact runtime compare stands between the maker and revealing p to a robbing contract.
+        with pytest.raises(ValidationError, match="does not EXACTLY equal"):
+            await maker.verify_funded(forged_loc, expected_amount_wei=_AMOUNT_WEI)
+    finally:
+        await rpc.close()
+
+
 async def test_provenance_rejects_foreign_contract_claim(anvil_url):
     """R6 on a real chain: a claim on contract A does NOT pass provenance for contract B (the
     per-swap-unique address is the binding), even with the same H/p."""
@@ -238,9 +284,11 @@ async def test_finalized_pin_rejects_reorg_swapped_in_contract(anvil_url_fast_fi
     on a real EVM and prove the 'finalized' pin is the live backstop for the runtime-mask gap.
 
     Attack model: the taker's deploy is reorged out inside the verify→lock window and a DIFFERENT
-    deployment lands at the SAME (deployer, nonce) CREATE address. _runtime_code_matches masks
-    every committed-zero byte (see test_eth_leg.py's mask-gap test), so a swapped-in contract can
-    evade the 'latest' checks — the maker's pre-lock re-verify at 'finalized' is what closes this.
+    deployment lands at the SAME (deployer, nonce) CREATE address. The 'finalized' pin is a
+    defence-in-depth backstop for that reorg substitution; the runtime compare is now slot-exact
+    (see test_forged_immutable_copy_is_rejected_by_verify_funded below), so this test's replacement
+    is a genuine honest deploy with identical immutables (over-funded by 1 wei) that 'latest' still
+    accepts because its runtime is byte-identical.
 
     Asserts: (a) 'latest' ACCEPTS the swapped-in contract (it cannot tell the substitution
     happened); (b) 'finalized' REJECTS it — the checkpoint predates the replacement, the code

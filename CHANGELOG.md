@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **ETH/ERC-20 HTLC: the counterparty runtime check is now slot-exact, closing a fund-theft path
+  proven on a local Anvil chain.** `EthHtlcContractLeg.verify_funded` compared the deployed runtime
+  to the committed artifact with a *value-masked* compare that wildcarded every committed-zero byte
+  — a superset of the immutable slots. Solidity splices each `immutable` into 2–3 SEPARATE runtime
+  offsets; a getter reads one copy while `claim()`/`refund()` read another. So a hostile TAKER
+  (who deploys the ETH side first) could deploy a runtime whose `claimant` getter-copy held the
+  negotiated maker (passing every `verify_funded` getter bind) while the `claim()`-copy held an
+  attacker address. `verify_funded` passed, the maker revealed the preimage, and `claim(p)` drained
+  the entire funded balance to the attacker — who then also held `p` to take the RXD leg. The prior
+  docstring's "Not exploitable in the current self-deploy wiring" was wrong for the taker-deploys
+  role. The fix (`_expected_runtime`) rebuilds the expected runtime by substituting each negotiated
+  immutable into EVERY `immutableReferences` offset and requires EXACT byte equality — no byte is
+  wildcarded, so a forged immutable copy or any modified logic byte is rejected. It fails closed if
+  the artifact lacks `immutableReferences` or the `immutable_names` map. The token leg
+  (`Erc20HtlcLeg`) inherits the check and extends it to its `token`/`amount` immutables. Regression
+  cover: an Anvil forged-runtime exploit test, a no-Anvil synthetic unit test, an honest-path test,
+  and fail-closed tests.
+
 ## [0.25.1] — 2026-09-29
 
 ### Changed (breaking)
