@@ -18,6 +18,7 @@
 #   scripts/mutation_test.sh verdicts       # the verification modules — authority, burn and relationship verdicts
 #   scripts/mutation_test.sh mutchain       # the mutable-chain walk and its discovery from the chain
 #   scripts/mutation_test.sh waveverdicts   # WAVE identity and HashMark anchor verdicts
+#   scripts/mutation_test.sh markblock      # verifying a mark's block — Radiant header PoW, checkpoints, the verifier
 #   scripts/mutation_test.sh btcleg        # the BTC HTLC leg — taproot refund/claim leafs, payment parse, key handling
 #   scripts/mutation_test.sh covenants     # consensus-enforced covenant bytes — the Gravity covenant, soulbound
 #   scripts/mutation_test.sh htlccovenant  # gravity/htlc_covenant.py — the HTLC covenant bytes (sharded in CI)
@@ -162,6 +163,7 @@ group_files() {
     verdicts)    echo "glyph/authority glyph/burn glyph/relationships" ;;
     mutchain)    echo "glyph/mutable_chain glyph/mutable_chain_discovery" ;;
     waveverdicts) echo "glyph/wave_identity glyph/mark_anchor" ;;
+    markblock)   echo "spv/radiant spv/radiant_checkpoints glyph/mark_block" ;;
     btcleg)      echo "btc_wallet/taproot btc_wallet/htlc_leg btc_wallet/payment btc_wallet/keys btc_wallet/chains btc_wallet/validate" ;;
     # `covenants`, `gravitycore` and `cryptoprim` were each ONE group until 2026-09-29, when
     # scheduled run 36558376548 cancelled all three at the 330-minute job timeout, having scored 2
@@ -269,6 +271,7 @@ group_tests() {
     glyphscript) echo "tests/test_mutation_hardening.py tests/test_glyph_v2.py tests/test_glyph_dmint.py tests/test_golden_vectors.py tests/test_glyph_red_team.py tests/test_glyph_security_red_team.py tests/test_glyph_v2_metadata.py tests/test_dmint_module.py tests/test_mut_container_wave_builders.py tests/test_glyph.py tests/test_glyph_scanner.py tests/test_script_encoder_consolidation.py tests/test_glyph_mint_facade.py tests/test_dmint_v1_mint.py tests/test_glyph_cbor_roundtrip.py tests/test_fuzz_parsers.py" ;;
     verdicts)    echo "tests/test_authority_tokens.py tests/test_inspect_core_classification.py tests/test_fuzz_parsers.py tests/test_dat_and_burn.py tests/test_hashmark_attestation.py tests/test_delegate_refs_authorise_in_and_by.py tests/test_relationship_claims_are_verified.py tests/cli/test_glyph_inspect_cmds.py tests/test_form2_security_hardening.py tests/test_wave_identity_form2.py tests/test_mutable_chain_walk.py tests/test_mark_anchor.py tests/test_wave_fold_fixture_discriminates.py tests/test_multi_glyph_reveal_attribution.py tests/test_mutable_chain_is_discovered_from_the_chain.py tests/test_name_at_mark_reaches_the_cli.py" ;;
     mutchain)    echo "tests/test_authority_tokens.py tests/test_inspect_core_classification.py tests/test_fuzz_parsers.py tests/test_dat_and_burn.py tests/test_hashmark_attestation.py tests/test_delegate_refs_authorise_in_and_by.py tests/test_relationship_claims_are_verified.py tests/cli/test_glyph_inspect_cmds.py tests/test_form2_security_hardening.py tests/test_wave_identity_form2.py tests/test_mutable_chain_walk.py tests/test_mark_anchor.py tests/test_wave_fold_fixture_discriminates.py tests/test_multi_glyph_reveal_attribution.py tests/test_mutable_chain_is_discovered_from_the_chain.py tests/test_name_at_mark_reaches_the_cli.py" ;;
+    markblock)   echo "tests/test_radiant_spv_primitives.py tests/test_radiant_checkpoints.py tests/test_mark_block_verification.py tests/network/test_get_transaction_merkle_real_data.py" ;;
     waveverdicts) echo "tests/test_authority_tokens.py tests/test_inspect_core_classification.py tests/test_fuzz_parsers.py tests/test_dat_and_burn.py tests/test_hashmark_attestation.py tests/test_delegate_refs_authorise_in_and_by.py tests/test_relationship_claims_are_verified.py tests/cli/test_glyph_inspect_cmds.py tests/test_form2_security_hardening.py tests/test_wave_identity_form2.py tests/test_mutable_chain_walk.py tests/test_mark_anchor.py tests/test_wave_fold_fixture_discriminates.py tests/test_multi_glyph_reveal_attribution.py tests/test_mutable_chain_is_discovered_from_the_chain.py tests/test_name_at_mark_reaches_the_cli.py" ;;
     btcleg)      echo "tests/test_watch_claim_executor.py tests/test_watch_v2_execute_invariants.py tests/test_swap_coordinator.py tests/test_btc_htlc_leg.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_builder_relay_fee_floors.py tests/test_btc_wallet.py tests/test_btc_chains.py tests/test_two_host_recovery_phases.py tests/test_watchtower_dust_run_harness.py tests/test_remaining_builder_relay_fee_floors.py tests/test_btc_taproot.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_swap_gate_binding.py" ;;
     covenants)   echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py" ;;
@@ -326,7 +329,7 @@ group_tests() {
     # 2026-09-21: merged with main, which had added tests/security/test_json_guards.py
     # here (security/json_guards moved under the 100%-coverage package and its tests had
     # to run in the group that mutates it). Both additions are kept: they are disjoint.
-    network)     echo "tests/network/test_guards.py tests/network/test_registry.py tests/network/test_bitcoin.py tests/network/test_confirm.py tests/network/test_tls_pin.py tests/network/test_chaintracker.py tests/network/test_rxindexer.py tests/test_glyph_wave.py tests/test_hashmark_wave_identity.py tests/test_mempool_adapters.py tests/test_endpoint_diversity.py tests/test_one_source_identity.py tests/network/test_failover.py tests/test_network_bitcoin.py tests/security/test_hostile_server_responses.py $GAPS tests/network/test_electrumx.py tests/test_rxindexer_discovery.py tests/security/test_json_guards.py" ;;
+    network)     echo "tests/network/test_guards.py tests/network/test_registry.py tests/network/test_bitcoin.py tests/network/test_confirm.py tests/network/test_tls_pin.py tests/network/test_chaintracker.py tests/network/test_rxindexer.py tests/test_glyph_wave.py tests/test_hashmark_wave_identity.py tests/test_mempool_adapters.py tests/test_endpoint_diversity.py tests/test_one_source_identity.py tests/network/test_failover.py tests/network/test_get_transaction_merkle_real_data.py tests/test_network_bitcoin.py tests/security/test_hostile_server_responses.py $GAPS tests/network/test_electrumx.py tests/test_rxindexer_discovery.py tests/security/test_json_guards.py" ;;
     keys)        echo "tests/security/ tests/test_keys.py tests/test_base58.py tests/test_hd_wallet.py tests/test_hd_descriptor.py tests/cli/test_swap_recovery.py tests/cli/test_swap_cmds.py tests/test_watch_secret_and_ack_hardening.py tests/security/test_errors.py tests/security/test_secrets.py" ;;
   esac
 }
@@ -348,6 +351,7 @@ group_timeout() {
     verdicts)    echo "45.0" ;;
     mutchain)    echo "45.0" ;;
     waveverdicts) echo "45.0" ;;
+    markblock)   echo "30.0" ;;
     btcleg)      echo "60.0" ;;
     covenants)   echo "60.0" ;;
     htlccovenant) echo "60.0" ;;
@@ -432,7 +436,7 @@ group_shards() {
 CONSENSUS_GROUPS="spv script transaction txpreimage dmint dmintchain dmintminer"
 # `keys` was in NEITHER meta-group, so `task mutate all` silently skipped the module set that
 # holds secrets, base58 and BIP32 derivation. Reachable only by exact name until now.
-VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network keys ethleg ethtimelock verdicts mutchain waveverdicts btcleg covenants htlccovenant radiantleg rswpcovenant gravitycore gravitystate gravitymaker gravitylegs cryptoprim cryptokeys cryptosec cryptoutils cryptohash glyphverify glyphscan glyphinspector waverules inspectcore glyphlock wire hashmark wiretx hdseed feecore walletcore markcli inspectcli"
+VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network keys ethleg ethtimelock verdicts mutchain waveverdicts markblock btcleg covenants htlccovenant radiantleg rswpcovenant gravitycore gravitystate gravitymaker gravitylegs cryptoprim cryptokeys cryptosec cryptoutils cryptohash glyphverify glyphscan glyphinspector waverules inspectcore glyphlock wire hashmark wiretx hdseed feecore walletcore markcli inspectcli"
 
 GROUPS_REQUESTED="${*:-spv}"
 case "$GROUPS_REQUESTED" in

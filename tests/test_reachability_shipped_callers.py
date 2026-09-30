@@ -129,6 +129,15 @@ _KNOWN_UNREACHED: dict[str, str] = {
     "src/pyrxd/eth_wallet/tokens.py::token_by_address": (
         "FINDING 2026-08-27: new in feat/erc20-usdc-leg with test-only callers — wire or remove"
     ),
+    # -- STAGED on purpose (2026-09-29): the mark-block verifier ships as phase 1 of a plan whose
+    #    phase 2 wires it into `pyrxd verify` (tracked in #799). Nothing prints its result yet, so
+    #    no surface over-claims. The stale-entry test below removes these the day that caller lands.
+    "src/pyrxd/glyph/mark_block.py::plan_block_verification": (
+        "STAGED: phase 1 of #799; the `pyrxd verify` caller is phase 2"
+    ),
+    "src/pyrxd/glyph/mark_block.py::verify_mark_block": (
+        "STAGED: phase 1 of #799; the `pyrxd verify` caller is phase 2"
+    ),
 }
 
 

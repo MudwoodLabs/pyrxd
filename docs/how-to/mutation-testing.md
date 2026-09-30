@@ -27,6 +27,7 @@ poetry run task mutate glyphscript        # glyph/script.py + glyph/payload.py �
 poetry run task mutate verdicts           # authority/burn/relationship verdicts — the modules that answer "is this true"
 poetry run task mutate mutchain           # the mutable-chain walk and its discovery from the chain
 poetry run task mutate waveverdicts       # WAVE identity and HashMark anchor verdicts
+poetry run task mutate markblock          # a mark's block: Radiant header PoW, checkpoints, the verifier
 poetry run task mutate btcleg            # the BTC HTLC leg — taproot refund/claim leafs, payment parse, key handling
 poetry run task mutate covenants         # consensus-enforced covenant bytes — the Gravity covenant, soulbound
 poetry run task mutate htlccovenant      # gravity/htlc_covenant.py — the HTLC covenant bytes (2 shards in CI)
@@ -63,7 +64,7 @@ poetry run task mutate ethleg             # eth_wallet/ — the EVM counter leg 
 poetry run task mutate ethtimelock        # gravity/eth_rxd_timelock.py — cross-clock timelock arithmetic
 
 poetry run task mutate consensus          # the original four groups, now seven after the timeout split
-poetry run task mutate value              # the forty-three value-moving groups
+poetry run task mutate value              # the forty-four value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 

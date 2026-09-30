@@ -589,14 +589,29 @@ class TestTheReferenceDecoderAcceptsOurRecords:
         """Non-vacuity: every parametrised test below iterates this list."""
         assert len(self.VECTORS["records"]) >= 6, "the cross-implementation vectors have gone missing"
 
-    def test_the_fixture_names_the_same_upstream_commit_as_the_pin(self) -> None:
+    def test_the_fixture_was_checked_against_the_reference_code_the_pin_names(self) -> None:
+        """The vectors were accepted by the reference implementation's files at ONE commit;
+        the pin may move past it only while those files are byte-identical.
+
+        This used to compare commits, which forced a choice on any spec-only bump (the pin moved
+        866f2b9c -> 1dcb9d59 when upstream added HASHMARK_PROTOCOL.md §2.3.2 and changed no
+        ``packages/protocol/src`` file): re-run the TypeScript harness, or rewrite
+        ``upstream_commit`` to a commit nobody ran against. Comparing the DIGESTS of the code
+        that did the accepting says exactly what the result depends on. When upstream changes
+        any of those files, this fails until the harness is re-run at the new commit.
+        """
         pin = json.loads(
             (pathlib.Path(__file__).resolve().parent / "fixtures/hashmark_upstream_pin.json").read_text(
                 encoding="utf-8"
             )
         )
-        assert self.VECTORS["upstream_commit"] == pin["commit"]
         assert self.VECTORS["upstream_repo"] == pin["repo"]
+        pinned_ref = {f: d for f, d in pin["files"].items() if f.startswith("packages/protocol/src/")}
+        assert len(pinned_ref) >= 5, "the pin no longer names the reference implementation's files"
+        assert self.VECTORS["reference_src_sha256"] == pinned_ref, (
+            "the reference implementation changed since these vectors were checked "
+            f"(at {self.VECTORS['upstream_commit'][:8]}); re-run its decoder on them at {pin['commit'][:8]}"
+        )
 
     @pytest.mark.parametrize("vector", VECTORS["records"], ids=lambda v: v["name"])
     def test_a_record_his_decoder_accepted_still_decodes_here(self, vector: dict) -> None:
