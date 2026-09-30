@@ -326,7 +326,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
     `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
     `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller;
-  - above dust, the funding's depth must be corroborated by two distinct operators: on a
+  - above dust, the funding's depth must be reported by two independent operators (a report is a
+    server's word — its verbose confirmations or its tip height — not a proof): on a
     value-bearing network, when the value at stake exceeds `ElapsedBoundPolicy.dust_threshold_photons`
     (1,000 RXD by default), the gate refuses the lock unless at least two operator groups
     (`source_key`; the user's own node is its own group) report a depth for the funding, and the
