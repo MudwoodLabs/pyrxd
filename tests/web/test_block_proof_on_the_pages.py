@@ -874,6 +874,27 @@ class TestTheInspectPage:
         assert '"height_is_verified": true' in out["rendered"]
         assert "block_proof_pending" not in out["rendered"]
 
+    def test_inspect_at_the_work_level_shows_the_proved_depth_not_the_servers(self, glue, monkeypatch) -> None:
+        """WHERE THE TWO DEPTHS DIFFER. At the checkpoint level the fixture's proved depth equals the
+        server's count by construction (both 9), so a card printing the server's figure as the
+        proved one would pass every test above. At the proof-of-work level the page proves six and
+        the server reports nine: the card must print six as proved, and nine only as the server's."""
+        out = _inspect_flow(glue, P, P.start)
+        monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", _checkpoints(P, P.start))
+        anchor = page_anchor(glue, P, _server(P))
+        cli, _ = cli_proof(
+            P, _server(P), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=page_target(glue, anchor)
+        )
+        proved, reported = cli.verified_depth, P.tip - P.height + 1
+        assert cli.state == "VERIFIED" and cli.level == "work" and proved != reported, "the premise"
+        card = _flat(out["rendered"]).split('"mark_anchor"')[0]
+        assert f"Verified: {_flat(cli.claim)}" in card
+        assert (
+            f"{P.height} — VERIFIED, at least {proved} confirmation(s) verified (the server reports {reported})"
+        ) in card
+        assert f"Depth: at least {proved} confirmation(s) verified here." in card
+        assert f"at least {reported} confirmation(s) verified" not in card
+
     def test_inspect_keeps_the_block_when_the_merkle_fetch_fails(self, glue) -> None:
         proof = _proof_table(C, merkle={"error": {"code": -32601, "message": "unknown method"}})
         out = _inspect_flow(glue, C, C.tip, proof=proof)
