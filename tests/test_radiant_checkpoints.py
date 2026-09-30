@@ -95,10 +95,57 @@ def test_the_file_is_exactly_what_the_script_renders() -> None:
     assert text == (ROOT / "src/pyrxd/spv/radiant_checkpoints.py").read_text(encoding="utf-8")
 
 
-def test_the_sources_are_the_shipped_default_servers() -> None:
+def test_the_sources_are_shipped_defaults_of_at_least_two_operators() -> None:
+    """The table records the servers that ACTUALLY agreed when it was generated. Each is one pyrxd
+    ships, and together they span two operators. They need not be every default: a default added
+    since (a second server of an operator already listed) was not asked, and listing it here
+    would claim a confirmation that never happened. The next regeneration asks every default."""
     from pyrxd.network.registry import DEFAULT_ENDPOINTS
+    from pyrxd.network.source_identity import source_key
 
-    assert cp.SOURCES["mainnet"] == tuple(DEFAULT_ENDPOINTS["mainnet"])
+    recorded = cp.SOURCES["mainnet"]
+    assert set(recorded) <= set(DEFAULT_ENDPOINTS["mainnet"])
+    assert len({source_key(u) for u in recorded}) >= 2
+
+
+def test_reconcile_counts_operators_not_urls() -> None:
+    """Two servers of one operator are one source: they cannot be the two a table needs."""
+    one_op = {
+        "wss://electrumx.radiant4people.com:50022/": {0: G, 2016: A},
+        "wss://electrumx2.radiant4people.com:50022/": {0: G, 2016: A},
+    }
+    with pytest.raises(refresh.Disagreement, match="different operators"):
+        refresh.reconcile(one_op, [0, 2016], G)
+
+
+@pytest.mark.parametrize(
+    "second",
+    ["wss://electrumx.radiantcore.org/", "node"],
+)
+def test_reconcile_accepts_a_second_operator_or_the_node(second) -> None:
+    """The honest pair: a server of another operator, or the maintainer's node, is a second source."""
+    answers = {"wss://electrumx.radiant4people.com:50022/": {0: G, 2016: A}, second: {0: G, 2016: A}}
+    assert refresh.reconcile(answers, [0, 2016], G) == [(0, G), (2016, A)]
+
+
+def test_the_rendered_prose_counts_the_servers_it_lists() -> None:
+    """Three servers must not render as "both servers" or "any of the three"."""
+    three = ("wss://a.example/", "wss://b.example/", "wss://c.example/")
+    with_node = refresh.render_module(
+        MAINNET[:1], servers=three, node_cli="x", pinned_at_tip=5000, min_depth=1000, generated_utc="2026-01-01"
+    )
+    flat = " ".join(with_node.split())
+    assert "all 3 servers agreed on every entry" in flat
+    assert "it agreed with all 3 servers on every one" in flat
+    assert "any of the four would have refused" in flat
+    assert "both servers" not in flat and "of the three" not in flat
+    no_node = " ".join(
+        refresh.render_module(
+            MAINNET[:1], servers=three, node_cli=None, pinned_at_tip=5000, min_depth=1000, generated_utc="2026-01-01"
+        ).split()
+    )
+    assert "rests on the three public servers alone. All are ElectrumX" in no_node
+    assert "the two public" not in no_node
 
 
 # ── the refresh script's refusals, each paired with the honest case ─────────────────────────
