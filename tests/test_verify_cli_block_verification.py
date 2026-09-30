@@ -450,6 +450,32 @@ def test_a_block_replaced_between_the_anchor_and_the_proof_is_verified_as_the_bl
         assert anchor["height_is_verified"] is True and out["checks"]["block"]["state"] == "VERIFIED"
 
 
+def test_the_block_the_endpoint_named_reaches_the_verifier(monkeypatch, tmp_path) -> None:
+    """WHAT THE BLOCKHASH STEP IS FOR, pinned at the production entry point. It no longer refuses
+    anything (a stale name alone is not a contradiction); it is how the reader learns that the
+    block the endpoint NAMED is not the block PROVED. So the anchor's name must reach the
+    verifier: when it matches, the step passes and nothing is noted; when it differs, the JSON
+    carries the name, labelled, beside the proved hash, and the summary says so. Dropping the name
+    on the way (``blockhash=None``) turns both into "not run" and silence — which this catches."""
+    _checkpoint(monkeypatch, C, C.tip)
+    honest = json.loads(_verify(monkeypatch, tmp_path, C)[0].output)
+    bv = honest["mark_anchor"]["block_verification"]
+    assert dict(bv["steps"])["blockhash"] == "passed", "the endpoint's name was checked against the header"
+    assert bv["named_blockhash"] is None
+    assert "named a different block" not in honest["checks"]["block"]["reason"]
+
+    stale = _renonced(C.headers[C.height])
+    moved = json.loads(_verify(monkeypatch, tmp_path, C, _server(C, **_reorg(C, named=stale)))[0].output)
+    bv = moved["mark_anchor"]["block_verification"]
+    assert dict(bv["steps"])["blockhash"] == "differs"
+    assert bv["named_blockhash"] == radiant_block_hash(stale)
+    assert moved["mark_anchor"]["blockhash"] == C.hash_at(C.height), "the anchor reports the block proved"
+    assert (
+        f"the endpoint had named a different block, the block proved is {C.hash_at(C.height)}"
+        in (moved["checks"]["block"]["reason"])
+    )
+
+
 def test_a_different_name_with_a_header_that_does_not_link_still_exits_2(monkeypatch, tmp_path) -> None:
     """The pair of the test above: the endpoint names one block, and the header its range serves
     at that height is a THIRD one, not on the checkpoint's chain. The proof fails — linkage — so
