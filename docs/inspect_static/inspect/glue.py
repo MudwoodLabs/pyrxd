@@ -1064,9 +1064,15 @@ def _anchor_answer(anchor, verification=None, verified_by: str | None = None) ->
         # Beside the caveat so a test, and a reader of the JSON drawer, can see the height was
         # bound without parsing a sentence. Always True here: an unbound height is never returned.
         "header_bound": anchor.header_bound,
+        # Shown under the block in EVERY state — drawn, being checked, verified or not — so it
+        # says only what holds in all of them: how deep the page tries to prove, that a count it
+        # proved is labelled as verified, and that any other count is the server's word.
         "no_depth_policy": (
-            "This page sets no confirmation-depth requirement: the count above is the fact, "
-            "and how much burial is enough depends on what this mark is worth to you"
+            "This page sets no confirmation-depth requirement. It tries to prove the depth itself "
+            f"— up to {_PROOF_TARGET_DEPTH} confirmations above pyrxd's newest checkpoint (fewer if "
+            "the server reports fewer), or, for a block at or below a checkpoint, every block up to "
+            "the newest one — and labels a count it proved as verified; any other count is the "
+            "server's word. How much burial is enough depends on what this mark is worth to you"
         ),
     }
 

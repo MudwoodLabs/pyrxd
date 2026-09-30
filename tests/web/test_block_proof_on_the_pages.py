@@ -833,6 +833,12 @@ class TestTheVerifyPageShowsEachState:
         for says in _UNVERIFIED_SAYS:
             assert says not in text, says
         assert "Not verified here" not in text
+        # The depth note under two figures: it names which one the page proved, and how deep it
+        # tries, and never calls the server's figure "the fact".
+        note = _flat(settled["no_depth_policy"])
+        assert note in text
+        assert "the fact" not in text
+        assert f"up to {glue._PROOF_TARGET_DEPTH} confirmations" in note and "the server's word" in note
 
     def test_inclusion_only_is_never_drawn_as_verified(self, glue, classified, monkeypatch) -> None:
         """The merkle branch passed, the height did not verify: the inclusion-only caveat and the
