@@ -22,6 +22,14 @@ How a hash is obtained, per source:
   server is never asked for a hash it could simply state.
 * **node** (``--node-cli``): ``<cli> getblockhash <height>``, the node's own answer.
 
+It also fetches EVERY header of the last checkpoint interval (the two newest checkpoints and every
+header between them) from every source — each server's ``blockchain.block.headers``, and the node's
+``getblockhash`` + ``getblockheader <hash> false`` — requires them to be byte-identical across sources
+and to link hash by hash from one checkpoint to the other, and records the most work any of them
+carries (:data:`LAST_INTERVAL_MAX_WORK`, with its height) and the newest checkpoint header's own work
+(:data:`NEWEST_CHECKPOINT_WORK`). The swap taker gate's negotiation-time check prices a forged
+confirmation from those two numbers before any server is asked (:mod:`pyrxd.gravity.funding_spv`).
+
 The script refuses to write if any source disagrees with any other at any height, if fewer than two
 sources answered, if block 0 is not the genesis hash pyrxd already declares
 (:data:`pyrxd.constants.GENESIS_BLOCK_HASHES`), or if a height is closer than ``--min-depth``
@@ -49,6 +57,14 @@ TARGET = REPO_ROOT / "src" / "pyrxd" / "spv" / "radiant_checkpoints.py"
 NETWORK = "mainnet"
 INTERVAL = 2016
 DEFAULT_MIN_DEPTH = 1000
+#: Radiant mainnet's ``consensus.powLimit`` (``tests/vendor/radiant_core/chainparams.cpp``), the limit
+#: the header work is computed at — the same one the swap taker gate uses (a test pins them equal).
+MAINNET_POW_LIMIT = (1 << 224) - 1
+#: Concurrent ``getblockhash``/``getblockheader`` calls when asking the node for the last interval
+#: (each is one ``--node-cli`` process; over ssh, many more than this are refused by the server).
+_NODE_WORKERS = 6
+#: Attempts per node call when the TRANSPORT fails (ssh exits 255); any other failure is final.
+_NODE_ATTEMPTS = 4
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
@@ -99,6 +115,50 @@ def reconcile(answers: Mapping[str, Mapping[int, str]], heights: Sequence[int], 
     return table
 
 
+def reconcile_interval(
+    answers: Mapping[str, Mapping[int, bytes]], table: Sequence[tuple[int, str]]
+) -> tuple[int, int, int]:
+    """``(max_work, its height, newest checkpoint work)`` over the last checkpoint interval, or raise.
+
+    *answers* maps each source to ``{height: raw 80-byte header}`` for every height from the
+    second-newest checkpoint of *table* to the newest, inclusive. Every source must serve every
+    height, byte-identically; the headers must link hash by hash (each one's previous-block hash is
+    the hash of the one below, hashed here with :func:`pyrxd.hash.radiant_block_hash`) from the
+    second-newest checkpoint's hash to the newest's. Work is ``2**256 // (target + 1)`` at
+    :data:`MAINNET_POW_LIMIT` (:func:`pyrxd.spv.radiant.radiant_header_work`); the height reported is
+    the lowest one carrying the maximum.
+    """
+    from pyrxd.hash import radiant_block_hash
+    from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work
+
+    if len(table) < 2:
+        raise Disagreement("the last checkpoint interval needs two checkpoints")
+    (lo, lo_hash), (hi, hi_hash) = table[-2], table[-1]
+    if not answers:
+        raise Disagreement("no source served the last checkpoint interval")
+    chosen: dict[int, bytes] = {}
+    for h in range(lo, hi + 1):
+        seen = {src: got.get(h) for src, got in answers.items()}
+        for src, hdr in seen.items():
+            if not isinstance(hdr, (bytes, bytearray)) or len(hdr) != 80:
+                raise Disagreement(f"{src} gave no 80-byte header for height {h}")
+        if len({bytes(v) for v in seen.values() if v is not None}) != 1:
+            raise Disagreement(f"sources disagree on the header at height {h}: {', '.join(seen)}")
+        chosen[h] = bytes(next(iter(seen.values())))  # type: ignore[arg-type]
+    below = lo_hash
+    if radiant_block_hash(chosen[lo]) != lo_hash:
+        raise Disagreement(f"the header served at {lo} does not hash to its checkpoint")
+    for h in range(lo + 1, hi + 1):
+        if radiant_header_prev_hash(chosen[h]) != below:
+            raise Disagreement(f"the header at {h} does not link to the one below it")
+        below = radiant_block_hash(chosen[h])
+    if below != hi_hash:
+        raise Disagreement(f"the headers from {lo} do not link to the checkpoint at {hi}")
+    works = {h: radiant_header_work(chosen[h], pow_limit=MAINNET_POW_LIMIT) for h in range(lo, hi + 1)}
+    best = max(works.values())
+    return best, min(h for h, w in works.items() if w == best), works[hi]
+
+
 def render_module(
     table: Sequence[tuple[int, str]],
     *,
@@ -107,6 +167,9 @@ def render_module(
     pinned_at_tip: int,
     min_depth: int,
     generated_utc: str,
+    last_interval_max_work: int,
+    last_interval_max_work_height: int,
+    newest_checkpoint_work: int,
 ) -> str:
     """The text of ``radiant_checkpoints.py``. Pure: the same inputs give the same bytes."""
     server_lines = "\n".join(f"  * ``{u}``" for u in servers)
@@ -135,6 +198,10 @@ def render_module(
         )
         node_comment = "#: Whether a node run by pyrxd's maintainer was one of the agreeing sources."
     entries = "\n".join(f'        ({h}, "{bh}"),' for h, bh in table)
+    interval_lo = table[-2][0] if len(table) >= 2 else table[-1][0]
+    interval_hi = table[-1][0]
+    interval_n = interval_hi - interval_lo + 1
+    interval_who = f"{agreed} and the node" if node_cli else agreed
     source_lines = "\n".join(f'        "{u}",' for u in servers)
     return f'''"""Radiant {NETWORK} block-hash checkpoints: one every {INTERVAL} blocks, from genesis.
 
@@ -151,6 +218,16 @@ on every entry:
 
 Every height is at least {min_depth} blocks below the lowest tip any source reported
 ({pinned_at_tip}), far past Radiant Core's default maximum reorg depth of 69.
+
+THE LAST INTERVAL'S WORK. Every one of the {interval_n} headers from {interval_lo} to {interval_hi} was
+fetched from every source; {interval_who} served them byte for byte
+alike, and the script linked them hash by hash from checkpoint {interval_lo} to checkpoint {interval_hi}.
+:data:`LAST_INTERVAL_MAX_WORK` is the most work any of them carries (at height
+:data:`LAST_INTERVAL_MAX_WORK_HEIGHT`) and
+:data:`NEWEST_CHECKPOINT_WORK` the work of the header at {interval_hi}, each ``2**256 // (target + 1)``
+at mainnet's proof-of-work limit. The checkpoint hashes commit to those headers, so the numbers are
+fixed by the table above; the swap taker gate recomputes the first from the headers it links on
+every run.
 
 WHAT THEY ARE FOR. :mod:`pyrxd.glyph.mark_block` places a block at a height by linking its header,
 hash by hash, to one of these. The height then rests on this table rather than on the server that
@@ -178,6 +255,13 @@ SOURCES: dict[str, tuple[str, ...]] = {{
     )
 }}
 
+#: The most header work in the last checkpoint interval (both checkpoints included), and its height.
+LAST_INTERVAL_MAX_WORK: dict[str, int] = {{"{NETWORK}": {last_interval_max_work}}}
+LAST_INTERVAL_MAX_WORK_HEIGHT: dict[str, int] = {{"{NETWORK}": {last_interval_max_work_height}}}
+
+#: The work of the newest checkpoint's own header.
+NEWEST_CHECKPOINT_WORK: dict[str, int] = {{"{NETWORK}": {newest_checkpoint_work}}}
+
 #: ``network -> ((height, block hash in display hex), ...)``, heights ascending. Networks with no
 #: entries cannot be verified against a checkpoint, and verification there reports NOT VERIFIED.
 CHECKPOINTS: dict[str, tuple[tuple[int, str], ...]] = {{
@@ -202,6 +286,46 @@ async def electrumx_hashes(url: str, heights: Iterable[int]) -> tuple[int, dict[
         for h in heights:
             out[h] = radiant_block_hash(await client.get_block_header(BlockHeight(h)))
     return tip, out
+
+
+async def electrumx_interval(url: str, lo: int, hi: int) -> dict[int, bytes]:
+    """``{height: raw header}`` for *lo*..*hi* inclusive from one ElectrumX server."""
+    from pyrxd.network.electrumx import ElectrumXClient
+    from pyrxd.security.types import BlockHeight
+
+    out: dict[int, bytes] = {}
+    async with ElectrumXClient([url]) as client:
+        h = lo
+        while h <= hi:
+            n = min(2016, hi - h + 1)
+            got = await client.get_block_headers(BlockHeight(h), n)
+            if len(got) != n:
+                raise Disagreement(f"{url} served {len(got)} of {n} headers from {h}")
+            for i, hdr in enumerate(got):
+                out[h + i] = bytes(hdr)
+            h += n
+    return out
+
+
+def node_interval(argv: Sequence[str], lo: int, hi: int, *, run: Callable = subprocess.run) -> dict[int, bytes]:
+    """``{height: raw header}`` for *lo*..*hi* from ``<argv> getblockhash`` + ``getblockheader <hash> false``."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def ask(*args: str) -> str:
+        for attempt in range(_NODE_ATTEMPTS):
+            try:
+                done = run([*argv, *args], capture_output=True, text=True, check=True, timeout=60)  # nosec B603
+                return done.stdout.strip()
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 255 or attempt == _NODE_ATTEMPTS - 1:
+                    raise
+        raise AssertionError("unreachable")
+
+    def one(h: int) -> tuple[int, bytes]:
+        return h, bytes.fromhex(ask("getblockheader", ask("getblockhash", str(h)), "false"))
+
+    with ThreadPoolExecutor(max_workers=_NODE_WORKERS) as pool:
+        return dict(pool.map(one, range(lo, hi + 1)))
 
 
 def node_hashes(argv: Sequence[str], heights: Iterable[int], *, run: Callable = subprocess.run) -> tuple[int, dict]:
@@ -242,6 +366,19 @@ async def _collect(
     return tip, heights, answers
 
 
+def _interval_answers(
+    servers: Sequence[str], node_argv: Sequence[str] | None, table: Sequence[tuple[int, str]]
+) -> dict[str, dict[int, bytes]]:
+    lo, hi = table[-2][0], table[-1][0]
+    answers: dict[str, dict[int, bytes]] = {}
+    for url in servers:
+        answers[url] = asyncio.run(electrumx_interval(url, lo, hi))
+    if node_argv:
+        answers["node"] = node_interval(node_argv, lo, hi)
+    print(f"last interval {lo}..{hi}: {hi - lo + 1} headers from {len(answers)} sources", file=sys.stderr)
+    return answers
+
+
 async def _tip(url: str) -> int:
     from pyrxd.network.electrumx import ElectrumXClient
 
@@ -276,6 +413,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             bad = [h for (h, a), (_, b) in zip(table, committed) if a != b]
             print(f"MISMATCH at heights {bad}", file=sys.stderr)
             return 1
+        from pyrxd.spv import radiant_checkpoints as shipped
+
+        work = reconcile_interval(_interval_answers(servers, node_argv, table), table)
+        recorded = (
+            shipped.LAST_INTERVAL_MAX_WORK[NETWORK],
+            shipped.LAST_INTERVAL_MAX_WORK_HEIGHT[NETWORK],
+            shipped.NEWEST_CHECKPOINT_WORK[NETWORK],
+        )
+        if work != recorded:
+            print(f"MISMATCH in the last interval's work: sources give {work}, the file records {recorded}")
+            return 1
         from pyrxd.network.source_identity import source_key
 
         operators = len({source_key(s) for s in answers})
@@ -287,6 +435,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     tip, heights, answers = asyncio.run(_collect(servers, node_argv, args.min_depth, None))
     table = reconcile(answers, heights, genesis)
+    max_work, max_work_height, cp_work = reconcile_interval(_interval_answers(servers, node_argv, table), table)
     text = render_module(
         table,
         servers=servers,
@@ -294,9 +443,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         pinned_at_tip=tip,
         min_depth=args.min_depth,
         generated_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        last_interval_max_work=max_work,
+        last_interval_max_work_height=max_work_height,
+        newest_checkpoint_work=cp_work,
     )
     TARGET.write_text(text, encoding="utf-8")
-    print(f"wrote {len(table)} checkpoints (0..{table[-1][0]}) to {TARGET}; sources: {', '.join(answers)}")
+    print(
+        f"wrote {len(table)} checkpoints (0..{table[-1][0]}) to {TARGET}; sources: {', '.join(answers)}; "
+        f"last interval max work {max_work} at {max_work_height}, newest checkpoint work {cp_work}"
+    )
     return 0
 
 
