@@ -77,7 +77,7 @@ Two independent facts had to line up:
 
 A small HTTP adapter, `scripts/_glyph_ref_http.py::SshTrHttpRefAdapter`, that implements the same
 `RefAuthenticityIndexer` protocol (one async `resolve_ref`) and resolves the ref over the REST api
-via `ssh tr curl`. It is wired into `scripts/eth_swap_run.py` as the **default** mainnet NFT REF
+via `curl` on the indexer's host, over ssh. It is wired into `scripts/eth_swap_run.py` as the **default** mainnet NFT REF
 gate (used whenever `--rxd-indexer-ws` is omitted); the ElectrumX-ws adapter remains available for
 the regtest path.
 

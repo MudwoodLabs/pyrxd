@@ -17,7 +17,7 @@ parent: docs/plans/2026-05-25-feat-gravity-htlc-concrete-legs-plan.md
 > any PRODUCT claim; this is a capped proof-of-mechanism, not a launch.
 
 ## Environment — VERIFIED 2026-05-26 (not assumed)
-- **Radiant mainnet:** reachable via `ssh tr 'docker exec radiant-mainnet radiant-cli …'`
+- **Radiant mainnet:** reachable via `radiant-cli` on a mainnet node, over ssh
   (chain=main, block ~432607). `scantxoutset` available (covenant-UTXO discovery works);
   `relayfee = 0.10 RXD/kB` (10× regtest — size fees as size_bytes × 0.10/1000, NOT flat;
   ~per memory project_radiant_relay_fee_per_kb).
@@ -97,8 +97,8 @@ binding "the gated txid is the txid of the exact bytes p was scraped from" is th
     the reorg gate (its whole job is reorg-finality). For dust a single source is acceptable ONLY with
     the honest SPOF statement (below) + operator manually corroborating claim depth in an explorer
     before the RXD-claim broadcast. **MUST cross-check before ANY above-dust value.**
-- **RXD chain-IO over `ssh tr`** — the `_RadiantCliClient` shim with the command prefix changed to
-  `ssh tr docker exec radiant-mainnet`. Constraints (architecture): (1) wrap the BLOCKING `ssh`
+- **RXD chain-IO over ssh** — the `_RadiantCliClient` shim with the command prefix changed to
+  run `radiant-cli` on the mainnet node over ssh. Constraints (architecture): (1) wrap the BLOCKING `ssh`
   `subprocess.run` in `asyncio.to_thread` — `RadiantChainIO.broadcast/confirmations` are `async` and
   a sync ssh blocks the event loop; (2) all dynamic args (covenant SPK hex, txids) passed as argv list
   elements, NEVER shell-interpolated — audit the `scantxoutset "raw(<spk>)"` desc path specifically.
@@ -191,6 +191,6 @@ NON-gate reads (funding amount/fee).
   durability (audit-gated track). A standing/automated swap service.
 
 ## Provenance
-Environment facts verified 2026-05-26 (ssh tr live query; mempool.space path per prior sweeps +
+Environment facts verified 2026-05-26 (live node query over ssh; mempool.space path per prior sweeps +
 PHASE4B_LIVE_SWAP_SCOPE.md). Builds on T7 (all legs consensus-proven on regtest, reorg gate
 shipped 0d04c77). Operator has run prior low-value mainnet transactions and accepts dust loss risk.

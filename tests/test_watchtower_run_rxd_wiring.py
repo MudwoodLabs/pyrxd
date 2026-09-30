@@ -124,10 +124,10 @@ async def test_dedup_normalizes_trailing_slash_and_case():
 
 
 async def test_ssh_backend_without_host_or_container_refuses_to_start():
-    """No private-infra defaults: omitting them must fail loudly, not silently `ssh tr`.
+    """No private-infra defaults: omitting them must fail loudly, not silently ssh to a default host.
 
     The old defaults were one operator's own host/container. A public user who passed only
-    --rxd-include-node would have attempted `ssh tr` — handing whoever answers that name in
+    --rxd-include-node would have ssh'd to that host alias — handing whoever answers that name in
     their DNS search domain the txid set of their in-flight swaps.
     """
     with pytest.raises(ValidationError, match="--ssh-host and --ssh-container required"):

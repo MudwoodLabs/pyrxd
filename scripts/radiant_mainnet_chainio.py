@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""OPS SHIM (not the shipped package): a RadiantChainIO client over `ssh tr`.
+"""OPS SHIM (not the shipped package): a RadiantChainIO client running radiant-cli over ssh.
 
 This is the mainnet RXD transport for the dust-mainnet swap runbook. It is
 DELIBERATELY in scripts/, NOT in src/pyrxd: the standing production transport for
-RadiantChainIO should be a real ElectrumX/Fulcrum RPC client. `ssh tr 'docker exec
-radiant-mainnet radiant-cli …'` is the only mainnet RXD access we have right now, so
+RadiantChainIO should be a real ElectrumX/Fulcrum RPC client. `radiant-cli` on a mainnet node,
+over ssh, is the only mainnet RXD access we have right now, so
 this shim exists for the one-shot, operator-supervised dust run — file the Fulcrum
 client as the known interim follow-up.
 

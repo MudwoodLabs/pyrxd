@@ -10,7 +10,7 @@ transaction.
 
     # ... and ALSO from a Radiant Core node you run, which must agree with every server
     PYTHONPATH=src python scripts/refresh_radiant_checkpoints.py --write \\
-        --node-cli "ssh tr docker exec radiant-mainnet radiant-cli"
+        --node-cli "<command that runs radiant-cli against your node>"
 
     # re-check the committed table against the sources, writing nothing
     PYTHONPATH=src python scripts/refresh_radiant_checkpoints.py --check
@@ -394,7 +394,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode.add_argument("--write", action="store_true", help=f"regenerate {TARGET.relative_to(REPO_ROOT)}")
     mode.add_argument("--check", action="store_true", help="re-check the committed table; write nothing")
     ap.add_argument(
-        "--node-cli", help='radiant-cli command prefix, e.g. "ssh tr docker exec radiant-mainnet radiant-cli"'
+        "--node-cli",
+        help='radiant-cli command prefix: "<command that runs radiant-cli against your node>", e.g. "radiant-cli"',
     )
     ap.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH)
     args = ap.parse_args(argv)

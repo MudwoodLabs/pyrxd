@@ -1,4 +1,4 @@
-"""Mainnet Glyph genesis-ref authenticity adapter over the RXinDexer REST api (via ssh tr).
+"""Mainnet Glyph genesis-ref authenticity adapter over the RXinDexer REST api (over ssh).
 
 The proven REF gate (``pyrxd.gravity.radiant_leg.RxinDexerRefAdapter``) resolves a genesis ref via
 the RXinDexer ElectrumX ws method ``glyph.get_token``. The mainnet RXinDexer deployment on ``tr``

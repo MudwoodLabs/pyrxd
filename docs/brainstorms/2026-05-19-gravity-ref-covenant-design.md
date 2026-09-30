@@ -371,7 +371,7 @@ ref** `343c4872…269e69d7e00`. That phantom singleton is in no input →
 phantom is the killer.
 
 Re-confirmed live: `testmempoolaccept` on the recorded
-`.funding_info.json` hex against the mainnet node (`ssh tr`, v2.3.0,
+`.funding_info.json` hex against a mainnet node (v2.3.0,
 block 430721) reproduced the exact reject string.
 
 **Corrections to the DEEPER finding above:**
@@ -736,7 +736,7 @@ replace the on-chain proof.
 
 ## Phase 2 — RADIANT-ONLY COVENANT PROVEN ON-CHAIN (2026-05-20)
 
-Mechanism 1a is validated on the live mainnet node (`ssh tr`). The
+Mechanism 1a is validated on a live mainnet node. The
 covenant-prologue FT (`GravityFtPrologue` compiled + `bd d0 <ref>
 dec0e9aa76e378e4a269e69d` epilogue, 217 B) was exercised end-to-end.
 
