@@ -72,6 +72,12 @@ HTLC against:
 | R2 (scriptSig>=128B) | **WON'T-FIX, documented** | SPV-oracle-swap parser only; that path is retired |
 | forged-payment-in-scriptsig | **WON'T-FIX, documented** | SPV-oracle-swap parser only; same |
 
+The orchestrator for this path, `GravityTrade` (`src/pyrxd/gravity/trade.py`), is
+**ungated**: it never independently checks that the maker's covenant exists on
+chain before the taker pays BTC, trusting only a single server's broadcast
+acknowledgement of the claim tx. It now warns on construction; do not build new
+integrations against it.
+
 ## Consequences for the work
 
 - **No more hardening of the SPV-oracle swap covenant.** R2 and forged-payment
