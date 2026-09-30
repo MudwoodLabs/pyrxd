@@ -18,7 +18,8 @@ WHAT THE KEY IS — distinct operators, as declared, or by registered domain. In
 2. An operator pyrxd SHIPS knowledge of: :data:`pyrxd.network.registry.KNOWN_OPERATORS`, keyed by
    registered domain, recorded from the Radiant maintainer's statement of 2026-09-29.
 3. THIS MACHINE: every loopback spelling — ``localhost``, ``*.localhost``, ``127.0.0.0/8``, ``::1``,
-   ``::ffff:127.x`` — is ONE group, ``localhost``. Two of them are one machine, and whatever they
+   ``::ffff:127.x``, and the unspecified ``0.0.0.0`` / ``::`` (connecting to either reaches this
+   machine) — is ONE group, ``localhost``. Two of them are one machine, and whatever they
    reach (one local node, or tunnels) the URL does not show two operators.
 4. An IP literal: ITSELF, one group per canonical address (every spelling of one address is one).
 5. Any other name: its REGISTERED DOMAIN (eTLD+1) under the Public Suffix List, a sha256-pinned
@@ -323,19 +324,26 @@ _LOOPBACK_KEY = "localhost"
 
 
 def _is_loopback(host: str) -> bool:
-    """Whether canonical *host* is this machine's loopback: ``localhost``, any ``*.localhost``
-    (RFC 6761 §6.3), anything in ``127.0.0.0/8``, or ``::1`` (``::ffff:127.x`` is already folded to
-    its IPv4 form by :func:`canonical_host`)."""
+    """Whether canonical *host* is this machine for COUNTING: ``localhost``, any ``*.localhost``
+    (RFC 6761 §6.3), anything in ``127.0.0.0/8``, ``::1`` (``::ffff:127.x`` is already folded to
+    its IPv4 form by :func:`canonical_host`), or the unspecified ``0.0.0.0`` / ``::`` — a
+    connection to either reaches this machine.
+
+    Broad on purpose, and the opposite of
+    :func:`pyrxd.network.registry._is_loopback_url`, which EXEMPTS an endpoint from a TLS rule and
+    so must stay strict (it rejects ``0.0.0.0``). Here the safe direction is the other one: calling
+    two spellings of this machine one source can only lower a count."""
     if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        return ipaddress.ip_address(host.partition("%")[0]).is_loopback
+        ip = ipaddress.ip_address(host.partition("%")[0])
     except ValueError:
         return False
+    return ip.is_loopback or ip.is_unspecified
 
 
 def _undeclared_key(host: str) -> str:
-    """The key canonical *host* has when nothing declares its operator (rules 2-5 in the module
+    """The key canonical *host* has when nothing declares its operator (rules 2-6 in the module
     docstring, with every loopback spelling folded to one)."""
     if _is_loopback(host):
         return _LOOPBACK_KEY
@@ -472,7 +480,7 @@ def describe_source(key: str) -> str:
     if key.startswith(_OPERATOR_PREFIX):
         return f"operator {key[len(_OPERATOR_PREFIX) :]!r}"
     if key == _LOOPBACK_KEY:
-        return "loopback (this machine: localhost, 127.0.0.0/8, ::1)"
+        return "loopback (this machine: localhost, 127.0.0.0/8, ::1, 0.0.0.0, ::)"
     if _is_ip_literal(key):
         return f"IP address {key!r}"
     if "." in key and registered_domain(key) == key:
@@ -567,8 +575,8 @@ def require_distinct_sources(sources: Sequence[object], *, what: str) -> tuple[S
         if key in first:
             raise ValidationError(
                 f"{what}: sources #{first[key]} and #{index} are the same source ({describe_source(key)}). "
-                "Sources are counted by registered domain, or by an operator pyrxd ships knowledge of, so "
-                "one cannot corroborate itself. Give each operator once: several URLs of one operator form "
+                "Sources are counted by operator (one pyrxd ships knowledge of, else the registered "
+                "domain; every loopback spelling is this machine), so one cannot corroborate itself. Give each operator once: several URLs of one operator form "
                 "one failover source. Use endpoints of different operators; this count takes no operator "
                 "declaration from the config file (declarations reach HashMark form 2 only)."
             )

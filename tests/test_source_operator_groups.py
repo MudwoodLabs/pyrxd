@@ -812,6 +812,8 @@ def test_the_shipped_defaults_are_still_two_operators() -> None:
         "ws://127.1:50022",
         "ws://[::1]:50022",
         "ws://[::ffff:127.0.0.1]:50022",
+        "ws://0.0.0.0:50022",
+        "ws://[::]:50022",
         "localhost:8545",
     ],
 )
@@ -825,9 +827,18 @@ def test_a_non_loopback_address_is_not_folded_into_loopback() -> None:
     assert source_key("ws://localhost.example:1") != source_key("ws://localhost:1")
 
 
-async def test_the_watchtower_does_not_corroborate_one_machine_with_itself(monkeypatch, caplog) -> None:
-    """Through the watchtower's real builder: localhost and 127.0.0.1 are one local node, so the
-    quorum is ONE source and corroboration is OFF."""
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("ws://localhost:50022", "ws://127.0.0.1:50022"),
+        ("ws://127.0.0.1:50022", "ws://0.0.0.0:50022"),
+        ("ws://[::1]:50022", "ws://[::]:50022"),
+    ],
+)
+async def test_the_watchtower_does_not_corroborate_one_machine_with_itself(monkeypatch, caplog, first, second) -> None:
+    """Through the watchtower's real builder: two spellings of this machine are one local node, so
+    the quorum is ONE source and corroboration is OFF. The unspecified addresses are in the set
+    because a connection to ``0.0.0.0`` or ``::`` reaches this machine too."""
     from pyrxd.gravity.watch import run
     from tests.test_one_source_identity import _NoConnectElectrumX
 
@@ -838,9 +849,9 @@ async def test_the_watchtower_does_not_corroborate_one_machine_with_itself(monke
             "--records-dir",
             "/nonexistent",
             "--rxd-electrumx-url",
-            "ws://localhost:50022",
+            first,
             "--rxd-electrumx-url",
-            "ws://127.0.0.1:50022",
+            second,
             "--allow-insecure",
         ]
     )

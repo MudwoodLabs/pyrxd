@@ -283,9 +283,9 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
         if len(group_urls) > 1:
             logger.log(
                 logging.INFO if using_defaults else logging.WARNING,
-                "RXD sources: %d %s are ONE source (%s): %s. Sources are counted by registered domain, "
-                "or by an operator pyrxd ships knowledge of, so they are one failover source, not %d "
-                "sources",
+                "RXD sources: %d %s are ONE source (%s): %s. Sources are counted by operator (one "
+                "pyrxd ships knowledge of, else the registered domain; every loopback spelling is this "
+                "machine), so they are one failover source, not %d sources",
                 len(group_urls),
                 what_urls,
                 describe_source(key),
