@@ -463,7 +463,11 @@ def mark_anchor_dict(anchor, verification=None, *, verified_by: str | None = Non
         "source": _sanitize_display_string(anchor.source),
         "height_is_verified": anchor.height_is_verified,
         # Whether the height was checked against the endpoint's own block header. Carried as a
-        # key so a JSON reader need not parse the caveat to learn it (#754).
+        # key so a JSON reader need not parse the caveat to learn it (#754). A fact about the
+        # ENDPOINT'S REPLY, and it stays one after a verification: the header it was bound to is
+        # the block the endpoint NAMED — `blockhash` here, and still `blockhash` unless a VERIFIED
+        # proof replaces that with the block proved, in which case the named one is kept as
+        # `block_verification.named_blockhash` (see `with_block_verification`).
         "header_bound": anchor.header_bound,
         "blockhash": anchor.blockhash,
         "caveat": anchor.caveat,
@@ -487,6 +491,13 @@ def with_block_verification(shape: Mapping[str, Any], verification: Any, *, veri
     ``source``, the endpoint whose data was checked (*verified_by*); ``None`` when *verification* is.
     When VERIFIED, ``blockhash`` is the hash of the block proved, which is not necessarily the one
     the endpoint named (see :attr:`~pyrxd.glyph.mark_block.BlockVerification.named_blockhash`).
+
+    ``header_bound`` IS NOT REWRITTEN, because it is not about the block proved. It says the
+    endpoint's height was checked against the endpoint's own header, and that header is the block
+    the endpoint NAMED: ``block_verification.named_blockhash`` when that is set (the proof served a
+    different block at that height), otherwise ``blockhash``. So ``header_bound: true`` beside a
+    ``blockhash`` never asserts that the endpoint's single header was that block's unless
+    ``named_blockhash`` is null.
 
     TWO DEPTHS, NAMED APART. ``confirmations`` is always the ENDPOINT'S figure, verified or not.
     ``verified_confirmations`` is the depth the verifier proved (its ``verified_depth``: a lower

@@ -924,3 +924,31 @@ def test_a_proved_depth_can_only_lift_a_shallow_mark_never_sink_a_deep_one_below
     assert "proved only 4 confirmations deep (the endpoint reports 100), below the 6 required" in (
         verdict.degraded_reason
     )
+
+
+@pytest.mark.parametrize("wave_name", [False, True], ids=["own_lookup", "wave_name"])
+@pytest.mark.parametrize("reorganised", [False, True], ids=["honest", "reorganised"])
+def test_header_bound_names_the_block_the_endpoint_named(monkeypatch, tmp_path, wave_name, reorganised) -> None:
+    """WHAT ``header_bound: true`` IS ABOUT, pinned. It says the endpoint's height was checked
+    against the endpoint's own single header (``blockchain.block.header``) — the block it NAMED.
+    After a reorganisation the anchor's ``blockhash`` is the block PROVED, a different one, so the
+    header that binding checked is ``block_verification.named_blockhash``; ``blockhash`` is it only
+    when ``named_blockhash`` is null. Checked against the header the endpoint really served."""
+    _checkpoint(monkeypatch, C, C.tip)
+    single = _renonced(C.headers[C.height]) if reorganised else C.headers[C.height]
+    override = _reorg(C, named=single) if reorganised else {}
+    a = _server(C, **override)
+    if wave_name:
+        r = _run_name(monkeypatch, tmp_path, a, _indexer(C))
+    else:
+        r, _ = _verify(monkeypatch, tmp_path, C, a)
+    assert r.exit_code == 0, r.output
+    anchor = json.loads(r.output)["mark_anchor"]
+    bv = anchor["block_verification"]
+    assert ["blockchain.block.header", [C.height]] in [[m, p] for m, p in a.calls], "the binding read that header"
+    assert anchor["header_bound"] is True and bv["state"] == "VERIFIED"
+    bound_to = bv["named_blockhash"] or anchor["blockhash"]
+    assert bound_to == radiant_block_hash(single)
+    assert anchor["blockhash"] == C.hash_at(C.height)
+    assert (bv["named_blockhash"] is not None) is reorganised
+    assert (anchor["blockhash"] == radiant_block_hash(single)) is not reorganised

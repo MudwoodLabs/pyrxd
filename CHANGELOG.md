@@ -78,8 +78,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     is bound to its header; under `VERIFIED`, the block proved), `verified_confirmations` (the
     depth proved, under `VERIFIED`; otherwise null — `confirmations` stays the endpoint's
     figure) and `block_verification` (every field of the outcome, including `named_blockhash`,
-    plus `source`, the endpoint asked for the proof); `height_is_verified` is true only for a
-    VERIFIED block. With `--wave-name`, `records[i].name_at_mark.anchor` is the same anchor,
+    plus `source`, the endpoint asked for the proof). `header_bound` keeps its meaning — the
+    endpoint's height was checked against the endpoint's own header — and that header is the
+    block the endpoint named: `block_verification.named_blockhash` when it is set (the block
+    proved is a different one, which is then `blockhash`), otherwise `blockhash`.
+    `height_is_verified` is true only for a VERIFIED block. With `--wave-name`, `records[i].name_at_mark.anchor` is the same anchor,
     with the same verification: the block is verified once, in the name lookup, before the name
     judgement reads its depth, so a mark proved at or past the floor is not judged "too shallow"
     for the name on the endpoint's lower figure, and the name's detail says whose depth it used
