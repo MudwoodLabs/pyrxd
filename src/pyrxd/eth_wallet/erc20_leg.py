@@ -139,6 +139,21 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
     def token(self) -> Erc20Token:
         return self._token
 
+    def _immutable_values(self, locator: EthHtlcLocator) -> dict[str, bytes]:
+        """The native four PLUS the token leg's ``token`` and ``amount`` immutables, so the parent's
+        slot-accurate :meth:`_expected_runtime` substitutes a value into EVERY ``immutableReferences``
+        offset of the 6-immutable Erc20Htlc. Leaving either out would make ``_expected_runtime`` fail
+        closed (no negotiated value for that name) — which is the correct fail-closed behaviour, but
+        binding them here is what lets the honest token deploy verify by EXACT equality. ``token`` is
+        the leg's pinned token address (already bound by getter below); ``amount`` is the contract's
+        immutable in the token's base units."""
+        from .htlc_leg import _addr_word
+
+        values = super()._immutable_values(locator)
+        values["token"] = _addr_word(self._token.address)
+        values["amount"] = int(locator.amount_wei).to_bytes(32, "big")
+        return values
+
     async def fund(
         self,
         *,

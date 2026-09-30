@@ -151,13 +151,24 @@ def _rpc_with(**kw) -> EthRpc:
     return r
 
 
+#: The smallest immutable layout the leg's constructor accepts (one 32-byte slot). These tests are
+#: about other things; the layout checks themselves live in test_eth_leg.py.
+_MIN_ART = {
+    "abi": [],
+    "bytecode": "0x00",
+    "runtime_bytecode": "0x" + "00" * 32,
+    "immutableReferences": {"1": [{"start": 0, "length": 32}]},
+    "immutable_names": {"1": "hashlock"},
+}
+
+
 def _leg(rpc) -> EthHtlcContractLeg:
     # Mirrors test_finality_verdict.py::_leg — the audited keyed leg, used as the parity oracle.
     return EthHtlcContractLeg(
         rpc=rpc,
         signing_key=PrivateKeyMaterial.generate(),
         chain_id=11155111,
-        artifact={"abi": [], "bytecode": "0x00", "runtime_bytecode": "0x00"},
+        artifact=_MIN_ART,
     )
 
 

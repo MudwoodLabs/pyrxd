@@ -51,9 +51,32 @@ DELEGATION = b"\xef\x01\x00" + b"\x11" * 20  # exactly 23 bytes — a 7702 EOA
 CONTRACT = b"\x60\x80\x60\x40" * 10  # ordinary bytecode
 
 
+def _spliced_runtime(artifact: dict) -> bytes:
+    """The runtime a correct deploy for these constants carries — the committed artifact with each
+    negotiated immutable substituted into every immutableReferences offset. Serving this (rather
+    than the raw zero-placeholder artifact) lets `verify_funded`'s slot-EXACT runtime compare pass
+    honestly and the test reach the recipient check it is about."""
+    from pyrxd.eth_wallet.htlc_leg import _addr_word
+
+    out = bytearray(bytes.fromhex(artifact["runtime_bytecode"].removeprefix("0x")))
+    vals = {
+        "hashlock": bytes.fromhex(_HASHLOCK[2:]),
+        "claimant": _addr_word(_CLAIMANT),
+        "refundee": _addr_word(_REFUNDEE),
+        "timeout": int(_TIMEOUT).to_bytes(32, "big"),
+        "token": _addr_word(token_for("USDC", 1).address),
+        "amount": int(_AMOUNT).to_bytes(32, "big"),
+    }
+    for ref_id, offsets in artifact.get("immutableReferences", {}).items():
+        name = artifact["immutable_names"][str(ref_id)]
+        for ref in offsets:
+            out[ref["start"] : ref["start"] + 32] = vals[name]
+    return bytes(out)
+
+
 def _rpc(artifact: dict, recipient_code: bytes, *, token_balance: int = _AMOUNT):
     """An RPC that gets `verify_funded` all the way to the recipient check and no further."""
-    runtime = bytes.fromhex(artifact["runtime_bytecode"].removeprefix("0x"))
+    runtime = _spliced_runtime(artifact)
 
     class _Call:
         def __init__(self, v):
