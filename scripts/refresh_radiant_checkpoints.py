@@ -112,10 +112,12 @@ def render_module(
     server_lines = "\n".join(f"  * ``{u}``" for u in servers)
     n = len(servers)
     words = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
-    agreed = "both servers" if n == 2 else f"all {n} servers"
+    agreed = "both servers" if n == 2 else f"all {words.get(n, str(n))} servers"
+    ordinals = {2: "third", 3: "fourth", 4: "fifth", 5: "sixth", 6: "seventh"}
+    node_ordinal = ordinals.get(n, f"{n + 1}th")
     if node_cli:
         node_para = (
-            f"A Radiant Core node run by pyrxd's maintainer was a third, REQUIRED source: on {generated_utc}\n"
+            f"A Radiant Core node run by pyrxd's maintainer was a {node_ordinal}, REQUIRED source: on {generated_utc}\n"
             "the script asked it ``radiant-cli getblockhash <height>`` for every entry (the node's own\n"
             f"answer, read-only; nothing was sent), and it agreed with {agreed} on every one. A\n"
             f"missing or different answer from any of the {words.get(n + 1, str(n + 1))} would have refused the write."
