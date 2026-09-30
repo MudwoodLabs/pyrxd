@@ -189,7 +189,7 @@ async function onCheck() {
     }
   }
   // AFTER the answer is drawn, and never before it: verifying the block costs more round trips
-  // and a few seconds of Python on this thread, and the block the server reported is already on
+  // and, at the end, Python hashing on this thread, and the block the server reported is already on
   // screen with its caveat. `blockProof` is kept so a caller (the render harness) can wait for it.
   blockProof = verifyTheBlock(result, token);
   await blockProof;

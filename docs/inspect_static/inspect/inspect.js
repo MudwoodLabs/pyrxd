@@ -1244,9 +1244,23 @@ function appendAnchor(dl, caveats, anchor, anchorReason) {
   caveats.push(`Depth: ${anchor.confirmations} confirmation(s). ${anchor.no_depth_policy}.`);
 }
 
+// A FILE COMPARISON OUTLIVES A REDRAW OF ITS CARD. `onFetchTxid` draws the card once the block is
+// placed, and again when the block proof lands, seconds later. A reader who chose a file in
+// between had their comparison — finished, or still hashing — dropped with the old card, because
+// the box it writes into was rebuilt empty. So each record's box is built ONCE, keyed by the record
+// (`hm`, the same object in both draws: the redraw changes only `payload.mark_anchor`), and a
+// redraw moves that same box, its chosen file and its answer, into the new card. A different
+// input is a different result, with different records, and gets fresh boxes.
+const FILE_CHECK_BOXES = new WeakMap();
+
 // The file check. Hashed HERE, in this page, with the algorithm the RECORD names.
 function appendFileCheck(panel, hm) {
   if (!hm.digest || !hm.algorithm) return;
+  const kept = FILE_CHECK_BOXES.get(hm);
+  if (kept) {
+    panel.appendChild(kept);
+    return;
+  }
   const box = el("div", { class: "filecheck" });
   box.appendChild(el("h4", { class: "filecheck-title", text: "Do you have the file?" }));
   box.appendChild(el("p", {
@@ -1268,6 +1282,7 @@ function appendFileCheck(panel, hm) {
   out.hidden = true;
   box.appendChild(out);
   input.addEventListener("change", () => onFileChosen(input, out, hm));
+  FILE_CHECK_BOXES.set(hm, box);
   panel.appendChild(box);
 }
 
@@ -2808,7 +2823,7 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   }
 
   // THE BLOCK IS DRAWN FIRST, as the server's word, and verified AFTER — the proof costs more
-  // round trips and a few seconds of Python on this thread, and must never hold the card back.
+  // round trips and, at the end, Python hashing on this thread, and must never hold the card back.
   const verifiable = Boolean(
     pyVerifyMarkBlock && anchor && anchor.resolved && anchor.height !== null && anchor.height !== undefined,
   );
@@ -2829,8 +2844,8 @@ async function onFetchTxid(txid, fetchBtn, statusEl) {
   }
   result.payload.mark_anchor = settled;
   // REDRAWN WHOLE, card and JSON drawer together, so the two cannot describe the block
-  // differently. (A file comparison started in the few seconds before this lands is redrawn
-  // empty; the file can be chosen again.)
+  // differently. A file comparison the reader started meanwhile is carried into the new card,
+  // not redrawn empty: `appendFileCheck` reuses each record's box (`FILE_CHECK_BOXES`).
   renderResult(result);
   statusEl.textContent = "";
 }

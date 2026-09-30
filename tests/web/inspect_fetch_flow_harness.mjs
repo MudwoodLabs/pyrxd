@@ -45,11 +45,16 @@
 //                      while the fetch is still waiting on the server
 //            "interleave_on_request"?: n, — do it when the server receives its n-th request
 //                      (every method counted), instead of during the first fetch
-//            "verify_python"?: path, "checkpoints"?: [[h, hash], …], "proof"?: {…}}
+//            "verify_python"?: path, "checkpoints"?: [[h, hash], …], "proof"?: {…},
 //                      — the block PROOF the page runs after drawing: the REAL
 //                      glue.verify_mark_block as `pyVerifyMarkBlock` (absent: none, as before),
 //                      the mainnet checkpoints that subprocess uses, and the proof requests'
 //                      answers (proof_server.mjs)
+//            "choose_file"?: {"on_request": n, "hex": bytes}}
+//                      — the reader chooses a file in the card's file check when the server
+//                      receives its n-th request: its `change` listener runs, with the REAL
+//                      glue.file_check_plan and glue.judge_file_digest (run by verify_python) and
+//                      Node's real digest. The run waits for that comparison as well as the fetch.
 //   stdout: {"requested": [txid, …],        — every raw-transaction fetch, in order
 //            "glue_calls": [[arg, …], …],   — every call to the classifier bridge, verbatim
 //            "binding_calls": [[arg, …], …], — every call to the binding bridge, verbatim
@@ -57,6 +62,7 @@
 //            "verify_calls": [[arg, …], …],  — every call to the block-proof bridge, verbatim
 //            "server_log": [[method, params], …], — every request the server received, in order
 //            "rendered": "…",               — the result block's text, one node per line
+//            "files_chosen": n,             — how many file-check inputs the choice reached
 //            "status": "…",                 — the fetch-row status text when it finished
 //            "__constants__": {"max_rows_shown": n}}
 
@@ -107,8 +113,27 @@ class StubElement {
   getAttribute(name) {
     return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
   }
-  addEventListener() {}
+  // Listeners are KEPT, so a case can fire one (`choose_file`): the page's own handler then runs.
+  addEventListener(type, cb) {
+    (this.listeners ||= {});
+    (this.listeners[type] ||= []).push(cb);
+  }
+  dispatch(type) {
+    return ((this.listeners && this.listeners[type]) || []).map((cb) => cb({ type, target: this }));
+  }
   focus() {}
+}
+
+// Every element under `node` (itself included) whose class list holds `name`, in document order.
+function byClass(node, name) {
+  const out = [];
+  const walk = (n) => {
+    if (!(n instanceof StubElement)) return;
+    if (String(n.className || "").split(/\s+/).includes(name)) out.push(n);
+    for (const child of n.childNodes) walk(child);
+  };
+  walk(node);
+  return out;
 }
 
 function renderedLines(node) {
@@ -302,6 +327,29 @@ async function main() {
     "pyVerifyMarkBlock = __verify_bridge__;",
     sandbox,
   );
+  // The file check's two bridges, the REAL glue's, only when a case chooses a file.
+  if (spec.choose_file) {
+    sandbox.__file_plan__ = makeGlueSubprocessBridge(spec.verify_python, GLUE_DIR, [], { fn: "file_check_plan" });
+    sandbox.__file_judge__ = makeGlueSubprocessBridge(spec.verify_python, GLUE_DIR, [], { fn: "judge_file_digest" });
+    vm.runInContext("pyFileCheckPlan = __file_plan__; pyJudgeFileDigest = __file_judge__;", sandbox);
+  }
+  // `choose_file`: the reader picks a file in every file check on the card, when the server
+  // receives its n-th request. The handlers' promises are kept, and awaited before the render.
+  const fileChecks = [];
+  let filesChosen = 0;
+  const chooseFile = () => {
+    const bytes = Buffer.from(spec.choose_file.hex, "hex");
+    const file = {
+      name: "chosen.bin",
+      size: bytes.length,
+      arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length),
+    };
+    for (const input of byClass(vm.runInContext("RESULT_BLOCK", sandbox), "filecheck-input")) {
+      input.files = [file];
+      filesChosen += 1;
+      fileChecks.push(...input.dispatch("change"));
+    }
+  };
 
   const fetchBtn = new StubElement("button");
   const status = new StubElement("span");
@@ -327,20 +375,27 @@ async function main() {
     }
   };
   let acted = false;
-  if (spec.interleave && spec.interleave_on_request !== undefined) {
-    hooks.onRequest = (n) => {
-      if (n === spec.interleave_on_request) {
-        acted = true;
-        act();
-      }
-    };
-  }
+  let chose = false;
+  hooks.onRequest = (n) => {
+    if (spec.interleave && spec.interleave_on_request !== undefined && n === spec.interleave_on_request) {
+      acted = true;
+      act();
+    }
+    if (spec.choose_file && n === spec.choose_file.on_request) {
+      chose = true;
+      chooseFile();
+    }
+  };
   const pending = sandbox.onFetchTxid(spec.txid, fetchBtn, status);
   if (spec.interleave && spec.interleave_on_request === undefined) {
     acted = true;
     act();
   }
   await pending;
+  await Promise.all(fileChecks);
+  if (spec.choose_file && !chose) {
+    throw new Error(`the file was never chosen: the server saw ${hooks.count} request(s), not ${spec.choose_file.on_request}`);
+  }
   if (spec.interleave && !acted) {
     // A case that asked to interrupt at a request the page never made proves nothing.
     throw new Error(`the interleave never ran: the server saw ${hooks.count} request(s), not ${spec.interleave_on_request}`);
@@ -358,6 +413,7 @@ async function main() {
     verify_calls: verifyCalls,
     server_log: hooks.log,
     rendered: renderedLines(resultBlock),
+    files_chosen: filesChosen,
     status: status.textContent,
     __constants__: constants,
   }));

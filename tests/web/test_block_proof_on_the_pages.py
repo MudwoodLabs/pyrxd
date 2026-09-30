@@ -1001,6 +1001,18 @@ class TestTheInspectPage:
         assert f"{C.height} — {C.tip - C.height + 1} confirmation(s) deep" in text
         assert "Not verified here: the transaction's merkle branch could not be fetched from" in text
 
+    def test_inspect_keeps_a_file_comparison_across_the_proofs_redraw(self, glue) -> None:
+        """The reviewer's case: a file chosen just after the block is drawn — here as the merkle
+        branch is requested (request 5) — and the proof landing after. The card is redrawn when it
+        lands; the comparison's answer must still be on it, not lost with the old card."""
+        out = _inspect_flow(glue, C, C.tip, choose_file={"on_request": 5, "hex": "00ff" * 8})
+        assert out["server_log"][4][0] == "blockchain.transaction.get_merkle", "the premise"
+        assert out["files_chosen"] == 1, "the premise: the drawn card had one file check"
+        text = _flat(out["rendered"])
+        assert f"{C.height} — VERIFIED" in text, "the premise: the proof landed and the card was redrawn"
+        assert "DOES NOT MATCH" in text, "the file comparison did not survive the redraw"
+        assert "Hashing chosen.bin" not in text, "the comparison never finished on the card shown"
+
     def test_inspect_a_reader_who_moves_on_during_the_proof_gets_no_redraw(self, glue) -> None:
         """The wait `proveMarkBlock` adds to `onFetchTxid`, interrupted: request 5 is the merkle
         branch (1 the transaction, 2-3 depth and tip, 4 the mark's header)."""
