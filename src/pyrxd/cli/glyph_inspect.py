@@ -934,8 +934,9 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
     verified = bool(a.get("height_is_verified")) and bv is not None
     if verified:
         caveat = f"VERIFIED: {caveat}"
-    # The longest claim (the proof-of-work level) wraps to 8 lines at this width; 10 leaves room.
-    for chunk in textwrap.wrap(caveat, width=92)[:10]:
+    # The longest claim (the proof-of-work level, with the sentence saying the endpoint had named a
+    # different block) wraps to 11 lines at this width; 14 leaves room. A cut claim reads as whole.
+    for chunk in textwrap.wrap(caveat, width=92)[:14]:
         lines.append(f"{indent}              {chunk}")
     if bv is not None and not verified and bv.get("reason"):
         why = _sanitize_display_string(f"not verified: {bv.get('reason')}")

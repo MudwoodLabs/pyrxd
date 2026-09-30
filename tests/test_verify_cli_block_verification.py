@@ -128,6 +128,50 @@ def _headers_reply(headers: dict[int, bytes], start: int, count: int) -> dict:
     return {"count": len(out), "hex": b"".join(out).hex(), "max": 2016}
 
 
+def _renonced(header: bytes, byte: int = 76) -> bytes:
+    """The same block with another nonce: the same merkle root (so the same transactions), a
+    different hash — what a reorganisation that re-mines the transaction at the same height leaves."""
+    moved = bytearray(header)
+    moved[byte] ^= 1
+    return bytes(moved)
+
+
+def _reorg(chain: Chain, *, named: bytes, served: bytes | None = None) -> dict[str, Any]:
+    """Overrides for a block at the mark's height that CHANGED between the endpoint's replies.
+
+    The anchor's replies (verbose ``blockhash``, and the single header it binds to) name the block
+    ``named``; the proof's header ranges serve ``served`` at that height (default: the real one,
+    which links to the rest of the chain). Every reply is internally honest for the moment it
+    was given."""
+    ranges = dict(chain.headers)
+    if served is not None:
+        ranges[chain.height] = served
+
+    def verbose_or_raw(params: list) -> Any:
+        txid, verbose = params
+        assert txid == chain.txid
+        if not verbose:
+            return chain.raw.hex()
+        return {
+            "txid": chain.txid,
+            "confirmations": chain.tip - chain.height + 1,
+            "blockhash": radiant_block_hash(named),
+        }
+
+    def one_header(params: list) -> str:
+        if params[0] == chain.height:
+            return named.hex()
+        if params[0] not in chain.headers:
+            raise NetworkError(f"height {params[0]} out of range")
+        return chain.headers[params[0]].hex()
+
+    return {
+        "blockchain.transaction.get": verbose_or_raw,
+        "blockchain.block.header": one_header,
+        "blockchain.block.headers": lambda p: _headers_reply(ranges, *p),
+    }
+
+
 def _checkpoint(monkeypatch, chain: Chain, height: int) -> None:
     """Replace the shipped mainnet table with one checkpoint: the real header at ``height``."""
     monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", ((height, chain.hash_at(height)),))
@@ -214,6 +258,17 @@ def test_the_human_report_prints_the_claim_whole_and_not_the_endpoint_caveat(mon
         assert _flat(BOUND_CAVEAT) not in flat
         assert "not verified:" not in flat
         assert f"(block proof asked of: {LABEL})" in r.output
+
+
+def test_the_longest_claim_is_printed_whole(monkeypatch, tmp_path) -> None:
+    """The proof-of-work claim with the different-name sentence: the longest a claim gets."""
+    _checkpoint(monkeypatch, C, C.start)
+    override = _reorg(C, named=_renonced(C.headers[C.height]))
+    r, _ = _verify(monkeypatch, tmp_path, C, _server(C, **override), json_out=False)
+    assert r.exit_code == 0, r.output
+    claim = json.loads(_verify(monkeypatch, tmp_path, C, _server(C, **override))[0].output)["mark_anchor"]["caveat"]
+    assert "proof-of-work" in claim and "had named a different block" in claim
+    assert _flat(f"VERIFIED: {claim}") in _flat(r.output), "the claim is printed whole, never cut"
 
 
 # ── degrades: CONFIRMED, the endpoint's word, with the reason; the verdict still holds ──────
@@ -364,6 +419,82 @@ def test_the_contradiction_reason_names_what_failed(monkeypatch, tmp_path) -> No
     assert f"the header at {C.height + 3} does not link to the header served at {C.height + 2}" in _flat(r.output)
 
 
+# ── a reorganisation between the anchor's reply and the proof's ────────────────────────────
+
+
+def test_a_block_replaced_between_the_anchor_and_the_proof_is_verified_as_the_block_proved(
+    monkeypatch, tmp_path
+) -> None:
+    """HONEST: the endpoint named block A at the mark's height, then the chain reorganised and
+    the transaction was re-mined at the same height in block B, which the proof's headers carry.
+    B's proof holds — inclusion, linkage to the checkpoint — so this is VERIFIED, exit 0, and
+    what is reported is B, the block proved, never the stale name. It used to exit 2."""
+    _checkpoint(monkeypatch, C, C.tip)
+    stale = _renonced(C.headers[C.height])
+    for json_out in (True, False):
+        r, _ = _verify(monkeypatch, tmp_path, C, _server(C, **_reorg(C, named=stale)), json_out=json_out)
+        assert r.exit_code == 0, r.output
+        if not json_out:
+            flat = _flat(r.output)
+            assert "block: VERIFIED" in flat
+            assert f"had named a different block for the transaction ({radiant_block_hash(stale)})" in flat
+            assert f"the block proved is {C.hash_at(C.height)}" in flat
+            continue
+        out = json.loads(r.output)
+        anchor = out["mark_anchor"]
+        bv = anchor["block_verification"]
+        assert bv["state"] == "VERIFIED", bv["reason"]
+        assert dict(bv["steps"])["blockhash"] == "differs"
+        assert anchor["blockhash"] == bv["blockhash"] == C.hash_at(C.height), "the proven hash, not the stale one"
+        assert bv["named_blockhash"] == radiant_block_hash(stale)
+        assert anchor["height_is_verified"] is True and out["checks"]["block"]["state"] == "VERIFIED"
+
+
+def test_a_different_name_with_a_header_that_does_not_link_still_exits_2(monkeypatch, tmp_path) -> None:
+    """The pair of the test above: the endpoint names one block, and the header its range serves
+    at that height is a THIRD one, not on the checkpoint's chain. The proof fails — linkage — so
+    this is CONTRADICTED and exits 2, as it did before; the different name is in the reason."""
+    _checkpoint(monkeypatch, C, C.tip)
+    override = _reorg(C, named=_renonced(C.headers[C.height], 77), served=_renonced(C.headers[C.height], 76))
+    r, _ = _verify(monkeypatch, tmp_path, C, _server(C, **override))
+    assert r.exit_code == 2, r.output
+    text = _flat(r.output)
+    assert f"the header at {C.height + 1} does not link to the header served at {C.height}" in text
+    assert "also named a different block" in text
+
+
+def test_an_inherited_anchor_from_before_a_reorganisation_is_verified_as_the_block_proved(
+    monkeypatch, tmp_path
+) -> None:
+    """The exposed path: the inherited anchor comes from the endpoint that answered the name
+    lookup, the proof from another. Their views of the block at the mark's height can differ
+    honestly; the proof decides, and the block it proved is the one reported."""
+    _checkpoint(monkeypatch, C, C.tip)
+    stale = _renonced(C.headers[C.height])
+    server = _server(C)
+    other = _server(C, **_reorg(C, named=stale))
+
+    async def _name_at_mark(ctx, *, name, mark_txid, min_confirmations, signer_hash160):
+        async with other:
+            anchor = await resolve_anchor_from(
+                other, "wss://other.invalid/", mark_txid=mark_txid, min_confirmations=min_confirmations
+            )
+        return {"resolved": True, "name": name, "anchor": mark_anchor_dict(anchor), "reason": "test"}
+
+    monkeypatch.setattr(glyph_inspect, "_name_at_mark", _name_at_mark)
+    r = _run(monkeypatch, tmp_path, server, C.txid, "--min-confirmations", "6", "--wave-name", "alice.rxd")
+    out = json.loads(r.output)
+    # Not 2: the block did not stop it. (5 is the stubbed name judgement, NOT ESTABLISHED.)
+    assert r.exit_code != 2 and out["verdict_failed_checks"] == ["name: NOT ESTABLISHED"], r.output
+    anchor = out["mark_anchor"]
+    assert anchor["source"] == "wss://other.invalid/"
+    assert anchor["block_verification"]["state"] == "VERIFIED"
+    assert anchor["blockhash"] == C.hash_at(C.height)
+    assert anchor["block_verification"]["named_blockhash"] == radiant_block_hash(stale)
+    # Form 2's own anchor is untouched: still the other endpoint's word, naming what it named.
+    assert out["records"][0]["name_at_mark"]["anchor"]["blockhash"] == radiant_block_hash(stale)
+
+
 # ── every path: the JSON keys, and the two halves of the human report agree ────────────────
 
 
@@ -371,6 +502,7 @@ def _paths() -> dict[str, tuple[int, dict]]:
     return {
         "verified_checkpoint": (C.tip, {}),
         "verified_work": (C.start, {}),
+        "verified_after_a_reorganisation": (C.tip, _reorg(C, named=_renonced(C.headers[C.height]))),
         "merkle_method_not_found": (C.tip, {"blockchain.transaction.get_merkle": _rpc_error(-32601, "x")}),
         "header_range_times_out": (C.tip, {"blockchain.block.headers": NetworkError("ElectrumX request timed out")}),
         "headers_short": (C.tip, {"blockchain.block.headers": lambda p: _headers_reply(C.headers, p[0], 1)}),
@@ -395,7 +527,7 @@ def test_the_json_carries_the_whole_verification_on_every_path(monkeypatch, tmp_
     anchor = out["mark_anchor"]
     bv = anchor["block_verification"]
     fields = {"state", "claim", "reason", "height", "blockhash", "level", "checkpoint_height", "checkpoint_hash"}
-    fields |= {"linked_headers", "floor_work_log2", "verified_depth", "steps", "source"}
+    fields |= {"linked_headers", "floor_work_log2", "verified_depth", "steps", "source", "named_blockhash"}
     assert fields <= set(bv), fields - set(bv)
     assert "blockhash" in anchor and "height_is_verified" in anchor
     verified = bv["state"] == "VERIFIED"

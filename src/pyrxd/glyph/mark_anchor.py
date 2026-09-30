@@ -416,7 +416,8 @@ def with_block_verification(shape: Mapping[str, Any], verification: Any, *, veri
 
     ``block_verification`` carries the whole outcome (every :class:`BlockVerification` field) plus
     ``source``, the endpoint whose data was checked (*verified_by*); ``None`` when *verification* is.
-    When VERIFIED, ``blockhash`` is the verified header's hash.
+    When VERIFIED, ``blockhash`` is the hash of the block proved, which is not necessarily the one
+    the endpoint named (see :attr:`~pyrxd.glyph.mark_block.BlockVerification.named_blockhash`).
     """
     out = dict(shape)
     if out.get("block_verification") is not None:
@@ -444,7 +445,9 @@ def with_block_verification(shape: Mapping[str, Any], verification: Any, *, veri
     out["height_is_verified"] = verified
     if verified:
         out["caveat"] = verification.claim
-        # The verified header's hash (equal to the endpoint's named block when it named one).
+        # The block PROVED, never the endpoint's name for it: after a reorganisation between the
+        # anchor's reply and the proof's the two differ, and the name is then kept, labelled, as
+        # ``block_verification.named_blockhash``.
         out["blockhash"] = verification.blockhash
     elif dict(verification.steps).get("merkle") == "passed":
         out["caveat"] = INCLUSION_ONLY_CAVEAT

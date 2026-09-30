@@ -60,10 +60,11 @@ becomes a :class:`BlockVerification` with a reason, never an exception. It raise
 caller's programming error: a bad ``min_confirmations`` or a malformed ``checkpoints`` table.
 
 Three states, and why three: ``VERIFIED`` (every check passed); ``CONTRADICTED`` (the data the
-server served is well-formed and fails a check — its own proof disagrees with its claim); ``NOT
-VERIFIED`` (nothing was proved either way: data missing or unreadable, no checkpoint for this
-network, the chain above the checkpoint too long for this pyrxd, or a difficulty below the floor —
-an honest low-difficulty stretch is not a lie). Neither non-VERIFIED state says the mark is
+server served is well-formed and fails a check — its own proof disagrees with its claim; a block
+hash it named that is not the header it served is not, on its own, a failed check: see
+:func:`verify_mark_block`); ``NOT VERIFIED`` (nothing was proved either way: data missing or
+unreadable, no checkpoint for this network, the chain above the checkpoint too long for this
+pyrxd, or a difficulty below the floor — an honest low-difficulty stretch is not a lie). Neither non-VERIFIED state says the mark is
 invalid; both mean the height remains the endpoint's word.
 """
 
@@ -154,8 +155,15 @@ class BlockVerification:
     #: Why it is not VERIFIED; ``None`` when it is.
     reason: str | None
     height: int | None
-    #: The mark's block hash, display hex, once the header at ``height`` has been read.
+    #: The mark's block hash, display hex, once the header at ``height`` has been read: the hash of
+    #: the header SERVED at that height, which is the block proved when the state is VERIFIED.
     blockhash: str | None = None
+    #: The block hash the endpoint had NAMED for the transaction, when it is not ``blockhash`` (the
+    #: ``blockhash`` step is then ``"differs"``); ``None`` when it matched, was not given, or was not
+    #: 64 hex characters. A different name is not a contradiction by itself — a chain
+    #: reorganisation between the endpoint's two replies produces one honestly — so it is reported,
+    #: and the rest of the checks decide the state.
+    named_blockhash: str | None = None
     #: ``"checkpoint"`` (at or below the newest checkpoint) or ``"work"`` (above it).
     level: str | None = None
     checkpoint_height: int | None = None
@@ -168,7 +176,9 @@ class BlockVerification:
     #: as 1 — once the height is established. At the checkpoint level this includes the blocks up
     #: to the newest checkpoint, which the table places on one chain.
     verified_depth: int | None = None
-    #: ``((step, "passed" | "failed" | "not run"), ...)`` in the order they run.
+    #: ``((step, "passed" | "failed" | "not run"), ...)`` in the order they run; the ``blockhash``
+    #: step is ``"passed"``, ``"differs"`` (see ``named_blockhash``) or ``"not run"``, never
+    #: ``"failed"``.
     steps: tuple[tuple[str, str], ...] = ()
 
 
@@ -315,7 +325,12 @@ def verify_mark_block(
     the same block, which pins the tree's depth — it has no default, so no caller can skip it;
     *headers* maps height to raw 80-byte
     header, covering :func:`plan_block_verification`'s ranges; *blockhash*, when given, is the
-    block hash the endpoint named for the transaction (verbose ``blockhash``) and must match.
+    block hash the endpoint named for the transaction (verbose ``blockhash``). When it is not the
+    hash of the header served at *height*, that alone decides nothing: the header served is
+    checked like any other (inclusion, linkage to a checkpoint), and VERIFIED then reports the
+    header served as the block proved, with ``named_blockhash`` and a sentence in the claim saying
+    the endpoint had named another. If that header fails a check, the state is whatever the check
+    says, and the reason notes the different name too.
 
     Never raises on server data — see the module docstring for the states and what each claims.
     """
@@ -344,7 +359,10 @@ def verify_mark_block(
             facts=facts,
         )
     except _Stop as stop:
-        return done(stop.state, stop.reason)
+        reason = stop.reason
+        if steps["blockhash"] == "differs":
+            reason += "; the endpoint had also named a different block for the transaction than the header served"
+        return done(stop.state, reason)
     except Exception as exc:  # the totality net; the property tests assert it never fires
         return done(NOT_VERIFIED, f"{_INTERNAL}: {type(exc).__name__})")
     return done(VERIFIED, claim=claim)
@@ -424,14 +442,21 @@ def _verify(
         raise _Stop(CONTRADICTED, f"merkle inclusion failed: {exc}") from None
     steps["merkle"] = "passed"
 
-    # 2. the endpoint's named block, when it named one.
+    # 2. the endpoint's named block, when it named one. A DIFFERENT name is recorded, not refused:
+    # the name and the header come from different replies, and a reorganisation between them (the
+    # transaction re-mined at the same height in a replacement block) makes them differ with no
+    # one lying. Nothing below trusts the name — the header served is checked on its own, and it
+    # is that header, never the name, that VERIFIED reports — so a stale name cannot make a false
+    # VERIFIED, and refusing on it alone would refuse an honest mark.
     mark_hash = radiant_block_hash(header_h)
     facts["blockhash"] = mark_hash
     if blockhash is not None:
-        if not isinstance(blockhash, str) or blockhash.lower() != mark_hash:
-            steps["blockhash"] = "failed"
-            raise _Stop(CONTRADICTED, f"the header served for block {height} is not the block the endpoint named")
-        steps["blockhash"] = "passed"
+        named = blockhash.lower() if isinstance(blockhash, str) else None
+        if named == mark_hash:
+            steps["blockhash"] = "passed"
+        else:
+            steps["blockhash"] = "differs"
+            facts["named_blockhash"] = named if named is not None and _HEX64.match(named) else None
 
     # 3. linkage to a checkpoint.
     heights = [h for h, _ in table]
@@ -532,5 +557,13 @@ def _verify(
             f"{facts['verified_depth']} header(s) from block {height} up, at that work or more. pyrxd does "
             f"not check that they are Radiant's most-work chain, or that each difficulty is the one "
             f"Radiant's rules require."
+        )
+    if steps["blockhash"] == "differs":
+        named = facts.get("named_blockhash")
+        claim += (
+            f" The endpoint had named a different block for the transaction"
+            f"{f' ({named})' if named else ''}; the block proved is {facts['blockhash']}, the header served "
+            f"for block {height} when the proof was fetched, as a chain reorganisation between the two "
+            f"replies would leave it."
         )
     return claim

@@ -251,9 +251,46 @@ def test_a_merkle_branch_for_another_block_is_contradicted() -> None:
     assert v.state == CONTRADICTED and "for block 460573" in (v.reason or "")
 
 
-def test_a_header_other_than_the_one_the_endpoint_named_is_contradicted() -> None:
-    v = C.run(C.cp(C.top), blockhash=radiant_block_hash(C.headers[460571]))
-    assert v.state == CONTRADICTED and _step(v, "blockhash") == "failed"
+def test_a_block_other_than_the_one_the_endpoint_named_is_verified_as_the_header_served() -> None:
+    """A stale name alone is not a contradiction (a reorganisation between the endpoint's two
+    replies makes one honestly). The header SERVED is checked on its own, and VERIFIED reports it —
+    never the name — with the name recorded and said in the claim."""
+    stale = radiant_block_hash(C.headers[460571])
+    v = C.run(C.cp(C.top), blockhash=stale.upper())
+    assert v.state == VERIFIED, v.reason
+    assert _step(v, "blockhash") == "differs"
+    assert v.blockhash == radiant_block_hash(C.headers[C.height]) != stale
+    assert v.named_blockhash == stale
+    assert f"had named a different block for the transaction ({stale})" in (v.claim or "")
+    assert f"the block proved is {v.blockhash}" in (v.claim or "")
+
+
+def test_a_different_name_that_is_not_a_hash_is_recorded_without_its_value() -> None:
+    v = C.run(C.cp(C.top), blockhash="not a hash")
+    assert v.state == VERIFIED and _step(v, "blockhash") == "differs" and v.named_blockhash is None
+    assert "had named a different block for the transaction;" in (v.claim or "")
+
+
+def test_a_different_name_with_a_header_that_does_not_link_is_still_contradicted() -> None:
+    """The pair of the test above: the header served at the height is not on the checkpoint's
+    chain (same merkle root, another nonce), so linkage fails — CONTRADICTED, as before, with the
+    different name noted in the reason."""
+    moved = bytearray(C.headers[C.height])
+    moved[76] ^= 1
+    headers = {**C.headers, C.height: bytes(moved)}
+    v = C.run(C.cp(C.top), headers=headers, blockhash=radiant_block_hash(C.headers[460571]))
+    assert v.state == CONTRADICTED
+    assert _step(v, "merkle") == "passed" and _step(v, "blockhash") == "differs"
+    assert _step(v, "linkage") == "failed"
+    assert f"the header at {C.height + 1} does not link to the header served at {C.height}" in (v.reason or "")
+    assert "also named a different block" in (v.reason or "")
+
+
+def test_a_different_name_with_the_chain_served_short_is_still_not_verified() -> None:
+    headers = {C.height: C.headers[C.height]}
+    v = C.run(C.cp(C.top), headers=headers, blockhash=radiant_block_hash(C.headers[460571]))
+    assert v.state == NOT_VERIFIED and _step(v, "blockhash") == "differs"
+    assert "also named a different block" in (v.reason or "")
 
 
 @pytest.mark.parametrize(
