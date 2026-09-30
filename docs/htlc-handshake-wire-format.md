@@ -177,7 +177,7 @@ see **HZ-3** for what it binds and why the derivable funding *address* does not 
 ### 4. Asset lock and revalidation
 
 Not a message: the maker funds the covenant on chain and the taker observes it. The taker MUST call
-the equivalent of `post_asset_lock_revalidate` (`swap_coordinator.py:2399-2466`), which recomputes the
+the equivalent of `post_asset_lock_revalidate` (`swap_coordinator.py:2483-2551`), which recomputes the
 expected covenant scriptPubKey from `terms` and compares it byte-for-byte against the observed one
 (`:1462-1475`). Match ⇒ `BOTH_LOCKED`. Mismatch, **or an inability to recompute it**, ⇒
 `PARAMS_MISMATCH` and the taker refunds the counter leg (`:1464-1469` — the unrecomputable case is
@@ -195,10 +195,10 @@ otherwise identical terms produce a **byte-identical** covenant scriptPubKey —
 demonstrate exactly that, and `test_credential_gating_does_not_change_the_covenant_spk` asserts it.
 
 The credential gate is therefore **off-chain policy, enforced by the party that chooses to run
-it** — the credential rule, `_credential_binding_failure` (`swap_coordinator.py:2468-2508`),
+it** — the credential rule, `_credential_binding_failure` (`swap_coordinator.py:2553-2593`),
 resolves the credential, checks it is genuinely consensus-soulbound, and requires its owner to be
 the swap's pinned payout (`taker_dest_hash`). The taker's pre-fund gate, `pre_btc_lock_check`
-(`swap_coordinator.py:1750-1930`), runs it before funding, and the maker's path runs it again
+(`swap_coordinator.py:1759-1944`), runs it before funding, and the maker's path runs it again
 before `BOTH_LOCKED`, the precondition for revealing `p`. (Earlier revisions of this document
 called the gate `pre_btc_lock_gate`; no function has that name.) It is fail-closed when a
 `credential_ref` is present (an unwired resolver, an unresolvable ref, or an owner mismatch all
@@ -395,7 +395,7 @@ refuses on failure (`scripts/btc_swap_two_host.py:562-565`). The shipped default
 `ESTIMATED_DEFAULT_MARGIN_BLOCKS = 36` (`swap_coordinator.py:153`), which is **labelled ESTIMATED
 and is test-only**: a policy constructed with `require_measured=True` refuses to use it
 (`:460-464`). A real-value swap MUST supply a margin measured from real block data
-(`measure_margin_from_btc_block_times`, `:643-743`).
+(`measure_margin_from_btc_block_times`, `:650-750`).
 
 **Two traps.**
 
@@ -426,7 +426,7 @@ separately, in `taker_intro.taker_pkh_hex` and `envelope.maker_pkh_hex`, so each
 the covenant; they are bound only transitively, by recomputing
 `holder_hash(pkh, variant=…, genesis_ref=…)` and comparing it to the dest hash baked into the
 covenant bytecode (`htlc_covenant.py:180`; the same mechanism proves a credential's owner is the
-payout recipient at `swap_coordinator.py:2498-2502`). A pkh that does not reproduce the dest hash
+payout recipient at `swap_coordinator.py:2583-2587`). A pkh that does not reproduce the dest hash
 is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:572-575`).
 Holder-script layouts, from `htlc_covenant.py:168-177`:
 
@@ -478,7 +478,7 @@ The values a second implementation should know about:
 
 | Parameter | Default | Nature | Source |
 |---|---|---|---|
-| `btc_claim_reorg_depth` | 6 blocks | **ESTIMATED**, test-only | `swap_coordinator.py:139, 195-197` |
+| `btc_claim_reorg_depth` | 6 blocks | **ESTIMATED**, test-only | `swap_coordinator.py:146, 195-197` |
 | `rxd_claim_burial` | 6 blocks | **ESTIMATED**, test-only | `:144, 198-200` |
 | **reorg-depth hard floor** | **2 blocks** | **not a knob** — rejected below this | `:150, 253-270` |
 | **ETH finalization window floor** | **768 s** (2 post-Merge epochs) | **not a knob** | `:157, 292-304` |
@@ -487,7 +487,7 @@ The values a second implementation should know about:
 | `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:504` |
 | `maker_stall_safety_window_blocks` (`N`) | 6 | policy | `:893` |
 
-The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1214-1369`), returns
+The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1221-1376`), returns
 `SAFE` / `WAIT` / `SQUEEZED` and **never claims silently off a shallow reveal**. On a value-bearing
 Radiant swap the coordinator additionally refuses to construct unless the burial is *value-scaled*
 — `ceil(value × factor / reorg_cost_per_block)` — or the operator explicitly opts into a flat
@@ -538,12 +538,18 @@ and *unimplemented*: the check lived only in the two operator scripts, so a call
 `SwapCoordinator` directly got `pre_btc_lock_check(...) -> ok=True` and `taker_funds_btc(...) ->
 BTC_LOCKED` having invoked **zero** methods on the Radiant leg. It is now step 5 of the gate:
 
-- **`RadiantCovenantLeg.verify_maker_asset_funded(terms, *, min_confirmations=None)`** re-derives the
-  covenant scriptPubKey from the **taker's own `terms`** (never anything the maker advertises),
-  locates its funded UTXO, binds the **on-chain value to `terms.radiant_amount` exactly**, and
-  requires a confirmation depth. "Funded" alone is not enough — ElectrumX `listunspent` includes
-  mempool outputs, so a maker can fund with a replaceable transaction, wait for the lock, then
-  double-spend the funding away.
+- **`RadiantCovenantLeg.maker_funding_evidence(...)`** re-derives the covenant scriptPubKey from the
+  **taker's own `terms`** (never anything the maker advertises), locates its funded UTXO with
+  `listunspent`, and fetches the funding transaction's raw bytes, its merkle and coinbase branches
+  and block headers. The coordinator then **proves** it with
+  `pyrxd.gravity.funding_spv.verify_maker_funding`: the script and the **value — bound to
+  `terms.radiant_amount` exactly — are read from the transaction's own bytes**, its inclusion is
+  checked against a header linked to a checkpoint pyrxd ships (through proof-of-work-checked headers
+  above the newest one), and the depth must reach
+  `k = max(6, burial, ceil(2 × value ÷ C))` on mainnet, `C` being the photon cost of one forged
+  confirmation. "Funded" alone is not enough — ElectrumX `listunspent` includes mempool outputs, so
+  a maker can fund with a replaceable transaction, wait for the lock, then double-spend the funding
+  away. That the output is still unspent remains the server's word: SPV cannot show a non-spend.
 - **`SwapCoordinator.taker_verify_asset_funding`** is the entry point, run inside
   `pre_btc_lock_check` and **re-run inside `taker_funds_btc`** immediately before the counter-leg
   broadcast — that re-run is what closes the verify→lock TOCTOU. It sits *before* the `SeenStore`
@@ -784,7 +790,7 @@ Notes a second implementation needs:
 - `ASSET_REFUNDED_TAKER_ACTS` is reached by a **maker-only** primitive. The covenant's CSV refund
   pays the *maker* in both directions, so a taker that runs it gifts the asset back and destroys
   its only recourse; the coordinator forbids it for a `TAKER`-role instance
-  (`swap_coordinator.py:3212-3217`). **The taker's stall recovery is `mutual_refund`.**
+  (`swap_coordinator.py:3297-3302`). **The taker's stall recovery is `mutual_refund`.**
 - Durable state MUST be persisted before an awaited broadcast and the post-broadcast write
   shielded from cancellation, or a retry double-funds (`swap_coordinator.py:1179-1192, 1358-1400`).
 

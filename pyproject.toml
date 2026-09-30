@@ -351,6 +351,7 @@ typecheck = """mypy \
   src/pyrxd/gravity/htlc_covenant.py \
   src/pyrxd/network/electrumx.py \
   src/pyrxd/gravity/radiant_leg.py \
+  src/pyrxd/gravity/funding_spv.py \
   src/pyrxd/gravity/swap_state.py \
   src/pyrxd/gravity/watch/decide.py \
   src/pyrxd/gravity/watch/quorum.py \

@@ -233,7 +233,6 @@ _OUT_OF_SCOPE: dict[str, str] = {
     # Radiant Core, at paths not vendored under tests/vendor/radiant_core/.
     # Anchored to MANIFEST.json's tag like every other Radiant-Core citation here
     # (tests/vendor/radiant_core/README.md), but with no local copy to check against.
-    "Radiant-Core/src/chainparams.cpp": "Radiant Core, not vendored",
     "feature_swap.py": "Radiant Core, not vendored",
     "src/index/swapindex.cpp": "Radiant Core, not vendored",
     "src/miner.cpp": "Radiant Core, not vendored",

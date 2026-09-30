@@ -100,6 +100,7 @@ from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests._funding_chain import NodeSpvReads
 
 pytestmark = pytest.mark.integration
 
@@ -302,12 +303,19 @@ def nodes():
 # --------------------------------------------------------------------------- chain-IO shims
 
 
-class _RadiantCliClient:
-    """radiant-cli ElectrumX-like client for RadiantChainIO (scantxoutset + SPK registry)."""
+class _RadiantCliClient(NodeSpvReads):
+    """radiant-cli ElectrumX-like client for RadiantChainIO (scantxoutset + SPK registry).
+
+    Also answers the four reads the taker gate PROVES the maker's funding from (raw tx, merkle
+    and coinbase branches, headers) out of the node itself — see ``tests/_funding_chain.py``.
+    """
 
     def __init__(self, nodes: _Nodes) -> None:
         self._n = nodes
         self._spk_by_hash: dict[bytes, bytes] = {}
+
+    def rpc(self, method: str, *args):
+        return self._n.rxd(method, *args)
 
     def register_spk(self, spk: bytes) -> None:
         self._spk_by_hash[hashlib.sha256(bytes(spk)).digest()[::-1]] = bytes(spk)
@@ -323,16 +331,17 @@ class _RadiantCliClient:
         if spk is None:
             return []
         res = self._n.rxd("scantxoutset", "start", json.dumps([{"desc": f"raw({spk.hex()})"}]))
-        tip = int(self._n.rxd("getblockcount"))
         out = []
         for u in res.get("unspents", []):
-            h = int(u.get("height", 0))
+            # The BLOCK HEIGHT, as the UtxoRecord contract says (0 = unconfirmed). This stored
+            # `tip - height + 1` — a confirmation count — until the taker gate began fetching the
+            # funding's merkle proof AT this height, which a count sends to the wrong block.
             out.append(
                 UtxoRecord(
                     tx_hash=u["txid"],
                     tx_pos=int(u["vout"]),
                     value=round(u["amount"] * 1e8),
-                    height=(tip - h + 1 if h else 0),
+                    height=int(u.get("height", 0)),
                 )
             )
         return out

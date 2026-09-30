@@ -44,6 +44,7 @@ from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import Hex20
+from tests._funding_chain import build_funding_chain
 from tests.test_swap_coordinator import FakeIndexer, FakeSeenStore
 
 pytestmark = pytest.mark.asyncio
@@ -51,7 +52,7 @@ pytestmark = pytest.mark.asyncio
 _BTC_SATS = 100_000
 _RXD_AMOUNT = 100_000
 _BTC_FUNDING_TXID = "ab" * 32
-_COV_FUNDING_TXID = "cd" * 32
+_COV_FUNDING_TXID = "cd" * 32  # the spy leg's made-up outpoint; the chain view serves real txids
 
 _TAKER_PKH = bytes(Hex20(PrivateKey(os.urandom(32)).public_key().hash160()))
 _MAKER_PKH = bytes(Hex20(PrivateKey(os.urandom(32)).public_key().hash160()))
@@ -67,6 +68,10 @@ class _RxdChainView:
     locked anything), a wrong ``value`` (mis-funded covenant), a wrong ``spk`` (funded some
     OTHER script), or a shallow ``confs`` (a replaceable/reorgable funding it can double-spend
     away after the taker's BTC is locked).
+
+    It serves a REAL regtest chain for what it reports (``tests/_funding_chain.py``): the taker gate
+    proves the funding from the raw transaction, its merkle branch and PoW-checked headers linked
+    to regtest's genesis, so an honest view has to be one it can prove.
     """
 
     def __init__(self, *, spk: bytes, value: int = _RXD_AMOUNT, confs: int = 6, funded: bool = True) -> None:
@@ -77,23 +82,50 @@ class _RxdChainView:
         self.utxo_reads = 0
         self.conf_reads = 0
         self.raise_on_read: Exception | None = None
+        self._chains: dict = {}
+
+    def chain(self):
+        key = (self.spk, self.value, max(self.confs, 1))
+        if key not in self._chains:
+            self._chains[key] = build_funding_chain(spk=self.spk, value=self.value, confs=max(self.confs, 1))
+        return self._chains[key]
+
+    def _read(self) -> None:
+        if self.raise_on_read is not None:
+            raise self.raise_on_read
 
     async def get_utxos(self, script_hash):
         self.utxo_reads += 1
-        if self.raise_on_read is not None:
-            raise self.raise_on_read
+        self._read()
         if not self.funded:
             return []
         want = hashlib.sha256(self.spk).digest()[::-1]
         if bytes(script_hash) != want:
             return []  # the taker scanned the agreed SPK; the maker funded a different one
-        return [UtxoRecord(tx_hash=_COV_FUNDING_TXID, tx_pos=0, value=self.value, height=100)]
+        c = self.chain()
+        return [UtxoRecord(tx_hash=c.txid, tx_pos=0, value=self.value, height=c.height if self.confs > 0 else 0)]
 
     async def get_transaction_verbose(self, txid):
         self.conf_reads += 1
-        if self.raise_on_read is not None:
-            raise self.raise_on_read
-        return {"confirmations": self.confs}
+        self._read()
+        return {"txid": txid, "confirmations": self.confs}
+
+    async def get_transaction(self, txid):
+        self._read()
+        return self.chain().raw_tx
+
+    async def get_transaction_merkle_branch(self, txid, height):
+        self._read()
+        return dict(self.chain().merkle)
+
+    async def get_transaction_id_from_pos(self, height, pos):
+        self._read()
+        return dict(self.chain().coinbase_merkle)
+
+    async def get_block_headers(self, start, count):
+        self._read()
+        hdrs = self.chain().headers
+        return [hdrs[h] for h in range(start, start + count) if h in hdrs]
 
     async def broadcast(self, raw_tx: bytes) -> str:  # pragma: no cover - the taker never spends here
         raise AssertionError("the taker must not broadcast a Radiant spend in this phase")

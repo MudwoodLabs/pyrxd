@@ -268,6 +268,7 @@ def env(request, tmp_path_factory):
                 time.sleep(0.25)
         else:  # pragma: no cover
             pytest.fail("anvil fork did not become ready")
+        node.clock = lambda: _now(url)  # one clock for both chains; see _RxdNode.rxd_mine
         # The anvil dev addresses carry EIP-7702 delegation designators on a mainnet fork; they are
         # deliberately left in place, because the token leg's ERC-20 sweep calls the token and never
         # the recipient, so it must work WITH them present (#478).

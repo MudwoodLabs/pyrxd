@@ -15,7 +15,8 @@ the name judgement reads its depth and hands that same anchor, verified, to the 
 outcome falls back to the endpoint's-word wording with the reason; CONTRADICTED exits 2 with its
 reason, as a binding failure does. What form 2 reads from its SECOND endpoint (the mark's height
 again, and every chain step's) is not verified, and neither ``glyph inspect`` nor the ``/verify/``
-and ``/inspect/`` pages call it yet (phase 3).
+and ``/inspect/`` pages call it yet (phase 3). The swap taker gate calls it too, through
+:func:`pyrxd.gravity.funding_spv.verify_maker_funding`, with a larger header cap.
 
 WHAT ``VERIFIED`` CLAIMS, per level. Both levels first require that the transaction's raw bytes
 (more than 64 of them) hash to its txid and that its merkle branch (SHA-256d, like Bitcoin's) leads
@@ -47,10 +48,10 @@ fetched or checked.
   sits above ``C``. (The low-work test in ``tests/test_mark_block_verification.py`` builds exactly
   this forgery: real headers to 460,580, one mined header on top.)
 
-  FOR A CALLER THAT GATES FUNDS on this (the planned swap taker gate, "phase 2b"): a single
-  forged confirmation costs one floor-level header, so the required ``min_confirmations`` MUST
-  scale with the value at risk, and the refusal must say what it required. The default of this
-  module is the mark path's, where a wrong answer misleads but moves nothing.
+  FOR A CALLER THAT GATES FUNDS on this: a single forged confirmation costs one floor-level
+  header, so the required ``min_confirmations`` MUST scale with the value at risk, and the refusal
+  must say what it required. The swap taker gate (:mod:`pyrxd.gravity.funding_spv`) does both.
+  The default of this module is the mark path's, where a wrong answer misleads but moves nothing.
 
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
 nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
@@ -120,7 +121,10 @@ CONTRADICTED = "CONTRADICTED"
 FLOOR_WORK_DIVISOR = 16
 
 #: The most headers linked from a checkpoint in one verification: past it, the answer is "this
-#: pyrxd's checkpoints are too old", not an unbounded walk. Two checkpoint intervals.
+#: pyrxd's checkpoints are too old", not an unbounded walk. Two checkpoint intervals. It is the
+#: DEFAULT of the ``max_headers_from_checkpoint`` parameter, and what the browser pages and
+#: ``pyrxd verify`` use; the swap taker gate (:mod:`pyrxd.gravity.funding_spv`), which runs in the
+#: CLI/SDK rather than under Pyodide, passes a larger cap (maintainer decision 2026-09-30).
 MAX_HEADERS_FROM_CHECKPOINT = 4032
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -222,6 +226,12 @@ def _require_min_confirmations(min_confirmations: Any) -> int:
     return min_confirmations
 
 
+def _require_cap(cap: Any) -> int:
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+        raise ValidationError("max_headers_from_checkpoint must be an int >= 1")
+    return cap
+
+
 def _is_height(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= BlockHeight.MAX
 
@@ -236,7 +246,9 @@ def _chunks(start: int, stop_inclusive: int) -> list[tuple[int, int]]:
     return out
 
 
-def _plan(height: Any, min_confirmations: int, table: tuple[tuple[int, str], ...]) -> BlockFetchPlan:
+def _plan(
+    height: Any, min_confirmations: int, table: tuple[tuple[int, str], ...], cap: int = MAX_HEADERS_FROM_CHECKPOINT
+) -> BlockFetchPlan:
     if not _is_height(height):
         return BlockFetchPlan(None, (), None, f"no usable block height to verify (got {type(height).__name__})")
     if not table:
@@ -248,21 +260,19 @@ def _plan(height: Any, min_confirmations: int, table: tuple[tuple[int, str], ...
         level = "checkpoint"
         idx = bisect.bisect_left([h for h, _ in table], height)
         above_h = table[idx][0]
-        if above_h - height > MAX_HEADERS_FROM_CHECKPOINT:
-            return BlockFetchPlan(
-                height, (), None, f"no checkpoint within {MAX_HEADERS_FROM_CHECKPOINT} blocks above block {height}"
-            )
+        if above_h - height > cap:
+            return BlockFetchPlan(height, (), None, f"no checkpoint within {cap} blocks above block {height}")
         ranges += _chunks(height, above_h)
     else:
         level = "work"
     if top > newest_h:
-        if top - newest_h > MAX_HEADERS_FROM_CHECKPOINT:
+        if top - newest_h > cap:
             return BlockFetchPlan(
                 height,
                 (),
                 None,
                 f"block {top} is {top - newest_h} blocks past this pyrxd's newest checkpoint ({newest_h}); "
-                f"it links at most {MAX_HEADERS_FROM_CHECKPOINT} — needs a newer pyrxd",
+                f"it links at most {cap} — needs a newer pyrxd",
             )
         ranges += _chunks(newest_h, top)
     return BlockFetchPlan(height, tuple(ranges), level, None)
@@ -274,13 +284,20 @@ def plan_block_verification(
     min_confirmations: int,
     network: str = "mainnet",
     checkpoints: Sequence[tuple[int, str]] | None = None,
+    max_headers_from_checkpoint: int = MAX_HEADERS_FROM_CHECKPOINT,
 ) -> BlockFetchPlan:
     """Which headers to fetch to verify the block at *height* — decided here, not by the caller.
 
     Total over *height* (it is the endpoint's claim). ``checkpoints`` defaults to the shipped table
-    for *network*; tests pass their own.
+    for *network*; tests pass their own. ``max_headers_from_checkpoint`` bounds the walk (see
+    :data:`MAX_HEADERS_FROM_CHECKPOINT`, its default).
     """
-    return _plan(height, _require_min_confirmations(min_confirmations), _table(network, checkpoints))
+    return _plan(
+        height,
+        _require_min_confirmations(min_confirmations),
+        _table(network, checkpoints),
+        _require_cap(max_headers_from_checkpoint),
+    )
 
 
 def _header(headers: Mapping[Any, Any], h: int) -> bytes:
@@ -320,6 +337,8 @@ def verify_mark_block(
     blockhash: Any = None,
     network: str = "mainnet",
     checkpoints: Sequence[tuple[int, str]] | None = None,
+    max_headers_from_checkpoint: int = MAX_HEADERS_FROM_CHECKPOINT,
+    pow_limit: int | None = None,
 ) -> BlockVerification:
     """Verify that *txid* is in the block at *height*, anchored to a shipped checkpoint.
 
@@ -336,10 +355,21 @@ def verify_mark_block(
     the endpoint had named another. If that header fails a check, the state is whatever the check
     says, and the reason notes the different name too.
 
+    ``max_headers_from_checkpoint`` bounds the walk (default :data:`MAX_HEADERS_FROM_CHECKPOINT`);
+    ``pow_limit``, when given, is the network's proof-of-work limit, and each header's nBits is then
+    decoded by Radiant Core's rule and refused above it (see
+    :func:`~pyrxd.spv.radiant.radiant_header_target`). Both exist for the swap taker gate; their
+    defaults leave this function exactly as the pages and ``pyrxd verify`` have always run it.
+
     Never raises on server data — see the module docstring for the states and what each claims.
     """
     table = _table(network, checkpoints)
     min_conf = _require_min_confirmations(min_confirmations)
+    cap = _require_cap(max_headers_from_checkpoint)
+    if pow_limit is not None and (
+        not isinstance(pow_limit, int) or isinstance(pow_limit, bool) or not 0 < pow_limit < (1 << 256)
+    ):
+        raise ValidationError("pow_limit must be an int in 1..2**256-1 or None")
     steps = dict.fromkeys(_STEPS, "not run")
     facts: dict[str, Any] = {"height": height if _is_height(height) else None}
 
@@ -361,6 +391,8 @@ def verify_mark_block(
             table=table,
             steps=steps,
             facts=facts,
+            cap=cap,
+            pow_limit=pow_limit,
         )
     except _Stop as stop:
         reason = stop.reason
@@ -385,9 +417,11 @@ def _verify(
     table: tuple[tuple[int, str], ...],
     steps: dict[str, str],
     facts: dict[str, Any],
+    cap: int = MAX_HEADERS_FROM_CHECKPOINT,
+    pow_limit: int | None = None,
 ) -> str:
     """Run every check; return the VERIFIED claim, or raise :class:`_Stop` with the outcome."""
-    plan = _plan(height, min_conf, table)
+    plan = _plan(height, min_conf, table, cap)
     if plan.reason is not None:
         raise _Stop(NOT_VERIFIED, plan.reason)
     facts["level"] = plan.level
@@ -499,8 +533,8 @@ def _verify(
     # 4. above the newest checkpoint: linkage from it, each header's own PoW, and the floor.
     if top > newest_h:
         anchor(newest_h, newest_hash)
-        floor = radiant_header_work(_header(headers, newest_h)) // FLOOR_WORK_DIVISOR
-        facts["floor_work_log2"] = floor.bit_length() - 1
+        floor = radiant_header_work(_header(headers, newest_h), pow_limit=pow_limit) // FLOOR_WORK_DIVISOR
+        facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
         below = newest_hash
         linked.add(newest_h)
         reached = newest_h
@@ -513,12 +547,12 @@ def _verify(
                 steps["linkage"] = "failed"
                 raise _Stop(CONTRADICTED, f"the header at {h} does not link to the header served at {h - 1}")
             try:
-                below = verify_radiant_header_pow(hdr)
+                below = verify_radiant_header_pow(hdr, pow_limit=pow_limit)
             except (SpvVerificationError, ValidationError) as exc:
                 steps["proof_of_work"] = "failed"
                 raise _Stop(CONTRADICTED, f"the header at {h} fails its own proof-of-work: {exc}") from None
             steps["proof_of_work"] = "passed"  # so far: every header up to this one
-            if radiant_header_work(hdr) < floor:
+            if radiant_header_work(hdr, pow_limit=pow_limit) < floor:
                 steps["floor"] = "failed"
                 raise _Stop(
                     NOT_VERIFIED,

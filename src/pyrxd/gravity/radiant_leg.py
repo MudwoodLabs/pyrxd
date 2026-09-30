@@ -55,6 +55,7 @@ from pyrxd.gravity.fee_policy import (
     DeadlineFeePolicy,
     assert_fee_covers,
 )
+from pyrxd.gravity.funding_spv import MakerFundingEvidence
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
     build_htlc_covenant_ft,
@@ -173,13 +174,19 @@ class RadiantChainIO:
     The injected ``client`` must expose ``broadcast(raw)->txid``,
     ``get_transaction_verbose(txid)->dict`` (with ``confirmations``), and
     ``get_utxos(script_hash)->list`` (records with ``tx_hash``/``tx_pos``/``value``).
+
+    ``proof_client``, when given, answers the four reads the swap taker gate PROVES a covenant
+    funding from (:meth:`funding_evidence`); by default ``client`` does. Any server will do for
+    those: the proof rests on the checkpoints pyrxd ships, not on who served it — so a transport
+    that cannot serve them (the operator scripts' node-over-ssh shim) pairs with an ElectrumX client.
     """
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, *, proof_client: Any = None) -> None:
         for m in ("broadcast", "get_transaction_verbose", "get_utxos"):
             if not hasattr(client, m):
                 raise ValidationError(f"RadiantChainIO client must provide {m}()")
         self._client = client
+        self._proof_client = client if proof_client is None else proof_client
 
     async def broadcast(self, raw_tx: bytes) -> str:
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
@@ -303,6 +310,68 @@ class RadiantChainIO:
             )
         u = utxos[0]
         return f"{u.tx_hash}:{u.tx_pos}", PhotonValue(int(u.value)), ChainHeight(int(u.height))
+
+    async def funding_evidence(
+        self, outpoint: str, height: int, *, header_ranges: tuple[tuple[int, int], ...]
+    ) -> MakerFundingEvidence:
+        """Fetch what the swap taker gate needs to PROVE a covenant funding: nothing here is judged.
+
+        The funding transaction's raw bytes, its merkle branch in block *height*, that block's
+        coinbase branch (which pins the tree's depth), the header ranges the coordinator planned
+        (:func:`pyrxd.gravity.funding_spv.funding_header_ranges`), and the server's verbose
+        ``confirmations``. :func:`pyrxd.gravity.funding_spv.verify_maker_funding` decides what they
+        prove; a reply this cannot fetch raises ``NetworkError``, and the gate refuses on it.
+
+        Header ranges are fetched in ascending order and fetching stops at the first SHORT reply: a
+        server answers fewer headers past its tip, so everything above that is beyond its chain.
+        """
+        client = self._proof_client
+        needed = (
+            "get_transaction",
+            "get_transaction_merkle_branch",
+            "get_transaction_id_from_pos",
+            "get_block_headers",
+        )
+        missing = [m for m in needed if not callable(getattr(client, m, None))]
+        if missing:
+            raise NetworkError(
+                f"this Radiant client cannot serve the proof of the maker's funding (it has no {', '.join(missing)}); "
+                "the taker gate refuses without it — use an ElectrumX client"
+            )
+        txid, _sep, vout_s = str(outpoint).partition(":")
+        if not _sep or not vout_s.isdigit():
+            raise ValidationError(f"bad covenant outpoint {outpoint!r}")
+        try:
+            raw = bytes(await client.get_transaction(txid))
+            merkle = await client.get_transaction_merkle_branch(txid, height)
+            coinbase = await client.get_transaction_id_from_pos(height, 0)
+            headers: dict[int, bytes] = {}
+            for start, count in sorted(header_ranges):
+                got = list(await client.get_block_headers(start, count))
+                for i, header in enumerate(got):
+                    headers.setdefault(start + i, bytes(header))
+                if len(got) < count:
+                    break
+        except NetworkError:
+            raise
+        except Exception as exc:
+            raise NetworkError(
+                f"could not fetch the proof of the maker's funding: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            reported: int | None = int(await self.confirmations(txid))
+        except Exception:
+            reported = None  # only ever RAISES the elapsed bound; the proof does not depend on it
+        return MakerFundingEvidence(
+            txid=txid.lower(),
+            vout=int(vout_s),
+            height=int(height),
+            raw_tx=raw,
+            merkle=merkle,
+            coinbase_merkle=coinbase,
+            headers=headers,
+            reported_confirmations=reported,
+        )
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to
@@ -656,6 +725,48 @@ class RadiantCovenantLeg:
                 "counter leg is locked. Wait for it to bury, then retry."
             )
         return outpoint, int(value), confs
+
+    async def maker_funding_evidence(
+        self,
+        terms: NegotiatedTerms,
+        *,
+        header_ranges: Any,
+        min_confirmations: int | None = None,
+    ) -> MakerFundingEvidence:
+        """TAKER-side: fetch the evidence the coordinator PROVES the maker's covenant funding from.
+
+        The swap taker gate (``SwapCoordinator.taker_verify_asset_funding``) calls this and runs
+        :func:`pyrxd.gravity.funding_spv.verify_maker_funding` on what it returns; nothing is
+        judged here. The covenant scriptPubKey is re-derived from the taker's own ``terms``, and
+        its ``listunspent`` entry is used only to LOCATE the outpoint and the height the server
+        names for it — the script and value the coordinator accepts are read from the funding
+        transaction's own raw bytes, and the height is proved or refused. The same read is what
+        still stands behind "the output is unspent", which SPV cannot show.
+
+        *header_ranges* is a callable ``height -> ((start, count), ...)``: the coordinator decides
+        what to fetch once the height is known. *min_confirmations*, when given, is the depth the
+        coordinator already knows it will require; a server that itself reports less is refused
+        here before thousands of headers are fetched. That refusal is the only use of the reported
+        depth on this path: a server over-reporting it gains nothing, because the proof decides.
+        """
+        cov = self._build_covenant(terms)
+        outpoint, _listed_value, height = await self.chain_io.find_covenant_utxo(
+            cov.funded_spk, expected_value=terms.radiant_amount
+        )
+        if int(height) <= 0:
+            raise NetworkError(
+                f"the maker's covenant funding {outpoint} is not yet mined (the server lists it unconfirmed); "
+                "wait for it to confirm, then retry"
+            )
+        if min_confirmations is not None:
+            reported = await self.chain_io.confirmations(outpoint.split(":")[0])
+            if reported < int(min_confirmations):
+                raise NetworkError(
+                    f"the maker's Radiant covenant funding {outpoint} has {reported} confirmation(s) by the server's "
+                    f"own count, below the {int(min_confirmations)} this swap requires before it is even proved. "
+                    "Wait for it to bury, then retry."
+                )
+        return await self.chain_io.funding_evidence(outpoint, int(height), header_ranges=header_ranges(int(height)))
 
     # -- spends -------------------------------------------------------------
     async def _resolve_covenant(self, record: SwapRecord) -> tuple[HtlcCovenant, str, int, int]:

@@ -67,6 +67,13 @@ from .eth_rxd_timelock import (
     assert_eth_deadline_is_claimable,
 )
 from .finality import CounterClaimFinality, CounterClaimState
+from .funding_spv import (
+    MIN_FUNDING_CONFIRMATIONS,
+    VerifiedMakerFunding,
+    funding_header_ranges,
+    radiant_chain_for_leg,
+    verify_maker_funding,
+)
 from .ref_authenticity import verify_ref_authenticity
 from .swap_state import (
     NegotiatedTerms,
@@ -1718,6 +1725,8 @@ class SwapCoordinator:
         # Optional credential-gating resolver (duck-typed CredentialResolver). Required
         # only when a swap sets terms.credential_ref; its absence then fails closed.
         self._credential_resolver = credential_resolver
+        #: What the taker gate last PROVED about the maker's funding (k, C, depths), or None.
+        self.last_maker_funding: VerifiedMakerFunding | None = None
 
     @property
     def btc_leg(self):
@@ -1869,8 +1878,13 @@ class SwapCoordinator:
         # 5. The MAKER'S ASSET IS REALLY LOCKED (HZ-1). Everything above is a re-derivation of what
         #    the swap SHOULD look like; only this reads the Radiant chain. See
         #    :meth:`taker_verify_asset_funding`.
+        #
+        #    `cov_confs` is the funding's elapsed depth as an UPPER bound (see
+        #    `taker_verify_asset_funding`), because steps 6 and 7 subtract it from t_rxd: SPV proves
+        #    only a LOWER bound, and an under-count is the direction that makes the CSV window look
+        #    longer than it is.
         try:
-            _cov_outpoint, _cov_value, cov_confs = await self.taker_verify_asset_funding(terms)
+            _cov_outpoint, _cov_value, cov_confs = await self.taker_verify_asset_funding(terms, now_unix_s=now_unix_s)
         except (ValidationError, NetworkError) as exc:
             return PreBtcLockGate(ok=False, reason=f"maker's Radiant covenant not verified; fail-closed ({exc})")
         except Exception as exc:
@@ -1991,37 +2005,108 @@ class SwapCoordinator:
             return PreBtcLockGate(ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})")
         return None
 
-    async def taker_verify_asset_funding(self, terms: NegotiatedTerms) -> tuple[str, int, int]:
-        """Fail-closed: the MAKER's asset must be locked on chain before the taker locks anything.
+    def _funding_value_at_stake_photons(self, terms: NegotiatedTerms) -> int | None:
+        """The swap's value in photons, for the taker gate's ``k`` — the coordinator's own assessment.
 
-        Returns the verified ``(outpoint, value_photons, confirmations)``; RAISES on anything else.
-
-        HZ-1 in ``docs/htlc-handshake-wire-format.md`` states this as a normative MUST, and until
-        now no library code enforced it — the check existed only inside
-        ``scripts/btc_swap_two_host.py``, so any caller driving :class:`SwapCoordinator` directly
-        locked its counter leg against nothing. The maker holds both ``p`` and the counter-leg
-        claim key from the moment the envelope is published, and the BTC claim leaf carries no
-        precondition that the asset was ever locked, so a maker that locks NOTHING sweeps the
-        taker's HTLC as soon as it appears: a one-sided taker loss of the full ``btc_sats``.
-
-        The Radiant leg re-derives the covenant scriptPubKey from the taker's OWN ``terms`` and
-        reads the chain for it (value bound exactly, depth pinned by :meth:`_asset_funding_depth`).
-        A leg that cannot perform that read cannot be verified AT ALL, so its absence refuses —
-        mirroring :meth:`_counter_verify_callable` on the maker side.
-
-        Called from :meth:`pre_btc_lock_check` AND re-run inside :meth:`taker_funds_btc`
-        immediately before the counter-leg broadcast: re-running is what closes the verify->lock
-        TOCTOU, where a maker double-spends its covenant funding away in the window between the
-        taker's check and the taker's lock.
+        The largest of what the policy and the terms already say it is worth: the operator's
+        ``value_at_risk_photons``; for an ``rxd`` swap, ``radiant_amount`` (its photons ARE the
+        asset, so it is a floor); and for a stablecoin counter leg, the photons its declared value
+        implies at the measured price (:func:`_stablecoin_value_floor_photons`). ``ft``/``nft`` have
+        no in-protocol value, so they carry the operator's figure or nothing — and nothing refuses
+        on a value-bearing network (:func:`pyrxd.gravity.funding_spv.required_funding_confirmations`).
         """
-        verify = getattr(self.radiant_leg, "verify_maker_asset_funded", None)
-        if not callable(verify):
+        mp = self.config.margin_policy
+        candidates: list[int] = []
+        if mp.value_at_risk_photons is not None:
+            candidates.append(int(mp.value_at_risk_photons))
+        if terms.asset_variant == "rxd":
+            candidates.append(int(terms.radiant_amount))
+        implied = _stablecoin_value_floor_photons(terms, mp, self.counter_leg)
+        if implied is not None:
+            candidates.append(int(implied))
+        return max(candidates) if candidates else None
+
+    async def taker_verify_asset_funding(
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None = None
+    ) -> tuple[str, int, int]:
+        """Fail-closed: the MAKER's asset must be PROVED locked on chain before the taker locks anything.
+
+        Returns ``(outpoint, value_photons, elapsed_blocks_upper)``; RAISES on anything else. The
+        third value is an UPPER bound on the blocks mined since the funding (for the timelock gates
+        that subtract it from ``t_rxd``); the full record of what was proved — ``k``, ``C``, the
+        proved depth — is left on :attr:`last_maker_funding`.
+
+        THE FUNNEL. Every path that locks the taker's counter leg crosses this method before
+        ``counter_leg.fund`` runs: :meth:`pre_btc_lock_check` step 5, and the re-run inside
+        :meth:`taker_funds_btc` immediately before the broadcast (which closes the verify->lock
+        TOCTOU: a maker double-spending its covenant funding away between check and lock), on the
+        BTC and the ETH/ERC-20 branch alike; :meth:`resume_interrupted_fund` completes a crashed
+        fund through :meth:`taker_funds_btc`, so it crosses both. ``tests/test_taker_funding_spv_gate.py``
+        derives the set of ``fund`` call sites from this module and checks each is preceded by it.
+
+        WHY. HZ-1 in ``docs/htlc-handshake-wire-format.md`` states it as a normative MUST: the maker
+        holds ``p`` and the counter-leg claim key from the moment the envelope is published, and
+        the BTC claim leaf carries no precondition that the asset was ever locked, so a taker that
+        locks against a covenant that does not exist loses the whole counter leg. Until this gate,
+        "exists" meant one ElectrumX server's ``listunspent`` said so — and a server that invented
+        the covenant made this coordinator lock.
+
+        WHAT IT DOES NOW. The Radiant leg fetches EVIDENCE (``maker_funding_evidence``: the raw
+        funding tx, its merkle and coinbase branches, and the header ranges
+        :func:`~pyrxd.gravity.funding_spv.funding_header_ranges` plans), and this method PROVES it
+        with :func:`~pyrxd.gravity.funding_spv.verify_maker_funding`: the covenant scriptPubKey —
+        re-derived here from the taker's OWN terms via the leg — and the value are read from the
+        funding transaction's raw bytes, inclusion is proved against a header linked to a shipped
+        checkpoint, and the depth must reach ``k = max(6, burial, ceil(2 × value ÷ C))`` (the
+        maintainer's rule; ``C`` is the photon cost of one forged confirmation, from Radiant's own
+        subsidy schedule and the proved headers). On regtest the same proof runs against the
+        network's genesis, with no value term. A leg that cannot supply evidence refuses — there is
+        no path that proceeds on the server's word.
+
+        What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show
+        a non-spend), and the elapsed-depth bound's residual described in
+        :mod:`pyrxd.gravity.funding_spv`.
+        """
+        fetch = getattr(self.radiant_leg, "maker_funding_evidence", None)
+        if not callable(fetch):
             raise ValidationError(
-                "radiant_leg does not implement verify_maker_asset_funded, so the maker's asset lock "
-                "cannot be confirmed on chain; fail-closed (refuse to fund the counter leg). Wire a "
+                "radiant_leg does not implement maker_funding_evidence, so the maker's asset lock cannot "
+                "be PROVED on chain; fail-closed (refuse to fund the counter leg). Wire a "
                 "RadiantCovenantLeg, or a leg exposing that read."
             )
-        return await verify(terms, min_confirmations=self._asset_funding_depth())
+        chain = radiant_chain_for_leg(self.radiant_leg)
+        mp = self.config.margin_policy
+        expected_spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms))
+        value_at_stake = self._funding_value_at_stake_photons(terms)
+        depth = self._asset_funding_depth()
+        if depth is None:
+            depth = int(getattr(self.radiant_leg, "min_confirmations", 1))
+        # The swap's existing reorg burial. On a value-bearing network that is the configured depth
+        # raised by the VALUE-SCALED burial — a reorg that removes the maker's funding after the
+        # taker locks is the same economic attack as one that removes the taker's claim, so it is
+        # priced the same way. A test network has no value to scale by, so its configured depth
+        # stands, exactly as before this gate.
+        burial = max(depth, _value_scaled_burial_blocks(mp, value_at_stake)) if chain.value_bearing else depth
+        # The depth known BEFORE the headers are read (the value term needs them): lets the leg
+        # refuse a funding its own server calls shallower without fetching thousands of headers.
+        known_floor = max(burial, MIN_FUNDING_CONFIRMATIONS) if chain.value_bearing else max(burial, 1)
+        evidence = await fetch(
+            terms,
+            header_ranges=functools.partial(funding_header_ranges, chain),
+            min_confirmations=known_floor,
+        )
+        result = verify_maker_funding(
+            evidence,
+            chain=chain,
+            expected_spk=expected_spk,
+            expected_value=int(terms.radiant_amount),
+            value_at_stake_photons=value_at_stake,
+            burial_blocks=burial,
+            now_unix_s=now_unix_s,
+            withheld_block_interval_s=_dividing_interval_s(mp),
+        )
+        self.last_maker_funding = result
+        return result.outpoint, result.value_photons, result.elapsed_blocks_upper
 
     def _assert_eth_timelock_ordering(
         self, terms: NegotiatedTerms, *, now_unix_s: int | None, elapsed_blocks: int = 0
@@ -2136,7 +2221,7 @@ class SwapCoordinator:
         # after the H reserve, so the reserve keeps its "last step before the only broadcast"
         # property (TOCTOU-1) and a refusal does not burn H for nothing. Fail-closed: this raises
         # and nothing is broadcast.
-        await self.taker_verify_asset_funding(terms)
+        await self.taker_verify_asset_funding(terms, now_unix_s=now_unix_s)
 
         # Reserve H ATOMICALLY and PRE-broadcast (TOCTOU-1 fix). The check-and-mark
         # is one indivisible step strictly before the only on-chain effect below, so

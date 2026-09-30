@@ -44,7 +44,7 @@ from _dust_swap_shared import (
     wait_for_covenant_funding,
 )
 from eth_swap_run import _build_terms_and_covenant, _eth_leg
-from radiant_mainnet_chainio import SshTrRadiantClient
+from radiant_mainnet_chainio import SshTrRadiantClient, mainnet_proof_client
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
@@ -138,7 +138,7 @@ async def run(args) -> None:
         network=rxd_network,
         taker_pkh=rkeys[2],
         maker_pkh=rkeys[3],
-        chain_io=RadiantChainIO(rxd_client),
+        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
         fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
         min_confirmations=1,
         audit_cleared=True,

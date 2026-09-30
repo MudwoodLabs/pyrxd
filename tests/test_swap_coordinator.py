@@ -206,6 +206,26 @@ class FakeRadiantLeg:
         confs = self.report_confs if self.report_confs is not None else max(int(min_confirmations or 1), 1)
         return ("ef" * 32 + ":0", terms.radiant_amount, int(confs))
 
+    async def maker_funding_evidence(self, terms: NegotiatedTerms, *, header_ranges, min_confirmations=None):
+        """The taker gate's read: a REAL regtest chain proving the covenant funding (see
+        ``tests/_funding_chain.py``), ``report_confs`` deep or exactly the depth asked for. The
+        coordinator proves it with the production verifier — nothing here is taken on trust."""
+        from tests._funding_chain import build_funding_chain
+
+        self.calls.append("maker_funding_evidence")
+        self.verify_min_confirmations.append(min_confirmations)
+        if not self.asset_funded:
+            raise NetworkError("no UTXO found for the covenant scriptPubKey (not yet funded / wrong SPK)")
+        confs = self.report_confs if self.report_confs is not None else max(int(min_confirmations or 1), 1)
+        spk = await self.expected_covenant_scriptpubkey(terms)
+        key = (spk, int(terms.radiant_amount), int(confs))
+        chain = self._chains.get(key) if hasattr(self, "_chains") else None
+        if chain is None:
+            chain = build_funding_chain(spk=spk, value=int(terms.radiant_amount), confs=int(confs))
+            self._chains = {**getattr(self, "_chains", {}), key: chain}
+        header_ranges(chain.height)  # the coordinator's plan must accept the height it is handed
+        return chain.evidence(reported_confirmations=int(confs))
+
     async def expected_covenant_scriptpubkey(self, terms: NegotiatedTerms) -> bytes:
         # Deterministic stand-in for the fused covenant SPK.
         body = (

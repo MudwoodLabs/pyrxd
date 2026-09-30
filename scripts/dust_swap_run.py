@@ -78,7 +78,7 @@ from _dust_swap_shared import (
     validated_resume_deadline_s,
     wait_for_covenant_funding,
 )
-from radiant_mainnet_chainio import SshTrRadiantClient
+from radiant_mainnet_chainio import SshTrRadiantClient, mainnet_proof_client
 
 # Per-stage endpoints. signet uses the "tb" HRP + the mempool.space signet API.
 _STAGES = {
@@ -303,7 +303,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         network=rxd_network,
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
-        chain_io=RadiantChainIO(rxd_client),
+        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
         fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
         min_confirmations=1,
         audit_cleared=audit_cleared,
@@ -347,7 +347,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
 
         # 2. Taker funds the BTC HTLC, then re-validates the covenant pinned to finality.
         confirm(f"taker_funds_btc: broadcast the {btc_network} P2TR HTLC funding tx", auto_yes=args.yes)
-        rec = await coord.taker_funds_btc(terms)
+        rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
         report.step(
             name="taker_funds_btc",
             chain="btc",

@@ -88,6 +88,11 @@ FILES = {
     # the sets but not the ordering: sorting refs the wrong way made dMint signing
     # fail ~50% of the time, and nothing vendored could adjudicate the rule.
     "uint256.h": "src/uint256.h",
+    # Per-network consensus parameters: nSubsidyHalvingInterval (which GetBlockSubsidy in
+    # validation.cpp divides by), powLimit, and each network's genesis hash. The swap taker
+    # gate (pyrxd.gravity.funding_spv) prices a forged confirmation from the block subsidy and
+    # links regtest headers to regtest's genesis, so both need the chain's own numbers.
+    "chainparams.cpp": "src/chainparams.cpp",
 }
 
 

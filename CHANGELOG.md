@@ -46,6 +46,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`verify_mark_block` and `plan_block_verification` take `max_headers_from_checkpoint`
+  (default 4,032, unchanged) and `verify_mark_block` takes `pow_limit`** (default `None`,
+  unchanged); `radiant_header_target`, `radiant_header_work` and `verify_radiant_header_pow` take
+  `pow_limit` too. With a limit, nBits is decoded by Radiant Core's own compact rule and refused
+  above it, which regtest's `0x207fffff` needs. The pages and `pyrxd verify` pass neither.
+- **A Radiant leg must now serve `maker_funding_evidence`** for the taker gate (see Security);
+  `RadiantCovenantLeg` does, through `RadiantChainIO.funding_evidence`, which needs a client with
+  `get_transaction`, `get_transaction_merkle_branch`, `get_transaction_id_from_pos` and
+  `get_block_headers`. `RadiantChainIO(client, proof_client=...)` fetches those from a second
+  client; the node-over-ssh operator scripts pass pyrxd's shipped mainnet ElectrumX endpoints
+  (`scripts/radiant_mainnet_chainio.py:mainnet_proof_client`). The third value
+  `taker_verify_asset_funding` returns is now that elapsed-depth upper bound; what was proved is on
+  `SwapCoordinator.last_maker_funding`.
 - **`pyrxd verify` now verifies the mark's block, on by default.** It fetches the transaction's
   merkle branch, the block's coinbase branch and the header ranges `verify_mark_block` asks for,
   from one configured endpoint, and checks them with the raw transaction it already fetched.
@@ -159,6 +172,43 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/how-to/build-a-cross-chain-swap.md` and `docs/red-team-checklist.md` said a value-bearing
   network needed an opt-in to construct. None does. The gate stays a no-op.
 ### Security
+
+- **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
+  exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
+  from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no
+  header: a server that invented the covenant got the real coordinator to lock the taker's BTC
+  against an output on no chain. It now PROVES the funding (`pyrxd.gravity.funding_spv`), on every
+  path that calls a counter leg's `fund` — `pre_btc_lock_check` step 5 and the re-run inside
+  `taker_funds_btc`, on the BTC and the ETH/ERC-20 branch, and `resume_interrupted_fund` through
+  `taker_funds_btc`. Anything short of a verified inclusion at the required depth refuses the lock.
+  What is now enforced:
+  - the covenant script and value are read from the funding transaction's own raw bytes, which
+    must hash to its txid — no longer from `listunspent`;
+  - the transaction's merkle branch must lead to the header served for its height, at the depth
+    the block's coinbase branch pins, and that header must link hash by hash to a checkpoint pyrxd
+    ships, through headers that each meet their own proof-of-work target and 1/16 of the newest
+    checkpoint's work (`verify_mark_block`, the verifier `pyrxd verify` runs);
+  - on mainnet the proved depth must reach `k = max(6, burial, ceil(2 × value ÷ C))`. `C` is the
+    photon cost of one forged confirmation: the block subsidy at the funding height (Radiant
+    Core's `GetBlockSubsidy` and `nSubsidyHalvingInterval`, vendored and re-derived by a test) ×
+    the floor work ÷ the most work of any header checked or in the last checkpoint interval.
+    `burial` is the swap's existing reorg burial, value-scaled; the value is the swap's own
+    assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
+    With no value to size `k` from, the lock is refused. Regtest runs the same proof against its
+    genesis, with no value term. A refusal names `k`, the value, `C` and what was proved;
+  - the gate links at most 20,160 headers above the newest checkpoint (the pages and
+    `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
+  - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the
+    blocks since funding: the depth proved to the newest header served, plus one block per
+    fast-tail interval since that header's timestamp, or the server's own count if higher. A
+    server that withholds its newest headers can no longer make the CSV window look longer. A
+    mainnet swap therefore needs `now_unix_s` on this path too; `scripts/dust_swap_run.py` passes it.
+
+  What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
+  non-spend; the `listunspent` read that locates it is kept for that), and blocks a withholding
+  server can hide inside the allowance above — after a header its miner dated ahead of time, or
+  arriving faster than the fast tail. Neither the most-work chain nor each header's nBits is
+  checked; the checkpoint table is only as good as its sources. `GravityTrade` is not gated.
 
 - **Every source count keys on ONE host identity, so one server can no longer corroborate
   itself.** Each quorum had its own idea of "a different source", and the cheap ones counted

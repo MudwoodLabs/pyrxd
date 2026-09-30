@@ -118,6 +118,8 @@ class _RxdNode:
     def __init__(self) -> None:
         self.rpass = secrets.token_hex(12)
         self.raddr = ""
+        #: The swap's wall clock, when the suite runs one (anvil's): see `rxd_mine`.
+        self.clock = None
 
     def _cli(self, wallet, args):
         base = ["docker", "exec", _RXD_CT, "radiant-cli", "-regtest", "-rpcuser=rt_user", f"-rpcpassword={self.rpass}"]
@@ -136,6 +138,14 @@ class _RxdNode:
         return self._cli(wallet, a)
 
     def rxd_mine(self, n=1):
+        # ONE CLOCK FOR BOTH CHAINS. The suites warp anvil's clock forward (to open an ETH refund)
+        # and hand the coordinator anvil's time as `now_unix_s`. Radiant's headers are stamped by
+        # this node's own clock, and the taker gate reads `now - newest header time` as blocks the
+        # Radiant server may be withholding — so a node stuck hours behind the ETH chain looked,
+        # correctly, like a server hiding hours of blocks. Production has one wall clock; the
+        # fixture now does too.
+        if self.clock is not None:
+            self.rxd("setmocktime", str(int(self.clock())))
         self.rxd("generatetoaddress", str(n), self.raddr, wallet="gravity")
 
     def start(self) -> None:
@@ -280,6 +290,7 @@ def env():
                 time.sleep(0.1)
         else:
             pytest.fail("anvil did not become ready")
+        node.clock = lambda: _anvil_now(url)
         yield node, url
     finally:
         anvil.terminate()

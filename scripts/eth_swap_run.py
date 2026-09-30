@@ -67,7 +67,7 @@ from _glyph_mainnet import (  # scripts/ sibling (NFT + FT paths)
     wait_genesis_mature,
 )
 from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet REST REF gate)
-from radiant_mainnet_chainio import SshTrRadiantClient
+from radiant_mainnet_chainio import SshTrRadiantClient, mainnet_proof_client
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.eth_wallet.chains import evm_chain_by_id
@@ -1218,7 +1218,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         network=rxd_network,
         taker_pkh=_rkeys[2],
         maker_pkh=_rkeys[3],
-        chain_io=RadiantChainIO(rxd_client),
+        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
         fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
         min_confirmations=1,
         audit_cleared=True,

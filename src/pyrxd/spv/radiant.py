@@ -64,36 +64,63 @@ def radiant_header_prev_hash(header: bytes) -> str:
     return _require_header(header)[4:36][::-1].hex()
 
 
-def radiant_header_target(header: bytes) -> int:
+def _require_pow_limit(pow_limit: Any) -> int:
+    if not isinstance(pow_limit, int) or isinstance(pow_limit, bool) or not 0 < pow_limit < (1 << 256):
+        raise ValidationError("pow_limit must be an int in 1..2**256-1")
+    return pow_limit
+
+
+def radiant_header_target(header: bytes, *, pow_limit: int | None = None) -> int:
     """The target *header*'s own nBits states, as an integer.
 
-    The nBits encoding is validated with :class:`pyrxd.security.types.Nbits` first (refuses a
-    zero mantissa, the sign bit, and an exponent that overflows 256 bits). Raises
-    ``ValidationError`` for a malformed nBits or a target that decodes to zero.
+    With no *pow_limit* (the default, and what the HashMark pages and ``pyrxd verify`` use), the
+    nBits encoding is validated with :class:`pyrxd.security.types.Nbits` first (refuses a zero
+    mantissa, the sign bit, and an exponent above ``0x1d``). Raises ``ValidationError`` for a
+    malformed nBits or a target that decodes to zero.
+
+    With a *pow_limit* (a network's ``consensus.powLimit``, from
+    :mod:`pyrxd.gravity.funding_spv`), the decode follows Radiant Core's own rule instead:
+    ``arith_uint256::SetCompact``'s negative and overflow tests, then ``CheckProofOfWork``'s
+    ``bnTarget == 0 || bnTarget > powLimit`` refusal (both inherited from Bitcoin Core; ``pow.cpp``
+    and ``arith_uint256.cpp`` are not vendored). The exponent cap above cannot be used there:
+    regtest's own genesis states ``0x207fffff`` (``tests/vendor/radiant_core/chainparams.cpp``),
+    which that cap refuses although Radiant Core accepts it.
     """
     raw = _require_header(header)[72:76]
-    Nbits(raw)
     exponent = raw[3]
     mantissa = int.from_bytes(raw[0:3], "little")
+    if pow_limit is None:
+        Nbits(raw)
+    else:
+        _require_pow_limit(pow_limit)
+        word = mantissa & 0x007FFFFF
+        if word != 0 and mantissa & 0x00800000:
+            raise ValidationError("nBits states a negative target")
+        if word != 0 and (exponent > 34 or (word > 0xFF and exponent > 33) or (word > 0xFFFF and exponent > 32)):
+            raise ValidationError("nBits overflows a 256-bit target")
+        mantissa = word
     if exponent <= 3:
         target = mantissa >> (8 * (3 - exponent))
     else:
         target = mantissa << (8 * (exponent - 3))
     if target == 0:
         raise ValidationError("nBits decodes to a zero target")
+    if pow_limit is not None and target > pow_limit:
+        raise ValidationError("nBits states a target above this network's proof-of-work limit")
     return target
 
 
-def radiant_header_work(header: bytes) -> int:
+def radiant_header_work(header: bytes, *, pow_limit: int | None = None) -> int:
     """Expected hash evaluations to find a header at *header*'s own target: ``2**256 // (target+1)``.
 
     The same quantity Bitcoin Core's ``GetBlockProof`` computes. It is the work the header's own
     nBits CLAIMS; only :func:`verify_radiant_header_pow` shows the header actually meets it.
+    *pow_limit* is as for :func:`radiant_header_target`.
     """
-    return (1 << 256) // (radiant_header_target(header) + 1)
+    return (1 << 256) // (radiant_header_target(header, pow_limit=pow_limit) + 1)
 
 
-def verify_radiant_header_pow(header: bytes) -> str:
+def verify_radiant_header_pow(header: bytes, *, pow_limit: int | None = None) -> str:
     """Check *header*'s SHA-512/256d hash is at or below its own nBits target.
 
     Returns the block hash in display hex. Raises ``ValidationError`` for a header that is not 80
@@ -104,8 +131,9 @@ def verify_radiant_header_pow(header: bytes) -> str:
 
     Proves only that the header cost about :func:`radiant_header_work` hash evaluations. It does not
     prove the nBits is the value Radiant's rules require, nor that the header is on any chain.
+    *pow_limit* is as for :func:`radiant_header_target`.
     """
-    target = radiant_header_target(header)
+    target = radiant_header_target(header, pow_limit=pow_limit)
     block_hash = radiant_block_hash(_require_header(header))
     if int(block_hash, 16) > target:
         raise SpvVerificationError("Radiant header proof-of-work invalid: hash is above its nBits target")

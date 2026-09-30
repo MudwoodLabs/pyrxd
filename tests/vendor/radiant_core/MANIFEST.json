@@ -11,7 +11,7 @@
   "tag": "v3.1.2",
   "commit": "45e0aa40d6ae022ba69439a58b706748b083a35b",
   "license": "MIT",
-  "fetched_utc": "2026-09-04",
+  "fetched_utc": "2026-09-30",
   "files": {
     "interpreter.cpp": {
       "upstream_path": "src/script/interpreter.cpp",
@@ -56,6 +56,10 @@
     "uint256.h": {
       "upstream_path": "src/uint256.h",
       "sha256": "e4cc8933a6e4c5a13e83b92a40d2b7d3d63ca9ebddd0403a287a0b913834def4"
+    },
+    "chainparams.cpp": {
+      "upstream_path": "src/chainparams.cpp",
+      "sha256": "900349ea75c4d7f210be485a6e5e49b85575f5184d9c51e07e49d921fbf1c69b"
     }
   }
 }

@@ -35,8 +35,20 @@ import subprocess
 from typing import Any
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
-from pyrxd.network.electrumx import UtxoRecord
+from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
+from pyrxd.network.registry import default_endpoints
 from pyrxd.security.units import ChainHeight, PhotonValue
+
+
+def mainnet_proof_client() -> ElectrumXClient:
+    """The client the taker gate fetches its PROOF of the maker's funding from, beside this shim.
+
+    ``radiant-cli`` over ssh can list the covenant UTXO but serves headers one call at a time, and
+    the gate reads up to 22,000 of them; ElectrumX serves 2,016 per call. Which server answers does
+    not matter to the verdict — the proof is checked against the checkpoints pyrxd ships — so these
+    are pyrxd's own shipped mainnet endpoints. Pass it as ``RadiantChainIO(..., proof_client=...)``.
+    """
+    return ElectrumXClient(urls=list(default_endpoints("mainnet")))
 
 
 class SshTrRadiantClient:
