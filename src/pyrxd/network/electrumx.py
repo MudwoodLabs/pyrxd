@@ -50,6 +50,7 @@ from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..security.units import ChainHeight, PhotonValue
 from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
 from .registry import block_hash_hex
+from .source_identity import SourceKey, source_key
 from .tls_pin import normalize_pin, verify_connection_pin
 
 logger = logging.getLogger(__name__)
@@ -456,6 +457,12 @@ class ElectrumXClient:
         # Validate all URLs at construction time (fast-fail).
         for url in self._urls:
             self._validate_url(url)
+        # The distinct host this client reads from, for a quorum to count it by. The URLs are raced
+        # (`_connect_first`), so a client over several URLs on ONE host is one failover source; a
+        # client over several hosts cannot say which one answered, and is ``None`` — which a
+        # quorum refuses rather than guess.
+        keys = {source_key(url) for url in self._urls}
+        self.source_key: SourceKey | None = next(iter(keys)) if len(keys) == 1 else None
 
     # ---------------------------------------------------------------------- context manager
 

@@ -15,6 +15,7 @@ import pytest
 
 from pyrxd.gravity.watch import MultiSourceRxdChainSource
 from pyrxd.security.errors import NetworkError, ValidationError
+from tests._source_hosts import distinct_host
 
 _OUTPOINT = "ab" * 32 + ":0"
 
@@ -27,6 +28,7 @@ class _FakeRxd:
     def __init__(
         self, tip: int = 100, covenant: int | None = None, *, tip_fails: bool = False, cov_fails: bool = False
     ):
+        self.source_key = distinct_host()
         self._tip = tip
         self._cov = covenant
         self._tip_fails = tip_fails

@@ -19,12 +19,14 @@ import pytest
 from pyrxd.eth_wallet.erc20_leg import _inflight_nonce_window
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.security.errors import NetworkError
+from tests._source_hosts import distinct_host
 
 
 class _Source:
     def __init__(self, pending: int, latest: int, *, chain_id: int = 1) -> None:
         self._p, self._l = pending, latest
         self.chain_id = chain_id
+        self.source_key = distinct_host()
 
     async def get_transaction_count(self, address: str, block: str = "pending") -> int:
         return self._p if block == "pending" else self._l
@@ -72,6 +74,7 @@ class TestTheAggregationRefusesRatherThanUnderReports:
     def test_below_quorum_refuses_rather_than_guessing(self) -> None:
         class _Dead:
             chain_id = 1
+            source_key = distinct_host()
 
             async def get_transaction_count(self, address, block="pending"):
                 raise NetworkError("down")

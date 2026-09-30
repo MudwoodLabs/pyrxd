@@ -24,6 +24,7 @@ from pyrxd.eth_wallet.erc20 import assert_not_frozen_before_funding, balance_of,
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc, read_contract
 from pyrxd.eth_wallet.tokens import token_for
 from pyrxd.security.errors import NetworkError, ValidationError
+from tests._source_hosts import distinct_host
 
 pytest.importorskip("web3", reason="needs the eth extra: pip install 'pyrxd[eth]'")
 
@@ -39,6 +40,7 @@ class _Source:
     def __init__(
         self, *, balance=0, frozen=(), decimals=6, finalized=100, head=110, down=False, head_ts=1_700_000_000
     ) -> None:
+        self.source_key = distinct_host()
         self.balance, self.decimals = balance, decimals
         self.frozen = {a.lower() for a in frozen}
         self.finalized, self.head, self.down = finalized, head, down

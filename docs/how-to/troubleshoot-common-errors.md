@@ -377,7 +377,7 @@ means.
 Three real strings from `ElectrumXClient`:
 
 - `"Failed to connect to any ElectrumX server"` —
-  [`src/pyrxd/network/electrumx.py:635`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`src/pyrxd/network/electrumx.py:959`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   every server in your URL list failed to connect. Check the URL(s), your
   network, and that the server is up.
 - `"ElectrumX connection lost"` —

@@ -56,6 +56,7 @@ from pyrxd.network.registry import Endpoint, NetworkProfile
 from pyrxd.network.tls_pin import normalize_pin
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Txid
+from tests._source_hosts import distinct_host
 
 # ── shared fixtures ───────────────────────────────────────────────────────────
 
@@ -395,6 +396,7 @@ async def test_multisource_get_raw_tx_refuses_agreed_bytes_for_a_different_trans
     """Quorum agreement is not identity: N sources agreeing on the WRONG tx is still wrong."""
     s1, s2 = MagicMock(), MagicMock()
     for s in (s1, s2):
+        s.source_key = distinct_host()
         s.get_raw_tx = AsyncMock(return_value=OTHER_TX)
     multi = MultiSourceBtcDataSource([s1, s2], quorum=2)
     with pytest.raises(NetworkError, match="do not match the requested txid"):
@@ -415,6 +417,7 @@ async def test_get_raw_tx_accepts_the_transaction_it_asked_for() -> None:
 
     s1, s2 = MagicMock(), MagicMock()
     for s in (s1, s2):
+        s.source_key = distinct_host()
         s.get_raw_tx = AsyncMock(return_value=REAL_TX)
     assert bytes(await MultiSourceBtcDataSource([s1, s2], quorum=2).get_raw_tx(Txid(REAL_TXID))) == REAL_TX
 
@@ -548,6 +551,7 @@ async def test_esplora_confirmed_unspent_output_accepts_a_real_live_output() -> 
 
 def fake_source(**answers) -> MagicMock:
     source = MagicMock()
+    source.source_key = distinct_host()
     for name, value in answers.items():
         setattr(source, name, AsyncMock(return_value=value))
     return source
