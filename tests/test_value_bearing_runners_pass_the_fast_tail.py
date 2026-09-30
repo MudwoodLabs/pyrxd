@@ -238,3 +238,48 @@ def test_every_mainnet_coordinator_script_hands_its_coordinator_a_policy_with_th
                 )
                 checked += 1
     assert checked >= len(scripts)
+
+
+#: The coordinator methods that cross the taker gate (``taker_verify_asset_funding``) on the way to a lock.
+_GATE_CALLS = ("taker_funds_btc", "pre_btc_lock_check", "resume_interrupted_fund", "taker_verify_asset_funding")
+
+
+def test_every_mainnet_script_that_reaches_the_taker_gate_asks_at_least_two_operators():
+    """Above dust the taker gate requires the funding's depth from two distinct operators, and the
+    coordinator refuses at construction a Radiant leg configured to ask fewer. Every script that
+    builds its Radiant leg on the mainnet node client AND calls a method that crosses the gate must
+    therefore hand that leg ``RadiantChainIO(<node client>, proof_client=mainnet_proof_client())`` —
+    the node (its ssh destination's ``source_key``) plus pyrxd's shipped endpoints, asked once per
+    operator. The set of scripts is DERIVED; the one that never crosses the gate is pinned by name,
+    and the reason it is exempt is asserted, not written."""
+    scripts = _mainnet_coordinator_scripts()
+    crossing = {n: t for n, t in scripts.items() if any(_calls(t, c) for c in _GATE_CALLS)}
+    exempt = set(scripts) - set(crossing)
+    assert {"dust_swap_run", "eth_swap_run", "eth_swap_grief_run"} <= set(crossing), sorted(crossing)
+    # Pinned membership: dust_swap_resume rebuilds a swap already at BTC_LOCKED (both legs funded)
+    # and drives only the claims — it never reaches a lock.
+    assert exempt == {"dust_swap_resume"}, sorted(exempt)
+    resume_src = (_SCRIPTS / "dust_swap_resume.py").read_text(encoding="utf-8")
+    assert ".with_state(SwapState.BTC_LOCKED)" in resume_src
+    checked = 0
+    for name, tree in crossing.items():
+        for leg in _calls(tree, "RadiantCovenantLeg"):
+            io = next((kw.value for kw in leg.keywords if kw.arg == "chain_io"), None)
+            assert isinstance(io, ast.Call) and _callee(io) == "RadiantChainIO", f"{name}:{leg.lineno}"
+            proof = next((kw.value for kw in io.keywords if kw.arg == "proof_client"), None)
+            assert _callee(proof) == "mainnet_proof_client", (
+                f"{name}:{leg.lineno}: the Radiant leg asks only the node for the funding's depth — one "
+                "operator; above dust the coordinator refuses it (pass proof_client=mainnet_proof_client())"
+            )
+            checked += 1
+    assert checked >= len(crossing)
+
+    # And what that construction asks, counted the way the gate counts it.
+    shim = _load("radiant_mainnet_chainio")
+    from pyrxd.gravity.funding_spv import MIN_REPORTING_OPERATORS, counted_operators
+    from pyrxd.gravity.radiant_leg import RadiantChainIO
+    from pyrxd.network.source_identity import source_key
+
+    node = shim.SshTrRadiantClient()
+    ops = counted_operators(RadiantChainIO(node, proof_client=shim.mainnet_proof_client()).configured_depth_operators())
+    assert str(source_key(node._ssh_host)) in ops and len(ops) >= MIN_REPORTING_OPERATORS + 1, ops

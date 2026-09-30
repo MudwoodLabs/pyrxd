@@ -471,8 +471,28 @@ class ElectrumXClient:
         # count it by. The URLs are raced (`_connect_first`), so a client over several URLs of ONE
         # group is one failover source; a client over several groups cannot say which one
         # answered, and is ``None`` — which a quorum refuses rather than guess.
-        keys = {source_key(url) for url in self._urls}
-        self.source_key: SourceKey | None = next(iter(keys)) if len(keys) == 1 else None
+        keys = tuple(dict.fromkeys(source_key(url) for url in self._urls))
+        #: Every operator group among the URLs, in the order they first appear.
+        self.source_keys: tuple[SourceKey, ...] = keys
+        self.source_key: SourceKey | None = keys[0] if len(keys) == 1 else None
+
+    def per_source_clients(self) -> tuple[ElectrumXClient, ...]:
+        """One NEW client per operator group of this client's URLs (:attr:`source_keys` order), each
+        over that group's URLs with this client's TLS settings and timeout.
+
+        This client races all its URLs, so a reply from it comes from ONE group and cannot say which;
+        a caller that needs an answer from EACH operator asks these instead. The caller owns them and
+        closes them. Nothing is connected here.
+        """
+        groups: dict[SourceKey, list[str]] = {}
+        for url in self._urls:
+            groups.setdefault(source_key(url), []).append(url)
+        return tuple(
+            ElectrumXClient(
+                groups[key], allow_insecure=self._allow_insecure, timeout=self._timeout, spki_pins=self._spki_pins
+            )
+            for key in self.source_keys
+        )
 
     # ---------------------------------------------------------------------- context manager
 

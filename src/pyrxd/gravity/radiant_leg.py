@@ -55,7 +55,7 @@ from pyrxd.gravity.fee_policy import (
     DeadlineFeePolicy,
     assert_fee_covers,
 )
-from pyrxd.gravity.funding_spv import MakerFundingEvidence
+from pyrxd.gravity.funding_spv import UNIDENTIFIED_SOURCE_PREFIX, MakerFundingEvidence
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
     build_htlc_covenant_ft,
@@ -183,7 +183,13 @@ class RadiantChainIO:
     ``depth_sources`` are further Radiant readers (each with ``get_transaction_verbose`` and/or
     ``get_tip_height``) whose REPORTED depth of the funding the gate's elapsed-depth upper bound may
     be raised by, beside ``client``'s and ``proof_client``'s. A report never lowers the bound, so a
-    source reporting less costs nothing; each is grouped by its ``source_key`` (its operator).
+    source reporting less costs nothing; each is grouped by its ``source_key`` (its operator). Above
+    dust on a value-bearing network the gate requires reports from at least two distinct operators
+    (:data:`pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`): :meth:`configured_depth_operators`
+    says which this configuration asks. A client over the URLs of several operators — an
+    ``ElectrumXClient`` given pyrxd's shipped mainnet endpoints, which races them — is asked once
+    PER OPERATOR (``ElectrumXClient.per_source_clients``), since one reply from it cannot say which
+    operator sent it.
     """
 
     def __init__(self, client: Any, *, proof_client: Any = None, depth_sources: tuple[Any, ...] = ()) -> None:
@@ -374,24 +380,78 @@ class RadiantChainIO:
             coinbase_merkle=coinbase,
             headers=headers,
             reported_depths=await self.reported_depths(txid, int(height)),
+            configured_operators=self.configured_depth_operators(),
         )
+
+    def _distinct_sources(self) -> list[Any]:
+        seen: list[Any] = []
+        for src in (self._client, self._proof_client, *self._depth_sources):
+            if not any(src is s for s in seen):
+                seen.append(src)
+        return seen
+
+    @staticmethod
+    def _unidentified_label(index: int, src: Any) -> str:
+        return f"{UNIDENTIFIED_SOURCE_PREFIX} #{index} ({type(src).__name__})"
+
+    @staticmethod
+    def _splits(src: Any) -> bool:
+        """A client over several operators' URLs that can be asked once per operator."""
+        keys = getattr(src, "source_keys", None)
+        return (
+            getattr(src, "source_key", None) is None
+            and isinstance(keys, tuple)
+            and len(keys) > 1
+            and callable(getattr(src, "per_source_clients", None))
+        )
+
+    def configured_depth_operators(self) -> tuple[str, ...]:
+        """The operator groups this configuration asks for a funding's depth — ``client``,
+        ``proof_client`` and every ``depth_sources`` reader — derived from each one's ``source_key``
+        (every group of a client over several operators' URLs), each once. A source that cannot say
+        which operator runs it appears as ``"unidentified source #i (<type>)"``, which
+        :func:`pyrxd.gravity.funding_spv.counted_operators` does not count. Nothing is connected."""
+        out: list[str] = []
+        for index, src in enumerate(self._distinct_sources()):
+            if self._splits(src):
+                out.extend(str(k) for k in src.source_keys)
+                continue
+            key = getattr(src, "source_key", None)
+            out.append(str(key) if key else self._unidentified_label(index, src))
+        return tuple(dict.fromkeys(out))
 
     async def reported_depths(self, txid: str, height: int) -> tuple[tuple[str, int], ...]:
         """``((operator, depth), ...)``: the depth of *txid* (mined at *height*) each configured
-        source REPORTS — ``client``, ``proof_client`` and every ``depth_sources`` reader, each once.
+        source REPORTS — ``client``, ``proof_client`` and every ``depth_sources`` reader, each once,
+        and a client over several operators' URLs once per operator (on clients made for this call
+        and closed before it returns).
 
         A source's depth is the larger of its verbose ``confirmations`` and its ``tip - height + 1``,
         whichever it answers; a source that answers neither is left out. Each is labelled by its
         ``source_key`` (its operator group, :func:`pyrxd.network.source_identity.source_key`), or
         ``"unidentified source #i (<type>)"`` for a client that cannot say — never merged with another.
-        These only ever RAISE the gate's elapsed upper bound; the proof does not depend on them.
+        These RAISE the gate's elapsed upper bound, and above dust the gate counts the operators
+        among them; the proof does not depend on them.
         """
-        seen: list[Any] = []
-        for src in (self._client, self._proof_client, *self._depth_sources):
-            if not any(src is s for s in seen):
-                seen.append(src)
+        asked: list[tuple[int, Any]] = []
+        made: list[Any] = []
+        for index, src in enumerate(self._distinct_sources()):
+            if self._splits(src):
+                parts = tuple(src.per_source_clients())
+                made.extend(parts)
+                asked.extend((index, part) for part in parts)
+            else:
+                asked.append((index, src))
+        try:
+            return await self._ask_depths(asked, txid, height)
+        finally:
+            for part in made:
+                with contextlib.suppress(Exception):
+                    await part.close()
+
+    async def _ask_depths(self, asked: list[tuple[int, Any]], txid: str, height: int) -> tuple[tuple[str, int], ...]:
         out: list[tuple[str, int]] = []
-        for index, src in enumerate(seen):
+        for index, src in asked:
             depths: list[int] = []
             verbose = getattr(src, "get_transaction_verbose", None)
             if callable(verbose):
@@ -412,7 +472,7 @@ class RadiantChainIO:
                     logger.debug("depth source %d gave no tip height", index, exc_info=True)
             if depths:
                 key = getattr(src, "source_key", None)
-                label = str(key) if key else f"unidentified source #{index} ({type(src).__name__})"
+                label = str(key) if key else self._unidentified_label(index, src)
                 out.append((label, max(depths)))
         return tuple(out)
 
@@ -816,6 +876,12 @@ class RadiantCovenantLeg:
                     "Wait for it to bury, then retry."
                 )
         return await self.chain_io.funding_evidence(outpoint, int(height), header_ranges=header_ranges(int(height)))
+
+    def configured_depth_operators(self) -> tuple[str, ...]:
+        """The operator groups this leg asks for the maker's funding depth
+        (:meth:`RadiantChainIO.configured_depth_operators`): what the coordinator checks, before
+        anyone locks, against the taker gate's two-operator rule above dust."""
+        return self.chain_io.configured_depth_operators()
 
     # -- spends -------------------------------------------------------------
     async def _resolve_covenant(self, record: SwapRecord) -> tuple[HtlcCovenant, str, int, int]:

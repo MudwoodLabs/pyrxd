@@ -76,9 +76,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   taker gate's elapsed-depth bound policy: `surge_factor` 3.0 (the maintainer's decision; a backtest
   over every mainnet header from height 14,088, after the chain's launch, found the bound short of
   no block count at 3.0, and short near height 98,705 at 2.0), `loss_budget_photons` 1 RXD with
-  `epsilon` clamped to 1e-12..1e-3, and, for the negotiation-time check only, `early_slack_s` 3600
-  and `early_work_margin` 2.0. The defaults other than `surge_factor` await the maintainer's
-  sign-off.
+  `epsilon` clamped to 1e-12..1e-3, `dust_threshold_photons` 1,000 RXD (above it, two distinct
+  operators must report the funding's depth; see Security), and, for the negotiation-time check
+  only, `early_slack_s` 3600 and `early_work_margin` 2.0. The defaults other than `surge_factor`
+  and `dust_threshold_photons` await the maintainer's sign-off.
+- **`ElectrumXClient.source_keys`** lists every operator group among a client's URLs, and
+  **`ElectrumXClient.per_source_clients()`** returns one new client per group. A client over
+  several operators' URLs races them, so one reply from it cannot say which operator sent it;
+  `RadiantChainIO` asks such a client once per operator for a funding's depth, on clients it closes
+  afterwards. **`RadiantChainIO.configured_depth_operators()`** (and
+  `RadiantCovenantLeg.configured_depth_operators()`) names the operator groups a configuration asks,
+  derived from each source's `source_key`. The mainnet node client in
+  `scripts/radiant_mainnet_chainio.py` now carries a `source_key` (its ssh destination), so the
+  user's own node counts as its own operator.
 - **`src/pyrxd/spv/radiant_checkpoints.py` ships the last checkpoint interval's work**:
   `LAST_INTERVAL_MAX_WORK` (and its height, `LAST_INTERVAL_MAX_WORK_HEIGHT`) and
   `NEWEST_CHECKPOINT_WORK`. `scripts/refresh_radiant_checkpoints.py` fetches every header of that
@@ -298,7 +308,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     quantile). `reported` is the largest depth any configured source reports, grouped by operator
     (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
     term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
-    `scripts/dust_swap_run.py` passes it.
+    `scripts/dust_swap_run.py` passes it;
+  - above dust, the funding's depth must be corroborated by two distinct operators: on a
+    value-bearing network, when the value at stake exceeds `ElapsedBoundPolicy.dust_threshold_photons`
+    (1,000 RXD by default), the gate refuses the lock unless at least two operator groups
+    (`source_key`; the user's own node is its own group) report a depth for the funding, and the
+    refusal names how many answered and which. A source that cannot say which operator runs it is
+    not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
+    configured to ask fewer than two operators for such a swap, naming them. At or below dust one
+    operator suffices and the result says so. pyrxd's shipped mainnet endpoints are two operators;
+    the node-over-ssh scripts ask the node and those endpoints.
 
   What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
   non-spend; the `listunspent` read that locates it is kept for that). The elapsed-depth bound is a

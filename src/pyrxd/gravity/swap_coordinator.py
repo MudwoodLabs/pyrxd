@@ -74,6 +74,7 @@ from .funding_spv import (
     MakerFundingNotVerified,
     RadiantChain,
     VerifiedMakerFunding,
+    counted_operators,
     early_elapsed_blocks_upper,
     funding_header_ranges,
     radiant_chain_for_leg,
@@ -2077,7 +2078,7 @@ class SwapCoordinator:
         """Why *terms* are refused BEFORE ANYONE LOCKS on a value-bearing Radiant network, or None.
 
         Run when the coordinator is built for a NEGOTIATED record and again at
-        :meth:`pre_btc_lock_check` step 3b, before the chain is read. Three checks:
+        :meth:`pre_btc_lock_check` step 3b, before the chain is read. Four checks:
 
         1. THE MEASURED FAST TAIL (every role). ``MarginPolicy.rxd_block_interval_fast_s`` is what
            the cross-clock timelock RESERVES divide time spans by (:func:`_dividing_interval_s`); unset,
@@ -2087,7 +2088,12 @@ class SwapCoordinator:
         2. A VALUE AT STAKE (a coordinator that runs the taker gate — any role but
            ``SwapRole.MAKER``). The gate sizes the depth it requires of the maker's funding from it
            and refuses without one at step 5, after the maker has locked.
-        3. ROOM IN ``t_rxd``. Step 6 subtracts the gate's elapsed-depth UPPER bound from ``t_rxd``, and
+        3. TWO OPERATORS ABOVE DUST (a coordinator that runs the taker gate). Above
+           ``funding_bound.dust_threshold_photons`` the gate refuses unless at least two distinct
+           operators report the funding's depth (:data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`);
+           a Radiant leg configured to ask fewer operator groups (``configured_depth_operators``,
+           derived from each source's ``source_key``) is refused here, naming them.
+        4. ROOM IN ``t_rxd``. Step 6 subtracts the gate's elapsed-depth UPPER bound from ``t_rxd``, and
            step 7 re-runs the timelock ordering against what remains. This models that bound with
            :func:`~pyrxd.gravity.funding_spv.early_elapsed_blocks_upper` — built from pyrxd's shipped
            checkpoint data only, to be AT LEAST what step 6 computes on an honest chain (blocks at the
@@ -2130,6 +2136,21 @@ class SwapCoordinator:
                 "locked; set MarginPolicy.value_at_risk_photons to the swap's value in photons (a coordinator "
                 "that drives only the maker side, config.role=SwapRole.MAKER, is not refused for this)"
             )
+        fb = self.config.funding_bound
+        needed = fb.requires_operators(chain, value) if runs_taker_gate else 0
+        if needed:
+            fetch_ops = getattr(self.radiant_leg, "configured_depth_operators", None)
+            configured = tuple(str(o) for o in fetch_ops()) if callable(fetch_ops) else ()
+            counted = counted_operators(configured)
+            if len(counted) < needed:
+                named = ", ".join(configured) if configured else "none (this Radiant leg does not say which it asks)"
+                return before + (
+                    f"the value at stake ({value} photons) is above the taker gate's dust threshold "
+                    f"({fb.dust_threshold_photons} photons), so the gate requires the maker's funding depth "
+                    f"reported by at least {needed} distinct operators (grouped by source_key), and this Radiant "
+                    f"leg is configured to ask {len(counted)}: {named}. Add a depth source run by another operator "
+                    "(RadiantChainIO(..., depth_sources=...) — pyrxd's shipped mainnet endpoints, or your own node)"
+                )
         burial = self._funding_burial_blocks(chain, value)
         try:
             early = early_elapsed_blocks_upper(
@@ -2155,7 +2176,6 @@ class SwapCoordinator:
                 why = f"with {elapsed} elapsed the timelock ordering fails (pre_btc_lock_check step 7): {exc}"
         if why is None:
             return None
-        fb = self.config.funding_bound
         return before + (
             f"with this coordinator's policy the taker gate can require the maker's funding up to {early.required_confirmations} "
             f"blocks deep (k = max({MIN_FUNDING_CONFIRMATIONS}, burial {burial}, ceil(2 × value {value} photons ÷ C) "

@@ -26,6 +26,7 @@ What each section pins:
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import json
 import os
@@ -61,6 +62,8 @@ from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, Swap
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.hash import radiant_block_hash
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
+from pyrxd.network.registry import DEFAULT_ENDPOINTS
+from pyrxd.network.source_identity import source_key
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.spv.radiant import radiant_header_work
 from pyrxd.transaction.transaction import Transaction
@@ -139,10 +142,25 @@ def _vb_policy(**over) -> MarginPolicy:
     return type(base)(**{**base.__dict__, "rxd_block_interval_fast_s": _FAST_S, **over})
 
 
+#: The distinct operator groups of pyrxd's shipped mainnet endpoints, by ``source_key`` — derived,
+#: not typed, so the fixtures count operators the way the gate does.
+_SHIPPED_OPERATORS = tuple(dict.fromkeys(source_key(u) for u in DEFAULT_ENDPOINTS["mainnet"]))
+assert len(_SHIPPED_OPERATORS) >= 2, _SHIPPED_OPERATORS
+
+
+def _two_operators(ev):
+    """*ev* with the funding's depth reported honestly (the served tip) by two distinct operators —
+    what the gate requires above dust on a value-bearing network."""
+    depth = max(ev.headers) - ev.height + 1
+    return dataclasses.replace(ev, reported_depths=tuple((str(k), depth) for k in _SHIPPED_OPERATORS[:2]))
+
+
 class _ChainView:
     """An ElectrumX-shaped Radiant server over a synthetic chain it serves honestly — unless told
     to lie: ``listed_spk`` makes ``listunspent`` claim an output for a script the raw transaction
-    does not pay (``pays`` is what it really pays)."""
+    does not pay (``pays`` is what it really pays). It is run by the first shipped operator."""
+
+    source_key = _SHIPPED_OPERATORS[0]
 
     def __init__(
         self,
@@ -191,12 +209,25 @@ class _ChainView:
         raise AssertionError("no Radiant broadcast in this phase")
 
 
-def _real_leg(view, *, network: str, min_confirmations: int = 1) -> RadiantCovenantLeg:
+class _DepthReader:
+    """A second operator's Radiant reader: it reports the depth *view*'s chain really has."""
+
+    def __init__(self, view, key=_SHIPPED_OPERATORS[1]):
+        self.source_key = key
+        self._view = view
+
+    async def get_transaction_verbose(self, txid):
+        return {"confirmations": self._view.confs}
+
+
+def _real_leg(view, *, network: str, min_confirmations: int = 1, depth_sources=None) -> RadiantCovenantLeg:
+    """The real leg over *view*, asking a second operator (:class:`_DepthReader`) for the depth too
+    unless *depth_sources* says otherwise."""
     return RadiantCovenantLeg(
         network=network,
         taker_pkh=A._TAKER_PKH,
         maker_pkh=A._MAKER_PKH,
-        chain_io=RadiantChainIO(view),
+        chain_io=RadiantChainIO(view, depth_sources=(_DepthReader(view),) if depth_sources is None else depth_sources),
         fee_source=A._FeeSource(),
         min_confirmations=min_confirmations,
     )
@@ -524,7 +555,7 @@ def test_a_reference_header_below_the_last_checkpoint_interval_is_fetched_and_li
     header to the checkpoint above it before reading its window."""
     ev, kw, value, fetched = _gap_case()
     assert set(range(0, 25)) <= fetched
-    r = verify_maker_funding(ev, now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+    r = verify_maker_funding(_two_operators(ev), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
     assert (r.value_term, r.served_tip, r.reference_height) == (23, 30, 8)
 
 
@@ -534,7 +565,7 @@ def test_a_reference_header_the_plan_cannot_reach_refuses_by_name_never_a_bare_k
     ev, kw, value, fetched = _gap_case(cap=4)
     assert not set(range(5, 12)) & fetched
     with pytest.raises(MakerFundingNotVerified, match=r"reference header .*block \d+, 23 deep.*checkpoint 22"):
-        verify_maker_funding(ev, now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+        verify_maker_funding(_two_operators(ev), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
 
 
 def test_a_reference_header_that_does_not_link_to_its_checkpoint_is_refused():
@@ -545,7 +576,7 @@ def test_a_reference_header_that_does_not_link_to_its_checkpoint_is_refused():
     forged[8] = mine("00" * 32, b"\x00" * 32, _NOW, _HARD_BITS)
     ev = type(ev)(**{**ev.__dict__, "headers": forged})
     with pytest.raises(MakerFundingNotVerified, match=r"reference header .*block 8"):
-        verify_maker_funding(ev, now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+        verify_maker_funding(_two_operators(ev), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
 
 
 def test_a_forged_span_between_the_reference_header_and_its_checkpoint_is_refused_by_name():
@@ -560,13 +591,15 @@ def test_a_forged_span_between_the_reference_header_and_its_checkpoint_is_refuse
     kw = dict(chain=chain, expected_spk=spk, expected_value=1000, burial_blocks=6)
     cost = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=1, **kw)
     value = 4 * cost.forged_confirmation_cost_photons
-    honest = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+    honest = verify_maker_funding(_two_operators(real.evidence()), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
     assert honest.reference_height == 3, honest.reference_height
     h3 = mine(radiant_block_hash(real.headers[2]), b"\x33" * 32, _NOW, _HARD_BITS)
     h4 = mine(radiant_block_hash(h3), b"\x44" * 32, _NOW, _HARD_BITS)
     forged = {**real.headers, 3: h3, 4: h4}
     with pytest.raises(MakerFundingNotVerified, match=r"reference header .*block 3.*checkpoint 4"):
-        verify_maker_funding(real.evidence(headers=forged), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+        verify_maker_funding(
+            _two_operators(real.evidence(headers=forged)), now_unix_s=_NOW, value_at_stake_photons=value, **kw
+        )
 
 
 def test_a_header_in_the_median_time_window_that_does_not_link_is_refused_by_name():
@@ -580,14 +613,18 @@ def test_a_header_in_the_median_time_window_that_does_not_link_is_refused_by_nam
     kw = dict(chain=chain, expected_spk=spk, expected_value=1000, burial_blocks=6)
     cost = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=1, **kw)
     value = 9 * cost.forged_confirmation_cost_photons // 2
-    honest = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+    honest = verify_maker_funding(_two_operators(real.evidence()), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
     assert (honest.value_term, honest.reference_height) == (9, 12)
     forged = {**real.headers, 7: mine("00" * 32, b"\x07" * 32, _NOW, _HARD_BITS)}
     with pytest.raises(MakerFundingNotVerified, match=r"header 7, in the 11-header window .*blocks 2 to 12"):
-        verify_maker_funding(real.evidence(headers=forged), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+        verify_maker_funding(
+            _two_operators(real.evidence(headers=forged)), now_unix_s=_NOW, value_at_stake_photons=value, **kw
+        )
     missing = {h: b for h, b in real.headers.items() if h != 4}
     with pytest.raises(MakerFundingNotVerified, match=r"header 4, in the 11-header window"):
-        verify_maker_funding(real.evidence(headers=missing), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+        verify_maker_funding(
+            _two_operators(real.evidence(headers=missing)), now_unix_s=_NOW, value_at_stake_photons=value, **kw
+        )
 
 
 def test_real_mainnet_headers_and_transaction_verify_at_the_gate():
@@ -637,7 +674,7 @@ def test_real_mainnet_headers_and_transaction_verify_at_the_gate():
         burial_blocks=6,
         now_unix_s=int.from_bytes(m.headers[460_580][68:72], "little"),
     )
-    r = verify_maker_funding(ev, value_at_stake_photons=value, **common)
+    r = verify_maker_funding(_two_operators(ev), value_at_stake_photons=value, **common)
     assert r.proved_depth == 9 and r.required_confirmations == 6
     assert r.forged_confirmation_cost_photons == cost and r.max_header_work == max_work
     # The negotiation-time floor on C, from the shipped interval work alone, bounds the real C from
@@ -653,7 +690,7 @@ def test_real_mainnet_headers_and_transaction_verify_at_the_gate():
     assert funding_spv.forged_confirmation_cost_floor_photons(shipped) <= cost
     # Nine proved blocks cover a value up to 4.5 C; one photon over that needs ten.
     with pytest.raises(MakerFundingNotVerified, match=r"proved only 9 block\(s\) deep; wait for 1 more"):
-        verify_maker_funding(ev, value_at_stake_photons=9 * cost // 2 + 1, **common)
+        verify_maker_funding(_two_operators(ev), value_at_stake_photons=9 * cost // 2 + 1, **common)
 
 
 # --------------------------------------------------------------------------- (c) the rule
@@ -1671,7 +1708,7 @@ def test_one_header_stamped_later_than_its_neighbours_moves_the_bound_by_at_most
     chain = _vb_chain(honest_chain.headers, (0, 2, 4))
     value = 10_000 * PHOTONS_PER_RXD
     kw = dict(chain=chain, expected_spk=spk, expected_value=1000, burial_blocks=6, value_at_stake_photons=value)
-    honest = verify_maker_funding(honest_chain.evidence(), now_unix_s=_NOW, **kw)
+    honest = verify_maker_funding(_two_operators(honest_chain.evidence()), now_unix_s=_NOW, **kw)
     ref = honest.reference_height
     policy = ElapsedBoundPolicy()
     tol = honest.time_blocks - policy.blocks_upper(honest.elapsed_s - 300, spacing_s=300, value_at_stake_photons=value)
@@ -1685,7 +1722,9 @@ def test_one_header_stamped_later_than_its_neighbours_moves_the_bound_by_at_most
             tip_time=_NOW - 600,
             time_at={h: _time(honest_chain.headers[h]) + 7200},
         )
-        r = verify_maker_funding(c.evidence(), now_unix_s=_NOW, **{**kw, "chain": _vb_chain(c.headers, (0, 2, 4))})
+        r = verify_maker_funding(
+            _two_operators(c.evidence()), now_unix_s=_NOW, **{**kw, "chain": _vb_chain(c.headers, (0, 2, 4))}
+        )
         assert r.reference_height == ref
         assert r.elapsed_blocks_upper >= honest.elapsed_blocks_upper - tol, h
 
@@ -1714,7 +1753,7 @@ def test_the_reference_time_comes_from_a_header_at_depth_value_term():
     first = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=1, **kw)
     cost = first.forged_confirmation_cost_photons
     value = 2 * cost  # value term ceil(2 × 2C ÷ C) = 4
-    r = verify_maker_funding(real.evidence(), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+    r = verify_maker_funding(_two_operators(real.evidence()), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
     assert r.value_term == 4 and r.value_term * cost >= FORGERY_COST_FACTOR * value
     assert r.reference_height == r.served_tip - r.value_term + 1 == 11
     assert r.reference_time == _mtp_at(real.headers, 11)
@@ -1725,7 +1764,9 @@ def test_the_reference_time_comes_from_a_header_at_depth_value_term():
     hdrs = dict(real.headers)
     top = max(hdrs)
     hdrs[top + 1] = mine(radiant_block_hash(hdrs[top]), hashlib.sha256(b"one more").digest(), _NOW, _HARD_BITS)
-    s = verify_maker_funding(real.evidence(headers=hdrs), now_unix_s=_NOW, value_at_stake_photons=value, **kw)
+    s = verify_maker_funding(
+        _two_operators(real.evidence(headers=hdrs)), now_unix_s=_NOW, value_at_stake_photons=value, **kw
+    )
     assert s.served_tip == top + 1 and s.proved_depth == r.proved_depth + 1
     assert s.reference_height == 12, "the reference moved by more than the one header added"
     assert s.reference_time == _mtp_at(real.headers, 12)
@@ -1793,3 +1834,188 @@ async def test_the_lock_time_rerun_alone_catches_a_covenant_that_vanishes_inside
     with pytest.raises(NetworkError, match="spent"):
         await coord.taker_funds_btc(eth_terms, now_unix_s=_NOW)
     assert leg.proofs == 2 and "fund" not in eth.calls
+
+
+# --------------------------------------------------------------------------- (g) two operators above dust
+
+#: The shipped mainnet endpoints, grouped by operator (``source_key``) — derived, never typed.
+_SHIPPED_BY_OPERATOR: dict[str, list[str]] = {}
+for _url in DEFAULT_ENDPOINTS["mainnet"]:
+    _SHIPPED_BY_OPERATOR.setdefault(str(source_key(_url)), []).append(_url)
+
+_ABOVE_DUST = ElapsedBoundPolicy().dust_threshold_photons + 1
+
+
+def _dust_case(monkeypatch):
+    base, chain = _value_bearing_chain(monkeypatch)
+    spk = b"\x76\xa9" + bytes(32)
+    c = build_funding_chain(spk=spk, value=1000, confs=40, base=base, bits=_HARD_BITS, tip_time=_NOW)
+    kw = dict(chain=chain, expected_spk=spk, expected_value=1000, burial_blocks=6, now_unix_s=_NOW)
+    return c, kw
+
+
+def test_above_dust_the_gate_refuses_unless_two_distinct_operators_report_the_depth(monkeypatch):
+    """The rule, at the gate: above ``dust_threshold_photons`` on a value-bearing network, reports
+    from fewer than two distinct operators refuse, naming how many answered and which (and which
+    configured ones did not); two pass. An unidentified source, a zero report and a second server of
+    the same operator are not a second operator. At the threshold one operator suffices, and the
+    result says the time term may govern."""
+    c, kw = _dust_case(monkeypatch)
+    a, b = (str(k) for k in _SHIPPED_OPERATORS[:2])
+    depth = max(c.headers) - c.height + 1
+
+    def run(reports, value=_ABOVE_DUST, configured=(a, b), **extra):
+        ev = c.evidence(reported_depths=tuple(reports), configured_operators=configured)
+        return verify_maker_funding(ev, value_at_stake_photons=value, **kw, **extra)
+
+    for reports in (
+        [],
+        [(a, depth)],
+        [(a, depth), (a, depth - 1)],
+        [(a, depth), ("unidentified source #1 (_Src)", depth)],
+        [(a, depth), (b, 0)],
+    ):
+        with pytest.raises(MakerFundingNotVerified) as exc:
+            run(reports)
+        msg = str(exc.value)
+        answered = 1 if reports else 0
+        assert f"at least 2 distinct operators; {answered} answered" in msg, msg
+        if answered:
+            assert f"({a})" in msg and f"{b} did not" in msg, msg
+        assert "above the dust threshold" in msg and f"{_ABOVE_DUST} photons" in msg, msg
+
+    ok = run([(a, depth), (b, depth)])
+    assert ok.reporting_operators == (a, b) and ok.reporting_operators_required == 2
+    assert "2 distinct operators reported, 2 required above the dust threshold" in ok.bound_note
+
+    # At the threshold: one operator suffices, and the result says the time term may govern.
+    at = run([(a, depth)], value=_ABOVE_DUST - 1)
+    assert at.reporting_operators_required == 0
+    assert "at or below the dust threshold" in at.bound_note and "time term may govern" in at.bound_note
+    # The threshold is policy: raised, the same value proceeds on one operator.
+    raised = run([(a, depth)], bound_policy=ElapsedBoundPolicy(dust_threshold_photons=_ABOVE_DUST))
+    assert raised.reporting_operators_required == 0
+    # A test network has no value to protect: no operator count.
+    reg = verify_maker_funding(
+        build_funding_chain(spk=kw["expected_spk"], value=1000, confs=3, tip_time=_NOW).evidence(),
+        now_unix_s=_NOW,
+        **{**_regtest_kw(kw["expected_spk"]), "value_at_stake_photons": 10**15},
+    )
+    assert reg.reporting_operators_required == 0
+
+
+def _operator_leg(chain_io) -> RadiantCovenantLeg:
+    return RadiantCovenantLeg(
+        network="bc",
+        taker_pkh=A._TAKER_PKH,
+        maker_pkh=A._MAKER_PKH,
+        chain_io=chain_io,
+        fee_source=A._FeeSource(),
+        min_confirmations=1,
+    )
+
+
+def _build_with(chain_io, value):
+    terms = _wide_terms(3000)
+    return _btc_coord(
+        terms,
+        _operator_leg(chain_io),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+    )
+
+
+def test_the_coordinator_refuses_before_anyone_locks_a_config_with_fewer_than_two_operators_above_dust():
+    """Construction, on the real shipped mainnet chain data, with real clients (nothing connects):
+
+    * pyrxd's shipped mainnet endpoints, as one client — two operators — construct above dust;
+    * the user's own loopback node plus one public operator construct above dust;
+    * two servers of ONE operator (as two clients) are refused above dust, naming it;
+    * the same one-operator config constructs at dust."""
+    shipped = RadiantChainIO(ElectrumXClient(urls=list(DEFAULT_ENDPOINTS["mainnet"])))
+    assert len(funding_spv.counted_operators(shipped.configured_depth_operators())) >= 2
+    assert _build_with(shipped, 10_000 * PHOTONS_PER_RXD)[0] is not None
+
+    public = next(iter(_SHIPPED_BY_OPERATOR.values()))[0]
+    own = RadiantChainIO(
+        ElectrumXClient(["ws://127.0.0.1:50001"], allow_insecure=True), depth_sources=(ElectrumXClient([public]),)
+    )
+    assert own.configured_depth_operators() == ("localhost", str(source_key(public)))
+    assert _build_with(own, 10_000 * PHOTONS_PER_RXD)[0] is not None
+
+    op, urls = next((k, v) for k, v in _SHIPPED_BY_OPERATOR.items() if len(v) >= 2)
+    one = RadiantChainIO(ElectrumXClient([urls[0]]), depth_sources=(ElectrumXClient([urls[1]]),))
+    assert one.configured_depth_operators() == (op,)
+    with pytest.raises(ValidationError) as exc:
+        _build_with(one, 10_000 * PHOTONS_PER_RXD)
+    msg = str(exc.value)
+    assert "refused before anyone locks" in msg and "at least 2 distinct operators" in msg, msg
+    assert f"configured to ask 1: {op}" in msg, msg
+    assert _build_with(one, ElapsedBoundPolicy().dust_threshold_photons)[0] is not None
+
+
+async def test_step_5_refuses_when_only_one_of_two_configured_operators_answers(monkeypatch):
+    """Through the production path (``pre_btc_lock_check`` → the real leg → ``RadiantChainIO``): two
+    operators configured, so the swap constructs; at the lock one of them does not answer, and the
+    gate refuses naming who answered and who did not. When both answer, it locks."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    value = 10_000 * PHOTONS_PER_RXD
+
+    class _Silent(_DepthReader):
+        async def get_transaction_verbose(self, txid):
+            raise NetworkError("unreachable")
+
+    silent = _Silent(view)
+    coord, btc_view = _btc_coord(
+        terms,
+        _real_leg(view, network="bc", depth_sources=(silent,)),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+    )
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is False
+    assert f"1 answered ({view.source_key}), and {silent.source_key} did not" in gate.reason, gate.reason
+    assert btc_view.broadcasts == []
+
+    coord, _ = _btc_coord(
+        terms,
+        _real_leg(view, network="bc"),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+    )
+    assert (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
+    assert coord.last_maker_funding.reporting_operators == (str(view.source_key), str(_SHIPPED_OPERATORS[1]))
+
+
+async def test_a_client_over_several_operators_is_asked_once_per_operator(monkeypatch):
+    """An ``ElectrumXClient`` over pyrxd's shipped mainnet endpoints races them, so one reply cannot
+    say which operator sent it: ``RadiantChainIO`` asks one client per operator group instead, labels
+    each by its ``source_key``, and closes them."""
+    closed: list[tuple[str, ...]] = []
+    depth_of = {op: 10 + i for i, op in enumerate(_SHIPPED_BY_OPERATOR)}
+
+    async def verbose(self, txid):
+        (op,) = {str(source_key(u)) for u in self._urls}  # a split client is ONE operator
+        return {"confirmations": depth_of[op]}
+
+    async def tip(self):
+        (op,) = {str(source_key(u)) for u in self._urls}
+        return 100 + depth_of[op] - 1
+
+    async def close(self):
+        closed.append(tuple(self._urls))
+
+    async def no_network(self, *a, **k):  # pragma: no cover - reached only if a read is not faked
+        raise AssertionError("the test reached the network")
+
+    monkeypatch.setattr(ElectrumXClient, "_call", no_network)
+    monkeypatch.setattr(ElectrumXClient, "get_tip_height", tip)
+    monkeypatch.setattr(ElectrumXClient, "get_transaction_verbose", verbose)
+    monkeypatch.setattr(ElectrumXClient, "close", close)
+    client = ElectrumXClient(urls=list(DEFAULT_ENDPOINTS["mainnet"]))
+    assert client.source_key is None and tuple(map(str, client.source_keys)) == tuple(_SHIPPED_BY_OPERATOR)
+    got = await RadiantChainIO(client).reported_depths("ab" * 32, 100)
+    assert got == tuple(depth_of.items())
+    assert sorted(closed) == sorted(tuple(v) for v in _SHIPPED_BY_OPERATOR.values())

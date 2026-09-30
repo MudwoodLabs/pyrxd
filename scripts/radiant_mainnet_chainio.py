@@ -37,6 +37,7 @@ from typing import Any
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
 from pyrxd.network.registry import default_endpoints
+from pyrxd.network.source_identity import source_key
 from pyrxd.security.units import ChainHeight, PhotonValue
 
 
@@ -85,6 +86,9 @@ class SshTrRadiantClient:
         self._rpcwallet = rpcwallet
         self._timeout = ssh_timeout_s
         self._spk_by_hash: dict[bytes, bytes] = {}
+        #: The node's operator group as the taker gate counts it (the user's own node): the ssh
+        #: destination, through the one identity function, as ``pyrxd.gravity.watch.sshtr`` does.
+        self.source_key = source_key(ssh_host)
 
     def register_spk(self, spk: bytes) -> None:
         """Register a covenant SPK so get_utxos can resolve it from its script_hash."""
