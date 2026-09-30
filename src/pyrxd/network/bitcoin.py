@@ -28,7 +28,7 @@ from collections import Counter
 from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urljoin
 
 import aiohttp
 
@@ -37,6 +37,7 @@ from ..security.errors import InsufficientConfirmationsError, NetworkError, Vali
 from ..security.secrets import SecretBytes
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
 from ._guards import finite_int, merkle_branch, nonneg_int, require_bool
+from .source_identity import SameHostFailover, SourceKey, group_by_source, require_distinct_sources, source_key
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,15 @@ _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
 
 class BtcDataSource(ABC):
-    """Abstract interface for blockchain data providers."""
+    """Abstract interface for blockchain data providers.
+
+    ``source_key`` names the distinct host a source reads from
+    (:func:`~pyrxd.network.source_identity.source_key` of its URL), which is how
+    :class:`MultiSourceBtcDataSource` counts it. ``None`` means "cannot say", and a quorum
+    refuses such a source rather than guess.
+    """
+
+    source_key: SourceKey | None = None
 
     @abstractmethod
     async def get_tip_height(self) -> BlockHeight:
@@ -253,6 +262,7 @@ class MempoolSpaceSource(BtcDataSource):
 
     def __init__(self, base_url: str = "https://mempool.space/api") -> None:
         self._base_url = base_url.rstrip("/") + "/"
+        self.source_key = source_key(base_url)
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -434,6 +444,7 @@ class BlockstreamSource(BtcDataSource):
 
     def __init__(self, base_url: str = "https://blockstream.info/api") -> None:
         self._base_url = base_url.rstrip("/") + "/"
+        self.source_key = source_key(base_url)
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -616,6 +627,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
 
     def __init__(self, url: str, user: str, password: str) -> None:
         self._url = url
+        self.source_key = source_key(url)
         self._user = user
         # Store password as SecretBytes to prevent accidental logging.
         self._password = SecretBytes(password.encode())
@@ -825,7 +837,10 @@ class MultiSourceBtcDataSource(BtcDataSource):
     Parameters
     ----------
     sources:
-        Two or more ``BtcDataSource`` instances.
+        Two or more ``BtcDataSource`` instances on DISTINCT HOSTS. Each must carry a
+        ``source_key`` (every shipped source derives one from its URL); two sources on one host
+        are refused, because one host agreeing with itself is not a quorum. Distinct hosts are
+        not proof of distinct operators — see :mod:`pyrxd.network.source_identity`.
     quorum:
         Minimum number of agreeing sources required (default 2).
     """
@@ -833,6 +848,7 @@ class MultiSourceBtcDataSource(BtcDataSource):
     def __init__(self, sources: list[BtcDataSource], quorum: int = 2) -> None:
         if not sources:
             raise ValidationError("MultiSourceBtcDataSource requires at least one source")
+        require_distinct_sources(sources, what="MultiSourceBtcDataSource")
         # `quorum` went unvalidated here while both sibling quorum readers
         # (:class:`MultiSourceBtcFundingReader`, :class:`~pyrxd.gravity.watch.adapters.
         # MultiSourceRxdChainSource`) refuse `quorum < 1`. A 0 or negative quorum makes
@@ -1118,6 +1134,7 @@ class _MempoolHttpClient:
 
     def __init__(self, base_url: str = "https://mempool.space/api", *, timeout_s: float | None = None) -> None:
         self._base_url = base_url.rstrip("/") + "/"
+        self.source_key = source_key(base_url)
         self._session: aiohttp.ClientSession | None = None
         self._timeout_s = self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
 
@@ -1261,6 +1278,9 @@ class MempoolSpaceFundingReader:
         self, client: _MempoolHttpClient | None = None, *, base_url: str = "https://mempool.space/api"
     ) -> None:
         self._http = client or _MempoolHttpClient(base_url)
+        #: The distinct host this reader counts as in a quorum: its HTTP client's, which was
+        #: derived from the URL it connects to. ``None`` for an injected client that cannot say.
+        self.source_key: SourceKey | None = getattr(self._http, "source_key", None)
 
     async def confirmations(self, txid: str) -> int:
         tx = txid if isinstance(txid, Txid) else Txid(txid)
@@ -1278,7 +1298,7 @@ class MempoolSpaceFundingReader:
         # confused or lying source — fail-closed LOUD (raise) rather than silently
         # computing a depth from it. NOTE: over-reporting via a plausible-but-false LOW
         # height is NOT detectable from a single source; above-dust value MUST corroborate
-        # across independent sources / SPV header burial (see the module DECISION note).
+        # across sources on distinct hosts / SPV header burial (see the module DECISION note).
         if block_height < 1 or block_height > int(tip):
             raise NetworkError(
                 f"inconsistent confirmation data for {str(tx)[:16]}…: block_height={block_height}, tip={int(tip)}; "
@@ -1391,31 +1411,6 @@ class MempoolSpaceFundingReader:
         await self._http.close()
 
 
-def endpoint_host(url: str) -> str | None:
-    """The lowercased hostname of a base URL, for endpoint-diversity checks. ``None`` if unparseable
-    (a token with no host is conservatively treated as its own distinct source by the caller)."""
-    if not isinstance(url, str) or not url.strip():
-        return None
-    parsed = urlparse(url if "://" in url else "//" + url.strip())
-    host = (parsed.hostname or "").lower()
-    return host or None
-
-
-def count_distinct_hosts(urls: Sequence[str]) -> int:
-    """Number of DISTINCT endpoint hosts in *urls*. URLs whose host can't be parsed are counted as one
-    distinct source each (we can't prove they collide). Used to bound a real quorum: a quorum of
-    same-host endpoints is false corroboration — one hostile/buggy host satisfies the whole "quorum"."""
-    hosts: set[str] = set()
-    opaque = 0
-    for u in urls:
-        h = endpoint_host(u)
-        if h is None:
-            opaque += 1
-        else:
-            hosts.add(h)
-    return len(hosts) + opaque
-
-
 _SATS_PER_BTC = Decimal(100_000_000)
 
 
@@ -1434,6 +1429,9 @@ class BitcoinCoreFundingReader:
         if not callable(rpc):
             raise ValidationError("rpc must be an async callable rpc(method, params)")
         self._rpc = rpc
+        #: The distinct host, when *rpc* is a bound method of a client that knows its URL
+        #: (e.g. :attr:`BitcoinCoreRpcSource._rpc`); otherwise ``None``, which a quorum refuses.
+        self.source_key: SourceKey | None = getattr(getattr(rpc, "__self__", None), "source_key", None)
 
     async def _verbose_tx(self, txid: str) -> dict:
         tx = txid if isinstance(txid, Txid) else Txid(txid)
@@ -1533,7 +1531,7 @@ class BitcoinCoreFundingReader:
 
 
 class MultiSourceBtcFundingReader:
-    """Quorum ``BtcFundingReader`` over N independent Esplora-style providers.
+    """Quorum ``BtcFundingReader`` over N Esplora-style providers on DISTINCT HOSTS.
 
     Audit 2026-05-29 F-17: mitigates the single-source confirmation-depth SPOF — a
     lone compromised/MITM'd source that OVER-reports depth (under-reports
@@ -1555,7 +1553,8 @@ class MultiSourceBtcFundingReader:
     failing source is simply dropped from the quorum (never fails the whole read).
     """
 
-    #: Default independent mainnet Esplora endpoints (distinct operators).
+    #: Default mainnet Esplora endpoints: three DISTINCT HOSTS. That is what a URL can show; whether
+    #: their operators are independent of each other is not, and is not claimed.
     DEFAULT_MAINNET_ENDPOINTS = (
         "https://mempool.space/api",
         "https://blockstream.info/api",
@@ -1564,6 +1563,11 @@ class MultiSourceBtcFundingReader:
 
     def __init__(self, readers: list, *, quorum: int = 2, dust_cap_sats: int = 10_000) -> None:
         readers = list(readers)
+        # ONE HOST, ONE VOTE. Each reader names its host (`source_key`, derived from its URL), and
+        # two readers on one host are refused: they would agree with each other and be counted as
+        # corroboration. Several URLs on one host belong in ONE `SameHostFailover` reader, which is
+        # what `from_endpoints` builds for them.
+        require_distinct_sources(readers, what="MultiSourceBtcFundingReader")
         if quorum < 1:
             raise ValidationError("quorum must be >= 1")
         if len(readers) < quorum:
@@ -1585,6 +1589,10 @@ class MultiSourceBtcFundingReader:
     ) -> MultiSourceBtcFundingReader:
         """Build the reader from Esplora base URLs, requiring at least ``quorum`` DISTINCT hosts.
 
+        URLs are grouped by :func:`~pyrxd.network.source_identity.source_key`, and each host becomes
+        ONE reader — several URLs on one host are that reader's failover list
+        (:class:`~pyrxd.network.source_identity.SameHostFailover`), never several votes.
+
         A quorum of same-host endpoints is false corroboration (one hostile/buggy/MITM'd host satisfies
         the whole "quorum"), so e.g. two ``mempool.space`` URLs can never form a genuine 2-of-2. By
         default this **fails closed** (raises ``ValidationError``) when the endpoints resolve to fewer
@@ -1596,20 +1604,21 @@ class MultiSourceBtcFundingReader:
         loudly so the operator sees the real corroboration level."""
         if not urls:
             raise ValidationError("from_endpoints requires at least one endpoint URL")
-        distinct = count_distinct_hosts(urls)
+        groups = group_by_source(urls)
+        distinct = len(groups)
         if distinct < quorum:
             if not allow_insufficient_diversity:
                 raise ValidationError(
                     f"BTC funding quorum: {len(urls)} endpoint(s) resolve to only {distinct} distinct "
                     f"host(s), short of quorum={quorum}. A quorum of same-host endpoints is false "
                     f"corroboration (one hostile/buggy host satisfies it), so this fails closed. "
-                    f"Configure >= {quorum} INDEPENDENT hosts, or pass allow_insufficient_diversity=True "
+                    f"Configure >= {quorum} DISTINCT hosts, or pass allow_insufficient_diversity=True "
                     f"to explicitly accept the degraded single-/low-source posture."
                 )
             logger.warning(
                 "BTC funding quorum: %d endpoint(s) resolve to only %d distinct host(s); clamping quorum "
                 "%d -> %d (allow_insufficient_diversity). A quorum of same-host endpoints is false "
-                "corroboration — configure >= %d INDEPENDENT hosts for genuine %d-of-N safety.",
+                "corroboration — configure >= %d DISTINCT hosts for a %d-of-N quorum.",
                 len(urls),
                 distinct,
                 quorum,
@@ -1618,12 +1627,17 @@ class MultiSourceBtcFundingReader:
                 quorum,
             )
         effective = max(1, min(quorum, distinct))
-        readers = [MempoolSpaceFundingReader(base_url=u) for u in urls]
+        readers = [
+            MempoolSpaceFundingReader(base_url=group[0])
+            if len(group) == 1
+            else SameHostFailover([MempoolSpaceFundingReader(base_url=u) for u in group])
+            for _key, group in groups
+        ]
         return cls(readers, quorum=effective, dust_cap_sats=dust_cap_sats)
 
     @classmethod
     def default_mainnet(cls, *, quorum: int = 2, dust_cap_sats: int = 10_000) -> MultiSourceBtcFundingReader:
-        """Wire the three default independent mainnet Esplora endpoints (2-of-3)."""
+        """Wire the three default mainnet Esplora endpoints (three distinct hosts, 2-of-3)."""
         return cls.from_endpoints(cls.DEFAULT_MAINNET_ENDPOINTS, quorum=quorum, dust_cap_sats=dust_cap_sats)
 
     async def _gather(self, coro_fn) -> list:

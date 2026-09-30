@@ -92,6 +92,7 @@ from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.network.rxindexer import RxinDexerClient
+from pyrxd.network.source_identity import group_by_source
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 
@@ -875,12 +876,25 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
     the lagging case is the common one: a load-balanced provider serving a stale node is already
     recorded in this codebase as having refused a claim and nearly killed a secret.
 
-    Independence is the operator's job and this code cannot check it. Three URLs at one provider
-    share one operator and one outage, and would satisfy the count while providing nothing.
+    The count is of DISTINCT HOSTS (`pyrxd.network.source_identity.source_key`), not of URLs: one
+    URL typed three times, or `https://h`, `https://h:443` and `https://h./x`, is one host and used
+    to pass the three-endpoint gate on its own. Repeating a host is refused outright rather than
+    silently collapsed, so the operator sees that the list they wrote is not the quorum they meant.
+
+    What a host count cannot check is independence, which is the operator's job: three hosts at one
+    provider, an RPC aggregator fronting other providers' nodes, or providers reading one upstream
+    node share one operator or one outage while counting as three distinct hosts.
     """
     urls = [u.strip() for u in str(rpc_url).split(",") if u.strip()]
     if not urls:
         raise SystemExit("--eth-rpc-url is required")
+    repeated = [(str(host), group) for host, group in group_by_source(urls) if len(group) > 1]
+    if repeated:
+        host, group = repeated[0]
+        raise SystemExit(
+            f"--eth-rpc-url names host {host!r} {len(group)} times; one host is one source however many "
+            "URLs reach it, so it cannot corroborate itself. List each host once."
+        )
     if _token_leg_is_real(args) and len(urls) < 3:
         # THREE, not two, and the reason is arithmetic rather than taste. `min_agreeing` defaults
         # to a true majority — max(2, n//2+1) — so at n=2 it is 2, and `assert_chain`'s tolerance
@@ -889,21 +903,21 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
         # Requiring two endpoints buys a cross-check; requiring three buys the cross-check AND
         # survives one of them being rate-limited, which on free public endpoints is routine.
         raise SystemExit(
-            f"a real-value token counter leg needs at least THREE independent --eth-rpc-url "
-            f"endpoints (got {len(urls)}), so a quorum survives one being unreachable. At two, "
+            f"a real-value token counter leg needs at least THREE --eth-rpc-url endpoints on "
+            f"distinct hosts (got {len(urls)}), so a quorum survives one being unreachable. At two, "
             "min_agreeing is 2 and a single 429 stalls the swap mid-flight. Working L1 endpoints "
             "measured 2026-08-26: ethereum-rpc.publicnode.com, eth-mainnet.public.blastapi.io, "
-            "eth.api.onfinality.io/public, eth.drpc.org, rpc.mevblocker.io. Use DIFFERENT "
-            "operators — several URLs from one provider share a single failure."
+            "eth.api.onfinality.io/public, eth.drpc.org, rpc.mevblocker.io. Prefer providers that do "
+            "not share an operator or an upstream node: distinct hosts at one provider share a "
+            "single failure, and pyrxd can count hosts but cannot see who runs them."
         )
     if len(urls) == 1:
         if _token_leg_is_real(args):
             raise SystemExit(
-                "a real-value token counter leg requires at least TWO independent --eth-rpc-url "
-                "endpoints (comma-separated), so no irreversible step rests on one endpoint's "
-                "word. Working L1 endpoints measured 2026-08-26: ethereum-rpc.publicnode.com. "
-                "Use providers with DIFFERENT operators — several URLs from one provider share a "
-                "single failure and satisfy nothing."
+                "a real-value token counter leg requires --eth-rpc-url endpoints on distinct hosts "
+                "(comma-separated), so no irreversible step rests on one endpoint's word. Working L1 "
+                "endpoints measured 2026-08-26: ethereum-rpc.publicnode.com. Prefer providers that "
+                "do not share an operator — several URLs from one provider share a single failure."
             )
         return EthRpc(urls[0], expected_chain_id=chain_id)
     return MultiSourceEthRpc([EthRpc(u, expected_chain_id=chain_id) for u in urls])
@@ -1500,7 +1514,8 @@ def _args() -> argparse.Namespace:
         help=(
             "EVM endpoint. Comma-separated for a QUORUM, which a real token counter leg requires: "
             "safety-critical reads then need agreement instead of one endpoint's word. Use "
-            "independent providers — several URLs from one provider share a single failure."
+            "providers on distinct hosts that do not share an operator — several URLs from one provider "
+            "share a single failure, and repeating a host is refused."
         ),
     )
     add_eth_key_arguments(ap)

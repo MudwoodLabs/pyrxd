@@ -83,6 +83,7 @@ from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
 from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
+from pyrxd.network.source_identity import group_by_source
 from pyrxd.security.errors import RxdSdkError, ValidationError
 
 logger = logging.getLogger("pyrxd.watchtower")
@@ -113,7 +114,7 @@ def build_reconciler(
     a no-op ``NullExecutor`` → ALERT-ONLY, byte-identical to v1."""
     store = JsonDirRecordStore(records_dir)
 
-    # Multi-source claim DETECTION (red-team MEDIUM): one /outspend fn per independent Esplora so a
+    # Multi-source claim DETECTION (red-team MEDIUM): one /outspend fn per configured Esplora so a
     # single lagging/lying source cannot suppress the PAGE_CLAIM (detection fails toward paging).
     def _make_outspend(base_url: str) -> Callable[[str, int], Awaitable[tuple[bool, str | None]]]:
         async def _outspend(funding_txid: str, vout: int) -> tuple[bool, str | None]:
@@ -198,7 +199,7 @@ def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> Mul
     A wrong/mainnet base on a signet run reads the wrong chain → the funding is never found → the maturity
     gate stays WATCH (fail-closed, never a wrongful broadcast)."""
     if network == "bc":
-        # Mainnet: the three default independent endpoints (2-of-3). from_endpoints fails closed if the
+        # Mainnet: the three default distinct-host endpoints (2-of-3). from_endpoints fails closed if the
         # endpoints ever resolve to < quorum distinct hosts — no silent single-source above-dust arming.
         return MultiSourceBtcFundingReader.default_mainnet(quorum=quorum)
     # Non-mainnet (signet/testnet) is a NO-REAL-VALUE test network and is typically 1-of-1, so it
@@ -211,10 +212,11 @@ def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> Mul
     )
 
 
-#: Default INDEPENDENT public Radiant ElectrumX endpoints (distinct operators), verified live
-#: 2026-06-08. Used when --rxd-electrumx-url is not given on an electrumx run, so the recommended
-#: 2-of-2 (or 2-of-3 with --rxd-include-node) corroboration is turnkey — mirrors the BTC reader's
-#: DEFAULT_MAINNET_ENDPOINTS. Pass --rxd-electrumx-url explicitly to override.
+#: Default public Radiant ElectrumX endpoints on DISTINCT HOSTS, verified live 2026-06-08 (the same
+#: pair as ``pyrxd.network.registry.DEFAULT_ENDPOINTS["mainnet"]``, whose note records what is and
+#: is not known about who runs them). Used when --rxd-electrumx-url is not given on an electrumx
+#: run, so the recommended 2-of-2 (or 2-of-3 with --rxd-include-node) corroboration is turnkey —
+#: mirrors the BTC reader's DEFAULT_MAINNET_ENDPOINTS. Pass --rxd-electrumx-url explicitly to override.
 DEFAULT_RXD_ELECTRUMX = (
     "wss://electrumx.radiant4people.com:50022",
     "wss://electrumx.radiantcore.org",
@@ -224,15 +226,18 @@ DEFAULT_RXD_ELECTRUMX = (
 async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> tuple[RxdChainSource, bool]:
     """Assemble the RXD chain source(s); return ``(source, corroborated)``.
 
-    Composes (optionally) the operator's own ssh-tr node + any number of INDEPENDENT public ElectrumX
-    endpoints. With >= ``--rxd-quorum`` (default 2) sources they are wrapped in a fail-closed
+    Composes (optionally) the operator's own ssh-tr node + any number of public ElectrumX endpoints,
+    ONE SOURCE PER DISTINCT HOST (:func:`pyrxd.network.source_identity.source_key`): several URLs on
+    one host become one client that races them (failover), never several sources. Distinct hosts are
+    not proof of distinct operators; one party running two of them defeats the quorum.
+    With >= ``--rxd-quorum`` (default 2) sources they are wrapped in a fail-closed
     :class:`MultiSourceRxdChainSource` and ``corroborated=True`` (clears the single-source
     ``low_corroboration`` flag — the recurring v2 blocker); a single source stays ``corroborated=False``
     (the v1 alert-only posture). ssh-tr is read-only (no broadcast surface); ElectrumX websockets are
     context-managed so the stack closes them on exit. Note: corroboration clears the low-corroboration
     gate but does NOT lift the executor's dust cap or the mainnet ``audit_cleared`` gate."""
     sources: list[RxdChainSource] = []
-    # The operator's own node (independent infra) — included on --rxd-backend ssh-tr OR --rxd-include-node.
+    # The operator's own node (its own host) — included on --rxd-backend ssh-tr OR --rxd-include-node.
     if args.rxd_backend == "ssh-tr" or args.rxd_include_node:
         from pyrxd.gravity.watch.sshtr import SshTrRxdReader  # deferred: only needed for this backend
 
@@ -251,16 +256,12 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     urls = list(args.rxd_electrumx_url or [])
     if not urls and args.rxd_backend != "ssh-tr":
         urls = list(DEFAULT_RXD_ELECTRUMX)
-    seen: set[str] = set()
-    for raw_url in urls:
-        url = raw_url.strip()
-        # Dedup on a normalized key (case + trailing slash) so the SAME endpoint listed twice can't
-        # masquerade as two independent sources and fake corroboration. Connect with the exact URL.
-        key = url.rstrip("/").lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        client = await stack.enter_async_context(ElectrumXClient([url], allow_insecure=args.allow_insecure))
+    # ONE SOURCE PER HOST, by the one identity every quorum uses. `wss://h`, `wss://h:443`,
+    # `wss://h/x` and `wss://h.` are one server; keyed on the URL text they were four sources, and
+    # one server's "not locked" became a CORROBORATED absence that permits an autonomous refund.
+    # A host's URLs go to ONE client, which races them — failover, counted once.
+    for _host, host_urls in group_by_source(u.strip() for u in urls):
+        client = await stack.enter_async_context(ElectrumXClient(host_urls, allow_insecure=args.allow_insecure))
         sources.append(ElectrumRxdChainSource(client))
     if not sources:
         raise ValidationError(
@@ -271,7 +272,7 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
         return sources[0], False  # single source → low-corroboration (v1 posture)
     if len(sources) < args.rxd_quorum:
         raise ValidationError(
-            f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} independent RXD source(s) wired; "
+            f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} RXD source(s) on distinct hosts wired; "
             "add --rxd-electrumx-url / --rxd-include-node, or lower --rxd-quorum"
         )
     # corroborated only when the quorum is a real majority-style check (>= 2); quorum=1 trusts any one.
@@ -657,15 +658,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--rxd-include-node",
         action="store_true",
-        help="ALSO include the operator's own ssh-tr node as an independent RXD source (combine with "
-        "--rxd-electrumx-url for 2-of-3); the node's own infra is independent of the public ElectrumX",
+        help="ALSO include the operator's own ssh-tr node as an RXD source on its own host (combine with "
+        "--rxd-electrumx-url for 2-of-3); it counts as one more distinct host beside the public ElectrumX",
     )
     p.add_argument(
         "--rxd-quorum",
         type=int,
         default=2,
         help="RXD source quorum (>=2 enables corroboration: clears low_corroboration when >= this many "
-        "independent sources are wired; fail-closed below it)",
+        "sources on distinct hosts are wired; fail-closed below it). Several URLs on one host count once",
     )
     # No defaults: this ships in the public wheel. The previous "tr" / "radiant-mainnet"
     # defaults were one operator's private infrastructure, and a user who passed only
@@ -677,7 +678,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--esplora-url",
         action="append",
-        help="additional INDEPENDENT Esplora base URL for claim-detection corroboration (repeatable); "
+        help="additional Esplora base URL, on another host, for claim-detection corroboration (repeatable); "
         "defaults to adding blockstream.info when none given (red-team: multi-source detection)",
     )
     p.add_argument(
@@ -951,8 +952,10 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
         with contextlib.suppress(NotImplementedError):  # Windows / restricted envs
             loop.add_signal_handler(sig, stop.set)
 
-    # Independent Esplora set for multi-source claim DETECTION (dedup, preserve order). Default a
-    # free second source so corroboration is ON out of the box (red-team MEDIUM).
+    # Esplora set for multi-source claim DETECTION (exact repeats dropped, order preserved). Default a
+    # free second source so corroboration is ON out of the box (red-team MEDIUM). Detection is
+    # any-of, so a repeated host costs nothing there; the funding QUORUM built from this list counts
+    # by host (`MultiSourceBtcFundingReader.from_endpoints` -> `source_key`), not by this dedupe.
     esploras = [args.mempool_base_url, *(args.esplora_url or [])]
     # blockstream.info is a MAINNET endpoint — only auto-add it on mainnet (a signet/testnet run must
     # point --mempool-base-url at that network's Esplora, e.g. https://mempool.space/signet).

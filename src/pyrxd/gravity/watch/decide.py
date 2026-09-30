@@ -87,7 +87,7 @@ class Observations:
     checkpoint-not-depth analogue (the maker's ETH claim + its ``finalized``-checkpoint
     verdict state), populated only for an ETH swap — see the inline note below.
     ``low_corroboration`` flags an RXD (or single-source ETH RPC) read that could not be
-    cross-checked against an independent source — a false read here causes a false *page*,
+    cross-checked against a source on another host — a false read here causes a false *page*,
     never a false broadcast.
     """
 

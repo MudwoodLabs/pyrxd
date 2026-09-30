@@ -33,6 +33,7 @@ from pyrxd.network.bitcoin import (
 )
 from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
+from tests._source_hosts import distinct_host
 
 # ---------------------------------------------------------------------------
 # Helpers to build fake aiohttp response objects
@@ -535,6 +536,7 @@ class TestBlockstreamSource:
 class TestMultiSourceBtcDataSource:
     def _make_source(self, tip=800000) -> MagicMock:
         src = AsyncMock()
+        src.source_key = distinct_host()
         src.get_tip_height = AsyncMock(return_value=BlockHeight(tip))
         src.get_block_hash = AsyncMock(return_value=Hex32(bytes.fromhex("cd" * 32)))
         src.get_raw_tx = AsyncMock(return_value=RawTx(_REAL_TX))
@@ -763,6 +765,7 @@ class TestMultiSourceBtcDataSource:
         """
         s1 = self._make_source()
         s2 = AsyncMock()
+        s2.source_key = distinct_host()
         s2.get_tip_height = AsyncMock(side_effect=NetworkError("timeout"))
         multi = MultiSourceBtcDataSource([s1, s2], quorum=1)
         with pytest.raises(NetworkError, match="majority of the configured sources"):
@@ -778,6 +781,7 @@ class TestMultiSourceBtcDataSource:
     async def test_three_sources_tolerate_one_outage(self):
         """Outage tolerance is what a third source buys."""
         s3 = AsyncMock()
+        s3.source_key = distinct_host()
         s3.get_tip_height = AsyncMock(side_effect=NetworkError("timeout"))
         multi = MultiSourceBtcDataSource([self._make_source(), self._make_source(), s3], quorum=2)
         assert int(await multi.get_tip_height()) == 800000
@@ -792,6 +796,7 @@ def _fake_reader(*, confs=None, amount=None, confs_exc=None, amount_exc=None, ou
     """A duck-typed funding reader whose confirmations / amount / confirmed-unspent output are
     scriptable (``output`` is the ``(scriptPubKey, value_sats)`` pair)."""
     r = MagicMock()
+    r.source_key = distinct_host()
     r.confirmations = AsyncMock(return_value=confs, side_effect=confs_exc)
     r.read_output_amount_sats = AsyncMock(return_value=amount, side_effect=amount_exc)
     r.read_confirmed_unspent_output = AsyncMock(return_value=output, side_effect=output_exc)

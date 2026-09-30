@@ -943,8 +943,8 @@ class EthHtlcContractLeg:
         CANONICAL block at ``blockNumber`` (a fabricated receipt height is caught when its hash !=
         the canonical hash) — so a naive lying RPC cannot make a non-final claim read FINAL. This
         does NOT defend a fully-consistent malicious provider (one that lies coherently about the
-        whole chain): a real-value path MUST use a multi-source finality quorum (≥2 independent
-        providers must agree the claim is final). That quorum is DEFERRED to the audit-gated
+        whole chain): a real-value path MUST use a multi-source finality quorum (≥2 providers on
+        distinct hosts must agree the claim is final; distinct hosts do not prove distinct operators). That quorum is DEFERRED to the audit-gated
         real-value track; the dust/pre-audit path accepts a single trusted provider.
         """
         receipt = await self._rpc.wait_receipt(tx_hash)

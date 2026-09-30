@@ -1,4 +1,4 @@
-"""Quorum reads across independent EVM endpoints — the ETH analogue of
+"""Quorum reads across EVM endpoints on distinct hosts — the ETH analogue of
 :class:`~pyrxd.network.bitcoin.MultiSourceBtcFundingReader`.
 
 The gap this closes
@@ -48,6 +48,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
+from ..network.source_identity import require_distinct_sources
 from ..security.errors import NetworkError, ValidationError
 
 __all__ = ["MultiSourceEthRpc", "read_contract"]
@@ -95,19 +96,30 @@ async def read_contract(
 
 
 class MultiSourceEthRpc:
-    """Several independent EVM endpoints presented as one, with quorum on the reads that matter.
+    """Several EVM endpoints on DISTINCT HOSTS presented as one, with quorum on the reads that matter.
 
-    Drop-in for :class:`~pyrxd.eth_wallet.rpc.EthRpc` on the read paths the swap depends on. The
-    sources must be genuinely independent to be worth anything — three URLs at one provider share
-    one failure and one operator, and this class cannot tell the difference.
+    Drop-in for :class:`~pyrxd.eth_wallet.rpc.EthRpc` on the read paths the swap depends on.
 
-    :param sources: two or more ``EthRpc`` instances, each pinned to the same chain id.
+    ONE HOST, ONE VOTE. Each source carries a ``source_key`` (``EthRpc`` derives it from its URL
+    through :func:`pyrxd.network.source_identity.source_key`), and two sources on one host are
+    refused: ``MultiSourceEthRpc([r, r])`` used to be a 2-of-2 quorum of one endpoint agreeing
+    with itself, and so did ``https://h/v2/KEY1`` beside ``https://h:443/v2/KEY2``.
+
+    What a host key cannot see, and this class therefore cannot either: two hosts run by one
+    provider, an RPC aggregator or load balancer fronting other providers' nodes, or two providers
+    reading from one upstream node. Those share one failure and one operator while counting as two
+    distinct hosts. Choosing providers that do not share an operator or an upstream is the
+    operator's job.
+
+    :param sources: two or more ``EthRpc`` instances on distinct hosts, each pinned to the same
+        chain id.
     :param min_agreeing: how many must answer before an answer exists. Defaults to a true majority
         of the sources, never fewer than 2.
     """
 
     def __init__(self, sources: Sequence[Any], *, min_agreeing: int | None = None) -> None:
         self._sources = list(sources)
+        require_distinct_sources(self._sources, what="MultiSourceEthRpc")
         if len(self._sources) < 2:
             raise ValidationError(
                 f"MultiSourceEthRpc needs at least 2 sources, got {len(self._sources)}. One source "

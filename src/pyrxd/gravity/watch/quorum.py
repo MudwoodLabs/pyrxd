@@ -2,11 +2,11 @@
 
 Turns chain reads into the :class:`Observations` that :func:`decide` consumes. The
 safety-critical input — the maker's BTC-claim *depth* — must be quorum-agreed
-(conservative ``min`` across independent sources, fail-closed below quorum); the
+(conservative ``min`` across sources on distinct hosts, fail-closed below quorum); the
 shell backs :class:`BtcClaimSource.confirmations` with
 ``network.bitcoin.MultiSourceBtcFundingReader`` (already built: ``min(depth)``,
 2-of-3, fail-closed). The RXD side is now **multi-source** too:
-:class:`pyrxd.gravity.watch.adapters.MultiSourceRxdChainSource` composes >= 2 independent
+:class:`pyrxd.gravity.watch.adapters.MultiSourceRxdChainSource` composes >= 2 distinct-host
 Radiant readers (the operator's node + public ElectrumX), and the daemon shell wires it by
 default (``pyrxd.gravity.watch.run``, 2-of-2 public ElectrumX) — passing
 ``rxd_corroborated=True`` clears the ``low_corroboration`` flag. A single-source RXD config
@@ -67,8 +67,8 @@ class BtcClaimStatus:
 class BtcClaimSource(Protocol):
     """Detects the maker's counter-leg claim and reads its quorum-agreed depth.
 
-    ``confirmations`` MUST be quorum-backed (conservative ``min`` across independent
-    sources) — it is the reorg-safety input to the gate. The shell satisfies it with
+    ``confirmations`` MUST be quorum-backed (conservative ``min`` across sources on distinct
+    hosts) — it is the reorg-safety input to the gate. The shell satisfies it with
     ``MultiSourceBtcFundingReader``.
     """
 

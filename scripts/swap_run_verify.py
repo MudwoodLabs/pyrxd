@@ -47,7 +47,6 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from urllib.parse import urlparse
 
 # pyrxd is importable from the repo (editable install / src layout).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -61,6 +60,7 @@ from pyrxd.btc_wallet.taproot import (
     scrape_secret,
 )
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
+from pyrxd.network.source_identity import source_key
 from pyrxd.transaction.transaction import Transaction
 
 # Secret substrings forbidden in any cross-host / journal file (mirrors eth_swap_two_host._assert_public_only).
@@ -318,17 +318,16 @@ def assert_no_secrets(doc: object, *, what: str) -> None:
 
 
 def _host_of(url: str) -> str:
-    """Hostname of a URL, ROBUST to scheme-less forms. ``urlparse("localhost:8545").hostname`` is ``None``
-    (it reads ``localhost`` as the scheme), so a naive ``.hostname or url`` would treat ``localhost:8545``
-    and ``localhost:8546`` as two distinct 'hosts' — a fake quorum / false independence (review LOW).
-    Prepend ``//`` when there is no scheme so the netloc parses; fall back to the raw string."""
-    u = url if "://" in url else "//" + url.lstrip("/")
-    return (urlparse(u).hostname or url).lower()
+    """The distinct-host key of a URL: :func:`pyrxd.network.source_identity.source_key`, the one identity
+    every source count in pyrxd uses. Scheme-less forms (``localhost:8545``) parse, and the port, path,
+    case and a trailing dot are dropped, so ``localhost:8545``/``localhost:8546`` and ``h``/``h.`` are one
+    host — counting them as two would be a fake quorum (review LOW)."""
+    return str(source_key(url))
 
 
 def _dedup_by_host(urls: list[str]) -> list[str]:
     """Collapse URLs that share a hostname to one (order-preserving). Two endpoints on the SAME host are the
-    SAME trust domain, so counting them as two independent sources would be a fake quorum — a party who runs
+    SAME trust domain, so counting them as two distinct sources would be a fake quorum — a party who runs
     that host could feed both a fabricated tx/receipt in lockstep."""
     seen: set[str] = set()
     out: list[str] = []
@@ -341,7 +340,10 @@ def _dedup_by_host(urls: list[str]) -> list[str]:
 
 
 def assert_independent_endpoints(verifier_urls: list[str], party_endpoints: tuple[str, ...]) -> None:
-    """The verifier's corroboration sources MUST be hosts neither party ran (else it's not independent).
+    """The verifier's corroboration sources MUST be hosts neither party used (else the re-fetch is not a distinct host).
+
+    Host identity is :func:`_host_of` (the shared distinct-host key). A distinct host is not proof of a distinct
+    operator: a party that runs a second host the verifier happens to pick passes this check.
 
     NB: `party_endpoints` is manifest-supplied (party-declared), so an adversary who runs the "third-party"
     source can simply omit it here and this hostname check passes. This guard is therefore ADVISORY — the
@@ -353,7 +355,7 @@ def assert_independent_endpoints(verifier_urls: list[str], party_endpoints: tupl
         host = _host_of(u)
         if host in party_hosts:
             raise ValueError(
-                f"verifier endpoint {host!r} was ALSO used by a swap party — re-fetch is not independent. "
+                f"verifier endpoint {host!r} was ALSO used by a swap party — the re-fetch is not from a distinct host. "
                 f"Point --btc-esplora-url / --rxd-electrumx-url at a third source."
             )
 
@@ -1062,13 +1064,13 @@ def _eth_material_fp(tx: dict, rcpt: dict | None) -> tuple:
 
 
 class _MultiEthFetcher:
-    """Cross-check an ETH tx/receipt across N INDEPENDENT RPCs (H2). Unlike a BTC/RXD tx — whose bytes are
+    """Cross-check an ETH tx/receipt across N RPCs on DISTINCT HOSTS (H2). Unlike a BTC/RXD tx — whose bytes are
     pinned by ``hash(tx) == txid`` — an ETH tx/receipt cannot be self-verified from the returned fields, so
     a single hostile or MITM'd RPC could fabricate a receipt (wrong value, forged Claimed log, spoofed
     finality) and steer the verdict to a false PASS. This fetcher queries every configured RPC and requires
     them to AGREE on every material fact (see ``_eth_material_fp``); a lone dissenter fails the run rather
     than being out-voted. With a single RPC it degrades to one source and the caller emits a loud
-    not-independent warning."""
+    single-source warning."""
 
     def __init__(self, rpc_urls: list[str], chain_id: int):
         # Dedup by host here too (not only at the CLI): a programmatic caller passing two same-host URLs
@@ -1087,7 +1089,7 @@ class _MultiEthFetcher:
         if len(fps) != 1:
             raise ValueError(
                 f"ETH sources DISAGREE on the material facts of {tx_hash} across {self.source_count} "
-                "independent RPCs — refusing to score a possibly-fabricated tx/receipt"
+                "RPCs on distinct hosts — refusing to score a possibly-fabricated tx/receipt"
             )
         return results[0]
 
@@ -1786,13 +1788,13 @@ def _self_check() -> int:
     r_fail = VerifyResult(verdict=Verdict.FAIL_ONE_SIDED)
     _append_trust_advisories(r_fail, m_eth, ["https://a.example", "https://b.example"], 1)
     check("advisory: FAIL gets no depth note", not any("burial DEPTH" in x for x in r_fail.reasons))
-    # same-host URLs are NOT two independent sources (fake-quorum guard).
+    # same-host URLs are NOT two distinct sources (fake-quorum guard).
     check(
         "dedup: same host collapses to one",
         _dedup_by_host(["https://a.example/x", "https://a.example/y", "https://b.example"])
         == ["https://a.example/x", "https://b.example"],
     )
-    # L-1: scheme-less hosts (urlparse(...).hostname is None) must still collapse (localhost:8545/:8546).
+    # L-1: scheme-less hosts must still collapse (localhost:8545/:8546).
     check(
         "dedup: scheme-less same host collapses",
         _dedup_by_host(["localhost:8545", "localhost:8546", "127.0.0.1:8545"]) == ["localhost:8545", "127.0.0.1:8545"],
@@ -1871,7 +1873,7 @@ def _append_trust_advisories(res: VerifyResult, m: RunManifest, eth_urls: list[s
                 "WARNING: the ETH counter leg was re-fetched from a SINGLE RPC — unlike a BTC/RXD tx, an "
                 "ETH tx/receipt cannot be hash-pinned from its returned fields, so a single hostile or "
                 "MITM'd RPC could fabricate the value/logs/finality that drive this verdict. Pass >=2 "
-                "independent --eth-rpc-url for a cross-checked (quorum) re-fetch before trusting a PASS."
+                "--eth-rpc-url on distinct hosts for a cross-checked (quorum) re-fetch before trusting a PASS."
             )
     if res.verdict in (Verdict.PASS, Verdict.PASS_UNVERIFIED, Verdict.PENDING):
         res.checks["depth_source"] = "single-source-trusted"
@@ -1884,7 +1886,7 @@ def _append_trust_advisories(res: VerifyResult, m: RunManifest, eth_urls: list[s
                 f"NOTE: confirmation depth / finality of the settled leg(s) was read from a SINGLE "
                 f"independent source at a SHALLOW min_confirmations={min_confirmations} (< {_DEEP_CONFIRMATIONS}); "
                 "the txid is unforgeable but its burial DEPTH is source-trusted. For real value set "
-                "--min-confirmations deep and prefer multiple independent depth sources — a shallow "
+                "--min-confirmations deep and prefer multiple depth sources on distinct hosts — a shallow "
                 "disposition that later reorgs is a real one-sided loss."
             )
 
@@ -1966,9 +1968,9 @@ def main(argv: list[str] | None = None) -> int:
         "--eth-rpc-url",
         action="append",
         default=None,
-        help="an ETH RPC NEITHER party ran (eth counter leg). REPEATABLE: pass >=2 independent RPCs for a "
+        help="an ETH RPC NEITHER party ran (eth counter leg). REPEATABLE: pass >=2 RPCs on distinct hosts for a "
         "cross-checked (quorum) re-fetch — unlike a BTC/RXD tx, an ETH tx/receipt cannot be hash-pinned, so "
-        "a single RPC is trusted (a loud not-independent warning is emitted).",
+        "a single RPC is trusted (a loud single-source warning is emitted). Several URLs on one host count once.",
     )
     ap.add_argument(
         "--min-confirmations",
