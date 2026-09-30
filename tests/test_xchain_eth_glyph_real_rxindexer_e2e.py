@@ -51,6 +51,7 @@ from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, eth_absolute_to_rxd_relative_blocks
+from pyrxd.gravity.funding_spv import ElapsedBoundPolicy
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
 from pyrxd.gravity.record_sink import JsonFileRecordSink
@@ -418,7 +419,10 @@ class TestEthRealGlyphSwap:
             # (Tried it the other way first: +600 s took t_rxd from 179 to 177 and the gate refused
             # by more, not less.) Anchoring one confirm-wait EARLIER buys exactly the elapsed
             # blocks, using the policy's own number for that wait rather than a padding constant.
-            expected_rxd_lock_time_unix_s=_anvil_now(url) - int(_pol.max_covenant_confirm_wait_s),
+            # ...and the taker gate's time term (the swap e2e's `_GATE_TIME_TERM_S`), pre-paid the same way.
+            expected_rxd_lock_time_unix_s=_anvil_now(url)
+            - int(_pol.max_covenant_confirm_wait_s)
+            - ElapsedBoundPolicy().blocks_upper(1800, spacing_s=300, value_at_stake_photons=None) * 300,
             margin=_pol.cross_clock_margin,
             rxd_block_interval_s=_pol.rxd_block_interval_s,
         )
