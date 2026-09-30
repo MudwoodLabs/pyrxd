@@ -322,7 +322,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     quantile). `reported` is the largest depth any configured source reports, grouped by operator
     (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
     term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
-    `scripts/dust_swap_run.py` passes it;
+    `scripts/dust_swap_run.py` passes it. The `now` the gate judges is taken AFTER its reads:
+    `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
+    `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
+    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller;
   - above dust, the funding's depth must be corroborated by two distinct operators: on a
     value-bearing network, when the value at stake exceeds `ElapsedBoundPolicy.dust_threshold_photons`
     (1,000 RXD by default), the gate refuses the lock unless at least two operator groups

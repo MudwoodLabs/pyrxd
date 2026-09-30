@@ -504,7 +504,11 @@ async def test_the_time_term_is_the_poisson_quantile_from_the_median_time_past(m
     """One hour after the newest header: ``E`` is measured from the median of the 11 timestamps ending
     at the reference header, and the time term is ``poisson_upper_quantile(2 × E ÷ 300, ε)`` with
     ``ε = clamp(1 RXD ÷ value, 1e-12, 1e-3)``. Dropping the surge factor, the value from ``ε``, or
-    the median fails here."""
+    the median fails here. The coordinator's read clock is held still, so ``now`` is exactly
+    ``_NOW`` (the clock's own effect is pinned by the test after the concurrent-reads section)."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(3000)
     view = _ChainView(
@@ -1588,10 +1592,14 @@ class _StaleTipLeg(FakeRadiantLeg):
         return c.evidence(reported_confirmations=self.report_confs)
 
 
-async def test_step_7_judges_the_timelocks_on_the_elapsed_UPPER_bound():
+async def test_step_7_judges_the_timelocks_on_the_elapsed_UPPER_bound(monkeypatch):
     """One block proved, but the newest header served is 30 blocks' worth of time old. The CSV
     window must be judged as if the blocks that time allows were mined — here that leaves too little
-    margin, so the gate refuses; the SAME funding with a fresh tip passes."""
+    margin, so the gate refuses; the SAME funding with a fresh tip passes. (The coordinator's read
+    clock is held still, so ``now`` is exactly ``_NOW``.)"""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
     terms = _terms(variant="rxd")  # t_rxd 144, t_btc 24: ~24 Radiant blocks of elapsed slack
     stale = _coordinator(terms=terms, radiant_leg=_StaleTipLeg(tip_time=_NOW - 300 * 30))
     gate = await stale.pre_btc_lock_check(terms, now_unix_s=_NOW)
@@ -2274,3 +2282,88 @@ def test_the_depth_timeout_must_be_a_positive_finite_number(bad):
     view = _ChainView(pays=b"\x51", value=1, confs=9)
     with pytest.raises(ValidationError, match="depth_timeout_s"):
         RadiantChainIO(view, depth_timeout_s=bad)
+
+
+# --------------------------------------------------------------------------- the reference time is taken after the reads
+
+
+class _FakeMonotonic:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _slow_reads(monkeypatch, view, seconds: float):
+    """The coordinator's read clock, and a view whose header fetch takes *seconds* on it."""
+    from pyrxd.gravity import swap_coordinator
+
+    clock = _FakeMonotonic()
+    monkeypatch.setattr(swap_coordinator, "_monotonic", clock)
+    real = view.get_block_headers
+
+    async def slow(start, count):
+        clock.t += seconds  # one header range is fetched per proof here (asserted below)
+        return await real(start, count)
+
+    view.get_block_headers = slow
+    return clock
+
+
+async def test_the_reference_time_is_taken_after_the_reads(monkeypatch):
+    """The gate's ``now`` was the caller's ``now_unix_s``, read before the fetch: a read that took ten
+    minutes left the time term ten minutes short. Now ``now`` is ``now_unix_s`` advanced by the
+    monotonic time the reads took — so ``E`` grows by exactly that — and through ``taker_funds_btc``
+    the lock-time re-run is advanced by everything since the call began (both fetches)."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    value = 10_000 * PHOTONS_PER_RXD
+
+    def coord_over(view):
+        return _btc_coord(
+            terms,
+            _real_leg(view, network="bc"),
+            policy=_vb_policy(value_at_risk_photons=value),
+            accept_nondurable_seen=True,
+        )[0]
+
+    def view_():
+        return _ChainView(
+            pays=_covenant(terms),
+            value=terms.radiant_amount,
+            confs=70,
+            base=base,
+            bits=_HARD_BITS,
+            tip_time=_NOW - 3600,
+        )
+
+    fast = view_()
+    _slow_reads(monkeypatch, fast, 0)
+    coord = coord_over(fast)
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    base_elapsed = coord.last_maker_funding.elapsed_s
+    assert base_elapsed == _NOW - coord.last_maker_funding.reference_time
+
+    slow = view_()
+    _slow_reads(monkeypatch, slow, 600)
+    coord = coord_over(slow)
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    assert slow.reads.count("headers") == 1, slow.reads
+    assert coord.last_maker_funding.elapsed_s == base_elapsed + 600
+    assert coord.last_maker_funding.time_blocks > 0
+
+    # A fractional second is rounded UP (never less conservative).
+    slow = view_()
+    _slow_reads(monkeypatch, slow, 0.2)
+    coord = coord_over(slow)
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    assert coord.last_maker_funding.elapsed_s == base_elapsed + 1
+
+    # Through the production entry point: the lock-time re-run counts both fetches.
+    slow = view_()
+    _slow_reads(monkeypatch, slow, 600)
+    coord = coord_over(slow)
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED
+    assert coord.last_maker_funding.elapsed_s == base_elapsed + 1200

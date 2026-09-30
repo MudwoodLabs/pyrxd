@@ -39,6 +39,7 @@ import hashlib
 import logging
 import math
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -114,6 +115,11 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+#: The MONOTONIC clock the taker gate measures its own reads with (never the wall clock: the
+#: caller's ``now_unix_s`` stays the only wall-clock reading). A module attribute so a test can
+#: advance it without touching the event loop's clock.
+_monotonic = time.monotonic
 
 
 # ---------------------------------------------------------------------------
@@ -1779,7 +1785,9 @@ class SwapCoordinator:
             await self._persist(record)
 
     # -- pre-BTC-lock gate (H4 a) -------------------------------------------
-    async def pre_btc_lock_check(self, terms: NegotiatedTerms, *, now_unix_s: int | None = None) -> PreBtcLockGate:
+    async def pre_btc_lock_check(
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None = None, now_sampled_monotonic: float | None = None
+    ) -> PreBtcLockGate:
         """Validate everything the taker can check BEFORE funding the counter leg (fail-closed).
 
         Checks, in order (any failure => do NOT fund):
@@ -1807,13 +1815,18 @@ class SwapCoordinator:
              Unfunded / mis-valued / shallow / unreadable => fail-closed.
 
         ``now_unix_s`` is the caller's wall-clock (the ``now_rxd_height`` precedent: the
-        coordinator takes clocks as params, never reads them). REQUIRED for an ETH swap (step 3's
+        coordinator takes the wall clock as a param, never reads it). REQUIRED for an ETH swap (step 3's
         cross-clock gate), for any swap whose Radiant leg is on mainnet (step 5 bounds the elapsed
         depth with it and refuses without it), and whenever the policy carries a reorg-cost
         measurement (step 0). Only a BTC swap on test networks may omit it; step 5 then omits the
-        time term of its bound. Async because binding (1) awaits the async indexer adapter (a sync
+        time term of its bound. ``now_sampled_monotonic`` is the :func:`time.monotonic` reading
+        taken when ``now_unix_s`` was (default: this call's entry); step 5 advances ``now_unix_s``
+        by the monotonic time elapsed since then, measured AFTER its reads (see
+        :meth:`taker_verify_asset_funding`). Async because binding (1) awaits the async indexer adapter (a sync
         gate would leak a truthy un-awaited coroutine = fail-OPEN, T7 plan D2).
         """
+        if now_sampled_monotonic is None:
+            now_sampled_monotonic = _monotonic()
         if not isinstance(terms, NegotiatedTerms):
             raise ValidationError("pre_btc_lock_check requires NegotiatedTerms")
 
@@ -1830,7 +1843,7 @@ class SwapCoordinator:
                     reason=(
                         "the policy carries a reorg-cost measurement but no now_unix_s was supplied, "
                         "so its freshness cannot be checked. Pass the caller's wall-clock (the "
-                        "coordinator never reads a clock itself), or drop to a bare "
+                        "coordinator never reads the wall clock itself), or drop to a bare "
                         "rxd_reorg_cost_per_block and accept that nothing can tell when it went stale."
                     ),
                 )
@@ -1917,7 +1930,9 @@ class SwapCoordinator:
         #    only a LOWER bound, and an under-count is the direction that makes the CSV window look
         #    longer than it is.
         try:
-            _cov_outpoint, _cov_value, cov_confs = await self.taker_verify_asset_funding(terms, now_unix_s=now_unix_s)
+            _cov_outpoint, _cov_value, cov_confs = await self.taker_verify_asset_funding(
+                terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
+            )
         except (ValidationError, NetworkError) as exc:
             return PreBtcLockGate(ok=False, reason=f"maker's Radiant covenant not verified; fail-closed ({exc})")
         except Exception as exc:
@@ -2194,7 +2209,7 @@ class SwapCoordinator:
         )
 
     async def taker_verify_asset_funding(
-        self, terms: NegotiatedTerms, *, now_unix_s: int | None = None
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None = None, now_sampled_monotonic: float | None = None
     ) -> tuple[str, int, int]:
         """Fail-closed: the MAKER's asset must be PROVED locked on chain before the taker locks anything.
 
@@ -2234,7 +2249,19 @@ class SwapCoordinator:
         a non-spend). The elapsed-depth upper bound is statistical — a confidence scaled by the value,
         at ``funding_bound.surge_factor`` times the nominal block rate — as
         :mod:`pyrxd.gravity.funding_spv` states.
+
+        THE REFERENCE TIME IS TAKEN AFTER THE READS. The gate's time term counts the blocks mined
+        between the reference header's median time past and "now"; a "now" read before a slow fetch
+        is earlier than the moment the bound is used, and would count fewer. So the ``now`` the gate
+        judges is ``now_unix_s`` ADVANCED by the monotonic time elapsed from ``now_sampled_monotonic``
+        (when ``now_unix_s`` was taken; default: this call's entry) to the end of the reads, rounded
+        up to a whole second. The wall clock is still only the caller's; a slow read can only make
+        the bound larger.
         """
+        if now_sampled_monotonic is None:
+            now_sampled_monotonic = _monotonic()
+        if now_unix_s is not None and (not isinstance(now_unix_s, int) or isinstance(now_unix_s, bool)):
+            raise ValidationError("now_unix_s must be an int or None")
         fetch = getattr(self.radiant_leg, "maker_funding_evidence", None)
         if not callable(fetch):
             raise ValidationError(
@@ -2254,6 +2281,10 @@ class SwapCoordinator:
             header_ranges=functools.partial(funding_header_ranges, chain),
             min_confirmations=known_floor,
         )
+        # Re-sampled AFTER the reads (see the docstring): never earlier than the caller's clock.
+        now_after_reads = (
+            None if now_unix_s is None else now_unix_s + math.ceil(max(0.0, _monotonic() - now_sampled_monotonic))
+        )
         result = verify_maker_funding(
             evidence,
             chain=chain,
@@ -2261,7 +2292,7 @@ class SwapCoordinator:
             expected_value=int(terms.radiant_amount),
             value_at_stake_photons=value_at_stake,
             burial_blocks=burial,
-            now_unix_s=now_unix_s,
+            now_unix_s=now_after_reads,
             bound_policy=self.config.funding_bound,
         )
         self.last_maker_funding = result
@@ -2369,9 +2400,12 @@ class SwapCoordinator:
         "already in mempool" as success) so a retry after an intent-only crash does
         not lock twice. Persistence is a no-op when no ``persist`` hook is injected.
         """
+        # When the caller's clock was read (as near as this method can know): the lock-time re-run
+        # below judges `now_unix_s` advanced by everything since, reads included.
+        now_sampled_monotonic = _monotonic()
         if self.record.state is not SwapState.NEGOTIATED:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
-        gate = await self.pre_btc_lock_check(terms, now_unix_s=now_unix_s)
+        gate = await self.pre_btc_lock_check(terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic)
         if not gate.ok:
             raise ValidationError(f"pre-BTC-lock gate refused funding: {gate.reason}")
 
@@ -2387,7 +2421,7 @@ class SwapCoordinator:
         # after the H reserve, so the reserve keeps its "last step before the only broadcast"
         # property (TOCTOU-1) and a refusal does not burn H for nothing. Fail-closed: this raises
         # and nothing is broadcast.
-        await self.taker_verify_asset_funding(terms, now_unix_s=now_unix_s)
+        await self.taker_verify_asset_funding(terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic)
 
         # Reserve H ATOMICALLY and PRE-broadcast (TOCTOU-1 fix). The check-and-mark
         # is one indivisible step strictly before the only on-chain effect below, so

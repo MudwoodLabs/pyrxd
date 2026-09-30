@@ -113,8 +113,11 @@ blocks without raising that price past what ``k`` already settles. ``value_term 
 ``R`` is never below the funding block. A test network has no value term, and ``R`` is the newest
 header served.
 
-The clock is the caller's (``now_unix_s``); the coordinator never reads one. It is REQUIRED on a
-value-bearing network; on a test network without it the time term is omitted and the result says so.
+The wall clock is the caller's (``now_unix_s``); the coordinator never reads one. It does take the
+reference time AFTER its reads: ``SwapCoordinator.taker_verify_asset_funding`` passes this function
+``now_unix_s`` advanced by the monotonic time elapsed since it was sampled, so a slow read makes
+``E`` larger, never smaller. It is REQUIRED on a value-bearing network; on a test network without
+it the time term is omitted and the result says so.
 
 THE NEGOTIATION-TIME CHECK. :func:`early_elapsed_blocks_upper` models the same bound for the
 coordinator before anyone locks (``SwapCoordinator._funding_proof_room_failure``), and is built to be
