@@ -74,10 +74,10 @@ fails closed until someone writes that down.
 (The token side is genuinely clean — see the BSC note in ``tokens.py`` — which is precisely why
 this exclusion is recorded here rather than left to be rediscovered.)
 
-The ``network`` tag feeds the existing fail-closed gates unchanged: any tag not in
-``AUDIT_CLEARED_NETWORKS`` (only isolated test chains are) is value-bearing and refuses to
-run without the explicit post-audit ``audit_cleared=True`` opt-in — so every chain here,
-including the testnets, stays behind the audit gate by construction.
+The ``network`` tag feeds the coordinator's value-bearing checks unchanged: any tag not in
+``AUDIT_CLEARED_NETWORKS`` (only isolated test chains are) is read as value-bearing, so every
+chain here, testnets included, gets those setup checks. It does NOT make a leg refuse to
+run: ``EthLeg``'s ``audit_cleared`` feeds ``require_audit_cleared``, a no-op since 0.9.0.
 """
 
 from __future__ import annotations

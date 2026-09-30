@@ -329,6 +329,11 @@ _NOT_SOURCE_IDENTITY: dict[tuple[str, str], str] = {
         "compares two ALERT CHANNELS for equality, where a different path (an ntfy topic) IS a "
         "different channel; nothing is counted as a source"
     ),
+    ("src/pyrxd/cli/swap_recovery.py", "endpoint_source_label"): (
+        "a DISPLAY label naming the one server an answer came from; nothing is counted. It uses "
+        "canonical_host but not source_key on purpose: source_key keys an unparseable URL by its "
+        "whole text, and printing that could print an API key carried in an RPC URL"
+    ),
 }
 
 #: Inside a counting site, any of these is the site building its own identity: case-folding text,

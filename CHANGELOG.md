@@ -6,6 +6,51 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`swap status` and `swap recover-preimage` no longer report a spent BTC HTLC as UNSPENT.** An
+  Esplora answer of `{"spent": true}` with the spending txid missing or malformed was folded into
+  the unspent case, so `status` printed "UNSPENT — the counterparty has not claimed" and
+  `recover-preimage` said no preimage had been revealed, while the counterparty may already have
+  claimed and published `p`. That answer is now its own state: `status` shows the counter-leg as
+  `ERROR`, and `recover-preimage` exits 2 as an inconclusive read. The UNSPENT and LOCKED texts
+  (BTC and ETH) now name the one server that gave the answer, by host only.
+- **`swap status` no longer says "no further action" for a spent covenant unless the counter-leg
+  is spent too.** A covenant is spent by the taker's claim and by the maker's CSV refund alike.
+  After a refund the taker's BTC or ETH may still be locked, and the BTC claim branch has no
+  timelock, so the maker can still sweep it. The screen could print `SETTLED … no further action`
+  above a counter-leg row reading `LOCKED`. The situation is now `SETTLED` only when both legs are
+  spent, `COUNTER_LEG_LOCKED` when the counter-leg is still locked, and `COVENANT_SPENT` when the
+  counter-leg was not checked. `SETTLED` names the one server whose answer it rests on, as the
+  `LOCKED` counter-leg text already did.
+- **`swap status` no longer tells a taker to run a refund command it cannot run.** The advice
+  named `scripts/*_swap_two_host.py --role taker --phase abort`, which needs that harness's
+  `envelope.json`, `taker_funding.json` and its own secret file; `status` reads only the files
+  `dust_swap_run.py`, `eth_swap_run.py` and `eth_swap_grief_run.py` write, and a pip install has
+  no `scripts/` at all. It now says plainly that pyrxd has no command that refunds the counter-leg,
+  names the harness that wrote the file, says when the leg's refund opens (`t_btc_blocks` after the
+  BTC funding confirmed, or the ETH contract's timeout), and names what in the file the refund
+  needs (`taker_btc_wif`, or the `eth_refund_to` refundee). A two-host `--local-out` file is refused
+  with that harness's own recovery command and the files it needs.
+- **`swap status` read an `eth_swap_grief_run.py` recovery file as a BTC swap.** That writer
+  records no `eth_chain`, so the counter-leg read asked for a BTC funding outpoint. An
+  `eth_timeout_unix_s` field now marks the file as ETH too.
+- **The handshake spec said the Radiant leg fails closed on an ambiguous covenant UTXO set.** It
+  selects the earliest-confirmed match instead, deliberately: a refusal could be triggered by any
+  payment to the public covenant SPK and would block the taker's claim until the maker's refund
+  opens. `docs/htlc-handshake-wire-format.md` and `verify_maker_asset_funded`'s docstring now
+  describe the selection, and the spec's stale line citations into the three legs are repaired.
+- **`swap status` counted one block too many before the maker's refund.** It printed
+  `funding_height + t_rxd - tip`, one more than the `t_rxd - confirmations` that
+  `RadiantCovenantLeg.claim_asset` sizes its fee against, and it reported `LOCKED` at the depth
+  where the refund is already valid. Both now come from the leg's own
+  `blocks_to_claim_deadline`, and `REFUND_OPEN` starts at the same depth where `refund_asset` and
+  `swap build-refund` accept the refund.
+- **Docstrings and docs no longer say `require_audit_cleared` blocks anything.** It has been a
+  no-op since 0.9.0. The Radiant, BTC and ETH legs, both chain registries, the SPV sole-authority
+  builder, the watchtower README, `docs/concepts/architecture.md`,
+  `docs/how-to/build-a-cross-chain-swap.md` and `docs/red-team-checklist.md` said a value-bearing
+  network needed an opt-in to construct. None does. The gate stays a no-op.
 ### Security
 
 - **Every source count keys on ONE host identity, so one server can no longer corroborate

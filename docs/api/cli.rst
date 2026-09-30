@@ -108,12 +108,29 @@ human sizing the fee is the only remaining control.
 
 - ``pyrxd swap status --swap-file PATH`` — inspection of a Gravity cross-chain swap from its
   recovery file: identity + timelock deadlines, and with ``--check-chain`` a read-only
-  ElectrumX query of the RXD covenant that classifies the live situation (LOCKED /
-  REFUND_OPEN / SETTLED / NOT_FUNDED) and prints the single safe next action. ``--check-chain``
-  also reads the BTC/ETH counter-leg, so it can report that the counterparty's claim has
-  revealed the preimage — the difference between "keep waiting" and "claim now", which the
-  RXD covenant alone cannot show. With no counter-leg locator or endpoint configured it
-  reports ``NOT_CHECKED`` with the reason rather than failing.
+  ElectrumX query of the RXD covenant that classifies the live situation and prints the single
+  safe next action. ``--check-chain`` also reads the BTC/ETH counter-leg, so it can report that
+  the counterparty's claim has revealed the preimage — the difference between "keep waiting"
+  and "claim now", which the RXD covenant alone cannot show. With no counter-leg locator or
+  endpoint configured it reports ``NOT_CHECKED`` with the reason rather than failing. The
+  situations:
+
+  - ``NOT_FUNDED`` — the covenant is not on chain.
+  - ``LOCKED`` — the covenant is live and only the taker's claim can be mined yet.
+  - ``REFUND_OPEN`` — the covenant is live and deep enough that the maker's CSV refund is valid.
+  - ``SETTLED`` — the covenant is spent and the counter-leg is spent too (claimed, or refunded).
+    The counter-leg half is the word of the one server that answered, and the text names it.
+  - ``COUNTER_LEG_LOCKED`` — the covenant is spent but the counter-leg is still locked. A spent
+    covenant is the taker's claim or the maker's CSV refund, and this read cannot tell which.
+    After a refund the taker must refund its own counter-leg; a BTC HTLC's claim branch has no
+    timelock, so until then a maker holding ``p`` can still sweep it.
+  - ``COVENANT_SPENT`` — the covenant is spent and the counter-leg was not checked, or its read
+    failed. It does not mean the swap is over.
+
+  pyrxd has no command that refunds a counter-leg, so for the last two the next action says
+  which harness wrote the recovery file, when that leg's refund opens, and what in the file
+  the refund needs. A two-host harness's ``--local-out`` secret file is not a recovery file
+  ``status`` reads; it is refused with that harness's own ``--phase abort`` command.
 - ``pyrxd swap recover-preimage`` — scrape the preimage ``p`` from the counterparty's own
   on-chain claim and verify it. Provenance is mandatory: the fetched bytes must re-derive to
   the reported spender txid AND spend this swap's funding outpoint before anything is

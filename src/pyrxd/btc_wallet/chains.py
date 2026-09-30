@@ -27,9 +27,10 @@ What IS chain-specific — and safety-critical:
   (``network/bitcoin.py``) are Bitcoin-mainnet-specific; a Litecoin deployment supplies
   its own reader/broadcaster (the regtest harness drives the node RPC directly).
 
-Every mainnet ``network`` tag here is value-bearing and stays behind the leg's
-``audit_cleared`` gate; the regtest/testnet tags are in ``AUDIT_CLEARED_NETWORKS``
-(isolated, no-value chains).
+Every mainnet ``network`` tag here is value-bearing; the regtest/testnet tags are in
+``AUDIT_CLEARED_NETWORKS`` (isolated, no-value chains). The leg's ``audit_cleared``
+argument does not gate anything — :func:`~pyrxd.btc_wallet.htlc_leg.require_audit_cleared`
+has been a no-op since 0.9.0 — so a mainnet tag constructs a leg without it.
 """
 
 from __future__ import annotations

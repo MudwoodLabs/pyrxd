@@ -267,7 +267,7 @@ class SpvProofBuilder:
         network: str,
         audit_cleared: bool = False,
     ) -> SpvProofBuilder:
-        """Construct a builder for a covenant-LESS sole-authority use, gated.
+        """Construct a builder for a covenant-LESS sole-authority use (the gate is advisory).
 
         Use this (NOT the plain constructor) when the SPV verdict is the ONLY thing
         releasing value — a bridge-in / oracle / payment-gate with no on-chain
