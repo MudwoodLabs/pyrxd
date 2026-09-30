@@ -358,7 +358,19 @@ async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
     Timing always comes from MAINNET BTC data regardless of stage — signet header
     intervals are not representative. Returns the same ``(policy, provenance)``
     tuple the forward runner and resume both consume.
+
+    The Radiant fast tail is NOT measured here: it comes from ``--rxd-block-interval-fast-s``, and
+    without it this refuses before any network read. A measured policy requires it, and the swap
+    taker gate divides by it on mainnet; there is no value to fall back to that would not
+    under-count blocks.
     """
+    fast = getattr(args, "rxd_block_interval_fast_s", None)
+    if not isinstance(fast, (int, float)) or isinstance(fast, bool) or fast <= 0:
+        raise SystemExit(
+            "--rxd-block-interval-fast-s is required: the MEASURED p10 Radiant inter-block interval "
+            "(seconds). The measured margin policy and the swap taker gate both divide by it, and the "
+            "nominal interval would under-count blocks. Measure it against a mainnet node for this run."
+        )
     src = MempoolSpaceSource(base_url=_MAINNET_BTC_API)
     try:
         tip = int(await src.get_tip_height())
@@ -375,6 +387,7 @@ async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
         btc_claim_reorg_depth_blocks=args.btc_claim_reorg_depth,
         rxd_claim_burial_blocks=args.rxd_claim_burial,
         rxd_block_interval_s=args.rxd_block_interval_s,
+        rxd_block_interval_fast_s=float(fast),
         # This is a DUST harness (gated on --i-accept-dust-loss): the value is below the Radiant
         # reorg cost, so opt out of value-scaled burial. A real-value run must NOT use this path.
         accept_flat_burial=True,

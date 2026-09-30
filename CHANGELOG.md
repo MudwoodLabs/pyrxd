@@ -59,6 +59,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`scripts/radiant_mainnet_chainio.py:mainnet_proof_client`). The third value
   `taker_verify_asset_funding` returns is now that elapsed-depth upper bound; what was proved is on
   `SwapCoordinator.last_maker_funding`.
+- **A mainnet swap's taker gate requires `MarginPolicy.rxd_block_interval_fast_s`** (the measured
+  p10 Radiant inter-block interval) and refuses without it, before fetching anything; it no longer
+  falls back to the nominal interval there. `scripts/dust_swap_run.py` and
+  `scripts/dust_swap_resume.py` take `--rxd-block-interval-fast-s` and refuse at startup without
+  it — their measured policy raised on its absence before, so the runner never reached the gate.
 - **`pyrxd verify` now verifies the mark's block, on by default.** It fetches the transaction's
   merkle branch, the block's coinbase branch and the header ranges `verify_mark_block` asks for,
   from one configured endpoint, and checks them with the raw transaction it already fetched.

@@ -114,6 +114,16 @@ def _value_bearing_chain(monkeypatch) -> tuple[dict[int, bytes], RadiantChain]:
     return base, chain
 
 
+#: The measured Radiant fast tail (p10) the value-bearing tests use; the nominal stays 300 s.
+_FAST_S = 36.0
+
+
+def _vb_policy(**over) -> MarginPolicy:
+    """An estimated dust-grade policy carrying the measured fast tail a value-bearing gate requires."""
+    base = MarginPolicy.estimated(accept_flat_burial=True)
+    return type(base)(**{**base.__dict__, "rxd_block_interval_fast_s": _FAST_S, **over})
+
+
 class _ChainView:
     """An ElectrumX-shaped Radiant server over a synthetic chain it serves honestly — unless told
     to lie: ``listed_spk`` makes ``listunspent`` claim an output for a script the raw transaction
@@ -277,9 +287,7 @@ async def test_a_complete_self_consistent_forged_proof_is_refused_on_the_value_b
             return [headers[h] for h in range(start, start + count) if h in headers]
 
     leg = _real_leg(_Liar(), network="bc")
-    coord, btc_view = _btc_coord(
-        terms, leg, policy=MarginPolicy.estimated(accept_flat_burial=True), accept_nondurable_seen=True
-    )
+    coord, btc_view = _btc_coord(terms, leg, policy=_vb_policy(), accept_nondurable_seen=True)
     gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
     assert gate.ok is False
     assert "did not verify (CONTRADICTED" in gate.reason, gate.reason
@@ -356,7 +364,7 @@ async def test_honest_value_bearing_funding_verifies_and_the_lock_proceeds(monke
     coord, _btc_view = _btc_coord(
         terms,
         _real_leg(view, network="bc"),
-        policy=MarginPolicy.estimated(accept_flat_burial=True),
+        policy=_vb_policy(),
         accept_nondurable_seen=True,
     )
     rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
@@ -365,6 +373,44 @@ async def test_honest_value_bearing_funding_verifies_and_the_lock_proceeds(monke
     assert proof.required_confirmations == MIN_FUNDING_CONFIRMATIONS
     assert proof.forged_confirmation_cost_photons > 0
     assert proof.value_at_stake_photons == terms.radiant_amount
+
+
+async def test_a_value_bearing_gate_without_a_measured_fast_tail_refuses_before_fetching(monkeypatch):
+    """The allowance for blocks mined since the reference header divides elapsed time by an interval;
+    on a value-bearing network that must be the MEASURED fast tail, never the nominal fallback. With
+    none set the gate refuses, and nothing is fetched."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _ab_terms(400)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    coord, btc_view = _btc_coord(
+        terms,
+        _real_leg(view, network="bc"),
+        policy=MarginPolicy.estimated(accept_flat_burial=True),
+        accept_nondurable_seen=True,
+    )
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is False
+    assert "needs MarginPolicy.rxd_block_interval_fast_s" in gate.reason, gate.reason
+    assert view.reads == [], "the gate fetched evidence it could not judge"
+    assert btc_view.broadcasts == []
+
+
+async def test_the_allowance_divides_by_the_measured_fast_tail_not_the_nominal_interval(monkeypatch):
+    """One hour since the reference header, a 36 s fast tail and a 300 s nominal: the allowance is
+    100 blocks, not 12. Swapping the nominal interval in at the gate fails here."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _ab_terms(400)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW - 3600
+    )
+    coord, _btc_view = _btc_coord(
+        terms, _real_leg(view, network="bc"), policy=_vb_policy(), accept_nondurable_seen=True
+    )
+    assert coord.config.margin_policy.rxd_block_interval_s == 300.0
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    proof = coord.last_maker_funding
+    assert proof.withheld_allowance_blocks == 100
+    assert proof.elapsed_blocks_upper >= proof.proved_depth + 100 - 1
 
 
 def test_real_mainnet_headers_and_transaction_verify_at_the_gate():
@@ -793,8 +839,7 @@ async def test_a_refusal_names_k_the_value_C_and_what_was_proved(monkeypatch):
     terms = _ab_terms(400)
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
     value = 1_000_000 * PHOTONS_PER_RXD
-    policy = MarginPolicy.estimated(accept_flat_burial=True)
-    policy = type(policy)(**{**policy.__dict__, "value_at_risk_photons": value})
+    policy = _vb_policy(value_at_risk_photons=value)
     coord, btc_view = _btc_coord(terms, _real_leg(view, network="bc"), policy=policy, accept_nondurable_seen=True)
     gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
     assert gate.ok is False

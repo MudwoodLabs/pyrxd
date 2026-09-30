@@ -69,6 +69,7 @@ from .eth_rxd_timelock import (
 from .finality import CounterClaimFinality, CounterClaimState
 from .funding_spv import (
     MIN_FUNDING_CONFIRMATIONS,
+    MakerFundingNotVerified,
     VerifiedMakerFunding,
     funding_header_ranges,
     radiant_chain_for_leg,
@@ -2076,6 +2077,23 @@ class SwapCoordinator:
             )
         chain = radiant_chain_for_leg(self.radiant_leg, counter_leg=self.counter_leg)
         mp = self.config.margin_policy
+        # The interval the elapsed-depth allowance DIVIDES a time span by. On a value-bearing network
+        # it must be the MEASURED fast tail: `_dividing_interval_s` falls back to the nominal
+        # interval when none is set, and dividing by a nominal 300 s where the measured p10 is ~36 s
+        # counts about an eighth of the blocks — an under-count, the direction steps 6 and 7 cannot
+        # afford. So its absence refuses here, before anything is fetched.
+        if chain.value_bearing:
+            if mp.rxd_block_interval_fast_s is None:
+                raise MakerFundingNotVerified(
+                    "a swap on a value-bearing network needs MarginPolicy.rxd_block_interval_fast_s, the MEASURED "
+                    "fast-tail (p10) Radiant inter-block interval in seconds: the upper bound on the blocks since "
+                    "the maker's funding converts elapsed time into blocks by dividing by it, and the nominal "
+                    f"{mp.rxd_block_interval_s:g}s would count fewer. Measure it for this run and set it "
+                    "(MarginPolicy.measured(rxd_block_interval_fast_s=...))"
+                )
+            withheld_interval_s = float(mp.rxd_block_interval_fast_s)
+        else:
+            withheld_interval_s = _dividing_interval_s(mp)
         expected_spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms))
         value_at_stake = self._funding_value_at_stake_photons(terms)
         depth = self._asset_funding_depth()
@@ -2103,7 +2121,7 @@ class SwapCoordinator:
             value_at_stake_photons=value_at_stake,
             burial_blocks=burial,
             now_unix_s=now_unix_s,
-            withheld_block_interval_s=_dividing_interval_s(mp),
+            withheld_block_interval_s=withheld_interval_s,
         )
         self.last_maker_funding = result
         return result.outpoint, result.value_photons, result.elapsed_blocks_upper

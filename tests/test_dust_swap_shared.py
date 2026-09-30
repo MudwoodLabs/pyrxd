@@ -195,3 +195,87 @@ class TestMergeIntoMode600:
             merge_into_mode_600(target, {"b": 2})
         assert json.loads(target.read_text()) == {"taker_rxd_wif": "secret"}
         assert list(tmp_path.iterdir()) == [target], "the temp file must not be left lying around"
+
+
+# --------------------------------------------------------------------------- measured_margin_from_mainnet
+
+
+class TestMeasuredMarginNeedsTheRadiantFastTail:
+    """The dust runner's measured policy is ``require_measured``, which refuses without a measured
+    Radiant fast tail, and the swap taker gate divides by that same number on mainnet. Before
+    ``--rxd-block-interval-fast-s`` existed the builder raised inside ``MarginPolicy`` and the run
+    never reached the gate; now the flag is required and its absence refuses before any read."""
+
+    @staticmethod
+    def _args(**over):
+        import argparse
+
+        kw = dict(
+            margin_sample_blocks=4,
+            btc_tail_percentile=90.0,
+            btc_claim_reorg_depth=2,
+            rxd_claim_burial=2,
+            rxd_block_interval_s=300.0,
+            rxd_block_interval_fast_s=0.0,
+        )
+        kw.update(over)
+        return argparse.Namespace(**kw)
+
+    @staticmethod
+    def _fake_source(monkeypatch, opened: list) -> None:
+        import struct as _struct
+
+        import _dust_swap_shared as shared
+
+        class _Src:
+            def __init__(self, **_kw):
+                opened.append(True)
+
+            async def get_tip_height(self):
+                return 100
+
+            async def get_block_header_hex(self, h):
+                return bytes(68) + _struct.pack("<I", 1_700_000_000 + 600 * int(h)) + bytes(8)
+
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(shared, "MempoolSpaceSource", _Src)
+
+    def test_without_the_flag_it_refuses_before_any_read(self, monkeypatch) -> None:
+        import asyncio
+
+        from _dust_swap_shared import measured_margin_from_mainnet
+
+        opened: list = []
+        self._fake_source(monkeypatch, opened)
+        with pytest.raises(SystemExit, match="--rxd-block-interval-fast-s is required"):
+            asyncio.run(measured_margin_from_mainnet(self._args()))
+        assert opened == [], "it read the network before refusing"
+
+    def test_with_the_flag_the_policy_carries_it_and_satisfies_the_taker_gate(self, monkeypatch) -> None:
+        import asyncio
+
+        from _dust_swap_shared import measured_margin_from_mainnet
+
+        opened: list = []
+        self._fake_source(monkeypatch, opened)
+        policy, _prov = asyncio.run(measured_margin_from_mainnet(self._args(rxd_block_interval_fast_s=36.0)))
+        assert policy.rxd_block_interval_fast_s == 36.0
+        assert policy.is_measured and policy.require_measured
+
+    @pytest.mark.parametrize("script", ["dust_swap_run", "dust_swap_resume"])
+    def test_both_runners_accept_the_flag(self, script) -> None:
+        import ast
+
+        src = (_SCRIPTS / f"{script}.py").read_text(encoding="utf-8")
+        flags = {
+            n.args[0].value
+            for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "add_argument"
+            and n.args
+            and isinstance(n.args[0], ast.Constant)
+        }
+        assert "--rxd-block-interval-fast-s" in flags

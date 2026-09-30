@@ -369,6 +369,15 @@ def _parse_args(argv):
     ap.add_argument("--btc-claim-reorg-depth", type=int, default=2)
     ap.add_argument("--rxd-claim-burial", type=int, default=2)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
+    ap.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=0.0,
+        help=(
+            "REQUIRED: the MEASURED p10 Radiant inter-block interval (seconds). The measured policy "
+            "and the swap taker gate divide by it; measure it against a mainnet node for this run."
+        ),
+    )
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument(
         "--resume-deadline-s",
