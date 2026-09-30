@@ -125,9 +125,12 @@ page's own words. A block that does not verify stays on screen as the
 server's word, with the reason. A proof that contradicts the height the
 server reported shows no block number, as `pyrxd verify` reports none.
 The pages link at most 4,032 headers past the newest checkpoint, as the
-CLI does, and prove only the block itself (their floor is one
-confirmation); the server's confirmation count is shown beside the
-proved depth, labelled as the server's.
+CLI does. They require one confirmation (the block itself) and try to
+prove up to six, or as many as the server reports if that is fewer, so a
+server whose tip is short still verifies to the depth it can prove; a
+block at or below a checkpoint is proved as deep as the newest
+checkpoint. The server's confirmation count is shown beside the proved
+depth, labelled as the server's.
 
 It is not a second implementation of anything. Both pages read the one
 wheel, the one `glue.py` and the one manifest built by the docs CI

@@ -105,9 +105,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     reply's size. A reply over that cap, and a fetch that fails in transport (a timeout, or an
     error frame from the server), are the reasons each surface words for itself.
   - VERIFIED shows the verifier's claim in place of the endpoint's-word caveat, the proved depth,
-    and the server's confirmation count beside it, labelled as the server's. The pages' floor is
-    one confirmation, so above the newest checkpoint they prove the block itself; at or below it,
-    the proved depth runs to the newest checkpoint.
+    and the server's confirmation count beside it, labelled as the server's. The pages REQUIRE one
+    confirmation and try to prove up to six, or the server's count if that is fewer: above the
+    newest checkpoint a server whose tip is short still verifies, to the depth it can prove; at or
+    below a checkpoint, the proved depth runs to the newest checkpoint.
+  - `pyrxd.glyph.mark_block` takes a `target_confirmations`, separate from the required
+    `min_confirmations`: headers up to the target are fetched and checked, and one missing or
+    failing past the required depth ends the proved depth there instead of failing the proof.
+    `pyrxd verify` passes none, so its required floor is still exactly `--min-confirmations`.
   - A block that does not verify stays on screen as the server's word, with "Not verified here:"
     and the reason. A proof that contradicts the height shows no block number, with the reason.
   - The page's anchor JSON now carries `block_verification`, `verified_confirmations` and, when

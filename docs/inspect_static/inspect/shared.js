@@ -943,7 +943,7 @@ async function resolveMarkAnchor(markAnchorBridge, txid, superseded) {
 // A safety stop on the proof loop below, NOT the rule. Which requests are made, in what order, is
 // `pyrxd.glyph.mark_block.verify_with_fetched`'s to decide (through `glue.verify_mark_block`): the
 // transaction's merkle branch, the block's coinbase branch, then at most three header ranges at
-// this page's floor. This only ends a loop that would otherwise keep asking;
+// this page's floor and target depth. This only ends a loop that would otherwise keep asking;
 // `tests/web/test_block_proof_on_the_pages.py` checks it is never smaller than what the rule can ask.
 const MAX_BLOCK_PROOF_REQUESTS = 8;
 
