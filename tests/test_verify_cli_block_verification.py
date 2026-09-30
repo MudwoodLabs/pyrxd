@@ -420,6 +420,47 @@ def test_the_contradiction_reason_names_what_failed(monkeypatch, tmp_path) -> No
     assert f"the header at {C.height + 3} does not link to the header served at {C.height + 2}" in _flat(r.output)
 
 
+def _bad_pow_at(headers: dict[int, bytes], h: int) -> dict[int, bytes]:
+    """The real headers, with the one at *h* altered so it hashes above its own nBits target."""
+    lie = dict(headers)
+    moved = bytearray(lie[h])
+    moved[79] ^= 0x01
+    lie[h] = bytes(moved)
+    return lie
+
+
+def test_a_header_failing_its_own_proof_of_work_exits_2(monkeypatch, tmp_path) -> None:
+    """The review's case: the server reports nine, and the header at 468,523 — three deep — hashes
+    above its own target. Required six deep, that is a lie in the server's own proof: exit 2. (The
+    pages, which require one and aim for six, say the same: ``tests/web/test_block_proof_on_the_pages.py``.)"""
+    chain = Chain(PYRXD)
+    _checkpoint(monkeypatch, chain, chain.start)
+    lie = _bad_pow_at(chain.headers, chain.height + 2)
+    r, _ = _verify(
+        monkeypatch, tmp_path, chain, _server(chain, **{"blockchain.block.headers": lambda p: _headers_reply(lie, *p)})
+    )
+    assert r.exit_code == 2, r.output
+    assert "the header at 468523 fails its own proof-of-work" in _flat(r.output)
+
+
+def test_the_json_reports_the_floor_on_a_proof_that_fails_above_the_checkpoint(monkeypatch, tmp_path) -> None:
+    """``floor_work_log2`` is known before any header above the checkpoint is checked, so a proof
+    failing among them still carries it in ``--json`` — here the header mined for
+    ``tests/test_mark_block_verification.py`` on top of the real 460,580, below the floor, ten deep."""
+    from pyrxd.glyph.mark_block import FLOOR_WORK_DIVISOR
+    from pyrxd.spv.radiant import radiant_header_work
+    from tests.test_mark_block_verification import _MINED_HEADER
+
+    _checkpoint(monkeypatch, C, C.start)
+    served = {**C.headers, C.tip + 1: _MINED_HEADER}
+    over = {**_confs(C, 10), "blockchain.block.headers": lambda p: _headers_reply(served, *p)}
+    r, _ = _verify(monkeypatch, tmp_path, C, _server(C, **over), conf=10)
+    bv = json.loads(r.output)["mark_anchor"]["block_verification"]
+    assert bv["state"] == "NOT VERIFIED" and dict(bv["steps"])["floor"] == "failed", bv
+    floor = radiant_header_work(C.headers[C.start]) // FLOOR_WORK_DIVISOR
+    assert bv["floor_work_log2"] == floor.bit_length() - 1 == 52
+
+
 # ── a reorganisation between the anchor's reply and the proof's ────────────────────────────
 
 

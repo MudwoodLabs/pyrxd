@@ -99,7 +99,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`pyrxd.glyph.mark_block.verify_with_fetched`, and the reply readers now in
   `pyrxd.spv.radiant`), so for the same server answers the page and `pyrxd verify
   --min-confirmations N`, where N is the depth the page aims for, give the same state, claim,
-  reason and proved depth.
+  reason and proved depth — except where the page's requiring only one confirmation matters. A
+  header between the mark's block and N deep that was not served (the server's chain is
+  shorter), that carries less work than the floor, or that does not link to the header below it
+  when the two came in separate requests ends the page's proved depth below it, still
+  `VERIFIED`, while the CLI at N is `NOT VERIFIED` (`CONTRADICTED` for the unlinked pair). And
+  where N deep would reach past the 4,032 blocks this pyrxd links from its newest checkpoint,
+  the page proves as far as it may and the CLI says it needs a newer pyrxd.
   - A malformed reply is refused by the same Python reader on both, with the same reason. The
     page's JavaScript judges no reply's shape: it drops the fields nothing reads and caps each
     reply's size. A reply over that cap, and a fetch that fails in transport (a timeout, or an
@@ -110,8 +116,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     newest checkpoint a server whose tip is short still verifies, to the depth it can prove; at or
     below a checkpoint, the proved depth runs to the newest checkpoint.
   - `pyrxd.glyph.mark_block` takes a `target_confirmations`, separate from the required
-    `min_confirmations`: headers up to the target are fetched and checked, and one missing or
-    failing past the required depth ends the proved depth there instead of failing the proof.
+    `min_confirmations`: headers up to the target are fetched and checked. Past the required
+    depth a header decides by cause: one served that fails its own proof-of-work, or that does
+    not link to the header below it within one reply, is `CONTRADICTED`, as it would be within
+    the required depth; one not served, below the floor, or unlinked across two separate
+    requests ends the proved depth below it, and the outcome's new `short_of_target` says which.
     `pyrxd verify` passes none, so its required floor is still exactly `--min-confirmations`.
   - A block that does not verify stays on screen as the server's word, with "Not verified here:"
     and the reason. A proof that contradicts the height shows no block number, with the reason.

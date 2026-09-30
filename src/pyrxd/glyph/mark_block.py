@@ -56,11 +56,24 @@ fetched or checked.
 REQUIRED DEPTH AND TARGET DEPTH ARE TWO NUMBERS. ``min_confirmations`` is REQUIRED: a proof that
 cannot reach it is NOT VERIFIED. ``target_confirmations`` (optional, never below the required
 depth in effect) is how deep to TRY: the headers up to it are fetched and checked like the rest,
-but one that is missing, malformed, unlinked, below its own target or below the floor only ends
-the proved run there — it is past what was required, so it is not a finding either way — and
-``verified_depth`` (with the claim's header count) is the depth actually proved. ``pyrxd verify``
-passes none, so its required depth is the only one; the browser pages require 1 and aim for
-more, so a server whose tip is short still VERIFIES to the depth it can prove.
+and ``verified_depth`` (with the claim's header count) is the depth actually proved. Past the
+required depth, what a header does decides by CAUSE:
+
+* one SERVED that fails its own proof-of-work (hashes above the target its own nBits states) is
+  a lie at any depth: CONTRADICTED, exactly as it is within the required depth;
+* one whose previous-block field does not name the header below it, when both came in ONE
+  ``blockchain.block.headers`` reply, is a lie too (one reply is one chain): CONTRADICTED;
+* one that was not served (the server's chain is shorter), is not an 80-byte header, carries less
+  work than the floor (an honest difficulty drop can do that), or does not link to the header
+  below it when the two came in SEPARATE requests (a reorganisation between them can do that)
+  only ENDS the proved run below it, and ``short_of_target`` says which. Which request each header
+  came in is read from the plan's ranges (:func:`plan_block_verification`), which is how
+  :func:`verify_with_fetched` fetches them; a caller handing :func:`verify_mark_block` headers it
+  fetched some other way is judged as if it had fetched those ranges.
+
+``pyrxd verify`` passes no target, so its required depth is the only one; the browser pages
+require 1 and aim for more, so a server whose tip is short still VERIFIES to the depth it can
+prove.
 
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
 nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
@@ -198,8 +211,14 @@ class BlockVerification:
     verified_depth: int | None = None
     #: ``((step, "passed" | "failed" | "not run"), ...)`` in the order they run; the ``blockhash``
     #: step is ``"passed"``, ``"differs"`` (see ``named_blockhash``) or ``"not run"``, never
-    #: ``"failed"``.
+    #: ``"failed"``. ``linkage``, ``proof_of_work`` and ``floor`` describe the headers IN the proved
+    #: run; a header past the required depth that ended it is in ``short_of_target``, never here.
     steps: tuple[tuple[str, str], ...] = ()
+    #: Why the proved run stopped below ``target_confirmations``, when a header past the REQUIRED
+    #: depth ended it without being a lie: not served, not an 80-byte header, below the floor, or
+    #: not linking to the header below it across two separate requests. ``None`` when nothing past
+    #: the required depth ended the run — always, with no target (``pyrxd verify``).
+    short_of_target: str | None = None
 
 
 _STEPS = ("tree_depth", "merkle", "blockhash", "linkage", "proof_of_work", "floor", "burial")
@@ -342,24 +361,6 @@ def _header(headers: Mapping[Any, Any], h: int) -> bytes:
 def _hashes_to(header: Any, want: str) -> bool:
     """Whether *header* is an 80-byte header whose hash is *want*."""
     return isinstance(header, (bytes, bytearray)) and len(header) == 80 and radiant_block_hash(bytes(header)) == want
-
-
-def _extends(header: Any, below: str, floor: int) -> bool:
-    """Whether *header* passes every check a header above the newest checkpoint must: 80 bytes,
-    naming *below* as its previous block, meeting its own target, carrying the floor's work.
-
-    Asked only of a header PAST the required depth (``target_confirmations``), before the checks
-    that would fail the proof: there, a header that does not pass ends the proved run instead."""
-    if not isinstance(header, (bytes, bytearray)) or len(header) != 80:
-        return False
-    header = bytes(header)
-    if radiant_header_prev_hash(header) != below:
-        return False
-    try:
-        verify_radiant_header_pow(header)
-    except (SpvVerificationError, ValidationError):
-        return False
-    return radiant_header_work(header) >= floor
 
 
 def _coinbase_branch(reply: Any, height: int) -> tuple[str, tuple[str, ...]]:
@@ -574,25 +575,42 @@ def _verify(
     else:
         facts.update(checkpoint_height=newest_h, checkpoint_hash=newest_hash)
 
-    # 4. above the newest checkpoint: linkage from it, each header's own PoW, and the floor. When
-    # only the TARGET reaches above it (a block just below the newest checkpoint), this is extra
-    # depth, and nothing here can fail the proof: it runs only from the checkpoint's own header,
-    # and records these steps only if it linked a header above it.
+    # 4. above the newest checkpoint: linkage from it, each header's own PoW, and the floor. Past
+    # the REQUIRED depth, a header decides by cause (module docstring): a failed proof-of-work, or
+    # a failed link within one reply, is CONTRADICTED as it is below; anything else ends the proved
+    # run there, recorded in `short_of_target`. When only the TARGET reaches above the checkpoint
+    # (a block just below it), this runs only from the checkpoint's own header, and records these
+    # steps only if it linked a header above it.
     required_above = required_top > newest_h
     if top > newest_h and (required_above or _hashes_to(headers.get(newest_h), newest_hash)):
         anchor(newest_h, newest_hash)
         floor = radiant_header_work(_header(headers, newest_h)) // FLOOR_WORK_DIVISOR
+        if required_above:
+            # Known before any header is checked, so reported on a failing proof too (as in #804).
+            facts["floor_work_log2"] = floor.bit_length() - 1
         below = newest_hash
         linked.add(newest_h)
         reached = newest_h
+        # A header that starts a request did not come in the same reply as the one below it.
+        request_starts = {start for start, _count in plan.header_ranges}
         for h in range(newest_h + 1, top + 1):
+            past = h > required_top  # past the REQUIRED depth: only aimed for
             got = headers.get(h)
             if got is None and h > height:
-                break  # burial shortfall, judged below
-            if h > required_top and not _extends(got, below, floor):
-                break  # past the REQUIRED depth: the proved run ends here, and that is no finding
+                if past:
+                    facts["short_of_target"] = f"the header at {h} was not served"
+                break  # within the required depth: a burial shortfall, judged below
+            if past and not (isinstance(got, (bytes, bytearray)) and len(got) == 80):
+                facts["short_of_target"] = f"the reply for the header at {h} is not an 80-byte header"
+                break
             hdr = _header(headers, h)
             if radiant_header_prev_hash(hdr) != below:
+                if past and h in request_starts:
+                    facts["short_of_target"] = (
+                        f"the header at {h} does not link to the header at {h - 1}, which came in a separate "
+                        f"request (a chain reorganisation between the two can do that)"
+                    )
+                    break
                 steps["linkage"] = "failed"
                 raise _Stop(CONTRADICTED, f"the header at {h} does not link to the header served at {h - 1}")
             try:
@@ -600,14 +618,22 @@ def _verify(
             except (SpvVerificationError, ValidationError) as exc:
                 steps["proof_of_work"] = "failed"
                 raise _Stop(CONTRADICTED, f"the header at {h} fails its own proof-of-work: {exc}") from None
-            steps["proof_of_work"] = "passed"  # so far: every header up to this one
             if radiant_header_work(hdr) < floor:
+                if past:
+                    # Not in the proved run, so no step records it: the run ends below it.
+                    facts["short_of_target"] = (
+                        f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of "
+                        f"checkpoint {newest_h}'s)"
+                    )
+                    break
+                steps["proof_of_work"] = "passed"  # every header up to this one, this one included
                 steps["floor"] = "failed"
                 raise _Stop(
                     NOT_VERIFIED,
                     f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of "
                     f"checkpoint {newest_h}'s); its difficulty may be honest, but it does not verify here",
                 )
+            steps["proof_of_work"] = "passed"  # so far: every header up to this one
             linked.add(h)
             reached = h
         if required_above or reached > newest_h:

@@ -568,19 +568,96 @@ def test_a_target_past_the_headers_served_still_verifies_to_the_depth_proved() -
     shortfall, which the same fifty REQUIRED would be."""
     v = C.run(C.cp(C.start), min_confirmations=1, target_confirmations=50)
     assert v.state == VERIFIED and v.verified_depth == 9
+    assert v.short_of_target == f"the header at {C.top + 1} was not served"
     required = C.run(C.cp(C.start), min_confirmations=50)
     assert required.state == NOT_VERIFIED and "only 9 of the 50" in (required.reason or "")
 
 
-def test_a_bad_header_past_the_required_depth_ends_the_run_and_is_no_finding() -> None:
-    """The header at 460,575 fails its own proof-of-work. REQUIRED that deep, it is a
-    contradiction (as before); only AIMED for, the proved run ends below it."""
+def test_a_header_failing_its_own_proof_of_work_past_the_required_depth_is_contradicted() -> None:
+    """The header at 460,575 (depth 4) was SERVED and hashes above its own nBits target: a lie at
+    any depth. Only AIMED for, it is the same CONTRADICTED, with the same reason and steps, as
+    REQUIRED that deep — never VERIFIED at the depth below it with the proof-of-work step "passed"."""
     lie = _bad_pow_at(460575)
-    required = C.run(C.cp(C.start), headers=lie, min_confirmations=5)
-    assert required.state == CONTRADICTED and _step(required, "proof_of_work") == "failed"
+    required = C.run(C.cp(C.start), headers=lie, min_confirmations=6)
     aimed = C.run(C.cp(C.start), headers=lie, min_confirmations=1, target_confirmations=6)
+    for v in (required, aimed):
+        assert v.state == CONTRADICTED, v.reason
+        assert _step(v, "proof_of_work") == "failed"
+        assert (v.reason or "").startswith("the header at 460575 fails its own proof-of-work")
+        assert v.short_of_target is None
+    assert aimed.reason == required.reason and aimed.steps == required.steps
+
+
+def _mined_on_top() -> dict[int, bytes]:
+    """The real headers to 460,580, and the header mined for this file on top (460,581): genuine
+    proof-of-work, linked to the real 460,580, and far below the floor."""
+    return {**C.headers, 460581: _MINED_HEADER}
+
+
+def test_a_header_below_the_floor_past_the_required_depth_ends_the_run() -> None:
+    """The honest half of the pair above. A header with genuine proof-of-work but less work than
+    the floor may be an honest difficulty drop, so past the required depth it ends the proved run
+    below it — VERIFIED at nine, the steps describing the nine proved, the reason recorded."""
+    aimed = C.run(C.cp(C.start), headers=_mined_on_top(), min_confirmations=1, target_confirmations=10)
+    assert aimed.state == VERIFIED and aimed.verified_depth == 9, aimed.reason
+    assert _step(aimed, "floor") == _step(aimed, "proof_of_work") == "passed"
+    assert (aimed.short_of_target or "").startswith("the header at 460581 carries less work than the floor")
+    required = C.run(C.cp(C.start), headers=_mined_on_top(), min_confirmations=10)
+    assert required.state == NOT_VERIFIED and _step(required, "floor") == "failed"
+    assert "the header at 460581 carries less work than the floor" in (required.reason or "")
+
+
+def test_a_header_served_short_past_the_required_depth_ends_the_run() -> None:
+    upto = {h: b for h, b in C.headers.items() if h <= 460574}
+    aimed = C.run(C.cp(C.start), headers=upto, min_confirmations=1, target_confirmations=6)
     assert aimed.state == VERIFIED and aimed.verified_depth == 3, aimed.reason
-    assert _step(aimed, "proof_of_work") == "passed"
+    assert aimed.short_of_target == "the header at 460575 was not served"
+    assert _step(aimed, "proof_of_work") == _step(aimed, "floor") == "passed"
+
+
+def _unlinked_at(h: int) -> dict[int, bytes]:
+    """A real header with genuine proof-of-work, from another block, served at *h*: it does not
+    name the header at ``h - 1`` as its previous block."""
+    return {**C.headers, h: MARKS["pyrxd_468521"].headers[468521]}
+
+
+@pytest.mark.parametrize(
+    ("at", "same_reply"), [(460575, True), (460576, False)], ids=["within_one_reply", "across_two_requests"]
+)
+def test_an_unlinked_header_past_the_required_depth_decides_by_whether_one_reply_served_both(
+    monkeypatch, at: int, same_reply: bool
+) -> None:
+    """Requests of four headers from the checkpoint (460,564): 460,572-460,575, then 460,576-…
+    Within ONE reply a header that does not link to the one below is a lie: CONTRADICTED. Across
+    two requests a reorganisation between them does that honestly: the run ends below it."""
+    monkeypatch.setattr(mark_block, "MAX_HEADERS_PER_REQUEST", 4)
+    plan = plan_block_verification(
+        height=C.height, min_confirmations=1, target_confirmations=6, checkpoints=C.cp(C.start)
+    )
+    assert plan.header_ranges == ((460564, 4), (460568, 4), (460572, 4), (460576, 2)), "the premise"
+    v = C.run(C.cp(C.start), headers=_unlinked_at(at), min_confirmations=1, target_confirmations=6)
+    if same_reply:
+        assert v.state == CONTRADICTED and _step(v, "linkage") == "failed"
+        assert f"the header at {at} does not link to the header served at {at - 1}" in (v.reason or "")
+    else:
+        assert v.state == VERIFIED and v.verified_depth == at - C.height, v.reason
+        assert _step(v, "linkage") == "passed"
+        assert (v.short_of_target or "").startswith(f"the header at {at} does not link to the header at {at - 1}")
+    required = C.run(C.cp(C.start), headers=_unlinked_at(at), min_confirmations=6)
+    assert required.state == CONTRADICTED, "within the REQUIRED depth, either is contradicted, as before"
+
+
+def test_floor_work_log2_is_reported_on_a_failing_proof() -> None:
+    """Known before any header above the checkpoint is checked, so a proof failing among them still
+    reports it — #804's behaviour, and what ``pyrxd verify --json`` carries."""
+    floor = radiant_header_work(C.headers[C.start]) // FLOOR_WORK_DIVISOR
+    for v in (
+        C.run(C.cp(C.start), headers=_bad_pow_at(460575), min_confirmations=6),
+        C.run(C.cp(C.start), headers=_mined_on_top(), min_confirmations=10),
+        C.run(C.cp(C.start), min_confirmations=10),
+    ):
+        assert v.state != VERIFIED
+        assert v.floor_work_log2 == floor.bit_length() - 1, v
 
 
 def test_no_target_is_exactly_the_required_depth() -> None:

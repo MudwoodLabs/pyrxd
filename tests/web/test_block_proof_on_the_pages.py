@@ -177,9 +177,9 @@ def cli_proof(chain: Chain, client, anchor: dict, *, label: str, min_confirmatio
 
     The CLI has one depth, REQUIRED (its ``--min-confirmations``); the page requires 1 and aims for
     :func:`page_target`. Asked to require the depth the page aims for, the CLI fetches the same
-    requests, and wherever that depth is served it reaches the same outcome — which is what the
-    parity tests compare. Where it is NOT served, the two differ by design (see
-    ``test_a_server_serving_fewer_headers_than_it_reports_still_verifies``)."""
+    requests, and wherever that depth is served and proved it reaches the same outcome — which is
+    what the parity tests compare. Where a header short of it is not served or is below the floor,
+    the two differ by design (see ``test_past_the_pages_required_depth_a_header_decides_by_cause``)."""
     return asyncio.run(
         glyph_inspect.verify_anchor_block(
             lambda: (client, label),
@@ -229,6 +229,22 @@ def _reorg_named(chain: Chain) -> dict:
     return {"blockchain.transaction.get": verbose_or_raw, "blockchain.block.header": one_header}
 
 
+def _bad_pow_at(chain: Chain, h: int) -> dict[int, bytes]:
+    """The real headers, with the one at *h* altered so it hashes above its own nBits target."""
+    lie = dict(chain.headers)
+    moved = bytearray(lie[h])
+    moved[79] ^= 0x01
+    lie[h] = bytes(moved)
+    return lie
+
+
+def _bad_pow_three_deep(chain: Chain) -> dict:
+    """The review's case: the server reports nine and serves them, and the header three deep hashes
+    above its own target — past the page's REQUIRED depth (one), within the six it aims for."""
+    lie = _bad_pow_at(chain, chain.height + 2)
+    return {"blockchain.block.headers": lambda p: _headers_reply(lie, *p)}
+
+
 def _hash(header: bytes) -> str:
     from pyrxd.hash import radiant_block_hash
 
@@ -264,6 +280,7 @@ CASES: dict[str, tuple[Chain, Any, dict, str]] = {
     "the_shipped_table_unpatched": (P, None, {}, "NOT VERIFIED"),
     "contradicted_flipped_sibling": (C, "tip", "bad_sibling", "CONTRADICTED"),
     "contradicted_spliced_header": (C, "tip", "spliced", "CONTRADICTED"),
+    "contradicted_bad_pow_past_the_pages_required_depth": (P, "start", "bad_pow", "CONTRADICTED"),
 }
 
 
@@ -276,9 +293,13 @@ def _setup(monkeypatch, case: str):
     elif cp == "none":
         monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", ())
     if isinstance(override, str):
-        override = {"short": _short, "bad_sibling": _bad_sibling, "spliced": _spliced, "reorg": _reorg_named}[override](
-            chain
-        )
+        override = {
+            "short": _short,
+            "bad_sibling": _bad_sibling,
+            "spliced": _spliced,
+            "reorg": _reorg_named,
+            "bad_pow": _bad_pow_three_deep,
+        }[override](chain)
     return chain, _server(chain, **override), state
 
 
@@ -435,7 +456,93 @@ def test_a_server_serving_fewer_headers_than_it_reports_still_verifies(glue, mon
     six, _ = cli_proof(chain, _server(chain, **over), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=6)
     assert six.state == "NOT VERIFIED" and six.reason == "only 3 of the 6 required blocks could be verified"
     three, _ = cli_proof(chain, _server(chain, **over), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=3)
-    assert _page_verification(page) == _cli_verification(three)
+    shown = _page_verification(page)
+    # The one field the CLI at three cannot have: why the page, aiming for six, stopped at three.
+    assert shown.pop("short_of_target") == f"the header at {chain.height + 3} was not served"
+    at_three = _cli_verification(three)
+    assert at_three.pop("short_of_target") is None
+    assert shown == at_three
+
+
+def _floor_just_above(chain: Chain, h: int):
+    """A floor one unit of work above the header at *h*: the effect of a difficulty drop at *h*,
+    which the fixture chain does not have. Set through the module's own parameter, so both the
+    page's bridge and the CLI's helper (both in this process) judge against it."""
+    from fractions import Fraction
+
+    from pyrxd.spv.radiant import radiant_header_work
+
+    return Fraction(radiant_header_work(chain.headers[chain.start]), radiant_header_work(chain.headers[h]) + 1)
+
+
+#: PAST THE PAGE'S REQUIRED DEPTH (one), within the six it aims for, a header decides by CAUSE:
+#: (chain, the server override, the page's state and depth, the CLI's state at six).
+_PAST_REQUIRED: dict[str, tuple[Chain, str, str, int | None, str]] = {
+    # SERVED, and hashes above its own target: a lie at any depth — the same CONTRADICTED on both.
+    "fails_its_own_proof_of_work": (P, "bad_pow", "CONTRADICTED", None, "CONTRADICTED"),
+    # NOT SERVED (the server's chain is shorter): the page's proved run ends below it.
+    "not_served": (C, "short_at_4", "VERIFIED", 3, "NOT VERIFIED"),
+    # BELOW THE FLOOR (an honest difficulty drop can do that): the same.
+    "below_the_floor": (C, "floor_at_4", "VERIFIED", 3, "NOT VERIFIED"),
+}
+
+
+@pytest.mark.parametrize("case", list(_PAST_REQUIRED), ids=list(_PAST_REQUIRED))
+def test_past_the_pages_required_depth_a_header_decides_by_cause(glue, monkeypatch, case: str) -> None:
+    """The page and ``pyrxd verify --min-confirmations 6`` on the same answers (the server reports
+    nine). A lie is CONTRADICTED on both. A header that is merely absent or below the floor ends
+    the page's proved run — VERIFIED at three, with ``short_of_target`` saying why — where the CLI,
+    requiring six, is NOT VERIFIED; required at the three the page proved, the CLI gives the
+    page's outcome exactly. Those are the only cases in which the two differ (glue's docstring)."""
+    from pyrxd.glyph import mark_block
+
+    chain, how, page_state, page_depth, cli_state = _PAST_REQUIRED[case]
+    _work_level(monkeypatch, chain)
+    fourth = chain.height + 3
+    if how == "bad_pow":
+        over = _bad_pow_three_deep(chain)
+    elif how == "short_at_4":
+        upto = {h: b for h, b in chain.headers.items() if h < fourth}
+        over = {"blockchain.block.headers": lambda p: _headers_reply(upto, *p)}
+    else:
+        monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", _floor_just_above(chain, fourth))
+        over = {}
+    anchor = page_anchor(glue, chain, _server(chain, **over))
+    assert anchor["confirmations"] == 9 and page_target(glue, anchor) == 6, "the premise"
+    page, _ = page_proof(glue, chain, _server(chain, **over), anchor)
+    six, _ = cli_proof(chain, _server(chain, **over), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=6)
+    assert six.state == cli_state, six.reason
+    bv = page["anchor"]["block_verification"]
+    assert bv["state"] == page_state, bv
+    if page_state == "CONTRADICTED":
+        assert six.reason.startswith(f"the header at {chain.height + 2} fails its own proof-of-work")
+        assert _page_verification(page) == _cli_verification(six)
+        assert dict(bv["steps"])["proof_of_work"] == "failed" and bv["short_of_target"] is None
+        assert page["anchor"]["resolved"] is False
+        # And through the page's own JavaScript loop, with the real glue behind it.
+        lie = _bad_pow_at(chain, chain.height + 2)
+        out = _js_proof(
+            glue, chain, chain.start, _proof_table(chain, headers={str(h): b.hex() for h, b in lie.items()})
+        )
+        got = out["answer"]["anchor"]
+        assert got["resolved"] is False and got["block_verification"]["state"] == "CONTRADICTED"
+        assert got["block_verification"]["reason"] == six.reason
+        return
+    assert bv["verified_depth"] == page_depth and page["anchor"]["height_is_verified"] is True
+    assert dict(bv["steps"])["proof_of_work"] == dict(bv["steps"])["floor"] == "passed"
+    if how == "short_at_4":
+        assert bv["short_of_target"] == f"the header at {fourth} was not served"
+        assert six.reason == "only 3 of the 6 required blocks could be verified"
+    else:
+        assert bv["short_of_target"].startswith(f"the header at {fourth} carries less work than the floor")
+        assert six.reason.startswith(f"the header at {fourth} carries less work than the floor"), six.reason
+    at_depth, _ = cli_proof(
+        chain, _server(chain, **over), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=page_depth
+    )
+    shown, cli = _page_verification(page), _cli_verification(at_depth)
+    shown.pop("short_of_target")
+    assert cli.pop("short_of_target") is None
+    assert shown == cli
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════

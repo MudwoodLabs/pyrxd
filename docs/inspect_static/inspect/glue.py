@@ -1203,8 +1203,19 @@ def verify_mark_block(txid: str, raw_hex: str, anchor_json: object, fetched_json
     client uses; the display shape is :func:`~pyrxd.glyph.mark_anchor.with_block_verification`'s.
     So for the same server answers the page and ``pyrxd verify --min-confirmations N`` — N the
     depth the page aims for, ``min(the server's count, _PROOF_TARGET_DEPTH)`` — give the same state,
-    claim, reason and proved depth. The page REQUIRES only ``_ANCHOR_FLOOR``, so where fewer than N
-    are served it still VERIFIES to the depth it proved, where the CLI at N would not.
+    claim, reason and proved depth, except where the page's REQUIRING only ``_ANCHOR_FLOOR``
+    matters, and only there:
+
+    * a header between the mark's block and N deep that was not served (the server's chain is
+      shorter), that carries less work than the floor, or that does not link to the header below
+      it when the two came in separate requests: the page VERIFIES to the depth below it, with
+      ``short_of_target`` saying why, where the CLI at N is NOT VERIFIED (CONTRADICTED, for the
+      unlinked pair);
+    * N deep reaching past ``MAX_HEADERS_FROM_CHECKPOINT`` above the newest checkpoint: the page
+      proves as far as it may, where the CLI at N says it needs a newer pyrxd.
+
+    A header SERVED that fails its own proof-of-work, or fails to link to the one below it within
+    one reply, is CONTRADICTED on both at any depth (``pyrxd.glyph.mark_block``'s docstring).
 
     THE PAGE HANDS OVER ONLY WHAT IS READ. ``proveMarkBlock`` (shared.js) passes each reply's
     fields that the readers here read, nothing else, and judges no shape: every refusal of a reply
