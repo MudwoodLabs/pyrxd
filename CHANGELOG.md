@@ -81,7 +81,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   over every mainnet header from height 14,088, after the chain's launch, found the bound short of
   no block count at 3.0, and short near height 98,705 at 2.0), `loss_budget_photons` 1 RXD with
   `epsilon` clamped to 1e-12..1e-3, `dust_threshold_photons` 1,000 RXD (above it, two distinct
-  operators must report the funding's depth; see Security), and, for the negotiation-time check
+  operators must report the funding's depth; see Security), `accept_single_operator_up_to_photons`
+  `None` (the user override of that threshold; see Security), and, for the negotiation-time check
   only, `early_slack_s` 3600 and `early_work_margin` 2.0. The defaults other than `surge_factor`
   and `dust_threshold_photons` await the maintainer's sign-off.
 - **`ElectrumXClient.source_keys`** lists every operator group among a client's URLs, and
@@ -322,6 +323,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     configured to ask fewer than two operators for such a swap, naming them. At or below dust one
     operator suffices and the result says so. pyrxd's shipped mainnet endpoints are two operators;
     the node-over-ssh scripts ask the node and those endpoints.
+    `ElapsedBoundPolicy.accept_single_operator_up_to_photons` (default `None`) is an explicit user
+    override of that threshold, in photons; every script that builds a mainnet coordinator sets it
+    with `--accept-single-operator-up-to RXD`, and nothing sets it from the environment. It may
+    raise or lower the threshold and has no cap. When it raises it, the gate logs a WARNING naming
+    the value; whenever it is set, the gate's result (`single_operator_override`, `bound_note`) and
+    the durable swap record (`SwapRecord.single_operator_override`, written only when set) say
+    "single-operator depth accepted up to X RXD by user override (default Y RXD)". The two-operator
+    refusals, at construction and at step 5, name the override and what it gives up: the funding's
+    depth then rests on that one operator's report.
 
   What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
   non-spend; the `listunspent` read that locates it is kept for that). The elapsed-depth bound is a

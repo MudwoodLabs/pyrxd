@@ -37,8 +37,10 @@ from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
     add_eth_key_arguments,
+    add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
+    funding_bound_from_args,
     merge_into_mode_600,
     resolve_eth_key_file,
     wait_for_covenant_funding,
@@ -168,6 +170,7 @@ async def run(args) -> None:
             accept_nondurable_seen=True,
             accept_estimated_eth_margins=True,
             fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+            funding_bound=funding_bound_from_args(args),
         ),
     )
 
@@ -276,6 +279,7 @@ def _args():
     ap.add_argument("--report-out", default="/tmp/eth_grief_report.json")  # noqa: S108
     ap.add_argument("--keys-out", default="~/.eth_grief_run_keys.json")
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
+    add_single_operator_override_arg(ap)
     args = ap.parse_args()
     resolve_eth_key_file(args)
     return args

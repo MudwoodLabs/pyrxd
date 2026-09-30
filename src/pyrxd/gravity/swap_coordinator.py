@@ -2093,8 +2093,9 @@ class SwapCoordinator:
            ``SwapRole.MAKER``). The gate sizes the depth it requires of the maker's funding from it
            and refuses without one at step 5, after the maker has locked.
         3. TWO OPERATORS ABOVE DUST (a coordinator that runs the taker gate). Above
-           ``funding_bound.dust_threshold_photons`` the gate refuses unless at least two distinct
-           operators report the funding's depth (:data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`);
+           ``funding_bound.single_operator_threshold_photons`` (``dust_threshold_photons`` unless the
+           user override ``accept_single_operator_up_to_photons`` is set) the gate refuses unless at
+           least two distinct operators report the funding's depth (:data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`);
            a Radiant leg configured to ask fewer operator groups (``configured_depth_operators``,
            derived from each source's ``source_key``) is refused here, naming them.
         4. ROOM IN ``t_rxd``. Step 6 subtracts the gate's elapsed-depth UPPER bound from ``t_rxd``, and
@@ -2150,10 +2151,11 @@ class SwapCoordinator:
                 named = ", ".join(configured) if configured else "none (this Radiant leg does not say which it asks)"
                 return before + (
                     f"the value at stake ({value} photons) is above the taker gate's dust threshold "
-                    f"({fb.dust_threshold_photons} photons), so the gate requires the maker's funding depth "
+                    f"({fb.single_operator_threshold_photons} photons), so the gate requires the maker's funding depth "
                     f"reported by at least {needed} distinct operators (grouped by source_key), and this Radiant "
                     f"leg is configured to ask {len(counted)}: {named}. Add a depth source run by another operator "
                     "(RadiantChainIO(..., depth_sources=...) — pyrxd's shipped mainnet endpoints, or your own node)"
+                    + fb.single_operator_refusal_hint()
                 )
         burial = self._funding_burial_blocks(chain, value)
         try:
@@ -2263,6 +2265,11 @@ class SwapCoordinator:
             bound_policy=self.config.funding_bound,
         )
         self.last_maker_funding = result
+        # The user override of the single-operator threshold goes into the DURABLE record, so the
+        # swap's own record says it was run under it. Carried by every later copy of the record
+        # (they use dataclasses.replace) and written by the intent persist before any lock.
+        if result.single_operator_override != self.record.single_operator_override:
+            self.record = dataclasses.replace(self.record, single_operator_override=result.single_operator_override)
         return result.outpoint, result.value_photons, result.elapsed_blocks_upper
 
     def _assert_eth_timelock_ordering(

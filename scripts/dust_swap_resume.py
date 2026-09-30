@@ -52,7 +52,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
     CapturingBroadcaster,
     SshTrFeeSource,
+    add_single_operator_override_arg,
     confirm,
+    funding_bound_from_args,
     measured_margin_from_mainnet,
     rxd_blockcount,
     validated_resume_deadline_s,
@@ -216,7 +218,7 @@ async def resume(args) -> None:
         # taker_funds_btc, so it neither reserves nor needs H — but the durable store keeps
         # the SEEN-1 guard satisfied without the accept_nondurable_seen opt-in.
         seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=policy),
+        config=CoordinatorConfig(margin_policy=policy, funding_bound=funding_bound_from_args(args)),
     )
     print(f"  coordinator seeded at {coord.record.state.value}")
 
@@ -378,6 +380,7 @@ def _parse_args(argv):
             "requires it (the timelock reserves divide by it); measure it against a mainnet node for this run."
         ),
     )
+    add_single_operator_override_arg(ap)
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument(
         "--resume-deadline-s",

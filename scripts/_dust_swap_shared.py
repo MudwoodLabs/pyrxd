@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import hashlib
 import json
 import math
@@ -25,9 +26,12 @@ import stat
 import struct
 import tempfile
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY, ElapsedBoundPolicy
+from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
 from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times
 from pyrxd.network.bitcoin import MempoolSpaceSource
 from pyrxd.security.units import ChainHeight
@@ -40,6 +44,62 @@ _MAINNET_BTC_API = "https://mempool.space/api"
 # slow link. Without this, aiohttp's default 5-min per-request timeout would let a single
 # stuck request blow through the deadline by minutes. (Red-team finding NEW #7 on 44707a3.)
 HTTP_REQUEST_TIMEOUT_S = 30.0
+
+
+# ---------------------------------------------------------------------------
+# Flags shared by every script that builds a mainnet swap coordinator
+# ---------------------------------------------------------------------------
+
+#: The flag that sets ``ElapsedBoundPolicy.accept_single_operator_up_to_photons``. Every script that
+#: builds a coordinator on the mainnet node client exposes it (a test derives that set from the
+#: source). There is no environment variable and nothing persists it between runs.
+SINGLE_OPERATOR_OVERRIDE_FLAG = "--accept-single-operator-up-to"
+
+
+def parse_rxd_amount_photons(text: str) -> int:
+    """``"2500"`` / ``"0.5"`` RXD → photons, exactly. Refuses a negative, non-finite or non-numeric
+    amount, and one finer than a photon (more than 8 decimal places)."""
+    try:
+        amount = Decimal(str(text).strip())
+    except InvalidOperation:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an RXD amount") from None
+    if not amount.is_finite() or amount < 0:
+        raise argparse.ArgumentTypeError(f"{text!r}: the RXD amount must be a finite, non-negative number")
+    photons = amount * PHOTONS_PER_RXD
+    if photons != photons.to_integral_value():
+        raise argparse.ArgumentTypeError(f"{text!r}: an RXD amount has at most 8 decimal places (1 photon)")
+    return int(photons)
+
+
+def add_single_operator_override_arg(ap: argparse.ArgumentParser) -> None:
+    """Add ``--accept-single-operator-up-to RXD`` (the taker gate's single-operator threshold)."""
+    default_rxd = Decimal(DEFAULT_ELAPSED_BOUND_POLICY.dust_threshold_photons) / PHOTONS_PER_RXD
+    ap.add_argument(
+        SINGLE_OPERATOR_OVERRIDE_FLAG,
+        dest="accept_single_operator_up_to",
+        metavar="RXD",
+        type=parse_rxd_amount_photons,
+        default=None,
+        help=(
+            "USER OVERRIDE of the value at stake (in RXD) up to which the taker gate accepts the maker's "
+            f"funding depth as reported by a single operator (default {default_rxd.normalize():f} RXD; above it, "
+            "two distinct operators must report it). Raising it means relying on that one operator for the "
+            "funding's depth: the gate logs a WARNING and the result and swap record say so. Lowering it "
+            "is recorded too."
+        ),
+    )
+
+
+def funding_bound_from_args(args: argparse.Namespace) -> ElapsedBoundPolicy:
+    """The coordinator's ``funding_bound``: the shipped defaults, with the user override from
+    ``--accept-single-operator-up-to`` when given (printed, so the run's output says so)."""
+    photons = args.accept_single_operator_up_to
+    policy = dataclasses.replace(DEFAULT_ELAPSED_BOUND_POLICY, accept_single_operator_up_to_photons=photons)
+    statement = policy.single_operator_override_statement()
+    if statement is not None:
+        prefix = "WARNING: " if policy.single_operator_threshold_raised else ""
+        print(f"  {prefix}taker gate: {statement}")
+    return policy
 
 
 # ---------------------------------------------------------------------------

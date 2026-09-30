@@ -283,3 +283,92 @@ def test_every_mainnet_script_that_reaches_the_taker_gate_asks_at_least_two_oper
     node = shim.SshTrRadiantClient()
     ops = counted_operators(RadiantChainIO(node, proof_client=shim.mainnet_proof_client()).configured_depth_operators())
     assert str(source_key(node._ssh_host)) in ops and len(ops) >= MIN_REPORTING_OPERATORS + 1, ops
+
+
+# --------------------------------------------------------------------------- the single-operator override
+
+
+def _parser_functions(tree: ast.Module) -> list[ast.FunctionDef]:
+    """The functions in a script that build an ``argparse.ArgumentParser``."""
+    return [
+        fn
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and _calls(fn, "ArgumentParser")
+    ]
+
+
+def test_every_mainnet_coordinator_script_exposes_the_override_flag_and_hands_it_to_its_coordinator():
+    """Every script that builds a coordinator on the mainnet node client — the set DERIVED from the
+    source, as above — adds ``--accept-single-operator-up-to`` to the parser it builds, and every
+    ``CoordinatorConfig`` it constructs takes ``funding_bound=funding_bound_from_args(...)``, the one
+    helper that turns the flag into ``ElapsedBoundPolicy.accept_single_operator_up_to_photons``."""
+    scripts = _mainnet_coordinator_scripts()
+    assert {"dust_swap_run", "eth_swap_run", "eth_swap_grief_run", "dust_swap_resume"} <= set(scripts), sorted(scripts)
+    configs = 0
+    for name, tree in scripts.items():
+        parsers = _parser_functions(tree)
+        assert parsers, f"{name}: no ArgumentParser found"
+        for fn in parsers:
+            assert _calls(fn, "add_single_operator_override_arg"), (
+                f"{name}:{fn.name} builds a parser without --accept-single-operator-up-to"
+            )
+        for call in _calls(tree, "CoordinatorConfig"):
+            fb = next((kw.value for kw in call.keywords if kw.arg == "funding_bound"), None)
+            assert _callee(fb) == "funding_bound_from_args", (
+                f"{name}:{call.lineno}: CoordinatorConfig without funding_bound=funding_bound_from_args(args) — "
+                "the --accept-single-operator-up-to flag would be parsed and ignored"
+            )
+            configs += 1
+    assert configs >= len(scripts)
+
+
+def test_the_override_flag_parses_rxd_exactly_and_refuses_nonsense():
+    shared = _load("_dust_swap_shared")
+    ap = argparse.ArgumentParser()
+    shared.add_single_operator_override_arg(ap)
+
+    def parsed(*argv):
+        return ap.parse_args(list(argv))
+
+    assert parsed().accept_single_operator_up_to is None
+    assert parsed("--accept-single-operator-up-to", "2500").accept_single_operator_up_to == 2500 * 10**8
+    assert parsed("--accept-single-operator-up-to", "0.00000001").accept_single_operator_up_to == 1
+    assert parsed("--accept-single-operator-up-to", "0").accept_single_operator_up_to == 0
+    for bad in ("-1", "abc", "nan", "inf", "0.000000001", ""):
+        with pytest.raises(SystemExit):
+            parsed("--accept-single-operator-up-to", bad)
+
+
+def test_the_flag_reaches_the_policy_and_the_output_says_so(capsys):
+    """The value typed is the value the coordinator's policy carries — and the run's own output
+    states it, with WARNING when it raises the threshold; unset, the shipped defaults, silently."""
+    shared = _load("_dust_swap_shared")
+    from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY
+
+    assert shared.funding_bound_from_args(argparse.Namespace(accept_single_operator_up_to=None)) == (
+        DEFAULT_ELAPSED_BOUND_POLICY
+    )
+    assert capsys.readouterr().out == ""
+    raised = shared.funding_bound_from_args(argparse.Namespace(accept_single_operator_up_to=2500 * 10**8))
+    assert raised.accept_single_operator_up_to_photons == 2500 * 10**8
+    out = capsys.readouterr().out
+    assert (
+        "WARNING" in out and "single-operator depth accepted up to 2500 RXD by user override (default 1000 RXD)" in out
+    )
+    lowered = shared.funding_bound_from_args(argparse.Namespace(accept_single_operator_up_to=10**8))
+    assert lowered.single_operator_threshold_photons == 10**8
+    out = capsys.readouterr().out
+    assert "WARNING" not in out and "accepted up to 1 RXD by user override" in out
+
+
+def test_each_mainnet_script_parses_the_flag_into_its_args(eth_run, grief_run, monkeypatch):
+    """Through each script's OWN parser, not the helper alone."""
+    flag = ("--accept-single-operator-up-to", "1500")
+    args = _sepolia_dust_args(eth_run, monkeypatch, *flag)
+    assert args.accept_single_operator_up_to == 1500 * 10**8
+    assert _grief_args(grief_run, monkeypatch, *flag).accept_single_operator_up_to == 1500 * 10**8
+    dust = _load("dust_swap_run")
+    assert dust._parse_args(["--stage", "dry-run", *flag]).accept_single_operator_up_to == 1500 * 10**8
+    resume = _load("dust_swap_resume")
+    got = resume._parse_args(["--keys-out", "k", "--btc-htlc-funding-txid", "ab" * 32, *flag])
+    assert got.accept_single_operator_up_to == 1500 * 10**8

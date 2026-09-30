@@ -585,6 +585,12 @@ class SwapRecord:
     #: is what blocked the resume carve-out in #515 and the idempotent-funding direction in #504
     #: item 1, not the pricing arithmetic.
     pending_push_tx_hash: str | None = None
+    #: The taker gate's statement that a USER OVERRIDE set the value up to which a depth reported by
+    #: a single operator was accepted (``ElapsedBoundPolicy.single_operator_override_statement``:
+    #: "single-operator depth accepted up to X RXD by user override (default Y RXD)"), or ``None``
+    #: when no override was set. Written by the coordinator when the gate runs; serialised only when
+    #: set, so a record without it keeps its existing wire form.
+    single_operator_override: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -654,6 +660,8 @@ class SwapRecord:
                 "whose slot is unknown, so a resume could neither replace it nor rule out sending a "
                 "second push at a different nonce. Record both or neither."
             )
+        if self.single_operator_override is not None and not isinstance(self.single_operator_override, str):
+            raise ValidationError("single_operator_override must be a str or None")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -741,6 +749,8 @@ class SwapRecord:
                 d["pending_push_nonce"] = self.pending_push_nonce
             if self.pending_push_tx_hash is not None:
                 d["pending_push_tx_hash"] = self.pending_push_tx_hash
+        if self.single_operator_override is not None:
+            d["single_operator_override"] = self.single_operator_override
         return d
 
     @classmethod
@@ -773,6 +783,7 @@ class SwapRecord:
             pending_counter_deploy_tx=d.get("pending_counter_deploy_tx"),
             pending_push_nonce=d.get("pending_push_nonce"),
             pending_push_tx_hash=d.get("pending_push_tx_hash"),
+            single_operator_override=d.get("single_operator_override"),
         )
 
 

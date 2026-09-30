@@ -67,11 +67,13 @@ from _dust_swap_shared import (
     CapturingBroadcaster,
     SshTrFeeSource,
     StepReport,
+    add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
     covenant_fund_height,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    funding_bound_from_args,
     measured_margin_from_mainnet,
     merge_into_mode_600,
     rxd_blockcount,
@@ -317,7 +319,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         # so the SEEN-1 replay/free-option reservation survives a restart or a second
         # process (durable-by-default; no accept_nondurable_seen opt-in needed).
         seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=policy),
+        config=CoordinatorConfig(margin_policy=policy, funding_bound=funding_bound_from_args(args)),
     )
 
     try:
@@ -526,6 +528,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "requires it (the timelock reserves divide by it); measure it against a mainnet node for this run."
         ),
     )
+    add_single_operator_override_arg(ap)
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
     ap.add_argument(
         "--resume-deadline-s",

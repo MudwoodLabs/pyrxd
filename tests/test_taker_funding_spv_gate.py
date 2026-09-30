@@ -2061,3 +2061,160 @@ def test_the_log_tail_error_stays_far_inside_the_quantile_margin(mean):
         exact = float(_exact_log_tail(mean, n))
         got = funding_spv._log_poisson_tail(mean, n)
         assert abs(got - exact) <= funding_spv._QUANTILE_LOG_MARGIN / 100, (mean, n, got, exact)
+
+
+# --------------------------------------------------------------------------- (g) the user override
+
+_RXD = PHOTONS_PER_RXD
+_DEFAULT_THRESHOLD = ElapsedBoundPolicy().dust_threshold_photons
+
+
+def _statement(up_to_rxd: str, default_rxd: str = "1000") -> str:
+    return f"single-operator depth accepted up to {up_to_rxd} RXD by user override (default {default_rxd} RXD)"
+
+
+@pytest.mark.parametrize("bad", [-1, -(10**9), True, False, 1.5, 1000.0, "1000", b"1"])
+def test_the_single_operator_override_refuses_nonsense_at_construction(bad):
+    with pytest.raises(
+        ValidationError, match="accept_single_operator_up_to_photons must be None or a non-negative int"
+    ):
+        ElapsedBoundPolicy(accept_single_operator_up_to_photons=bad)
+
+
+def test_the_override_defaults_to_none_and_changes_nothing_unset():
+    p = ElapsedBoundPolicy()
+    assert _DEFAULT_THRESHOLD == 1_000 * _RXD  # the shipped default, unchanged
+    assert p.accept_single_operator_up_to_photons is None
+    assert p.single_operator_threshold_photons == _DEFAULT_THRESHOLD
+    assert p.single_operator_override_statement() is None and not p.single_operator_threshold_raised
+    zero = ElapsedBoundPolicy(accept_single_operator_up_to_photons=0)
+    assert zero.single_operator_threshold_photons == 0
+    assert zero.single_operator_override_statement() == _statement("0")
+
+
+def _one_operator_run(monkeypatch, *, value, policy):
+    c, kw = _dust_case(monkeypatch)
+    a, b = (str(k) for k in _SHIPPED_OPERATORS[:2])
+    depth = max(c.headers) - c.height + 1
+    ev = c.evidence(reported_depths=((a, depth),), configured_operators=(a, b))
+    return lambda: verify_maker_funding(ev, value_at_stake_photons=value, bound_policy=policy, **kw)
+
+
+def test_without_the_override_the_gate_is_unchanged_and_says_nothing_of_one(monkeypatch, caplog):
+    ok = _one_operator_run(monkeypatch, value=_DEFAULT_THRESHOLD, policy=ElapsedBoundPolicy())()
+    assert ok.single_operator_override is None and ok.single_operator_threshold_photons == _DEFAULT_THRESHOLD
+    assert "user override" not in ok.bound_note
+    with pytest.raises(MakerFundingNotVerified) as exc:
+        _one_operator_run(monkeypatch, value=_DEFAULT_THRESHOLD + 1, policy=ElapsedBoundPolicy())()
+    # The refusal names the override and what it gives up — and, unset, no "currently".
+    msg = str(exc.value)
+    assert "accept_single_operator_up_to_photons" in msg and "--accept-single-operator-up-to" in msg, msg
+    assert "you then rely on that one operator for the funding's depth" in msg, msg
+    assert "currently" not in msg, msg
+    assert not [r for r in caplog.records if "user override" in r.getMessage()]
+
+
+def test_an_override_above_the_value_accepts_one_operator_warns_and_states_it(monkeypatch, caplog):
+    value = 10_000 * _RXD
+    policy = ElapsedBoundPolicy(accept_single_operator_up_to_photons=20_000 * _RXD)
+    with caplog.at_level("WARNING", logger="pyrxd.gravity.funding_spv"):
+        ok = _one_operator_run(monkeypatch, value=value, policy=policy)()
+    assert ok.reporting_operators_required == 0 and len(ok.reporting_operators) == 1
+    assert ok.single_operator_threshold_photons == 20_000 * _RXD
+    assert ok.single_operator_override == _statement("20000")
+    assert _statement("20000") in ok.bound_note, ok.bound_note
+    warned = [r for r in caplog.records if r.levelname == "WARNING" and _statement("20000") in r.getMessage()]
+    assert len(warned) == 1, [r.getMessage() for r in caplog.records]
+    assert "10000 RXD" in warned[0].getMessage()  # the value at stake, stated
+
+
+def test_an_override_below_the_value_still_refuses_and_names_the_override(monkeypatch):
+    policy = ElapsedBoundPolicy(accept_single_operator_up_to_photons=5_000 * _RXD)
+    with pytest.raises(MakerFundingNotVerified) as exc:
+        _one_operator_run(monkeypatch, value=10_000 * _RXD, policy=policy)()
+    msg = str(exc.value)
+    assert "at least 2 distinct operators; 1 answered" in msg, msg
+    assert f"dust threshold ({5_000 * _RXD} photons)" in msg, msg
+    assert f"currently {_statement('5000')}" in msg, msg
+
+
+def test_lowering_the_threshold_refuses_a_previously_dust_swap_on_one_operator(monkeypatch, caplog):
+    value = 500 * _RXD
+    assert _one_operator_run(monkeypatch, value=value, policy=ElapsedBoundPolicy())().reporting_operators_required == 0
+    lowered = ElapsedBoundPolicy(accept_single_operator_up_to_photons=100 * _RXD)
+    with caplog.at_level("WARNING", logger="pyrxd.gravity.funding_spv"):
+        with pytest.raises(MakerFundingNotVerified) as exc:
+            _one_operator_run(monkeypatch, value=value, policy=lowered)()
+        assert f"currently {_statement('100')}" in str(exc.value)
+        # Recorded, but not warned: lowering asks MORE of the funding.
+        ok = _one_operator_run(monkeypatch, value=100 * _RXD, policy=lowered)()
+    assert ok.single_operator_override == _statement("100") and _statement("100") in ok.bound_note
+    assert not [r for r in caplog.records if r.levelname == "WARNING"], [r.getMessage() for r in caplog.records]
+
+
+def test_the_early_check_honours_and_names_the_override():
+    """At construction, before anyone locks: a one-operator configuration above the default is
+    refused naming the override; with the override above the value it constructs; with the override
+    below the value it is refused, and the refusal says what the override currently is."""
+    _op, urls = next((k, v) for k, v in _SHIPPED_BY_OPERATOR.items() if len(v) >= 2)
+    one = RadiantChainIO(ElectrumXClient([urls[0]]), depth_sources=(ElectrumXClient([urls[1]]),))
+    value = 10_000 * PHOTONS_PER_RXD
+
+    def build(policy):
+        return _btc_coord(
+            _wide_terms(3000),
+            _operator_leg(one),
+            policy=_vb_policy(value_at_risk_photons=value),
+            accept_nondurable_seen=True,
+            funding_bound=policy,
+        )
+
+    with pytest.raises(ValidationError) as exc:
+        build(ElapsedBoundPolicy())
+    msg = str(exc.value)
+    assert "refused before anyone locks" in msg and "--accept-single-operator-up-to" in msg, msg
+    assert "you then rely on that one operator for the funding's depth" in msg, msg
+    assert build(ElapsedBoundPolicy(accept_single_operator_up_to_photons=value))[0] is not None
+    with pytest.raises(ValidationError) as exc:
+        build(ElapsedBoundPolicy(accept_single_operator_up_to_photons=value - 1))
+    assert "currently single-operator depth accepted up to 9999.99999999 RXD by user override" in str(exc.value)
+
+
+async def test_the_durable_record_carries_the_override_statement(monkeypatch):
+    """Through the production path (``taker_funds_btc`` → the real leg → the gate): one operator
+    configured, a value above the default, the override above it. The swap locks, and EVERY record
+    written to durable storage — the intent written before the lock and the funded one after —
+    carries the statement, and it survives the JSON round trip."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    value = 10_000 * PHOTONS_PER_RXD
+    written: list[dict] = []
+
+    async def persist(record):
+        written.append(json.loads(json.dumps(record.to_dict())))
+
+    coord, _btc_view = _btc_coord(
+        terms,
+        _real_leg(view, network="bc", depth_sources=()),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+        funding_bound=ElapsedBoundPolicy(accept_single_operator_up_to_photons=20_000 * PHOTONS_PER_RXD),
+    )
+    coord._persist = persist
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED
+    assert len(written) >= 2 and all(w.get("single_operator_override") == _statement("20000") for w in written)
+    assert SwapRecord.from_dict(written[-1]).single_operator_override == _statement("20000")
+
+    # Without the override the record does not grow the field (its wire form is unchanged).
+    coord, _ = _btc_coord(
+        terms,
+        _real_leg(view, network="bc"),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+    )
+    written.clear()
+    coord._persist = persist
+    assert (await coord.taker_funds_btc(terms, now_unix_s=_NOW)).state is SwapState.BTC_LOCKED
+    assert written and all("single_operator_override" not in w for w in written)

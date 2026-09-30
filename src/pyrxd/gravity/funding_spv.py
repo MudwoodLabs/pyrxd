@@ -92,7 +92,9 @@ used is::
   it is not counted — and the refusal names how many answered and which. The coordinator refuses
   at construction, before anyone locks, a configuration with fewer operator groups than that. At
   or below dust one operator suffices: with one operator configured, the time term is what stands
-  against a source that stops serving early, and the result says so.
+  against a source that stops serving early, and the result says so. The user may move that
+  threshold explicitly (``ElapsedBoundPolicy.accept_single_operator_up_to_photons``); raised, the
+  gate logs a WARNING, and the result and the durable swap record state the override.
 
 The result names the term that set the bound (``bound_term``). A server that stops serving at an
 older header hands the taker an older ``MTP(R)`` and a larger ``E``: fewer headers served shows up as
@@ -148,6 +150,7 @@ WHAT REMAINS THE SERVER'S WORD, stated rather than implied:
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -164,6 +167,7 @@ from pyrxd.glyph.mark_block import (
     plan_block_verification,
     verify_mark_block,
 )
+from pyrxd.glyph.wave_rules import format_rxd
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
 from pyrxd.hash import hash256, radiant_block_hash
 from pyrxd.security.errors import ValidationError
@@ -171,6 +175,8 @@ from pyrxd.security.types import BlockHeight
 from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work
 from pyrxd.spv.radiant_checkpoints import CHECKPOINTS, LAST_INTERVAL_MAX_WORK, NEWEST_CHECKPOINT_WORK
 from pyrxd.transaction.transaction import Transaction
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "FORGERY_COST_FACTOR",
@@ -280,6 +286,14 @@ class ElapsedBoundPolicy:
       funding's depth must be reported by at least :data:`MIN_REPORTING_OPERATORS` distinct
       operators, or the gate refuses; at or below it one operator suffices and the time term may
       govern the bound. Default 1,000 RXD.
+    * ``accept_single_operator_up_to_photons`` — an explicit USER OVERRIDE of that threshold: the
+      value at stake up to which the gate accepts a depth reported by a single operator. ``None``
+      (the default) uses ``dust_threshold_photons``. It may raise or lower the threshold; there is no
+      cap. Raised, the swap relies on that one operator for the funding's depth: the gate logs a
+      WARNING naming the value, and the result (``single_operator_override``, ``bound_note``) and the
+      durable swap record carry :meth:`single_operator_override_statement`. Lowered, it is recorded
+      the same way, without the warning. The swap scripts set it with
+      ``--accept-single-operator-up-to RXD``; nothing sets it from the environment.
     """
 
     surge_factor: float = 3.0
@@ -289,6 +303,7 @@ class ElapsedBoundPolicy:
     early_slack_s: int = 3600
     early_work_margin: float = 2.0
     dust_threshold_photons: int = 1_000 * PHOTONS_PER_RXD
+    accept_single_operator_up_to_photons: int | None = None
 
     def __post_init__(self) -> None:
         def num(v: Any) -> bool:
@@ -309,15 +324,54 @@ class ElapsedBoundPolicy:
         dt = self.dust_threshold_photons
         if not isinstance(dt, int) or isinstance(dt, bool) or dt < 0:
             raise ValidationError("ElapsedBoundPolicy.dust_threshold_photons must be a non-negative int")
+        ov = self.accept_single_operator_up_to_photons
+        if ov is not None and (not isinstance(ov, int) or isinstance(ov, bool) or ov < 0):
+            raise ValidationError(
+                "ElapsedBoundPolicy.accept_single_operator_up_to_photons must be None or a non-negative int "
+                f"(photons), not {ov!r}"
+            )
+
+    @property
+    def single_operator_threshold_photons(self) -> int:
+        """The value at stake up to which one operator's depth report suffices: the user override
+        when set, else ``dust_threshold_photons``."""
+        ov = self.accept_single_operator_up_to_photons
+        return self.dust_threshold_photons if ov is None else ov
+
+    @property
+    def single_operator_threshold_raised(self) -> bool:
+        """True when the user override raises the threshold above ``dust_threshold_photons``."""
+        return self.single_operator_threshold_photons > self.dust_threshold_photons
+
+    def single_operator_override_statement(self) -> str | None:
+        """The sentence the gate's result and the durable swap record carry when the user override is
+        set, or ``None`` when it is not."""
+        if self.accept_single_operator_up_to_photons is None:
+            return None
+        return (
+            f"single-operator depth accepted up to {format_rxd(self.single_operator_threshold_photons)} "
+            f"by user override (default {format_rxd(self.dust_threshold_photons)})"
+        )
+
+    def single_operator_refusal_hint(self) -> str:
+        """What a two-operator refusal says about the override: how to set it and what it gives up."""
+        now = self.single_operator_override_statement()
+        return (
+            "; or set accept_single_operator_up_to_photons on ElapsedBoundPolicy (the swap scripts' "
+            "--accept-single-operator-up-to RXD) to at least the value at stake to accept one operator's report "
+            "for this value (you then rely on that one operator for the funding's depth)"
+            + (f"; currently {now}" if now else "")
+        )
 
     def requires_operators(self, chain: RadiantChain, value_at_stake_photons: int | None) -> int:
         """How many distinct operators must report the funding's depth for a swap of this value on
         *chain*: :data:`MIN_REPORTING_OPERATORS` on a value-bearing network above
-        ``dust_threshold_photons``, else 0."""
+        :attr:`single_operator_threshold_photons` (``dust_threshold_photons`` unless the user override
+        is set), else 0."""
         if (
             chain.value_bearing
             and value_at_stake_photons is not None
-            and value_at_stake_photons > self.dust_threshold_photons
+            and value_at_stake_photons > self.single_operator_threshold_photons
         ):
             return MIN_REPORTING_OPERATORS
         return 0
@@ -889,6 +943,12 @@ class VerifiedMakerFunding:
     #: network, else 0.
     reporting_operators: tuple[str, ...]
     reporting_operators_required: int
+    #: The value at stake up to which one operator's report sufficed for this run
+    #: (:attr:`ElapsedBoundPolicy.single_operator_threshold_photons`), and — when the user override
+    #: set it — the statement saying so (:meth:`ElapsedBoundPolicy.single_operator_override_statement`),
+    #: which the coordinator also writes into the durable swap record. ``None``: no override.
+    single_operator_threshold_photons: int
+    single_operator_override: str | None
     served_tip: int
     #: One sentence: which term set the bound, and what stood behind it.
     bound_note: str
@@ -1185,12 +1245,12 @@ def verify_maker_funding(
         silent = [c for c in counted_operators(configured) if c not in answered]
         raise refuse(
             f"the value at stake ({value_at_stake_photons} photons) is above the dust threshold "
-            f"({bound_policy.dust_threshold_photons} photons), so the funding's depth must be reported by at "
+            f"({bound_policy.single_operator_threshold_photons} photons), so the funding's depth must be reported by at "
             f"least {needed} distinct operators; {len(answered)} answered"
             + (f" ({', '.join(answered)})" if answered else "")
             + (f", and {', '.join(silent)} did not" if silent else "")
             + ". Configure a depth source run by another operator (RadiantChainIO(..., depth_sources=...)) "
-            "and retry",
+            "and retry" + bound_policy.single_operator_refusal_hint(),
             f"depth reports from {needed} distinct operators",
             f"the funding in block {height}, {proved} deep; "
             + (", ".join(f"{k} {d}" for k, d in by_operator) if by_operator else "no depth reports"),
@@ -1226,11 +1286,23 @@ def verify_maker_funding(
         rule_part = f"; {len(answered)} distinct operators reported, {needed} required above the dust threshold"
     elif chain.value_bearing:
         rule_part = (
-            f"; the value at stake is at or below the dust threshold ({bound_policy.dust_threshold_photons} "
+            f"; the value at stake is at or below the dust threshold ({bound_policy.single_operator_threshold_photons} "
             "photons), so a report from one operator suffices and the time term may govern"
         )
     else:
         rule_part = ""
+    # THE USER OVERRIDE of the single-operator threshold. Stated in the result (and, by the
+    # coordinator, in the durable record) whenever it is set; a WARNING, naming the value, whenever
+    # it raises the threshold — above the default the swap relies on one operator for the depth.
+    override = bound_policy.single_operator_override_statement()
+    if override is not None:
+        rule_part += f"; {override}"
+        if bound_policy.single_operator_threshold_raised and chain.value_bearing:
+            logger.warning(
+                "taker gate: %s; the value at stake for this swap is %s",
+                override,
+                "unknown" if value_at_stake_photons is None else format_rxd(value_at_stake_photons),
+            )
     note = f"the {term} term set the bound at {upper}: {time_part}; {report_part}; proved {proved}{one_op}{rule_part}"
 
     return VerifiedMakerFunding(
@@ -1260,6 +1332,8 @@ def verify_maker_funding(
         reported_depth=reported,
         reporting_operators=answered,
         reporting_operators_required=needed,
+        single_operator_threshold_photons=bound_policy.single_operator_threshold_photons,
+        single_operator_override=override,
         served_tip=top,
         bound_note=note,
         claim=v.claim or "",

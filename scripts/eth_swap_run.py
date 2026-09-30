@@ -46,10 +46,12 @@ from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
     add_eth_key_arguments,
+    add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    funding_bound_from_args,
     merge_into_mode_600,
     read_own_private_file,
     resolve_eth_key_file,
@@ -1264,6 +1266,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # Exclusive across processes: `reserve(H)` was the only mutual exclusion in the funding
         # path, and resuming an interrupted fund skips it.
         fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+        # The taker gate's single-operator threshold: the shipped default unless the user passed
+        # --accept-single-operator-up-to.
+        funding_bound=funding_bound_from_args(args),
     )
     # RESUME FROM THE PERSISTED STATE, not from NEGOTIATED. The sink has always had `load_record`
     # and nothing called it: the coordinator was constructed fresh every time, so a resumed run
@@ -1647,6 +1652,7 @@ def _args() -> argparse.Namespace:
     # ops
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
+    add_single_operator_override_arg(ap)
     # NOT /tmp. It is world-writable and shared with every process on the box: the report from the
     # first real-value RXD/USDT swap was deleted there by an unrelated cleanup the same day. The
     # report is the run's only off-chain provenance — txids, timings, the margins actually used —
