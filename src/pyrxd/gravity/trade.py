@@ -1,5 +1,17 @@
 """High-level GravityTrade orchestrator.
 
+.. deprecated::
+    ``GravityTrade`` is the SPV-oracle swap and is **deprecated and UNGATED**:
+    between ``claim()`` and the taker's BTC payment, the only Radiant-side
+    evidence it reads is the broadcast acknowledgement of the claim tx from a
+    single server (see ``_broadcast_radiant``); nothing independently verifies
+    that the maker's covenant exists on chain before the taker pays. A single
+    lying server can take the taker's full BTC payment for a covenant that was
+    never actually broadcast or mined. See
+    ``docs/solutions/design-decisions/spv-swap-deprecated-primitive-retained.md``.
+    Use the HTLC swap (:class:`~pyrxd.gravity.swap_coordinator.SwapCoordinator`)
+    instead.
+
 Wraps the Phase 3a primitive builders into a single async class that steps
 through the full four-step Maker↔Taker swap:
 
@@ -12,6 +24,9 @@ through the full four-step Maker↔Taker swap:
 verifier and never offers a "skip verification" shortcut. The primitive layer
 (``build_finalize_tx``, ``SpvProofBuilder``) can still be called directly for
 testing or advanced use cases where the caller has already verified externally.
+None of this changes the deprecation above: the verifiers it does run cover
+the Bitcoin-payment SPV proof at ``finalize()`` time, not the existence of the
+maker's covenant at claim time — that is the gap the taker pays into.
 
 Security notes
 --------------
@@ -30,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 
 from pyrxd.network.bitcoin import BtcDataSource
@@ -126,6 +142,15 @@ class ConfirmationStatus:
 class GravityTrade:
     """Orchestrate a complete Gravity BTC↔RXD atomic swap.
 
+    .. deprecated::
+        Deprecated and **UNGATED**: nothing verifies that the maker's covenant
+        exists on chain before you pay. Between ``claim()`` and the taker's BTC
+        payment, the only Radiant-side evidence read is the claim tx's broadcast
+        acknowledgement from a single server — one lying server can take the
+        full BTC payment for a covenant that does not exist. Use the HTLC swap
+        (:class:`~pyrxd.gravity.swap_coordinator.SwapCoordinator`) instead.
+        Constructing this class emits a ``DeprecationWarning``.
+
     Parameters
     ----------
     radiant_network:
@@ -166,6 +191,14 @@ class GravityTrade:
             )
     """
 
+    #: Text shared by the constructor's ``DeprecationWarning`` and its logged
+    #: WARNING, so the two can never drift apart.
+    _DEPRECATION_MESSAGE = (
+        "GravityTrade is deprecated and UNGATED: nothing verifies that the "
+        "maker's covenant exists on chain before you pay; one lying server can "
+        "take the full payment. Use the HTLC swap (SwapCoordinator) instead."
+    )
+
     def __init__(
         self,
         *,
@@ -173,6 +206,8 @@ class GravityTrade:
         bitcoin_source: BtcDataSource,
         config: TradeConfig | None = None,
     ) -> None:
+        warnings.warn(self._DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+        logger.warning(self._DEPRECATION_MESSAGE)
         self._rxd = radiant_network
         self._btc = bitcoin_source
         self._cfg = config or TradeConfig()

@@ -137,6 +137,33 @@ class TestTradeConfig:
 
 
 # ---------------------------------------------------------------------------
+# GravityTrade is deprecated and ungated — constructing it must warn
+# ---------------------------------------------------------------------------
+
+
+class TestGravityTradeDeprecationWarning:
+    """GravityTrade is the SPV-oracle swap: deprecated, and UNGATED — nothing
+    verifies the maker's covenant exists on chain before the taker pays BTC.
+    Every construction must surface that, through the real public constructor
+    (there is no other entry point: no classmethod/factory bypasses __init__).
+    """
+
+    def test_construction_warns_deprecation_ungated(self):
+        rxd = mock_electrumx()
+        btc = mock_btc_source()
+        with pytest.warns(DeprecationWarning, match="UNGATED"):
+            GravityTrade(radiant_network=rxd, bitcoin_source=btc)
+
+    def test_construction_logs_warning(self, caplog):
+        rxd = mock_electrumx()
+        btc = mock_btc_source()
+        with caplog.at_level("WARNING", logger="pyrxd.gravity.trade"):
+            with pytest.warns(DeprecationWarning):
+                GravityTrade(radiant_network=rxd, bitcoin_source=btc)
+        assert any("UNGATED" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # _find_output_zero_offset
 # ---------------------------------------------------------------------------
 
