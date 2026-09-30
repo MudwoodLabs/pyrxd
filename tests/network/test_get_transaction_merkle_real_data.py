@@ -45,7 +45,7 @@ def _cases() -> list[tuple[str, dict[str, Any]]]:
 def _header_at(fx: dict[str, Any], height: int) -> bytes:
     raw = bytes.fromhex(fx["headers_hex"])
     i = height - fx["headers_start"]
-    assert 0 <= i and (i + 1) * 80 <= len(raw), "fixture does not carry that height"
+    assert i >= 0 and (i + 1) * 80 <= len(raw), "fixture does not carry that height"
     return raw[i * 80 : (i + 1) * 80]
 
 
@@ -100,9 +100,7 @@ async def test_the_bump_round_trips_through_its_binary_form(txid: str, fx: dict)
 async def test_the_branch_method_returns_the_reply_verbatim_and_validated(txid: str, fx: dict) -> None:
     height = fx["merkle"]["block_height"]
     branch = await _client_answering(fx["merkle"]).get_transaction_merkle_branch(Txid(txid), BlockHeight(height))
-    assert branch == TxMerkleBranch(
-        block_height=height, branch=tuple(fx["merkle"]["merkle"]), pos=fx["merkle"]["pos"]
-    )
+    assert branch == TxMerkleBranch(block_height=height, branch=tuple(fx["merkle"]["merkle"]), pos=fx["merkle"]["pos"])
 
 
 @pytest.mark.parametrize(("txid", "fx"), _cases(), ids=[t[:8] for t, _ in _cases()])
@@ -123,9 +121,7 @@ async def test_a_pos_that_aliases_another_leaf_is_refused(pos_offset: int) -> No
     reply = dict(fx["merkle"])
     reply["pos"] = 2 ** len(reply["merkle"]) + pos_offset
     with pytest.raises(NetworkError, match="Malformed merkle"):
-        await _client_answering(reply).get_transaction_merkle_branch(
-            Txid(txid), BlockHeight(reply["block_height"])
-        )
+        await _client_answering(reply).get_transaction_merkle_branch(Txid(txid), BlockHeight(reply["block_height"]))
 
 
 async def test_the_failover_client_forwards_the_branch_method() -> None:
