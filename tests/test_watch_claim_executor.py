@@ -139,7 +139,7 @@ class _FakeChainIO:
 
 
 class _FakeRadiantLeg:
-    #: Production ``RadiantCovenantLeg`` sets ``.network`` (radiant_leg.py:630), and the
+    #: Production ``RadiantCovenantLeg`` sets ``.network`` (radiant_leg.py:690), and the
     #: executor's network-consistency guard reads it via ``getattr(leg, "network", None)``.
     #: This double used to omit the attribute entirely, so ``leg_net`` was ``None`` in all
     #: 38 leg resolutions across the suite and the comparison was structurally unreachable

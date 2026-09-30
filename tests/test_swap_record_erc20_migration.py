@@ -192,7 +192,7 @@ class TestTheNoChangeDecisionsAreDeliberateNotAccidental:
     """
 
     def test_the_coordinators_fund_return_check_admits_a_token_locator(self) -> None:
-        """`swap_coordinator.py:2466` isinstance-checks fund()'s return. No edit needed."""
+        """`swap_coordinator.py:2490` isinstance-checks fund()'s return. No edit needed."""
         from pyrxd.gravity.swap_state import BtcHtlcLocator
 
         assert isinstance(_erc20_locator(), (BtcHtlcLocator, EthHtlcLocator))

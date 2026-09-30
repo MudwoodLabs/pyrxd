@@ -218,7 +218,7 @@ def _required_btc_depth_blocks(policy: MarginPolicy) -> BlockSpan:
     On a BLOCKS value both conversions are the identity and the two agree.
 
     THE DOCSTRING HERE CLAIMED MORE THAN THAT — "identical to the coordinator's construction
-    (swap_coordinator.py:1257-1259), so the verdict and the gate's internal reserve cannot
+    (swap_coordinator.py:1258-1260), so the verdict and the gate's internal reserve cannot
     diverge". Both halves are wrong. The line reference has drifted onto an unrelated comment
     about the seen-store; the construction lives in ``assess_claim_finality`` as
     ``_reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)``. And the two
@@ -292,9 +292,9 @@ def _btc_refund_matured(terms: NegotiatedTerms, obs: Observations) -> bool:
 # must still page the claim race. But WHICH step to name is a different question, and it is
 # answered by the record, because both claim methods are strictly state-gated:
 #
-#   taker_scrape_and_claim_asset       — SECRET_REVEALED only  (swap_coordinator.py:3222, :3292)
-#   taker_claim_asset_from_vulnerable  — ASSET_VULNERABLE only (swap_coordinator.py:3365, :3381)
-#   taker_observed_reveal              — BOTH_LOCKED only      (swap_coordinator.py:3153)
+#   taker_scrape_and_claim_asset       — SECRET_REVEALED only  (swap_coordinator.py:3246, :3316)
+#   taker_claim_asset_from_vulnerable  — ASSET_VULNERABLE only (swap_coordinator.py:3389, :3405)
+#   taker_observed_reveal              — BOTH_LOCKED only      (swap_coordinator.py:3177)
 #
 # Naming a step the record cannot run burns claim window at exactly the moment it is scarcest:
 # after ``p`` is public, under a running timelock, at 3am. The page said

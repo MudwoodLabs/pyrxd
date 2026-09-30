@@ -682,5 +682,5 @@ def _is_missing_utxo(exc: Exception) -> bool:
     """True ONLY if a NetworkError signals an ABSENT covenant UTXO (the SPK has no live UTXO = spent/
     settled or not-yet-funded), vs a transient read fault OR a fail-closed anomaly (a value mismatch, which
     must NOT read as benign settlement; several matches are selected, never raised). Matches the exact 'no
-    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:268), not the mismatch."""
+    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:274), not the mismatch."""
     return "no utxo found" in str(exc).lower()
