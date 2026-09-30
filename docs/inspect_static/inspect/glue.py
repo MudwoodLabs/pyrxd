@@ -1079,14 +1079,23 @@ def _anchor_answer(anchor, verification=None, verified_by: str | None = None) ->
 #: hundred characters of numbers and one caveat; anything near this is not that dict.
 _MAX_ANCHOR_JSON_CHARS = 16_000
 
-#: Cap on the fetched-proof JSON. The page's floor is 1, so the most a plan asks for is the
-#: longest walk to a checkpoint — ``MAX_HEADERS_FROM_CHECKPOINT + 1`` headers, 160 hex characters
-#: each — plus two merkle replies; this leaves headroom for the JSON around them and the errors.
+#: Cap on the fetched-proof JSON. The most a plan asks for is the longest walk to a checkpoint —
+#: ``MAX_HEADERS_FROM_CHECKPOINT + 1`` headers, 160 hex characters each; the page's target depth
+#: never lengthens it, as the fetch stops that far past the newest checkpoint — plus two merkle
+#: replies; this leaves headroom for the JSON around them and the errors.
 #: ``tests/web/test_block_proof_on_the_pages.py`` checks it covers the worst plan.
 _MAX_PROOF_JSON_CHARS = 1_000_000
 
 #: How much of a page-reported fetch error crosses into a reason.
 _PROOF_ERROR_CAP = 160
+
+#: How deep the pages TRY to prove the mark's block: ``min(the server's reported confirmations,
+#: this)``. NOT a requirement — the page still requires only ``_ANCHOR_FLOOR`` — so a server whose
+#: tip is short, or which serves fewer headers than it reports, still VERIFIES to the depth it can
+#: prove (``target_confirmations`` in :mod:`pyrxd.glyph.mark_block`). Above the newest checkpoint,
+#: each header proved on top of the block is one more that a server lying about the height would
+#: have had to mine, and five more headers are a handful to fetch and hash.
+_PROOF_TARGET_DEPTH = 6
 
 _HEX64_CHARS = frozenset("0123456789abcdef")
 
@@ -1234,7 +1243,14 @@ def verify_mark_block(txid: str, raw_hex: str, anchor_json: object, fetched_json
             and all(c in "0123456789abcdefABCDEF" for c in raw_hex)
         ):
             raw_tx = bytes.fromhex(raw_hex)
-        plan = plan_block_verification(height=anchor.height, min_confirmations=_ANCHOR_FLOOR, network=_PAGE_NETWORK)
+        # Required: the page's floor. Aimed for: the server's own count, at most six.
+        target = min(anchor.confirmations, _PROOF_TARGET_DEPTH)
+        plan = plan_block_verification(
+            height=anchor.height,
+            min_confirmations=_ANCHOR_FLOOR,
+            target_confirmations=target,
+            network=_PAGE_NETWORK,
+        )
         fetched = _page_fetched(fetched_json, block_fetches(plan, txid))
         if isinstance(fetched, str):
             return {"needs": None, "anchor": None, "reason": fetched}
@@ -1244,6 +1260,7 @@ def verify_mark_block(txid: str, raw_hex: str, anchor_json: object, fetched_json
             height=anchor.height,
             blockhash=anchor.blockhash,
             min_confirmations=_ANCHOR_FLOOR,
+            target_confirmations=target,
             source=_ANCHOR_SOURCE,
             fetched=fetched[0],
             failed=fetched[1],

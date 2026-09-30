@@ -546,6 +546,83 @@ def test_a_burial_shortfall_is_not_verified_with_the_depth_reached() -> None:
     assert "only 9 of the 10" in (v.reason or "")
 
 
+# ── a TARGET depth: aimed for, never required ──────────────────────────────────────────────────
+
+
+def _bad_pow_at(h: int) -> dict[int, bytes]:
+    lie = dict(C.headers)
+    moved = bytearray(lie[h])
+    moved[79] ^= 0x01
+    lie[h] = bytes(moved)
+    return lie
+
+
+def test_a_target_proves_as_deep_as_it_is_served() -> None:
+    v = C.run(C.cp(C.start), min_confirmations=1, target_confirmations=6)
+    assert v.state == VERIFIED and v.verified_depth == 6, v.reason
+    assert f"mine the 6 header(s) from block {C.height} up" in (v.claim or "")
+
+
+def test_a_target_past_the_headers_served_still_verifies_to_the_depth_proved() -> None:
+    """Nine served, fifty aimed for, one required: VERIFIED at nine — never NOT VERIFIED for the
+    shortfall, which the same fifty REQUIRED would be."""
+    v = C.run(C.cp(C.start), min_confirmations=1, target_confirmations=50)
+    assert v.state == VERIFIED and v.verified_depth == 9
+    required = C.run(C.cp(C.start), min_confirmations=50)
+    assert required.state == NOT_VERIFIED and "only 9 of the 50" in (required.reason or "")
+
+
+def test_a_bad_header_past_the_required_depth_ends_the_run_and_is_no_finding() -> None:
+    """The header at 460,575 fails its own proof-of-work. REQUIRED that deep, it is a
+    contradiction (as before); only AIMED for, the proved run ends below it."""
+    lie = _bad_pow_at(460575)
+    required = C.run(C.cp(C.start), headers=lie, min_confirmations=5)
+    assert required.state == CONTRADICTED and _step(required, "proof_of_work") == "failed"
+    aimed = C.run(C.cp(C.start), headers=lie, min_confirmations=1, target_confirmations=6)
+    assert aimed.state == VERIFIED and aimed.verified_depth == 3, aimed.reason
+    assert _step(aimed, "proof_of_work") == "passed"
+
+
+def test_no_target_is_exactly_the_required_depth() -> None:
+    """``target_confirmations=None`` (the CLI) and a target at or below the floor change nothing."""
+    base = C.run(C.cp(C.start), min_confirmations=4)
+    for target in (None, 1, 4):
+        assert C.run(C.cp(C.start), min_confirmations=4, target_confirmations=target) == base
+    assert plan_block_verification(height=C.height, min_confirmations=4, checkpoints=C.cp(C.start)) == (
+        plan_block_verification(height=C.height, min_confirmations=4, target_confirmations=2, checkpoints=C.cp(C.start))
+    )
+
+
+def test_a_target_never_turns_a_verifiable_block_into_needs_a_newer_pyrxd() -> None:
+    """The fetch is capped at MAX_HEADERS_FROM_CHECKPOINT past the newest checkpoint; only the
+    REQUIRED depth can exceed it."""
+    newest = CHECKPOINTS["mainnet"][-1][0]
+    h = newest + MAX_HEADERS_FROM_CHECKPOINT
+    plan = plan_block_verification(height=h, min_confirmations=1, target_confirmations=6)
+    assert plan.reason is None
+    assert max(s + n - 1 for s, n in plan.header_ranges) == h
+
+
+def test_a_target_reaching_above_the_newest_checkpoint_claims_no_proof_of_work_it_did_not_check() -> None:
+    """A block two below the newest checkpoint, aiming for six: the headers above the checkpoint
+    are extra depth. None served: VERIFIED at the checkpoint's depth, the proof-of-work step NOT
+    RUN. Served: they are checked, and the depth runs past the checkpoint."""
+    cp = C.cp(C.height + 2)
+    only_to_cp = {h: b for h, b in C.headers.items() if h <= C.height + 2}
+    v = C.run(cp, headers=only_to_cp, min_confirmations=1, target_confirmations=6)
+    assert v.state == VERIFIED and v.verified_depth == 3
+    assert _step(v, "proof_of_work") == "not run" and v.floor_work_log2 is None
+    served = C.run(cp, min_confirmations=1, target_confirmations=6)
+    assert served.state == VERIFIED and served.verified_depth == 6
+    assert _step(served, "proof_of_work") == "passed"
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.0, "6"])
+def test_a_bad_target_is_a_caller_error(bad: Any) -> None:
+    with pytest.raises(ValidationError):
+        C.run(C.cp(C.top), target_confirmations=bad)
+
+
 # ── contract ─────────────────────────────────────────────────────────────────────────────────
 
 

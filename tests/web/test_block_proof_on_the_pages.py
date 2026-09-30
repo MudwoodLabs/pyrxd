@@ -50,6 +50,7 @@ from tests.test_verify_cli_block_verification import (
     PYRXD,
     REFERENCE,
     Chain,
+    _confs,
     _flip,
     _headers_reply,
     _renonced,
@@ -163,8 +164,19 @@ def page_proof(glue, chain: Chain, client, anchor: dict) -> tuple[dict, list]:
     raise AssertionError("the proof bridge kept asking")
 
 
-def cli_proof(chain: Chain, client, anchor: dict, *, label: str):
-    """The CLI helper ``pyrxd verify`` calls, on the same anchor, from the same server."""
+def page_target(glue, anchor: dict) -> int:
+    """The depth the page AIMS for: the server's own count, at most ``_PROOF_TARGET_DEPTH``."""
+    return min(anchor["confirmations"], glue._PROOF_TARGET_DEPTH)
+
+
+def cli_proof(chain: Chain, client, anchor: dict, *, label: str, min_confirmations: int):
+    """The CLI helper ``pyrxd verify`` calls, on the same anchor, from the same server.
+
+    The CLI has one depth, REQUIRED (its ``--min-confirmations``); the page requires 1 and aims for
+    :func:`page_target`. Asked to require the depth the page aims for, the CLI fetches the same
+    requests, and wherever that depth is served it reaches the same outcome — which is what the
+    parity tests compare. Where it is NOT served, the two differ by design (see
+    ``test_a_server_serving_fewer_headers_than_it_reports_still_verifies``)."""
     return asyncio.run(
         glyph_inspect.verify_anchor_block(
             lambda: (client, label),
@@ -173,7 +185,7 @@ def cli_proof(chain: Chain, client, anchor: dict, *, label: str):
             blockhash=anchor["blockhash"],
             raw_tx=chain.raw,
             network="mainnet",
-            min_confirmations=1,
+            min_confirmations=min_confirmations,
         )
     )
 
@@ -293,7 +305,9 @@ def test_the_cli_and_the_page_reach_the_same_outcome(glue, monkeypatch, case: st
     page, _asked = page_proof(glue, chain, client, anchor)
     # The CLI names its endpoint by URL; the page names its one endpoint. Given the SAME label,
     # every sentence must be the same, byte for byte.
-    cli, label = cli_proof(chain, client, anchor, label=glue._ANCHOR_SOURCE)
+    cli, label = cli_proof(
+        chain, client, anchor, label=glue._ANCHOR_SOURCE, min_confirmations=page_target(glue, anchor)
+    )
     assert cli.state == state, cli.reason
     assert _page_verification(page) == _cli_verification(cli), "the page and the CLI disagree"
     for field in ("state", "claim", "reason", "verified_depth"):
@@ -334,8 +348,11 @@ def test_the_cli_and_the_page_reach_the_same_outcome(glue, monkeypatch, case: st
 def test_the_page_asks_in_the_order_the_cli_fetches(glue, monkeypatch) -> None:
     """Merkle branch, coinbase branch, then each planned header range — and nothing twice."""
     chain, client, _ = _setup(monkeypatch, "verified_checkpoint_reference")
-    _, asked = page_proof(glue, chain, client, page_anchor(glue, chain, client))
-    plan = plan_block_verification(height=chain.height, min_confirmations=1)
+    anchor = page_anchor(glue, chain, client)
+    _, asked = page_proof(glue, chain, client, anchor)
+    plan = plan_block_verification(
+        height=chain.height, min_confirmations=1, target_confirmations=page_target(glue, anchor)
+    )
     assert asked == [
         ("blockchain.transaction.get_merkle", [chain.txid, chain.height]),
         ("blockchain.transaction.id_from_pos", [chain.height, 0, True]),
@@ -351,6 +368,71 @@ def test_nothing_is_asked_when_nothing_could_verify(glue, monkeypatch) -> None:
     assert answer["needs"] is None
     assert "ships no checkpoints for this network" in answer["anchor"]["block_verification"]["reason"]
     assert answer["anchor"]["caveat"] == BOUND_CAVEAT
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+# THE DEPTH THE PAGE PROVES: it requires 1, and aims for min(the server's count, 6)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+
+
+def _work_level(monkeypatch, chain: Chain) -> None:
+    """The proof-of-work level — the checkpoint BELOW the mark — where depth is what is proved."""
+    monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", _checkpoints(chain, chain.start))
+
+
+@pytest.mark.parametrize("chain", [C, P], ids=["reference", "pyrxd"])
+def test_a_server_reporting_170_gets_six_proved(glue, monkeypatch, chain: Chain) -> None:
+    """The server's count is far past six: the page proves six — no fewer, and no more asked for."""
+    _work_level(monkeypatch, chain)
+    client = _server(chain, **_confs(chain, 170))
+    anchor = page_anchor(glue, chain, client)
+    assert anchor["confirmations"] == 170, "the premise"
+    page, asked = page_proof(glue, chain, client, anchor)
+    bv = page["anchor"]["block_verification"]
+    assert bv["state"] == "VERIFIED" and bv["verified_depth"] == 6, bv
+    assert page["anchor"]["verified_confirmations"] == 6 and page["anchor"]["confirmations"] == 170
+    # The claim reports the depth proved: six headers a liar would have had to mine.
+    assert f"it would have had to mine the 6 header(s) from block {chain.height} up" in bv["claim"]
+    top = max(p[0] + p[1] - 1 for m, p in asked if m == "blockchain.block.headers")
+    assert top == chain.height + 5, "the page asked for more (or fewer) headers than six deep"
+
+
+def test_a_server_reporting_three_gets_three_proved_and_verified(glue, monkeypatch) -> None:
+    """A server whose tip is three blocks up (it reports 3, and serves nothing above its tip): the
+    page aims for three, proves three, and it is VERIFIED — never NOT VERIFIED for want of six.
+    The CLI, asked to require the same three, reaches the identical outcome."""
+    chain = P
+    _work_level(monkeypatch, chain)
+    upto = {h: b for h, b in chain.headers.items() if h <= chain.height + 2}
+    over = {**_confs(chain, 3), "blockchain.block.headers": lambda p: _headers_reply(upto, *p)}
+    anchor = page_anchor(glue, chain, _server(chain, **over))
+    assert anchor["confirmations"] == 3, "the premise"
+    page, _ = page_proof(glue, chain, _server(chain, **over), anchor)
+    bv = page["anchor"]["block_verification"]
+    assert bv["state"] == "VERIFIED" and bv["verified_depth"] == 3, bv
+    assert page["anchor"]["height_is_verified"] is True and page["anchor"]["verified_confirmations"] == 3
+    cli, _ = cli_proof(chain, _server(chain, **over), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=3)
+    assert _page_verification(page) == _cli_verification(cli)
+
+
+def test_a_server_serving_fewer_headers_than_it_reports_still_verifies(glue, monkeypatch) -> None:
+    """It reports 9 and serves headers only three deep. The page REQUIRES one, so it VERIFIES to
+    the three it can prove. `pyrxd verify` is unchanged: its required floor is the user's
+    ``--min-confirmations``, so at 6 the same answers are NOT VERIFIED with its own reason — and
+    required at the three the page proved, it gives the page's outcome exactly."""
+    chain = C
+    _work_level(monkeypatch, chain)
+    upto = {h: b for h, b in chain.headers.items() if h <= chain.height + 2}
+    over = {"blockchain.block.headers": lambda p: _headers_reply(upto, *p)}
+    anchor = page_anchor(glue, chain, _server(chain, **over))
+    assert anchor["confirmations"] == 9, "the premise"
+    page, _ = page_proof(glue, chain, _server(chain, **over), anchor)
+    bv = page["anchor"]["block_verification"]
+    assert bv["state"] == "VERIFIED" and bv["verified_depth"] == 3, bv
+    six, _ = cli_proof(chain, _server(chain, **over), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=6)
+    assert six.state == "NOT VERIFIED" and six.reason == "only 3 of the 6 required blocks could be verified"
+    three, _ = cli_proof(chain, _server(chain, **over), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=3)
+    assert _page_verification(page) == _cli_verification(three)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
@@ -391,7 +473,9 @@ def test_the_js_loop_reaches_the_clis_verdict(glue, monkeypatch, chain: Chain, l
     out = _js_proof(glue, chain, cp, _proof_table(chain))
     monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", _checkpoints(chain, cp))
     anchor = page_anchor(glue, chain, _server(chain))
-    cli, _ = cli_proof(chain, _server(chain), anchor, label=glue._ANCHOR_SOURCE)
+    cli, _ = cli_proof(
+        chain, _server(chain), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=page_target(glue, anchor)
+    )
     got = out["answer"]["anchor"]
     assert cli.state == "VERIFIED" and got["block_verification"]["level"] == level
     bv = dict(got["block_verification"])
@@ -468,12 +552,25 @@ def test_the_cap_is_above_what_the_rule_can_ask_at_the_pages_floor(glue) -> None
     table = radiant_checkpoints.CHECKPOINTS["mainnet"]
     assert table, "non-vacuity: the shipped mainnet table is empty"
     newest = table[-1][0]
-    heights = {newest, newest + 1, newest + MAX_HEADERS_FROM_CHECKPOINT, table[0][0], table[-2][0] + 1}
+    heights = {
+        newest,
+        newest - 1,
+        newest + 1,
+        newest + MAX_HEADERS_FROM_CHECKPOINT,
+        newest + MAX_HEADERS_FROM_CHECKPOINT - 1,
+        table[0][0],
+        table[-2][0] + 1,
+    }
     seen = 0
     for h in heights:
-        plan = plan_block_verification(height=h, min_confirmations=glue._ANCHOR_FLOOR)
-        if plan.reason is None:
-            seen = max(seen, 2 + len(plan.header_ranges))
+        # The page requires its floor and AIMS for up to `_PROOF_TARGET_DEPTH`: the worst plan is
+        # the one with the target, never smaller than without it.
+        for target in (None, glue._PROOF_TARGET_DEPTH):
+            plan = plan_block_verification(height=h, min_confirmations=glue._ANCHOR_FLOOR, target_confirmations=target)
+            if plan.reason is None:
+                seen = max(seen, 2 + len(plan.header_ranges))
+                headers = sum(n for _, n in plan.header_ranges)
+                assert headers <= MAX_HEADERS_FROM_CHECKPOINT + 1 + glue._PROOF_TARGET_DEPTH, (h, target, headers)
     assert seen, "non-vacuity: no height in the sample produced a plan"
     assert seen <= worst <= cap
 
@@ -707,7 +804,10 @@ class TestTheVerifyPageEndToEnd:
         these server answers, found verbatim on the page `onCheck` drew."""
         out = _verify_check(glue, classified, P, P.start)
         monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", _checkpoints(P, P.start))
-        cli, _ = cli_proof(P, _server(P), page_anchor(glue, P, _server(P)), label=glue._ANCHOR_SOURCE)
+        anchor = page_anchor(glue, P, _server(P))
+        cli, _ = cli_proof(
+            P, _server(P), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=page_target(glue, anchor)
+        )
         assert cli.state == "VERIFIED"
         text = _flat(out["text"])
         assert f"Verified here: {_flat(cli.claim)}" in text
@@ -761,7 +861,10 @@ class TestTheInspectPage:
     def test_inspect_draws_the_same_claim_the_cli_prints(self, glue, monkeypatch) -> None:
         out = _inspect_flow(glue, C, C.tip)
         monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", _checkpoints(C, C.tip))
-        cli, _ = cli_proof(C, _server(C), page_anchor(glue, C, _server(C)), label=glue._ANCHOR_SOURCE)
+        anchor = page_anchor(glue, C, _server(C))
+        cli, _ = cli_proof(
+            C, _server(C), anchor, label=glue._ANCHOR_SOURCE, min_confirmations=page_target(glue, anchor)
+        )
         text = _flat(out["rendered"])
         assert f"Verified: {_flat(cli.claim)}" in text
         assert f"{C.height} — VERIFIED, at least {cli.verified_depth} confirmation(s) verified" in text
