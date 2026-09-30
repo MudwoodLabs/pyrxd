@@ -51,6 +51,95 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   builder, the watchtower README, `docs/concepts/architecture.md`,
   `docs/how-to/build-a-cross-chain-swap.md` and `docs/red-team-checklist.md` said a value-bearing
   network needed an opt-in to construct. None does. The gate stays a no-op.
+### Security
+
+- **Every source count keys on ONE host identity, so one server can no longer corroborate
+  itself.** Each quorum had its own idea of "a different source", and the cheap ones counted
+  spellings. The watchtower's RXD quorum folded only case and a trailing slash, so `wss://h`,
+  `wss://h:443`, `wss://h/x` and `wss://h.` were four sources: one server behind two URLs gave
+  `corroborated=True`, and its "not locked" answer became a corroborated absence that can permit
+  an autonomous refund. `MultiSourceEthRpc([r, r])` was accepted as a 2-of-2 quorum, and
+  `scripts/eth_swap_run.py` counted one URL typed three times as the "THREE" endpoints a
+  real-value token leg requires. The Esplora host helper (`endpoint_host`) only lower-cased, so
+  `mempool.space` and `mempool.space.`, or `127.0.0.1` and `2130706433`, were two hosts.
+  `MultiSourceBtcDataSource` checked no host at all, and `MultiSourceBtcFundingReader` checked
+  host diversity only in `from_endpoints`, then built one voting reader per URL, so
+  `[h/a, h/b, g]` at quorum 2 let host `h` agree with itself. HashMark §7.6 form 2's public
+  `judge_name_at_mark` and `walk_mutable_chain` compared raw labels, so only the CLI, which picked
+  a second host itself, was protected. Every one of these now counts through
+  `pyrxd.network.source_identity.source_key`, the canonical host (`Endpoint.source` already used
+  that logic), and the judge and the walker compare by host inside themselves. An unbracketed IPv6
+  literal, as an ssh destination is written (`--ssh-host 2001:db8::1`), is read as that address:
+  parsed as a URL it was host `2001`, i.e. `0.0.7.209`, so the node over ssh and
+  `wss://[2001:db8::1]:50022` on the same machine were two sources, and any two bare IPv6 hosts
+  were one. Several URLs on one host remain a failover list for ONE source: the watchtower hands
+  them to one `ElectrumXClient`, which races them, and logs a warning that they are one source
+  (and that corroboration is off, when that leaves one); `MultiSourceBtcFundingReader.from_endpoints`
+  wraps them in one `SameHostFailover` reader.
+
+### Changed (breaking)
+
+- **Quorums refuse two sources on one host, and every source must name its host.**
+  `MultiSourceRxdChainSource`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
+  `MultiSourceEthRpc` raise `ValidationError` when two sources share a host, and when a source
+  carries no `source_key` built by `pyrxd.network.source_identity.source_key`. Every shipped
+  reader derives one from its own URL: `EthRpc`, `ElectrumXClient` (when all its URLs are one
+  host), `ElectrumRxdChainSource`, `SshTrRxdReader`, `MempoolSpaceSource`, `BlockstreamSource`,
+  `BitcoinCoreRpcSource`, `MempoolSpaceFundingReader`, and `BitcoinCoreFundingReader` when its
+  `rpc` is a bound method of a client that has one. A custom source sets
+  `source_key = source_key(<its URL>)`. `pyrxd.network.bitcoin.endpoint_host` and
+  `count_distinct_hosts` are removed: they were the Esplora quorum's second identity, and nothing
+  shipped calls them now. Use `source_key` and `group_by_source` from
+  `pyrxd.network.source_identity`, which refuse a blank URL rather than counting it as a host.
+  `scripts/eth_swap_run.py` refuses an `--eth-rpc-url` list that names one host twice, and its
+  three-endpoint gate counts distinct hosts.
+
+### Changed
+
+- **"Distinct host", never "independent operator".** A URL can show that two servers are on
+  different hosts, and nothing about who runs them. Docstrings, CLI help and the threat model now
+  say "distinct host", and that limit is stated once, in the `pyrxd.network.source_identity`
+  module docstring ("the operator limit"), which the other places point to. The
+  `registry.py` note on the two shipped ElectrumX servers no longer says "distinct operators": on
+  2026-09-29 they resolved to different IP addresses under different DNS providers, which is
+  separate infrastructure and not proof of separate operators. `verify --wave-name` keeps the
+  verdict name ESTABLISHED, and its explanation, `--help` and the form-2 caveat now say that it
+  rests on two distinct hosts and that one party running both would defeat it.
+  `docs/threat-model.md` no longer says form 2 is the only place the default pair is counted as
+  two sources (the watchtower's RXD quorum counts it too), and no longer says multi-source
+  ElectrumX is unimplemented.
+- **ETH/ERC-20 HTLC: the counterparty runtime check is now slot-exact, closing a fund-theft path
+  proven on a local Anvil chain. Affects v0.6.0 through v0.25.1; upgrade before running an ETH or
+  ERC-20 swap.** The affected surface is a MAKER verifying a counterparty-deployed ETH or ERC-20
+  HTLC (`EthHtlcContractLeg.verify_funded`, and `Erc20HtlcLeg.verify_funded`, which inherits it,
+  since that leg shipped in v0.21.0). The masked compare arrived with #155, was first released in
+  v0.6.0, and is in every release through v0.25.1. It compared the deployed runtime to the
+  committed artifact with a *value-masked* compare that wildcarded every committed-zero byte — a
+  superset of the immutable slots. Solidity splices each `immutable` into 2–3 SEPARATE runtime
+  offsets; a getter reads one copy while `claim()`/`refund()` read another. So a hostile TAKER
+  (who deploys the ETH side first) could deploy a runtime whose `claimant` getter-copy held the
+  negotiated maker (passing every `verify_funded` getter bind) while the `claim()`-copy held an
+  attacker address. `verify_funded` passed, the maker revealed the preimage, and `claim(p)` sent
+  the entire funded balance to the attacker — who then also held `p` to take the RXD leg. The prior
+  docstring's "Not exploitable in the current self-deploy wiring" was wrong for the taker-deploys
+  role. The fix (`_expected_runtime`) rebuilds the expected runtime by substituting each negotiated
+  immutable into EVERY `immutableReferences` offset and requires EXACT byte equality — no byte is
+  wildcarded, so a forged immutable copy or any modified logic byte is rejected. The token leg
+  extends it to its `token`/`amount` immutables.
+
+### Changed (breaking)
+
+- **The injected ETH/ERC-20 HTLC artifact must now carry `immutableReferences` and
+  `immutable_names`, and a leg built from one that does not is refused at CONSTRUCTION.** The exact
+  compare cannot be built without them. Checking only inside `verify_funded` let a leg deploy and
+  fund its own contract first (native `fund` sends the value with the deploy), leaving the ETH
+  locked until the refund timeout. An empty map, an unnamed reference id, a name for an id the
+  build does not have, or a slot outside the runtime is refused the same way. A plain Foundry
+  build output does not qualify; `load_artifact`'s docstring says how to produce one that does.
+  Regression cover: an Anvil forged-copy test for each of `EthHtlc` and the real `Erc20Htlc` (the
+  latter forging every copy of every immutable in turn), an Anvil test that checks each
+  `immutable_names` entry by executing its getter, a default-suite test that derives the same map
+  from the bytecode without reading it, and construction-refusal tests with their honest paths.
 
 ## [0.25.1] — 2026-09-29
 

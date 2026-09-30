@@ -84,6 +84,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pyrxd.base58 import base58check_decode
 from pyrxd.btc_wallet.taproot import (
@@ -104,7 +105,7 @@ from pyrxd.gravity.htlc_covenant import (
 )
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
-from pyrxd.network.registry import url_host
+from pyrxd.network.source_identity import canonical_host
 
 # ``_looks_like_mnemonic`` is private to ``security.errors`` but is THE definition of
 # "this string is a seed phrase" in this SDK, and the gate below must agree with the
@@ -861,14 +862,16 @@ def not_checked(chain: str, reason: str) -> CounterLegStatus:
 def endpoint_source_label(url: str) -> str:
     """Name the ONE server an answer came from, for operator-facing text.
 
-    The canonical host (:func:`pyrxd.network.registry.url_host`, the same spelling
-    :attr:`~pyrxd.network.registry.Endpoint.source` counts sources by), never the full
-    URL: an RPC URL routinely carries an API key in its path or query.
+    The canonical host (:func:`pyrxd.network.source_identity.canonical_host`, the spelling
+    every source count keys through), never the full URL: an RPC URL routinely carries an API
+    key in its path or query. Deliberately NOT :func:`~pyrxd.network.source_identity.source_key`,
+    which keys an unparseable URL by its whole text; printing that could print the key.
     """
     try:
-        host = url_host(url)
+        raw = urlsplit(url).hostname or ""
     except ValueError:
-        host = ""
+        raw = ""
+    host = canonical_host(raw) if raw else ""
     return host or "an endpoint whose URL has no parseable host"
 
 

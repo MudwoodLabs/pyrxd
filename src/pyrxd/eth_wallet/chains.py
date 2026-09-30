@@ -57,7 +57,7 @@ only by an emergency hard fork — a validator-set liveness risk with no Ethereu
 Deliberately NOT in the registry — **BNB Smart Chain** (chain_id 56), for the same reason as
 Polygon PoS and it is worth stating separately because the token side looks so inviting. BSC's
 ``finalized`` tag is its OWN validator set's (Parlia + BEP-126 fast finality), not
-Ethereum-anchored. MEASURED 2026-08-25 against three independent endpoints
+Ethereum-anchored. MEASURED 2026-08-25 against three endpoints on distinct hosts
 (``bsc-dataseed.bnbchain.org``, ``bsc-mainnet.public.blastapi.io``, ``bsc-dataseed1.defibit.io``):
 the ``finalized`` tag sits **0-2 seconds / 1-2 blocks behind the tip**. An Ethereum-anchored
 chain cannot finalize in under the 768 s L1 checkpoint, so that measurement alone settles what

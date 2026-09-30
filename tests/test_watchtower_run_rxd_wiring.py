@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from pyrxd.gravity.watch import ElectrumRxdChainSource, MultiSourceRxdChainSource
+from pyrxd.network.source_identity import source_key
 from pyrxd.security.errors import ValidationError
 
 _SCRIPTS = str(Path(__file__).resolve().parent.parent / "scripts")
@@ -29,6 +30,9 @@ class _FakeElectrumX:
 
     def __init__(self, urls, **_kw):
         self.urls = urls
+        # The real client's identity rule, through the real function: one host -> that host.
+        keys = {source_key(u) for u in urls}
+        self.source_key = next(iter(keys)) if len(keys) == 1 else None
 
     async def __aenter__(self):
         return self

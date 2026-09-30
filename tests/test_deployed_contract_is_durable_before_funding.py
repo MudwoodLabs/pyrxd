@@ -341,6 +341,27 @@ class TestResumeCompletesTheFundInsteadOfStartingASecondOne:
 # REAL method against a fake node serving real immutables.
 # ---------------------------------------------------------------------------
 
+
+def _runtime_carrying(artifact: dict, imm: dict) -> bytes:
+    """The runtime a contract constructed with ``imm`` really carries: the artifact's code with each
+    immutable spliced into EVERY one of its ``immutableReferences`` offsets, the way the compiler
+    does at deploy. The fakes used to serve the raw zero-placeholder runtime, a code no deploy can
+    produce; the exact runtime compare in ``verify_funded`` rightly refuses it. Built from the SAME
+    ``imm`` the fake's getters return, so code and getters describe one contract."""
+    out = bytearray(bytes.fromhex(artifact["runtime_bytecode"].removeprefix("0x")))
+    for ref_id, slots in artifact["immutableReferences"].items():
+        v = imm[artifact["immutable_names"][str(ref_id)]]
+        if isinstance(v, (bytes, bytearray)):
+            word = bytes(v)
+        elif isinstance(v, str):
+            word = b"\x00" * 12 + bytes.fromhex(v.removeprefix("0x"))
+        else:
+            word = int(v).to_bytes(32, "big")
+        for slot in slots:
+            out[slot["start"] : slot["start"] + 32] = word
+    return bytes(out)
+
+
 _CLAIMANT = "0x" + "44" * 20
 _REFUNDEE = "0x" + "55" * 20
 _TIMEOUT = _FUND_TIMEOUT
@@ -451,11 +472,11 @@ def _real_verify_leg(
             return None
 
         async def get_code(self, address, *a, **k):
-            # Address-AWARE. The HTLC carries the committed runtime bytecode (the parent compares
-            # it and refuses a mismatch); the claimant and refundee are EOAs and must return empty,
+            # Address-AWARE. The HTLC carries the runtime its immutables imply (the parent compares
+            # it EXACTLY and refuses a mismatch); the claimant and refundee are EOAs and must return empty,
             # or the recipient-policy check refuses them as contracts.
             if str(address).lower() == _DEPLOYED.lower():
-                return bytes.fromhex(_ART["runtime_bytecode"].removeprefix("0x"))
+                return _runtime_carrying(_ART, imm)
             return b""
 
         async def get_balance(self, *a, **k):
@@ -724,7 +745,7 @@ def _native_leg(
 
         async def get_code(self, address, *a, **k):
             if str(address).lower() == _DEPLOYED.lower():
-                return bytes.fromhex(_NATIVE_ART["runtime_bytecode"].removeprefix("0x"))
+                return _runtime_carrying(_NATIVE_ART, imm)
             return b""
 
         async def get_balance(self, *a, **k):

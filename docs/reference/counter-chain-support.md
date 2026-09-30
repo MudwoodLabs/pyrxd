@@ -160,8 +160,8 @@ and `evm_chain_by_id` fails closed for both:
   both directions. A Polygon swap needs a finality model argued in Polygon's own
   security terms.
 - **BNB Smart Chain (56)** — same reason: BSC's `finalized` tag is its own validator
-  set's (Parlia + BEP-126), measured 0–2 s behind the tip against three independent
-  endpoints on 2026-08-25. An Ethereum-anchored chain cannot finalize inside the 768 s
+  set's (Parlia + BEP-126), measured 0–2 s behind the tip against three endpoints on
+  distinct hosts on 2026-08-25. An Ethereum-anchored chain cannot finalize inside the 768 s
   L1 checkpoint, and inflating the window does not recover the difference — a longer
   wait buys more of BSC's security, never Ethereum's. **The blocker is the chain, not
   the token:** BSC USDT is unpinned as a consequence, and stays unpinned until that

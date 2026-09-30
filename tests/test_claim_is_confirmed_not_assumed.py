@@ -30,6 +30,7 @@ from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.security.errors import ClaimNotConfirmed, NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
+from tests._source_hosts import distinct_host
 
 _ART = json.loads((pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
 _CONTRACT = "0x" + "11" * 20
@@ -203,6 +204,7 @@ class _Source:
     provider does, and what the retry loop has to tolerate."""
 
     def __init__(self, *, waited: dict, receipts: list) -> None:
+        self.source_key = distinct_host()
         self._waited = waited
         self._receipts = list(receipts)
         self.receipt_calls = 0

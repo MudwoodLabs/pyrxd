@@ -17,6 +17,7 @@ from pyrxd.network.bitcoin import (
 )
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, RawTx, Txid
+from tests._source_hosts import distinct_host
 
 # A real, parseable legacy tx + its locally-derived txid, so get_raw_tx's F-004
 # txid-binding (returned bytes must hash to the requested txid) is satisfied.
@@ -173,6 +174,7 @@ class _MockSource(MempoolSpaceSource):
 
     def __init__(self, tip: int):
         super().__init__()
+        self.source_key = distinct_host()  # each stub plays a different host, as a quorum requires
         self._tip = tip
 
     async def get_tip_height(self) -> BlockHeight:

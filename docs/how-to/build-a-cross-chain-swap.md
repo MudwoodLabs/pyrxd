@@ -302,6 +302,8 @@ from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 base = KNOWN_EVM_CHAINS["base-sepolia"]          # or "base" (mainnet; opt-in required)
 
 rpc = EthRpc("https://sepolia.base.org", expected_chain_id=base.chain_id)
+# ARTIFACT must carry `immutableReferences` and `immutable_names`, or the constructor refuses it;
+# a plain Foundry build output does not. See `load_artifact`'s docstring.
 contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=key, chain_id=base.chain_id, artifact=ARTIFACT)
 eth_leg = EthLeg(contract_leg=contract_leg, network=base.network, ...)  # mainnet needs an opt-in
 

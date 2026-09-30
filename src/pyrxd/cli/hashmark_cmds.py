@@ -844,18 +844,24 @@ def _digest_check(record: dict) -> tuple[str, str]:
 def _name_check(record: dict, *, asked: bool) -> tuple[str, str]:
     """ESTABLISHED only for a form-2 verdict whose target at that height is THIS record's signing key.
 
-    FAIL-CLOSED on a degrade. With ONE configured endpoint (``--electrumx URL``,
-    ``PYRXD_ELECTRUMX``, or a config naming a single server) form 2 is unreachable, so
-    `--wave-name` lands here — correctly: the question was asked and not answered, and a gate
-    that passes on "not answered" is the quiet direction this codebase keeps finding. That is
-    NOT the shipped mainnet default: ``network/registry.py`` ships two independent endpoints, so
-    form 2 — and ESTABLISHED — is reachable with no configuration at all.
+    FAIL-CLOSED on a degrade. With ONE configured host (``--electrumx URL``, ``PYRXD_ELECTRUMX``,
+    or a config whose servers are all one host) form 2 is unreachable, so `--wave-name` lands
+    here — correctly: the question was asked and not answered, and a gate that passes on "not
+    answered" is the quiet direction this codebase keeps finding. That is NOT the shipped mainnet
+    default: ``network/registry.py`` ships two endpoints on distinct hosts, so form 2 — and
+    ESTABLISHED — is reachable with no configuration at all.
+
+    The ESTABLISHED line says what it rests on: two distinct HOSTS agreeing, which one party
+    running both would defeat. The verdict name stays; the sentence under it must not overclaim.
     """
     if not asked:
         return "NOT CHECKED", "--wave-name was not given"
     nam = record.get("name_at_mark") or {}
     if nam.get("form") == 2 and nam.get("signer_is_target_at_height") is True:
-        return "ESTABLISHED", f"{nam.get('name')} pointed at the signing key at block {nam.get('height')}"
+        return "ESTABLISHED", (
+            f"{nam.get('name')} pointed at the signing key at block {nam.get('height')}, per two ElectrumX "
+            "servers on distinct hosts, which does not prove they have different operators"
+        )
     if nam.get("form") == 2:
         return (
             "NOT THE SIGNER",
@@ -1409,9 +1415,9 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
     default=None,
     metavar="NAME",
     help="HashMark 7.6 form 2: did NAME (e.g. company.rxd) point at the signing key AT THE BLOCK "
-    "THAT CARRIED THIS MARK? Needs two configured ElectrumX servers that report the same block "
-    "heights; with one, or if they disagree, it degrades to form 1, says why, and the verdict "
-    "does NOT hold.",
+    "THAT CARRIED THIS MARK? Needs two configured ElectrumX servers on DISTINCT HOSTS that report "
+    "the same block heights; with one host, or if they disagree, it degrades to form 1, says why, "
+    "and the verdict does NOT hold. Distinct hosts are not proof of distinct operators.",
 )
 @click.option(
     "--verify-wave",
@@ -1453,6 +1459,12 @@ def verify_cmd(
       file       MATCHES / DOES NOT MATCH / CANNOT COMPARE / NOT CHECKED
       name       ESTABLISHED / NOT THE SIGNER / NOT ESTABLISHED / NOT CHECKED
       block      CONFIRMED / PROVISIONAL / NO BLOCK
+
+    \b
+    ESTABLISHED RESTS ON TWO DISTINCT HOSTS, not on proof. It means two configured ElectrumX
+    servers on different hosts reported the same block heights for the mark and the name's
+    history. Nothing checks who runs them, so one party running both could pass a lie off as
+    agreement.
 
     \b
     THE VERDICT IS ABOUT ONE RECORD. A transaction can carry several HashMark outputs, and the
