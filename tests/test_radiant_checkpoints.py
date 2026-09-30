@@ -55,12 +55,31 @@ def test_every_entry_was_deep_when_pinned() -> None:
     assert cp.PINNED_AT_TIP["mainnet"] - MAINNET[-1][0] < cp.MIN_DEPTH_BELOW_TIP + 2016, "a whole interval was skipped"
 
 
-def test_the_table_does_not_claim_a_node_signed_it() -> None:
-    """Generated from the two public servers only. When the maintainer's node is added, the
-    script sets this True and rewrites the docstring, and this test must change with it."""
-    assert cp.NODE_CONFIRMED == {"mainnet": False}
-    assert "NO node run by pyrxd's maintainer was consulted" in (cp.__doc__ or "")
-    assert len(cp.SOURCES["mainnet"]) == 2
+def test_the_table_was_confirmed_by_the_maintainers_node() -> None:
+    """Regenerated 2026-09-30 with ``--node-cli``: the maintainer's Radiant Core node was a third
+    source, and ``reconcile`` refuses the write unless every source answers every height alike.
+    A later ``--write`` WITHOUT the node flips both of these back, and this test fails."""
+    assert cp.NODE_CONFIRMED == {"mainnet": True}
+    doc = " ".join((cp.__doc__ or "").split())
+    assert "maintainer was a third, REQUIRED source: on 2026-09-30" in doc
+    assert "``radiant-cli getblockhash <height>`` for every entry" in doc
+    assert "NO node" not in doc
+    assert len(cp.SOURCES["mainnet"]) == 2, "SOURCES lists the ElectrumX servers; the node is not one"
+
+
+def test_a_table_written_without_a_node_says_so() -> None:
+    """The other branch of the renderer: no node, no claim of one."""
+    text = refresh.render_module(
+        MAINNET[:1],
+        servers=("wss://a/", "wss://b/"),
+        node_cli=None,
+        pinned_at_tip=5000,
+        min_depth=1000,
+        generated_utc="2026-01-01",
+    )
+    assert "NO node run by pyrxd's maintainer was consulted" in text
+    assert 'NODE_CONFIRMED: dict[str, bool] = {"mainnet": False}' in text
+    assert "REQUIRED" not in text
 
 
 def test_the_file_is_exactly_what_the_script_renders() -> None:

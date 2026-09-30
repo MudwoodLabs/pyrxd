@@ -100,8 +100,13 @@ def render_module(
     server_lines = "\n".join(f"  * ``{u}``" for u in servers)
     if node_cli:
         node_para = (
-            "A Radiant Core node run by pyrxd's maintainer was ALSO asked (``getblockhash``) and agreed\n"
-            "on every entry."
+            f"A Radiant Core node run by pyrxd's maintainer was a third, REQUIRED source: on {generated_utc}\n"
+            "the script asked it ``radiant-cli getblockhash <height>`` for every entry (the node's own\n"
+            "answer, read-only; nothing was sent), and it agreed with both servers on every one. A\n"
+            "missing or different answer from any of the three would have refused the write."
+        )
+        node_comment = (
+            f"#: True: a node run by pyrxd's maintainer agreed on every entry (``getblockhash``, {generated_utc})."
         )
     else:
         node_para = (
@@ -111,6 +116,7 @@ def render_module(
             "endpoints' word, not as independent confirmation. The maintainer's node is to be added\n"
             "as a further source (``--node-cli``); regenerating with it rewrites this paragraph."
         )
+        node_comment = "#: Whether a node run by pyrxd's maintainer was one of the agreeing sources."
     entries = "\n".join(f'        ({h}, "{bh}"),' for h, bh in table)
     source_lines = "\n".join(f'        "{u}",' for u in servers)
     return f'''"""Radiant {NETWORK} block-hash checkpoints: one every {INTERVAL} blocks, from genesis.
@@ -145,7 +151,7 @@ GENERATED_UTC = "{generated_utc}"
 #: The lowest tip height any source reported when the table was generated.
 PINNED_AT_TIP: dict[str, int] = {{"{NETWORK}": {pinned_at_tip}}}
 
-#: Whether a node run by pyrxd's maintainer was one of the agreeing sources.
+{node_comment}
 NODE_CONFIRMED: dict[str, bool] = {{"{NETWORK}": {bool(node_cli)}}}
 
 #: The ElectrumX servers that agreed on every entry.

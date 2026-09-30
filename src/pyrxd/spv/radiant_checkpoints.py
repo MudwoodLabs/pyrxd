@@ -10,14 +10,13 @@ on every entry:
   * ``wss://electrumx.radiant4people.com:50022/``
   * ``wss://electrumx.radiantcore.org/``
 
-NO node run by pyrxd's maintainer was consulted: this table rests on the two public
-servers alone. Both are ElectrumX endpoints pyrxd ships as defaults, and nothing here
-establishes that different people operate them, so treat their agreement as two
-endpoints' word, not as independent confirmation. The maintainer's node is to be added
-as a further source (``--node-cli``); regenerating with it rewrites this paragraph.
+A Radiant Core node run by pyrxd's maintainer was a third, REQUIRED source: on 2026-09-30
+the script asked it ``radiant-cli getblockhash <height>`` for every entry (the node's own
+answer, read-only; nothing was sent), and it agreed with both servers on every one. A
+missing or different answer from any of the three would have refused the write.
 
 Every height is at least 1000 blocks below the lowest tip any source reported
-(468596), far past Radiant Core's default maximum reorg depth of 69.
+(468603), far past Radiant Core's default maximum reorg depth of 69.
 
 WHAT THEY ARE FOR. :mod:`pyrxd.glyph.mark_block` places a block at a height by linking its header,
 hash by hash, to one of these. The height then rests on this table rather than on the server that
@@ -33,10 +32,10 @@ MIN_DEPTH_BELOW_TIP = 1000
 GENERATED_UTC = "2026-09-30"
 
 #: The lowest tip height any source reported when the table was generated.
-PINNED_AT_TIP: dict[str, int] = {"mainnet": 468596}
+PINNED_AT_TIP: dict[str, int] = {"mainnet": 468603}
 
-#: Whether a node run by pyrxd's maintainer was one of the agreeing sources.
-NODE_CONFIRMED: dict[str, bool] = {"mainnet": False}
+#: True: a node run by pyrxd's maintainer agreed on every entry (``getblockhash``, 2026-09-30).
+NODE_CONFIRMED: dict[str, bool] = {"mainnet": True}
 
 #: The ElectrumX servers that agreed on every entry.
 SOURCES: dict[str, tuple[str, ...]] = {
