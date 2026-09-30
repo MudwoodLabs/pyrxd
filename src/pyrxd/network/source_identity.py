@@ -17,13 +17,16 @@ WHAT THE KEY IS — distinct operators, as declared, or by registered domain. In
    profile is invisible to another profile, to any quorum, and to a later load.
 2. An operator pyrxd SHIPS knowledge of: :data:`pyrxd.network.registry.KNOWN_OPERATORS`, keyed by
    registered domain, recorded from the Radiant maintainer's statement of 2026-09-29.
-3. An IP literal: ITSELF, one group per canonical address (every spelling of one address is one).
-4. Any other name: its REGISTERED DOMAIN (eTLD+1) under the Public Suffix List, a sha256-pinned
+3. THIS MACHINE: every loopback spelling — ``localhost``, ``*.localhost``, ``127.0.0.0/8``, ``::1``,
+   ``::ffff:127.x`` — is ONE group, ``localhost``. Two of them are one machine, and whatever they
+   reach (one local node, or tunnels) the URL does not show two operators.
+4. An IP literal: ITSELF, one group per canonical address (every spelling of one address is one).
+5. Any other name: its REGISTERED DOMAIN (eTLD+1) under the Public Suffix List, a sha256-pinned
    snapshot vendored in ``network/data/``. So ``x.bladenet.online`` and ``y.bladenet.online`` are one
    source, while ``a.co.uk`` and ``b.co.uk`` stay two, because ``co.uk`` is a public suffix. The
    list's PRIVATE section is included, as browsers include it: ``a.github.io`` and ``b.github.io``
    are two, because that section exists to say those names have different owners.
-5. A name with no registered domain (``localhost``, a bare ssh host alias, a name that is itself a
+6. A name with no registered domain (a bare ssh host alias, a name that is itself a
    public suffix): itself.
 
 Case, a trailing dot, the port, the path, the query, userinfo and the spelling of an IP literal
@@ -42,12 +45,15 @@ can do, and it is not proof of independence:
 * A DECLARED OPERATOR IS ONLY AS GOOD AS THE DECLARATION. ``operator = "…"`` is the configuring
   user's statement, and pyrxd believes it: declaring two hosts as two operators makes them two
   sources. A declaration that contradicts an operator pyrxd ships knowledge of is refused, and so
-  is one host counted as two sources within one set (:func:`require_one_key_per_host`); anything
-  else is taken as written.
+  is one host counted as two sources within one set, and a declared host next to an UNDECLARED
+  host of its own group (:func:`require_one_key_per_host`) — a declaration may merge groups, and
+  may split one only when every host of it in the set is declared. Anything else is taken as
+  written.
 
 Choosing sources whose operators and upstreams do not overlap remains the operator's job. The prose
-elsewhere says "distinct operators (as declared, or by registered domain)" for this reason, and
-never "independent".
+elsewhere says "distinct operators" for this reason — "as declared, or by registered domain" where
+declarations reach the count (HashMark form 2), "known operators, else registered domain" where
+they do not (every quorum of client objects) — and never "independent".
 
 WHERE A QUORUM HOLDS CLIENT OBJECTS rather than URLs, each client carries its own ``source_key``
 (a :class:`SourceKey`, derived from the URL it was built with) and the quorum refuses two clients
@@ -177,10 +183,19 @@ class SourceKey(str):
     """
 
     host: str | None
+    #: The key *host* has WITHOUT any declaration: its shipped operator, IP address, loopback, or
+    #: registered domain. Equal to the key itself unless ``declared``.
+    natural: str | None
+    #: Whether an ``operator=`` declaration made this key.
+    declared: bool
 
-    def __new__(cls, value: str, host: str | None = None) -> SourceKey:
+    def __new__(
+        cls, value: str, host: str | None = None, *, natural: str | None = None, declared: bool = False
+    ) -> SourceKey:
         key = super().__new__(cls, value)
         key.host = host
+        key.natural = natural if natural is not None else (value if host is not None else None)
+        key.declared = declared
         return key
 
 
@@ -302,6 +317,36 @@ def _is_ip_literal(host: str) -> bool:
     return True
 
 
+#: The ONE key every spelling of this machine's loopback interface gets. ``localhost`` is a single
+#: label with no registered domain, so no other rule can produce it for a different host.
+_LOOPBACK_KEY = "localhost"
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether canonical *host* is this machine's loopback: ``localhost``, any ``*.localhost``
+    (RFC 6761 §6.3), anything in ``127.0.0.0/8``, or ``::1`` (``::ffff:127.x`` is already folded to
+    its IPv4 form by :func:`canonical_host`)."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host.partition("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _undeclared_key(host: str) -> str:
+    """The key canonical *host* has when nothing declares its operator (rules 2-5 in the module
+    docstring, with every loopback spelling folded to one)."""
+    if _is_loopback(host):
+        return _LOOPBACK_KEY
+    if _is_ip_literal(host):
+        return host
+    shipped = _shipped_operator(host)
+    if shipped is not None:
+        return _OPERATOR_PREFIX + shipped
+    return registered_domain(host) or host
+
+
 def _canonical_host_of(url: object) -> str:
     """The canonical host *url* names, or ``ValidationError`` when it names none."""
     if not isinstance(url, str) or not url.strip():
@@ -336,27 +381,36 @@ def source_key(url: str, *, operator: str | None = None) -> SourceKey:
             *operator*.
     """
     host = _canonical_host_of(url)
+    natural = _undeclared_key(host)
     if operator is not None:
-        return SourceKey(_OPERATOR_PREFIX + _checked_declaration(host, operator), host)
-    if _is_ip_literal(host):
-        return SourceKey(host, host)
-    shipped = _shipped_operator(host)
-    if shipped is not None:
-        return SourceKey(_OPERATOR_PREFIX + shipped, host)
-    return SourceKey(registered_domain(host) or host, host)
+        declared = _OPERATOR_PREFIX + _checked_declaration(host, operator)
+        return SourceKey(declared, host, natural=natural, declared=True)
+    return SourceKey(natural, host)
 
 
 def require_one_key_per_host(keys: Iterable[SourceKey], *, what: str) -> None:
-    """Refuse a set of keys in which ONE host is TWO sources.
+    """Refuse a set of keys in which a declaration makes MORE sources than the set has.
 
-    One host is one operator. A declaration on ``wss://h:1`` and a different one (or none) on
-    ``wss://h:2`` would otherwise make one machine two votes — the single-call
-    :func:`source_key` cannot see the other URL, so the refusal lives here, where a SET is keyed:
-    :func:`source_keys` (every URL list: a profile's, a quorum builder's, form 2's labels) and
-    :func:`require_distinct_sources` (every quorum of client objects) both call it. Keys built by
-    hand carry no host and are not checked here.
+    Two refusals, both about ONE set of keys, which a single :func:`source_key` call cannot see:
+
+    1. ONE HOST, TWO SOURCES. One host is one operator. A declaration on ``wss://h:1`` and a
+       different one (or none) on ``wss://h:2`` would otherwise make one machine two votes.
+    2. A DECLARATION THAT SPLITS A GROUP IT DOES NOT COVER. A declaration may make two groups ONE
+       source (``rpc.acme.io`` and ``edge.acme-cdn.net`` as ``acme``), and may split a group only
+       when EVERY host of that group in the set is declared. A declared host next to an UNDECLARED
+       host of the same group (registered domain, shipped operator, IP address or loopback) would
+       count them as two sources where, without the declaration, they are one — the declaration
+       lowering safety below the grouping it was meant to refine.
+
+    This is the FUNNEL every set-level count crosses: :func:`source_keys` (every URL list: a
+    profile's, a quorum builder's, a config's declaring list at load, form 2's judge and walker),
+    :func:`require_distinct_sources` (every quorum of client objects), and
+    :class:`~pyrxd.network.registry.NetworkProfile` (whose ``Endpoint.source`` picks form 2's
+    pair). Keys built by hand carry no host and are not checked here.
     """
     seen: dict[str, SourceKey] = {}
+    undeclared: dict[str, SourceKey] = {}  # natural key -> the first undeclared key of that group
+    declared: list[SourceKey] = []
     for key in keys:
         host = getattr(key, "host", None)
         if host is None:
@@ -367,6 +421,20 @@ def require_one_key_per_host(keys: Iterable[SourceKey], *, what: str) -> None:
                 f"{what}: host {host!r} is counted as two sources ({describe_source(other)} and "
                 f"{describe_source(key)}). One host is one operator: give every URL of that host the "
                 "same operator, or none"
+            )
+        if getattr(key, "declared", False):
+            declared.append(key)
+        else:
+            undeclared.setdefault(str(key), key)
+    for key in declared:
+        other = undeclared.get(str(key.natural))
+        if other is not None and other != key:
+            raise ValidationError(
+                f"{what}: {key.host!r} is declared as {describe_source(key)}, but {other.host!r}, of the "
+                f"same {describe_source(other)}, is not declared — so the declaration would count those "
+                "two hosts as two sources where without it they are one. A declaration may merge sources, "
+                f"and may split a group only when every host of it is declared: declare {other.host!r} too, "
+                f"or remove the declaration for {key.host!r}"
             )
 
 
@@ -403,6 +471,8 @@ def describe_source(key: str) -> str:
     key = str(key)
     if key.startswith(_OPERATOR_PREFIX):
         return f"operator {key[len(_OPERATOR_PREFIX) :]!r}"
+    if key == _LOOPBACK_KEY:
+        return "loopback (this machine: localhost, 127.0.0.0/8, ::1)"
     if _is_ip_literal(key):
         return f"IP address {key!r}"
     if "." in key and registered_domain(key) == key:
@@ -500,7 +570,7 @@ def require_distinct_sources(sources: Sequence[object], *, what: str) -> tuple[S
                 "Sources are counted by registered domain, or by an operator pyrxd ships knowledge of, so "
                 "one cannot corroborate itself. Give each operator once: several URLs of one operator form "
                 "one failover source. Use endpoints of different operators; this count takes no operator "
-                "declaration from the config file (that is for ElectrumX endpoints and HashMark form 2)."
+                "declaration from the config file (declarations reach HashMark form 2 only)."
             )
         first[key] = index
     return keys

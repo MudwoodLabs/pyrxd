@@ -876,8 +876,8 @@ def _eth_rpc(args, *, rpc_url: str, chain_id: int):
     the lagging case is the common one: a load-balanced provider serving a stale node is already
     recorded in this codebase as having refused a claim and nearly killed a secret.
 
-    The count is of DISTINCT OPERATORS, as declared, or by registered domain
-    (`pyrxd.network.source_identity.source_key`), not of URLs: one URL typed three times,
+    The count is of DISTINCT OPERATORS — known operators, else registered domain
+    (`pyrxd.network.source_identity.source_key`; this quorum takes no declarations) — not of URLs: one URL typed three times,
     `https://h`, `https://h:443` and `https://h./x`, or `https://eu.rpc.example` and
     `https://us.rpc.example`, is one source and used to pass the three-endpoint gate on its own.
     Repeating a source is refused outright rather than silently collapsed, so the operator sees that

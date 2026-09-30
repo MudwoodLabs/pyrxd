@@ -837,10 +837,10 @@ class MultiSourceBtcDataSource(BtcDataSource):
     Parameters
     ----------
     sources:
-        Two or more ``BtcDataSource`` instances of DISTINCT OPERATORS (as declared, or by
-        registered domain). Each must carry a ``source_key`` (every shipped source derives one
-        from its URL); two sources with one key are refused, because one operator agreeing with
-        itself is not a quorum. That grouping is not proof of independence — see
+        Two or more ``BtcDataSource`` instances of DISTINCT OPERATORS (known operators, else
+        registered domain; this quorum takes no declarations). Each must carry a ``source_key``
+        (every shipped source derives one from its URL); two sources with one key are refused,
+        because one operator agreeing with itself is not a quorum. That grouping is not proof of independence — see
         :mod:`pyrxd.network.source_identity`.
     quorum:
         Minimum number of agreeing sources required (default 2).
@@ -1566,7 +1566,7 @@ class MultiSourceBtcFundingReader:
     def __init__(self, readers: list, *, quorum: int = 2, dust_cap_sats: int = 10_000) -> None:
         readers = list(readers)
         # ONE OPERATOR, ONE VOTE. Each reader names its source (`source_key`, derived from its URL:
-        # operator, as declared, or registered domain), and two readers with one key are refused:
+        # known operator, else registered domain), and two readers with one key are refused:
         # they would agree with each other and be counted as corroboration. Several URLs of one
         # source belong in ONE `SameSourceFailover` reader, which is what `from_endpoints` builds.
         require_distinct_sources(readers, what="MultiSourceBtcFundingReader")

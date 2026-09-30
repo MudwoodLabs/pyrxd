@@ -161,7 +161,7 @@ def test_a_bridged_usdt_leg_builds_without_a_freeze_predicate(runner):
     function at all, and a leg that only works for freezable tokens would refuse honest work."""
     args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "8453")
     # Base mainnet USDT is real value, so two endpoints — the same requirement a real run carries.
-    leg = _make_leg(runner, args, rpc_url="http://127.0.0.1:1,http://127.0.0.2:1,http://127.0.0.3:1")
+    leg = _make_leg(runner, args, rpc_url="http://127.0.0.1:1,http://198.51.100.2:1,http://203.0.113.3:1")
     assert isinstance(leg, Erc20HtlcLeg)
     assert leg._token.has_blacklist is False
     assert leg._token.chain_id == 8453
@@ -183,7 +183,7 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
 
     def test_TWO_urls_build_a_quorum(self, runner) -> None:
         args = _parse(runner, "--counter-asset", "native", "--eth-chain-id", "1")
-        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1, http://127.0.0.2:1", chain_id=1)
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1, http://198.51.100.2:1", chain_id=1)
         assert isinstance(rpc, MultiSourceEthRpc)
         assert len(rpc.sources) == 2 and rpc.min_agreeing == 2
 
@@ -204,13 +204,13 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
         """
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
         with pytest.raises(SystemExit, match="at least THREE --eth-rpc-url endpoints of distinct operators"):
-            runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.2:1", chain_id=1)
+            runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://198.51.100.2:1", chain_id=1)
 
     def test_a_real_token_leg_is_SATISFIED_by_three(self, runner) -> None:
         """The honest-path pair. Three is where the tolerance becomes real: 2-of-3 survives one
         endpoint being down, which is routine on free public RPCs."""
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
-        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://127.0.0.2:1,http://127.0.0.3:1", chain_id=1)
+        rpc = runner._eth_rpc(args, rpc_url="http://127.0.0.1:1,http://198.51.100.2:1,http://203.0.113.3:1", chain_id=1)
         assert isinstance(rpc, MultiSourceEthRpc)
         assert rpc.min_agreeing == 2 and len(rpc.sources) == 3, "2-of-3 tolerates one unreachable"
 
@@ -244,7 +244,7 @@ class TestTheQuorumIsREACHABLEFromTheRunner:
         args = _parse(runner, "--counter-asset", "usdt", "--eth-chain-id", "1")
         rpc, leg = runner._eth_leg(
             args,
-            rpc_url="http://127.0.0.1:1,http://127.0.0.2:1,http://127.0.0.3:1",
+            rpc_url="http://127.0.0.1:1,http://198.51.100.2:1,http://203.0.113.3:1",
             chain_id=1,
             key_hex="11" * 32,
             claim_to="0x" + "44" * 20,

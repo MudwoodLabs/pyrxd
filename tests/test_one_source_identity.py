@@ -127,9 +127,11 @@ def test_every_spelling_of_one_host_is_one_key(spellings) -> None:
 
 def test_distinct_hosts_stay_distinct() -> None:
     """The honest half. A name and its IP address are two hosts here: the URL cannot show otherwise,
-    and folding them would be a claim nobody checked."""
+    and folding them would be a claim nobody checked. (Loopback is the one exception, because
+    ``localhost`` and ``127.0.0.1`` are this machine by definition: see
+    ``test_source_operator_groups.py``.)"""
     assert source_key("wss://a.example") != source_key("wss://b.example")
-    assert source_key("http://localhost:8545") != source_key("http://127.0.0.1:8545")
+    assert source_key("http://node.example:8545") != source_key("http://203.0.113.7:8545")
     assert source_key("https://eth.drpc.org") != source_key("https://rpc.mevblocker.io")
 
 

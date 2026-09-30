@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -223,7 +224,7 @@ async def test_the_shipped_defaults_still_reach_rxd_corroboration(monkeypatch, c
     from pyrxd.gravity.watch import run
     from tests.test_one_source_identity import _NoConnectElectrumX
 
-    caplog.set_level("WARNING", logger="pyrxd.watchtower")
+    caplog.set_level("INFO", logger="pyrxd.watchtower")
     monkeypatch.setattr(run, "ElectrumXClient", _NoConnectElectrumX)
     args = run._parse_args(["--records-dir", "/nonexistent"])
     async with contextlib.AsyncExitStack() as stack:
@@ -235,9 +236,15 @@ async def test_the_shipped_defaults_still_reach_rxd_corroboration(monkeypatch, c
     ]
     assert "corroboration is OFF" not in caplog.text
     # Two URLs became one source, and the log says so rather than hiding it — naming what they
-    # are: pyrxd's defaults, not a flag this run never passed.
-    assert "2 default RXD ElectrumX endpoints (no --rxd-electrumx-url given) are ONE source" in caplog.text
-    assert "(operator 'radiant4people')" in caplog.text
+    # are: pyrxd's defaults, not a flag this run never passed. For the defaults that grouping is
+    # the DESIGN (radiant4people's failover beside a second operator), so it is INFO: a WARNING on
+    # every default run is one an operator learns to ignore.
+    grouped = [r for r in caplog.records if "are ONE source" in r.getMessage()]
+    assert len(grouped) == 1, caplog.text
+    assert "2 default RXD ElectrumX endpoints (no --rxd-electrumx-url given) are ONE source" in grouped[0].getMessage()
+    assert "(operator 'radiant4people')" in grouped[0].getMessage()
+    assert grouped[0].levelname == "INFO", grouped[0].levelname
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
     assert "--rxd-electrumx-url values" not in caplog.text, caplog.text
 
 
@@ -248,6 +255,8 @@ async def test_the_watchtower_names_the_flags_when_the_flags_were_given(monkeypa
     caplog.set_level("WARNING", logger="pyrxd.watchtower")
     await _rxd_source_from_run("wss://x.pool.example.org", "wss://y.pool.example.org", monkeypatch)
     assert "2 --rxd-electrumx-url values are ONE source" in caplog.text, caplog.text
+    # A list the operator SUPPLIED that collapses is still a WARNING: only the defaults are INFO.
+    assert [r.levelname for r in caplog.records if "are ONE source" in r.getMessage()] == ["WARNING"]
     assert "the 2 --rxd-electrumx-url values are all one source" in caplog.text, caplog.text
     assert "default RXD ElectrumX endpoints" not in caplog.text
 
@@ -430,7 +439,8 @@ def test_describe_source_names_the_kind_of_group() -> None:
     assert describe_source(source_key("wss://electrumx.radiantcore.org")) == "operator 'radiantcore'"
     assert describe_source(source_key("wss://x.pool.example.org")) == "registered domain 'example.org'"
     assert describe_source(source_key("wss://0xcb.0.113.7")) == "IP address '203.0.113.7'"
-    assert describe_source(source_key("localhost:1")) == "host 'localhost'"
+    assert describe_source(source_key("localhost:1")).startswith("loopback (this machine")
+    assert describe_source(source_key("myalias:22")) == "host 'myalias'"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,7 +464,7 @@ def test_a_config_entry_declares_its_operator(tmp_path, monkeypatch) -> None:
         "electrumx_servers = [\n"
         '  { url = "wss://x.shared.example/", operator = "op-x" },\n'
         '  { url = "wss://y.shared.example/", operator = "op-y" },\n'
-        '  "wss://z.shared.example/",\n'
+        '  "wss://z.other.example/",\n'
         "]\n"
     )
     cfg = _load(tmp_path, monkeypatch, body).for_network("mainnet")
@@ -462,7 +472,7 @@ def test_a_config_entry_declares_its_operator(tmp_path, monkeypatch) -> None:
     assert cfg.declared_operators() == cfg.endpoint_operators
     profile = cfg.require_profile()
     assert [e.operator for e in profile.endpoints] == ["op-x", "op-y", None]
-    assert [e.source for e in profile.endpoints] == ["operator:op-x", "operator:op-y", "shared.example"]
+    assert [e.source for e in profile.endpoints] == ["operator:op-x", "operator:op-y", "other.example"]
     # The declaration stays on the endpoint. A key asked for without it is the registered domain.
     assert source_key("wss://x.shared.example/") == source_key("wss://y.shared.example/") == "shared.example"
 
@@ -644,3 +654,198 @@ def test_a_quorum_refusal_says_what_can_be_done_where_nothing_can_be_declared() 
     message = str(info.value)
     assert "declare the operators" not in message, message
     assert "takes no operator declaration" in message and "different operators" in message, message
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A declaration may MERGE sources, never split a group it does not cover (#803 round 2)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `rpc.acme.io` declared "acme", `backup.acme.io` left bare: without the declaration the two are one
+# source (registered domain acme.io); with it they were two (operator:acme and acme.io), so form 2's
+# pair rpc | backup was judged two sources — a declaration making things LESS safe than the grouping
+# it refines. Refused in `require_one_key_per_host`, the funnel every set-level count crosses.
+
+_ACME_SPLIT_BY_OMISSION = (
+    'network = "mainnet"\nelectrumx_servers = [\n'
+    '  { url = "wss://rpc.acme.io/", operator = "acme" },\n'
+    '  { url = "wss://edge.acme-cdn.net/", operator = "acme" },\n'
+    '  "wss://backup.acme.io/",\n]\n'
+)
+_ACME_OPS = {"wss://rpc.acme.io/": "acme", "wss://edge.acme-cdn.net/": "acme"}
+
+
+def test_a_declared_host_beside_an_undeclared_host_of_its_domain_is_refused_at_load(tmp_path, monkeypatch) -> None:
+    with pytest.raises(ValidationError, match="declare 'backup.acme.io' too") as info:
+        _load(tmp_path, monkeypatch, _ACME_SPLIT_BY_OMISSION)
+    assert "'rpc.acme.io'" in str(info.value) and "remove the declaration" in str(info.value)
+
+
+def test_the_same_refusal_for_a_networks_list_at_for_network(tmp_path, monkeypatch) -> None:
+    body = _ACME_SPLIT_BY_OMISSION.replace('network = "mainnet"\n', 'network = "mainnet"\n[networks.mainnet]\n')
+    cfg = _load(tmp_path, monkeypatch, body)  # the [networks.*] list is read when it is selected
+    with pytest.raises(ValidationError, match="declare 'backup.acme.io' too"):
+        cfg.for_network("mainnet")
+
+
+def test_the_judge_refuses_such_a_map_handed_to_it_directly() -> None:
+    from pyrxd.glyph.wave_identity import _same_source
+
+    with pytest.raises(ValidationError, match="declare 'backup.acme.io' too"):
+        _same_source("wss://rpc.acme.io/", "wss://backup.acme.io/", _ACME_OPS)
+    # Control: the same pair with NO declarations is one source, which is what the refusal preserves.
+    assert _same_source("wss://rpc.acme.io/", "wss://backup.acme.io/", None) is True
+
+
+async def test_the_walker_refuses_such_a_map_handed_to_it_directly() -> None:
+    from pyrxd.glyph.mutable_chain import _one_source, walk_mutable_chain
+
+    with pytest.raises(ValidationError, match="declare 'backup.acme.io' too"):
+        _one_source("wss://rpc.acme.io/", "wss://backup.acme.io/", _ACME_OPS)
+
+    async def _no_fetch(_txid):  # never reached: the refusal comes before the walk
+        raise AssertionError("walked")
+
+    with pytest.raises(ValidationError, match="declare 'backup.acme.io' too"):
+        await walk_mutable_chain(
+            mint_txid="ab" * 32,
+            candidates=[],
+            fetch_tx=_no_fetch,
+            candidate_source="wss://rpc.acme.io/",
+            tip_source="wss://backup.acme.io/",
+            operators=_ACME_OPS,
+        )
+
+
+def test_a_profile_built_with_such_a_map_is_refused() -> None:
+    with pytest.raises(ValidationError, match="declare 'backup.acme.io' too"):
+        NetworkProfile.build(
+            "mainnet", ["wss://rpc.acme.io/", "wss://edge.acme-cdn.net/", "wss://backup.acme.io/"], operators=_ACME_OPS
+        )
+
+
+def test_the_refusal_covers_every_group_not_only_registered_domains() -> None:
+    """The group is whatever the host would key as undeclared — here loopback and an IP address."""
+    with pytest.raises(ValidationError, match="is not declared"):
+        source_keys(["ws://localhost:1/", "ws://127.0.0.1:2/"], {"ws://localhost:1/": "tunnel-a"})
+    with pytest.raises(ValidationError, match="counted as two sources"):  # one host: the host-level rule
+        source_keys(["ws://203.0.113.7:1/", "ws://203.0.113.7:2/"], {"ws://203.0.113.7:1/": "a"})
+
+
+# ---- the honest paths beside it ---------------------------------------------------------------------
+
+
+def test_a_split_where_every_host_of_the_domain_is_declared_is_two_sources(tmp_path, monkeypatch) -> None:
+    from pyrxd.glyph.mutable_chain import _one_source
+    from pyrxd.glyph.wave_identity import _same_source
+
+    ops = {"wss://rpc.acme.io/": "alice", "wss://backup.acme.io/": "bob"}
+    assert _same_source("wss://rpc.acme.io/", "wss://backup.acme.io/", ops) is False
+    assert _one_source("wss://rpc.acme.io/", "wss://backup.acme.io/", ops) is False
+    body = (
+        'network = "mainnet"\nelectrumx_servers = [\n'
+        '  { url = "wss://rpc.acme.io/", operator = "alice" },\n'
+        '  { url = "wss://backup.acme.io/", operator = "bob" },\n'
+        '  "wss://other.example/",\n]\n'
+    )
+    profile = _load(tmp_path, monkeypatch, body).for_network("mainnet").require_profile()
+    assert [e.source for e in profile.endpoints] == ["operator:alice", "operator:bob", "other.example"]
+
+
+def test_declarations_merging_two_domains_still_count_one() -> None:
+    from pyrxd.glyph.mutable_chain import _one_source
+    from pyrxd.glyph.wave_identity import _same_source
+
+    assert _same_source("wss://rpc.acme.io/", "wss://edge.acme-cdn.net/", _ACME_OPS) is True
+    assert _one_source("wss://rpc.acme.io/", "wss://edge.acme-cdn.net/", _ACME_OPS) is True
+
+
+def test_declaring_a_shipped_operator_beside_its_undeclared_twin_is_not_a_split() -> None:
+    """Declaring what pyrxd already records moves no key, so the other radiant4people server may stay
+    bare: the refusal is for a declaration that CHANGES the count, not for any declaration."""
+    keys = source_keys(
+        ["wss://electrumx.radiant4people.com:50022/", "wss://electrumx2.radiant4people.com:50022/"],
+        {"wss://electrumx.radiant4people.com:50022/": "radiant4people"},
+    )
+    assert set(keys.values()) == {"operator:radiant4people"}
+
+
+def test_a_declaring_config_without_a_split_loads_and_an_offline_inspect_runs(tmp_path, monkeypatch) -> None:
+    from click.testing import CliRunner
+
+    from pyrxd.cli.main import cli
+
+    for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX"):
+        monkeypatch.delenv(var, raising=False)
+    good = tmp_path / "good.toml"
+    good.write_text(_ACME_SPLIT_BY_OMISSION.replace('"wss://backup.acme.io/"', '"wss://other.example/"'))
+    contract = "b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a800000004"
+    result = CliRunner().invoke(cli, ["--config", str(good), "glyph", "inspect", contract])
+    assert result.exit_code == 0, result.output
+    assert "vout:     4" in result.output
+    # Control: the conflicting config is refused by the same command (a bad declaring list refuses
+    # even offline, as a bad fee_rate does).
+    bad = tmp_path / "bad.toml"
+    bad.write_text(_ACME_SPLIT_BY_OMISSION)
+    result = CliRunner().invoke(cli, ["--config", str(bad), "glyph", "inspect", contract])
+    assert result.exit_code != 0, result.output
+    assert isinstance(result.exception, ValidationError) and "backup.acme.io" in str(result.exception)
+
+
+def test_the_shipped_defaults_are_still_two_operators() -> None:
+    keys = source_keys(DEFAULT_ENDPOINTS["mainnet"])
+    assert sorted(set(map(str, keys.values()))) == ["operator:radiant4people", "operator:radiantcore"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Every loopback spelling is ONE source (#803 round 2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ws://localhost:50022",
+        "ws://LOCALHOST.:50022",
+        "ws://node.localhost:50022",
+        "ws://127.0.0.1:50022",
+        "ws://127.0.0.2:50022",
+        "ws://127.1:50022",
+        "ws://[::1]:50022",
+        "ws://[::ffff:127.0.0.1]:50022",
+        "localhost:8545",
+    ],
+)
+def test_every_loopback_spelling_is_one_key(url) -> None:
+    assert source_key(url) == source_key("ws://localhost:50022") == "localhost"
+
+
+def test_a_non_loopback_address_is_not_folded_into_loopback() -> None:
+    assert source_key("ws://128.0.0.1:1") != source_key("ws://localhost:1")
+    assert source_key("ws://[::2]:1") != source_key("ws://localhost:1")
+    assert source_key("ws://localhost.example:1") != source_key("ws://localhost:1")
+
+
+async def test_the_watchtower_does_not_corroborate_one_machine_with_itself(monkeypatch, caplog) -> None:
+    """Through the watchtower's real builder: localhost and 127.0.0.1 are one local node, so the
+    quorum is ONE source and corroboration is OFF."""
+    from pyrxd.gravity.watch import run
+    from tests.test_one_source_identity import _NoConnectElectrumX
+
+    caplog.set_level("WARNING", logger="pyrxd.watchtower")
+    monkeypatch.setattr(run, "ElectrumXClient", _NoConnectElectrumX)
+    args = run._parse_args(
+        [
+            "--records-dir",
+            "/nonexistent",
+            "--rxd-electrumx-url",
+            "ws://localhost:50022",
+            "--rxd-electrumx-url",
+            "ws://127.0.0.1:50022",
+            "--allow-insecure",
+        ]
+    )
+    async with contextlib.AsyncExitStack() as stack:
+        _src, corroborated = await run._build_rxd_source(args, stack)
+    assert corroborated is False
+    assert "RXD corroboration is OFF" in caplog.text
+    assert "loopback (this machine" in caplog.text, caplog.text

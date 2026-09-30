@@ -42,13 +42,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bladenet.online, three different operators per the Radiant maintainer's statement of
   2026-09-29), else the host's REGISTERED DOMAIN (eTLD+1, by the Public Suffix List, vendored at
   `src/pyrxd/network/data/` and sha256-pinned), else, for an IP address, that address. So
-  `x.example.com` and `y.example.com` are ONE source while `a.co.uk` and `b.co.uk` stay two. This
+  `x.example.com` and `y.example.com` are ONE source while `a.co.uk` and `b.co.uk` stay two. Every
+  loopback spelling (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`) is ONE source, `localhost`:
+  `ws://localhost:50022` and `ws://127.0.0.1:50022` gave the watchtower `corroborated=True` from
+  one local node. This
   is breaking for any list whose endpoints share a registered domain: the watchtower's RXD quorum,
   the BTC Esplora quorums, the ETH RPC quorum, `scripts/eth_swap_run.py`'s endpoint gate,
   `scripts/swap_run_verify.py`'s cross-check and HashMark §7.6 form 2 now count them once, and the
   quorums that refused one host twice now refuse one operator twice (`ValidationError` "the same
   source"). The watchtower still accepts such URLs as one failover source and warns that
-  corroboration is off when that leaves one. `SameHostFailover` (unreleased) is renamed
+  corroboration is off when that leaves one. For its own defaults, whose two radiant4people
+  servers are one failover source by design beside radiantcore, the grouping is logged at INFO,
+  so the WARNING fires only for a list the operator supplied. `SameHostFailover` (unreleased) is renamed
   `SameSourceFailover`, and its members may be several hosts of one operator.
 - **Input that names no host is refused.** `source_key` raised nothing for `[bad`, `wss://[::1`,
   `[::1]x` or `wss://` and made each its own key, so a typo counted as a source. They now raise
@@ -83,9 +88,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `walk_mutable_chain` and `source_keys`. Refused when the list is read — at `load()` for the
   top-level list, and when `for_network()` selects a `[networks.<name>]` list: an id that is not
   1-64 lower-case letters, digits, `.` or `-`; unknown keys in the table; one host counted as two
-  sources (two operators on its URLs, or an operator on one and not another); and a declaration
-  that contradicts a shipped operator. A profile, form 2's labels and a quorum of client objects
-  refuse one host counted as two sources too. pyrxd believes the declaration; it is only as good as
+  sources (two operators on its URLs, or an operator on one and not another); a declared host next
+  to an UNDECLARED host of the same registered domain (or shipped operator, IP address or loopback)
+  — a declaration may merge sources, and may split a group only when every host of it in the list
+  is declared; and a declaration that contradicts a shipped operator. A profile, form 2's judge
+  and walker, and a quorum of client objects refuse the two set-level cases too
+  (`require_one_key_per_host`), so a library caller handing them such a map directly is refused
+  rather than counted. pyrxd believes the declaration; it is only as good as
   what is written. Documented in `pyrxd.cli.config` and `docs/how-to/troubleshoot-common-errors.md`
   (7c).
 - **`wss://electrumx2.radiant4people.com:50022/` is a shipped mainnet default, for failover.** It is

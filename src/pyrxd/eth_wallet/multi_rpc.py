@@ -101,8 +101,8 @@ class MultiSourceEthRpc:
     Drop-in for :class:`~pyrxd.eth_wallet.rpc.EthRpc` on the read paths the swap depends on.
 
     ONE OPERATOR, ONE VOTE. Each source carries a ``source_key`` (``EthRpc`` derives it from its URL
-    through :func:`pyrxd.network.source_identity.source_key`: distinct operators, as declared, or by
-    registered domain), and two sources with one key are refused: ``MultiSourceEthRpc([r, r])`` used
+    through :func:`pyrxd.network.source_identity.source_key`: distinct operators — known operators,
+    else registered domain; this quorum takes no declarations), and two sources with one key are refused: ``MultiSourceEthRpc([r, r])`` used
     to be a 2-of-2 quorum of one endpoint agreeing with itself, and so did ``https://h/v2/KEY1``
     beside ``https://h:443/v2/KEY2`` — and so would ``https://eu.rpc.example`` beside
     ``https://us.rpc.example``.

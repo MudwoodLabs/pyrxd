@@ -1798,10 +1798,15 @@ def _self_check() -> int:
         _dedup_by_host(["https://a.example/x", "https://a.example/y", "https://b.example"])
         == ["https://a.example/x", "https://b.example"],
     )
-    # L-1: scheme-less hosts must still collapse (localhost:8545/:8546).
+    # L-1: scheme-less hosts must still collapse (localhost:8545/:8546), and so does every loopback
+    # spelling: localhost and 127.0.0.1 are one machine, so one source.
     check(
         "dedup: scheme-less same host collapses",
-        _dedup_by_host(["localhost:8545", "localhost:8546", "127.0.0.1:8545"]) == ["localhost:8545", "127.0.0.1:8545"],
+        _dedup_by_host(["localhost:8545", "localhost:8546", "127.0.0.1:8545"]) == ["localhost:8545"],
+    )
+    check(
+        "dedup: scheme-less distinct hosts stay distinct",
+        _dedup_by_host(["localhost:8545", "node.example:8545"]) == ["localhost:8545", "node.example:8545"],
     )
 
     # L-4: hostile t_btc_blocks (out-of-range / bool) is a clean INVALID, not a mid-verify traceback.

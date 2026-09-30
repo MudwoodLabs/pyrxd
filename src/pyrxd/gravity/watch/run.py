@@ -260,9 +260,11 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     # A warning about "--rxd-electrumx-url values" on a run that passed none sent the reader to a
     # flag they never used.
     what_urls = "--rxd-electrumx-url values"
+    using_defaults = False
     if not urls and args.rxd_backend != "ssh-tr":
         urls = list(DEFAULT_RXD_ELECTRUMX)
         what_urls = "default RXD ElectrumX endpoints (no --rxd-electrumx-url given)"
+        using_defaults = True
     # ONE SOURCE PER OPERATOR GROUP, by the one identity every quorum uses. `wss://h`, `wss://h:443`,
     # `wss://h/x` and `wss://h.` are one server, and `wss://x.d.example` and `wss://y.d.example` one
     # registered domain; counted apart, one party's "not locked" became a CORROBORATED absence that
@@ -273,10 +275,14 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
         client = await stack.enter_async_context(ElectrumXClient(group_urls, allow_insecure=args.allow_insecure))
         sources.append(ElectrumRxdChainSource(client))
     # Say so when the list the operator wrote is not the quorum they meant: several URLs of one
-    # operator collapse to one source, and if that leaves one source, corroboration is OFF.
+    # operator collapse to one source, and if that leaves one source, corroboration is OFF. The
+    # shipped defaults collapse BY DESIGN (radiant4people's second server is its failover, and a
+    # second operator is still there), so for them this is INFO: a WARNING on every default run is
+    # one the operator learns to ignore, and then it says nothing when their own list collapses.
     for key, group_urls in groups:
         if len(group_urls) > 1:
-            logger.warning(
+            logger.log(
+                logging.INFO if using_defaults else logging.WARNING,
                 "RXD sources: %d %s are ONE source (%s): %s. Sources are counted by registered domain, "
                 "or by an operator pyrxd ships knowledge of, so they are one failover source, not %d "
                 "sources",
@@ -294,8 +300,8 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     if len(sources) == 1:
         if len(urls) > 1:
             logger.warning(
-                "RXD corroboration is OFF: the %d %s are all one source (one registered domain, or one "
-                "operator pyrxd ships knowledge of), so the watchtower runs SINGLE-SOURCE (every RXD read "
+                "RXD corroboration is OFF: the %d %s are all one source (one registered domain, one "
+                "operator pyrxd ships knowledge of, or this machine's loopback), so the watchtower runs SINGLE-SOURCE (every RXD read "
                 "is low-corroboration). Add a --rxd-electrumx-url of a different operator to corroborate; "
                 "the watchtower takes no operator declaration, so that means a different registered domain.",
                 len(urls),

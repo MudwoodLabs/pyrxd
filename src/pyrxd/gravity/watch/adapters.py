@@ -148,8 +148,8 @@ class MultiSourceRxdChainSource:
     node + public ElectrumX servers), mirroring :class:`network.bitcoin.MultiSourceBtcFundingReader`.
 
     ONE OPERATOR, ONE VOTE. Each source names its source key (``source_key``, derived from its URL
-    by :func:`pyrxd.network.source_identity.source_key`: operator, as declared, or registered
-    domain), and two sources with one key are REFUSED at construction: ``wss://h`` and
+    by :func:`pyrxd.network.source_identity.source_key`: known operator, else registered domain;
+    the watchtower takes no declarations), and two sources with one key are REFUSED at construction: ``wss://h`` and
     ``wss://h:443`` are one server, radiant4people's two servers one operator, and one operator's
     "not locked" must never be a corroborated absence. The grouping is not proof of independence:
     see the operator limit in :mod:`pyrxd.network.source_identity`.

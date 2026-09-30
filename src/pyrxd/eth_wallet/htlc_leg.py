@@ -1079,8 +1079,8 @@ class EthHtlcContractLeg:
         the canonical hash) — so a naive lying RPC cannot make a non-final claim read FINAL. This
         does NOT defend a fully-consistent malicious provider (one that lies coherently about the
         whole chain): a real-value path MUST use a multi-source finality quorum (≥2 providers of
-        distinct operators, as declared, or by registered domain, must agree the claim is final; that
-        grouping does not prove independence). That quorum is DEFERRED to the audit-gated
+        distinct operators — known operators, else registered domain — must agree the claim is final;
+        that grouping does not prove independence). That quorum is DEFERRED to the audit-gated
         real-value track; the dust/pre-audit path accepts a single trusted provider.
         """
         receipt = await self._rpc.wait_receipt(tx_hash)

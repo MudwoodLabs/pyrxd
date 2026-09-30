@@ -608,7 +608,9 @@ sources as *distinct operators, as declared, or by registered domain*:
   are one;
 - any other hosts under one registered domain are one source
   (`x.example.com` and `y.example.com`), while `a.co.uk` and `b.co.uk` are two,
-  because `co.uk` is a public suffix; an IP address is its own source.
+  because `co.uk` is a public suffix; an IP address is its own source;
+- every spelling of this machine (`localhost`, `127.0.0.1` or anything else in
+  `127.0.0.0/8`, `::1`) is ONE source.
 
 If your two servers really are run by different parties under one domain, or
 you want two domains you know to be one operator counted once, say so per
@@ -626,7 +628,11 @@ An `operator` is 1-64 lower-case letters, digits, `.` or `-`. Unknown keys in a
 server table, one host counted as two sources (two operators on its URLs, or an
 operator on one and not another), and a declaration that contradicts a shipped
 operator (e.g. `electrumx2.radiant4people.com` as anything but `radiant4people`)
-are refused when the list is read: at load for the top-level
+are refused, and so is a declared server next to an UNDECLARED server of the same
+registered domain (declare `rpc.acme.io` and leave `backup.acme.io` bare, and the
+two would count as two sources where without the declaration they are one — a
+declaration may merge sources, and may split a domain only when every server of
+that domain in the list is declared). All are refused when the list is read: at load for the top-level
 `electrumx_servers`, and when the network is selected for a
 `[networks.<name>]` list — before any server is contacted. **pyrxd believes the
 declaration**: it cannot see who runs a server, so declaring two operators that

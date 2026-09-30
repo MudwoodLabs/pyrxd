@@ -234,7 +234,7 @@ class TestSourceIdentityFollowUps:
             # The codec maps U+3002 to ".", so the A-label can end in the dot the ASCII path strips.
             ("wss://bücher.example\u3002/a", "xn--bcher-kva.example"),
             # ...and maps full-width digits to ASCII, so a non-ASCII host can spell an IP literal.
-            ("wss://\uff10x7f.0.0.1/", "127.0.0.1"),
+            ("wss://\uff10xcb.0.113.7/", "203.0.113.7"),
         ],
     )
     def test_the_a_label_is_canonicalised_like_any_ascii_host(self, url, source) -> None:
@@ -265,7 +265,9 @@ class TestSourceIdentityFollowUps:
             _config.load(cfg).for_network("mainnet").require_profile()
 
     def test_a_well_formed_ipv6_url_is_accepted(self) -> None:
-        assert Endpoint(url="wss://[::1]:50002/").source == "::1"
+        assert Endpoint(url="wss://[2001:db8::7]:50002/").source == "2001:db8::7"
+        # Loopback is accepted too, and is this machine's one source whatever its spelling.
+        assert Endpoint(url="wss://[::1]:50002/").source == "localhost"
 
     def test_the_loopback_check_fails_closed_on_a_malformed_url(self) -> None:
         from pyrxd.network.registry import _is_loopback_url
