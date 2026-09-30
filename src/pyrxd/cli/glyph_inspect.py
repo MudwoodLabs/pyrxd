@@ -909,6 +909,11 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
     not reach VERIFIED, the reason is printed under it — so a reader sees both that the height is
     the endpoint's word and why pyrxd could not do better. An anchor no verification ran on (form
     2's, ``glyph inspect``'s) prints exactly as it always did.
+
+    The depth follows the same rule. VERIFIED prints the PROVED depth (``verified_confirmations``)
+    as "at least N confirmation(s) verified", judged against the floor, and the endpoint's figure
+    beside it, labelled, only when the two differ; otherwise the depth is the endpoint's
+    ``confirmations``, as before.
     """
     if not a:
         return []
@@ -918,7 +923,17 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
             f"(unconfirmed, or the endpoint reports no depth)",
             f"{indent}              a mark in the mempool fixes no time; nothing below is anchored",
         ]
-    depth = f"{a['confirmations']} confirmation(s), floor {a['min_confirmations']}"
+    bv = a.get("block_verification")
+    bv = bv if isinstance(bv, Mapping) else None
+    verified = bool(a.get("height_is_verified")) and bv is not None
+    if verified:
+        # The PROVED depth, which the floor was judged against; the endpoint's number beside it,
+        # labelled, when it differs (it is only a claim, and may be larger or smaller).
+        depth = f"at least {a.get('verified_confirmations')} confirmation(s) verified, floor {a['min_confirmations']}"
+        if a.get("verified_confirmations") != a.get("confirmations"):
+            depth += f"; the endpoint reports {a['confirmations']}"
+    else:
+        depth = f"{a['confirmations']} confirmation(s), floor {a['min_confirmations']}"
     verdict = "PROVISIONAL — below the floor you set" if a.get("provisional") else "at or past the floor you set"
     lines = [f"{indent}block:        {a['height']}  ({depth}) — {verdict}"]
     # WRAPPED, NOT TRUNCATED. `_truncate_for_human` caps at 200 characters and this caveat is
@@ -929,9 +944,6 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
     # as complete. Sanitised anyway, so a future caveat from elsewhere cannot carry control
     # bytes, and bounded by line count rather than by cutting the sentence.
     caveat = _sanitize_display_string(str(a.get("caveat") or ""))
-    bv = a.get("block_verification")
-    bv = bv if isinstance(bv, Mapping) else None
-    verified = bool(a.get("height_is_verified")) and bv is not None
     if verified:
         caveat = f"VERIFIED: {caveat}"
     # The longest claim (the proof-of-work level, with the sentence saying the endpoint had named a

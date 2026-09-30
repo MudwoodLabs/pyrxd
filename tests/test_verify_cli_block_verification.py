@@ -498,20 +498,56 @@ def test_an_inherited_anchor_from_before_a_reorganisation_is_verified_as_the_blo
 # ── every path: the JSON keys, and the two halves of the human report agree ────────────────
 
 
-def _paths() -> dict[str, tuple[int, dict]]:
+def _confs(chain: Chain, n: int) -> dict[str, Any]:
+    """Overrides for an endpoint that REPORTS ``n`` confirmations (and a tip to match), while the
+    headers it serves are the real ones — nine of them from the mark's block up."""
+
+    def verbose_or_raw(params: list) -> Any:
+        txid, verbose = params
+        assert txid == chain.txid
+        if not verbose:
+            return chain.raw.hex()
+        return {"txid": chain.txid, "confirmations": n, "blockhash": chain.hash_at(chain.height)}
+
     return {
-        "verified_checkpoint": (C.tip, {}),
-        "verified_work": (C.start, {}),
-        "verified_after_a_reorganisation": (C.tip, _reorg(C, named=_renonced(C.headers[C.height]))),
-        "merkle_method_not_found": (C.tip, {"blockchain.transaction.get_merkle": _rpc_error(-32601, "x")}),
-        "header_range_times_out": (C.tip, {"blockchain.block.headers": NetworkError("ElectrumX request timed out")}),
-        "headers_short": (C.tip, {"blockchain.block.headers": lambda p: _headers_reply(C.headers, p[0], 1)}),
-        "no_checkpoints": (-1, {}),
+        "blockchain.transaction.get": verbose_or_raw,
+        "blockchain.headers.subscribe": lambda p: {
+            "height": chain.height + n - 1,
+            "hex": chain.headers[chain.tip].hex(),
+        },
+    }
+
+
+_NO_MERKLE = {"blockchain.transaction.get_merkle": _rpc_error(-32601, "x")}
+
+
+def _paths() -> dict[str, tuple[int, dict, str]]:
+    """Every path ``checks.block`` can take here: (checkpoint height or -1 for none, overrides, state)."""
+    return {
+        "verified_checkpoint": (C.tip, {}, "VERIFIED"),
+        "verified_work": (C.start, {}, "VERIFIED"),
+        "verified_after_a_reorganisation": (C.tip, _reorg(C, named=_renonced(C.headers[C.height])), "VERIFIED"),
+        # The endpoint's number is a claim either way; the proved depth (9) is what counts.
+        "verified_while_the_endpoint_reports_fewer_than_the_floor": (C.tip, _confs(C, 3), "VERIFIED"),
+        "verified_while_the_endpoint_reports_a_million": (C.tip, _confs(C, 1_000_000), "VERIFIED"),
+        "merkle_method_not_found": (C.tip, _NO_MERKLE, "CONFIRMED"),
+        "header_range_times_out": (
+            C.tip,
+            {"blockchain.block.headers": NetworkError("ElectrumX request timed out")},
+            "CONFIRMED",
+        ),
+        "headers_short": (
+            C.tip,
+            {"blockchain.block.headers": lambda p: _headers_reply(C.headers, p[0], 1)},
+            "CONFIRMED",
+        ),
+        "no_checkpoints": (-1, {}, "CONFIRMED"),
+        "provisional_and_not_verified": (C.tip, {**_confs(C, 3), **_NO_MERKLE}, "PROVISIONAL"),
     }
 
 
 def _setup(monkeypatch, case: str) -> ElectrumXClient:
-    cp, override = _paths()[case]
+    cp, override, _state = _paths()[case]
     if cp < 0:
         monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", ())
     else:
@@ -519,46 +555,74 @@ def _setup(monkeypatch, case: str) -> ElectrumXClient:
     return _server(C, **override)
 
 
+def _exit_for(state: str) -> int:
+    return 5 if state == "PROVISIONAL" else 0
+
+
 @pytest.mark.parametrize("case", list(_paths()), ids=list(_paths()))
 def test_the_json_carries_the_whole_verification_on_every_path(monkeypatch, tmp_path, case: str) -> None:
+    state = _paths()[case][2]
     r, _ = _verify(monkeypatch, tmp_path, C, _setup(monkeypatch, case))
-    assert r.exit_code == 0, r.output
+    assert r.exit_code == _exit_for(state), r.output
     out = json.loads(r.output)
     anchor = out["mark_anchor"]
     bv = anchor["block_verification"]
     fields = {"state", "claim", "reason", "height", "blockhash", "level", "checkpoint_height", "checkpoint_hash"}
     fields |= {"linked_headers", "floor_work_log2", "verified_depth", "steps", "source", "named_blockhash"}
     assert fields <= set(bv), fields - set(bv)
-    assert "blockhash" in anchor and "height_is_verified" in anchor
+    assert {"blockhash", "height_is_verified", "confirmations", "verified_confirmations"} <= set(anchor)
     verified = bv["state"] == "VERIFIED"
-    assert verified is case.startswith("verified_")
+    assert verified is (state == "VERIFIED")
     assert anchor["height_is_verified"] is verified
-    assert (out["checks"]["block"]["state"] == "VERIFIED") is verified
+    assert out["checks"]["block"]["state"] == state
     assert (bv["claim"] is not None) is verified and (bv["reason"] is None) is verified
-    # The form-2-free record copy is untouched: nothing but the verify anchor was verified.
-    assert out["verdict_holds"] is True
+    # TWO DEPTHS, NAMED APART: `confirmations` is the endpoint's, `verified_confirmations` the proof's.
+    assert anchor["verified_confirmations"] == (bv["verified_depth"] if verified else None)
+    assert anchor["provisional"] is (state == "PROVISIONAL")
+    assert anchor["deep_enough"] is (state != "PROVISIONAL")
+    assert out["verdict_holds"] is (state != "PROVISIONAL")
+
+
+def _halves(output: str) -> tuple[str, str]:
+    """The human report's summary ``block:`` line, and the whole detail block under it."""
+    lines = output.splitlines()
+    summary = next(ln for ln in lines if ln.strip().startswith("block:") and "VERDICT" not in ln)
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("  block:        "))
+    end = next(i for i in range(start, len(lines)) if "(source:" in lines[i])
+    return _flat(summary), _flat(" ".join(lines[start : end + 1]))
 
 
 @pytest.mark.parametrize("case", list(_paths()), ids=list(_paths()))
-def test_the_summary_and_the_detail_agree_on_every_path(monkeypatch, tmp_path, case: str) -> None:
-    """Two elements on one screen describing the same quantity must agree after the change."""
-    server = _setup(monkeypatch, case)
-    r, _ = _verify(monkeypatch, tmp_path, C, server, json_out=False)
-    assert r.exit_code == 0, r.output
-    summary = next(ln for ln in r.output.splitlines() if ln.strip().startswith("block:") and "VERDICT" not in ln)
-    detail_start = next(i for i, ln in enumerate(r.output.splitlines()) if ln.startswith("  block:        "))
-    detail = _flat(" ".join(r.output.splitlines()[detail_start : detail_start + 14]))
-    if case.startswith("verified_"):
-        assert " VERIFIED " in f" {summary} " and "VERIFIED:" in detail
-        assert "not verified:" not in detail and "not verified:" not in summary
+def test_the_summary_the_detail_and_the_json_agree_on_every_path(monkeypatch, tmp_path, case: str) -> None:
+    """Two elements on one screen describing the same quantity must agree — with each other and
+    with the JSON — on the state, the depth, and whose depth it is."""
+    state = _paths()[case][2]
+    out = json.loads(_verify(monkeypatch, tmp_path, C, _setup(monkeypatch, case))[0].output)
+    r, _ = _verify(monkeypatch, tmp_path, C, _setup(monkeypatch, case), json_out=False)
+    assert r.exit_code == _exit_for(state), r.output
+    summary, detail = _halves(r.output)
+    anchor, bv = out["mark_anchor"], out["mark_anchor"]["block_verification"]
+    endpoint = anchor["confirmations"]
+    assert f" {state} " in f" {summary} "
+    assert ("PROVISIONAL — below the floor you set" in detail) is (state == "PROVISIONAL")
+    if state == "VERIFIED":
+        proved = anchor["verified_confirmations"]
+        assert proved == bv["verified_depth"] >= anchor["min_confirmations"]
+        assert "VERIFIED:" in detail and "not verified:" not in detail + summary
+        said = f"at least {proved} confirmation(s) verified"
+        assert said in summary and said in detail
+        if proved != endpoint:
+            assert f"the endpoint reports {endpoint}" in summary and f"the endpoint reports {endpoint}" in detail
+            assert f" {endpoint} confirmation(s)" not in f" {summary} {detail}", "the endpoint's figure, unlabelled"
+        else:
+            assert "the endpoint reports" not in summary + detail
     else:
-        assert " CONFIRMED " in f" {summary} " and "VERIFIED:" not in detail
+        assert anchor["verified_confirmations"] is None
+        assert "VERIFIED:" not in detail and "verified)" not in summary
+        assert f"{endpoint} confirmation(s)" in summary and f"{endpoint} confirmation(s)" in detail
         # The same reason, in both halves (the summary may be cut at 200 characters).
-        reason = json.loads(_verify(monkeypatch, tmp_path, C, _setup(monkeypatch, case))[0].output)["mark_anchor"][
-            "block_verification"
-        ]["reason"]
-        assert f"not verified: {reason}"[:60] in _flat(summary)
-        assert _flat(f"not verified: {reason}") in detail
+        assert f"not verified: {bv['reason']}"[:60] in summary
+        assert _flat(f"not verified: {bv['reason']}") in detail
 
 
 # ── the inherited branch: form 2's anchor crosses the same verification ────────────────────

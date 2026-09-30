@@ -882,23 +882,28 @@ def _block_check(anchor: dict | None) -> tuple[str, str]:
 
     VERIFIED only when the anchor's own ``height_is_verified`` says so, which
     :func:`~pyrxd.glyph.mark_anchor.with_block_verification` sets for a VERIFIED outcome alone —
-    the same field the detail lines below read, so the summary and the detail cannot disagree.
-    Any other outcome is CONFIRMED, the endpoint's word, with the reason verification did not
-    reach VERIFIED. Both hold the verdict: verification that could not run is not a finding
-    against the mark. (A CONTRADICTED outcome never gets here: :func:`_verify_anchor` refuses it.)
+    the same field the detail lines read, so the summary and the detail cannot disagree. Under
+    VERIFIED the depth is the PROVED one (``verified_confirmations``), and the floor was judged
+    against it: an endpoint's number is only a claim, larger or smaller, and is printed beside it
+    when it differs, labelled as the endpoint's. Any other outcome is the endpoint's word —
+    CONFIRMED, or PROVISIONAL below the floor — with the reason verification did not reach
+    VERIFIED. Neither fails the verdict on that account: verification that could not run is not a
+    finding against the mark. (A CONTRADICTED outcome never gets here: :func:`_verify_anchor`
+    refuses it.)
     """
     if not anchor or anchor.get("height") is None:
         return "NO BLOCK", "this transaction is not in a block; a mark in the mempool fixes no time"
-    if anchor.get("provisional"):
-        return (
-            "PROVISIONAL",
-            f"{anchor['confirmations']} confirmation(s) against the floor of {anchor['min_confirmations']} you set",
-        )
-    where = f"block {anchor['height']}, {anchor['confirmations']} confirmation(s)"
     bv = anchor.get("block_verification")
-    if not isinstance(bv, dict):
-        return "CONFIRMED", where
-    if anchor.get("height_is_verified"):
+    bv = bv if isinstance(bv, dict) else None
+    if bv is not None and anchor.get("height_is_verified"):
+        # `with_block_verification` sets it only when the proved depth reaches the floor.
+        where = f"block {anchor['height']}, at least {anchor.get('verified_confirmations')} confirmation(s) verified"
+        if anchor.get("verified_confirmations") != anchor.get("confirmations"):
+            where += f" (the endpoint reports {anchor.get('confirmations')})"
+        # Before the "how", which the detail lines state in full: the human summary is cut at 200
+        # characters, and this is the part a reader must not lose.
+        if dict(bv.get("steps") or ()).get("blockhash") == "differs":
+            where += f"; the endpoint had named a different block, the block proved is {anchor.get('blockhash')}"
         if bv.get("level") == "checkpoint":
             how = f"linked hash by hash to pyrxd checkpoint {bv.get('checkpoint_height')}"
         else:
@@ -907,7 +912,14 @@ def _block_check(anchor: dict | None) -> tuple[str, str]:
                 f"proof-of-work of at least 2^{bv.get('floor_work_log2')}"
             )
         return "VERIFIED", f"{where}; merkle inclusion proved, {how}"
-    return "CONFIRMED", f"{where} (endpoint's word; not verified: {bv.get('reason')})"
+    unverified = f" (endpoint's word; not verified: {bv.get('reason')})" if bv is not None else ""
+    if anchor.get("provisional"):
+        return (
+            "PROVISIONAL",
+            f"{anchor['confirmations']} confirmation(s) against the floor of {anchor['min_confirmations']} you set"
+            f"{unverified}",
+        )
+    return "CONFIRMED", f"block {anchor['height']}, {anchor['confirmations']} confirmation(s){unverified}"
 
 
 def _digest_match_lines(dm: dict | None, indent: str = "  ") -> list[str]:

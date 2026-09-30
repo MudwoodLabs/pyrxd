@@ -388,6 +388,8 @@ def mark_anchor_dict(anchor, verification=None, *, verified_by: str | None = Non
 
     shape = {
         "height": anchor.height,
+        # The ENDPOINT'S figure, always. A verified depth, when there is one, is
+        # ``verified_confirmations`` (set by `with_block_verification`), never written here.
         "confirmations": anchor.confirmations,
         "min_confirmations": anchor.min_confirmations,
         "provisional": anchor.provisional,
@@ -418,12 +420,26 @@ def with_block_verification(shape: Mapping[str, Any], verification: Any, *, veri
     ``source``, the endpoint whose data was checked (*verified_by*); ``None`` when *verification* is.
     When VERIFIED, ``blockhash`` is the hash of the block proved, which is not necessarily the one
     the endpoint named (see :attr:`~pyrxd.glyph.mark_block.BlockVerification.named_blockhash`).
+
+    TWO DEPTHS, NAMED APART. ``confirmations`` is always the ENDPOINT'S figure, verified or not.
+    ``verified_confirmations`` is the depth the verifier proved (its ``verified_depth``: a lower
+    bound, the mark's block counting as 1) when VERIFIED, and ``None`` otherwise. When VERIFIED,
+    the floor is judged against the PROVED depth — ``provisional`` and ``deep_enough`` follow it,
+    not the endpoint's number, which may be larger or smaller and is only a claim; VERIFIED
+    requires the proved depth to reach ``min_confirmations``, so a VERIFIED anchor is never
+    provisional. Otherwise both stay the endpoint's word, as ``mark_anchor_dict`` set them.
     """
     out = dict(shape)
     if out.get("block_verification") is not None:
-        # Applied before: the caveat is the earlier outcome's, so start again from the endpoint's.
+        # Applied before: the caveat and the depth verdicts are the earlier outcome's, so start
+        # again from the endpoint's.
         out["caveat"] = BOUND_CAVEAT if out.get("header_bound") else UNVERIFIED_CAVEAT
+        confs, floor = out.get("confirmations"), out.get("min_confirmations")
+        if isinstance(confs, int) and isinstance(floor, int):
+            out["provisional"] = out.get("height") is not None and confs < floor
+            out["deep_enough"] = out.get("height") is not None and not out["provisional"]
     out["height_is_verified"] = False
+    out["verified_confirmations"] = None
     if verification is None:
         out["block_verification"] = None
         return out
@@ -436,15 +452,24 @@ def with_block_verification(shape: Mapping[str, Any], verification: Any, *, veri
     detail["source"] = verified_by
     out["block_verification"] = detail
     height = out.get("height")
+    floor = out.get("min_confirmations")
     verified = (
         verification.state == VERIFIED
         and isinstance(verification.claim, str)
         and height is not None
         and verification.height == height
+        # The verifier's burial step already requires this; checked again against the floor THIS
+        # anchor reports, since the depth verdicts below are rewritten from it.
+        and isinstance(verification.verified_depth, int)
+        and isinstance(floor, int)
+        and verification.verified_depth >= floor
     )
     out["height_is_verified"] = verified
     if verified:
         out["caveat"] = verification.claim
+        out["verified_confirmations"] = verification.verified_depth
+        out["provisional"] = False
+        out["deep_enough"] = True
         # The block PROVED, never the endpoint's name for it: after a reorganisation between the
         # anchor's reply and the proof's the two differ, and the name is then kept, labelled, as
         # ``block_verification.named_blockhash``.
