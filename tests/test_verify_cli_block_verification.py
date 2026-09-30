@@ -492,15 +492,17 @@ def test_a_different_name_with_a_header_that_does_not_link_still_exits_2(monkeyp
 def test_an_inherited_anchor_from_before_a_reorganisation_is_verified_as_the_block_proved(
     monkeypatch, tmp_path
 ) -> None:
-    """The exposed path: the inherited anchor comes from the endpoint that answered the name
-    lookup, the proof from another. Their views of the block at the mark's height can differ
-    honestly; the proof decides, and the block it proved is the one reported."""
+    """An inherited anchor that did not come with a verification (the name lookup here is a stub
+    that verifies nothing, so this is ``_with_verified_block``'s fallback) is verified with the
+    proof of ``_endpoint_pair``'s first endpoint — here another server than the one that gave the
+    anchor. Their views of the block at the mark's height can differ honestly; the proof decides,
+    and the block it proved is the one reported."""
     _checkpoint(monkeypatch, C, C.tip)
     stale = _renonced(C.headers[C.height])
     server = _server(C)
     other = _server(C, **_reorg(C, named=stale))
 
-    async def _name_at_mark(ctx, *, name, mark_txid, min_confirmations, signer_hash160):
+    async def _name_at_mark(ctx, *, name, mark_txid, min_confirmations, signer_hash160, **_verify_block):
         async with other:
             anchor = await resolve_anchor_from(
                 other, "wss://other.invalid/", mark_txid=mark_txid, min_confirmations=min_confirmations
@@ -517,7 +519,8 @@ def test_an_inherited_anchor_from_before_a_reorganisation_is_verified_as_the_blo
     assert anchor["block_verification"]["state"] == "VERIFIED"
     assert anchor["blockhash"] == C.hash_at(C.height)
     assert anchor["block_verification"]["named_blockhash"] == radiant_block_hash(stale)
-    # Form 2's own anchor is untouched: still the other endpoint's word, naming what it named.
+    # The stub's own anchor is untouched: still the other endpoint's word, naming what it named.
+    # (The real lookup verifies its anchor itself: see the `--wave-name` tests below.)
     assert out["records"][0]["name_at_mark"]["anchor"]["blockhash"] == radiant_block_hash(stale)
 
 
@@ -659,12 +662,15 @@ def test_an_anchor_inherited_from_the_name_lookup_is_verified_too(monkeypatch, t
     resolved ``--wave-name`` lookup (so the block comes from the endpoint that did NOT supply the
     name binding). Both must cross the verification. The inherited anchor here is built by the
     real ``resolve_anchor_from`` against the fixture, labelled as the OTHER endpoint; the name
-    judgement is replaced, since forging a mainnet name's chain is not the point."""
+    lookup is replaced by a stub that verifies nothing, so this pins the FALLBACK: an inherited
+    anchor that arrives without a verification is verified by ``_with_verified_block``. (The real
+    lookup verifies its own anchor, and that outcome is reported as it is: the ``--wave-name``
+    tests below.)"""
     _checkpoint(monkeypatch, C, C.tip)
     server = _server(C)
     other = _server(C)
 
-    async def _name_at_mark(ctx, *, name, mark_txid, min_confirmations, signer_hash160):
+    async def _name_at_mark(ctx, *, name, mark_txid, min_confirmations, signer_hash160, **_verify_block):
         async with other:
             anchor = await resolve_anchor_from(
                 other, "wss://other.invalid/", mark_txid=mark_txid, min_confirmations=min_confirmations
@@ -679,6 +685,242 @@ def test_an_anchor_inherited_from_the_name_lookup_is_verified_too(monkeypatch, t
     assert anchor["block_verification"]["state"] == "VERIFIED"
     assert anchor["block_verification"]["source"] == LABEL
     assert out["checks"]["block"]["state"] == "VERIFIED"
-    # FORM 2'S OWN ANCHOR IS NOT VERIFIED: its caveat is unchanged (plan risk 9).
+    # THE STUB'S ANCHOR IS NOT VERIFIED — it made none — and the reported one is a copy: the
+    # verification is applied to `mark_anchor`, not written back into the record.
     own = out["records"][0]["name_at_mark"]["anchor"]
     assert own["block_verification"] is None and own["caveat"] == BOUND_CAVEAT and own["height_is_verified"] is False
+
+
+# ── --wave-name: the name judgement reads the SAME proof as the block check ─────────────────
+#
+# Through the REAL `_name_at_mark` and `judge_name_at_mark`: two fixture servers (real
+# `ElectrumXClient`s, only `_call` faked) of two distinct operators, B running the indexer
+# extension. Only the name's chain WALK is faked — a complete walk whose mint names the label and
+# whose target is the mark's own signer, placed 100 blocks before the mark by both servers — as
+# `tests/test_hashmark_verify_one_record.py` does, because forging a mainnet name's chain is not
+# the point. B answers the binding, so the anchor, and the proof of its block, are A's.
+
+A_URL, B_URL = "wss://a.invalid/", "wss://b.invalid/"
+WAVE_LABEL = "alice"
+MINT = "ab" * 32
+
+
+def _signer_address(chain: Chain) -> str:
+    from pyrxd.base58 import base58check_encode
+    from pyrxd.constants import NETWORK_ADDRESS_PREFIX_DICT, Network
+
+    payload = glyph_inspect._classify_raw_tx(chain.txid, chain.raw, network="mainnet")
+    (h160,) = {row["hashmark"]["attestation"]["recovered_hash160"] for row in payload["outputs"] if row.get("hashmark")}
+    return base58check_encode(NETWORK_ADDRESS_PREFIX_DICT[Network.MAINNET] + bytes.fromhex(h160))
+
+
+def _name_walk(monkeypatch, chain: Chain) -> None:
+    import cbor2
+
+    from pyrxd.glyph import mutable_chain_discovery as mcd
+    from pyrxd.glyph.mutable_chain import ChainStep, MutableChainWalk
+
+    target = _signer_address(chain)
+    placed = chain.height - 100
+
+    async def walk(*, mint_txid, discovery_source, tip_source, **_):
+        attrs = {"name": WAVE_LABEL, "domain": "rxd", "target": target}
+        step = ChainStep(
+            txid=mint_txid,
+            mut_vout=1,
+            kind="mint",
+            attrs={"target": target},
+            envelope_cbor=cbor2.dumps({"p": [2, 5, 11], "name": f"{WAVE_LABEL}.rxd", "attrs": attrs}),
+        )
+        w = MutableChainWalk(
+            ref=f"{mint_txid}:1",
+            steps=(step,),
+            tip_txid=mint_txid,
+            tip_vout=1,
+            tip_proved_unspent=True,
+            complete=discovery_source != tip_source,
+        )
+        d = mcd.ChainDiscovery(
+            mint_txid=mint_txid,
+            candidates=(),
+            heights={mint_txid: placed},
+            hops=0,
+            fetches=1,
+            capped=False,
+            stopped="tip",
+            source=discovery_source,
+        )
+        return mcd.DiscoveredWalk(walk=w, discovery=d, tip_heights={mint_txid: placed})
+
+    monkeypatch.setattr(mcd, "walk_discovered_chain", walk)
+
+
+def _indexer(chain: Chain) -> ElectrumXClient:
+    """B: an honest fixture server that also answers ``wave.resolve`` for the label."""
+    target = _signer_address(chain)
+
+    def resolve(params: list) -> Any:
+        return {"name": WAVE_LABEL, "ref": f"{MINT}_0", "target": target} if params == [WAVE_LABEL] else None
+
+    return _server(chain, **{"wave.resolve": resolve})
+
+
+def _run_name(monkeypatch, tmp_path, a: ElectrumXClient, b: ElectrumXClient, *, json_out: bool = True):
+    _name_walk(monkeypatch, C)
+    monkeypatch.setattr(CliContext, "make_client", lambda self: a)
+    monkeypatch.setattr(glyph_inspect, "_endpoint_pair", lambda ctx: (a, A_URL, b, B_URL))
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
+    args = ["verify", C.txid, "--min-confirmations", "6", "--wave-name", f"{WAVE_LABEL}.rxd"]
+    return CliRunner().invoke(cli, [*head, *(["--json"] if json_out else []), *args])
+
+
+def _name_detail(output: str) -> str:
+    lines = output.splitlines()
+    start = next(i for i, ln in enumerate(lines) if "at the mark's block" in ln)
+    end = next((i for i in range(start + 1, len(lines)) if not lines[i].startswith("      ")), len(lines))
+    return _flat(" ".join(lines[start:end]))
+
+
+@pytest.mark.parametrize("case", list(_paths()), ids=list(_paths()))
+def test_under_wave_name_the_name_the_block_and_the_json_agree_on_every_path(monkeypatch, tmp_path, case) -> None:
+    """Every block path, with ``--wave-name``: the name judgement's depth test and the block check
+    read ONE verification, so "too shallow" beside "at or past the floor" (or the reverse) cannot
+    be printed. Under VERIFIED the proved depth decides both; otherwise the endpoint's figure
+    decides both, exactly as without the proof."""
+    state = _paths()[case][2]
+    out = json.loads(_run_name(monkeypatch, tmp_path, _setup(monkeypatch, case), _indexer(C)).output)
+    r = _run_name(monkeypatch, tmp_path, _setup(monkeypatch, case), _indexer(C), json_out=False)
+    assert r.exit_code == _exit_for(state), r.output
+    anchor, nam = out["mark_anchor"], out["records"][0]["name_at_mark"]
+    assert out["checks"]["block"]["state"] == state
+    # ONE anchor: the block check reports the very dict the name judgement produced.
+    assert anchor == nam["anchor"]
+    assert anchor["source"] == A_URL and nam["binding_source"] == B_URL
+    shallow = state == "PROVISIONAL"
+    assert nam["provisional"] is anchor["provisional"] is shallow
+    if shallow:
+        assert out["checks"]["name"]["state"] == "NOT ESTABLISHED"
+        # The endpoint's figure, the same one the block line prints as the endpoint's word.
+        said = f"the mark is {anchor['confirmations']} confirmations deep, below the 6 required — too shallow"
+        assert said in out["checks"]["name"]["reason"]
+    else:
+        assert out["checks"]["name"]["state"] == "ESTABLISHED", out["checks"]["name"]["reason"]
+        assert "too shallow" not in r.output
+    detail = _name_detail(r.output)
+    proved, endpoint = anchor["verified_confirmations"], anchor["confirmations"]
+    note = f"at least {proved} confirmation(s) verified; the endpoint reports {endpoint}"
+    assert (note in detail) is (state == "VERIFIED" and proved != endpoint), detail
+    summary, block_detail = _halves(r.output)
+    if state == "VERIFIED" and proved != endpoint:
+        # The same two numbers, each labelled the same way, as the block's own line.
+        assert f"at least {proved} confirmation(s) verified" in block_detail
+        assert f"the endpoint reports {endpoint}" in block_detail and f"the endpoint reports {endpoint}" in summary
+
+
+def test_the_reviewers_scenario_an_endpoint_a_block_behind_the_floor(monkeypatch, tmp_path) -> None:
+    """HONEST: A's index reports 5 confirmations against a floor of 6; its proof shows the block 9
+    deep. The name was judged "5 confirmations deep ... too shallow" beside ``block: VERIFIED ...
+    at least 9``, exit 5. Now the name is judged by the proved depth too: ESTABLISHED, exit 0, and
+    the name's line says whose depth it used."""
+    _checkpoint(monkeypatch, C, C.tip)
+    a = _server(C, **_confs(C, 5))
+    out = json.loads(_run_name(monkeypatch, tmp_path, a, _indexer(C)).output)
+    assert out["verdict_holds"] is True, out["verdict_failed_checks"]
+    assert out["checks"]["name"]["state"] == "ESTABLISHED"
+    assert out["checks"]["block"]["state"] == "VERIFIED"
+    nam = out["records"][0]["name_at_mark"]
+    assert nam["form"] == 2 and nam["provisional"] is False
+    assert nam["anchor"]["verified_confirmations"] == 9 and nam["anchor"]["confirmations"] == 5
+    assert out["mark_anchor"]["provisional"] is nam["anchor"]["provisional"] is False
+    r = _run_name(monkeypatch, tmp_path, _server(C, **_confs(C, 5)), _indexer(C), json_out=False)
+    assert r.exit_code == 0, r.output
+    assert "too shallow" not in r.output
+    assert "at least 9 confirmation(s) verified; the endpoint reports 5" in _name_detail(r.output)
+
+
+def test_a_proof_shallower_than_the_floor_leaves_the_name_too_shallow(monkeypatch, tmp_path) -> None:
+    """The pair of the test above: the proof can only RAISE the depth to proved. Here it links and
+    carries the work, but the server serves headers only 4 deep against a floor of 6 — NOT
+    VERIFIED — so the endpoint's 5 decides both checks, as before: too shallow, PROVISIONAL, exit 5."""
+    _checkpoint(monkeypatch, C, C.start)  # the proof-of-work level, so depth is what fails
+    short = {h: b for h, b in C.headers.items() if h <= C.height + 3}
+    a = _server(C, **_confs(C, 5), **{"blockchain.block.headers": lambda p: _headers_reply(short, *p)})
+    r = _run_name(monkeypatch, tmp_path, a, _indexer(C))
+    assert r.exit_code == 5, r.output
+    out = json.loads(r.output)
+    bv = out["mark_anchor"]["block_verification"]
+    assert bv["state"] == "NOT VERIFIED" and bv["verified_depth"] == 4 < 6, bv
+    assert out["mark_anchor"]["verified_confirmations"] is None
+    assert out["checks"]["block"]["state"] == "PROVISIONAL"
+    assert out["checks"]["name"]["state"] == "NOT ESTABLISHED"
+    assert "the mark is 5 confirmations deep, below the 6 required" in out["checks"]["name"]["reason"]
+    assert out["records"][0]["name_at_mark"]["provisional"] is True
+
+
+def test_a_block_that_does_not_verify_leaves_the_name_on_the_endpoints_figure(monkeypatch, tmp_path) -> None:
+    """NOT VERIFIED (a server without the merkle method): the name judgement is exactly what it was
+    before any proof existed — the endpoint's 3 is too shallow, with the unchanged sentence."""
+    _checkpoint(monkeypatch, C, C.tip)
+    a = _server(C, **_confs(C, 3), **_NO_MERKLE)
+    out = json.loads(_run_name(monkeypatch, tmp_path, a, _indexer(C)).output)
+    assert out["checks"]["block"]["state"] == "PROVISIONAL"
+    assert out["checks"]["name"]["reason"] == (
+        "the mark is 3 confirmations deep, below the 6 required — too shallow to build a claim on"
+    )
+
+
+@pytest.mark.parametrize("case", list(_contradictions()), ids=list(_contradictions()))
+def test_under_wave_name_a_contradicting_proof_still_exits_2(monkeypatch, tmp_path, case: str) -> None:
+    """The verification made in the name lookup is reported, not repeated — and it crosses the
+    same CONTRADICTED refusal as one made by ``_verify_anchor``."""
+    _checkpoint(monkeypatch, C, C.tip)
+    r = _run_name(monkeypatch, tmp_path, _server(C, **_contradictions()[case]), _indexer(C))
+    assert r.exit_code == 2, r.output
+    text = _flat(r.output)
+    assert "contradicts the height reported for the mark" in text and A_URL in text
+
+
+def test_under_wave_name_the_block_is_proved_once(monkeypatch, tmp_path) -> None:
+    """ONE proof, so the name and the block cannot be judged from two: the merkle branch is fetched
+    once across both endpoints, from the one that gave the anchor."""
+    _checkpoint(monkeypatch, C, C.tip)
+    a, b = _server(C), _indexer(C)
+    r = _run_name(monkeypatch, tmp_path, a, b)
+    assert r.exit_code == 0, r.output
+    merkles = [c for s in (a, b) for c in s.calls if c[0] == "blockchain.transaction.get_merkle"]
+    assert len(merkles) == 1 and any(c[0] == "blockchain.transaction.get_merkle" for c in a.calls)
+    assert json.loads(r.output)["mark_anchor"]["block_verification"]["source"] == A_URL
+
+
+def test_a_proved_depth_can_only_lift_a_shallow_mark_never_sink_a_deep_one_below_the_floor() -> None:
+    """`MarkAnchor.provisional` is the one depth test the judge and the dict both derive from. A
+    proved depth is set only from a VERIFIED outcome that reaches the floor (`proven_depth`), so it
+    lifts the endpoint's 5 to proved; a VERIFIED-looking outcome below the floor, or one about
+    another height, sets nothing. An anchor built by hand with a proved depth below the floor is
+    provisional whatever the endpoint reports — and the judge says whose number it was."""
+    from dataclasses import replace
+
+    from pyrxd.glyph.mark_anchor import MarkAnchor, proven_depth, with_proven_depth
+    from pyrxd.glyph.mark_block import NOT_VERIFIED, VERIFIED, BlockVerification
+    from pyrxd.glyph.wave_identity import judge_name_at_mark
+
+    shallow = MarkAnchor(txid=C.txid, height=C.height, confirmations=5, min_confirmations=6, source=A_URL)
+    proof = BlockVerification(state=VERIFIED, claim="c", reason=None, height=C.height, verified_depth=9)
+    assert shallow.provisional and not with_proven_depth(shallow, proof).provisional
+    for no in (
+        replace(proof, verified_depth=5),  # below the floor
+        replace(proof, height=C.height + 1),  # another height
+        replace(proof, state=NOT_VERIFIED, claim=None, reason="r"),
+        None,
+    ):
+        assert proven_depth(no, height=C.height, min_confirmations=6) is None
+        assert with_proven_depth(shallow, no).provisional
+    by_hand = replace(shallow, confirmations=100, verified_confirmations=4)
+    assert by_hand.provisional
+    verdict = judge_name_at_mark(
+        ref="00" * 36, name="alice.rxd", binding_source=B_URL, anchor=by_hand, walk=None, height_reports=[]
+    )
+    assert verdict.form == 1 and verdict.provisional
+    assert "proved only 4 confirmations deep (the endpoint reports 100), below the 6 required" in (
+        verdict.degraded_reason
+    )

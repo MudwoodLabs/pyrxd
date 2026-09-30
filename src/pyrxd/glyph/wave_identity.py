@@ -21,7 +21,8 @@ note about it.
 
 SIX THINGS MUST HOLD, or the verdict degrades to form 1 WITH A REASON:
 
-1. The mark has a block, buried to the caller's bar (``MarkAnchor.usable_for_point_in_time``).
+1. The mark has a block, buried to the caller's bar (``MarkAnchor.usable_for_point_in_time``: the
+   depth pyrxd proved when the caller verified the block, else the endpoint's figure).
 2. The mark's block and the name→glyph binding came from DIFFERENT sources — distinct operators,
    as declared, or by registered domain (:func:`pyrxd.network.source_identity.source_key`), so
    ``wss://h/`` and ``wss://h:443/x``, or ``wss://x.d.example`` and ``wss://y.d.example``, are one
@@ -304,6 +305,15 @@ def judge_name_at_mark(
     if not anchor.usable_for_point_in_time:
         if anchor.height is None:
             reason = "the mark has no block (unmined, or pasted without one) — form 2 needs one"
+        elif anchor.verified_confirmations is not None:
+            # A proved depth is the one judged (`MarkAnchor.provisional`); say so, and whose the
+            # other number is. `with_proven_depth` never sets one below the floor, so this is
+            # reached only by an anchor built by hand.
+            reason = (
+                f"the mark is proved only {anchor.verified_confirmations} confirmations deep (the endpoint "
+                f"reports {anchor.confirmations}), below the {anchor.min_confirmations} required — too "
+                "shallow to build a claim on"
+            )
         else:
             reason = (
                 f"the mark is {anchor.confirmations} confirmations deep, below the "

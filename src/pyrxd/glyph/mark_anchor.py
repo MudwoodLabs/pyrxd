@@ -36,8 +36,10 @@ THE BLOCK VERIFICATION THAT DOES EXIST is :mod:`pyrxd.glyph.mark_block`: merkle 
 linkage to a checkpoint pyrxd ships (and proof-of-work above the newest one). This module does not
 run it. ``pyrxd verify`` runs it on the anchor it reports and hands the outcome to
 :func:`with_block_verification`, which is the only way a display dict's ``height_is_verified``
-becomes ``True``. Every other anchor — form 2's, ``glyph inspect``'s, the pages' (for now) — is
-still a single endpoint's claim and carries the caveat below.
+becomes ``True`` — and, with ``--wave-name``, runs it in the form-2 lookup that fetched that
+anchor, before the name judgement reads its depth (:func:`with_proven_depth`). Every other anchor —
+the second endpoint's in form 2, ``glyph inspect``'s, the pages' (for now) — is still a single
+endpoint's claim and carries the caveat below.
 
 WHAT IT IS. ``get_transaction_verbose`` binds the echoed txid, so an endpoint cannot answer about a
 DIFFERENT transaction — that much is checked. Beyond it, an endpoint that lies about the height
@@ -172,11 +174,25 @@ class MarkAnchor:
     #: display hex — set only when ``header_bound``, i.e. when the header at ``height`` hashed to
     #: it. ``None`` otherwise: an unbound hash would be a second unchecked claim.
     blockhash: str | None = None
+    #: The depth pyrxd PROVED for this block (:func:`with_proven_depth`), or ``None``: the default,
+    #: and what every anchor an endpoint's reply builds carries. Set only from a VERIFIED block
+    #: verification of this height that reached ``min_confirmations`` (:func:`proven_depth`), so it
+    #: can move the depth verdict from the endpoint's word to proved and never below the floor.
+    #: ``confirmations`` stays the endpoint's figure either way.
+    verified_confirmations: int | None = None
 
     @property
     def provisional(self) -> bool:
-        """Below the caller's bar — real, but shallow enough to be reorged out."""
-        return self.height is not None and self.confirmations < self.min_confirmations
+        """Below the caller's bar — real, but shallow enough to be reorged out.
+
+        Judged against the PROVED depth when there is one (``verified_confirmations``), else the
+        endpoint's ``confirmations``. A proved depth reaches the floor by construction, so it can
+        only lift a mark the endpoint reports as shallow; one below the floor (built by hand) is
+        provisional, whatever the endpoint reports."""
+        if self.height is None:
+            return False
+        depth = self.verified_confirmations if self.verified_confirmations is not None else self.confirmations
+        return depth < self.min_confirmations
 
     @property
     def usable_for_point_in_time(self) -> bool:
@@ -368,6 +384,51 @@ async def _bind_to_block(
     )
 
 
+def proven_depth(verification: Any, *, height: object, min_confirmations: object) -> int | None:
+    """The depth *verification* PROVED for the block at *height*, or ``None`` when it proved none.
+
+    THE ONE PREDICATE for "this block is verified, deep enough". Non-``None`` exactly when
+    *verification* is VERIFIED, carries a claim, is about *height*, and proved a depth
+    (``verified_depth``) that reaches *min_confirmations*. :func:`with_block_verification` (the
+    display dict: the ``block`` check) and :func:`with_proven_depth` (the anchor a form-2 name
+    judgement reads) both decide through it, so the two cannot disagree about whether the mark's
+    block was proved deep enough.
+    """
+    if verification is None:
+        return None
+    from .mark_block import VERIFIED  # lazy: the page imports this module and must stay light
+
+    depth = getattr(verification, "verified_depth", None)
+    ok = (
+        getattr(verification, "state", None) == VERIFIED
+        and isinstance(getattr(verification, "claim", None), str)
+        and height is not None
+        and getattr(verification, "height", None) == height
+        # The verifier's burial step already requires this; checked again against the floor the
+        # CALLER holds, since the depth verdicts are rewritten from it.
+        and isinstance(depth, int)
+        and not isinstance(depth, bool)
+        and isinstance(min_confirmations, int)
+        and depth >= min_confirmations
+    )
+    return depth if ok else None
+
+
+def with_proven_depth(anchor: MarkAnchor, verification: Any) -> MarkAnchor:
+    """*anchor* with the depth *verification* proved (:func:`proven_depth`) — a copy.
+
+    For a caller that judges the anchor's depth (``provisional``, ``usable_for_point_in_time``)
+    after verifying its block: a VERIFIED block is judged by the depth proved, anything else by
+    the endpoint's figure, exactly as the display dict's are (:func:`with_block_verification`).
+    Nothing else changes — the height, the endpoint's ``confirmations``, the caveat and ``source``
+    are still the endpoint's report; the display of the proof is :func:`mark_anchor_dict`'s job.
+    """
+    from dataclasses import replace
+
+    depth = proven_depth(verification, height=anchor.height, min_confirmations=anchor.min_confirmations)
+    return replace(anchor, verified_confirmations=depth)
+
+
 def mark_anchor_dict(anchor, verification=None, *, verified_by: str | None = None) -> dict:
     """The display shape of a :class:`~pyrxd.glyph.mark_anchor.MarkAnchor`.
 
@@ -386,14 +447,19 @@ def mark_anchor_dict(anchor, verification=None, *, verified_by: str | None = Non
     # `tests/web/test_mark_anchor_bridge.py` measures.
     from ._inspect_core import _sanitize_display_string
 
+    # THE ENDPOINT'S WORD FIRST, even for an anchor carrying a proved depth: the dict's depth
+    # verdicts move to the proof only through *verification*, below, alongside the keys that say
+    # so (`height_is_verified`, `verified_confirmations`, the claim). A dict saying "deep enough"
+    # with nothing beside it to say why would be the one place the two could disagree.
+    endpoint_provisional = anchor.height is not None and anchor.confirmations < anchor.min_confirmations
     shape = {
         "height": anchor.height,
         # The ENDPOINT'S figure, always. A verified depth, when there is one, is
         # ``verified_confirmations`` (set by `with_block_verification`), never written here.
         "confirmations": anchor.confirmations,
         "min_confirmations": anchor.min_confirmations,
-        "provisional": anchor.provisional,
-        "deep_enough": anchor.usable_for_point_in_time,
+        "provisional": endpoint_provisional,
+        "deep_enough": anchor.height is not None and not endpoint_provisional,
         "source": _sanitize_display_string(anchor.source),
         "height_is_verified": anchor.height_is_verified,
         # Whether the height was checked against the endpoint's own block header. Carried as a
@@ -447,24 +513,12 @@ def with_block_verification(shape: Mapping[str, Any], verification: Any, *, veri
 
     from dataclasses import asdict
 
-    from .mark_block import VERIFIED  # lazy: the page imports this module and must stay light
-
     detail = asdict(verification)
     detail["source"] = verified_by
     out["block_verification"] = detail
-    height = out.get("height")
-    floor = out.get("min_confirmations")
-    verified = (
-        verification.state == VERIFIED
-        and isinstance(verification.claim, str)
-        and height is not None
-        and verification.height == height
-        # The verifier's burial step already requires this; checked again against the floor THIS
-        # anchor reports, since the depth verdicts below are rewritten from it.
-        and isinstance(verification.verified_depth, int)
-        and isinstance(floor, int)
-        and verification.verified_depth >= floor
-    )
+    # The same predicate a form-2 name judgement's anchor is judged by (`with_proven_depth`).
+    depth = proven_depth(verification, height=out.get("height"), min_confirmations=out.get("min_confirmations"))
+    verified = depth is not None
     out["height_is_verified"] = verified
     if verified:
         out["caveat"] = verification.claim
@@ -489,6 +543,8 @@ __all__ = [
     "AnchorBindingError",
     "MarkAnchor",
     "mark_anchor_dict",
+    "proven_depth",
     "resolve_mark_anchor",
     "with_block_verification",
+    "with_proven_depth",
 ]

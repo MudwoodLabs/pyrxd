@@ -144,6 +144,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # `height_is_verified` becomes true), and the caveat it leaves when inclusion alone was checked.
     "with_block_verification": ("pyrxd.glyph.mark_anchor", "with_block_verification"),
     "INCLUSION_ONLY_CAVEAT": ("pyrxd.glyph.mark_anchor", "INCLUSION_ONLY_CAVEAT"),
+    # The one predicate for "this block is proved deep enough", and the anchor a form-2 name
+    # judgement reads once the block is verified (its depth then proved, not the endpoint's).
+    "proven_depth": ("pyrxd.glyph.mark_anchor", "proven_depth"),
+    "with_proven_depth": ("pyrxd.glyph.mark_anchor", "with_proven_depth"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
     "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
     "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),

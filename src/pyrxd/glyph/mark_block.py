@@ -9,12 +9,13 @@ checkpoint, not in who served the proof.
 CALLERS (tracked in #799). ``pyrxd verify`` calls it, on by default, through
 :func:`pyrxd.cli.glyph_inspect.verify_anchor_block`, for ONE anchor: the mark's own (``mark_anchor``
 in its JSON, and the ``block`` check), which crosses it on both of the paths that build it — its
-own lookup and the anchor inherited from a ``--wave-name`` lookup. VERIFIED prints this module's
-claim; any other outcome falls back to the endpoint's-word wording with the reason; CONTRADICTED
-exits 2 with its reason, as a binding failure does. NOT every anchor that command prints: the
-anchors inside a form-2 name verdict (such as ``records[i].name_at_mark.anchor``, with
-``--wave-name``) are not verified and keep the endpoint's-word caveat. Neither do ``glyph
-inspect`` or the ``/verify/`` and ``/inspect/`` pages call it yet (phase 3).
+own lookup, and with ``--wave-name`` the form-2 lookup, which verifies the anchor it fetched before
+the name judgement reads its depth and hands that same anchor, verified, to the ``block`` check
+(``records[i].name_at_mark.anchor`` is that anchor). VERIFIED prints this module's claim; any other
+outcome falls back to the endpoint's-word wording with the reason; CONTRADICTED exits 2 with its
+reason, as a binding failure does. What form 2 reads from its SECOND endpoint (the mark's height
+again, and every chain step's) is not verified, and neither ``glyph inspect`` nor the ``/verify/``
+and ``/inspect/`` pages call it yet (phase 3).
 
 WHAT ``VERIFIED`` CLAIMS, per level. Both levels first require that the transaction's raw bytes
 (more than 64 of them) hash to its txid and that its merkle branch (SHA-256d, like Bitcoin's) leads

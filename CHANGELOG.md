@@ -56,8 +56,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Under `VERIFIED` the depth is the one pyrxd proved, printed as "at least N confirmation(s)
     verified", with the endpoint's figure beside it, labelled, only when the two differ. The
     floor you set is judged against the proved depth, not the endpoint's number: a mark the
-    endpoint reports below the floor, but proved at or past it, is `VERIFIED` with exit 0 (it
-    was `PROVISIONAL`, exit 5).
+    endpoint reports below the floor, but proved at or past it, is `VERIFIED`, and its depth no
+    longer fails the verdict (it was `PROVISIONAL`, exit 5). That holds for the `name` check
+    too: with `--wave-name`, form 2's depth test reads the same proved depth, so the exit is 0
+    unless another check fails.
   - When it does not verify (no checkpoints for the network, as on testnet and regtest; a block
     too far past the newest checkpoint; a server without the merkle method; a fetch that failed
     or came back malformed), the state stays `CONFIRMED` (or `PROVISIONAL`, below the floor),
@@ -77,9 +79,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     depth proved, under `VERIFIED`; otherwise null — `confirmations` stays the endpoint's
     figure) and `block_verification` (every field of the outcome, including `named_blockhash`,
     plus `source`, the endpoint asked for the proof); `height_is_verified` is true only for a
-    VERIFIED block. Form-2 anchors (`name_at_mark.anchor`) and the anchor in the pages' JSON
-    carry the same three keys, with `verified_confirmations` and `block_verification` null: they
-    are not verified, and their caveats are unchanged.
+    VERIFIED block. With `--wave-name`, `records[i].name_at_mark.anchor` is the same anchor,
+    with the same verification: the block is verified once, in the name lookup, before the name
+    judgement reads its depth, so a mark proved at or past the floor is not judged "too shallow"
+    for the name on the endpoint's lower figure, and the name's detail says whose depth it used
+    when the two differ. The name's chain-step heights are still the two endpoints' word.
+    `glyph inspect --wave-name` and the pages' JSON carry the same three keys, with
+    `verified_confirmations` and `block_verification` null: they are not verified, and their
+    caveats are unchanged.
   - A mark whose block, plus the confirmations asked for, reaches more than 4,032 blocks past
     this pyrxd's newest checkpoint cannot be verified by it and reports `CONFIRMED` with that
     reason; newer checkpoints come with newer releases.

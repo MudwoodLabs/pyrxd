@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import unicodedata
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
@@ -1121,7 +1121,9 @@ def _verify_anchor(
     prefer: dict | None = None,
 ) -> dict:
     """The mark's block, VERIFIED where pyrxd can: every anchor this returns crosses
-    :func:`_with_verified_block`, whichever branch below produced it.
+    :func:`_with_verified_block`, whichever branch below produced it. (An anchor inherited from a
+    ``--wave-name`` lookup arrives verified already — the verification the name judgement's depth
+    came from — and is reported with that outcome rather than verified twice.)
 
     ``raw_tx`` is the transaction the verify path already fetched and hash-checked; the block
     verification uses those bytes rather than fetching them again. Required, with no default, so
@@ -1139,6 +1141,14 @@ def _with_verified_block(
 ) -> dict:
     """*anchor* with its block verified (:func:`~pyrxd.cli.glyph_inspect.verify_anchor_block`).
 
+    ONE VERIFICATION PER ANCHOR. An anchor inherited from a ``--wave-name`` lookup already carries
+    the verification that lookup made (``block_verification``), and the name judgement's depth came
+    from it (:func:`~pyrxd.cli.glyph_inspect._name_at_mark`). That outcome is reported as it is —
+    never verified again here, where a second fetch could come out differently (a block arriving
+    between the two) and leave the ``name`` and ``block`` checks judging the mark's depth from two
+    different proofs. It crosses the same CONTRADICTED refusal below. An anchor with none (its own
+    lookup, or a name lookup that did not verify) is verified here.
+
     ON BY DEFAULT, and it never refuses a valid mark: anything that stops verification from
     running — a server without the merkle method, a header range that times out, a network pyrxd
     ships no checkpoints for, even an error of pyrxd's own — is NOT VERIFIED with the reason, and
@@ -1150,9 +1160,15 @@ def _with_verified_block(
     error says only that the height could not be established, and why.
     """
     from ..glyph.mark_anchor import with_block_verification
-    from ..glyph.mark_block import CONTRADICTED, NOT_VERIFIED, BlockVerification
+    from ..glyph.mark_block import CONTRADICTED
 
     height = anchor.get("height")
+
+    made = anchor.get("block_verification")
+    if isinstance(made, dict):
+        if made.get("state") == CONTRADICTED:
+            _refuse_contradicted(height, made.get("source"), made.get("reason"))
+        return anchor
 
     def endpoint() -> tuple[object, str]:
         # ONE endpoint pinned to one URL, the same seam `_anchor_of` asks — so the label names
@@ -1174,28 +1190,27 @@ def _with_verified_block(
             )
         )
     except Exception as exc:  # the helper is total over server data; this is pyrxd's own failure
-        verification = BlockVerification(
-            state=NOT_VERIFIED,
-            claim=None,
-            reason=_sanitize_display_string(f"block verification could not run ({type(exc).__name__}: {exc})"),
-            height=height if isinstance(height, int) else None,
-        )
-        label = None
+        verification, label = _inspect.block_verification_could_not_run(exc, height), None
     if verification.state == CONTRADICTED:
-        where = label or "the endpoint"
-        raise NetworkBoundaryError(
-            "could not establish which block the mark is in",
-            cause=_sanitize_display_string(
-                f"the block proof {where} served contradicts the height reported for the mark "
-                f"(block {height}): {verification.reason}"
-            ),
-            fix=(
-                "this says nothing against the mark itself, only that the server's own proof does not "
-                "support the height it reported — re-run in a moment, or ask another server with "
-                "--electrumx URL"
-            ),
-        )
+        _refuse_contradicted(height, label, verification.reason)
     return with_block_verification(anchor, verification, verified_by=label)
+
+
+def _refuse_contradicted(height: Any, label: Any, reason: Any) -> NoReturn:
+    """Exit 2 for a block proof that contradicts the height its endpoint reported — whichever
+    lookup made the verification."""
+    where = label or "the endpoint"
+    raise NetworkBoundaryError(
+        "could not establish which block the mark is in",
+        cause=_sanitize_display_string(
+            f"the block proof {where} served contradicts the height reported for the mark (block {height}): {reason}"
+        ),
+        fix=(
+            "this says nothing against the mark itself, only that the server's own proof does not "
+            "support the height it reported — re-run in a moment, or ask another server with "
+            "--electrumx URL"
+        ),
+    )
 
 
 def _anchor_of(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer: dict | None = None) -> dict:
@@ -1711,7 +1726,16 @@ def verify_cmd(
     if verify_wave:
         _attach_wave_identity(ctx, payload)
     if name_asked:
-        _attach_name_at_mark(ctx, payload, name=wave_name, min_confirmations=min_confirmations)  # type: ignore[arg-type]
+        # `verify_block`: the name judgement reads the mark's depth from the block verification,
+        # made once, in the lookup that fetched the anchor; `_verify_anchor` reports that outcome.
+        _attach_name_at_mark(
+            ctx,
+            payload,
+            name=wave_name,  # type: ignore[arg-type]
+            min_confirmations=min_confirmations,  # type: ignore[arg-type]
+            verify_block=True,
+            mark_raw_tx=raw_out[0] if raw_out else None,
+        )
 
     expected, absent_reason = _digest_expectation(records, file_path=file_path, digest_hex=digest_hex)
     source = "--digest" if digest_hex is not None else (str(file_path) if file_path is not None else "")
