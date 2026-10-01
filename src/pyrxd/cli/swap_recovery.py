@@ -135,6 +135,7 @@ __all__ = [
     "PreimageRecovery",
     "ProvenanceRefused",
     "RecoveryExtras",
+    "RefundReportedUnconfirmed",
     "assert_covenant_matches",
     "build_cold_claim",
     "build_cold_refund",
@@ -193,6 +194,18 @@ class CounterLegInconclusive(ValidationError):
     commonest way to get an empty answer for a CLAIMED contract is a node that does not serve
     the log history (pruning, or a log-range limit) — and a taker who keeps watching then can
     lose both legs when the covenant's CSV refund opens.
+    """
+
+
+class RefundReportedUnconfirmed(CounterLegInconclusive):
+    """The ETH contract's logs report only ``Refunded()``, but the transaction was NOT returned.
+
+    A refund verdict carries no self-verifying value (a claim does: ``sha256(p) == H``), so a log
+    alone is one server's unverifiable word. Read as "refunded", it drove ``swap status`` to
+    SPENT_NO_PREIMAGE — and, beside a taker claim of the covenant, to TAKER_CLAIMED_AND_REFUNDED,
+    telling a MAKER who may still be able to claim the ETH that there is nothing left to claim.
+    So it is inconclusive for every decision; only a returned, hash-checked refund transaction
+    makes the refund definitive.
     """
 
 
@@ -826,6 +839,13 @@ def _bound_logs(logs: Sequence[Any], contract_address: str) -> list[dict[str, An
     return [lg for lg in logs if isinstance(lg, dict) and _same_address(lg.get("address"), contract_address)]
 
 
+def _fetched_tx_hash(logs: Sequence[Any], contract_address: str) -> str | None:
+    """The hash of the transaction :func:`fetch_eth_claim_artifacts` asks for: the LAST bound log's."""
+    bound = _bound_logs(logs, contract_address)
+    tx_hash = bound[-1].get("transactionHash") if bound else None
+    return tx_hash if isinstance(tx_hash, str) else None
+
+
 def _log_topic0(log: dict[str, Any]) -> str | None:
     """The lower-case 0x-hex of a log's first topic (its event selector), or ``None``."""
     topics = log.get("topics") or []
@@ -906,8 +926,12 @@ def recover_preimage_from_eth_artifacts(
     3. **A ``Claimed`` event whose value does not hash to H** — :class:`ProvenanceRefused`. The
        swap's own contract only emits ``Claimed`` for a preimage of ITS hashlock, so this is the
        wrong contract for this swap or a server that is not telling the truth. Never shown as p.
-    4. **The transaction is in hand** — the calldata path, :func:`recover_preimage_from_eth_claim`.
-    5. **Only ``Refunded()`` events** — :class:`PreimageNotRevealed` (the leg was refunded).
+    4. **The transaction is in hand** — the calldata path, :func:`recover_preimage_from_eth_claim`,
+       with the transaction's hash checked against the one requested (the last bound log's). A
+       refund it shows is DEFINITIVE (:class:`PreimageNotRevealed`).
+    5. **Only ``Refunded()`` events, no transaction** — :class:`RefundReportedUnconfirmed`. A
+       refund log is one server's word with nothing in it to verify, so it never drives a
+       "nothing left to do" verdict.
     6. **Anything else** (logs that carry no p, transaction not retrievable) —
        :class:`CounterLegInconclusive`.
     """
@@ -935,12 +959,17 @@ def recover_preimage_from_eth_artifacts(
         )
     if claim_tx is not None:
         return recover_preimage_from_eth_claim(
-            hashlock=hashlock, contract_address=contract_address, claim_tx=claim_tx, logs=logs
+            hashlock=hashlock,
+            contract_address=contract_address,
+            claim_tx=claim_tx,
+            logs=logs,
+            reported_tx_hash=_fetched_tx_hash(logs, contract_address),
         )
     if bound and all(t == REFUNDED_TOPIC0 for t in topic0s):
-        raise PreimageNotRevealed(
-            f"the HTLC contract {contract_address} emitted only Refunded() — the leg was refunded and no "
-            "preimage was revealed by it"
+        raise RefundReportedUnconfirmed(
+            f"{source} reports only Refunded() from {contract_address} but did not return the transaction, so "
+            "the refund is UNCONFIRMED (a log alone proves nothing). Verify against another RPC or an explorer; "
+            "MAKER: if the contract still holds the ETH, you can still claim it."
         )
     raise CounterLegInconclusive(
         f"{source} returned {len(bound)} log(s) from the HTLC contract {contract_address}; none carries a "
@@ -979,7 +1008,10 @@ class CounterLegStatus:
     """
 
     chain: str  # "btc" | "eth"
-    state: str  # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | UNKNOWN | ERROR
+    # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | REFUND_REPORTED_UNCONFIRMED
+    # | UNKNOWN | ERROR. REFUND_REPORTED_UNCONFIRMED (ETH): a Refunded() log with no transaction —
+    # NOT resolved; swap status treats it like UNKNOWN for every decision.
+    state: str
     reason: str
     claim_txid: str | None = None
     preimage_available: bool = False
@@ -1221,8 +1253,9 @@ async def fetch_eth_claim_artifacts(
     logs = [lg for lg in (logs or []) if isinstance(lg, dict)]
     if not logs:
         return None, []
-    tx_hash = logs[-1].get("transactionHash")
-    if not isinstance(tx_hash, str):
+    # The last log emitted BY the contract — never a foreign log the RPC slipped into the answer.
+    tx_hash = _fetched_tx_hash(logs, contract_address)
+    if tx_hash is None:
         return None, logs
     tx = await eth_rpc_read(session, rpc_url, "eth_getTransactionByHash", [tx_hash], timeout_s=timeout_s)
     return (tx if isinstance(tx, dict) else None), logs
@@ -1243,6 +1276,11 @@ async def read_eth_counter_leg(
     try:
         rec = recover_preimage_from_eth_artifacts(
             hashlock=hashlock, contract_address=contract_address, claim_tx=tx, logs=logs, source=source
+        )
+    except RefundReportedUnconfirmed as exc:
+        # Not SPENT_NO_PREIMAGE: that state is "resolved" for swap status's situation table.
+        return CounterLegStatus(
+            chain="eth", state="REFUND_REPORTED_UNCONFIRMED", reason=str(exc), claim_txid=tx_hash, source=source
         )
     except CounterLegInconclusive as exc:
         return CounterLegStatus(chain="eth", state="UNKNOWN", reason=str(exc), claim_txid=tx_hash, source=source)

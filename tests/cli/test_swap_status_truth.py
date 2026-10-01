@@ -229,18 +229,81 @@ def test_the_honest_claimed_path_is_unchanged(case, eth_rpc) -> None:
     assert P.hex() in rec.output
 
 
-@pytest.mark.parametrize("with_tx", [True, False], ids=["tx-served", "tx-null"])
-def test_the_honest_refunded_path_reads_refunded(case, eth_rpc, with_tx) -> None:
+def test_the_honest_refunded_path_reads_refunded(case, eth_rpc) -> None:
+    """A Refunded() log AND its transaction, returned and hash-checked: the refund is definitive."""
     _eth_swap(case)
-    eth_rpc.scenario = {
-        "logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)],
-        "txs": {REFUND_TX: _refund_tx()} if with_tx else {},
-    }
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {REFUND_TX: _refund_tx()}}
     counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
     assert counter["state"] == "SPENT_NO_PREIMAGE"
     rec = _eth_recover(case, eth_rpc)
     assert rec.exit_code == 1, rec.output
     assert "no preimage has been revealed yet" in rec.output
+
+
+def test_a_refunded_log_with_no_transaction_is_unconfirmed_not_refunded(case, eth_rpc) -> None:
+    """A Refunded() log alone carries nothing to verify (a claim carries p, which hashes to H). Read
+    as "refunded" it told a maker who could still claim the ETH that there was nothing to claim."""
+    _eth_swap(case)
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "REFUND_REPORTED_UNCONFIRMED"
+    assert "UNCONFIRMED" in counter["reason"] and "you can still claim it" in counter["reason"]
+    rec = _eth_recover(case, eth_rpc)
+    assert rec.exit_code == 2, rec.output  # inconclusive, never "not revealed yet — keep watching"
+    assert "inconclusive" in rec.output
+
+
+def test_a_taker_claim_plus_an_unconfirmed_eth_refund_tells_the_maker_to_claim(case, eth_rpc) -> None:
+    """The fund-relevant case: covenant claimed by the taker, and a (possibly lying) RPC reporting
+    only a Refunded() log with no transaction. This used to read TAKER_CLAIMED_AND_REFUNDED —
+    "MAKER: ... there is nothing left on chain to claim" — while the maker might still claim."""
+    from .test_swap_recovery_cmds import _spent_by
+
+    _eth_swap(case)
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {}}
+    doc = json.loads(_eth_status(case, eth_rpc, client=_spent_by(case, "claim"), output_mode="json").output)
+    assert doc["counter_leg"]["state"] == "REFUND_REPORTED_UNCONFIRMED"
+    assert doc["situation"] == "COVENANT_SPENT", doc["situation"]
+    assert "nothing left" not in doc["chain"]["next_action"]
+    assert "MAKER: check the ETH leg" in doc["chain"]["next_action"]
+    assert "claim it with p" in doc["chain"]["next_action"]
+    # The same RPC WITH the refund transaction returned is definitive, and the situation is named.
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {REFUND_TX: _refund_tx()}}
+    doc = json.loads(_eth_status(case, eth_rpc, client=_spent_by(case, "claim"), output_mode="json").output)
+    assert doc["situation"] == "TAKER_CLAIMED_AND_REFUNDED"
+
+
+def test_a_refunded_log_plus_an_unrecognised_log_is_unknown_not_a_refund(case, eth_rpc) -> None:
+    """``all`` Refunded, not ``any``: one Refunded() among other events is not a refund verdict."""
+    _eth_swap(case)
+    other = _log("0x" + "22" * 32, b"", CLAIM_TX)
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX), other], "txs": {}}
+    assert _counter(_eth_status(case, eth_rpc, output_mode="json"))["state"] == "UNKNOWN"
+
+
+def test_a_returned_transaction_must_be_the_one_requested(case, eth_rpc) -> None:
+    """The refund transaction's hash is checked against the log's: an RPC answering the lookup with a
+    different transaction is not believed (and is not turned into a definitive refund)."""
+    _eth_swap(case)
+    wrong = dict(_refund_tx(), hash="0x" + "dd" * 32)
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {REFUND_TX: wrong}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "ERROR", counter
+    assert "different transaction" in counter["reason"]
+
+
+def test_a_claimed_log_from_a_foreign_contract_is_never_taken_as_p(case, eth_rpc) -> None:
+    """The per-swap contract address IS the provenance: a log carrying a valid p for H but emitted by
+    ANOTHER address (an RPC ignoring the address filter, or lying) is not this swap's claim."""
+    _eth_swap(case)
+    foreign = dict(_log(CLAIMED_TOPIC0, P, CLAIM_TX), address="0x" + "ee" * 20)
+    eth_rpc.scenario = {"logs": [foreign], "txs": {}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] != "CLAIMED_PREIMAGE_REVEALED", counter
+    assert counter["preimage_available"] is False
+    rec = _eth_recover(case, eth_rpc)
+    assert rec.exit_code != 0
+    assert P.hex() not in rec.output
 
 
 def test_logs_that_carry_no_p_with_the_transaction_unretrievable_are_unknown(case, eth_rpc) -> None:
