@@ -95,3 +95,43 @@ def test_redact_endpoints_in_renders_every_label_in_a_payload() -> None:
         "steps": ("ab" * 32, 3),
     }
     assert redact_endpoints_in(payload, ()) is payload  # nothing configured: unchanged
+
+
+# --------------------------------------------------------------------------- round 3, Q2: whole tokens
+
+TXID = "00deadbeef00112233" + "44" * 23
+
+
+@pytest.mark.parametrize(
+    ("url", "text"),
+    [
+        # a query value that happens to occur inside a txid
+        ("https://h.io/?apikey=deadbeef00112233", f"spent by {TXID}:1"),
+        # a path WORD in prose, and in a hostname
+        ("wss://h.example:50022/testnet", "switch the wallet to testnet first"),
+        ("wss://electrumx.h.example/electrumx", "wss://electrumx.h.example:50022 did not answer"),
+        # a block height in a path, and the same number in a message
+        ("https://h.io/blocks/458591", "the mark is at height 458591"),
+        # a long password inside a longer word is not that password
+        ("https://u:hunter2222@h.io/", "hunter2222x is not the password"),
+    ],
+)
+def test_words_txids_and_heights_that_merely_contain_a_part_are_untouched(url: str, text: str) -> None:
+    assert redact_endpoint_secrets(text, url) == text
+
+
+@pytest.mark.parametrize(
+    ("url", "text", "secret"),
+    [
+        ("https://h.io/?apikey=deadbeef00112233", "bad key deadbeef00112233", "deadbeef00112233"),
+        ("https://h.io/?k=x1", "k=x1 rejected", "x1"),  # a query value at ANY length
+        ("https://u:p@h.io/", "auth u:p@h.io", ":p@"),  # userinfo at any length
+        ("https://h.io/v2/shortkey", "/v2/shortkey denied", "shortkey"),  # after a key marker
+        ("https://h.io/abc123xyz", "path abc123xyz", "abc123xyz"),  # mixed letters + digits, 8+
+        ("https://h.io/v3/" + "f" * 32, "%2Fv3%2F" + "F" * 32, "F" * 32),  # a percent-escape is a boundary
+    ],
+)
+def test_real_keys_are_still_redacted_as_whole_tokens(url: str, text: str, secret: str) -> None:
+    out = redact_endpoint_secrets(text, url)
+    assert secret.lower() not in out.lower(), out
+    assert "<redacted>" in out

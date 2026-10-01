@@ -17,15 +17,19 @@ Two helpers, used at every place an endpoint is named in text:
 
 The redaction rule (structural, from the URL — not a list of exact strings):
 
-* **userinfo** — the user name and the password are redacted at ANY length. Parts shorter than
-  six characters are matched only as a whole token (not inside a longer word), so a two-letter
-  password does not delete every occurrence of those two letters from the message.
-* **each path segment, each query VALUE, the fragment and each fragment value** — redacted,
-  except a trivially common token: a letters-only word of at most five characters (``api``,
-  ``rpc``, ``eth``), ``v`` plus up to three digits (``v1``, ``v2``), or at most five digits. Those
-  are never keys, and scrubbing them would delete ordinary words from the message. Anything
-  longer, or mixing letters with digits or symbols, is treated as possibly secret.
+* **userinfo** — the user name and the password: ALWAYS redacted, at any length.
+* **each query VALUE, the fragment and each fragment value**: ALWAYS redacted (a query value is
+  where a key travels, and pyrxd cannot tell ``?apikey=`` from ``?k=``).
+* **a path segment** only when it looks like a credential: 16 characters or more (an Infura,
+  Alchemy or QuickNode key), or 8 or more mixing letters and digits (``abc123xyz``), or any
+  segment that is not a trivially common token (``api``, ``v2``, ``1``) right after a key-ish
+  marker segment (``/key/``, ``/token/``, ``/v3/`` …). A plain word (``testnet``, ``electrumx``)
+  or a number (a block height) in a path is not a credential, and scrubbing it deleted that word
+  from every message that mentioned it.
 * query parameter NAMES (``apikey``) and the host are not secret and are kept.
+* matching is WHOLE-TOKEN: a part is replaced only where it is not inside a longer run of letters
+  and digits, so a query value that happens to occur inside a txid, or a path word inside a
+  hostname, is left alone. A percent-escape counts as a boundary (``%2F<key>``).
 * matching is case-insensitive, and each character may appear literally or percent-encoded
   (``~`` or ``%7E``, ``/`` or ``%2F``, a space as ``%20`` or ``+``), so a server that re-encodes or
   upper-cases what it echoes is still caught.
@@ -41,11 +45,16 @@ __all__ = ["redact_endpoint_secrets", "redact_endpoints_in", "redacted_url", "se
 
 _REDACTED = "<redacted>"
 
-#: A path/query/fragment part matching this is a common, non-secret token and is kept.
+#: A trivially common token (``api``, ``v2``, ``1``): never a credential, even after a marker.
 _COMMON_TOKEN = re.compile(r"[A-Za-z]{1,5}|[vV]\d{1,3}|\d{1,5}")
 
-#: Parts shorter than this are matched only as a whole token.
-_SHORT = 6
+#: A path segment after one of these is a credential unless it is a common token.
+_KEY_MARKER = re.compile(r"(?i)[vV]\d{1,3}|key|keys|apikey|api[-_]key|token|tokens|auth|secret|access|private")
+
+#: A path segment at least this long is treated as a credential.
+_LONG_SEGMENT = 16
+#: ...and one at least this long that mixes letters and digits.
+_MIXED_SEGMENT = 8
 
 
 def redacted_url(url: object) -> str:
@@ -81,15 +90,28 @@ def secret_parts(url: str) -> list[str]:
         pieces = [rest, *re.split(r"[/?#&=@:;\[\]]", rest)]
         return [unquote(p) for p in pieces if p and not _COMMON_TOKEN.fullmatch(unquote(p))]
     out = [unquote(u) for u in (username, password) if u]
-    candidates = [unquote(seg) for seg in parts.path.split("/")]
-    candidates += [v for _, v in parse_qsl(parts.query, keep_blank_values=True)]
+    prev = ""
+    for raw_seg in parts.path.split("/"):
+        seg = unquote(raw_seg)
+        if seg and _looks_like_a_credential(seg, after=prev):
+            out.append(seg)
+        prev = seg or prev
+    out += [v for _, v in parse_qsl(parts.query, keep_blank_values=True) if v]
     if parts.fragment:
-        candidates.append(unquote(parts.fragment))
-        candidates += [v for _, v in parse_qsl(parts.fragment, keep_blank_values=True)]
-    for c in candidates:
-        if c and not _COMMON_TOKEN.fullmatch(c):
-            out.append(c)
+        out.append(unquote(parts.fragment))
+        out += [v for _, v in parse_qsl(parts.fragment, keep_blank_values=True) if v]
     return out
+
+
+def _looks_like_a_credential(segment: str, *, after: str) -> bool:
+    """A path segment that may be a key (rule: module doc). Userinfo and query values do not ask."""
+    if len(segment) >= _LONG_SEGMENT:
+        return True
+    has_letter = any(c.isalpha() for c in segment)
+    has_digit = any(c.isdigit() for c in segment)
+    if len(segment) >= _MIXED_SEGMENT and has_letter and has_digit:
+        return True
+    return bool(_KEY_MARKER.fullmatch(after)) and not _COMMON_TOKEN.fullmatch(segment)
 
 
 def _char_pattern(ch: str) -> str:
@@ -101,10 +123,10 @@ def _char_pattern(ch: str) -> str:
 
 
 def _part_pattern(part: str) -> str:
+    """*part* as a WHOLE TOKEN: not preceded or followed by a letter or digit, except that a
+    percent-escape before it (``%2F``) is a boundary, not part of a longer word."""
     body = "".join(_char_pattern(ch) for ch in part)
-    if len(part) < _SHORT:
-        return rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])"
-    return body
+    return rf"(?:(?<![A-Za-z0-9])|(?<=%[0-9A-Fa-f]{{2}})){body}(?![A-Za-z0-9])"
 
 
 def redact_endpoint_secrets(text: str, urls: str | Sequence[str | None] | None) -> str:

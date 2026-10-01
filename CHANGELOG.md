@@ -354,11 +354,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `scheme://host:port` (`pyrxd.network.redaction.redacted_url`), and the node-RPC transport scrubs
   a node's error text of its URL. `redact_endpoint_secrets` matched exact strings of six or more
   characters, so it missed a short password, a key a server re-encoded (`~` as `%7E`) or
-  upper-cased, and a fragment; it now derives each URL's user name, password, path segments, query
-  values and fragment and matches them case-insensitively and percent-encoded, keeping only
-  trivially common path/query tokens (a letters-only word of up to five characters such as `api`,
-  `v` plus up to three digits, up to five digits); the user name and password are redacted at any
-  length. `setup --json` reports
+  upper-cased, and a fragment; it now derives each URL's user name, password, query values and
+  fragment (always redacted, at any length) and the path segments that look like a credential (16
+  or more characters, 8 or more mixing letters and digits, or anything but a trivially common
+  token after a `/key/`, `/token/` or `/v3/`-style marker), and matches them case-insensitively,
+  percent-encoded, and as whole tokens only, so a value that merely occurs inside a txid, a
+  hostname or a word, and a plain path word such as `testnet` or a block height, is left alone. `setup --json` reports
   `electrumx_url` as `scheme://host:port`. `verify --wave-name` and `glyph inspect --wave-name`
   labelled every source in the name-at-mark verdict by its full endpoint URL, so `--json` printed
   the URL's credentials in `binding_source`, `anchor_source`, `chain.discovery_source` and

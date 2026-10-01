@@ -158,8 +158,9 @@ human sizing the fee is the only remaining control.
   Errors from a counter-leg endpoint are printed as the exception type, HTTP status and host —
   never the URL, which may carry an API key. Across the CLI, an endpoint named in an error, a
   ``fix:`` hint or a failover warning on stderr is shown as ``scheme://host:port`` only, and text
-  an endpoint sends back has the URL's user name, password, path segments, query values and
-  fragment removed (matched case-insensitively and in percent-encoded form).
+  an endpoint sends back has the URL's user name, password, query values, fragment and any path
+  segment that looks like a credential removed (matched as whole tokens, case-insensitively and in
+  percent-encoded form).
 
   pyrxd has no command that refunds a counter-leg, so where the taker may have to refund it the
   next action says which harness wrote the recovery file, when that leg's refund opens, and
