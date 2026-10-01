@@ -3154,3 +3154,22 @@ async def test_the_reference_time_is_taken_after_the_reads(monkeypatch):
     rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
     assert rec.state is SwapState.BTC_LOCKED
     assert coord.last_maker_funding.elapsed_s == base_elapsed + 1200
+
+
+def test_a_reply_names_a_txid_only_as_exactly_64_hex_characters_ignoring_case():
+    """``_names_txid`` directly: both sides must be 64 hex characters — a shorter or longer string that
+    merely equals the other is not a txid, on either side — compared ignoring case."""
+    from pyrxd.gravity.radiant_leg import _names_txid
+
+    t = os.urandom(32).hex()
+    assert _names_txid(t, t) and _names_txid(t.upper(), t) and _names_txid(t, t.upper())
+    for reported, requested in (
+        (t[:-1], t[:-1]),
+        (t + "00", t + "00"),
+        ("g" * 64, "g" * 64),
+        (os.urandom(32).hex(), t),
+        (None, t),
+        (t, None),
+        (int(t, 16), t),
+    ):
+        assert not _names_txid(reported, requested), (reported, requested)
