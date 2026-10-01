@@ -1055,7 +1055,8 @@ async def test_eth_counter_leg_states(monkeypatch) -> None:
     refund_log = dict(_eth_log(), topics=[REFUNDED_TOPIC0])
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(verified, [refund_log])))
     refunded = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
-    assert refunded.state == "SPENT_NO_PREIMAGE"
+    # Bytes pyrxd hashed and decoded are still one server's: never definitive (round 4).
+    assert refunded.state == "REFUND_REPORTED_UNCONFIRMED"
     assert refunded.claim_txid == "0xfeed"
 
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(_eth_tx(to=OTHER_CONTRACT), [])))

@@ -200,16 +200,21 @@ class CounterLegInconclusive(ValidationError):
 
 
 class RefundReportedUnconfirmed(CounterLegInconclusive):
-    """The ETH contract's logs report only ``Refunded()``, but the transaction was NOT returned.
+    """The ETH contract's logs report only ``Refunded()`` — ALWAYS this, from one RPC, never a verdict.
 
-    A refund verdict carries no self-verifying value (a claim does: ``sha256(p) == H``), so a log
-    alone is one server's unverifiable word. Read as "refunded", it drove ``swap status`` to
-    SPENT_NO_PREIMAGE — and, beside a taker claim of the covenant, to TAKER_CLAIMED_AND_REFUNDED,
-    telling a MAKER who may still be able to claim the ETH that there is nothing left to claim.
-    So it is inconclusive for every decision; only a refund transaction whose hash pyrxd COMPUTED
-    from its raw signed bytes (:class:`VerifiedEthTx`) makes the refund definitive. A transaction
-    returned only as ``eth_getTransactionByHash`` JSON does not: its ``hash``, ``to`` and ``input``
-    are three independent fields of the server's answer, none derived from another.
+    A refund carries no self-verifying value (a claim does: ``sha256(p) == H``). Everything a refund
+    report consists of — the ``Refunded`` log, and the transaction bytes behind it — is one server's
+    word, and pyrxd cannot prove from one server that the refund happened. Read as "refunded", it
+    drove ``swap status`` to SPENT_NO_PREIMAGE — and, beside a taker claim of the covenant, to
+    TAKER_CLAIMED_AND_REFUNDED, telling a MAKER who may still be able to claim the ETH that there is
+    nothing left to claim. So it is inconclusive for every decision, however consistent the report.
+
+    Raw signed bytes (:class:`VerifiedEthTx`) do not change that. Their hash and their ``to`` /
+    selector are checked against the log, which catches an honest RPC that served the wrong
+    transaction (that is a :class:`ProvenanceRefused`), but nothing in them shows the transaction
+    was ever broadcast or mined: ``refund()`` takes no argument and anyone may call it, so a server
+    can produce bytes for any key that hash to the transaction its fabricated log names. Checking
+    the signature would not help, for the same reason. Only a second, independent source can.
     """
 
 
@@ -916,13 +921,14 @@ class VerifiedEthTx:
     Built from RPC data only by :func:`verify_raw_eth_tx`. ``hash`` is ``keccak256(raw)`` and ``to`` /
     ``input`` are decoded from those same bytes, so one cannot be swapped without changing the
     other — unlike ``eth_getTransactionByHash`` JSON, where a server can pair any ``hash`` with any
-    ``to`` and ``input``. This is the only form of transaction a definitive ETH refund verdict is
-    drawn from.
+    ``to`` and ``input``. That makes it a CONSISTENCY check on the server's answer: it catches an
+    RPC that served a different transaction than its log names.
 
-    What it does NOT prove: that the transaction was mined, or succeeded. The bytes still come from
-    the RPC that served the logs, and a server willing to sign a never-broadcast ``refund()`` call
-    and name its hash in a fabricated ``Refunded`` log is not caught here — only a second,
-    independent source (another RPC, an explorer, an inclusion proof) can catch that.
+    What it does NOT prove: anything about the chain. Its signature, sender and chain id are not
+    checked, and checking them would not help — the bytes come from the RPC that served the logs,
+    and ``refund()`` can be called by anyone, so a server can produce well-formed bytes under any key
+    for a refund that was never broadcast and name their hash in a fabricated ``Refunded`` log. So
+    an ETH refund read from one RPC is never definitive (:class:`RefundReportedUnconfirmed`).
     """
 
     hash: str  # 0x-prefixed lower-case keccak256 of the raw bytes
@@ -1054,16 +1060,20 @@ def recover_preimage_from_eth_artifacts(
     3. **A ``Claimed`` event whose value does not hash to H** — :class:`ProvenanceRefused`. The
        swap's own contract only emits ``Claimed`` for a preimage of ITS hashlock, so this is the
        wrong contract for this swap or a server that is not telling the truth. Never shown as p.
-    4. **The transaction is in hand** — the calldata path, :func:`recover_preimage_from_eth_claim`,
-       with the transaction's hash checked against the one requested (the last bound log's). A
-       refund it shows is DEFINITIVE (:class:`PreimageNotRevealed`) only when the transaction is a
-       :class:`VerifiedEthTx` — its hash computed by pyrxd from the raw signed bytes, and ``to`` and
-       the ``refund()`` selector decoded from those bytes — and every bound log is ``Refunded``.
-    5. **Only ``Refunded()`` events, and no transaction pyrxd could verify** —
-       :class:`RefundReportedUnconfirmed`. A refund log, or JSON naming a refund, is one server's
-       word with nothing in it to verify, so it never drives a "nothing left to do" verdict.
-    6. **Anything else** (logs that carry no p, transaction not retrievable) —
+    4. **``Refunded()`` events naming more than one transaction** — :class:`ProvenanceRefused`.
+       The contract settles once (``AlreadySettled``), so this RPC's answer contradicts itself.
+    5. **The transaction is in hand** — the calldata path, :func:`recover_preimage_from_eth_claim`,
+       with the transaction's hash checked against the one requested (the last bound log's).
+    6. **Only ``Refunded()`` events** — :class:`RefundReportedUnconfirmed`, ALWAYS. One RPC's refund
+       report is that server's word and pyrxd cannot prove it, whatever came with the log: no
+       transaction, transaction JSON, or raw signed bytes that hash to the log's transaction and
+       decode to a ``refund()`` call to the contract. Those checks are CONSISTENCY checks (a
+       mismatch is :class:`ProvenanceRefused` above); passing them never makes a refund definitive.
+    7. **Anything else** (logs that carry no p, transaction not retrievable) —
        :class:`CounterLegInconclusive`.
+
+    It never raises :class:`PreimageNotRevealed`: on ETH, "spent without revealing p" is never
+    reached from one RPC's answer.
     """
     from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 
@@ -1088,6 +1098,15 @@ def recover_preimage_from_eth_artifacts(
             "as the preimage."
         )
     only_refunded = bool(bound) and all(t == REFUNDED_TOPIC0 for t in topic0s)
+    refund_txs = (
+        {h.lower() for lg in bound if isinstance(h := lg.get("transactionHash"), str)} if only_refunded else set()
+    )
+    if len(refund_txs) > 1:
+        raise ProvenanceRefused(
+            f"{source} reports Refunded() from {contract_address} in {len(refund_txs)} different transactions. The "
+            "per-swap contract settles once, so this answer contradicts itself: the RPC is wrong or not telling "
+            "the truth. Nothing was concluded; read the contract on another RPC or an explorer."
+        )
     unverified = "did not return the transaction"
     if claim_tx is not None:
         verified = claim_tx if isinstance(claim_tx, VerifiedEthTx) else None
@@ -1100,11 +1119,15 @@ def recover_preimage_from_eth_artifacts(
                 reported_tx_hash=_fetched_tx_hash(logs, contract_address),
             )
         except PreimageNotRevealed:
-            # Definitive ONLY from bytes pyrxd hashed and decoded itself: a refund() call to this
-            # contract, named by the Refunded log. JSON's `hash` is the server's word (round-3 F2).
-            if verified is not None and only_refunded and verified.is_refund_call_to(contract_address):
-                raise
-            if verified is None:
+            # NEVER definitive from one RPC (round 4): even raw bytes that hash to the log's
+            # transaction and decode to refund() on this contract are bytes this server chose.
+            if verified is not None and verified.is_refund_call_to(contract_address):
+                unverified = (
+                    f"its transaction {verified.hash} is consistent with the log (the raw bytes hash to it and "
+                    "decode to a refund() call to the contract) — but that is still this one server's word: "
+                    "pyrxd cannot prove from one RPC that the transaction was ever broadcast or mined"
+                )
+            elif verified is None:
                 unverified = (
                     "returned the transaction only as JSON, whose hash field pyrxd cannot check against its "
                     "contents (no raw signed bytes from eth_getRawTransactionByHash)"
@@ -1113,9 +1136,9 @@ def recover_preimage_from_eth_artifacts(
                 unverified = f"returned transaction {verified.hash}, which is not a refund() call to the contract"
     if only_refunded:
         raise RefundReportedUnconfirmed(
-            f"{source} reports only Refunded() from {contract_address} but {unverified}, so the refund is "
-            "UNCONFIRMED (a log alone proves nothing). Verify against another RPC or an explorer; "
-            "MAKER: if the contract still holds the ETH, you can still claim it."
+            f"{source} reports only Refunded() from {contract_address}, and {unverified}, so the refund is "
+            "UNCONFIRMED (one server's report of a refund proves nothing). Check the contract on a second, "
+            "independent ETH RPC or an explorer; MAKER: if the contract still holds the ETH, you can still claim it."
         )
     raise CounterLegInconclusive(
         f"{source} returned {len(bound)} log(s) from the HTLC contract {contract_address}; none carries a "
@@ -1156,8 +1179,9 @@ class CounterLegStatus:
 
     chain: str  # "btc" | "eth"
     # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | REFUND_REPORTED_UNCONFIRMED
-    # | UNKNOWN | ERROR. REFUND_REPORTED_UNCONFIRMED (ETH): a Refunded() log with no transaction
-    # pyrxd could hash and decode from its raw bytes — NOT resolved; swap status treats it like UNKNOWN for every decision.
+    # | UNKNOWN | ERROR. REFUND_REPORTED_UNCONFIRMED (ETH): what EVERY refund report from one RPC is —
+    # one server's word, whatever transaction bytes came with it. NOT resolved; swap status treats it
+    # like UNKNOWN for every decision. SPENT_NO_PREIMAGE is never produced for ETH.
     state: str
     reason: str
     claim_txid: str | None = None
@@ -1455,10 +1479,6 @@ async def read_eth_counter_leg(
         )
     except CounterLegInconclusive as exc:
         return CounterLegStatus(chain="eth", state="UNKNOWN", reason=str(exc), claim_txid=tx_hash, source=source)
-    except PreimageNotRevealed as exc:
-        return CounterLegStatus(
-            chain="eth", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=tx_hash, source=source
-        )
     except ProvenanceRefused as exc:
         return CounterLegStatus(chain="eth", state="ERROR", reason=str(exc), claim_txid=tx_hash, source=source)
     return CounterLegStatus(

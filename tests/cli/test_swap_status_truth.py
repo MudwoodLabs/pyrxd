@@ -256,18 +256,126 @@ def test_the_honest_claimed_path_is_unchanged(case, eth_rpc) -> None:
 
 
 @pytest.mark.parametrize("tx_type", [0, 1, 2])
-def test_the_honest_refunded_path_reads_refunded(case, eth_rpc, tx_type) -> None:
+def test_a_consistent_refund_from_one_rpc_is_still_only_reported(case, eth_rpc, tx_type) -> None:
     """A Refunded() log AND the raw signed refund() transaction, whose hash pyrxd computes and whose
-    ``to`` and selector it decodes from those bytes: the refund is definitive. Legacy, EIP-2930 and
-    EIP-1559 envelopes, each signed by eth_account."""
+    ``to`` and selector it decodes from those bytes. Round 4: that is consistent, and it is still one
+    server's word — nothing in it shows the transaction was broadcast or mined — so it is
+    REFUND_REPORTED_UNCONFIRMED, never SPENT_NO_PREIMAGE. Legacy, EIP-2930 and EIP-1559 envelopes,
+    each signed by eth_account (so the decode is also checked against an independent encoder)."""
     _eth_swap(case)
     eth_rpc.scenario = _honest_refund_scenario(tx_type)
     counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
-    assert counter["state"] == "SPENT_NO_PREIMAGE", counter
+    assert counter["state"] == "REFUND_REPORTED_UNCONFIRMED", counter
     assert counter["claim_txid"] == eth_rpc.scenario["logs"][0]["transactionHash"]
+    assert "consistent with the log" in counter["reason"]
+    assert "second, independent ETH RPC" in counter["reason"]
     rec = _eth_recover(case, eth_rpc)
-    assert rec.exit_code == 1, rec.output
-    assert "no preimage has been revealed yet" in rec.output
+    assert rec.exit_code == 2, rec.output  # inconclusive, never exit 1 "not revealed yet — keep watching"
+    assert "cannot confirm from one server" in rec.output
+    assert "no preimage has been revealed yet" not in rec.output
+
+
+# --------------------------------------------------------------------------- the round-4 reviewer probe
+
+
+def _unsigned_raw(fields: list[Any], tx_type: int) -> tuple[str, str]:
+    """A typed transaction whose signature fields are EMPTY — no key ever signed it — and its keccak.
+
+    Encoded by pyrlp, independent of pyrxd's decoder. What a lying RPC can serve for free."""
+    rlp = pytest.importorskip("rlp")
+    raw = bytes([tx_type]) + rlp.encode(fields)
+    from pyrxd.cli.swap_recovery import _keccak256
+
+    return "0x" + _keccak256(raw).hex(), "0x" + raw.hex()
+
+
+def _probe_unsigned_type2() -> tuple[str, str]:
+    to = bytes.fromhex(ETH_CONTRACT[2:])
+    # chainId, nonce, maxPriority, maxFee, gas, to, value, data, accessList, yParity, r, s
+    return _unsigned_raw([1, 0, 0, 0, 60_000, to, 0, bytes.fromhex("590e1ae3"), [], b"", b"", b""], 2)
+
+
+def _probe_type4() -> tuple[str, str]:
+    to = bytes.fromhex(ETH_CONTRACT[2:])
+    # EIP-7702: chainId, nonce, maxPriority, maxFee, gas, to, value, data, accessList, authList, yParity, r, s
+    return _unsigned_raw([1, 0, 0, 0, 60_000, to, 0, bytes.fromhex("590e1ae3"), [], [], 1, 7, 7], 4)
+
+
+def _probe_wrong_chain() -> tuple[str, str]:
+    """A REAL signature, on a transaction for a chain the swap is not on (chain id 5)."""
+    eth_account = pytest.importorskip("eth_account")
+    from eth_utils import to_checksum_address
+
+    tx = {
+        "nonce": 0,
+        "gas": 60_000,
+        "to": to_checksum_address(ETH_CONTRACT),
+        "value": 0,
+        "data": bytes.fromhex("590e1ae3"),
+        "chainId": 5,
+        "type": 2,
+        "maxFeePerGas": 2,
+        "maxPriorityFeePerGas": 1,
+    }
+    signed = eth_account.Account.create().sign_transaction(tx)
+    return "0x" + signed.hash.hex().removeprefix("0x"), "0x" + signed.raw_transaction.hex().removeprefix("0x")
+
+
+_PROBES = {
+    "signed-by-any-key": lambda: _signed_raw(bytes.fromhex("590e1ae3")),
+    "unsigned": _probe_unsigned_type2,
+    "wrong-chain-id": _probe_wrong_chain,
+    "type-4": _probe_type4,
+}
+
+
+@pytest.mark.parametrize("probe", sorted(_PROBES))
+def test_the_reviewers_fabricated_refund_is_never_definitive(case, eth_rpc, probe) -> None:
+    """The round-4 probe: a fake RPC serving a fabricated Refunded() log plus raw bytes whose keccak
+    IS the log's transaction hash. Nothing pyrxd checks on those bytes can tell them from a real
+    refund, so the verdict must not be definitive — on its own, and beside a taker claim of the
+    covenant, where SPENT_NO_PREIMAGE used to read TAKER_CLAIMED_AND_REFUNDED: "MAKER: ... nothing
+    left on chain to claim" while the maker could still claim the ETH."""
+    from .test_swap_recovery_cmds import _spent_by
+
+    _eth_swap(case)
+    tx_hash, raw = _PROBES[probe]()
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", tx_hash)], "txs": {}, "raws": {tx_hash: raw}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] in ("REFUND_REPORTED_UNCONFIRMED", "ERROR"), counter
+    doc = json.loads(_eth_status(case, eth_rpc, client=_spent_by(case, "claim"), output_mode="json").output)
+    assert doc["situation"] not in ("TAKER_CLAIMED_AND_REFUNDED", "SETTLED", "BOTH_SPENT_OUTCOME_UNKNOWN"), doc
+    assert "nothing left" not in doc["chain"]["next_action"].lower()
+    rec = _eth_recover(case, eth_rpc)
+    assert rec.exit_code != 0 and "no preimage has been revealed yet" not in rec.output, rec.output
+
+
+def test_two_refunded_logs_naming_different_transactions_are_refused(case, eth_rpc) -> None:
+    """The per-swap contract settles once (``AlreadySettled``): two Refunded() logs in two
+    transactions is a self-contradicting answer — ERROR, not a refund, and not 'unconfirmed'."""
+    _eth_swap(case)
+    first, raw1 = _signed_raw(bytes.fromhex("590e1ae3"))
+    second, raw2 = _signed_raw(bytes.fromhex("590e1ae3"))
+    eth_rpc.scenario = {
+        "logs": [_log(REFUNDED_TOPIC0, b"", first), _log(REFUNDED_TOPIC0, b"", second)],
+        "txs": {},
+        "raws": {first: raw1, second: raw2},
+    }
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "ERROR", counter
+    assert "2 different transactions" in counter["reason"]
+    rec = _eth_recover(case, eth_rpc)
+    assert rec.exit_code == 1 and "REFUSED on provenance" in rec.output, rec.output
+
+
+def test_two_refunded_logs_in_the_same_transaction_are_not_a_contradiction(case, eth_rpc) -> None:
+    """Honest-path pair for the refusal above: duplicate logs from ONE transaction (an RPC that
+    repeats a log) are still just a refund report — unconfirmed, not refused."""
+    _eth_swap(case)
+    scenario = _honest_refund_scenario()
+    scenario["logs"] = scenario["logs"] * 2
+    eth_rpc.scenario = scenario
+    assert _counter(_eth_status(case, eth_rpc, output_mode="json"))["state"] == "REFUND_REPORTED_UNCONFIRMED"
 
 
 def test_a_lying_rpc_hash_field_beside_a_refund_body_is_not_a_refund(case, eth_rpc) -> None:
@@ -347,10 +455,12 @@ def test_a_taker_claim_plus_an_unconfirmed_eth_refund_tells_the_maker_to_claim(c
     assert "nothing left" not in doc["chain"]["next_action"]
     assert "MAKER: check the ETH leg" in doc["chain"]["next_action"]
     assert "claim it with p" in doc["chain"]["next_action"]
-    # The same RPC WITH the raw signed refund transaction is definitive, and the situation is named.
+    # The same RPC WITH the raw signed refund transaction is STILL one server's word (round 4).
     eth_rpc.scenario = _honest_refund_scenario()
     doc = json.loads(_eth_status(case, eth_rpc, client=_spent_by(case, "claim"), output_mode="json").output)
-    assert doc["situation"] == "TAKER_CLAIMED_AND_REFUNDED"
+    assert doc["counter_leg"]["state"] == "REFUND_REPORTED_UNCONFIRMED"
+    assert doc["situation"] == "COVENANT_SPENT", doc["situation"]
+    assert "nothing left" not in doc["chain"]["next_action"]
 
 
 def test_a_refunded_log_plus_an_unrecognised_log_is_unknown_not_a_refund(case, eth_rpc) -> None:

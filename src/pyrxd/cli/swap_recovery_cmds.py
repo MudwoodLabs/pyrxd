@@ -48,6 +48,7 @@ from .swap_recovery import (
     PreimageNotRevealed,
     PreimageRecovery,
     ProvenanceRefused,
+    RefundReportedUnconfirmed,
     assert_covenant_matches,
     build_cold_claim,
     build_cold_refund,
@@ -354,6 +355,16 @@ def swap_recover_preimage_cmd(
             ),
             url=read_url,
         )
+    except RefundReportedUnconfirmed as exc:
+        # Before CounterLegInconclusive (its base): the advice differs. Full log history is not the
+        # gap here — a refund report from ONE RPC cannot be confirmed by that RPC at all.
+        raise NetworkBoundaryError(
+            "the counter-chain read is inconclusive — one RPC reports the ETH leg refunded, which pyrxd cannot "
+            "confirm from one server; no preimage was taken",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=500),
+            fix="read the contract on a second, independent ETH RPC (another operator) or a block explorer before "
+            "acting on a refund — nothing was broadcast",
+        ) from exc
     except CounterLegInconclusive as exc:
         # Before PreimageNotRevealed (both are ValidationErrors): "no evidence" must never be
         # rendered as "not revealed yet — keep watching".
