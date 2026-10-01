@@ -84,7 +84,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import urlsplit
 
 from pyrxd.base58 import base58check_decode
 from pyrxd.btc_wallet.taproot import (
@@ -105,6 +105,7 @@ from pyrxd.gravity.htlc_covenant import (
 )
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
+from pyrxd.network.redaction import redact_endpoint_secrets as redact_endpoint_secrets  # re-export
 from pyrxd.network.source_identity import canonical_host
 from pyrxd.script.script import Script
 
@@ -1023,51 +1024,6 @@ def endpoint_source_label(url: str) -> str:
         raw = ""
     host = canonical_host(raw) if raw else ""
     return host or "an endpoint whose URL has no parseable host"
-
-
-#: Shortest path segment / query value treated as possibly secret. Shorter fragments
-#: (``api``, ``v2``, ``1``) are never keys, and scrubbing them out of a message would delete
-#: ordinary words from it.
-_MIN_SECRET_FRAGMENT = 6
-
-
-def _secret_fragments(url: str) -> list[str]:
-    """Every part of *url* that can carry a credential: the whole URL and everything after the host."""
-    out = [url]
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return out
-    rest = url.split(parts.netloc, 1)[1] if parts.netloc and parts.netloc in url else ""
-    out += [rest, parts.path, parts.query, parts.fragment]
-    if parts.username:
-        out.append(parts.username)
-    if parts.password:
-        out.append(parts.password)
-    out += [seg for seg in parts.path.split("/")]
-    out += [v for _, v in parse_qsl(parts.query, keep_blank_values=True)]
-    out += [unquote(f) for f in list(out)]
-    return [f for f in out if len(f) >= _MIN_SECRET_FRAGMENT]
-
-
-def redact_endpoint_secrets(text: str, urls: str | Sequence[str | None] | None) -> str:
-    """Remove from *text* every part of each URL in *urls* that can carry a credential.
-
-    An RPC or explorer URL routinely carries an API key in its path (``/v2/<key>``) or query
-    (``?apikey=<key>``). Exception text from the HTTP layer quotes the URL whole, and an RPC's own
-    error body can echo the key back, so any text that crossed a network call is passed through
-    here before it reaches the operator's terminal or ``--json``. Longest fragment first, so the
-    whole URL is replaced before its pieces are.
-    """
-    if isinstance(urls, str):
-        urls = [urls]
-    fragments: list[str] = []
-    for url in urls or ():
-        if isinstance(url, str) and url:
-            fragments += _secret_fragments(url)
-    for frag in sorted(set(fragments), key=len, reverse=True):
-        text = text.replace(frag, "<redacted>")
-    return text
 
 
 def electrumx_urls(ctx: Any) -> tuple[str, ...]:

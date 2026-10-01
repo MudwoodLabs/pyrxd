@@ -423,7 +423,9 @@ def test_pyrxd_messages_that_quote_a_url_are_scrubbed_but_kept() -> None:
 
     url = f"https://rpc.example/v2/{FAKE_PATH_SECRET}?apikey={FAKE_QUERY_SECRET}"
     ours = describe_network_error(NetworkError(f"TLS pin mismatch for {url}: rotate the pin"), url)
-    assert ours.startswith("NetworkError from rpc.example: TLS pin mismatch for <redacted>")
+    assert ours.startswith(
+        "NetworkError from rpc.example: TLS pin mismatch for https://rpc.example/v2/<redacted>?apikey=<redacted>"
+    )
     assert "rotate the pin" in ours
     assert FAKE_PATH_SECRET not in ours and FAKE_QUERY_SECRET not in ours
     # Pieces of the URL quoted separately are scrubbed too (an RPC body echoing the key).
