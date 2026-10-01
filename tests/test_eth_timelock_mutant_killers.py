@@ -481,11 +481,18 @@ class TestTheCoordinatorRefusesTheBoundaryBeforeAnyLock:
         assert coord.record.state is SwapState.NEGOTIATED
         assert not seen.has_seen(h), "a refused gate must not burn H"
 
-    async def test_one_second_past_the_floor_funds(self) -> None:
+    async def test_one_second_past_the_floor_funds(self, monkeypatch) -> None:
         """The paired honest path: the same wiring one second later must fund, or the refusal
-        above could be any other gate failing."""
+        above could be any other gate failing.
+
+        The coordinator's monotonic clock is held still. ``taker_funds_btc`` judges its lock-time
+        re-run at ``now_unix_s`` advanced by the time since the call began, ROUNDED UP to a whole
+        second, so on a real clock any elapsed time at all moves ``now`` one second — exactly the
+        one second of headroom this boundary test is built on."""
+        from pyrxd.gravity import swap_coordinator
         from pyrxd.gravity.swap_state import SwapState
 
+        monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
         coord, terms, leg, _seen, _h, now = self._coordinator(self.FLOOR + 1)
         gate = await coord.pre_btc_lock_check(terms, now_unix_s=now)
         assert gate.ok, gate.reason

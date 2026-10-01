@@ -325,7 +325,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `scripts/dust_swap_run.py` passes it. The `now` the gate judges is taken AFTER its reads:
     `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
     `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
-    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller;
+    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller. The
+    lock-time re-run inside `taker_funds_btc` is judged by steps 6 and 7 on ITS OWN bound, at a
+    `now` taken after its reads, and refuses the lock when they fail: the re-run reads the chain
+    later than the gate, so its bound can be larger;
   - above dust, the funding's depth must be reported by two independent operators (a report is a
     server's word — its verbose confirmations or its tip height — not a proof): on a
     value-bearing network, when the value at stake exceeds `ElapsedBoundPolicy.dust_threshold_photons`

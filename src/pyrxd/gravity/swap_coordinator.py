@@ -1940,6 +1940,26 @@ class SwapCoordinator:
                 ok=False, reason=f"could not verify the maker's Radiant covenant; fail-closed ({exc})"
             )
 
+        # 6 and 7. The timelocks judged against the window that ACTUALLY REMAINS once `cov_confs`
+        #    blocks of t_rxd have elapsed — see `_judge_remaining_window`, which the lock-time
+        #    re-run in `taker_funds_btc` calls again with the re-run's own bound.
+        remaining = self._judge_remaining_window(terms, cov_confs=cov_confs, now_unix_s=now_unix_s)
+        if remaining is not None:
+            return remaining
+
+        return PreBtcLockGate(ok=True)
+
+    def _judge_remaining_window(
+        self, terms: NegotiatedTerms, *, cov_confs: int, now_unix_s: int | None
+    ) -> PreBtcLockGate | None:
+        """Steps 6 and 7 of :meth:`pre_btc_lock_check`: None when the timelocks still hold with
+        ``cov_confs`` blocks of ``t_rxd`` already elapsed; a refusing gate otherwise.
+
+        ``cov_confs`` is an elapsed-depth UPPER bound from :meth:`taker_verify_asset_funding`. Every
+        run of that method that a lock relies on must be judged here ON ITS OWN BOUND: the
+        lock-time re-run in :meth:`taker_funds_btc` reads the chain later than the gate did, so its
+        bound can be larger, and a window that held on the gate's bound need not hold on it.
+        """
         # 6. The burial-vs-t_rxd floor, using the window that ACTUALLY REMAINS.
         #
         # This ran as step 3b, before the chain read, against the NEGOTIATED t_rxd. But `t_rxd` is a
@@ -1988,8 +2008,7 @@ class SwapCoordinator:
                 self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s, elapsed_blocks=cov_confs)
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"margin check failed against the REMAINING window: {exc}")
-
-        return PreBtcLockGate(ok=True)
+        return None
 
     def _asset_funding_depth(self) -> int | None:
         """How deep the MAKER's Radiant covenant funding must be buried before the taker locks.
@@ -2424,7 +2443,23 @@ class SwapCoordinator:
         # after the H reserve, so the reserve keeps its "last step before the only broadcast"
         # property (TOCTOU-1) and a refusal does not burn H for nothing. Fail-closed: this raises
         # and nothing is broadcast.
-        await self.taker_verify_asset_funding(terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic)
+        _rerun_outpoint, _rerun_value, rerun_upper = await self.taker_verify_asset_funding(
+            terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
+        )
+        # ...AND JUDGE THE TIMELOCKS ON THE RE-RUN'S OWN BOUND. The re-run reads the chain later than
+        # the gate did, so its elapsed-depth upper bound can be larger (more blocks, or a slow read
+        # pushing `now` further from the reference time); steps 6 and 7 held on the gate's bound,
+        # which says nothing about this one. Discarding it — as this did when the re-run landed —
+        # funded on a window the gate itself would now refuse. The ETH ordering is judged at a
+        # `now` taken after the re-run's reads, never earlier than the one the bound used.
+        rerun_now = (
+            None if now_unix_s is None else now_unix_s + math.ceil(max(0.0, _monotonic() - now_sampled_monotonic))
+        )
+        again = self._judge_remaining_window(terms, cov_confs=rerun_upper, now_unix_s=rerun_now)
+        if again is not None:
+            raise ValidationError(
+                f"lock-time re-run refused funding (elapsed-depth upper bound {rerun_upper}): {again.reason}"
+            )
 
         # Reserve H ATOMICALLY and PRE-broadcast (TOCTOU-1 fix). The check-and-mark
         # is one indivisible step strictly before the only on-chain effect below, so

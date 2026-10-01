@@ -1161,6 +1161,14 @@ def test_every_counter_leg_fund_call_crosses_the_gate():
             "taker_verify_asset_funding before it (the verify->lock TOCTOU)"
         )
         assert any(line < call.lineno for line in gate_lines), f"{fn.name} funds without pre_btc_lock_check"
+        # ...and the LAST verification before the lock is judged on its own bound (steps 6 and 7):
+        # a re-run whose elapsed-depth bound is discarded proves the funding exists and nothing more.
+        last_verify = max(line for line in verify_lines if line < call.lineno)
+        judged = _calls_in(fn, "_judge_remaining_window")
+        assert any(last_verify <= line < call.lineno for line in judged), (
+            f"{fn.name} re-runs taker_verify_asset_funding at line {last_verify} but does not judge "
+            f"steps 6 and 7 on its bound before counter_leg.fund at line {call.lineno}"
+        )
     # A leg's own `fund` delegating to an inner leg (the ERC-20 wrapper) is the same lock, reached
     # through the coordinator; anything else outside the coordinator is the reviewed set.
     outside = {
@@ -1842,6 +1850,136 @@ async def test_the_lock_time_rerun_alone_catches_a_covenant_that_vanishes_inside
     with pytest.raises(NetworkError, match="spent"):
         await coord.taker_funds_btc(eth_terms, now_unix_s=_NOW)
     assert leg.proofs == 2 and "fund" not in eth.calls
+
+
+class _Clock:
+    """A monotonic clock the test advances by hand."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class _SlowSecondProof(_StaleTipLeg):
+    """An honest leg whose SECOND evidence fetch — the lock-time re-run inside ``taker_funds_btc`` —
+    takes ``delay`` seconds of the coordinator's monotonic clock."""
+
+    def __init__(self, *, clock: _Clock, delay: int, tip_time: int) -> None:
+        super().__init__(tip_time=tip_time)
+        self.clock, self.delay, self.proofs = clock, delay, 0
+
+    async def maker_funding_evidence(self, terms, **kw):
+        self.proofs += 1
+        if self.proofs == 2:
+            self.clock.t += self.delay
+        return await super().maker_funding_evidence(terms, **kw)
+
+
+async def _fresh_gate_refusal_delay(build, terms, *, hi: int = 20_000) -> int:
+    """The smallest delay (s) after ``_NOW`` at which a FRESH ``pre_btc_lock_check`` refuses this swap
+    at step 6 or 7 — found by bisection against the real gate, never typed."""
+
+    async def ok(delay):
+        coord = build(_StaleTipLeg(tip_time=_NOW))
+        return (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW + delay)).ok
+
+    lo = 0
+    assert await ok(lo) and not await ok(hi), "the swap must pass now and be refused later"
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if await ok(mid):
+            lo = mid
+        else:
+            hi = mid
+    coord = build(_StaleTipLeg(tip_time=_NOW))
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW + hi)
+    assert "REMAINING window" in gate.reason or "safe claim" in gate.reason, gate.reason
+    return hi
+
+
+async def test_the_lock_time_rerun_judges_steps_6_and_7_on_its_own_bound(monkeypatch, tmp_path):
+    """The lock-time re-run's elapsed-depth bound used to be DISCARDED: the gate inside
+    ``taker_funds_btc`` judged steps 6 and 7 on the first read's bound, and the re-run — which reads
+    later, so its bound can be larger — only had to prove the funding exists. Measured on the code
+    that shipped: a re-run read that took as long as it takes a fresh gate to refuse this swap
+    (1,165 s for the BTC case) still FUNDED.
+
+    Driven through every public entry point that reaches ``fund`` (BTC and ETH ``taker_funds_btc``,
+    ETH ``resume_interrupted_fund``): the first proof is instant and passes, the re-run's read takes
+    exactly the delay at which a fresh gate refuses, and the counter leg is never funded. The same
+    swap with the re-run one second faster than that locks, so the refusal is the window and not the
+    fixture."""
+    import dataclasses
+
+    from pyrxd.gravity import swap_coordinator
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    clock = _Clock()
+    monkeypatch.setattr(swap_coordinator, "_monotonic", clock)
+
+    btc_terms = _terms(variant="rxd")
+    _p = os.urandom(32)
+    eth_terms = _eth_terms(hashlock=hashlib.sha256(_p).digest())
+
+    def btc_build(leg, btc=None):
+        return _coordinator(terms=btc_terms, btc_leg=btc or FakeBtcLeg(), radiant_leg=leg)
+
+    def eth_build(leg, eth=None, **kw):
+        return _eth_coord_full(
+            terms=eth_terms, eth_leg=eth or FakeEthLeg(preimage=_p, verdict=_final()), radiant_leg=leg, **kw
+        )
+
+    async def btc_fund(delay):
+        btc = FakeBtcLeg()
+        leg = _SlowSecondProof(clock=clock, delay=delay, tip_time=_NOW)
+        coord = btc_build(leg, btc)
+        return leg, btc, coord, coord.taker_funds_btc(btc_terms, now_unix_s=_NOW)
+
+    async def eth_fund(delay):
+        eth = FakeEthLeg(preimage=_p, verdict=_final())
+        leg = _SlowSecondProof(clock=clock, delay=delay, tip_time=_NOW)
+        coord = eth_build(leg, eth)
+        return leg, eth, coord, coord.taker_funds_btc(eth_terms, now_unix_s=_NOW)
+
+    async def eth_resume(delay):
+        sink = JsonFileRecordSink(tmp_path / f"swap-{delay}-{os.urandom(4).hex()}.json")
+        await sink(
+            dataclasses.replace(
+                SwapRecord(state=SwapState.NEGOTIATED, terms=eth_terms),
+                pending_counter_contract="0x" + "ab" * 20,
+                pending_counter_deploy_tx="0x" + "cd" * 32,
+            )
+        )
+        seen = FakeSeenStore()
+        seen.reserve(eth_terms.hashlock)
+        eth = FakeEthLeg(preimage=_p, verdict=_final())
+        leg = _SlowSecondProof(clock=clock, delay=delay, tip_time=_NOW)
+        coord = eth_build(leg, eth, seen_store=seen, fund_lock=_MemLock())
+        return leg, eth, coord, coord.resume_interrupted_fund(eth_terms, sink=sink, now_unix_s=_NOW)
+
+    cases = {
+        "taker_funds_btc (btc)": (btc_build, btc_terms, btc_fund),
+        "taker_funds_btc (eth)": (eth_build, eth_terms, eth_fund),
+        "resume_interrupted_fund (eth)": (eth_build, eth_terms, eth_resume),
+    }
+    assert {name.split(" ")[0] for name in cases} == _coordinator_entry_points_that_fund()
+    for name, (build, terms, drive) in cases.items():
+        refuse_at = await _fresh_gate_refusal_delay(build, terms)
+
+        leg, counter, coord, run = await drive(refuse_at)
+        with pytest.raises(ValidationError, match="lock-time re-run refused funding") as exc:
+            await run
+        assert leg.proofs == 2, (name, leg.proofs)
+        assert "fund" not in counter.calls, f"{name}: funded on a window a fresh gate refuses"
+        assert "REMAINING window" in str(exc.value) or "safe claim" in str(exc.value), (name, str(exc.value))
+        assert coord.last_maker_funding.elapsed_s >= refuse_at, name
+
+        # Honest path: one second faster and the same swap locks.
+        leg, counter, coord, run = await drive(refuse_at - 1)
+        await run
+        assert leg.proofs == 2 and "fund" in counter.calls, name
 
 
 # --------------------------------------------------------------------------- (g) two operators above dust
