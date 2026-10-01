@@ -1590,11 +1590,22 @@ def _eth_early_case(monkeypatch, *, t_rxd: int | None = None, deadline_s: int = 
         )
 
     def terms_at(t_rxd_blocks):
-        return dataclasses.replace(
+        terms = dataclasses.replace(
             _eth_terms(hashlock=hashlib.sha256(p).digest(), eth_timeout_unix_s=_NOW + deadline_s),
             t_btc=t.Timelock(1, t.TimeUnit.BLOCKS),
             t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
             radiant_amount=1000,
+        )
+        cov = build_htlc_covenant_rxd(
+            amount=terms.radiant_amount,
+            taker_pkh=A._TAKER_PKH,
+            maker_pkh=A._MAKER_PKH,
+            hashlock=terms.hashlock,
+            refund_csv=t_rxd_blocks,
+        )
+        # The destinations the real leg's covenant commits to, so an honest funding of it verifies.
+        return dataclasses.replace(
+            terms, taker_dest_hash=cov.expected_taker_hash, maker_dest_hash=cov.expected_maker_hash
         )
 
     def build(terms, value=1000, now=_NOW):
@@ -1690,6 +1701,21 @@ def test_an_eth_deadline_too_near_for_the_takers_gate_is_refused_when_the_coordi
         eth_timeout_unix_s=terms.eth_timeout_unix_s,
         margin=coord.config.margin_policy.cross_clock_margin,
     )
+
+
+async def test_an_honest_eth_swap_passes_pre_btc_lock_check_with_its_clock(monkeypatch):
+    """The other branch: an ETH swap on value-bearing Radiant, built with room for the bound, a real
+    funding 100 blocks deep and the right clock passes ``pre_btc_lock_check`` end to end — step 3b
+    judges the ETH ordering from the clock the call was handed, and never refuses it for want of one."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch)
+    terms = terms_at(floor + reserve() + 200)
+    coord = build(terms)
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is True, gate.reason
+    assert coord.last_maker_funding is not None and coord.last_maker_funding.proved_depth >= 100
 
 
 def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monkeypatch):
