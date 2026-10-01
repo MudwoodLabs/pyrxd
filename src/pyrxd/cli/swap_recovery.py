@@ -61,7 +61,7 @@ Read-only enforcement
 ---------------------
 * No broadcaster, coordinator, or key-holding leg is imported by name here.
 * The Radiant reads go through the ElectrumX client's ``get_utxos`` / ``get_history`` /
-  ``get_tip_height`` only.
+  ``get_tip_height`` / ``get_transaction`` only.
 * The BTC reads are Esplora **GET**s (``/outspend``, ``/hex``).
 * Ethereum has no read transport other than JSON-RPC over HTTP POST, so the write
   surface is closed the only way it can be: :data:`ETH_READ_ONLY_RPC_METHODS` is a hard
@@ -106,12 +106,14 @@ from pyrxd.gravity.htlc_covenant import (
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
 from pyrxd.network.source_identity import canonical_host
+from pyrxd.script.script import Script
 
 # ``_looks_like_mnemonic`` is private to ``security.errors`` but is THE definition of
 # "this string is a seed phrase" in this SDK, and the gate below must agree with the
 # redactor rather than grow a second, drifting copy of the test. Reached by name for the
 # same reason ``load_recovery_json`` reaches ``cli_secrets._tighten_hint``.
 from pyrxd.security.errors import KeyMaterialError, RxdSdkError, ValidationError, _looks_like_mnemonic
+from pyrxd.transaction.transaction import Transaction
 from pyrxd.utils import decode_wif
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,7 @@ __all__ = [
     "CounterLegInconclusive",
     "CounterLegStatus",
     "CovenantChainState",
+    "CovenantSpend",
     "PreimageNotRevealed",
     "PreimageRecovery",
     "ProvenanceRefused",
@@ -134,6 +137,7 @@ __all__ = [
     "assert_covenant_matches",
     "build_cold_claim",
     "build_cold_refund",
+    "classify_covenant_spend_input",
     "covenant_pkhs",
     "describe_network_error",
     "electrumx_script_hash",
@@ -149,6 +153,7 @@ __all__ = [
     "read_btc_counter_leg",
     "read_counter_leg",
     "read_covenant_chain_state",
+    "read_covenant_spend",
     "read_eth_counter_leg",
     "read_fee_utxos",
     "rebuild_covenant",
@@ -1378,6 +1383,165 @@ def electrumx_script_hash(spk: bytes | str) -> str:
     """ElectrumX ``script_hash`` for a raw scriptPubKey: ``sha256(spk)`` reversed."""
     raw = bytes.fromhex(spk) if isinstance(spk, str) else bytes(spk)
     return hashlib.sha256(raw).digest()[::-1].hex()
+
+
+#: The covenant's history is read in full to find its spend; a covenant SPK is per swap, so its
+#: history is the funding transaction and the one spend. Past this many entries something else
+#: is paying the script, and the read reports UNKNOWN rather than fetch an unbounded list.
+MAX_COVENANT_HISTORY = 16
+
+
+@dataclass(frozen=True)
+class CovenantSpend:
+    """Which covenant branch spent the RXD covenant, read from the spending transaction itself.
+
+    ``kind`` is ``TAKER_CLAIM`` (function 0: ``<p> OP_0``, the covenant then pays the taker),
+    ``MAKER_REFUND`` (function 1: ``OP_1`` after the CSV, the covenant then pays the maker), or
+    ``UNKNOWN`` with the reason. A spent covenant looks the same either way from its UTXO set,
+    which is why ``swap status`` used to call a maker's refund + the maker's counter-leg claim
+    SETTLED. ``p`` itself is never carried here.
+    """
+
+    kind: str
+    reason: str
+    spend_txid: str | None = None
+    height: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "reason": self.reason, "spend_txid": self.spend_txid, "height": self.height}
+
+
+def _push_values(unlocking: bytes) -> list[bytes] | None:
+    """The stack a push-only scriptSig leaves, or ``None`` if it is not push-only / unparseable."""
+    try:
+        chunks = Script(bytes(unlocking)).chunks
+    except Exception:
+        return None
+    out: list[bytes] = []
+    for ch in chunks:
+        op = ch.op[0]
+        if op == 0x00:
+            out.append(b"")
+        elif op == 0x4F:  # OP_1NEGATE
+            out.append(b"\x81")
+        elif 0x51 <= op <= 0x60:  # OP_1 .. OP_16
+            out.append(bytes([op - 0x50]))
+        elif ch.data is not None and op <= 0x4E:
+            out.append(bytes(ch.data))
+        else:
+            return None
+    return out
+
+
+def _script_num(b: bytes) -> int:
+    """Decode a stack item as a script number (little-endian sign-magnitude; empty is 0)."""
+    if not b:
+        return 0
+    mag = int.from_bytes(b[:-1] + bytes([b[-1] & 0x7F]), "little")
+    return -mag if b[-1] & 0x80 else mag
+
+
+def classify_covenant_spend_input(unlocking: bytes, *, hashlock: bytes | None) -> str | None:
+    """``"claim"`` / ``"refund"`` for a covenant input's scriptSig, or ``None`` if neither.
+
+    The covenant dispatches on the TOP stack item (``OP_DUP OP_0 OP_NUMEQUAL OP_IF <claim> OP_ELSE
+    OP_1 OP_NUMEQUALVERIFY <refund>``; see :mod:`pyrxd.gravity.htlc_spend`), so the branch a mined
+    spend took is that item's numeric value — ``build_htlc_claim_tx`` pushes ``<p> OP_0`` and
+    ``build_htlc_refund_tx`` pushes ``OP_1``. Decoded numerically rather than by byte pattern, so a
+    non-minimal encoding the interpreter accepts is classified the same. A claim must also carry a
+    value hashing to ``hashlock`` (the claim branch cannot validate without one).
+    """
+    items = _push_values(unlocking)
+    if not items:
+        return None
+    selector = _script_num(items[-1]) if len(items[-1]) <= 4 else None
+    if selector == 1:
+        return "refund"
+    if selector == 0 and hashlock is not None:
+        h = bytes(hashlock)
+        if any(len(v) == 32 and hashlib.sha256(v).digest() == h for v in items[:-1]):
+            return "claim"
+    return None
+
+
+async def read_covenant_spend(
+    client: Any, spk_hex: str, history: Sequence[dict[str, Any]], *, hashlock: bytes | None
+) -> CovenantSpend:
+    """Find the transaction that spent the covenant and say which branch it took. Read-only.
+
+    Fetches each transaction in the covenant script's history (``get_transaction``), re-derives
+    its txid from the bytes (a server serving the wrong transaction is not believed), finds the
+    covenant output(s) the funding transaction created, and classifies the input that spends one.
+    Anything it cannot establish is ``UNKNOWN`` with the reason — never a guess.
+    """
+    spk = bytes.fromhex(spk_hex)
+    entries = [e for e in history if isinstance(e, dict) and isinstance(e.get("tx_hash"), str)]
+    if not entries:
+        return CovenantSpend("UNKNOWN", "the covenant script's history is empty, so no spend could be read")
+    if len(entries) > MAX_COVENANT_HISTORY:
+        return CovenantSpend(
+            "UNKNOWN",
+            f"the covenant script has {len(entries)} history entries (more than {MAX_COVENANT_HISTORY}); "
+            "something other than this swap is paying it, so its spend was not read",
+        )
+    txs: dict[str, tuple[Transaction, int | None]] = {}
+    for e in entries:
+        txid = e["tx_hash"]
+        raw = await client.get_transaction(txid)
+        tx = Transaction.from_hex(bytes(raw)) if isinstance(raw, (bytes, bytearray)) else None
+        if tx is None or tx.txid() != txid:
+            return CovenantSpend(
+                "UNKNOWN", f"the server's bytes for covenant history transaction {txid} do not parse to that txid"
+            )
+        height = e.get("height")
+        txs[txid] = (tx, height if isinstance(height, int) and height > 0 else None)
+    funded = {
+        (txid, i)
+        for txid, (tx, _) in txs.items()
+        for i, out in enumerate(tx.outputs)
+        if out.locking_script is not None and out.locking_script.serialize() == spk
+    }
+    kinds: set[str] = set()
+    spender: tuple[str, int | None] | None = None
+    for txid, (tx, height) in txs.items():
+        for inp in tx.inputs:
+            if (inp.source_txid, inp.source_output_index) not in funded:
+                continue
+            unlocking = inp.unlocking_script.serialize() if inp.unlocking_script is not None else b""
+            kind = classify_covenant_spend_input(unlocking, hashlock=hashlock)
+            if kind is None:
+                return CovenantSpend(
+                    "UNKNOWN",
+                    f"transaction {txid} spends the covenant with an unlocking script that is neither the "
+                    "claim branch nor the refund branch",
+                    spend_txid=txid,
+                    height=height,
+                )
+            kinds.add(kind)
+            spender = (txid, height)
+    if spender is None:
+        return CovenantSpend(
+            "UNKNOWN",
+            "no transaction in the covenant script's history spends the covenant output — the server's "
+            "history is incomplete, so who spent it is not known",
+        )
+    if len(kinds) > 1:
+        return CovenantSpend("UNKNOWN", "the covenant was spent through BOTH branches (more than one funding)")
+    txid, height = spender
+    when = f"at height {height}" if height is not None else "UNCONFIRMED"
+    if kinds == {"claim"}:
+        return CovenantSpend(
+            "TAKER_CLAIM",
+            f"the taker CLAIMED the covenant in {txid} ({when}); the covenant pays the claim to the taker",
+            spend_txid=txid,
+            height=height,
+        )
+    return CovenantSpend(
+        "MAKER_REFUND",
+        f"the maker CSV-REFUNDED the covenant in {txid} ({when}); the covenant pays the refund to the maker",
+        spend_txid=txid,
+        height=height,
+    )
 
 
 @dataclass(frozen=True)

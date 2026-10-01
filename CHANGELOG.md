@@ -241,6 +241,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read. With a spent covenant, pruned logs used to produce `COUNTER_LEG_LOCKED` ("your ETH is still
   locked — refund it now"); they now produce `COVENANT_SPENT`. The ETH counter-leg no longer has a
   `LOCKED` state at all, since nothing the contract emits can show it.
+- **`swap status` called a maker's refund plus the maker's counter-leg claim SETTLED.** The covenant
+  read used only `get_utxos` / `get_history`, which cannot tell the taker's claim from the maker's
+  CSV refund, so a maker who refunded the RXD covenant AND claimed the taker's BTC or ETH with `p`
+  (the taker losing both legs) read `SETTLED … nothing left to claim or refund` above a counter-leg
+  row saying the leg had been claimed. Present in every release with the counter-leg read (0.14.0
+  on). `status --check-chain` now fetches the covenant's spending transaction, checks it hashes to
+  the txid asked for, and reads which branch its covenant input took (the claim's `<p> OP_0` or the
+  refund's `OP_1`, the shapes `build_htlc_claim_tx` and `build_htlc_refund_tx` produce). The new
+  `chain.covenant_spend` field (`TAKER_CLAIM`, `MAKER_REFUND` or `UNKNOWN`, with the txid and a
+  reason) is in `--json`, and a `spent by` line in human mode. `SETTLED` now means the swap
+  completed (taker claim + counter-leg claimed) or was aborted with both sides refunded. The two
+  outcomes where one side took both legs have their own situations, `MAKER_REFUNDED_AND_CLAIMED`
+  and `TAKER_CLAIMED_AND_REFUNDED`, in every output mode. When the spending transaction cannot be
+  read, the situation is `BOTH_SPENT_OUTCOME_UNKNOWN`, not `SETTLED`. With the counter-leg still
+  locked or unchecked, the advice now names which side has to act when the spend is known.
 - **`swap status` and `swap recover-preimage` no longer report a spent BTC HTLC as UNSPENT.** An
   Esplora answer of `{"spent": true}` with the spending txid missing or malformed was folded into
   the unspent case, so `status` printed "UNSPENT — the counterparty has not claimed" and

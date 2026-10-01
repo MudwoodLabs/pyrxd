@@ -431,3 +431,141 @@ def test_pyrxd_messages_that_quote_a_url_are_scrubbed_but_kept() -> None:
     assert FAKE_PATH_SECRET not in echoed
     theirs = describe_network_error(RuntimeError(f"boom {url}"), url)
     assert theirs == "RuntimeError from rpc.example"
+
+
+# --------------------------------------------------------------------------- 3. who spent the covenant
+
+
+def _btc_counter(monkeypatch, raw: bytes) -> None:
+    from pyrxd.btc_wallet.taproot import btc_txid_from_raw
+
+    from .test_swap_recovery_cmds import _FakeEsplora, _serve
+
+    spender = btc_txid_from_raw(raw)
+    _serve(monkeypatch, _FakeEsplora({"spent": True, "txid": spender}, tx_hex={spender: raw.hex()}))
+
+
+def _all_modes(case, client_factory) -> dict[str, Any]:
+    from .test_swap_recovery_cmds import _checked_status
+
+    out = {}
+    for mode in ("human", "json", "quiet"):
+        res = _checked_status(case, client=client_factory(), output_mode=mode)
+        assert res.exit_code == 0, res.output
+        out[mode] = res.output
+    return out
+
+
+def test_a_maker_refund_plus_the_makers_counter_leg_claim_is_not_settled(case, monkeypatch) -> None:
+    """The maker CSV-refunded the RXD covenant AND claimed the taker's BTC with p: the taker lost
+    both legs. This used to read SETTLED, "nothing left to claim or refund", directly above the
+    counter-leg row that said the BTC had been claimed."""
+    from .test_swap_recovery import _claim_tx
+    from .test_swap_recovery_cmds import _spent_by
+
+    _btc_counter(monkeypatch, _claim_tx())
+    out = _all_modes(case, lambda: _spent_by(case, "refund"))
+    assert "situation  : MAKER_REFUNDED_AND_CLAIMED" in out["human"]
+    assert "spent by   : MAKER_REFUND" in out["human"]
+    assert "The MAKER took BOTH legs" in out["human"]
+    assert "SETTLED" not in out["human"]
+    doc = json.loads(out["json"])
+    assert doc["situation"] == "MAKER_REFUNDED_AND_CLAIMED"
+    assert doc["chain"]["covenant_spend"]["kind"] == "MAKER_REFUND"
+    assert doc["counter_leg"]["state"] == "CLAIMED_PREIMAGE_REVEALED"
+    assert out["quiet"].strip() == "MAKER_REFUNDED_AND_CLAIMED"
+    assert P.hex() not in out["human"] + out["json"]
+
+
+def test_the_eth_maker_refund_plus_claim_is_not_settled_either(case, eth_rpc) -> None:
+    from .test_swap_recovery_cmds import _spent_by
+
+    _eth_swap(case)
+    eth_rpc.scenario = {"logs": [_log(CLAIMED_TOPIC0, P, CLAIM_TX)], "txs": {CLAIM_TX: _claim_tx()}}
+    doc = json.loads(_eth_status(case, eth_rpc, client=_spent_by(case, "refund"), output_mode="json").output)
+    assert doc["situation"] == "MAKER_REFUNDED_AND_CLAIMED"
+
+
+def test_a_taker_claim_plus_the_takers_counter_leg_refund_is_named_too(case, monkeypatch) -> None:
+    from .test_swap_recovery import _refund_tx
+    from .test_swap_recovery_cmds import _spent_by
+
+    _btc_counter(monkeypatch, _refund_tx())
+    out = _all_modes(case, lambda: _spent_by(case, "claim"))
+    assert json.loads(out["json"])["situation"] == "TAKER_CLAIMED_AND_REFUNDED"
+    assert out["quiet"].strip() == "TAKER_CLAIMED_AND_REFUNDED"
+    assert "The TAKER took BOTH legs" in out["human"]
+
+
+def test_an_unreadable_covenant_spend_is_unknown_never_settled(case, monkeypatch) -> None:
+    """Both legs spent but the covenant's spending transaction cannot be fetched: who received the
+    asset is unknown, so the screen must not say SETTLED."""
+    from .test_swap_recovery import _claim_tx
+    from .test_swap_recovery_cmds import _spent_by
+
+    _btc_counter(monkeypatch, _claim_tx())
+    out = _all_modes(case, lambda: _spent_by(case, "claim", serve_spend=False))
+    doc = json.loads(out["json"])
+    assert doc["situation"] == "BOTH_SPENT_OUTCOME_UNKNOWN"
+    assert doc["chain"]["covenant_spend"]["kind"] == "UNKNOWN"
+    assert "could not be read" in doc["chain"]["covenant_spend"]["reason"]
+    assert out["quiet"].strip() == "BOTH_SPENT_OUTCOME_UNKNOWN"
+    assert "SETTLED" not in out["human"]
+    assert "NOT a confirmed settlement" in out["human"]
+
+
+def test_a_server_serving_the_wrong_bytes_for_the_spend_is_not_believed(case, monkeypatch) -> None:
+    from .test_swap_recovery import _claim_tx
+    from .test_swap_recovery_cmds import _funding_and_spend, _SpentByClient
+
+    funding, spend = _funding_and_spend(case, "refund")
+    funding_again, claim = _funding_and_spend(case, "claim")
+    assert funding_again.txid() == funding.txid()  # the claim spends the SAME covenant output
+    client = _SpentByClient(case, funding, spend)
+    # The history names the REFUND; the server serves a CLAIM's bytes under that txid. Believed,
+    # this would read TAKER_CLAIM — and with the BTC claimed, SETTLED.
+    client._txs[spend.txid()] = claim.serialize()
+    _btc_counter(monkeypatch, _claim_tx())
+    from .test_swap_recovery_cmds import _checked_status
+
+    doc = json.loads(_checked_status(case, client=client, output_mode="json").output)
+    assert doc["chain"]["covenant_spend"]["kind"] == "UNKNOWN"
+    assert "do not parse to that txid" in doc["chain"]["covenant_spend"]["reason"]
+    assert doc["situation"] == "BOTH_SPENT_OUTCOME_UNKNOWN"
+
+
+def test_a_maker_refund_with_the_counter_leg_locked_tells_the_taker_to_refund(case, monkeypatch) -> None:
+    from .test_swap_recovery_cmds import _FakeEsplora, _serve, _spent_by
+
+    _serve(monkeypatch, _FakeEsplora({"spent": False}))
+    out = _all_modes(case, lambda: _spent_by(case, "refund"))
+    assert json.loads(out["json"])["situation"] == "COUNTER_LEG_LOCKED"
+    assert "The maker CSV-REFUNDED the RXD covenant" in out["human"]
+    assert "TAKER: refund your BTC now" in out["human"]
+
+
+def test_a_taker_claim_with_the_counter_leg_locked_tells_the_maker_to_claim(case, monkeypatch) -> None:
+    from .test_swap_recovery_cmds import _FakeEsplora, _serve, _spent_by
+
+    _serve(monkeypatch, _FakeEsplora({"spent": False}))
+    out = _all_modes(case, lambda: _spent_by(case, "claim"))
+    assert json.loads(out["json"])["situation"] == "COUNTER_LEG_LOCKED"
+    assert "MAKER: claim your BTC with p NOW" in out["human"]
+    assert "TAKER: refund" not in out["human"]
+
+
+@pytest.mark.parametrize(
+    ("script_hex", "expected"),
+    [
+        ("51", "refund"),  # what build_htlc_refund_tx pushes
+        ("0101", "refund"),  # a non-minimal 1: the covenant's OP_NUMEQUAL takes it the same way
+        ("20" + "11" * 32 + "00", "claim"),  # what build_htlc_claim_tx pushes: <p> OP_0
+        ("20" + "5a" * 32 + "00", None),  # selector 0 without a preimage of H: no valid claim
+        ("52", None),  # neither branch
+        ("76", None),  # not push-only
+    ],
+)
+def test_the_branch_is_read_from_the_selector(script_hex, expected) -> None:
+    from pyrxd.cli.swap_recovery import classify_covenant_spend_input
+
+    assert classify_covenant_spend_input(bytes.fromhex(script_hex), hashlock=H) == expected
