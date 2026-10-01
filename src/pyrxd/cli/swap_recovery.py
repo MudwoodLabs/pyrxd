@@ -1277,9 +1277,9 @@ async def read_eth_counter_leg(
 ) -> CounterLegStatus:
     """Classify the ETH counter-leg through the SAME decision as recovery.
 
-    There is no ``LOCKED`` verdict on this chain: the contract emits nothing until it is claimed
-    or refunded, so "no logs" is all an unclaimed contract can show — and a pruned node shows a
-    claimed one the same way. That is reported ``UNKNOWN``, never ``LOCKED``.
+    There is no ``LOCKED`` verdict on this chain: a log can show that the contract was claimed or
+    refunded, never that it was not, and "no logs" is also what a pruned node or a log-range limit
+    returns for a CLAIMED contract. That is reported ``UNKNOWN``, never ``LOCKED``.
     """
     tx, logs = await fetch_eth_claim_artifacts(session, rpc_url, contract_address=contract_address, timeout_s=timeout_s)
     source = endpoint_source_label(rpc_url)

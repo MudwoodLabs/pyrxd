@@ -240,7 +240,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reports the ETH leg as the new state `UNKNOWN` and `recover-preimage` exits 2 as an inconclusive
   read. With a spent covenant, pruned logs used to produce `COUNTER_LEG_LOCKED` ("your ETH is still
   locked — refund it now"); they now produce `COVENANT_SPENT`. The ETH counter-leg no longer has a
-  `LOCKED` state at all, since nothing the contract emits can show it.
+  `LOCKED` state at all: a log can show that the contract was claimed or refunded, never that it
+  was not.
 - **`swap status` called a maker's refund plus the maker's counter-leg claim SETTLED.** The covenant
   read used only `get_utxos` / `get_history`, which cannot tell the taker's claim from the maker's
   CSV refund, so a maker who refunded the RXD covenant AND claimed the taker's BTC or ETH with `p`
