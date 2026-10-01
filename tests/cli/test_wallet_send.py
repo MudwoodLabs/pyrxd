@@ -77,14 +77,14 @@ def _start_daemon(wallet: HdWallet, sock_path: Path) -> tuple[AgentDaemon, threa
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         if sock_path.exists():
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe.settimeout(0.2)
-            try:
-                probe.connect(str(sock_path))
-                probe.close()
-                return daemon, t
-            except OSError:
-                pass
+            # `with`: a refused connect used to leave the socket open (close() sat in the try body).
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                try:
+                    probe.connect(str(sock_path))
+                    return daemon, t
+                except OSError:
+                    pass
         time.sleep(0.02)
     raise RuntimeError("daemon did not come up")
 
