@@ -258,7 +258,8 @@ def electrumx_script_hash(spk_hex: str) -> str:
 
 
 #: Counter-leg states in which that leg is finished: claimed by the maker (revealing p) or
-#: spent without revealing p (the taker's refund). Only these, together with a spent
+#: spent without revealing p (the taker's refund; BTC only — an ETH refund read from one RPC is
+#: REFUND_REPORTED_UNCONFIRMED, deliberately absent here). Only these, together with a spent
 #: covenant, justify "no further action".
 _COUNTER_LEG_RESOLVED = frozenset({"CLAIMED_PREIMAGE_REVEALED", "SPENT_NO_PREIMAGE"})
 

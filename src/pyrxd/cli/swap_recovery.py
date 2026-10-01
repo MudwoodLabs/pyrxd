@@ -213,9 +213,10 @@ class RefundReportedUnconfirmed(CounterLegInconclusive):
     Raw signed bytes (:class:`VerifiedEthTx`) do not change that. Their hash and their ``to`` /
     selector are checked against the log, which catches an honest RPC that served the wrong
     transaction (that is a :class:`ProvenanceRefused`), but nothing in them shows the transaction
-    was ever broadcast or mined: ``refund()`` takes no argument and anyone may call it, so a server
-    can produce bytes for any key that hash to the transaction its fabricated log names. Checking
-    the signature would not help, for the same reason. Only a second, independent source can.
+    was ever broadcast or mined. A server can sign a ``refund()`` call (it takes no argument) with
+    any key it holds and name that transaction's hash in a fabricated log; pyrxd does not check that
+    a transaction succeeded, so checking its signature or sender would not help. Only a second,
+    independent source can.
     """
 
 
@@ -961,8 +962,8 @@ class VerifiedEthTx:
 
     What it does NOT prove: anything about the chain. Its signature, sender and chain id are not
     checked, and checking them would not help — the bytes come from the RPC that served the logs,
-    and ``refund()`` can be called by anyone, so a server can produce well-formed bytes under any key
-    for a refund that was never broadcast and name their hash in a fabricated ``Refunded`` log. So
+    which can sign a ``refund()`` call with any key it holds, never broadcast it, and name its hash in
+    a fabricated ``Refunded`` log. So
     an ETH refund read from one RPC is never definitive (:class:`RefundReportedUnconfirmed`).
     """
 
@@ -1500,7 +1501,8 @@ async def fetch_eth_claim_artifacts(
     emitted the LAST one: first as raw signed bytes (``eth_getRawTransactionByHash``),
     hashed and decoded locally into a :class:`VerifiedEthTx`; if the RPC does not serve
     raw transactions, as ``eth_getTransactionByHash`` JSON (enough for a claim, whose
-    ``p`` verifies itself; never enough for a definitive refund).
+    ``p`` verifies itself). Neither form makes a refund definitive: a refund from one RPC is
+    always :class:`RefundReportedUnconfirmed`.
 
     Raises
     ------

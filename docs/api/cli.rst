@@ -144,16 +144,24 @@ human sizing the fee is the only remaining control.
   (``Claimed``) or refunded (``Refunded``), never that it was not, and an empty log set is also
   what a pruned node or a log-range limit returns for a claimed contract. It is reported
   ``UNKNOWN``. A preimage in a ``Claimed`` log is
-  recovered from the log itself, whether or not the RPC returns the claim transaction. A refund
-  is only definitive (``SPENT_NO_PREIMAGE``) when the RPC returns the raw signed bytes of the
-  transaction that emitted the ``Refunded`` log (``eth_getRawTransactionByHash``), their keccak256,
-  computed by pyrxd, equals the log's transaction hash, and the decoded transaction is a
-  ``refund()`` call to the swap's contract. Transaction JSON alone does not count: its ``hash``
-  field is the server's word, not derived from the transaction it describes. A ``Refunded`` log
-  without such a transaction carries nothing to verify, so it is reported
-  ``REFUND_REPORTED_UNCONFIRMED`` and never produces a situation that says nothing is left to
-  claim. The raw bytes come from the same RPC, so a server that fabricates and signs a refund it
-  never broadcast is not caught; check a second source before acting on a refund.
+  recovered from the log itself, whether or not the RPC returns the claim transaction, because
+  ``p`` is checked against the hashlock. A refund has nothing like that to check. One RPC's
+  report of a refund — the ``Refunded`` log and whatever transaction it returns with it,
+  including the raw transaction bytes — is that server's word, and pyrxd cannot prove it from
+  that server, which can sign a ``refund()`` call with any key, never broadcast it, and name its
+  hash in a fabricated log. It is therefore always reported
+  ``REFUND_REPORTED_UNCONFIRMED`` (``SPENT_NO_PREIMAGE`` is never produced for ETH), it never
+  produces a situation that says nothing is left to claim, and ``recover-preimage`` reports it
+  as inconclusive. Check the contract on a second, independent RPC or an explorer before acting
+  on a refund; ``--eth-rpc-url`` takes one URL, so pyrxd does not do that for you. The raw bytes
+  (``eth_getRawTransactionByHash``) are still checked for consistency with the log: their
+  keccak256 must equal the log's transaction hash, and ``Refunded`` logs naming two different
+  transactions, or a transaction signed for another chain than the RPC's, are an ``ERROR``.
+
+  Before reading anything, the ETH counter-leg read (``status`` and ``recover-preimage``) asks
+  the RPC its chain (``eth_chainId``) and compares it to the ``eth_chain_id`` the recovery file
+  records; an RPC on another chain is an ``ERROR`` naming both chain ids. A file that records no
+  chain id is still read, and the output says the chain was not checked.
 
   Errors from a counter-leg endpoint are printed as the exception type, HTTP status and host —
   never the URL, which may carry an API key. Across the CLI, an endpoint named in an error, a

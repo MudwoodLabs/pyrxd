@@ -241,19 +241,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read. With a spent covenant, pruned logs used to produce `COUNTER_LEG_LOCKED` ("your ETH is still
   locked — refund it now"); they now produce `COVENANT_SPENT`. The ETH counter-leg no longer has a
   `LOCKED` state at all: a log can show that the contract was claimed or refunded, never that it
-  was not. A refund is definitive (`SPENT_NO_PREIMAGE`) only when the RPC returns the raw signed
-  bytes of the transaction that emitted the `Refunded` log (`eth_getRawTransactionByHash`), pyrxd's
-  own keccak256 of those bytes equals the log's transaction hash, and the transaction decoded from
-  them is a `refund()` call to the swap's contract. Transaction JSON from `eth_getTransactionByHash`
-  is not enough: its `hash`, `to` and `input` are separate fields of the server's answer, so one
-  RPC could pair a refund-shaped body with any hash. This still rests on the one RPC: a server
-  willing to sign a `refund()` call that was never mined, and name it in a fabricated log, is not
-  detected without a second source. A `Refunded` log with no transaction pyrxd could verify that
-  way is the new state `REFUND_REPORTED_UNCONFIRMED`: nothing in a refund log can be
-  verified, and read as a refund it let one RPC turn a taker's covenant claim into
-  `TAKER_CLAIMED_AND_REFUNDED`, telling a maker who could still claim the ETH that nothing was left
-  to claim. `status` treats it like `UNKNOWN` (`COVENANT_SPENT`, with the advice to claim), and
-  `recover-preimage` reports it as inconclusive (exit 2).
+  was not. A refund read from one RPC is never definitive: it is the new state
+  `REFUND_REPORTED_UNCONFIRMED`, and the ETH leg no longer produces `SPENT_NO_PREIMAGE` at all.
+  One RPC's report of a refund — the `Refunded` log, and any transaction it returns, as
+  `eth_getTransactionByHash` JSON or as raw bytes from `eth_getRawTransactionByHash` — is that
+  server's word and cannot be proven by pyrxd: a server can sign a `refund()` call with any key,
+  never broadcast it, and serve bytes whose keccak256 matches its fabricated log, so checking the
+  signature would not change that. Read as a
+  refund, it let one RPC turn a taker's covenant claim into `TAKER_CLAIMED_AND_REFUNDED`, telling
+  a maker who could still claim the ETH that nothing was left to claim. `status` treats it like
+  `UNKNOWN` (`COVENANT_SPENT`, with the advice to claim), and `recover-preimage` reports it as
+  inconclusive (exit 2) with the advice to check a second, independent RPC; `--eth-rpc-url`
+  takes one URL, so pyrxd cannot make that check itself. The raw bytes are still checked for
+  consistency with the log (their keccak256 must be the log's transaction hash), and `Refunded`
+  logs naming two different transactions, or a transaction signed for another chain than the
+  RPC's, are `ERROR`. The reader of those bytes accepts canonical RLP only, as pyrlp's strict
+  decoder does.
+- **The ETH counter-leg read never checked which chain its RPC was on.** `eth_chainId` was on the
+  read-only allowlist but never called, and the `eth_chain_id` a recovery file records was never
+  compared, so an RPC for another network answered for the swap's contract address. `status` and
+  `recover-preimage` now ask the RPC its chain before reading anything and refuse a mismatch
+  (`ERROR` in `status`, naming both chain ids). A file that records no chain id is still read,
+  and the output says the chain was not checked; a malformed `eth_chain_id` is refused.
 - **`swap status` called a maker's refund plus the maker's counter-leg claim SETTLED.** The covenant
   read used only `get_utxos` / `get_history`, which cannot tell the taker's claim from the maker's
   CSV refund, so a maker who refunded the RXD covenant AND claimed the taker's BTC or ETH with `p`
