@@ -9,9 +9,10 @@ It DELIBERATELY crosses the audit gate (operator accepts dust loss). The externa
 remains the hard gate for any product claim. Use ONLY for a capped, supervised run.
 
 Staging (--stage), each gating the next (see docs/plans/2026-05-26-...-dust-mainnet-trade-plan.md):
-  dry-run : build the real txs + read-only sanity, NO broadcast. (Honest: mempool.space
-            has no testmempoolaccept, so the BTC leg gets no consensus rehearsal here —
-            signet is that.)
+  dry-run : build the real txs AND the swap coordinator the broadcast stages build (every
+            construction-time check, on offline transports) and report its verdict; NO
+            broadcast. (Honest: mempool.space has no testmempoolaccept, so the BTC leg gets no
+            consensus rehearsal here — signet is that.)
   signet  : real BTC SIGNET (free faucet) ↔ RXD mainnet. First end-to-end run of the new
             broadcaster + the P-SAFE-2 txid serializer + live conf reads against real
             Bitcoin. MANDATORY before any mainnet BTC.
