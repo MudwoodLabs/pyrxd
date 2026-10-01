@@ -138,7 +138,10 @@ class _Hostile(BaseHTTPRequestHandler):
         self.server.hits += 1  # type: ignore[attr-defined]
         if mode == "redirect":
             self.send_response(307)
-            self.send_header("Location", self.path)
+            # A fixed target built from the test's own constants (it carries the same fake secrets the
+            # request did), never the request path: echoing request input into a header is the
+            # response-splitting shape, even in a test server.
+            self.send_header("Location", f"/v2/{PATH}?apikey={QUERY}")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
