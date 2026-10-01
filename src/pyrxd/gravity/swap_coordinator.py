@@ -2393,7 +2393,7 @@ class SwapCoordinator:
             f"its upper bound on the blocks elapsed since the funding can then be {elapsed} on an honest chain "
             f"(blocks every {int(chain.target_spacing_s)} s, the newest up to {fb.early_slack_s} s old; the blocks after "
             f"the reference header {early.reference_depth} deep counted at {fb.surge_factor:g}× that rate, "
-            f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why}. {remedy}"
+            f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why.rstrip('.')}. {remedy}"
         )
 
     async def taker_verify_asset_funding(
