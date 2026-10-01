@@ -45,6 +45,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`pyrxd-watchtower` refuses to start with fewer RXD sources than `--rxd-quorum`, whatever the
+  shortfall.** One effective source (one `--rxd-electrumx-url`, several URLs of one operator, or
+  `--rxd-backend ssh-tr` alone) against the default `--rxd-quorum 2` used to start silently
+  single-source, while two sources against `--rxd-quorum 3` refused. Now both refuse, naming the
+  sources found. `--accept-single-source` starts anyway with a WARNING naming them, the quorum
+  clamped to their count (two operators stay a corroborated 2-of-2); `--rxd-quorum 1` asks for
+  single-source operation outright. The shipped defaults (two operators) start as before. **A
+  watchtower started with a single RXD source and no flag now exits 1**; the runbook example, which
+  used one URL, names two operators.
+- **An empty or whitespace-only entry in an `electrumx_servers` list is a config error:**
+  `empty endpoint in electrumx_servers at index N`, for a URL string or a `{ url = ... }` table, at
+  load or when a `[networks.<name>]` list is selected. `electrumx_servers = [""]` used to resolve to
+  the shipped default servers without a word, and `"  "` was kept as an endpoint. An empty list is
+  still "not configured".
+- **`scripts/swap_run_verify.py` exits 3 with `INVALID: <reason>` on a malformed manifest** (a bad
+  field, an endpoint with no parseable host, a verifier endpoint a party also used, a manifest that
+  is not a JSON object) instead of a traceback and exit 1. 3 is the code it already used for parties
+  disagreeing on a cited txid; the exit codes are now in its docstring.
+
 - **Mutation CI: the taker gate (`gravity/funding_spv`) is its own group, `fundingspv`, sharded in
   two, with its own test list.** It had joined `radiantleg`, and its test file had joined all four
   `covenants` lists, putting `radiantleg` at an ESTIMATED 317-379 minutes against the 330-minute job
@@ -227,6 +246,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/solutions/design-decisions/spv-swap-deprecated-primitive-retained.md`.
 
 ### Fixed
+
+- **Outpoint vouts are parsed as ASCII `0-9`.** The Radiant leg's covenant outpoint parsing used
+  `str.isdigit()`, which accepts `"²"` (then a bare `ValueError`) and Arabic-Indic or full-width
+  digits (silently converted to a vout); it now raises `ValidationError` before any read. The same
+  fix in `swap_run_verify.py`, the `swap` recovery and order-book CLI outpoint parsers (which also
+  took `" 1"`, `"+1"` and `"1_0"`), the dust harness's photon amount and the leak scanner's IPv4
+  octets. `BtcOutpoint` refuses a vout above 32 bits.
+- **`MultiSourceEthRpc`'s below-quorum errors no longer quote an endpoint's API key**: the joined
+  endpoint errors go through `network.redaction`, keeping host and port.
+- **`scripts/eth_swap_run.py`: a resume refused on its `t_rxd` no longer tells the operator to
+  "restore" a re-measured block interval or finalization window.** For those inputs it says the swap
+  was negotiated under the recorded value, that changing it changes the agreed terms, and that the
+  options are to resume with that value as the agreed term or to let the swap time out and refund.
+- **`docs/htlc-handshake-wire-format.md` and `docs/security-audit-scope.md` cite the lines they
+  name on current `main`.** #815 and #817 had moved most of the handshake spec's `terms` and
+  finality-table citations onto unrelated code. HZ-1's opening described the lock order that the
+  code comments it cited no longer state; it now matches them. The spec's `terms` table gains the
+  `token_address` key it omitted. `tests/test_doc_citations_resolve.py` now reads every range of
+  a multi-range citation, checks a keyed table row's citations against the row's name, and refuses
+  a bare `:N` that names no file.
 
 - **The mainnet swap runners construct at their defaults, and build their coordinator before
   anything is minted or broadcast.** Measured on `scripts/dust_swap_run.py`, `eth_swap_run.py` and
