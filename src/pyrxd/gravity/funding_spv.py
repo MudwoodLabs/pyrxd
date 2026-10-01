@@ -219,6 +219,7 @@ __all__ = [
     "counted_operators",
     "early_elapsed_blocks_upper",
     "elapsed_blocks_upper_bound",
+    "erlang_upper_quantile_s",
     "forged_confirmation_cost_floor_photons",
     "funding_header_ranges",
     "median_time_past",
@@ -479,6 +480,67 @@ def poisson_upper_quantile(mean: float, epsilon: float) -> int:
     while hi - lo > 1:
         mid = (lo + hi) // 2
         if _log_poisson_tail(float(mean), mid) <= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def _log_poisson_lower_tail(mean: float, k: int) -> float:
+    """``log P(X <= k - 1)`` for ``X ~ Poisson(mean)``, ``mean > 0``, ``k >= 1`` — the probability that
+    fewer than ``k`` blocks arrive, i.e. that ``k`` blocks take LONGER than ``mean`` spacings.
+
+    Sums the ``k`` pmf terms from ``k - 1`` downward in scaled form (each the previous times
+    ``j ÷ mean``), starting from ``log pmf(k - 1)`` by ``lgamma``. Every term is summed — no truncated
+    remainder — so the only error is floating-point, which :data:`_QUANTILE_LOG_MARGIN` covers in
+    :func:`erlang_upper_quantile_s`; a test compares it against a 60-digit summation.
+    """
+    top = k - 1
+    log_first = -mean + top * math.log(mean) - math.lgamma(top + 1)
+    total = 1.0
+    term = 1.0
+    for j in range(top, 0, -1):
+        term *= j / mean
+        total += term
+    return log_first + math.log(total)
+
+
+def erlang_upper_quantile_s(blocks: int, *, spacing_s: int, epsilon: float) -> int:
+    """The smallest whole ``t`` seconds with ``P(T > t) <= epsilon``, where ``T`` is the time *blocks*
+    blocks take when they arrive as a Poisson process at one per *spacing_s* — never below the exact
+    value.
+
+    ``T`` is Erlang(``blocks``, ``spacing_s``): ``T > t`` exactly when fewer than ``blocks`` arrive in
+    ``t``, so ``P(T > t)`` is the Poisson lower tail at mean ``t ÷ spacing_s``
+    (:func:`_log_poisson_lower_tail`). ``t`` is accepted only when that computed log-tail is at least
+    :data:`_QUANTILE_LOG_MARGIN` below ``log epsilon`` (the same rule as :func:`poisson_upper_quantile`),
+    so the result is the exact quantile or a second or so above it. ``0`` for ``blocks == 0``.
+
+    Used by the construction-time projection of when the taker's gate can first accept the maker's
+    funding: ``blocks × spacing_s`` is the MEAN of ``T`` and an honest chain exceeds it about half the
+    time; this is the time an honest chain at the nominal rate exceeds with probability at most
+    ``epsilon``.
+    """
+    if not isinstance(blocks, int) or isinstance(blocks, bool) or blocks < 0:
+        raise ValidationError("blocks must be a non-negative int")
+    if not isinstance(spacing_s, int) or isinstance(spacing_s, bool) or spacing_s <= 0:
+        raise ValidationError("spacing_s must be a positive int")
+    if not (isinstance(epsilon, float) and 0 < epsilon < 1):
+        raise ValidationError("epsilon must be a float in (0, 1)")
+    if blocks == 0:
+        return 0
+    target = math.log(epsilon) - _QUANTILE_LOG_MARGIN
+
+    def accepted(t: int) -> bool:
+        return t > 0 and _log_poisson_lower_tail(t / spacing_s, blocks) <= target
+
+    # Invariant: `lo` is not accepted, `hi` is. Doubling from the mean finds an accepted `hi`.
+    lo, hi = 0, blocks * spacing_s
+    while not accepted(hi):
+        lo, hi = hi, hi * 2
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if accepted(mid):
             hi = mid
         else:
             lo = mid

@@ -1735,9 +1735,14 @@ def _eth_early_case(monkeypatch, *, t_rxd: int | None = None, deadline_s: int = 
             terms, taker_dest_hash=cov.expected_taker_hash, maker_dest_hash=cov.expected_maker_hash
         )
 
-    def build(terms, value=1000, now=_NOW, *, pending=None, observed=None):
+    def build(terms, value=1000, now=_NOW, *, pending=None, observed=None, confs=100, tip_time=_NOW):
         view = _ChainView(
-            pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS, tip_time=_NOW
+            pays=_covenant(terms),
+            value=terms.radiant_amount,
+            confs=confs,
+            base=base,
+            bits=_HARD_BITS,
+            tip_time=tip_time,
         )
         eth = FakeEthLeg(preimage=p, verdict=_final())
         eth.network, eth.chain_id = "sepolia", 11155111
@@ -1811,29 +1816,116 @@ def test_the_early_eth_check_also_refuses_step_3_alone(monkeypatch):
 def test_an_eth_deadline_too_near_for_the_takers_gate_is_refused_when_the_coordinator_is_built(monkeypatch):
     """The deadline's liveness floor runs the other way from the ordering: a LATER clock is nearer the
     deadline. The taker's gate first accepts the funding once it is ``k`` deep — on the modelled honest
-    chain ``k`` nominal spacings plus the bound's slack after the coordinator is built — so a deadline that
-    clears the floor now but not then (``eth_swap_grief_run.py``'s old 1,800 s default) is refused at
-    construction, naming that wait; a deadline that clears it then constructs. At ``pre_btc_lock_check``
-    step 3b nothing is added: the funding already exists there, and step 3 judges the real clock."""
+    chain as late as the upper ``ε`` quantile of the time ``k`` blocks take, plus the bound's slack, after
+    the coordinator is built — so a deadline that clears the floor now but not then (``eth_swap_grief_run.py``'s
+    old 1,800 s and 7,200 s defaults) is refused at construction, naming that wait; a deadline that clears it
+    then constructs. At ``pre_btc_lock_check`` step 3b nothing is added: the funding already exists there,
+    and step 3 judges the real clock."""
     from pyrxd.gravity.eth_rxd_timelock import assert_eth_deadline_is_claimable
 
-    for deadline in (1800, 3600):
+    wait = funding_spv.erlang_upper_quantile_s(6, spacing_s=300, epsilon=1e-3) + 3600
+    assert wait > 6 * 300 + 3600
+    for deadline in (1800, 3600, 7200):
         build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=deadline)
         terms = terms_at(floor + reserve())
-        with pytest.raises(ValidationError, match=r"first accept the funding about 5400 s from now.*too near") as exc:
+        with pytest.raises(
+            ValidationError, match=rf"first accept the funding about {wait} s from now.*too near"
+        ) as exc:
             build(terms)
         assert "Negotiate a later counter-leg deadline" in str(exc.value)
         assert "Negotiate a longer t_rxd" not in str(exc.value)
-    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=7200)
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=10_800)
     terms = terms_at(floor + reserve())
     coord = build(terms)
     # The same terms judged at step 3b (no wait added) pass, and the floor itself holds at the taker's time.
     assert coord._funding_proof_room_failure(terms, now_unix_s=_NOW) is None
     assert_eth_deadline_is_claimable(
-        now_unix_s=_NOW + 5400,
+        now_unix_s=_NOW + wait,
         eth_timeout_unix_s=terms.eth_timeout_unix_s,
         margin=coord.config.margin_policy.cross_clock_margin,
     )
+
+
+def _log_erlang_tail_exact(blocks: int, t: int, spacing: int):
+    """``log P(T > t)`` for ``T`` the time *blocks* Poisson blocks at one per *spacing* take — the
+    Poisson lower tail at ``t / spacing`` — by a 60-digit summation, as a ``Decimal``."""
+    from decimal import Decimal, localcontext
+
+    with localcontext() as ctx:
+        ctx.prec = 60
+        mean = Decimal(t) / Decimal(spacing)
+        term, total = Decimal(1), Decimal(0)
+        for j in range(blocks):
+            if j:
+                term = term * mean / j
+            total += term
+        return (total * (-mean).exp()).ln()
+
+
+@pytest.mark.parametrize("blocks", [1, 2, 6, 13, 30, 80, 300])
+@pytest.mark.parametrize("epsilon", [1e-3, 1e-6, 1e-9, 1e-12])
+def test_the_erlang_quantile_matches_a_60_digit_tail_and_is_never_below_it(blocks, epsilon):
+    """``erlang_upper_quantile_s`` against an exact 60-digit tail: at the result the time ``blocks``
+    blocks take exceeds it with probability at most ``ε``; two seconds less, more than ``ε`` (the result
+    is the exact quantile or a second above it, from the shared log margin)."""
+    from decimal import Decimal
+
+    q = funding_spv.erlang_upper_quantile_s(blocks, spacing_s=300, epsilon=epsilon)
+    log_eps = Decimal(epsilon).ln()
+    assert _log_erlang_tail_exact(blocks, q, 300) <= log_eps
+    assert _log_erlang_tail_exact(blocks, q - 2, 300) > log_eps
+    assert q > blocks * 300  # never the mean
+
+
+def test_the_erlang_quantile_refuses_nonsense():
+    q = funding_spv.erlang_upper_quantile_s
+    assert q(0, spacing_s=300, epsilon=1e-3) == 0
+    for bad in (dict(blocks=-1), dict(blocks=True), dict(spacing_s=0), dict(epsilon=1e-3 * 1000), dict(epsilon=0.0)):
+        kw = {"blocks": 6, "spacing_s": 300, "epsilon": 1e-3, **bad}
+        with pytest.raises(ValidationError):
+            q(kw.pop("blocks"), **kw)
+
+
+async def test_a_slow_but_honest_chain_at_the_projected_quantile_still_passes_after_the_maker_locks(monkeypatch):
+    """The projection used ``k`` blocks at exactly the nominal spacing — the MEAN of the time they take,
+    which an honest chain exceeds about half the time — so a deadline the coordinator accepted at
+    construction could be too near by the time the funding really was ``k`` deep, and step 3 refused
+    after the maker had locked. It is the upper ``ε`` quantile now. Through ``pre_btc_lock_check``: at
+    the SMALLEST deadline the coordinator accepts, a chain whose ``k`` blocks took that whole quantile —
+    the funding exactly ``k`` deep, its newest header the bound's slack old — passes; at the projection's
+    own clock one second later than that, it does not (the deadline is the tight one)."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+
+    def constructs(deadline_s: int) -> bool:
+        build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=deadline_s)
+        try:
+            build(terms_at(floor + reserve()))
+        except ValidationError:
+            return False
+        return True
+
+    lo, hi = 1, 40_000
+    assert not constructs(lo) and constructs(hi)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (lo, mid) if constructs(mid) else (mid, hi)
+    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=hi)
+    terms = terms_at(floor + reserve())
+    coord = build(terms)
+    early = taker_gate_early_bound(chain=chain, policy=coord.config.margin_policy, value_at_stake_photons=1000)
+    k = early.required_confirmations
+    blocks_s = funding_spv.erlang_upper_quantile_s(k, spacing_s=300, epsilon=early.epsilon)
+    slack = coord.config.funding_bound.early_slack_s
+    assert hi > k * 300 + slack + 1164, "the smallest accepted deadline is past the old mean-based projection"
+    # The k-th block mined `blocks_s` after construction; the taker checks `slack` later.
+    slow = build(terms, confs=k, tip_time=_NOW + blocks_s)
+    gate = await slow.pre_btc_lock_check(terms, now_unix_s=_NOW + blocks_s + slack)
+    assert gate.ok is True, gate.reason
+    late = build(terms, confs=k, tip_time=_NOW + blocks_s + 1)
+    gate = await late.pre_btc_lock_check(terms, now_unix_s=_NOW + blocks_s + slack + 1)
+    assert gate.ok is False and "too little time to claim" in gate.reason, gate.reason
 
 
 async def test_the_takers_first_acceptance_is_projected_from_where_the_funding_actually_is(monkeypatch):
@@ -1885,7 +1977,7 @@ async def test_an_honest_eth_swap_passes_pre_btc_lock_check_with_its_clock(monke
 def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monkeypatch):
     """The step-6 floor on the bound, for an ETH counter leg: a small value constructs; a value whose
     modelled bound leaves t_rxd no room for a safe claim is refused at construction, naming step 6."""
-    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=7200)
+    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=10_800)
     terms = terms_at(floor + reserve() + 10)
     assert build(terms) is not None
     big = 150 * funding_spv.forged_confirmation_cost_floor_photons(chain)

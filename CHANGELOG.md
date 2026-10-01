@@ -249,12 +249,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     refuse on an honest chain before anyone locks. An ETH or ERC-20 deadline is absolute, so
     `SwapCoordinator` takes `now_unix_s` (new) and refuses such a NEGOTIATED value-bearing swap
     without it. At construction the deadline's claim floor is also judged when the taker's gate can
-    first accept the funding on that chain (`k` nominal spacings plus the bound's slack, 5,400 s at
-    dust). The ETH runners now derive `t_rxd` when `--t-rxd-blocks` is omitted: the deadline's own
-    floor plus the gate's modelled bound (`eth_swap_run.py`, both stages: 2,577 at the 24 h default
-    and a 36 s fast tail; `eth_swap_grief_run.py`: 308 at its new 2 h default deadline, which
-    replaces 1,800 s). A resume reuses the recorded `t_rxd`, and the derivation's fallback is the
-    smallest feasible value, not the BIP68 maximum.
+    first accept the funding on that chain: the blocks the funding still lacks of `k`, timed at the
+    upper `ε` quantile of the time that many blocks take at the nominal spacing (new
+    `funding_spv.erlang_upper_quantile_s`; `ε` as for the elapsed bound, from the swap's value), plus
+    the bound's slack — 4,937 + 3,600 = 8,537 s at dust (`k` 6, `ε` 1e-3), where `k` nominal spacings
+    (5,400 s) is only the mean, which an honest chain exceeds about half the time. All `k` blocks
+    before the maker funds; fewer, or none, when the caller passes the depth it observed
+    (`SwapCoordinator(maker_funding_confirmations=...)`, new; `eth_swap_run.py --resume` reads it off
+    the node); nothing for a record carrying a pending counter-leg deploy (a resumed fund), which was
+    refused at construction while `pre_btc_lock_check` accepted it. The ETH runners now derive `t_rxd`
+    when `--t-rxd-blocks` is omitted: the deadline's own floor plus the gate's modelled bound
+    (`eth_swap_run.py`, both stages: 2,577 at the 24 h default and a 36 s fast tail;
+    `eth_swap_grief_run.py`: 408 at its new 3 h default deadline, which replaces 1,800 s; the
+    smallest deadline it accepts is 9,522 s). A resume reuses the recorded `t_rxd`, and the
+    derivation's fallback is the smallest feasible value, not the BIP68 maximum.
   - NFT and FT swaps had no value at stake, so the coordinator refused them, and without
     `--*-reuse-reveal-txid` the fresh mainnet mint ran first. `--value-at-risk-photons` (new, on
     every script that builds a mainnet coordinator; `measure_margin_from_btc_block_times` takes

@@ -78,6 +78,7 @@ from .funding_spv import (
     VerifiedMakerFunding,
     counted_operators,
     early_elapsed_blocks_upper,
+    erlang_upper_quantile_s,
     funding_header_ranges,
     radiant_chain_for_leg,
     verify_maker_funding,
@@ -2426,8 +2427,17 @@ class SwapCoordinator:
         the funding mined one block after the maker broadcasts, ``k - 1`` more after it. One built
         after the funding is already on chain waits only for the blocks it still lacks — none once
         it is ``k`` deep — so the caller passes the depth it observed
-        (``maker_funding_confirmations``). Each wait is ``k`` blocks at the nominal spacing plus
-        ``funding_bound.early_slack_s`` (the newest header up to that old).
+        (``maker_funding_confirmations``).
+
+        HOW LONG THOSE BLOCKS TAKE is not their count times the nominal spacing: that is the MEAN of
+        the time ``n`` blocks take, and an honest chain at the nominal rate is slower than its mean
+        about half the time — after the maker has locked, when the taker's step 3 then refuses. The
+        wait is the upper ``ε`` quantile of that time instead (:func:`~pyrxd.gravity.funding_spv.erlang_upper_quantile_s`:
+        ``n`` blocks arriving as a Poisson process at one per nominal spacing), with the same ``ε`` as
+        the elapsed-depth bound (``early.epsilon``: ``ElapsedBoundPolicy.epsilon`` of the swap's
+        value), plus ``funding_bound.early_slack_s`` (the newest header up to that old). A chain slower
+        than that quantile is the case the model leaves to step 3, which judges the real clock before
+        the taker locks.
 
         ``None`` for a record carrying a pending counter-leg deploy: the taker has already passed its
         gate and started funding, so there is no first acceptance ahead to project. The lock-time
@@ -2445,10 +2455,12 @@ class SwapCoordinator:
             )
         spacing = int(chain.target_spacing_s)
         slack = int(self.config.funding_bound.early_slack_s)
+        blocks_s = erlang_upper_quantile_s(remaining, spacing_s=spacing, epsilon=early.epsilon)
         start = "" if seen is None else f"the funding observed {seen} deep, "
         return (
-            remaining * spacing + slack,
-            f"{start}{remaining} more block{'s' if remaining != 1 else ''} at {spacing} s, the newest header up to {slack} s old",
+            blocks_s + slack,
+            f"{start}{remaining} more block{'s' if remaining != 1 else ''} at {spacing} s on average take up to "
+            f"{blocks_s} s at ε = {early.epsilon:.3g}, and the newest header may be up to {slack} s old",
         )
 
     async def taker_verify_asset_funding(

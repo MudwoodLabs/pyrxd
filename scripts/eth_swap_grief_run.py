@@ -13,10 +13,11 @@ broadcast (no --yes for the real run). Reuses eth_swap_run.py's building blocks 
 
 Timing: mutual_refund needs BOTH legs matured — the RXD covenant buried t_rxd deep (BIP68 CSV) AND
 the ETH timeout passed. Margin components are set SMALL here (this is a deliberate dust test, not a
-production swap). The ETH timeout defaults to 2 h: on mainnet Radiant the taker's gate first accepts the
-maker's funding once it is k (6 at dust) blocks deep, about 1.5 h on the coordinator's own model, and
-the deadline must still leave the claim floor then — the coordinator refuses a shorter one when it is
-built. t_rxd is derived to outlast it (`derived_t_rxd_blocks`). The cross-clock gate still runs
+production swap). The ETH timeout defaults to 3 h: on mainnet Radiant the taker's gate first accepts the
+maker's funding once it is k (6 at dust) blocks deep — on the coordinator's own model as late as the time
+an honest chain takes for k blocks with probability 1 - ε (4,937 s at dust), plus an hour for the newest
+header's age — and the deadline must still leave the claim floor then (984 s at these margins). The
+coordinator refuses a shorter one when it is built; the smallest it accepts at the defaults is 9,522 s. t_rxd is derived to outlast it (`derived_t_rxd_blocks`). The cross-clock gate still runs
 (rxd_refund_open > eth_timeout + margin); we just size the margin for a fast demo.
 
 Example:
@@ -290,10 +291,12 @@ def _args():
     ap.add_argument(
         "--eth-artifact", default=str(Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "EthHtlc.json")
     )
-    # 2 h. The taker's gate first accepts the funding about k × 300 s + 3,600 s after the coordinator is
-    # built (5,400 s at k = 6), and the deadline must still clear the claim floor (984 s at these margins)
-    # then; the coordinator refuses a shorter deadline at construction. 1800 s was refused.
-    ap.add_argument("--eth-timeout-s", type=int, default=7200)
+    # 3 h. The taker's gate first accepts the funding as late as the upper-ε quantile of the time k blocks
+    # take at 300 s plus 3,600 s after the coordinator is built (4,937 + 3,600 = 8,537 s at k = 6, ε = 1e-3),
+    # and the deadline must still clear the claim floor (984 s at these margins) then; the coordinator
+    # refuses a shorter deadline at construction (the smallest it accepts is 9,522 s). 1,800 s and 7,200 s
+    # were refused.
+    ap.add_argument("--eth-timeout-s", type=int, default=10_800)
     ap.add_argument("--rxd-photons", type=int, default=1000)
     # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
     ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)

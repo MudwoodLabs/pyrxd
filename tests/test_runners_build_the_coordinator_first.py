@@ -81,9 +81,9 @@ def _judge_at_the_modelled_maximum(coord) -> str:
     chain with the taker gate's modelled maximum of blocks already elapsed (``taker_gate_early_bound``,
     the bound the gate can reach on such a chain), judged at two clocks: NOW (the runner's, just after it
     built the coordinator) — the worst case for the ordering, since a later clock only moves the
-    projected refund later — and when the taker's gate can first accept the funding on that chain (``k``
-    blocks at the nominal spacing plus the bound's slack) — the worst case for an ETH deadline's
-    liveness floor. Step 3 is called as ``pre_btc_lock_check`` calls it, not through the
+    projected refund later — and when the taker's gate can first accept the funding on that chain (the
+    upper ``ε`` quantile of the time ``k`` blocks take at the nominal spacing, plus the bound's slack) —
+    the worst case for an ETH deadline's liveness floor. Step 3 is called as ``pre_btc_lock_check`` calls it, not through the
     negotiation-time check under test. ``"ok"``, or the first refusal."""
     import time
 
@@ -99,9 +99,10 @@ def _judge_at_the_modelled_maximum(coord) -> str:
         funding_bound=coord.config.funding_bound,
         radiant_min_confirmations=int(getattr(coord.radiant_leg, "min_confirmations", 1)),
     )
-    taker_at = (
-        now + early.required_confirmations * int(chain.target_spacing_s) + int(coord.config.funding_bound.early_slack_s)
+    blocks_s = funding_spv.erlang_upper_quantile_s(
+        early.required_confirmations, spacing_s=int(chain.target_spacing_s), epsilon=early.epsilon
     )
+    taker_at = now + blocks_s + int(coord.config.funding_bound.early_slack_s)
     for when in (now, taker_at):
         try:
             if terms.counter_chain == "btc":
