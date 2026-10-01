@@ -699,7 +699,9 @@ def _btc_counter(monkeypatch, raw: bytes) -> None:
     from .test_swap_recovery_cmds import _FakeEsplora, _serve
 
     spender = btc_txid_from_raw(raw)
-    _serve(monkeypatch, _FakeEsplora({"spent": True, "txid": spender}, tx_hex={spender: raw.hex()}))
+    # A CONFIRMED spend, as Esplora reports one: a refund still in the mempool is not a finished leg.
+    outspend = {"spent": True, "txid": spender, "status": {"confirmed": True}}
+    _serve(monkeypatch, _FakeEsplora(outspend, tx_hex={spender: raw.hex()}))
 
 
 def _all_modes(case, client_factory) -> dict[str, Any]:
@@ -883,7 +885,7 @@ def test_blocks_to_refund_is_omitted_rather_than_raising_when_depth_is_none(case
     """Item 4's guard on its own: a live covenant with a funding height but no measured depth."""
     from pyrxd.cli import swap_cmds
 
-    async def _read(ctx, spk_hex, hashlock_hex=None):
+    async def _read(ctx, spk_hex, hashlock_hex=None, **_kw):
         return {"covenant_state": "live", "funding_height": 100, "depth": None, "value_photons": 1, "now_height": 130}
 
     monkeypatch.setattr(swap_cmds, "_read_covenant", _read)

@@ -50,6 +50,7 @@ from .swap_recovery import (
     PreimageRecovery,
     ProvenanceRefused,
     RefundReportedUnconfirmed,
+    SpentWithoutPreimage,
     WrongEthChain,
     assert_covenant_matches,
     build_cold_claim,
@@ -237,7 +238,9 @@ async def _recover(
         outpoint = parse_outpoint(btc_outpoint, what="--btc-funding-outpoint")
         session = await open_http_session()
         async with session:
-            spent, spender, raw = await fetch_btc_claim_bytes(session, btc_api_url, outpoint, timeout_s=timeout_s)
+            spent, spender, raw, confirmed = await fetch_btc_claim_bytes(
+                session, btc_api_url, outpoint, timeout_s=timeout_s
+            )
         source = endpoint_source_label(btc_api_url)
         if not spent:
             raise PreimageNotRevealed(
@@ -260,7 +263,17 @@ async def _recover(
                 f"the outpoint is spent by {spender}, but its raw bytes are not retrievable from "
                 f"{source} yet. Refusing to proceed on an unverifiable transaction."
             )
-        return recover_preimage_from_btc_claim(raw, hashlock=hashlock, funding_outpoint=outpoint, reported_txid=spender)
+        try:
+            return recover_preimage_from_btc_claim(
+                raw, hashlock=hashlock, funding_outpoint=outpoint, reported_txid=spender
+            )
+        except SpentWithoutPreimage as exc:
+            if confirmed:
+                raise
+            raise SpentWithoutPreimage(
+                f"{exc}. {source} reports this spend NOT CONFIRMED: until it confirms, a claim revealing p "
+                "could still replace it"
+            ) from exc
 
     if not eth_contract or not eth_rpc_url:
         raise UserError(
@@ -400,6 +413,15 @@ def swap_recover_preimage_cmd(
                 "shares the hashlock is not this swap's claim"
             ),
         ) from exc
+    except SpentWithoutPreimage as exc:
+        # Before PreimageNotRevealed (its base). The outpoint is already SPENT, so no preimage will
+        # ever appear on it: "not revealed yet — keep watching" was the wrong advice here.
+        raise UserError(
+            "the funding outpoint was spent without revealing a preimage (a refund) — there is none to recover",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=500),
+            fix="no preimage will appear on this outpoint once that spend is confirmed. Run `pyrxd swap status "
+            "--check-chain` for what is left to do on the RXD covenant — nothing was broadcast",
+        ) from exc
     except PreimageNotRevealed as exc:
         raise UserError(
             "no preimage has been revealed yet",
@@ -449,13 +471,26 @@ def swap_recover_preimage_cmd(
 # --------------------------------------------------------------------------- cold spend builders
 
 
+def _known_amount(variant: str, extras: Any, explicit: int | None) -> int | None:
+    """The covenant amount when the flag or the file gives it, else ``None`` (derived after the read)."""
+    if explicit is not None:
+        return explicit
+    if extras.rxd_covenant_amount is not None:
+        return int(extras.rxd_covenant_amount)
+    if variant == "ft" and extras.asset_ft_amount is not None:
+        return int(extras.asset_ft_amount)
+    return None
+
+
 def _resolve_amount(variant: str, extras: Any, carrier_value: int, explicit: int | None) -> int:
     """The covenant's ``amount``/``nftCarrierValue`` parameter — self-checked downstream.
 
     Precedence: the explicit flag, then ``rxd_covenant_amount`` (which the harnesses now
     persist — older files predate it), then a derivation. For ``rxd``/``nft`` the value
-    parameter IS the funded carrier value read from chain; for ``ft`` it is the token
-    amount (``asset_ft_amount``), which the carrier value does not encode.
+    parameter IS the funded carrier value, read from chain. For ``ft`` it is the token amount
+    (``asset_ft_amount``); on Radiant that is the funded output's value too (1 photon = 1 token
+    unit), but it is taken from the file or the flag, not derived from the output this read
+    selected, so an old file without it is asked for ``--covenant-amount``.
 
     Any wrong answer is caught by the SPK equality check in
     :func:`~pyrxd.cli.swap_recovery.assert_covenant_matches`, so this is a convenience
@@ -492,17 +527,26 @@ async def _prepare(
     policy: DeadlineFeePolicy,
     kind: str,
     allow_overpay: bool = False,
+    covenant_outpoint: str | None = None,
 ) -> tuple[Any, Any, Any]:
     """Read the covenant + fee UTXOs, rebuild the covenant, and pick a fee input.
 
-    Reads only: ``get_utxos`` / ``get_history`` / ``get_tip_height``. The client's
-    ``broadcast`` method is never called on this path.
+    Reads only: ``get_utxos`` / ``get_history`` / ``get_transaction`` / ``get_tip_height``. The
+    client's ``broadcast`` method is never called on this path.
+
+    The covenant output is identified by
+    :func:`~pyrxd.cli.swap_recovery.read_covenant_chain_state` — ``--covenant-outpoint``, then
+    the recovery file's ``rxd_covenant_outpoint``, then the earliest-confirmed payment to the
+    script. When the amount is already known (flag or file) the covenant is rebuilt and checked
+    against the recovery file's SPK FIRST, so that a verified amount, not a guessed one, filters
+    the outputs by value (for every variant the amount is the funded output's value; for ft
+    because 1 photon = 1 token unit on Radiant).
     """
-    async with ctx.make_client() as client:
-        chain = await read_covenant_chain_state(client, facts.rxd_covenant_spk)
-        amount = _resolve_amount(facts.asset_variant, extras, chain.carrier_value, covenant_amount)
+    pin = covenant_outpoint or extras.rxd_covenant_outpoint
+
+    def _rebuild(amount: int) -> Any:
         taker_pkh, maker_pkh = covenant_pkhs(swap_file, taker_pkh_hex=taker_pkh_hex, maker_pkh_hex=maker_pkh_hex)
-        covenant = rebuild_covenant(
+        return rebuild_covenant(
             asset_variant=facts.asset_variant,
             taker_pkh=taker_pkh,
             maker_pkh=maker_pkh,
@@ -511,7 +555,37 @@ async def _prepare(
             amount=amount,
             genesis_ref=genesis_ref or extras.asset_genesis_ref,
         )
-        assert_covenant_matches(covenant, facts.rxd_covenant_spk)
+
+    known = _known_amount(facts.asset_variant, extras, covenant_amount)
+    covenant = None
+    if known is not None:
+        try:
+            covenant = _rebuild(known)
+        except Exception:  # deterministic: the same call below raises it again, after the chain read
+            covenant = None
+        if covenant is not None:
+            assert_covenant_matches(covenant, facts.rxd_covenant_spk)
+    # Only an amount the SPK check has just VERIFIED filters outputs by value.
+    expected_value = known if covenant is not None else None
+    async with ctx.make_client() as client:
+        chain = await read_covenant_chain_state(
+            client, facts.rxd_covenant_spk, pin_outpoint=pin, expected_value=expected_value
+        )
+        if covenant is None:
+            covenant = _rebuild(_resolve_amount(facts.asset_variant, extras, chain.carrier_value, covenant_amount))
+            try:
+                assert_covenant_matches(covenant, facts.rxd_covenant_spk)
+            except ValidationError as exc:
+                if pin is None and chain.ignored_outputs:
+                    # The amount was DERIVED from the output the selection rule picked, and other
+                    # outputs pay the script: the pick may not be the covenant.
+                    raise ValidationError(
+                        f"{exc} The amount was read from {chain.outpoint}, the earliest-confirmed of "
+                        f"{chain.ignored_outputs + 1} outputs paying the covenant script — it may not be this "
+                        "swap's covenant. Pass --covenant-outpoint TXID:VOUT (the covenant's funding outpoint) "
+                        "or --covenant-amount."
+                    ) from exc
+                raise
 
         utxos = await read_fee_utxos(client, fee_wif)
     # Selecting a fee input needs a size, but the size is only knowable once the transaction
@@ -646,13 +720,28 @@ def _spend_lines(spend: ColdSpend, *, tip_height: int) -> list[str]:
 
 def _emit_spend(ctx: CliContext, spend: ColdSpend, facts: Any, chain: Any) -> None:
     payload = _spend_payload(spend, facts)
+    payload["covenant_identified_by"] = chain.identified_by
+    payload["ignored_outputs"] = chain.ignored_outputs
     if ctx.output_mode == "json":
         click.echo(emit(payload, mode="json"))
         return
     if ctx.output_mode == "quiet":
         click.echo(emit(payload, mode="quiet", quiet_field="raw_hex"))
         return
-    click.echo(emit(payload, mode="human", human_lines=_spend_lines(spend, tip_height=chain.tip_height)))
+    lines = _spend_lines(spend, tip_height=chain.tip_height)
+    if chain.ignored_outputs:
+        # Directly under the "covenant :" line, where the operator checks which output is spent.
+        lines.insert(
+            3,
+            f"  ⚠ {chain.ignored_outputs} other output(s) pay the covenant script and were NOT spent: anyone can "
+            "pay it. The covenant above is "
+            + (
+                "the outpoint you pinned."
+                if chain.identified_by == "pinned"
+                else "the earliest-confirmed payment; pass --covenant-outpoint if that is not your covenant."
+            ),
+        )
+    click.echo(emit(payload, mode="human", human_lines=lines))
 
 
 def _cold_options(f: Any) -> Any:
@@ -670,6 +759,13 @@ def _cold_options(f: Any) -> Any:
             click.option("--fee-wif-file", default=None, help="File holding the fee key WIF (mode 0600, owner-only)."),
             click.option("--fee-utxo", default=None, help="Use this fee input TXID:VOUT instead of auto-selecting."),
             click.option("--covenant-amount", type=int, default=None, help="The covenant's amount parameter."),
+            click.option(
+                "--covenant-outpoint",
+                default=None,
+                help="The covenant's funding outpoint TXID:VOUT, for when other outputs pay the covenant "
+                "script. Overrides the recovery file's rxd_covenant_outpoint; without either, the "
+                "earliest-confirmed payment to the script is taken as the covenant.",
+            ),
             click.option("--genesis-ref", default=None, help="FT/NFT asset genesis ref TXID:VOUT."),
             click.option("--taker-pkh", default=None, help="Taker RXD pkh (40 hex) if the file lacks the key."),
             click.option("--maker-pkh", default=None, help="Maker RXD pkh (40 hex) if the file lacks the key."),
@@ -716,6 +812,7 @@ def swap_build_claim_cmd(
     fee_wif_file: str | None,
     fee_utxo: str | None,
     covenant_amount: int | None,
+    covenant_outpoint: str | None,
     genesis_ref: str | None,
     taker_pkh: str | None,
     maker_pkh: str | None,
@@ -761,6 +858,7 @@ def swap_build_claim_cmd(
                 policy=policy,
                 kind="claim",
                 allow_overpay=allow_overpay,
+                covenant_outpoint=covenant_outpoint,
             ),
             scrub=electrumx_urls(ctx),
         )
@@ -798,6 +896,7 @@ def swap_build_refund_cmd(
     fee_wif_file: str | None,
     fee_utxo: str | None,
     covenant_amount: int | None,
+    covenant_outpoint: str | None,
     genesis_ref: str | None,
     taker_pkh: str | None,
     maker_pkh: str | None,
@@ -836,6 +935,7 @@ def swap_build_refund_cmd(
                 policy=policy,
                 kind="refund",
                 allow_overpay=allow_overpay,
+                covenant_outpoint=covenant_outpoint,
             ),
             scrub=electrumx_urls(ctx),
         )

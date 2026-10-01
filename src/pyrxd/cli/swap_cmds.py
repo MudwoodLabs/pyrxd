@@ -37,11 +37,15 @@ from .format import emit, sanitize_terminal
 from .swap_recovery import (
     CounterLegStatus,
     CovenantSpend,
+    CovenantUnidentified,
     describe_network_error,
     electrumx_urls,
+    locate_covenant_funding,
+    parse_outpoint,
     parse_recovery_extras,
     read_counter_leg,
     read_covenant_spend,
+    recorded_covenant_value,
 )
 
 #: Default Esplora/mempool.space base URL for the BTC counter-leg read (a GET-only API).
@@ -343,12 +347,18 @@ def _covenant_spent(
     TAKER_CLAIM       spent, no p (refunded)       TAKER_CLAIMED_AND_REFUNDED
     UNKNOWN           spent either way             BOTH_SPENT_OUTCOME_UNKNOWN
     any               LOCKED                       COUNTER_LEG_LOCKED
+    any               BTC refund, unconfirmed      COUNTER_LEG_REFUND_UNCONFIRMED
     any               anything else                COVENANT_SPENT
     ================  ===========================  ===============================
 
     SETTLED used to be printed for every "both legs spent", so a maker who CSV-refunded the
     covenant AND claimed the counter-leg — the taker losing both legs — read "nothing left to
     claim or refund" directly above the counter-leg row that contradicted it.
+
+    Every row rests on one ElectrumX server's answer and one counter-chain server's, and the text
+    says so. None of them says outright that nothing is left to claim or refund: a refund the
+    explorer reports but has not confirmed can still be replaced by a claim (the BTC claim branch
+    has no timelock), and a covenant spend one ElectrumX reports may not exist on any other.
     """
     chain = counter_chain.upper()
     kind = spend_kind if spend_kind in ("TAKER_CLAIM", "MAKER_REFUND") else None
@@ -363,9 +373,14 @@ def _covenant_spent(
         if counter_chain == "btc"
         else ""
     )
+    # The host came from the operator's own URL, but the line it lands on is printed raw.
+    source = sanitize_terminal(counter_leg_source, max_len=120) if counter_leg_source else "one server"
+    rxd_hedge = "The covenant's spend is one ElectrumX server's answer, too."
+    second = (
+        "Confirm both spends on a second, independent source (another ElectrumX server and another "
+        f"{chain} explorer or node) before treating the swap as finished."
+    )
     if counter_leg_state in _COUNTER_LEG_RESOLVED:
-        # The host came from the operator's own URL, but the line it lands on is printed raw.
-        source = sanitize_terminal(counter_leg_source, max_len=120) if counter_leg_source else "one server"
         claimed = counter_leg_state == "CLAIMED_PREIMAGE_REVEALED"
         how_spent = "claimed with p" if claimed else "spent by a transaction that reveals no preimage (a refund)"
         hedge = f"{source} reports the {chain} leg {how_spent} — that is one server's answer, not a verified fact."
@@ -373,24 +388,26 @@ def _covenant_spent(
             return (
                 "MAKER_REFUNDED_AND_CLAIMED",
                 f"The MAKER took BOTH legs: they CSV-refunded the RXD covenant AND claimed the {chain} leg. "
-                f"{hedge} TAKER: you received neither the asset nor your {chain} back, and there is nothing "
-                "left on chain to claim or refund. Read both spending transactions before acting on this.",
+                f"{hedge} {rxd_hedge} TAKER: if a second, independent source confirms both spends, you received "
+                f"neither the asset nor your {chain} back. If the covenant is still unspent on another ElectrumX "
+                "server, claim it with p now. Read both spending transactions before acting on this.",
             )
         if kind == "TAKER_CLAIM" and not claimed:
             return (
                 "TAKER_CLAIMED_AND_REFUNDED",
                 f"The TAKER took BOTH legs: they claimed the RXD covenant with p AND the {chain} leg was "
-                f"spent without revealing p. {hedge} MAKER: you received neither the {chain} nor the asset "
-                "back, and there is nothing left on chain to claim or refund. Read both spending transactions "
-                "before acting on this.",
+                f"spent without revealing p. {hedge} {rxd_hedge} MAKER: if a second, independent source confirms "
+                f"both spends, you received neither the {chain} nor the asset back. Read both spending "
+                "transactions before acting on this.",
             )
         if kind is None:
             return (
                 "BOTH_SPENT_OUTCOME_UNKNOWN",
-                f"Both legs are spent, but the RXD covenant's spending transaction could not be read, so whether "
-                f"the taker claimed it or the maker refunded it is UNKNOWN — this is NOT a confirmed "
-                f"settlement. {hedge} Nothing is left to claim or refund; read the covenant's spending "
-                "transaction to see who received the asset.",
+                f"Both legs are reported spent, but the RXD covenant's spending transaction could not be read, so "
+                f"whether the taker claimed it or the maker refunded it is UNKNOWN — this is NOT a confirmed "
+                f"settlement. {hedge} The covenant's state is one ElectrumX server's answer. Read the covenant "
+                "on a second, independent ElectrumX server: if it is still unspent there and you are the TAKER "
+                "holding p, claim it now; otherwise its spending transaction shows who received the asset.",
             )
         outcome = (
             f"The swap COMPLETED: the taker claimed the RXD covenant and the maker claimed the {chain} leg with p."
@@ -400,8 +417,35 @@ def _covenant_spent(
         )
         return (
             "SETTLED",
-            f"{outcome} {hedge} There is nothing left to claim or refund. No further action once a second "
-            "source agrees.",
+            f"{outcome} {hedge} {rxd_hedge} {second} No further action once a second, independent source "
+            "confirms both spends.",
+        )
+    if counter_leg_state == "REFUND_REPORTED_UNCONFIRMED" and counter_chain == "btc":
+        # A BTC refund still in the mempool is not a finished leg: the HTLC's claim branch has no
+        # timelock, so whoever holds p can replace it with a claim until it confirms. (An ETH
+        # refund from one RPC shares the state name but is handled by the rows below.)
+        unconfirmed = (
+            f"{source} reports the {chain} leg spent by a refund that is NOT CONFIRMED (see Counter-leg below): "
+            "until it confirms, a claim with p can still replace it."
+        )
+        if kind == "TAKER_CLAIM":
+            return (
+                "COUNTER_LEG_REFUND_UNCONFIRMED",
+                f"The taker CLAIMED the RXD covenant, so p is public in that spend. {unconfirmed} MAKER: claim "
+                f"your {chain} with p now, at a fee that outbids the refund, before it confirms.",
+            )
+        who = (
+            "The maker CSV-REFUNDED the RXD covenant."
+            if kind == "MAKER_REFUND"
+            else (
+                "The RXD covenant is SPENT (by the taker's claim or the maker's CSV refund; this read cannot tell which)."
+            )
+        )
+        return (
+            "COUNTER_LEG_REFUND_UNCONFIRMED",
+            f"{who} {unconfirmed} TAKER: keep watching your refund until it confirms, fee-bump it if it is slow, "
+            f"and check it on a second, independent explorer — the maker holds p and can sweep your {chain} "
+            "with it until then.",
         )
     if counter_leg_state == "LOCKED":
         if kind == "MAKER_REFUND":
@@ -473,7 +517,16 @@ def classify_covenant(
         return (
             "NOT_FUNDED",
             "Covenant not on chain — not yet funded, or funded then spent and pruned. "
-            "Verify the SPK / --network, or the swap is already settled.",
+            "Verify the SPK / --network, or the swap is already settled. That is one ElectrumX server's "
+            "answer: if the counter-leg shows p revealed, read the covenant on a second, independent "
+            "ElectrumX server before concluding anything.",
+        )
+    if covenant_state == "unidentified":
+        return (
+            "COVENANT_UNIDENTIFIED",
+            "This read could not tell which output at the covenant script is this swap's covenant (see the "
+            "reason above), and anyone can pay that script. Pass --covenant-outpoint TXID:VOUT — the covenant "
+            "funding outpoint from your run log — or, if you pinned one, check it; then re-run.",
         )
     if covenant_state == "spent":
         return _covenant_spent(
@@ -509,52 +562,84 @@ def classify_covenant(
     )
 
 
-async def _read_covenant(ctx: CliContext, spk_hex: str, hashlock_hex: str | None = None) -> dict[str, Any]:
+async def _read_covenant(
+    ctx: CliContext,
+    spk_hex: str,
+    hashlock_hex: str | None = None,
+    *,
+    pin_outpoint: str | None = None,
+    expected_value: int | None = None,
+    t_rxd_blocks: int | None = None,
+) -> dict[str, Any]:
     """Read-only ElectrumX query: covenant liveness + funding height + current tip. Never broadcasts.
+
+    The covenant is ONE output, found by :func:`~pyrxd.cli.swap_recovery.locate_covenant_funding`
+    (``pin_outpoint`` when known, else the earliest-confirmed payment to the script, of
+    ``expected_value`` when known) — never "any unspent output at the script". The script is a pure
+    function of public terms, so other outputs can sit at it; whether the covenant is live, its
+    value and its funding height are those of the identified output alone. Other outputs are
+    counted (``ignored_outputs``) and change nothing else.
 
     For a SPENT covenant it also reads the spending transaction and records which branch took it
     (``covenant_spend``): without that, a maker's refund and a taker's claim are indistinguishable.
     A failure of that second read is reported as ``UNKNOWN`` with its reason, never raised — the
     liveness verdict above it is still worth printing.
     """
-    sh = electrumx_script_hash(spk_hex)
     async with ctx.make_client() as client:
-        utxos = await client.get_utxos(sh)
-        now_height = int(await client.get_tip_height())
-        if utxos:
-            # > 0, not truthiness: ElectrumX reports 0 AND -1 for an unconfirmed UTXO (-1 when
-            # a parent is unconfirmed too), and -1 is truthy — it was taken as a funding height,
-            # giving a depth of tip + 2 and a REFUND_OPEN verdict for a covenant in no block.
-            heights = [int(u.height) for u in utxos if int(u.height) > 0]
-            funding_height = min(heights) if heights else None
-            # A funding height above the tip is two reads of a moving chain (a lagging endpoint),
-            # not a depth; reported unmeasured rather than as zero or negative.
+        try:
+            loc = await locate_covenant_funding(
+                client, spk_hex, pin_outpoint=pin_outpoint, expected_value=expected_value
+            )
+        except CovenantUnidentified as exc:
             return {
-                "covenant_state": "live",
-                "funding_height": funding_height,
-                "depth": (
-                    (now_height - funding_height + 1)
-                    if funding_height is not None and funding_height <= now_height
-                    else None
-                ),
-                "value_photons": sum(int(u.value) for u in utxos),
-                "now_height": now_height,
+                "covenant_state": "unidentified",
+                "covenant_reason": str(exc),
+                "funding_height": None,
+                "depth": None,
+                "value_photons": None,
+                "now_height": None,
             }
-        history = await client.get_history(sh)
+        now_height = loc.tip_height
         out: dict[str, Any] = {
-            "covenant_state": "spent" if history else "not_found",
+            "covenant_state": {"live": "live", "spent": "spent"}.get(loc.state, "not_found"),
+            "covenant_outpoint": loc.outpoint,
+            "covenant_identified_by": loc.identified_by,
+            "ignored_outputs": loc.ignored_outputs,
             "funding_height": None,
             "depth": None,
             "value_photons": None,
             "now_height": now_height,
         }
-        if history:
+        if loc.state == "absent" and loc.identified_by == "pinned":
+            out["covenant_reason"] = (
+                f"the pinned covenant outpoint {loc.outpoint} was not found: it is neither live at the covenant "
+                "script nor in the script's history"
+            )
+        if loc.state == "live":
+            # A funding height above the tip is two reads of a moving chain (a lagging endpoint),
+            # not a depth; reported unmeasured rather than as zero or negative. An unconfirmed
+            # covenant has no height (ElectrumX reports 0 or -1; the locator maps both to None).
+            fh = loc.height
+            out["funding_height"] = fh
+            out["depth"] = (now_height - fh + 1) if fh is not None and fh <= now_height else None
+            out["value_photons"] = loc.value
+            return out
+        history = list(loc.history)
+        if loc.state == "spent":
             try:
                 hashlock = bytes.fromhex(hashlock_hex) if hashlock_hex else None
             except ValueError:
                 hashlock = None
             try:
-                spend = await read_covenant_spend(client, spk_hex, history, hashlock=hashlock)
+                spend = await read_covenant_spend(
+                    client,
+                    spk_hex,
+                    history,
+                    hashlock=hashlock,
+                    outpoint=loc.outpoint,
+                    funding_height=loc.height,
+                    t_rxd_blocks=t_rxd_blocks,
+                )
             except Exception as exc:
                 spend = CovenantSpend(
                     "UNKNOWN",
@@ -599,6 +684,13 @@ def swap_group() -> None:
 @click.option("--btc-api-url", default=DEFAULT_BTC_API_URL, show_default=True, help="Esplora / mempool.space base URL.")
 @click.option("--eth-contract", default=None, help="The swap's per-swap ETH HTLC contract address (0x…).")
 @click.option("--eth-rpc-url", default=None, help="Ethereum JSON-RPC URL (read-only methods only).")
+@click.option(
+    "--covenant-outpoint",
+    "covenant_outpoint",
+    default=None,
+    help="The RXD covenant's funding outpoint TXID:VOUT. Overrides the recovery file's rxd_covenant_outpoint; "
+    "without either, the earliest-confirmed payment to the covenant script is taken as the covenant.",
+)
 @click.pass_obj
 def swap_status_cmd(
     ctx: CliContext,
@@ -608,6 +700,7 @@ def swap_status_cmd(
     btc_api_url: str,
     eth_contract: str | None,
     eth_rpc_url: str | None,
+    covenant_outpoint: str | None,
 ) -> None:
     """Show a swap's identity, timelock deadlines, and (with --check-chain) the safe next action."""
     try:
@@ -618,6 +711,20 @@ def swap_status_cmd(
         extras = parse_recovery_extras(swap_file)
     except (ValueError, ValidationError, json.JSONDecodeError, OSError) as exc:
         raise click.ClickException(f"could not parse swap file: {exc}") from exc
+    pin = covenant_outpoint or extras.rxd_covenant_outpoint
+    if check_chain and pin is not None:
+        # Only where it is used: a malformed pin must not stop the offline identity view.
+        pin_name = "--covenant-outpoint" if covenant_outpoint else "the recovery file's rxd_covenant_outpoint"
+        try:
+            parse_outpoint(pin, what=pin_name)
+        except ValidationError as exc:
+            msg = str(exc) if pin_name in str(exc) else f"{pin_name}: {exc}"
+            raise click.ClickException(f"invalid {sanitize_terminal(msg, max_len=200)}") from exc
+    # The covenant's amount IS its funded output's value for every variant, so it tells the covenant
+    # from a payment of another value. For ft that holds because 1 photon = 1 token unit on Radiant
+    # (security/units.py, TokenUnits): the FT covenant is built from the token amount and funded with
+    # an output whose value is that amount, which is also what RadiantChainIO.find_covenant_utxo filters on.
+    expected_value = recorded_covenant_value(facts.asset_variant, extras)
 
     payload: dict = {
         "swap_file": str(swap_file),
@@ -639,7 +746,16 @@ def swap_status_cmd(
 
     if check_chain:
         try:
-            chain = asyncio.run(_read_covenant(ctx, facts.rxd_covenant_spk, facts.hashlock_hex))
+            chain = asyncio.run(
+                _read_covenant(
+                    ctx,
+                    facts.rxd_covenant_spk,
+                    facts.hashlock_hex,
+                    pin_outpoint=pin,
+                    expected_value=expected_value,
+                    t_rxd_blocks=facts.t_rxd_blocks,
+                )
+            )
         except Exception as exc:  # surface any read failure as a clean CLI error
             raise click.ClickException(
                 "--check-chain read failed: "
@@ -732,6 +848,27 @@ def swap_status_cmd(
         chain = payload["chain"]
         lines.append("")
         lines.append(f"On-chain (read-only): covenant {chain['covenant_state'].upper()}")
+        if chain.get("covenant_reason"):
+            lines.append(f"  reason     : {sanitize_terminal(chain['covenant_reason'], max_len=400)}")
+        if chain.get("covenant_outpoint"):
+            how = (
+                "pinned by the recovery file / --covenant-outpoint"
+                if chain.get("covenant_identified_by") == "pinned"
+                else "the earliest-confirmed payment to the covenant script"
+            )
+            lines.append(f"  outpoint   : {sanitize_terminal(chain['covenant_outpoint'], max_len=80)}  ({how})")
+        if chain.get("ignored_outputs"):
+            n = chain["ignored_outputs"]
+            if chain.get("covenant_identified_by") == "pinned":
+                why = "none is the outpoint you pinned."
+            elif chain["covenant_state"] == "live":
+                why = (
+                    "the earliest-confirmed one was taken as the covenant; pass --covenant-outpoint if it is not "
+                    "this swap's."
+                )
+            else:
+                why = "none carries the recorded covenant amount, so none was taken as the covenant."
+            lines.append(f"  ⚠ {n} other output(s) are live at the covenant script, which anyone can pay: {why}")
         spend = chain.get("covenant_spend")
         if spend:
             lines.append(f"  spent by   : {spend['kind']} — {sanitize_terminal(spend['reason'], max_len=300)}")
