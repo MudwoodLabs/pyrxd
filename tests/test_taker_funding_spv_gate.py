@@ -766,46 +766,73 @@ def test_the_median_time_rule_and_spacing_are_derived_from_the_vendored_radiant_
         median_time_past(list(range(12)))
 
 
-def test_the_local_clock_tolerance_is_radiant_cores_max_future_block_time():
-    """``LOCAL_CLOCK_BEHIND_TOLERANCE_S`` is READ from the vendored ``chain.h`` (``MAX_FUTURE_BLOCK_TIME``),
-    and the consensus check that applies it is found in ``validation.cpp``."""
-    import re
-
-    vendor = ROOT / "tests" / "vendor" / "radiant_core"
-    chain_h = (vendor / "chain.h").read_text()
-    a, b, c = re.search(r"static constexpr int64_t MAX_FUTURE_BLOCK_TIME = (\d+) \* (\d+) \* (\d+);", chain_h).groups()
-    assert int(a) * int(b) * int(c) == funding_spv.LOCAL_CLOCK_BEHIND_TOLERANCE_S == 7200
-    assert "block.GetBlockTime() > nAdjustedTime + MAX_FUTURE_BLOCK_TIME" in (vendor / "validation.cpp").read_text()
+def test_the_local_clock_tolerance_is_one_nominal_block_spacing():
+    """``LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S`` is policy, stated: one nominal spacing (300 s)."""
+    assert funding_spv.LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S == funding_spv.TARGET_BLOCK_SPACING_S == 300
 
 
 def test_a_local_clock_behind_the_chain_is_refused_not_clamped(monkeypatch):
-    """``E = now - MTP(R)`` was clamped at zero, so a clock 9,000 s slow made a two-and-a-half-hour-old
-    tip read as fresh: the bound fell to the proved depth and steps 6 and 7 passed on a window that
-    is gone. On a value-bearing network, a clock more than ``MAX_FUTURE_BLOCK_TIME`` (7,200 s) behind
-    the newest verified header is now REFUSED, saying so; a correct clock and any skew up to the
-    tolerance pass, and a skew that puts ``now`` before the reference time is stated in the note."""
+    """``E = now - MTP(R)`` was clamped at zero, so a clock hours slow made a stale tip read as fresh:
+    the bound fell to the proved depth and steps 6 and 7 passed on a window that is gone. On a
+    value-bearing network a local clock behind the chain's median time is now REFUSED, saying so: more
+    than the 300 s tolerance before the median time past of the newest verified headers. A correct clock
+    and any skew within the tolerance pass, and a skew that puts ``now`` before the reference time is
+    stated in the note. Headers 300 s apart, the newest stamped ``_NOW``: that median is ``_NOW - 1500``,
+    so the boundary is a clock 1,800 s slow."""
     c, kw = _dust_case(monkeypatch)  # value-bearing, newest header stamped _NOW
     ev = _two_operators(c.evidence())
-    tip_time = _time(c.headers[c.top])
-    assert tip_time == _NOW
+    assert _time(c.headers[c.top]) == _NOW
+    tip_mtp = median_time_past([_time(c.headers[h]) for h in range(c.top - 10, c.top + 1)])
+    assert tip_mtp == _NOW - 1500
 
-    def run(now):
-        return verify_maker_funding(ev, **{**kw, "now_unix_s": now}, value_at_stake_photons=10_000 * PHOTONS_PER_RXD)
+    def run(now, value=10_000 * PHOTONS_PER_RXD):
+        return verify_maker_funding(ev, **{**kw, "now_unix_s": now}, value_at_stake_photons=value)
 
     honest = run(_NOW)
     assert "E was taken as 0" not in honest.bound_note
     stated = 0
-    for skew in (60, 300, 1800, 7200):
-        r = run(_NOW - skew)
+    # At a small value the reference header is the newest, so MTP(R) is that same median and a clock
+    # within the tolerance below it is clamped — and said so.
+    for skew, value in ((60, None), (300, None), (1500, None), (1800, None), (1600, 1000), (1800, 1000)):
+        r = run(_NOW - skew) if value is None else run(_NOW - skew, value)
         assert r.elapsed_blocks_upper >= r.proved_depth
         if _NOW - skew < r.reference_time:
-            assert "before the reference time (within the 7200 s tolerance), so E was taken as 0" in r.bound_note
+            assert "before the reference time (within the 300 s tolerance of the chain's median time)" in r.bound_note
             stated += 1
     assert stated, "non-vacuity: no skew inside the tolerance put now before the reference time"
-    for skew in (7201, 9000, 86_400):
+    for skew in (1801, 7200, 9000, 86_400):
         with pytest.raises(MakerFundingNotVerified, match="local clock appears to be behind the chain") as exc:
             run(_NOW - skew)
-        assert f"{skew} s before the timestamp of block {c.top}" in str(exc.value)
+        assert f"{skew - 1500} s before the median time past of the newest verified headers" in str(exc.value)
+        assert f"(blocks {c.top - 10} to {c.top})" in str(exc.value)
+
+
+def test_an_honest_clock_behind_the_newest_headers_own_timestamp_but_not_the_median_passes(monkeypatch):
+    """The refusal compared ``now`` with the NEWEST header's own timestamp, which can sit ahead of the
+    local clock, so an honest clock a minute behind a newest header stamped two hours ahead was refused
+    for about a block. The median of the newest headers is the reference now: that clock passes, and a
+    clock behind the median is still refused."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    spk = b"\x76\xa9" + bytes(32)
+    probe = build_funding_chain(spk=spk, value=1000, confs=40, base=base, bits=_HARD_BITS, tip_time=_NOW)
+    c = build_funding_chain(
+        spk=spk, value=1000, confs=40, base=base, bits=_HARD_BITS, tip_time=_NOW, time_at={probe.top: _NOW + 7200}
+    )
+    assert _time(c.headers[c.top]) == _NOW + 7200
+    kw = dict(chain=_chain, expected_spk=spk, expected_value=1000, burial_blocks=6)
+    ev = _two_operators(c.evidence())
+    value = 10_000 * PHOTONS_PER_RXD
+    r = verify_maker_funding(ev, now_unix_s=_NOW - 60, value_at_stake_photons=value, **kw)
+    assert r.proved_depth == 40
+    tip_mtp = median_time_past([_time(c.headers[h]) for h in range(c.top - 10, c.top + 1)])
+    assert tip_mtp - funding_spv.LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S < _NOW - 60
+    with pytest.raises(MakerFundingNotVerified, match="local clock appears to be behind the chain"):
+        verify_maker_funding(
+            ev,
+            now_unix_s=tip_mtp - funding_spv.LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S - 1,
+            value_at_stake_photons=value,
+            **kw,
+        )
 
 
 async def test_a_slow_clock_cannot_make_the_coordinator_fund(monkeypatch):

@@ -381,10 +381,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     quantile). `reported` is the largest depth any configured source reports, grouped by operator
     (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
     term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
-    `scripts/dust_swap_run.py` passes it. On mainnet a local clock more than 7,200 s (Radiant Core's
-    `MAX_FUTURE_BLOCK_TIME`) behind the newest verified header's timestamp is refused with "the
-    local clock appears to be behind the chain", rather than counted as no elapsed time; within that
-    tolerance a `now` before `MTP(R)` gives `E = 0` and `bound_note` says so. The `now` the gate
+    `scripts/dust_swap_run.py` passes it. On mainnet a local clock behind the chain's median time is
+    refused with "the local clock appears to be behind the chain", rather than counted as no elapsed
+    time: `now` more than 300 s (`LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S`, one nominal spacing) before
+    the median time past of the newest verified headers. Within that tolerance a `now` before
+    `MTP(R)` gives `E = 0` and `bound_note` says so. The `now` the gate
     judges is taken AFTER its reads:
     `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
     `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
