@@ -241,7 +241,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read. With a spent covenant, pruned logs used to produce `COUNTER_LEG_LOCKED` ("your ETH is still
   locked — refund it now"); they now produce `COVENANT_SPENT`. The ETH counter-leg no longer has a
   `LOCKED` state at all: a log can show that the contract was claimed or refunded, never that it
-  was not.
+  was not. A refund is definitive (`SPENT_NO_PREIMAGE`) only when the RPC returns the transaction
+  that emitted the `Refunded` log and its hash matches the log's. A `Refunded` log with no
+  transaction is the new state `REFUND_REPORTED_UNCONFIRMED`: nothing in a refund log can be
+  verified, and read as a refund it let one RPC turn a taker's covenant claim into
+  `TAKER_CLAIMED_AND_REFUNDED`, telling a maker who could still claim the ETH that nothing was left
+  to claim. `status` treats it like `UNKNOWN` (`COVENANT_SPENT`, with the advice to claim), and
+  `recover-preimage` reports it as inconclusive (exit 2).
 - **`swap status` called a maker's refund plus the maker's counter-leg claim SETTLED.** The covenant
   read used only `get_utxos` / `get_history`, which cannot tell the taker's claim from the maker's
   CSV refund, so a maker who refunded the RXD covenant AND claimed the taker's BTC or ETH with `p`
@@ -321,15 +327,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   aiohttp's `ClientResponseError` quotes the full URL, so an API key in its path or query appeared
   in `status`'s counter-leg row, in `status --json`, and in `recover-preimage`'s error. There it was
   worse: `ClientResponseError` is not an `OSError`, so it escaped as "unexpected failure", exit 4,
-  with the URL as the printed cause. Present since the counter-leg read was added in 0.14.0. Every
-  place in the swap CLI that prints an exception from a chain read now goes through one renderer
-  (`describe_network_error`): the exception type, its HTTP status, and the endpoint's host, never
-  the URL. A library exception's own text is dropped; pyrxd's own error text is kept with every
-  part of the endpoint URLs that can carry a credential removed (`redact_endpoint_secrets`), which
-  also covers an RPC error body that echoes the key. `recover-preimage`, `build-claim` and
-  `build-refund` now map an aiohttp error or a timeout to the ordinary "a chain read failed" exit 2.
-  The ElectrumX error paths in `swap status --check-chain`, `build-claim`, `build-refund` and the
-  orderbook commands scrub every configured ElectrumX URL the same way.
+  with the URL as the printed cause. Present since the counter-leg read was added in 0.14.0. A
+  transport exception from a counter-leg read is now rendered by `describe_network_error`: the
+  exception type, its HTTP status, and the endpoint's host, never the URL; a library exception's
+  own text is dropped. pyrxd's own error text (which can wrap an RPC error body echoing the key)
+  is printed through `redact_endpoint_secrets`, which removes every credential-bearing part of each
+  endpoint URL the command used. `recover-preimage`, `build-claim` and `build-refund` now map an
+  aiohttp error, a timeout, or a 200 whose body is not JSON to a clean exit 2 instead of
+  "unexpected failure", exit 4. The ElectrumX error paths in `swap status --check-chain`,
+  `build-claim`, `build-refund` and the reserve/post/take/cancel/refund orderbook commands scrub
+  every configured ElectrumX URL; `swap orders`, which reads through `--node-rpc`, scrubs that URL.
+- **Endpoint credentials were printed outside the swap commands too.** The ElectrumX failover client
+  logged `<call> failed on <URL>` to stderr for every failed read, with the URL's user name,
+  password, path and query; 28 other places — mostly `fix: check that <URL> is reachable` hints in
+  the glyph, wallet, query, hashmark and setup commands — and the TLS-pin errors did the same; and
+  the `swap orders`
+  node-RPC transport wrapped failures as the aiohttp exception's repr, which quotes the full
+  request URL (a redirect loop printed the API key), and passed a node error body that echoed the
+  request path through verbatim. Every one of those now names the endpoint as
+  `scheme://host:port` (`pyrxd.network.redaction.redacted_url`), and the node-RPC transport scrubs
+  a node's error text of its URL. `redact_endpoint_secrets` matched exact strings of six or more
+  characters, so it missed a short password, a key a server re-encoded (`~` as `%7E`) or
+  upper-cased, and a fragment; it now derives each URL's user name, password, path segments, query
+  values and fragment and matches them case-insensitively and percent-encoded, keeping only
+  trivially common path/query tokens (a letters-only word of up to five characters such as `api`,
+  `v` plus up to three digits, up to five digits); the user name and password are redacted at any
+  length. `setup --json` reports
+  `electrumx_url` as `scheme://host:port`. The exit-4 "unexpected failure" path scrubs every URL on
+  the command line.
 - **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
   exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
   from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no

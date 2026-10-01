@@ -137,16 +137,24 @@ human sizing the fee is the only remaining control.
     timelock, so until then a maker holding ``p`` can still sweep it. After a taker's claim the
     maker must claim the counter-leg with ``p`` before the taker's refund opens.
   - ``COVENANT_SPENT`` — the covenant is spent and the counter-leg was not checked, its read
-    failed, or its state is ``UNKNOWN``. It does not mean the swap is over.
+    failed, or its state is ``UNKNOWN`` or ``REFUND_REPORTED_UNCONFIRMED``. It does not mean the
+    swap is over.
 
   The ETH counter-leg has no ``LOCKED`` state: a log can show that the HTLC contract was claimed
   (``Claimed``) or refunded (``Refunded``), never that it was not, and an empty log set is also
   what a pruned node or a log-range limit returns for a claimed contract. It is reported
   ``UNKNOWN``. A preimage in a ``Claimed`` log is
-  recovered from the log itself, whether or not the RPC returns the claim transaction.
+  recovered from the log itself, whether or not the RPC returns the claim transaction. A refund
+  is only definitive (``SPENT_NO_PREIMAGE``) when the RPC returns the transaction that emitted the
+  ``Refunded`` log and its hash matches the log's; a ``Refunded`` log alone carries nothing to
+  verify, so it is reported ``REFUND_REPORTED_UNCONFIRMED`` and never produces a situation that
+  says nothing is left to claim.
 
   Errors from a counter-leg endpoint are printed as the exception type, HTTP status and host —
-  never the URL, which may carry an API key.
+  never the URL, which may carry an API key. Across the CLI, an endpoint named in an error, a
+  ``fix:`` hint or a failover warning on stderr is shown as ``scheme://host:port`` only, and text
+  an endpoint sends back has the URL's user name, password, path segments, query values and
+  fragment removed (matched case-insensitively and in percent-encoded form).
 
   pyrxd has no command that refunds a counter-leg, so where the taker may have to refund it the
   next action says which harness wrote the recovery file, when that leg's refund opens, and
