@@ -241,9 +241,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read. With a spent covenant, pruned logs used to produce `COUNTER_LEG_LOCKED` ("your ETH is still
   locked — refund it now"); they now produce `COVENANT_SPENT`. The ETH counter-leg no longer has a
   `LOCKED` state at all: a log can show that the contract was claimed or refunded, never that it
-  was not. A refund is definitive (`SPENT_NO_PREIMAGE`) only when the RPC returns the transaction
-  that emitted the `Refunded` log and its hash matches the log's. A `Refunded` log with no
-  transaction is the new state `REFUND_REPORTED_UNCONFIRMED`: nothing in a refund log can be
+  was not. A refund is definitive (`SPENT_NO_PREIMAGE`) only when the RPC returns the raw signed
+  bytes of the transaction that emitted the `Refunded` log (`eth_getRawTransactionByHash`), pyrxd's
+  own keccak256 of those bytes equals the log's transaction hash, and the transaction decoded from
+  them is a `refund()` call to the swap's contract. Transaction JSON from `eth_getTransactionByHash`
+  is not enough: its `hash`, `to` and `input` are separate fields of the server's answer, so one
+  RPC could pair a refund-shaped body with any hash. This still rests on the one RPC: a server
+  willing to sign a `refund()` call that was never mined, and name it in a fabricated log, is not
+  detected without a second source. A `Refunded` log with no transaction pyrxd could verify that
+  way is the new state `REFUND_REPORTED_UNCONFIRMED`: nothing in a refund log can be
   verified, and read as a refund it let one RPC turn a taker's covenant claim into
   `TAKER_CLAIMED_AND_REFUNDED`, telling a maker who could still claim the ETH that nothing was left
   to claim. `status` treats it like `UNKNOWN` (`COVENANT_SPENT`, with the advice to claim), and

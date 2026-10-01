@@ -52,7 +52,7 @@ REFUND_TX = "0x" + "aa" * 32
 
 
 class _Rpc(BaseHTTPRequestHandler):
-    """Answers ``eth_getLogs`` / ``eth_getTransactionByHash`` from ``server.scenario``."""
+    """Answers ``eth_getLogs`` / ``eth_getRawTransactionByHash`` / ``eth_getTransactionByHash``."""
 
     def do_POST(self) -> None:
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -61,6 +61,8 @@ class _Rpc(BaseHTTPRequestHandler):
             result: Any = scenario["logs"]
         elif req["method"] == "eth_getTransactionByHash":
             result = scenario["txs"].get(req["params"][0])
+        elif req["method"] == "eth_getRawTransactionByHash":
+            result = scenario.get("raws", {}).get(req["params"][0])
         else:
             result = None
         body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1), "result": result}).encode()
@@ -101,6 +103,30 @@ def _claim_tx(p: bytes = P) -> dict[str, Any]:
 
 def _refund_tx() -> dict[str, Any]:
     return {"hash": REFUND_TX, "to": ETH_CONTRACT, "input": "0x590e1ae3"}  # refund()
+
+
+def _signed_raw(data: bytes, *, to: str = ETH_CONTRACT, tx_type: int = 2) -> tuple[str, str]:
+    """A REAL signed transaction ``(hash, raw_hex)``, encoded by eth_account (an independent
+    encoder, so pyrxd's decoder is checked against something it did not write). Fresh key."""
+    eth_account = pytest.importorskip("eth_account")
+    from eth_utils import to_checksum_address
+
+    tx: dict[str, Any] = {"nonce": 7, "gas": 60_000, "to": to_checksum_address(to), "value": 0, "data": data}
+    tx["chainId"] = 1
+    if tx_type == 0:
+        tx["gasPrice"] = 10**9
+    elif tx_type == 1:
+        tx.update(type=1, gasPrice=10**9, accessList=[{"address": tx["to"], "storageKeys": ["0x" + "00" * 32]}])
+    else:
+        tx.update(type=2, maxFeePerGas=2 * 10**9, maxPriorityFeePerGas=10**9)
+    signed = eth_account.Account.create().sign_transaction(tx)
+    return "0x" + signed.hash.hex().removeprefix("0x"), "0x" + signed.raw_transaction.hex().removeprefix("0x")
+
+
+def _honest_refund_scenario(tx_type: int = 2) -> dict[str, Any]:
+    """A Refunded() log AND the raw signed refund() transaction that emitted it."""
+    tx_hash, raw = _signed_raw(bytes.fromhex("590e1ae3"), tx_type=tx_type)
+    return {"logs": [_log(REFUNDED_TOPIC0, b"", tx_hash)], "txs": {}, "raws": {tx_hash: raw}}
 
 
 def _eth_status(case, srv, *, client=None, output_mode: str = "human"):
@@ -229,15 +255,69 @@ def test_the_honest_claimed_path_is_unchanged(case, eth_rpc) -> None:
     assert P.hex() in rec.output
 
 
-def test_the_honest_refunded_path_reads_refunded(case, eth_rpc) -> None:
-    """A Refunded() log AND its transaction, returned and hash-checked: the refund is definitive."""
+@pytest.mark.parametrize("tx_type", [0, 1, 2])
+def test_the_honest_refunded_path_reads_refunded(case, eth_rpc, tx_type) -> None:
+    """A Refunded() log AND the raw signed refund() transaction, whose hash pyrxd computes and whose
+    ``to`` and selector it decodes from those bytes: the refund is definitive. Legacy, EIP-2930 and
+    EIP-1559 envelopes, each signed by eth_account."""
     _eth_swap(case)
-    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {REFUND_TX: _refund_tx()}}
+    eth_rpc.scenario = _honest_refund_scenario(tx_type)
     counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
-    assert counter["state"] == "SPENT_NO_PREIMAGE"
+    assert counter["state"] == "SPENT_NO_PREIMAGE", counter
+    assert counter["claim_txid"] == eth_rpc.scenario["logs"][0]["transactionHash"]
     rec = _eth_recover(case, eth_rpc)
     assert rec.exit_code == 1, rec.output
     assert "no preimage has been revealed yet" in rec.output
+
+
+def test_a_lying_rpc_hash_field_beside_a_refund_body_is_not_a_refund(case, eth_rpc) -> None:
+    """Round-3 F2, the reviewer's exact shape: ``{"hash": X, "to": C, "input": "0x590e1ae3"}`` as
+    JSON beside its Refunded() log. Every field is the server's word and ``hash`` was never
+    recomputed, so one lying RPC produced SPENT_NO_PREIMAGE and, with a taker claim,
+    TAKER_CLAIMED_AND_REFUNDED. Without raw bytes pyrxd can hash, it stays unconfirmed."""
+    from .test_swap_recovery_cmds import _spent_by
+
+    _eth_swap(case)
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {REFUND_TX: _refund_tx()}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "REFUND_REPORTED_UNCONFIRMED", counter
+    assert "only as JSON" in counter["reason"]
+    doc = json.loads(_eth_status(case, eth_rpc, client=_spent_by(case, "claim"), output_mode="json").output)
+    assert doc["situation"] == "COVENANT_SPENT", doc["situation"]
+    assert "nothing left" not in doc["chain"]["next_action"]
+    assert _eth_recover(case, eth_rpc).exit_code == 2
+
+
+def test_raw_bytes_that_hash_to_a_different_transaction_are_refused(case, eth_rpc) -> None:
+    """A REAL signed refund(), served under a log naming a DIFFERENT hash: the computed hash is the
+    check, so the server's pairing is not believed."""
+    _eth_swap(case)
+    _, raw = _signed_raw(bytes.fromhex("590e1ae3"))
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {}, "raws": {REFUND_TX: raw}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "ERROR", counter
+    assert "different transaction" in counter["reason"]
+    assert _eth_recover(case, eth_rpc).exit_code != 0
+
+
+@pytest.mark.parametrize(
+    ("data", "to"),
+    [
+        (bytes.fromhex("bd66528a") + bytes(32), ETH_CONTRACT),  # claim(bytes32) with no p of H: not refund()
+        (bytes.fromhex("590e1ae3"), "0x" + "ee" * 20),  # refund() on ANOTHER contract
+    ],
+)
+def test_a_verified_transaction_that_is_not_a_refund_call_to_the_contract_is_unconfirmed(
+    case, eth_rpc, data, to
+) -> None:
+    """The selector and ``to`` are read from the decoded bytes, not the JSON: a hash-valid
+    transaction that is not ``refund()`` on THIS contract does not make a Refunded() log definitive."""
+    _eth_swap(case)
+    tx_hash, raw = _signed_raw(data, to=to)
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", tx_hash)], "txs": {}, "raws": {tx_hash: raw}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] in ("REFUND_REPORTED_UNCONFIRMED", "ERROR"), counter
+    assert counter["state"] != "SPENT_NO_PREIMAGE"
 
 
 def test_a_refunded_log_with_no_transaction_is_unconfirmed_not_refunded(case, eth_rpc) -> None:
@@ -267,8 +347,8 @@ def test_a_taker_claim_plus_an_unconfirmed_eth_refund_tells_the_maker_to_claim(c
     assert "nothing left" not in doc["chain"]["next_action"]
     assert "MAKER: check the ETH leg" in doc["chain"]["next_action"]
     assert "claim it with p" in doc["chain"]["next_action"]
-    # The same RPC WITH the refund transaction returned is definitive, and the situation is named.
-    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", REFUND_TX)], "txs": {REFUND_TX: _refund_tx()}}
+    # The same RPC WITH the raw signed refund transaction is definitive, and the situation is named.
+    eth_rpc.scenario = _honest_refund_scenario()
     doc = json.loads(_eth_status(case, eth_rpc, client=_spent_by(case, "claim"), output_mode="json").output)
     assert doc["situation"] == "TAKER_CLAIMED_AND_REFUNDED"
 

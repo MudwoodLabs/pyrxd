@@ -145,10 +145,15 @@ human sizing the fee is the only remaining control.
   what a pruned node or a log-range limit returns for a claimed contract. It is reported
   ``UNKNOWN``. A preimage in a ``Claimed`` log is
   recovered from the log itself, whether or not the RPC returns the claim transaction. A refund
-  is only definitive (``SPENT_NO_PREIMAGE``) when the RPC returns the transaction that emitted the
-  ``Refunded`` log and its hash matches the log's; a ``Refunded`` log alone carries nothing to
-  verify, so it is reported ``REFUND_REPORTED_UNCONFIRMED`` and never produces a situation that
-  says nothing is left to claim.
+  is only definitive (``SPENT_NO_PREIMAGE``) when the RPC returns the raw signed bytes of the
+  transaction that emitted the ``Refunded`` log (``eth_getRawTransactionByHash``), their keccak256,
+  computed by pyrxd, equals the log's transaction hash, and the decoded transaction is a
+  ``refund()`` call to the swap's contract. Transaction JSON alone does not count: its ``hash``
+  field is the server's word, not derived from the transaction it describes. A ``Refunded`` log
+  without such a transaction carries nothing to verify, so it is reported
+  ``REFUND_REPORTED_UNCONFIRMED`` and never produces a situation that says nothing is left to
+  claim. The raw bytes come from the same RPC, so a server that fabricates and signs a refund it
+  never broadcast is not caught; check a second source before acting on a refund.
 
   Errors from a counter-leg endpoint are printed as the exception type, HTTP status and host —
   never the URL, which may carry an API key. Across the CLI, an endpoint named in an error, a

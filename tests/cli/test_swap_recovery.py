@@ -1043,9 +1043,20 @@ async def test_eth_counter_leg_states(monkeypatch) -> None:
     assert claimed.state == "CLAIMED_PREIMAGE_REVEALED"
     assert P.hex() not in json.dumps(claimed.to_dict())
 
+    # JSON naming a call that carries no p is the server's word (its `hash` is not derived from its
+    # contents): no longer a definitive refund, round-3 F2.
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(_eth_tx(calldata=b"\x01\x02"), [])))
+    json_only = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
+    assert json_only.state == "UNKNOWN"
+
+    from pyrxd.gravity.watch.eth_adapters import REFUNDED_TOPIC0
+
+    verified = sr.VerifiedEthTx(hash="0xfeed", to=CONTRACT.lower(), input=sr.ETH_REFUND_SELECTOR, tx_type=2)
+    refund_log = dict(_eth_log(), topics=[REFUNDED_TOPIC0])
+    monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(verified, [refund_log])))
     refunded = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
     assert refunded.state == "SPENT_NO_PREIMAGE"
+    assert refunded.claim_txid == "0xfeed"
 
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(_eth_tx(to=OTHER_CONTRACT), [])))
     unbound = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
@@ -1183,7 +1194,7 @@ async def test_eth_rpc_read_surfaces_an_rpc_error_and_a_malformed_body() -> None
 @pytest.mark.asyncio
 async def test_fetch_eth_claim_artifacts_only_ever_posts_allowlisted_methods() -> None:
     log = _eth_log(data=P, tx_hash="0xfeed")
-    session = _SpyRpcSession([{"result": [log]}, {"result": _eth_tx(calldata=P)}])
+    session = _SpyRpcSession([{"result": [log]}, {"result": None}, {"result": _eth_tx(calldata=P)}])
     tx, logs = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
     assert tx is not None and logs == [log]
     assert set(session.methods) <= sr.ETH_READ_ONLY_RPC_METHODS
@@ -1200,9 +1211,42 @@ async def test_fetch_eth_claim_artifacts_handles_no_logs_and_an_unusable_log() -
     tx, logs = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
     assert tx is None and logs == [bad]
 
-    session = _SpyRpcSession([{"result": [_eth_log(data=P)]}, {"result": "not-a-tx-object"}])
+    session = _SpyRpcSession([{"result": [_eth_log(data=P)]}, {"result": None}, {"result": "not-a-tx-object"}])
     tx, _ = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
     assert tx is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_falls_back_to_json_when_raw_transactions_are_not_served() -> None:
+    """A JSON-RPC error for ``eth_getRawTransactionByHash`` (method not found) is a fallback, not a
+    failure: the JSON transaction is still read, and is never a VerifiedEthTx."""
+    log = _eth_log(data=P, tx_hash="0xfeed")
+    session = _SpyRpcSession([{"result": [log]}, {"error": {"code": -32601}}, {"result": _eth_tx(calldata=P)}])
+    tx, _ = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
+    assert isinstance(tx, dict) and not isinstance(tx, sr.VerifiedEthTx)
+    assert session.methods == ["eth_getLogs", "eth_getRawTransactionByHash", "eth_getTransactionByHash"]
+
+
+def test_refund_selector_is_keccak_of_the_signature() -> None:
+    assert sr._keccak256(b"refund()")[:4] == sr.ETH_REFUND_SELECTOR
+    assert sr._keccak256(b"")[:4].hex() == "c5d24601"  # the well-known keccak256 of the empty string
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        bytes([0x05]) + bytes.fromhex("c0"),  # an envelope type pyrxd does not know
+        bytes([0x02]) + bytes.fromhex("c3010203"),  # a type-2 envelope with 3 fields, not 12
+        bytes.fromhex("c9") + bytes(8),  # list length runs past the end
+        bytes.fromhex("c0") + b"\x00",  # trailing bytes after the transaction
+        bytes([0xC1]) * 5000 + b"\x80",  # hostile nesting: refused, never a RecursionError
+    ],
+)
+def test_undecodable_raw_bytes_are_refused_on_provenance(raw) -> None:
+    computed = "0x" + sr._keccak256(raw).hex()
+    with pytest.raises(sr.ProvenanceRefused):
+        sr.verify_raw_eth_tx(raw, computed)
 
 
 @pytest.mark.asyncio
