@@ -238,8 +238,18 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     ``low_corroboration`` flag — the recurring v2 blocker); a single source stays ``corroborated=False``
     (the v1 alert-only posture). ssh-tr is read-only (no broadcast surface); ElectrumX websockets are
     context-managed so the stack closes them on exit. Note: corroboration clears the low-corroboration
-    gate but does NOT lift the executor's dust cap or the mainnet ``audit_cleared`` gate."""
+    gate but does NOT lift the executor's dust cap or the mainnet ``audit_cleared`` gate.
+
+    FEWER SOURCES THAN ``--rxd-quorum`` REFUSES TO START, whatever the shortfall. It used to depend on
+    the count: one effective source silently ran single-source while two against a quorum of three
+    refused, so the operator who asked for the most corroboration with the least to give it was the
+    one told nothing. ``--accept-single-source`` (the existing opt-in to single-source operation) is
+    the way through: the tower then starts on what it has, with a WARNING naming those sources, and
+    a quorum clamped to their count (one source stays low-corroboration).
+    """
     sources: list[RxdChainSource] = []
+    #: What each entry of ``sources`` is, for the quorum messages below.
+    labels: list[str] = []
     # The operator's own node (its own host) — included on --rxd-backend ssh-tr OR --rxd-include-node.
     if args.rxd_backend == "ssh-tr" or args.rxd_include_node:
         from pyrxd.gravity.watch.sshtr import SshTrRxdReader  # deferred: only needed for this backend
@@ -255,6 +265,7 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
                 f"{'--rxd-backend ssh-tr' if args.rxd_backend == 'ssh-tr' else '--rxd-include-node'}"
             )
         sources.append(ElectrumRxdChainSource(SshTrRxdReader(ssh_host=args.ssh_host, container=args.ssh_container)))
+        labels.append("your own node over ssh")
     # Public ElectrumX endpoints (repeatable). Default to the verified set unless this is a node-only run.
     urls = list(args.rxd_electrumx_url or [])
     # What the URLs ARE, for the messages below: the flags the operator gave, or pyrxd's defaults.
@@ -272,9 +283,10 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     # permits an autonomous refund. A group's URLs go to ONE client, which races them — failover,
     # counted once.
     groups = group_by_source(u.strip() for u in urls)
-    for _key, group_urls in groups:
+    for key, group_urls in groups:
         client = await stack.enter_async_context(ElectrumXClient(group_urls, allow_insecure=args.allow_insecure))
         sources.append(ElectrumRxdChainSource(client))
+        labels.append(describe_source(key))
     # Say so when the list the operator wrote is not the quorum they meant: several URLs of one
     # operator collapse to one source, and if that leaves one source, corroboration is OFF. The
     # shipped defaults collapse BY DESIGN (radiant4people's second server is its failover, and a
@@ -298,6 +310,25 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
             "no RXD source configured — pass --rxd-electrumx-url (repeatable) and/or --rxd-include-node "
             "(or --rxd-backend ssh-tr)"
         )
+    if len(sources) < args.rxd_quorum:
+        named = "; ".join(labels)
+        if not args.accept_single_source:
+            raise ValidationError(
+                f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} RXD source(s) of distinct operators "
+                f"wired ({named}); sources are counted by operator, so several URLs of one count once. Add a "
+                "--rxd-electrumx-url of a different operator or --rxd-include-node, lower --rxd-quorum, or pass "
+                "--accept-single-source to run on fewer sources than the quorum"
+            )
+        logger.warning(
+            "RXD quorum NOT MET: --rxd-quorum %d but only %d RXD source(s) of distinct operators wired (%s). "
+            "Starting anyway because --accept-single-source was given%s",
+            args.rxd_quorum,
+            len(sources),
+            named,
+            " — every RXD read is SINGLE-SOURCE (low-corroboration)"
+            if len(sources) == 1
+            else f" — the quorum is {len(sources)}-of-{len(sources)}",
+        )
     if len(sources) == 1:
         if len(urls) > 1:
             logger.warning(
@@ -309,13 +340,10 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
                 url_origin,
             )
         return sources[0], False  # single source → low-corroboration (v1 posture)
-    if len(sources) < args.rxd_quorum:
-        raise ValidationError(
-            f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} RXD source(s) of distinct operators wired; "
-            "add --rxd-electrumx-url / --rxd-include-node, or lower --rxd-quorum"
-        )
+    # Clamped only on the accepted path above: otherwise len(sources) >= the requested quorum.
+    quorum = min(args.rxd_quorum, len(sources))
     # corroborated only when the quorum is a real majority-style check (>= 2); quorum=1 trusts any one.
-    return MultiSourceRxdChainSource(sources, quorum=args.rxd_quorum), args.rxd_quorum >= 2
+    return MultiSourceRxdChainSource(sources, quorum=quorum), quorum >= 2
 
 
 async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> RpcEthChainSource | None:
@@ -706,7 +734,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="RXD source quorum (>=2 enables corroboration: clears low_corroboration when >= this many "
-        "sources of distinct operators are wired; fail-closed below it). Sources are counted by registered "
+        "sources of distinct operators are wired). Fewer sources than this REFUSES TO START unless "
+        "--accept-single-source is given. Sources are counted by registered "
         "domain, or by an operator pyrxd ships knowledge of: several URLs of one count once. There is no "
         "operator declaration here",
     )
@@ -916,8 +945,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--accept-single-source",
         action="store_true",
-        help="permit an autonomous refund on a single-source (low-corroboration) read — required for a dust run "
-        "until a multi-source RXD quorum lands",
+        help="accept single-source operation: permit an autonomous refund on a single-source (low-corroboration) "
+        "read, and start with fewer RXD sources of distinct operators than --rxd-quorum (a WARNING names them) "
+        "instead of refusing",
     )
     return p
 

@@ -66,7 +66,7 @@ async def test_defaults_to_public_endpoints_when_none_given():
 
 
 async def test_single_source_stays_low_corroboration():
-    src, corr = await _build("--rxd-electrumx-url", "wss://only")
+    src, corr = await _build("--rxd-electrumx-url", "wss://only", "--accept-single-source")
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False
 
@@ -97,6 +97,7 @@ async def test_ssh_only_is_single_source():
         "node.example.com",
         "--ssh-container",
         "radiant-node",
+        "--accept-single-source",
     )
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False
@@ -111,14 +112,22 @@ async def test_quorum_above_wired_sources_fails_loud():
 
 async def test_dedup_identical_urls_collapses_to_single_source():
     # the same endpoint twice is NOT two independent sources → collapses to one → not corroborated.
-    src, corr = await _build("--rxd-electrumx-url", "wss://dup", "--rxd-electrumx-url", "wss://dup")
+    src, corr = await _build(
+        "--rxd-electrumx-url", "wss://dup", "--rxd-electrumx-url", "wss://dup", "--accept-single-source"
+    )
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False
 
 
 async def test_dedup_normalizes_trailing_slash_and_case():
     # trivially-different forms of ONE endpoint (trailing slash / case) must NOT fake a 2-source quorum.
-    src, corr = await _build("--rxd-electrumx-url", "wss://Dup.Example", "--rxd-electrumx-url", "wss://dup.example/")
+    src, corr = await _build(
+        "--rxd-electrumx-url",
+        "wss://Dup.Example",
+        "--rxd-electrumx-url",
+        "wss://dup.example/",
+        "--accept-single-source",
+    )
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False
 
@@ -136,3 +145,73 @@ async def test_ssh_backend_without_host_or_container_refuses_to_start():
     # Only the genuinely-missing flag is named.
     with pytest.raises(ValidationError, match=r"^--ssh-container required"):
         await _build("--rxd-electrumx-url", "wss://a", "--rxd-include-node", "--ssh-host", "h")
+
+
+# --------------------------------------------------------------------------- fewer sources than the quorum
+#
+# One rule for every shortfall: fewer sources of distinct operators than --rxd-quorum REFUSES TO START,
+# unless --accept-single-source, which starts with a WARNING naming the sources. One configuration per
+# row of the table the inconsistency was reported with (one URL, two URLs of one operator, the node
+# alone, two operators against a quorum of three), each in both directions, plus the shipped defaults.
+
+_NODE = ("--ssh-host", "node.example.com", "--ssh-container", "radiant-node")
+_SHORTFALLS = {
+    "one-url": (("--rxd-electrumx-url", "wss://one.example"), 1, "registered domain 'one.example'"),
+    "two-urls-one-operator": (
+        ("--rxd-electrumx-url", "wss://a.pool.example", "--rxd-electrumx-url", "wss://b.pool.example"),
+        1,
+        "registered domain 'pool.example'",
+    ),
+    "node-only": (("--rxd-backend", "ssh-tr", *_NODE), 1, "your own node over ssh"),
+    "two-operators-quorum-3": (
+        ("--rxd-electrumx-url", "wss://a.example", "--rxd-electrumx-url", "wss://b.example", "--rxd-quorum", "3"),
+        2,
+        "registered domain 'a.example'; registered domain 'b.example'",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SHORTFALLS))
+async def test_fewer_sources_than_the_quorum_refuses_to_start(case):
+    argv, count, named = _SHORTFALLS[case]
+    with pytest.raises(ValidationError) as exc:
+        await _build(*argv)
+    msg = str(exc.value)
+    assert f"but only {count} RXD source(s) of distinct operators wired ({named})" in msg, msg
+    assert "--accept-single-source" in msg
+
+
+@pytest.mark.parametrize("case", sorted(_SHORTFALLS))
+async def test_accept_single_source_starts_on_fewer_sources_and_warns_naming_them(case, caplog):
+    argv, count, named = _SHORTFALLS[case]
+    caplog.set_level("WARNING", logger="pyrxd.watchtower")
+    src, corr = await _build(*argv, "--accept-single-source")
+    warned = [r.getMessage() for r in caplog.records if "RXD quorum NOT MET" in r.getMessage()]
+    assert len(warned) == 1 and named in warned[0] and "--accept-single-source" in warned[0], caplog.text
+    if count == 1:
+        assert isinstance(src, ElectrumRxdChainSource) and corr is False
+        assert "SINGLE-SOURCE" in warned[0]
+    else:
+        # Two operators really do corroborate: the quorum is clamped to 2-of-2, not dropped to one.
+        assert isinstance(src, MultiSourceRxdChainSource) and corr is True
+        assert len(src._sources) == count and "2-of-2" in warned[0]
+
+
+async def test_a_quorum_the_sources_meet_starts_without_the_flag(caplog):
+    """The honest half: the shipped defaults (two operators) and a deliberate --rxd-quorum 1 start, unwarned."""
+    caplog.set_level("WARNING", logger="pyrxd.watchtower")
+    src, corr = await _build()
+    assert isinstance(src, MultiSourceRxdChainSource) and corr is True
+    src, corr = await _build("--rxd-electrumx-url", "wss://one.example", "--rxd-quorum", "1")
+    assert isinstance(src, ElectrumRxdChainSource) and corr is False
+    assert "RXD quorum NOT MET" not in caplog.text, caplog.text
+
+
+def test_the_refusal_reaches_the_console_script_as_exit_1(tmp_path, capsys):
+    """Through ``main``: the operator sees the reason and exit code 1, not a traceback."""
+    from pyrxd.gravity.watch import run
+
+    code = run.main(["--records-dir", str(tmp_path), "--rxd-electrumx-url", "wss://one.example", "--once"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "--rxd-quorum 2 but only 1 RXD source(s)" in err and "Traceback" not in err
