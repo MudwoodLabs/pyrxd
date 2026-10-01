@@ -49,6 +49,7 @@ from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, mark_anchor_dict
 from ..glyph.payload import _MAX_ATTRS_LIST_LEN
 from ..glyph.relationships import resolve_delegated_refs
 from ..glyph.types import GlyphRef
+from ..network.redaction import redacted_url
 from ..script.timelock import LOCKTIME_THRESHOLD
 from ..security.errors import NetworkError, ValidationError
 from ..security.types import Txid
@@ -2154,7 +2155,7 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str, raw_out: list[
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
 

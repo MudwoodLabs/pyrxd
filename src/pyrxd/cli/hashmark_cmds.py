@@ -42,6 +42,7 @@ from ..constants import genesis_hash_for
 from ..glyph._inspect_core import _CONTRACT_HEX_LEN, _inspect_contract, _inspect_outpoint, _truncate_for_human
 from ..glyph.client import BroadcastEchoMismatch
 from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, AnchorBindingError
+from ..network.redaction import redacted_url
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from ..security.types import _TXID_RE, Txid
@@ -519,7 +520,7 @@ def mark_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     record = build.plan.record
@@ -1265,7 +1266,7 @@ def _anchor_of(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer
         # not its words: "its index and its node disagree" only when every header in the window was
         # served and none matched — with one missing, the missing one may be the match, and the
         # sentence would accuse an honest server (0.25.0 review, round 2).
-        where = asked[0] if asked else ctx.electrumx_url
+        where = asked[0] if asked else redacted_url(ctx.electrumx_url)
         retry = "re-run in a moment, or ask another server with --electrumx URL"
         if exc.disagrees:
             fix = (
@@ -1289,7 +1290,7 @@ def _anchor_of(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer
         raise NetworkBoundaryError(
             "could not establish which block the mark is in",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable; without a block there is no mark claim to check",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable; without a block there is no mark claim to check",
         ) from exc
 
 

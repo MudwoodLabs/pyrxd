@@ -39,6 +39,8 @@ import pytest
 import pyrxd
 from pyrxd.cli.main import cli
 
+from .test_swap_recovery_cmds import swap as swap_fixture  # noqa: F401 - registered as a fixture by that name
+
 USER = "FAKEUSERSECRET89AB"
 PW = "FAKEPWSECRET77"
 PATH = "FAKEPATHSECRET0123"
@@ -276,3 +278,202 @@ def test_swap_orders_renderer_scrubs_the_node_rpc_url_itself(runner, monkeypatch
     assert "orderbook read failed" in result.output
     for s in SECRETS:
         assert s not in result.output, result.output
+
+
+# --------------------------------------------------------------------------- the sweep, every endpoint option
+
+P_TEST = bytes.fromhex("11" * 32)
+H_TEST = hashlib.sha256(P_TEST).digest()
+TXID = "ab" * 32
+
+
+def _swap_file(tmp_path: Path, chain: str) -> Path:
+    """A cold-recovery keys file (fresh random keys; nothing is ever broadcast)."""
+    from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
+    from pyrxd.keys import PrivateKey
+
+    taker, maker = PrivateKey(), PrivateKey()
+    cov = build_htlc_covenant_rxd(
+        amount=100_000,
+        taker_pkh=bytes(taker.public_key().hash160()),
+        maker_pkh=bytes(maker.public_key().hash160()),
+        hashlock=H_TEST,
+        refund_csv=20,
+    )
+    d: dict[str, Any] = {
+        "stage": "dust",
+        "rxd_network": "bc",
+        "hashlock_H": H_TEST.hex(),
+        "taker_rxd_wif": taker.wif(),
+        "rxd_covenant_spk": cov.funded_spk.hex(),
+        "t_rxd_blocks": 20,
+    }
+    if chain == "btc":
+        d.update(btc_network="bc", t_btc_blocks=30, btc_htlc_address="bc1qexample")
+    else:
+        d.update(eth_chain="sepolia", eth_timeout_unix_s=1780686598)
+    p = tmp_path / f"keys_{chain}.json"
+    p.write_text(json.dumps(d))
+    p.chmod(0o600)
+    return p
+
+
+def _fee_wif_file(tmp_path: Path) -> Path:
+    from pyrxd.keys import PrivateKey
+
+    p = tmp_path / "fee.wif"
+    p.write_text(PrivateKey().wif())
+    p.chmod(0o600)
+    return p
+
+
+def _wallet(tmp_path: Path) -> tuple[Path, str]:
+    from pyrxd.hd.bip39 import mnemonic_from_entropy
+    from pyrxd.hd.wallet import HdWallet
+
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    path = tmp_path / "wallet.dat"
+    HdWallet.from_mnemonic(mnemonic).save(path)
+    return path, mnemonic
+
+
+def _pyrxd_in(tmp_path: Path, args: list[str], stdin: str | None) -> tuple[int, str, str]:
+    r = subprocess.run(
+        [sys.executable, "-m", "pyrxd.cli", *args],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path),
+        input=stdin,
+        timeout=180,
+    )
+    return r.returncode, r.stdout, r.stderr
+
+
+def _recover_commands(tmp_path: Path, url: str) -> dict[tuple[str, str], list[str]]:
+    kb, ke = _swap_file(tmp_path, "btc"), _swap_file(tmp_path, "eth")
+    rp = ["swap", "recover-preimage"]
+    return {
+        ("swap recover-preimage", "--btc-api-url"): [
+            *rp, "--swap-file", str(kb), "--btc-funding-outpoint", f"{TXID}:1", "--btc-api-url", url,
+        ],
+        ("swap recover-preimage", "--eth-rpc-url"): [
+            *rp, "--swap-file", str(ke), "--eth-contract", "0x" + "ab" * 20, "--eth-rpc-url", url,
+        ],
+    }  # fmt: skip
+
+
+#: ``swap status`` reads the counter leg only after a successful RXD covenant read, so it is driven
+#: in-process with the fake ElectrumX client of ``test_swap_recovery_cmds`` (the counter-leg read
+#: itself is real: a real aiohttp session to the hostile server). Logged output is checked via caplog.
+STATUS_OPTIONS = ("--btc-api-url", "--eth-rpc-url")
+
+
+def test_every_derived_endpoint_option_is_swept(tmp_path) -> None:
+    """Both directions: every derived (command, option) is swept, and nothing swept is stale."""
+    swept = {("", "--electrumx"), ("swap orders", "--node-rpc")}
+    swept |= set(_recover_commands(tmp_path, "http://x"))
+    swept |= {("swap status", f) for f in STATUS_OPTIONS}
+    derived = {(" ".join(path), flag) for path, flags in derived_endpoint_options().items() for flag in flags}
+    assert derived == swept, (derived, swept)
+
+
+@pytest.mark.parametrize("mode", ["redirect", "echo"])
+def test_recover_preimage_endpoint_options_never_print_their_secrets(tmp_path, hostile, mode) -> None:
+    hostile.mode = mode
+    url = _keyed(f"http://127.0.0.1:{hostile.server_port}")
+    for name, args in _recover_commands(tmp_path, url).items():
+        for json_flag in ((), ("--json",)):
+            before = hostile.hits
+            rc, out, err = _pyrxd(tmp_path, *json_flag, *args)
+            assert hostile.hits > before, f"{name}: never reached the endpoint — vacuous"
+            _assert_clean(rc, out, err, f"{name} [{mode}] {json_flag}")
+
+
+@pytest.mark.parametrize("mode", ["redirect", "echo", "badjson"])
+@pytest.mark.parametrize("option", STATUS_OPTIONS)
+@pytest.mark.parametrize("output_mode", ["human", "json"])
+def test_swap_status_endpoint_options_never_print_their_secrets(
+    request, hostile, caplog, mode, option, output_mode
+) -> None:
+    from .test_swap_recovery_cmds import _eth_swap, _status
+
+    case = request.getfixturevalue("swap_fixture")
+
+    hostile.mode = mode
+    url = _keyed(f"http://127.0.0.1:{hostile.server_port}")
+    if option == "--eth-rpc-url":
+        swap = _eth_swap(case)
+        extra = ["--eth-contract", "0x" + "ab" * 20, option, url]
+    else:
+        swap = case
+        extra = ["--btc-funding-outpoint", f"{TXID}:1", option, url]
+    caplog.set_level("DEBUG")
+    res = _status(swap, *extra, output_mode=output_mode)
+    assert hostile.hits >= 1, f"swap status {option}: never reached the endpoint — vacuous:\n{res.output}"
+    text = res.output + caplog.text
+    for s in SECRETS:
+        assert s.lower() not in text.lower(), f"swap status {option} [{mode}]: {s} in:\n{text}"
+    assert "unexpected failure" not in text
+
+
+def _electrumx_commands(tmp_path: Path) -> dict[str, tuple[list[str], str | None]]:
+    """Commands that read through the root ``--electrumx`` endpoint: ``{name: (args, stdin)}``."""
+    wallet, mnemonic = _wallet(tmp_path)
+    kb = _swap_file(tmp_path, "btc")
+    fee = _fee_wif_file(tmp_path)
+    w = ["--wallet", str(wallet)]
+    return {
+        "balance": ([*w, "balance"], mnemonic + "\n"),
+        "utxos": ([*w, "utxos"], mnemonic + "\n"),
+        "address --next": ([*w, "address", "--next"], mnemonic + "\n"),
+        "glyph list": ([*w, "glyph", "list"], mnemonic + "\n"),
+        "glyph inspect --fetch": (["glyph", "inspect", "--fetch", TXID], None),
+        "glyph dmint-estimate --contract": (["glyph", "dmint-estimate", "--contract", f"{TXID}:0"], None),
+        "verify": (["verify", "--min-confirmations", "1", TXID], None),
+        "swap status --check-chain": (["swap", "status", "--swap-file", str(kb), "--check-chain"], None),
+        "swap build-refund": (["swap", "build-refund", "--swap-file", str(kb), "--fee-wif-file", str(fee)], None),
+        "swap build-claim": (
+            ["swap", "build-claim", "--swap-file", str(kb), "--preimage", P_TEST.hex(), "--fee-wif-file", str(fee)],
+            None,
+        ),
+    }
+
+
+def test_electrumx_endpoint_secrets_never_printed(tmp_path, black_hole) -> None:
+    """``--electrumx`` with a keyed URL whose server fails every read: the failover warning, the
+    error and its ``fix:`` hint must name the endpoint by scheme://host:port only."""
+    keyed = _keyed(f"wss://127.0.0.1:{black_hole['port']}")
+    # A WebSocket URI may not carry a fragment, so the client refuses the first spelling before
+    # connecting (that refusal's text must not leak either); the second one reaches the server.
+    variants = {"with fragment": (keyed, False), "no fragment": (keyed.split("#", 1)[0], True)}
+    commands = _electrumx_commands(tmp_path)
+    for variant, (url, must_connect) in variants.items():
+        for name, (args, stdin) in commands.items():
+            for json_flag in ((), ("--json",)):
+                before = black_hole["hits"]
+                argv = [*json_flag, "--network", "mainnet", "--electrumx", url, *args]
+                rc, out, err = _pyrxd_in(tmp_path, argv, stdin)
+                if must_connect:
+                    assert black_hole["hits"] > before, f"{name}: never reached the endpoint — vacuous:\n{err}"
+                _assert_clean(rc, out, err, f"{name} {json_flag} [{variant}]")
+
+
+def test_the_unexpected_failure_path_scrubs_every_url_on_the_command_line(monkeypatch, capsys) -> None:
+    """The bug path (exit 4) prints the exception's own text; a library's can quote the URL."""
+    from pyrxd.cli import main
+
+    url = _keyed("https://node.example:7332")
+
+    def boom() -> None:
+        raise RuntimeError(f"Cannot connect to host for url {url}")
+
+    monkeypatch.setattr(main, "cli", boom)
+    monkeypatch.setattr(sys, "argv", ["pyrxd", "swap", "orders", "rxd", f"--node-rpc={url}"])
+    with pytest.raises(SystemExit) as ei:
+        main.run()
+    assert ei.value.code == 4
+    err = capsys.readouterr().err
+    assert "unexpected failure (RuntimeError)" in err
+    assert "node.example" in err  # the useful part survives
+    for s in SECRETS:
+        assert s not in err, err

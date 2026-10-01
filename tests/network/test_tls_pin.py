@@ -146,9 +146,10 @@ class TestAssertPinMatches:
         der, pin = _self_signed()
         _, other = _self_signed()
         with pytest.raises(TlsPinMismatchError) as exc:
-            assert_pin_matches(der, [other], url="wss://a.example/")
+            assert_pin_matches(der, [other], url="wss://u:FAKEPW99@a.example/FAKEKEY123?k=FAKEQ456")
         message = str(exc.value)
-        assert "wss://a.example/" in message
+        assert "for wss://a.example:" in message  # names the endpoint by scheme://host only
+        assert "FAKEPW99" not in message and "FAKEKEY123" not in message and "FAKEQ456" not in message
         assert pin in message and other in message
         assert "spki_pins" in message  # tells the operator how to fix a rotation
 

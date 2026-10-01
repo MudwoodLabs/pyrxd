@@ -17,6 +17,7 @@ import socket
 
 import click
 
+from ..network.redaction import redacted_url
 from . import config as _config
 from .context import CliContext
 from .format import emit
@@ -148,7 +149,7 @@ def setup_cmd(ctx: CliContext, no_interactive: bool, coin_type: str | None) -> N
         "config_existed": config_existed,
         "node_probed": f"{_NODE_PROBE_HOST}:{_NODE_PROBE_PORT}",
         "node_reachable": has_node,
-        "electrumx_url": ctx.electrumx_url,
+        "electrumx_url": redacted_url(ctx.electrumx_url) if ctx.electrumx_url else "",
         "electrumx_reachable": has_electrumx,
         "wallet_path": str(wallet_path),
         "wallet_exists": has_wallet,
@@ -170,7 +171,7 @@ def setup_cmd(ctx: CliContext, no_interactive: bool, coin_type: str | None) -> N
     click.echo("\npyrxd setup status:")
     click.echo(f"  config:    {config_path} {'(exists)' if config_existed else '(written with defaults)'}")
     click.echo(f"  node:      {_NODE_PROBE_HOST}:{_NODE_PROBE_PORT} {'reachable' if has_node else 'NOT reachable'}")
-    click.echo(f"  electrumx: {ctx.electrumx_url} {'reachable' if has_electrumx else 'NOT reachable'}")
+    click.echo(f"  electrumx: {redacted_url(ctx.electrumx_url)} {'reachable' if has_electrumx else 'NOT reachable'}")
     click.echo(f"  wallet:    {wallet_path} {'(exists)' if has_wallet else '(missing)'}")
     click.echo(f"  coin type: {coin_type_int}  (new wallets derive at m/44'/{coin_type_int}'/0')")
 
@@ -180,7 +181,7 @@ def setup_cmd(ctx: CliContext, no_interactive: bool, coin_type: str | None) -> N
             "ElectrumX not reachable. Either:\n"
             "      - run a local Radiant Core node on 127.0.0.1:7332, or\n"
             f"      - point pyrxd at a public ElectrumX server via PYRXD_ELECTRUMX env\n"
-            f"        (current: {ctx.electrumx_url or '<none configured for this network>'})"
+            f"        (current: {redacted_url(ctx.electrumx_url) if ctx.electrumx_url else '<none configured for this network>'})"
         )
     if ctx.config.endpoint_error:
         # No endpoint resolved for the selected network. Print the full guidance
