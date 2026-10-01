@@ -359,7 +359,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   trivially common path/query tokens (a letters-only word of up to five characters such as `api`,
   `v` plus up to three digits, up to five digits); the user name and password are redacted at any
   length. `setup --json` reports
-  `electrumx_url` as `scheme://host:port`. The exit-4 "unexpected failure" path scrubs every URL on
+  `electrumx_url` as `scheme://host:port`. `verify --wave-name` and `glyph inspect --wave-name`
+  labelled every source in the name-at-mark verdict by its full endpoint URL, so `--json` printed
+  the URL's credentials in `binding_source`, `anchor_source`, `chain.discovery_source` and
+  `tip_source`, `heights.by_source[].source` and `heights.agreed_by`, the anchor's `source` and
+  `verified_by`, and every reason that quotes them, and `verify`'s "`<endpoint>` answered, but …"
+  hint did the same; these are now `scheme://host:port` too. The labels stay full URLs inside the
+  verdict, where the source-identity rules compare them, and are redacted where they become output
+  (`pyrxd.network.redaction.redact_endpoints_in`), so those `--json` fields change shape (a
+  trailing `/` or path is no longer part of the value). The exit-4 "unexpected failure" path scrubs every URL on
   the command line.
 - **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
   exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth

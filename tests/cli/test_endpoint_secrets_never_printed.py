@@ -490,3 +490,95 @@ def test_recover_preimage_against_a_non_json_200_is_a_clean_network_error(tmp_pa
     assert rc == 2, err
     assert "not valid JSON" in err and "JSONDecodeError" in err
     assert "unexpected failure" not in err
+
+
+# --------------------------------------------------------------------------- name-at-mark source labels
+
+#: The two commands whose output carries endpoint SOURCE LABELS (``binding_source``,
+#: ``anchor_source``, ``chain.discovery_source`` / ``tip_source``, ``heights.by_source``, the
+#: anchor's ``source``, the reasons that quote them). The source-identity rules compare the raw
+#: URLs, so these labels are raw internally and must be redacted where they become output. A black
+#: hole never reaches them (the transaction fetch fails first), so these run in-process against a
+#: fake chain that ANSWERS — only the client class is replaced; the config loader, the real
+#: ``_endpoint_pair``, the judge and the command are real.
+NAME_AT_MARK_COMMANDS = ("verify", "glyph inspect --wave-name")
+
+
+@pytest.mark.parametrize("command", NAME_AT_MARK_COMMANDS)
+@pytest.mark.parametrize("json_flag", [(), ("--json",)])
+def test_name_at_mark_source_labels_never_print_the_endpoint_secrets(
+    tmp_path, monkeypatch, caplog, command, json_flag
+) -> None:
+    import pyrxd.network.failover as failover
+    from pyrxd.keys import PrivateKey
+    from tests.test_hashmark_verify_one_record import NAME, _address, _fake_walk, _invoke, _signed, _tx
+    from tests.test_hashmark_verify_one_record import _Server as _MarkServer
+
+    for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX"):
+        monkeypatch.delenv(var, raising=False)
+    key = PrivateKey()
+    content = b"a press kit behind a keyed endpoint\n"
+    txid, raw = _tx(_signed(content, key))
+    built: list[str] = []
+
+    def factory(profile, *_a, **_k):
+        built.append(profile.endpoints[0].url)
+        return _MarkServer({txid: raw}, indexer=True, target=_address(key), mint="cd" * 32)
+
+    monkeypatch.setattr(failover, "FailoverElectrumXClient", factory)
+    _fake_walk(monkeypatch, _address(key))
+    url = _keyed("wss://only.example.invalid:50022").split("#", 1)[0]  # a WebSocket URI has no fragment
+    if command == "verify":
+        args = ["verify", txid, "--digest", hashlib.sha256(content).hexdigest()]
+    else:
+        args = ["glyph", "inspect", "--fetch", txid]
+    caplog.set_level("DEBUG")
+    r = _invoke(tmp_path, [*json_flag, "--electrumx", url, *args, "--wave-name", NAME, "--min-confirmations", "6"])
+    text = r.output + caplog.text
+    # Non-vacuity: the keyed endpoint was really used, and the name lookup really resolved — so the
+    # source labels really were rendered (as the endpoint's host, which must still be shown).
+    assert built and set(built) == {url}, built
+    assert "only.example.invalid" in r.output, r.output
+    if json_flag:
+        doc = json.loads(r.stdout)
+        records = doc.get("records") or [o["hashmark"] for o in doc.get("outputs", []) if o.get("hashmark")]
+        nam = records[0]["name_at_mark"]
+        assert nam["resolved"] is True, nam
+        assert nam["binding_source"] == nam["anchor_source"] == "wss://only.example.invalid:50022", nam
+    for s in (USER, PW, PATH, QUERY):
+        assert s.lower() not in text.lower(), f"{command} {json_flag}: {s} in:\n{text}"
+
+
+def test_verify_names_the_endpoint_that_answered_without_its_secrets(tmp_path, monkeypatch, caplog) -> None:
+    """``verify``'s "<endpoint> answered, but its index and its node disagree" hint named the endpoint
+    by its raw source label (``where = asked[0]``) — the whole keyed URL. Real config, real
+    ``_endpoint_pair``; only the client class is replaced, by a server whose headers never match."""
+    import pyrxd.network.failover as failover
+    from pyrxd.keys import PrivateKey
+    from tests.test_hashmark_verify_cli import _FakeServer, _mark_script, _tx_with
+    from tests.test_hashmark_verify_one_record import _invoke
+    from tests.test_mutable_chain_is_discovered_from_the_chain import synthetic_header as _header
+
+    class _HeadersDisagree(_FakeServer):
+        async def get_block_header(self, height) -> bytes:
+            return _header(int(height) + 1000)  # never the block its node named
+
+    for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX"):
+        monkeypatch.delenv(var, raising=False)
+    txid, raw = _tx_with(_mark_script(b"a report\n", PrivateKey()))
+    built: list[str] = []
+
+    def factory(profile, *_a, **_k):
+        built.append(profile.endpoints[0].url)
+        return _HeadersDisagree({txid: raw})
+
+    monkeypatch.setattr(failover, "FailoverElectrumXClient", factory)
+    url = _keyed("wss://only.example.invalid:50022").split("#", 1)[0]
+    caplog.set_level("DEBUG")
+    r = _invoke(tmp_path, ["--electrumx", url, "verify", txid, "--min-confirmations", "6"])
+    flat = " ".join(r.output.split())
+    assert built, "the keyed endpoint was never used — vacuous"
+    assert r.exit_code == 2, r.output
+    assert "wss://only.example.invalid:50022 answered, but its index and its node disagree" in flat, flat
+    for s in (USER, PW, PATH, QUERY):
+        assert s.lower() not in (r.output + caplog.text).lower(), f"{s} in:\n{r.output}"

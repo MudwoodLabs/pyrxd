@@ -6,6 +6,10 @@ Two helpers, used at every place an endpoint is named in text:
 
 * :func:`redacted_url` — the ONE way to name an endpoint in a log line, an error message or a
   ``fix:`` hint. Scheme, host and port only; never userinfo, path, query or fragment.
+* :func:`redact_endpoints_in` — for a value about to be RENDERED (a JSON payload, a reason string)
+  that carries endpoint URLs as source LABELS. Source-identity rules compare the raw URLs, so the
+  labels stay raw internally and are redacted here, where they become output: each whole URL
+  becomes :func:`redacted_url`, then :func:`redact_endpoint_secrets` catches any part quoted alone.
 * :func:`redact_endpoint_secrets` — for text pyrxd did not write (an exception from a library, an
   RPC's own error body), which may quote the URL or echo the key back. It removes the
   credential-bearing PARTS of each known URL wherever they appear, in any letter case and in their
@@ -33,7 +37,7 @@ import re
 from collections.abc import Sequence
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit
 
-__all__ = ["redact_endpoint_secrets", "redacted_url", "secret_parts"]
+__all__ = ["redact_endpoint_secrets", "redact_endpoints_in", "redacted_url", "secret_parts"]
 
 _REDACTED = "<redacted>"
 
@@ -118,3 +122,34 @@ def redact_endpoint_secrets(text: str, urls: str | Sequence[str | None] | None) 
         if part:
             text = re.sub(_part_pattern(part), _REDACTED, text, flags=re.IGNORECASE)
     return text
+
+
+def redact_endpoints_in(value: object, urls: str | Sequence[str | None] | None) -> object:
+    """*value* with every endpoint URL in *urls* rendered as :func:`redacted_url` — RENDER-TIME.
+
+    Walks dicts (keys and values), lists and tuples; every string has each whole URL replaced by
+    its ``scheme://host:port`` form, then any credential part quoted on its own removed
+    (:func:`redact_endpoint_secrets`). Other values are returned unchanged. Apply it where source
+    labels become output, never before a rule compares them.
+    """
+    if isinstance(urls, str):
+        urls = [urls]
+    known = sorted({u for u in urls or () if isinstance(u, str) and u}, key=len, reverse=True)
+    if not known:
+        return value
+
+    def walk(v: object) -> object:
+        if isinstance(v, str):
+            for u in known:
+                if u in v:
+                    v = v.replace(u, redacted_url(u))
+            return redact_endpoint_secrets(v, known)
+        if isinstance(v, dict):
+            return {walk(k): walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(walk(x) for x in v)
+        return v
+
+    return walk(value)

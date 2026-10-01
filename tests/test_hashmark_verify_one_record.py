@@ -356,7 +356,10 @@ class TestTheShippedDefaultConfig:
         # NON-VACUITY: form 2 WAS reached on the default config — the name really is ESTABLISHED
         # for the copied record, over both shipped endpoints — so the refusal is the rule's.
         assert j["records"][1]["checks"]["name"]["state"] == "ESTABLISHED"
-        assert j["records"][1]["name_at_mark"]["binding_source"] == b_url
+        # Rendered as scheme://host:port (the label is redacted where it becomes output, round 3 F1).
+        from pyrxd.network.redaction import redacted_url
+
+        assert j["records"][1]["name_at_mark"]["binding_source"] == redacted_url(b_url)
         assert set(built) == {a_url, b_url}, built
         assert b.extension_calls, "the indexer on the second shipped endpoint was asked"
 

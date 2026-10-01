@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from pyrxd.network.redaction import redact_endpoint_secrets, redacted_url, secret_parts
+from pyrxd.network.redaction import redact_endpoint_secrets, redact_endpoints_in, redacted_url, secret_parts
 
 LEAKS = [
     # (url, text the server/library echoed, the secret that must not survive)
@@ -75,3 +75,23 @@ def test_redacted_url_keeps_scheme_host_port_only(url: str, label: str) -> None:
 def test_an_unparseable_url_still_has_its_pieces_redacted() -> None:
     url = "http://[::1/v2/FAKEPATHSECRET0123"
     assert "FAKEPATHSECRET0123" not in redact_endpoint_secrets("path FAKEPATHSECRET0123 bad", url)
+
+
+def test_redact_endpoints_in_renders_every_label_in_a_payload() -> None:
+    """Render-time: source labels are raw URLs internally; in the output each is scheme://host:port,
+    wherever it sits — a value, a key, inside a sentence, in a list — and nothing else changes."""
+    url = "wss://U53R:PW0RD@h.example:50022/KEYPATH12345?apikey=QVAL6789"
+    payload = {
+        "binding_source": url,
+        "heights": {"by_source": [{"source": url, "mark": 7}], url: True},
+        "reason": f"'{url}' says 458580; also QVAL6789 echoed",
+        "steps": ("ab" * 32, 3),
+    }
+    out = redact_endpoints_in(payload, [url, None, ""])
+    assert out == {
+        "binding_source": "wss://h.example:50022",
+        "heights": {"by_source": [{"source": "wss://h.example:50022", "mark": 7}], "wss://h.example:50022": True},
+        "reason": "'wss://h.example:50022' says 458580; also <redacted> echoed",
+        "steps": ("ab" * 32, 3),
+    }
+    assert redact_endpoints_in(payload, ()) is payload  # nothing configured: unchanged

@@ -42,7 +42,7 @@ from ..constants import genesis_hash_for
 from ..glyph._inspect_core import _CONTRACT_HEX_LEN, _inspect_contract, _inspect_outpoint, _truncate_for_human
 from ..glyph.client import BroadcastEchoMismatch
 from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, AnchorBindingError
-from ..network.redaction import redacted_url
+from ..network.redaction import redact_endpoints_in, redacted_url
 from ..script.hashmark import canonicalize_label, max_label_bytes
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from ..security.types import _TXID_RE, Txid
@@ -1132,9 +1132,12 @@ def _verify_anchor(
     reports NOT VERIFIED with that reason).
     """
     anchor = _anchor_of(ctx, payload, min_confirmations=min_confirmations, prefer=prefer)
-    return _with_verified_block(
+    verified = _with_verified_block(
         ctx, anchor, txid=payload.get("txid"), raw_tx=raw_tx, min_confirmations=min_confirmations
     )
+    # RENDER TIME: the anchor's `source` and the verification's `verified_by` are raw endpoint URLs
+    # (the independence rule compares them); this dict is output, so they are redacted here.
+    return redact_endpoints_in(verified, _inspect._endpoint_urls(ctx))  # type: ignore[return-value]
 
 
 def _with_verified_block(
@@ -1168,7 +1171,7 @@ def _with_verified_block(
     made = anchor.get("block_verification")
     if isinstance(made, dict):
         if made.get("state") == CONTRADICTED:
-            _refuse_contradicted(height, made.get("source"), made.get("reason"))
+            _refuse_contradicted(height, made.get("source"), made.get("reason"), urls=_inspect._endpoint_urls(ctx))
         return anchor
 
     def endpoint() -> tuple[object, str]:
@@ -1193,19 +1196,20 @@ def _with_verified_block(
     except Exception as exc:  # the helper is total over server data; this is pyrxd's own failure
         verification, label = _inspect.block_verification_could_not_run(exc, height), None
     if verification.state == CONTRADICTED:
-        _refuse_contradicted(height, label, verification.reason)
+        _refuse_contradicted(height, label, verification.reason, urls=_inspect._endpoint_urls(ctx))
     return with_block_verification(anchor, verification, verified_by=label)
 
 
-def _refuse_contradicted(height: Any, label: Any, reason: Any) -> NoReturn:
+def _refuse_contradicted(height: Any, label: Any, reason: Any, *, urls: tuple[str, ...]) -> NoReturn:
     """Exit 2 for a block proof that contradicts the height its endpoint reported — whichever
-    lookup made the verification."""
+    lookup made the verification. *label* is a raw endpoint URL; it is redacted (with *urls*) here,
+    where it becomes output."""
     from ..glyph.mark_block import NOTHING_AGAINST_THE_MARK, contradicted_sentence
 
     # Both sentences are the pages' too (`glue.verify_mark_block`), from one definition.
     raise NetworkBoundaryError(
         "could not establish which block the mark is in",
-        cause=_sanitize_display_string(contradicted_sentence(height, label, reason)),
+        cause=_sanitize_display_string(str(redact_endpoints_in(contradicted_sentence(height, label, reason), urls))),
         fix=f"{NOTHING_AGAINST_THE_MARK} — re-run in a moment, or ask another server with --electrumx URL",
     )
 
@@ -1266,7 +1270,7 @@ def _anchor_of(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer
         # not its words: "its index and its node disagree" only when every header in the window was
         # served and none matched — with one missing, the missing one may be the match, and the
         # sentence would accuse an honest server (0.25.0 review, round 2).
-        where = asked[0] if asked else redacted_url(ctx.electrumx_url)
+        where = redacted_url(asked[0] if asked else ctx.electrumx_url)
         retry = "re-run in a moment, or ask another server with --electrumx URL"
         if exc.disagrees:
             fix = (
@@ -1283,13 +1287,13 @@ def _anchor_of(ctx: CliContext, payload: dict, *, min_confirmations: int, prefer
             fix = f"{where} answered, but named no block for the mark's transaction — {retry}"
         raise NetworkBoundaryError(
             "could not establish which block the mark is in",
-            cause=str(exc),
+            cause=str(redact_endpoints_in(str(exc), _inspect._endpoint_urls(ctx))),
             fix=fix,
         ) from exc
     except NetworkError as exc:
         raise NetworkBoundaryError(
             "could not establish which block the mark is in",
-            cause=str(exc),
+            cause=str(redact_endpoints_in(str(exc), _inspect._endpoint_urls(ctx))),
             fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable; without a block there is no mark claim to check",
         ) from exc
 
