@@ -538,7 +538,9 @@ def test_status_survives_a_counter_leg_read_failure(swap, monkeypatch) -> None:
     res = _status(swap)
     assert res.exit_code == 0, res.output
     assert "Counter-leg (BTC): ERROR" in res.output
-    assert "explorer down" in res.output
+    # The type, never the library's own text: that text can quote a keyed endpoint URL.
+    assert "counter-leg read failed: RuntimeError" in res.output
+    assert "explorer down" not in res.output
     assert "situation" in res.output  # the covenant verdict still made it out
 
 

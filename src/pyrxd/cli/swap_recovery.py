@@ -84,7 +84,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from pyrxd.base58 import base58check_decode
 from pyrxd.btc_wallet.taproot import (
@@ -111,7 +111,7 @@ from pyrxd.network.source_identity import canonical_host
 # "this string is a seed phrase" in this SDK, and the gate below must agree with the
 # redactor rather than grow a second, drifting copy of the test. Reached by name for the
 # same reason ``load_recovery_json`` reaches ``cli_secrets._tighten_hint``.
-from pyrxd.security.errors import KeyMaterialError, ValidationError, _looks_like_mnemonic
+from pyrxd.security.errors import KeyMaterialError, RxdSdkError, ValidationError, _looks_like_mnemonic
 from pyrxd.utils import decode_wif
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,9 @@ __all__ = [
     "build_cold_claim",
     "build_cold_refund",
     "covenant_pkhs",
+    "describe_network_error",
     "electrumx_script_hash",
+    "electrumx_urls",
     "endpoint_source_label",
     "eth_rpc_read",
     "fee_scriptpubkey",
@@ -154,6 +156,7 @@ __all__ = [
     "recover_preimage_from_eth_artifacts",
     "recover_preimage_from_eth_claim",
     "recover_preimage_from_eth_logs",
+    "redact_endpoint_secrets",
     "select_fee_utxo",
     "spent_spender_unknown_reason",
 ]
@@ -1015,6 +1018,96 @@ def endpoint_source_label(url: str) -> str:
         raw = ""
     host = canonical_host(raw) if raw else ""
     return host or "an endpoint whose URL has no parseable host"
+
+
+#: Shortest path segment / query value treated as possibly secret. Shorter fragments
+#: (``api``, ``v2``, ``1``) are never keys, and scrubbing them out of a message would delete
+#: ordinary words from it.
+_MIN_SECRET_FRAGMENT = 6
+
+
+def _secret_fragments(url: str) -> list[str]:
+    """Every part of *url* that can carry a credential: the whole URL and everything after the host."""
+    out = [url]
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return out
+    rest = url.split(parts.netloc, 1)[1] if parts.netloc and parts.netloc in url else ""
+    out += [rest, parts.path, parts.query, parts.fragment]
+    if parts.username:
+        out.append(parts.username)
+    if parts.password:
+        out.append(parts.password)
+    out += [seg for seg in parts.path.split("/")]
+    out += [v for _, v in parse_qsl(parts.query, keep_blank_values=True)]
+    out += [unquote(f) for f in list(out)]
+    return [f for f in out if len(f) >= _MIN_SECRET_FRAGMENT]
+
+
+def redact_endpoint_secrets(text: str, urls: str | Sequence[str | None] | None) -> str:
+    """Remove from *text* every part of each URL in *urls* that can carry a credential.
+
+    An RPC or explorer URL routinely carries an API key in its path (``/v2/<key>``) or query
+    (``?apikey=<key>``). Exception text from the HTTP layer quotes the URL whole, and an RPC's own
+    error body can echo the key back, so any text that crossed a network call is passed through
+    here before it reaches the operator's terminal or ``--json``. Longest fragment first, so the
+    whole URL is replaced before its pieces are.
+    """
+    if isinstance(urls, str):
+        urls = [urls]
+    fragments: list[str] = []
+    for url in urls or ():
+        if isinstance(url, str) and url:
+            fragments += _secret_fragments(url)
+    for frag in sorted(set(fragments), key=len, reverse=True):
+        text = text.replace(frag, "<redacted>")
+    return text
+
+
+def electrumx_urls(ctx: Any) -> tuple[str, ...]:
+    """Every ElectrumX URL a CLI context may read through — for :func:`redact_endpoint_secrets`.
+
+    The failover client may have answered from any configured endpoint, not only the primary
+    ``electrumx_url``, so all of them are scrubbed. Best-effort: a context with no resolvable
+    profile still yields its primary URL.
+    """
+    urls = [getattr(ctx, "electrumx_url", "") or ""]
+    try:
+        urls += list(ctx.config.require_profile().urls)
+    except Exception:  # nosec B110 - no profile means nothing further to scrub
+        pass
+    return tuple(u for u in urls if u)
+
+
+def describe_network_error(exc: BaseException, url: str | None = None, *, scrub: Sequence[str | None] = ()) -> str:
+    """Render an exception from a network call WITHOUT the URL it was raised for.
+
+    THE one rendering for every place the swap CLI prints a failed chain read. aiohttp's
+    ``ClientResponseError`` renders as ``401, message='Unauthorized', url='https://host/<key>?…'``,
+    so printing ``{exc}`` put the operator's keyed ``--eth-rpc-url`` / ``--btc-api-url`` into
+    ``swap status`` (human and ``--json``) and into ``recover-preimage``'s error. This renders the
+    exception TYPE, its HTTP status when it has one, and the host (:func:`endpoint_source_label`)
+    — never the URL. Text from a library exception is dropped entirely: it is not ours, so it
+    cannot be known not to quote the URL. Text from pyrxd's own exceptions is kept (it carries the
+    useful part, e.g. an RPC's "query returned more than 10000 results") but still passed through
+    :func:`redact_endpoint_secrets`, because it can wrap a library message or echo an RPC body.
+
+    ``url`` is the endpoint the call was made to (named by host); ``scrub`` lists any further
+    URLs whose secrets must not appear (e.g. every ElectrumX endpoint a failover client may have
+    used).
+    """
+    text = type(exc).__name__
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        text += f" (HTTP {status})"
+    if url:
+        text += f" from {endpoint_source_label(url)}"
+    if isinstance(exc, RxdSdkError):
+        detail = redact_endpoint_secrets(str(exc), [url, *scrub])
+        if detail:
+            text += f": {detail}"
+    return text
 
 
 async def fetch_btc_claim_bytes(

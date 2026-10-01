@@ -34,7 +34,13 @@ import click
 from ..security.errors import ValidationError
 from .context import CliContext
 from .format import emit, sanitize_terminal
-from .swap_recovery import CounterLegStatus, parse_recovery_extras, read_counter_leg
+from .swap_recovery import (
+    CounterLegStatus,
+    describe_network_error,
+    electrumx_urls,
+    parse_recovery_extras,
+    read_counter_leg,
+)
 
 #: Default Esplora/mempool.space base URL for the BTC counter-leg read (a GET-only API).
 DEFAULT_BTC_API_URL = "https://mempool.space"
@@ -514,7 +520,10 @@ def swap_status_cmd(
         try:
             chain = asyncio.run(_read_covenant(ctx, facts.rxd_covenant_spk))
         except Exception as exc:  # surface any read failure as a clean CLI error
-            raise click.ClickException(f"--check-chain read failed: {type(exc).__name__}: {exc}") from exc
+            raise click.ClickException(
+                "--check-chain read failed: "
+                + sanitize_terminal(describe_network_error(exc, scrub=electrumx_urls(ctx)), max_len=300)
+            ) from exc
         # The counter-leg read is BEST-EFFORT and must never sink the covenant verdict below:
         # an unreachable third-party explorer is not a reason to deny an operator the RXD facts
         # they came for, mid-incident. Any failure is reported as an ERROR row, not raised.
@@ -535,7 +544,9 @@ def swap_status_cmd(
             counter = CounterLegStatus(
                 chain=facts.counter_chain,
                 state="ERROR",
-                reason=f"counter-leg read failed: {type(exc).__name__}: {exc}",
+                # Never ``{exc}``: an aiohttp error quotes the full URL, and these URLs carry API keys.
+                reason="counter-leg read failed: "
+                + describe_network_error(exc, btc_api_url if facts.counter_chain == "btc" else eth_rpc_url),
             )
         payload["counter_leg"] = counter.to_dict()
 

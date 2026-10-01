@@ -52,6 +52,8 @@ from .swap_recovery import (
     build_cold_claim,
     build_cold_refund,
     covenant_pkhs,
+    describe_network_error,
+    electrumx_urls,
     endpoint_source_label,
     fetch_btc_claim_bytes,
     fetch_eth_claim_artifacts,
@@ -63,6 +65,7 @@ from .swap_recovery import (
     rebuild_covenant,
     recover_preimage_from_btc_claim,
     recover_preimage_from_eth_artifacts,
+    redact_endpoint_secrets,
     select_fee_utxo,
     spent_spender_unknown_reason,
 )
@@ -157,13 +160,25 @@ def _resolve_secret_wif(inline: str | None, from_file: str | None, env_name: str
     return wif.strip()
 
 
-def _run(coro: Any) -> Any:
+def _run(coro: Any, *, url: str | None = None, scrub: tuple[str, ...] = ()) -> Any:
+    """Run a chain read, mapping every transport failure to a clean exit-2 error.
+
+    ``url`` is the endpoint the read goes to; ``scrub`` any further URLs it may use. The cause is
+    rendered by :func:`~pyrxd.cli.swap_recovery.describe_network_error`, never ``{exc}``.
+
+    ``aiohttp.ClientError`` is caught by name: ``ClientResponseError`` (an HTTP 401/429/5xx from
+    ``raise_for_status``) is NOT an ``OSError``, so it used to escape to the top-level handler as
+    "unexpected failure (ClientResponseError)", exit 4, with its full keyed URL printed as the cause.
+    ``asyncio.TimeoutError`` likewise, which on Python 3.10 is not an ``OSError`` either.
+    """
+    import aiohttp
+
     try:
         return asyncio.run(coro)
-    except (NetworkError, OSError) as exc:
+    except (NetworkError, OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
         raise NetworkBoundaryError(
             "a chain read failed",
-            cause=sanitize_terminal(f"{type(exc).__name__}: {exc}", max_len=300),
+            cause=sanitize_terminal(describe_network_error(exc, url, scrub=scrub), max_len=300),
             fix="check the endpoint URL and your connectivity, then retry — nothing was broadcast",
         ) from exc
 
@@ -314,6 +329,7 @@ def swap_recover_preimage_cmd(
         except ValueError as exc:
             raise UserError("the supplied claim transaction is not valid hex") from exc
 
+    read_url = None if offline_raw is not None else (btc_api_url if facts.counter_chain == "btc" else eth_rpc_url)
     try:
         rec = _run(
             _recover(
@@ -325,21 +341,22 @@ def swap_recover_preimage_cmd(
                 eth_rpc_url=eth_rpc_url,
                 offline_raw=offline_raw,
                 timeout_s=timeout_s,
-            )
+            ),
+            url=read_url,
         )
     except CounterLegInconclusive as exc:
         # Before PreimageNotRevealed (both are ValidationErrors): "no evidence" must never be
         # rendered as "not revealed yet — keep watching".
         raise NetworkBoundaryError(
             "the counter-chain read is inconclusive — no preimage was taken",
-            cause=sanitize_terminal(str(exc), max_len=400),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
             fix="re-run against an RPC that serves the contract's full log history, or read the contract's "
             "events on a block explorer — nothing was broadcast",
         ) from exc
     except ProvenanceRefused as exc:
         raise UserError(
             "REFUSED on provenance — no preimage was taken",
-            cause=sanitize_terminal(str(exc), max_len=400),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
             fix=(
                 "confirm --eth-contract is THIS swap's per-swap HTLC contract; a contract that does not "
                 "reveal a preimage of this swap's hashlock is not this swap's"
@@ -351,12 +368,16 @@ def swap_recover_preimage_cmd(
     except PreimageNotRevealed as exc:
         raise UserError(
             "no preimage has been revealed yet",
-            cause=sanitize_terminal(str(exc), max_len=400),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
             fix="keep watching (`pyrxd swap status --check-chain`); if the covenant's CSV window opens "
             "first, the refund path is the one that applies",
         ) from exc
     except ValidationError as exc:
-        raise UserError("preimage recovery failed", cause=sanitize_terminal(str(exc), max_len=400)) from exc
+        # Can carry an RPC's own error body (``eth_rpc_read``), which may echo the key back.
+        raise UserError(
+            "preimage recovery failed",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
+        ) from exc
 
     payload: dict[str, Any] = {
         "counter_chain": rec.counter_chain,
@@ -705,7 +726,8 @@ def swap_build_claim_cmd(
                 policy=policy,
                 kind="claim",
                 allow_overpay=allow_overpay,
-            )
+            ),
+            scrub=electrumx_urls(ctx),
         )
         spend = build_cold_claim(
             covenant=covenant,
@@ -719,7 +741,7 @@ def swap_build_claim_cmd(
     except ValidationError as exc:
         raise UserError(
             "could not build the claim spend",
-            cause=sanitize_terminal(str(exc), max_len=500),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), electrumx_urls(ctx)), max_len=500),
             fix="nothing was broadcast — correct the input above and re-run",
         ) from exc
     _emit_spend(ctx, spend, facts, chain)
@@ -779,7 +801,8 @@ def swap_build_refund_cmd(
                 policy=policy,
                 kind="refund",
                 allow_overpay=allow_overpay,
-            )
+            ),
+            scrub=electrumx_urls(ctx),
         )
         spend = build_cold_refund(
             covenant=covenant,
@@ -793,7 +816,7 @@ def swap_build_refund_cmd(
     except ValidationError as exc:
         raise UserError(
             "could not build the refund spend",
-            cause=sanitize_terminal(str(exc), max_len=500),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), electrumx_urls(ctx)), max_len=500),
             fix="nothing was broadcast — correct the input above and re-run",
         ) from exc
     _emit_spend(ctx, spend, facts, chain)

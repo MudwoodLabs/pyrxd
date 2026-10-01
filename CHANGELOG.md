@@ -286,6 +286,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   network needed an opt-in to construct. None does. The gate stays a no-op.
 ### Security
 
+- **`swap status` and `swap recover-preimage` printed the operator's keyed endpoint URL.** An HTTP
+  error (401, 429, 5xx) from `--eth-rpc-url` or `--btc-api-url` was rendered with `{exc}`, and
+  aiohttp's `ClientResponseError` quotes the full URL, so an API key in its path or query appeared
+  in `status`'s counter-leg row, in `status --json`, and in `recover-preimage`'s error. There it was
+  worse: `ClientResponseError` is not an `OSError`, so it escaped as "unexpected failure", exit 4,
+  with the URL as the printed cause. Present since the counter-leg read was added in 0.14.0. Every
+  place in the swap CLI that prints an exception from a chain read now goes through one renderer
+  (`describe_network_error`): the exception type, its HTTP status, and the endpoint's host, never
+  the URL. A library exception's own text is dropped; pyrxd's own error text is kept with every
+  part of the endpoint URLs that can carry a credential removed (`redact_endpoint_secrets`), which
+  also covers an RPC error body that echoes the key. `recover-preimage`, `build-claim` and
+  `build-refund` now map an aiohttp error or a timeout to the ordinary "a chain read failed" exit 2.
+  The ElectrumX error paths in `swap status --check-chain`, `build-claim`, `build-refund` and the
+  orderbook commands scrub every configured ElectrumX URL the same way.
 - **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
   exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
   from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no

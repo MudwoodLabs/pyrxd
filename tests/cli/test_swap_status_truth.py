@@ -258,3 +258,176 @@ def test_a_live_covenant_status_with_a_claimed_log_reads_claimed(case, eth_rpc) 
     doc = json.loads(_eth_status(case, eth_rpc, client=_client(case, confirmations=5), output_mode="json").output)
     assert doc["chain"]["covenant_state"] == "live"
     assert doc["counter_leg"]["state"] == "CLAIMED_PREIMAGE_REVEALED"
+
+
+# --------------------------------------------------------------------------- 2. no keyed URL in any output
+
+FAKE_PATH_SECRET = "FAKEPATHSECRET0123"
+FAKE_QUERY_SECRET = "FAKEQUERYSECRET4567"
+FAKE_USER_SECRET = "FAKEUSERSECRET89AB"
+SECRETS = (FAKE_PATH_SECRET, FAKE_QUERY_SECRET, FAKE_USER_SECRET)
+
+
+class _Refusing(BaseHTTPRequestHandler):
+    """Answers every request with ``server.status`` and records the paths it was asked for."""
+
+    def _reply(self) -> None:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        self.server.seen.append(self.path)  # type: ignore[attr-defined]
+        self.send_response(self.server.status, "Refused")  # type: ignore[attr-defined]
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    do_GET = do_POST = _reply
+
+    def log_message(self, *a: Any) -> None:
+        return None
+
+
+@pytest.fixture(params=[401, 429])
+def refusing(request) -> Iterator[ThreadingHTTPServer]:
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Refusing)
+    srv.status = request.param  # type: ignore[attr-defined]
+    srv.seen = []  # type: ignore[attr-defined]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _keyed_url(srv: ThreadingHTTPServer) -> str:
+    return f"http://{FAKE_USER_SECRET}:pw@127.0.0.1:{srv.server_port}/v2/{FAKE_PATH_SECRET}?apikey={FAKE_QUERY_SECRET}"
+
+
+def _url_taking_commands() -> dict[str, Any]:
+    """Every ``swap`` subcommand that reads from an operator-supplied URL — DERIVED from the group.
+
+    A hand-kept list here would pass vacuously over the next command to grow a URL flag."""
+    from pyrxd.cli.swap_cmds import swap_group
+
+    return {
+        name: cmd
+        for name, cmd in swap_group.commands.items()
+        if any(opt.endswith("-url") for p in cmd.params for opt in getattr(p, "opts", ()))
+    }
+
+
+def test_the_derived_command_set_is_not_vacuous() -> None:
+    # The two commands this defect was found in must be among those derived; if the derivation
+    # ever stops finding them, every leak test below would pass over nothing.
+    assert {"status", "recover-preimage"} <= set(_url_taking_commands())
+
+
+def _args_for(cmd: Any, case: dict[str, Any], url: str) -> list[str]:
+    from .test_swap_recovery_cmds import _OUTPOINT
+
+    opts = {opt for p in cmd.params for opt in getattr(p, "opts", ())}
+    args = ["--swap-file", str(case["keys"])]
+    if "--check-chain" in opts:
+        args.append("--check-chain")
+    for opt in sorted(o for o in opts if o.endswith("-url")):
+        args += [opt, url]
+    if "--btc-funding-outpoint" in opts:
+        args += ["--btc-funding-outpoint", _OUTPOINT]
+    if "--eth-contract" in opts:
+        args += ["--eth-contract", ETH_CONTRACT]
+    return args
+
+
+@pytest.mark.parametrize("chain", ["btc", "eth"])
+@pytest.mark.parametrize("output_mode", ["human", "json"])
+def test_no_command_prints_the_keyed_url_on_an_http_error(case, refusing, chain, output_mode) -> None:
+    """An HTTP 401/429 from a keyed endpoint used to print the whole URL — path key, query key and
+    all — in ``swap status`` (human and ``--json``), and ``recover-preimage`` escaped as
+    "unexpected failure (ClientResponseError)" with the URL as its cause."""
+    from .test_swap_recovery_cmds import _ctx, _invoke
+
+    if chain == "eth":
+        _eth_swap(case)
+    url = _keyed_url(refusing)
+    commands = _url_taking_commands()
+    for name, cmd in commands.items():
+        refusing.seen.clear()  # type: ignore[attr-defined]
+        res = _invoke([name, *_args_for(cmd, case, url)], _ctx(_client(case), output_mode=output_mode))
+        rendered = res.output + (repr(res.exception) if res.exception else "")
+        # The request really went to the keyed URL — otherwise "no secret in the output" is vacuous.
+        assert any(FAKE_PATH_SECRET in path for path in refusing.seen), (name, refusing.seen)  # type: ignore[attr-defined]
+        for secret in SECRETS:
+            assert secret not in rendered, (name, secret, rendered)
+        assert res.exception is None or isinstance(res.exception, SystemExit), (name, rendered)
+        assert "unexpected failure" not in rendered
+        assert f"HTTP {refusing.status}" in rendered, (name, rendered)  # type: ignore[attr-defined]
+        assert "127.0.0.1" in rendered  # the host is named; only the parts after it are withheld
+    assert commands  # non-vacuity, again, at the point of use
+
+
+def test_status_json_reports_the_http_error_as_a_counter_leg_error(case, refusing) -> None:
+    from .test_swap_recovery_cmds import _OUTPOINT
+
+    res = _status(case, "--btc-funding-outpoint", _OUTPOINT, "--btc-api-url", _keyed_url(refusing), output_mode="json")
+    counter = _counter(res)
+    assert counter["state"] == "ERROR"
+    assert counter["reason"].startswith(f"counter-leg read failed: ClientResponseError (HTTP {refusing.status})")  # type: ignore[attr-defined]
+    assert not any(s in res.output for s in SECRETS)
+
+
+def test_recover_preimage_is_a_clean_network_error_through_the_real_entry_point(case, refusing) -> None:
+    """Through ``pyrxd`` itself, not the group: the top-level handler is where the URL escaped."""
+    import os
+    import subprocess
+    import sys
+
+    from .test_swap_recovery_cmds import _OUTPOINT
+
+    url = _keyed_url(refusing)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pyrxd.cli",
+            "swap",
+            "recover-preimage",
+            "--swap-file",
+            str(case["keys"]),
+            "--btc-funding-outpoint",
+            _OUTPOINT,
+            "--btc-api-url",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+        timeout=60,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 2, out  # NetworkBoundaryError, not exit 4 "unexpected failure"
+    assert "a chain read failed" in out
+    assert "unexpected failure" not in out
+    for secret in SECRETS:
+        assert secret not in out, out
+    assert any(FAKE_PATH_SECRET in p for p in refusing.seen)  # type: ignore[attr-defined]
+
+
+def test_pyrxd_messages_that_quote_a_url_are_scrubbed_but_kept() -> None:
+    """Our own exception text is shown (it carries the useful part) with the URL's secrets removed;
+    a library exception's text is dropped whole."""
+    from pyrxd.cli.swap_recovery import describe_network_error
+    from pyrxd.security.errors import NetworkError
+
+    url = f"https://rpc.example/v2/{FAKE_PATH_SECRET}?apikey={FAKE_QUERY_SECRET}"
+    ours = describe_network_error(NetworkError(f"TLS pin mismatch for {url}: rotate the pin"), url)
+    assert ours.startswith("NetworkError from rpc.example: TLS pin mismatch for <redacted>")
+    assert "rotate the pin" in ours
+    assert FAKE_PATH_SECRET not in ours and FAKE_QUERY_SECRET not in ours
+    # Pieces of the URL quoted separately are scrubbed too (an RPC body echoing the key).
+    echoed = describe_network_error(NetworkError(f"invalid project id {FAKE_PATH_SECRET}"), url)
+    assert FAKE_PATH_SECRET not in echoed
+    theirs = describe_network_error(RuntimeError(f"boom {url}"), url)
+    assert theirs == "RuntimeError from rpc.example"
