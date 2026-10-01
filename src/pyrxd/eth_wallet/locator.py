@@ -123,8 +123,8 @@ class EthHtlcLocator:
         EIP-155 chain id (Sepolia = 11155111, mainnet = 1). RECORDS which network this
         locator was created on, so a durable record read back later says which chain its
         ``contract_address`` lives on. It is a note, not a gate: as of 2026-09-03 NO code
-        compares it to anything. ``EthRpc.assert_chain`` checks the NODE against the leg's
-        own ``expected_chain_id``, and ``_sign_and_send`` signs with the LEG's ``chain_id``
+        compares it to anything. ``EthRpc.assert_chain`` checks the NODE against the rpc's
+        own ``expected_chain_id``; ``_sign_tx`` refuses unless the LEG's ``chain_id`` equals it
         — so a leg pointed at the wrong network is caught, but a locator from a DIFFERENT
         network driven by a correctly-configured leg is not. This entry claimed "the leg
         refuses a chain_id mismatch up front" until 2026-09-03; it never did. Adding the

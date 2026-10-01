@@ -55,6 +55,7 @@ def _leg(rpc: _Rpc) -> EthHtlcContractLeg:
     leg._rpc = rpc
     leg._key = PrivateKeyMaterial(os.urandom(32))
     leg._private_submitter = None
+    leg._chain_id = _TX["chainId"]  # `_sign_tx` refuses a transaction for any chain but the leg's
     return leg
 
 

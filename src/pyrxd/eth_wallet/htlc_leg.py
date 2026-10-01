@@ -309,7 +309,19 @@ class _ClaimTooLate(Exception):
         self.permanent = permanent
 
 
+class _AlreadySettled(Exception):
+    """Internal: the claim cannot be built because the HTLC's ``settled`` flag is set at the tip."""
+
+
 _LOG = logging.getLogger(__name__)
+
+#: The storage slot holding the HTLC's ``bool settled`` flag — slot 0, where Solidity places the
+#: first state variable, in BOTH reference contracts (EthHtlc and Erc20Htlc; every other field is
+#: an ``immutable`` and lives in the runtime code). ``claim()`` and ``refund()`` both revert
+#: ``AlreadySettled`` while it is set. ``tests/test_eth_htlc_settled_slot.py`` derives the slot from
+#: the vendored artifacts' runtime bytecode, so a layout change fails there rather than silently
+#: turning this check into a read of an unrelated word.
+SETTLED_SLOT: int = 0
 
 #: Seconds of head-room a claim must have before ``timeout`` to be worth broadcasting. DEFINED in
 #: :mod:`pyrxd.gravity.eth_rxd_timelock` and re-exported here, because the pre-funding check
@@ -373,7 +385,9 @@ class EthHtlcContractLeg:
         :class:`PrivateKeyMaterial` for the EOA that sends txs (taker for fund/refund,
         maker for claim — separate leg instances per role).
     chain_id:
-        EIP-155 chain id; must match ``rpc``'s endpoint (asserted at use).
+        EIP-155 chain id; must equal ``rpc.expected_chain_id``. Checked at the one place it
+        matters — :meth:`_sign_tx`, before any transaction is signed — because ``assert_chain``
+        only holds the endpoint to the RPC's own id and cannot see the id the leg signs with.
     artifact:
         The EthHtlc contract artifact dict (``abi`` + ``bytecode`` + ``runtime_bytecode`` +
         ``immutableReferences`` + ``immutable_names``), owned and INJECTED by the deploying
@@ -529,7 +543,10 @@ class EthHtlcContractLeg:
         4. claimant and refundee are EOAs (empty code) — a contract recipient that
            reverts on ``receive`` would brick claim/refund via the contract's
            ``require(ok)``;
-        5. funded balance >= expected amount (a LOWER bound — see the comment at the check) (no underfunded contract).
+        5. funded balance >= expected amount (a LOWER bound — see the comment at the check) (no underfunded contract);
+        6. the contract is NOT ALREADY SETTLED (storage slot :data:`SETTLED_SLOT` is zero). Check 2
+           covers the code, not storage; a contract whose ``settled`` flag is set cannot pay out
+           (``claim()`` and ``refund()`` both revert ``AlreadySettled``), so it is not a funded HTLC.
 
         ``block_identifier`` (red-team HIGH TOCTOU): pin EVERY read to one block. The taker's
         fund-time self-verify reads 'latest' (None). The MAKER's pre-lock re-verify passes
@@ -557,6 +574,8 @@ class EthHtlcContractLeg:
                 f"expected for the negotiated terms ({len(code)} bytes present, but different) — "
                 "wrong/attacker contract, or an immutable copy the getters cannot see was forged"
             )
+        # Code is exact; storage is not code. Same pinned block as every other read here.
+        await self._assert_not_settled(locator, block_identifier)
         # Read immutables back by value and bind them to the negotiated terms.
         #
         # Through `read_contract`, so a multi-source rpc rebuilds the contract per endpoint and
@@ -632,6 +651,29 @@ class EthHtlcContractLeg:
         if bal < expected_amount_wei:
             raise ValidationError(f"funded balance {bal} wei < negotiated {expected_amount_wei} wei (under-funded)")
 
+    async def _settled_word(self, locator: EthHtlcLocator, block_identifier: str | int | None) -> bytes:
+        """The 32-byte word at :data:`SETTLED_SLOT`, read through :func:`read_contract` so a
+        multi-source rpc makes it an identity quorum read like the immutables."""
+        _bid = "latest" if block_identifier is None else block_identifier
+        addr = locator.contract_address
+
+        def _call(r):
+            return r.w3.eth.get_storage_at(addr, SETTLED_SLOT, block_identifier=_bid)
+
+        word = bytes(await read_contract(self._rpc, _call, label=f"{addr}.storage[{SETTLED_SLOT}]"))
+        return word.rjust(32, b"\x00")
+
+    async def _assert_not_settled(self, locator: EthHtlcLocator, block_identifier: str | int | None) -> None:
+        """Refuse a contract whose ``settled`` flag is already set (check 6 of :meth:`verify_funded`)."""
+        word = await self._settled_word(locator, block_identifier)
+        if any(word):
+            raise ValidationError(
+                f"the HTLC at {locator.contract_address} is ALREADY SETTLED (storage slot "
+                f"{SETTLED_SLOT} = 0x{word.hex()} as of block_identifier={block_identifier!r}): its "
+                "claim() and refund() both revert, so it can never pay out. An HTLC created by this "
+                "artifact's constructor starts unsettled. Do NOT lock the other leg against it."
+            )
+
     def _account_address(self) -> str:
         """Derive this leg's sender address from the held key (no plaintext persisted)."""
         from pyrxd.eth_wallet.keys import derive_address
@@ -690,8 +732,27 @@ class EthHtlcContractLeg:
         hash to re-price against (#515, #504 item 1).
 
         Nothing here touches the network. The key's raw bytes live for one call and are dropped.
+
+        THE CHAIN CHECK LIVES HERE, because this is the one function every transaction this leg
+        sends is signed in. ``assert_chain`` holds the ENDPOINT to the rpc's ``expected_chain_id``;
+        nothing held the LEG's ``chain_id`` to that same value, so a leg and an rpc built with
+        different ids could sign for one chain and send to another. An rpc that declares no ``expected_chain_id`` (a duck-typed stand-in)
+        cannot be cross-checked here; both shipped rpc classes declare one.
         """
         web3 = _require_web3()
+        if tx.get("chainId") != self._chain_id:
+            raise ValidationError(
+                f"refusing to sign: the transaction's chainId {tx.get('chainId')!r} is not this leg's "
+                f"chain_id {self._chain_id}"
+            )
+        rpc_chain = getattr(self._rpc, "expected_chain_id", None)
+        if rpc_chain is not None and rpc_chain != self._chain_id:
+            raise ValidationError(
+                f"refusing to sign: this leg signs for chain {self._chain_id} but its rpc is pinned to "
+                f"chain {rpc_chain}. assert_chain checks only the rpc's own id, so the signed bytes "
+                "would have reached a provider on one chain while being valid on another. Build the "
+                "leg and the rpc with the same chain id."
+            )
         raw = self._key.unsafe_raw_bytes()
         try:
             signed = web3.Account.sign_transaction(tx, raw)
@@ -915,10 +976,30 @@ class EthHtlcContractLeg:
                     "counterparty both legs. Refund after the timeout instead.",
                     permanent=True,
                 )
+            # SETTLED AT THE TIP. `verify_funded` refuses a settled contract too, but this is the
+            # last read before `p` can leave the process: a claim against a settled contract reverts,
+            # and a reverted claim still carries `p` in its calldata (the private path has no
+            # preflight to stop it). One storage read keeps that independent of whether the caller
+            # verified first.
+            settled_word = await self._settled_word(locator, None)
+            if any(settled_word):
+                raise _AlreadySettled(
+                    f"refusing to build a claim: the HTLC at {locator.contract_address} is already "
+                    f"settled (storage slot {SETTLED_SLOT} = 0x{settled_word.hex()}), so claim() would "
+                    "revert while still publishing the preimage in its calldata. Nothing was sent. "
+                    "If a claim from this address already succeeded, this swap is done — look for its "
+                    "Claimed event. If not, the contract was deployed pre-settled and can never pay: "
+                    "do not claim, and refund the other leg once its timelock allows."
+                )
             c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
             built = await c.functions.claim(bytes(preimage)).build_transaction(
                 await self._base_tx(gas=120_000, basefee_headroom=CLAIM_BASEFEE_HEADROOM)
             )
+        except _AlreadySettled as exc:
+            # Its own message, not the generic wrapper's: "the preimage is still secret" is true of
+            # THIS call, but if our own earlier claim is what settled the contract, p is already
+            # public, and the message must not tell the operator otherwise.
+            raise PreRevealAbort(str(exc)) from exc
         except _ClaimTooLate as exc:
             # Permanent -> PreRevealExpired, so a driver stops and refunds rather than spinning
             # until the deadline it is already too close to (#485). Both keep `p`: nothing was

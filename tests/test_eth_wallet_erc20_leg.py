@@ -60,6 +60,11 @@ def _locator(**over) -> Erc20HtlcLocator:
     return Erc20HtlcLocator(**base)
 
 
+async def _unsettled_storage(*_a, **_k) -> bytes:
+    """`eth_getStorageAt` for an HTLC whose `settled` flag (slot 0) is clear — every honest one."""
+    return b"\x00" * 32
+
+
 class _Rpc:
     """Serves one correctly-deployed token HTLC. Override any answer by keyword."""
 
@@ -96,7 +101,9 @@ class _Rpc:
                 return lambda *_a: _Call(name)
 
         self.w3 = types.SimpleNamespace(
-            eth=types.SimpleNamespace(contract=lambda **_k: types.SimpleNamespace(functions=_Fns()))
+            eth=types.SimpleNamespace(
+                contract=lambda **_k: types.SimpleNamespace(functions=_Fns()), get_storage_at=_unsettled_storage
+            )
         )
 
     async def assert_chain(self):
@@ -392,7 +399,7 @@ class _PushRpc:
         def _contract(**_k):
             return types.SimpleNamespace(functions=_Fns(), constructor=lambda *_a: _Ctor())
 
-        eth = types.SimpleNamespace(contract=_contract)
+        eth = types.SimpleNamespace(contract=_contract, get_storage_at=_unsettled_storage)
         self.w3 = self.write_w3 = types.SimpleNamespace(eth=eth)
 
     async def assert_chain(self):
