@@ -248,7 +248,7 @@ on every entry:
 {node_para}
 
 Every height is at least {min_depth} blocks below the lowest tip any source reported
-({pinned_at_tip}), far past Radiant Core's default maximum reorg depth of 69.
+({pinned_at_tip}), far past Radiant Core's default `-maxreorgdepth` (69).
 
 THE LAST INTERVAL'S WORK. Every one of the {interval_n} headers from {interval_lo} to {interval_hi} was
 fetched from every source; {interval_who} served them byte for byte

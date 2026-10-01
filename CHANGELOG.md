@@ -463,8 +463,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `epsilon` clamped to 1e-12..1e-3, `dust_threshold_photons` 1,000 RXD (above it, two distinct
   operators must report the funding's depth; see Security), `accept_single_operator_up_to_photons`
   `None` (the user override of that threshold; see Security), and, for the negotiation-time check
-  only, `early_slack_s` 3600 and `early_work_margin` 2.0. The defaults other than `surge_factor`
-  and `dust_threshold_photons` await the maintainer's sign-off.
+  only, `early_slack_s` 3600 and `early_work_margin` 2.0. The maintainer signed off on 2026-09-30 on
+  `surge_factor`, `loss_budget_photons` with its `epsilon` clamp, `early_slack_s`,
+  `dust_threshold_photons` and the `accept_single_operator_up_to_photons` override;
+  `early_work_margin` was not on that list.
 - **The operator scripts no longer default to any one operator's node.**
   `scripts/radiant_mainnet_chainio.py:SshTrRadiantClient` and `scripts/_glyph_ref_http.py:SshTrHttpRefAdapter`
   take `ssh_host` (and the shim `container`) with no default, charset-checked as the watchtower's
@@ -668,7 +670,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   maker's asset until `t_rxd`. The construction-time check now projects where a funding agreed now
   reaches the depth the gate requires, from the newest checkpoint's timestamp and the clock (the
   system clock when the coordinator is built without one), with blocks counted 1.1 times faster
-  than the nominal 300 s (`CHECKPOINT_HORIZON_RATE_FACTOR`, a policy value for maintainer sign-off),
+  than the nominal 300 s (`CHECKPOINT_HORIZON_RATE_FACTOR`, a policy value the maintainer signed off on; the fastest
+  20,160-block stretch since height 300,000 ran 1.032 times nominal),
   and refuses past the horizon with "Upgrade pyrxd (newer checkpoints)". The checkpoint table now
   ships the newest checkpoint's raw header (`NEWEST_CHECKPOINT_HEADER`; a test re-hashes it to the
   checkpoint), which `scripts/refresh_radiant_checkpoints.py` writes and `--check` compares. Step 5's

@@ -100,7 +100,7 @@ used is::
   probability at most ``ε`` (:func:`poisson_upper_quantile`, computed conservatively).
   ``ε = clamp(loss_budget ÷ value_at_stake, 1e-12, 1e-3)``: the confidence scales with the value,
   so the expected cost of an honest over-run stays at or below about the loss budget (1 RXD by
-  default). The defaults are policy (:class:`ElapsedBoundPolicy`), listed for maintainer sign-off.
+  default). The defaults are policy (:class:`ElapsedBoundPolicy`); see it for which the maintainer signed off.
 * ``reported`` is the largest depth any configured source reports for the funding — its verbose
   ``confirmations`` or ``tip - H + 1`` — grouped by operator (:func:`pyrxd.network.source_identity.source_key`).
   A report can only RAISE the bound; a source reporting less never lowers it. Any ONE configured
@@ -320,7 +320,10 @@ class MakerFundingNotVerified(ValidationError):
 
 @dataclass(frozen=True)
 class ElapsedBoundPolicy:
-    """The policy inputs of the elapsed-depth upper bound — defaults for maintainer sign-off.
+    """The policy inputs of the elapsed-depth upper bound.
+
+    The maintainer signed off on every default here on 2026-09-30 except ``early_work_margin``,
+    which was not on that list.
 
     * ``surge_factor`` — the block rate the bound allows for, as a multiple of the nominal spacing:
       ``λ = surge_factor ÷ nPowTargetSpacing``. Default 3.0: a backtest of this bound over every
@@ -446,7 +449,7 @@ class ElapsedBoundPolicy:
         return poisson_upper_quantile(mean, self.epsilon(value_at_stake_photons))
 
 
-#: The defaults, as listed for maintainer sign-off.
+#: The defaults (see :class:`ElapsedBoundPolicy` for their sign-off).
 DEFAULT_ELAPSED_BOUND_POLICY = ElapsedBoundPolicy()
 
 

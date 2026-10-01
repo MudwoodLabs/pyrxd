@@ -17,7 +17,7 @@ answer, read-only; nothing was sent), and it agreed with all three servers on ev
 missing or different answer from any of the four would have refused the write.
 
 Every height is at least 1000 blocks below the lowest tip any source reported
-(468799), far past Radiant Core's default maximum reorg depth of 69.
+(468799), far past Radiant Core's default `-maxreorgdepth` (69).
 
 THE LAST INTERVAL'S WORK. Every one of the 2017 headers from 465696 to 467712 was
 fetched from every source; all three servers and the node served them byte for byte
