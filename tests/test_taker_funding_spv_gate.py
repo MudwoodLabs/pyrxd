@@ -1088,6 +1088,167 @@ def test_C_takes_the_hardest_header_of_the_last_checkpoint_interval():
     assert r.forged_confirmation_cost_photons == r.subsidy_photons * (work[4] // 16) // work[3]
 
 
+#: Twice ``_HARD_BITS``' work: target ``0x3fffff…`` against ``0x7fffff…``.
+_HARDER_BITS = 0x1F3FFFFF
+
+
+def _recent_hashrate_case(monkeypatch):
+    """A value-bearing chain whose NEWEST three headers are mined at twice the work of all the others,
+    and a proof server that serves the chain only up to just below them — the real recent headers
+    left out, so every header it serves is easy. The value is sized so ``k``'s value term is ten at the
+    served headers' work and twenty at the withheld ones'."""
+    base, chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    spk = _covenant(terms)
+    probe = build_funding_chain(spk=spk, value=terms.radiant_amount, confs=40, base=base, bits=_HARD_BITS)
+    top = probe.top
+    real = build_funding_chain(
+        spk=spk,
+        value=terms.radiant_amount,
+        confs=40,
+        base=base,
+        bits=_HARD_BITS,
+        tip_time=_NOW,
+        bits_at={h: _HARDER_BITS for h in range(top - 2, top + 1)},
+    )
+    pl = chain.pow_limit
+    easy_work = radiant_header_work(real.headers[top - 3], pow_limit=pl)
+    hard_work = radiant_header_work(real.headers[top], pow_limit=pl)
+    assert hard_work >= 2 * easy_work - 2
+    served = dataclasses.replace(real, headers={h: b for h, b in real.headers.items() if h <= top - 3})
+    subsidy = block_subsidy_photons(real.height, chain)
+    c_easy = subsidy * (chain.newest_checkpoint_work // 16) // easy_work
+    value = 5 * c_easy  # value term ceil(2 × value ÷ C) = 10 at the easy work
+    return chain, terms, spk, real, served, value, easy_work, hard_work
+
+
+class _TipServer(_DepthReader):
+    """A second operator that serves the REAL chain: the funding's confirmations, its tip, and the
+    headers ending at its tip (or ``tip_headers`` instead, when given)."""
+
+    def __init__(self, view, real, *, tip_headers=None, fail_headers=False):
+        super().__init__(view)
+        self.real, self._tip_headers, self.fail_headers, self.header_reads = real, tip_headers, fail_headers, []
+
+    async def get_transaction_verbose(self, txid):
+        return {"confirmations": self.real.top - self.real.height + 1}
+
+    async def get_tip_height(self):
+        return self.real.top
+
+    async def get_block_headers(self, start, count):
+        self.header_reads.append((start, count))
+        if self.fail_headers:
+            raise NetworkError("headers unavailable")
+        if self._tip_headers is not None:
+            return list(self._tip_headers)
+        return [self.real.headers[h] for h in range(start, start + count) if h in self.real.headers]
+
+
+async def test_recent_harder_headers_a_server_leaves_out_still_raise_max_work_and_k(monkeypatch):
+    """``max_header_work`` was the maximum over the headers the PROOF's server chose to serve and the
+    shipped last checkpoint interval, so a server that left the chain's newest, harder headers out
+    priced ``C`` on easier ones: a larger ``C``, a smaller ``k``.
+
+    Through the real leg and ``RadiantChainIO``: a second operator serving its own newest headers —
+    the real, harder ones — raises ``max_header_work`` to theirs and doubles the value term, and the
+    result says whose headers raised it. One header-range read per operator. Without those headers
+    (a source that serves none) the gate is exactly what it was, and says so."""
+    from pyrxd.gravity.radiant_leg import TIP_HEADERS_FOR_WORK
+
+    _chain, terms, _spk, real, served, value, easy_work, hard_work = _recent_hashrate_case(monkeypatch)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=40, chain=served)
+
+    async def proof_with(second):
+        coord, _ = _btc_coord(
+            terms,
+            _real_leg(view, network="bc", depth_sources=(second,)),
+            policy=_vb_policy(value_at_risk_photons=value),
+            accept_nondurable_seen=True,
+        )
+        await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+        return coord.last_maker_funding
+
+    plain = await proof_with(_DepthReader(view))  # no tip headers served
+    assert plain.max_header_work == easy_work and plain.value_term == 10
+    assert plain.operator_tip_work == ()
+    assert "no source served its tip headers" in plain.bound_note, plain.bound_note
+
+    honest = _TipServer(view, real)
+    raised = await proof_with(honest)
+    b = str(_SHIPPED_OPERATORS[1])
+    start = max(0, real.top - TIP_HEADERS_FOR_WORK + 1)
+    assert honest.header_reads == [(start, real.top - start + 1)]  # one header-range read, ending at its tip
+    assert raised.max_header_work == hard_work and dict(raised.operator_tip_work)[b] == hard_work
+    assert raised.value_term == 20 and raised.required_confirmations == 20 > plain.required_confirmations
+    assert raised.forged_confirmation_cost_photons < plain.forged_confirmation_cost_photons
+    assert f"raised by the tip headers of {b}" in raised.bound_note, raised.bound_note
+
+
+def test_tip_headers_can_only_raise_max_work_never_lower_it(monkeypatch):
+    """At the gate: a source's tip headers that are EASIER than what the proof served change nothing
+    (the maximum cannot fall); headers that fail their own proof-of-work, or do not link to one
+    another, are ignored and named; and an absent read leaves the gate on the proof's headers, said
+    in ``bound_note``."""
+    chain, terms, spk, real, served, value, easy_work, hard_work = _recent_hashrate_case(monkeypatch)
+    kw = dict(chain=chain, expected_spk=spk, expected_value=terms.radiant_amount, burial_blocks=6, now_unix_s=_NOW)
+    b = str(_SHIPPED_OPERATORS[1])
+
+    def run(tip_headers):
+        ev = _two_operators(served.evidence())
+        ev = dataclasses.replace(ev, operator_tip_headers=tip_headers)
+        return verify_maker_funding(ev, value_at_stake_photons=value, **kw)
+
+    plain = run(())
+    assert plain.max_header_work == easy_work and "no source served its tip headers" in plain.bound_note
+
+    # Easier: a valid, linked run of regtest-difficulty headers. Cannot lower anything.
+    easy_run = build_funding_chain(spk=b"\x51", value=1, confs=20).headers
+    easier = run(((b, 0, tuple(easy_run[h] for h in sorted(easy_run))),))
+    assert dict(easier.operator_tip_work)[b] < easy_work
+    assert (
+        easier.max_header_work == plain.max_header_work
+        and easier.required_confirmations == plain.required_confirmations
+    )
+    assert "did not raise it" in easier.bound_note, easier.bound_note
+
+    tip = [real.headers[h] for h in range(real.top - 9, real.top + 1)]
+    # A hard header whose proof-of-work fails: one byte of its nonce changed.
+    bad_pow = list(tip)
+    bad_pow[-1] = bad_pow[-1][:76] + bytes([bad_pow[-1][76] ^ 1]) + bad_pow[-1][77:]
+    # Real hard headers that do not link: one header dropped from the middle.
+    unlinked = tip[:4] + tip[5:]
+    for broken in (bad_pow, unlinked):
+        r = run(((b, real.top - 9, tuple(broken)),))
+        assert dict(r.operator_tip_work)[b] is None
+        assert r.max_header_work == plain.max_header_work, "an unverified run must change nothing"
+        assert f"the tip headers of {b} did not verify and were ignored" in r.bound_note, r.bound_note
+
+    good = run(((b, real.top - 9, tuple(tip)),))
+    assert good.max_header_work == hard_work and good.required_confirmations > plain.required_confirmations
+
+
+async def test_a_tip_header_read_that_fails_leaves_the_gate_as_it_was(monkeypatch):
+    """Fetch failure: the operator answers its depth but its header read raises. The gate falls back to
+    the proof's headers — same ``max_header_work``, same ``k`` — the operator still counts for the
+    two-operator rule, and ``bound_note`` says no source served its tip headers."""
+    _chain, terms, _spk, real, served, value, easy_work, _hard = _recent_hashrate_case(monkeypatch)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=40, chain=served)
+    failing = _TipServer(view, real, fail_headers=True)
+    coord, _ = _btc_coord(
+        terms,
+        _real_leg(view, network="bc", depth_sources=(failing,)),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+    )
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    proof = coord.last_maker_funding
+    assert failing.header_reads, "the header read was attempted"
+    assert proof.max_header_work == easy_work and proof.value_term == 10
+    assert str(_SHIPPED_OPERATORS[1]) in proof.reporting_operators
+    assert "no source served its tip headers" in proof.bound_note, proof.bound_note
+
+
 def test_k_past_the_cap_refuses_with_upgrade_or_use_your_own_node(monkeypatch):
     base, chain = _value_bearing_chain(monkeypatch)
     spk = b"\x76\xa9" + bytes(32)

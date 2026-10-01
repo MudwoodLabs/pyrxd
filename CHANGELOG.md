@@ -288,7 +288,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - on mainnet the proved depth must reach `k = max(6, burial, ceil(2 × value ÷ C))`. `C` is the
     photon cost of one forged confirmation: the block subsidy at the funding height (Radiant
     Core's `GetBlockSubsidy` and `nSubsidyHalvingInterval`, vendored and re-derived by a test) ×
-    the floor work ÷ the most work of any header checked or in the last checkpoint interval.
+    the floor work ÷ the most work of any header checked, in the last checkpoint interval, or in
+    the newest 144 headers each configured source serves below its own tip (one header-range read
+    per operator, concurrent; a run counts only when each header meets its own proof-of-work target
+    and links to the one before). Those tip headers can only raise it: a source that serves none,
+    easier ones, or ones that do not verify leaves `C` where the proof's own headers put it, and the
+    result's `bound_note` says which sources raised it, which did not, and which were ignored.
     `burial` is the swap's existing reorg burial, value-scaled; the value is the swap's own
     assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
     With no value to size `k` from, the lock is refused. Regtest runs the same proof against its

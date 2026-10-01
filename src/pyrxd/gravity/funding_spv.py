@@ -39,10 +39,17 @@ proved here, never a server's figure:
   at the pinned tag and a test re-derives these constants from them.
 * ``floor_work`` — the newest shipped checkpoint's header work ÷ 16, the floor the verifier enforces.
 * ``max_header_work`` — the MOST work any header carries, over every header the verifier checked
-  in this run AND the whole last checkpoint interval (linked between the two newest shipped
-  checkpoints). The maximum, because a higher real work makes the floor a smaller fraction of a real
-  block, i.e. a cheaper forgery and a smaller ``C``; including the checkpoint interval keeps a server
-  from lowering it by serving only easy headers above the checkpoint.
+  in this run, the whole last checkpoint interval (linked between the two newest shipped
+  checkpoints), AND each configured source's own newest headers
+  (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` ending at its tip; a run counts only when
+  every header in it meets its own proof-of-work target and links to the one before). The maximum,
+  because a higher real work makes the floor a smaller fraction of a real block, i.e. a cheaper
+  forgery and a smaller ``C``. The checkpoint interval keeps a server from lowering it by serving
+  only easy headers above the checkpoint; the other sources' tip headers keep the proof's server from
+  hiding the chain's recent difficulty by leaving the newest, harder headers out. A source can only
+  RAISE it (a hostile one can ask more of the funding, never less); a source that serves no tip
+  headers, or ones that do not verify, leaves it at what the proof's headers give, and the result's
+  ``bound_note`` says which.
 
 ``burial`` is the swap's existing Radiant reorg burial (the policy's measured claim burial, raised by
 the value-scaled burial of :func:`pyrxd.gravity.swap_coordinator._value_scaled_burial_blocks`), and
@@ -176,9 +183,9 @@ from pyrxd.glyph.mark_block import (
 from pyrxd.glyph.wave_rules import format_rxd
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
 from pyrxd.hash import hash256, radiant_block_hash
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.security.types import BlockHeight
-from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work
+from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work, verify_radiant_header_pow
 from pyrxd.spv.radiant_checkpoints import CHECKPOINTS, LAST_INTERVAL_MAX_WORK, NEWEST_CHECKPOINT_WORK
 from pyrxd.transaction.transaction import Transaction
 
@@ -742,8 +749,9 @@ def early_elapsed_blocks_upper(
     shipped last interval's own price, so this takes the MAXIMUM of that expression over every value
     term the two allow, with ``k = max(6, burial, v)`` as the gate computes it.
 
-    NOT COVERED, stated: a header served above the newest checkpoint carrying more than
-    ``early_work_margin`` times the shipped last interval's hardest (the gate's ``C`` then falls below
+    NOT COVERED, stated: a header served above the newest checkpoint — by the proof's server, or in
+    any source's tip headers — carrying more than ``early_work_margin`` times the shipped last
+    interval's hardest (the gate's ``C`` then falls below
     the floor used here, and its ``k`` and bound grow in proportion); a funding mined below the
     newest checkpoint (a covenant for terms agreed now is mined above it); and a chain whose blocks
     come slower than the nominal spacing by more than ``early_slack_s`` absorbs. In each case step 6
@@ -904,6 +912,11 @@ class MakerFundingEvidence:
     #: tip height said nothing about this transaction, so it may raise the bound (through
     #: ``reported_depths``) but is not an operator reporting the funding.
     funding_tx_depths: tuple[tuple[str, int], ...] = ()
+    #: ``((source, start_height, headers), ...)``: the headers each source served ending at its own
+    #: tip (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` of them). Each run whose headers
+    #: all meet their own proof-of-work target and link to one another RAISES ``max_header_work`` to
+    #: its hardest header; it can never lower anything, and a run that does not verify is ignored.
+    operator_tip_headers: tuple[tuple[str, int, tuple[bytes, ...]], ...] = ()
     #: The operator groups the leg was configured to ask (whether or not they answered), for a
     #: refusal to name. Not evidence of anything.
     configured_operators: tuple[str, ...] = ()
@@ -929,6 +942,9 @@ class VerifiedMakerFunding:
     subsidy_photons: int
     floor_work: int
     max_header_work: int
+    #: ``((source, work), ...)``: the hardest header in each source's tip headers, or ``None`` where
+    #: they did not verify (ignored). ``max_header_work`` is at least each of these.
+    operator_tip_work: tuple[tuple[str, int | None], ...]
     #: The most work in the last checkpoint interval, as linked in this run (``None`` with one
     #: checkpoint). The shipped table records the same number for the negotiation-time check.
     last_interval_max_work: int | None
@@ -1003,6 +1019,30 @@ def counted_operators(labels: Sequence[str]) -> tuple[str, ...]:
     """The distinct operator groups among *labels* that count toward :data:`MIN_REPORTING_OPERATORS`:
     every label but an unidentified source's (:data:`UNIDENTIFIED_SOURCE_PREFIX`), each once."""
     return tuple(dict.fromkeys(str(k) for k in labels if not str(k).startswith(UNIDENTIFIED_SOURCE_PREFIX)))
+
+
+def _tip_run_max_work(run: Any, pow_limit: int) -> tuple[str, int | None] | None:
+    """``(source, hardest work)`` for one source's served tip headers, or ``(source, None)`` when any
+    header fails its own proof-of-work or the run does not link header to header; ``None`` for an
+    entry that is not ``(source, start, headers)`` at all."""
+    if not (isinstance(run, (tuple, list)) and len(run) == 3):
+        return None
+    label, _start, headers = run
+    if not isinstance(headers, (tuple, list)) or not headers:
+        return (str(label), None)
+    try:
+        best = 0
+        below: str | None = None
+        for hdr in headers:
+            raw = bytes(hdr)
+            block_hash = verify_radiant_header_pow(raw, pow_limit=pow_limit)
+            if below is not None and radiant_header_prev_hash(raw) != below:
+                return (str(label), None)
+            below = block_hash
+            best = max(best, radiant_header_work(raw, pow_limit=pow_limit))
+    except (TypeError, ValueError, ValidationError, SpvVerificationError):
+        return (str(label), None)
+    return (str(label), best)
 
 
 def verify_maker_funding(
@@ -1139,6 +1179,40 @@ def verify_maker_funding(
             rule,
             f"the funding in block {height}, at least {proved} deep",
         ) from None
+    # The chain's RECENT difficulty, as every source sees it. The headers above were chosen by the
+    # proof's server, which could leave out real recent headers harder than any it served — a smaller
+    # max_header_work, a larger C, a smaller k. Each source's own tip headers (the newest
+    # TIP_HEADERS_FOR_WORK it serves) are folded in when they verify: each meets its own proof-of-work
+    # target and links to the one before. They can only RAISE max_work, so a source serving easier
+    # headers, or none, or headers that do not verify, changes nothing — the gate is then exactly
+    # what the proof's headers alone give, and bound_note says so. A hostile source can raise it,
+    # which only asks more of the funding (a larger k), never less.
+    served_max_work = max_work
+    tip_work: list[tuple[str, int | None]] = []
+    runs = evidence.operator_tip_headers if isinstance(evidence.operator_tip_headers, (tuple, list)) else ()
+    for run in runs:
+        got = _tip_run_max_work(run, chain.pow_limit)
+        if got is None:
+            continue
+        tip_work.append(got)
+        if got[1] is not None and got[1] > max_work:
+            max_work = got[1]
+    raisers = [k for k, w in tip_work if w is not None and w == max_work and w > served_max_work]
+    unverified = [k for k, w in tip_work if w is None]
+    if not tip_work:
+        work_part = (
+            "no source served its tip headers, so max header work is from the proof's headers and the last "
+            "checkpoint interval alone"
+        )
+    elif raisers:
+        work_part = f"max header work {_log2(max_work)} raised by the tip headers of {', '.join(raisers)}"
+    else:
+        work_part = (
+            f"max header work {_log2(max_work)}; the tip headers of "
+            f"{', '.join(k for k, w in tip_work if w is not None) or 'no source'} did not raise it"
+        )
+    if unverified:
+        work_part += f"; the tip headers of {', '.join(unverified)} did not verify and were ignored"
     subsidy = block_subsidy_photons(height, chain)
     cost = subsidy * floor_work // max_work if max_work > 0 else 0
 
@@ -1152,9 +1226,10 @@ def verify_maker_funding(
         )
     except MakerFundingNotVerified as exc:
         raise refuse(str(exc), rule, f"the funding in block {height}, at least {proved} deep") from None
+    raised_by = f", raised by the tip headers of {', '.join(raisers)}" if raisers else ""
     pricing = (
         f"C = {cost} photons (subsidy {subsidy} at block {height} × floor work {_log2(floor_work)} ÷ max header "
-        f"work {_log2(max_work)})"
+        f"work {_log2(max_work)}{raised_by})"
     )
     if chain.value_bearing:
         why = (
@@ -1330,7 +1405,10 @@ def verify_maker_funding(
                 override,
                 "unknown" if value_at_stake_photons is None else format_rxd(value_at_stake_photons),
             )
-    note = f"the {term} term set the bound at {upper}: {time_part}; {report_part}; proved {proved}{one_op}{rule_part}"
+    note = (
+        f"the {term} term set the bound at {upper}: {time_part}; {report_part}; proved {proved}{one_op}{rule_part}; "
+        f"{work_part}"
+    )
 
     return VerifiedMakerFunding(
         outpoint=f"{txid}:{vout}",
@@ -1346,6 +1424,7 @@ def verify_maker_funding(
         subsidy_photons=subsidy,
         floor_work=floor_work,
         max_header_work=max_work,
+        operator_tip_work=tuple(tip_work),
         last_interval_max_work=interval_max,
         elapsed_blocks_upper=upper,
         bound_term=term,

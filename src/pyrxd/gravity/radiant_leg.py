@@ -171,6 +171,12 @@ class RadiantBroadcaster(Protocol):
 #: it. The sources are asked concurrently, so this bounds the whole call, not each source in turn.
 DEPTH_SOURCE_TIMEOUT_S = 20.0
 
+#: How many headers, ending at its own tip, :meth:`RadiantChainIO.depth_reports` asks each source for
+#: — about half a day of Radiant blocks at the nominal 300 s — so the taker gate's maximum header
+#: work reflects the chain's recent difficulty as every operator sees it, not only the headers the
+#: proof's server chose to serve.
+TIP_HEADERS_FOR_WORK = 144
+
 
 @dataclass(frozen=True)
 class DepthReports:
@@ -186,6 +192,11 @@ class DepthReports:
 
     reported: tuple[tuple[str, int], ...]
     funding_tx: tuple[tuple[str, int], ...]
+    #: ``((source, start_height, headers), ...)``: the newest :data:`TIP_HEADERS_FOR_WORK` headers each
+    #: source served below its own tip, as served — for the gate's maximum header work, which they can
+    #: only raise (:func:`pyrxd.gravity.funding_spv.verify_maker_funding` checks each header's own
+    #: proof-of-work and their linkage). A source that did not serve them is absent.
+    tip_headers: tuple[tuple[str, int, tuple[bytes, ...]], ...] = ()
 
 
 class RadiantChainIO:
@@ -423,6 +434,7 @@ class RadiantChainIO:
             headers=headers,
             reported_depths=reports.reported,
             funding_tx_depths=reports.funding_tx,
+            operator_tip_headers=reports.tip_headers,
             configured_operators=self.configured_depth_operators(),
         )
 
@@ -484,9 +496,15 @@ class RadiantChainIO:
         ``reported`` RAISES the gate's elapsed upper bound; above dust the gate counts the operators in
         ``funding_tx`` only. The proof does not depend on either.
 
-        The sources are asked CONCURRENTLY, each under ``depth_timeout_s``; one that times out or
-        fails is left out exactly as one that answers neither. So an unresponsive operator costs the
-        call one timeout, not one per source in turn.
+        Each source is also asked for the :data:`TIP_HEADERS_FOR_WORK` headers ending at the tip it
+        reported (``tip_headers``), one header-range read, for the gate's maximum header work — which
+        they can only RAISE: a source that serves none, or headers that do not verify, leaves the gate
+        on the headers of the proof alone, and the gate says so.
+
+        The sources are asked CONCURRENTLY, each under ``depth_timeout_s`` for its depth reads and again
+        for its header read; one that times out or fails is left out exactly as one that answers
+        neither. So an unresponsive operator costs the call at most two timeouts, not two per source
+        in turn.
         """
         asked: list[tuple[int, Any]] = []
         made: list[Any] = []
@@ -505,30 +523,42 @@ class RadiantChainIO:
                     await part.close()
         reported: list[tuple[str, int]] = []
         funding_tx: list[tuple[str, int]] = []
-        for label, confs, tip_depth in answers:
+        tip_headers: list[tuple[str, int, tuple[bytes, ...]]] = []
+        for label, confs, tip, served in answers:
+            tip_depth = tip - height + 1 if tip is not None and tip >= height else None
             found = [d for d in (confs, tip_depth) if d is not None]
             if found:
                 reported.append((label, max(found)))
             if confs is not None:
                 funding_tx.append((label, confs))
-        return DepthReports(reported=tuple(reported), funding_tx=tuple(funding_tx))
+            if served is not None:
+                tip_headers.append((label, *served))
+        return DepthReports(reported=tuple(reported), funding_tx=tuple(funding_tx), tip_headers=tuple(tip_headers))
 
     async def _ask_depths(
         self, asked: list[tuple[int, Any]], txid: str, height: int
-    ) -> tuple[tuple[str, int | None, int | None], ...]:
-        async def one(index: int, src: Any) -> tuple[str, int | None, int | None] | None:
+    ) -> tuple[tuple[str, int | None, int | None, tuple[int, tuple[bytes, ...]] | None], ...]:
+        async def one(
+            index: int, src: Any
+        ) -> tuple[str, int | None, int | None, tuple[int, tuple[bytes, ...]] | None] | None:
             try:
-                confs, tip_depth = await asyncio.wait_for(
-                    self._ask_one(index, src, txid, height), self._depth_timeout_s
-                )
+                confs, tip = await asyncio.wait_for(self._ask_one(index, src, txid, height), self._depth_timeout_s)
             except asyncio.TimeoutError:
                 logger.debug("depth source %d did not answer within %.1f s", index, self._depth_timeout_s)
                 return None
-            if confs is None and tip_depth is None:
+            served = None
+            if tip is not None:
+                # After the depth reads, on the same connection (see `_ask_one`); its own timeout, so a
+                # slow header read never costs the depth answers already in hand.
+                try:
+                    served = await asyncio.wait_for(self._ask_tip_headers(index, src, tip), self._depth_timeout_s)
+                except asyncio.TimeoutError:
+                    logger.debug("depth source %d served no tip headers within %.1f s", index, self._depth_timeout_s)
+            if confs is None and tip is None:
                 return None
             key = getattr(src, "source_key", None)
             label = str(key) if key else self._unidentified_label(index, src)
-            return (label, confs, tip_depth)
+            return (label, confs, tip, served)
 
         # Concurrently: one unresponsive operator costs one timeout, not one per source in turn.
         # `gather` keeps the order they were asked in.
@@ -536,10 +566,26 @@ class RadiantChainIO:
         return tuple(a for a in answers if a is not None)
 
     @staticmethod
+    async def _ask_tip_headers(index: int, src: Any, tip: int) -> tuple[int, tuple[bytes, ...]] | None:
+        """``(start, headers)``: the :data:`TIP_HEADERS_FOR_WORK` headers ending at *tip*, as *src*
+        serves them, or ``None`` when it cannot (no ``get_block_headers``, a failed read, nothing
+        served). Nothing here is checked: the gate verifies each header and their linkage."""
+        fetch = getattr(src, "get_block_headers", None)
+        if not callable(fetch) or tip < 0:
+            return None
+        start = max(0, tip - TIP_HEADERS_FOR_WORK + 1)
+        try:
+            got = tuple(bytes(h) for h in await fetch(start, tip - start + 1))
+        except Exception:
+            logger.debug("depth source %d served no tip headers", index, exc_info=True)
+            return None
+        return (start, got) if got else None
+
+    @staticmethod
     async def _ask_one(index: int, src: Any, txid: str, height: int) -> tuple[int | None, int | None]:
-        """``(confirmations, tip_depth)`` one source reports: its verbose ``confirmations`` for *txid*
-        (``None`` unless it answered that read with a positive count) and ``tip - height + 1``
-        (``None`` unless it answered its tip at or above *height*); a read that fails is ``None``.
+        """``(confirmations, tip)`` one source reports: its verbose ``confirmations`` for *txid*
+        (``None`` unless it answered that read with a positive count) and its tip height (``None``
+        unless it answered one at or above *height*); a read that fails is ``None``.
 
         The two reads are asked ONE AFTER THE OTHER. Only different sources run concurrently: two
         concurrent first calls on one fresh ``ElectrumXClient`` would each open a connection, and
@@ -563,7 +609,7 @@ class RadiantChainIO:
                 return None
             try:
                 t = finite_int(await tip())
-                return t - height + 1 if t >= height else None
+                return t if t >= height else None
             except Exception:
                 logger.debug("depth source %d gave no tip height", index, exc_info=True)
                 return None
