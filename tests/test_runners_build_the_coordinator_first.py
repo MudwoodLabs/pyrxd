@@ -709,7 +709,9 @@ async def test_a_resume_refused_on_its_t_rxd_names_the_changed_input_and_never_s
         await _run(resume("--rxd-block-interval-fast-s", "30"))
     msg = str(exc.value)
     assert "this is a RESUME" in msg and f"t_rxd {recorded['t_rxd_blocks']} is the one this swap recorded" in msg, msg
-    assert "--rxd-block-interval-fast-s 30.0 (the swap was negotiated with 36.0)" in msg, msg
+    assert "--rxd-block-interval-fast-s 30.0 (the swap was negotiated under 36.0)" in msg, msg
+    # A re-measured fast tail is not "restored" as if 36 s were still true (see the per-kind test below).
+    assert "Restore the recorded value" not in msg and "let the swap time out and refund" in msg, msg
     assert "OMIT --t-rxd-blocks" not in msg and "minimum: --t-rxd-blocks" not in msg, msg
 
     assert await _run(resume()) == "stopped at wait_for_covenant_funding"
@@ -722,6 +724,57 @@ async def test_a_resume_refused_on_its_t_rxd_names_the_changed_input_and_never_s
     msg = str(exc.value)
     assert "predates recording the run's inputs" in msg and "--rxd-block-interval-fast-s" in msg, msg
     assert "OMIT --t-rxd-blocks" not in msg, msg
+
+
+def _remedy_for(mod, changes: dict) -> str:
+    """``_t_rxd_remedy`` on a resume whose recorded inputs differ from this run's by *changes*."""
+    import argparse
+
+    recorded = {name: 1 for name in mod._NEGOTIATED_INPUTS}
+    now = {**recorded, **changes}
+    args = argparse.Namespace(t_rxd_blocks=2677, resumed_record={"negotiated_inputs": recorded}, **now)
+    return mod._t_rxd_remedy(args, remaining_s=3600)
+
+
+@pytest.mark.parametrize(
+    "name", ["rxd_block_interval_fast_s", "rxd_block_interval_s", "btc_block_interval_s", "eth_finalization_window_s"]
+)
+def test_a_re_measured_input_is_never_told_to_restore_the_stale_figure(name):
+    """A measured input changed on a resume is usually a RE-measurement. The advice names the recorded
+    value as the term the swap was negotiated under and offers the two safe options; it does not tell
+    the operator to bring the old figure back as though it were still accurate."""
+    mod = _load("eth_swap_run")
+    msg = _remedy_for(mod, {name: 2})
+    flag = "--" + name.replace("_", "-")
+    assert f"re-measured: {flag} 2 (the swap was negotiated under 1)" in msg, msg
+    assert "changes the terms the counterparty agreed to" in msg, msg
+    assert "(a) resume with the recorded value only if you accept it as the agreed term" in msg, msg
+    assert "(b) do not resume, let the swap time out and refund" in msg, msg
+    assert "Restore the recorded value" not in msg and "changed:" not in msg, msg
+
+
+@pytest.mark.parametrize(
+    "name", ["eth_finality_stall_tolerance_s", "rxd_claim_burial_s", "margin_blocks", "rxd_photons"]
+)
+def test_a_chosen_input_is_still_told_to_restore_the_recorded_value(name):
+    """The honest pair: an input the operator CHOSE (a budget, a burial, the margin, the amount) has no
+    newer truth to protect, so restoring the recorded value is the advice, as before."""
+    mod = _load("eth_swap_run")
+    msg = _remedy_for(mod, {name: 2})
+    flag = "--" + name.replace("_", "-")
+    assert f"changed: {flag} 2 (the swap was negotiated with 1). Restore the recorded value" in msg, msg
+    assert "re-measured" not in msg, msg
+
+
+def test_a_resume_with_both_kinds_changed_gets_both_pieces_of_advice():
+    mod = _load("eth_swap_run")
+    msg = _remedy_for(mod, {"rxd_block_interval_fast_s": 2, "rxd_claim_burial_s": 2})
+    assert "changed: --rxd-claim-burial-s 2" in msg and "re-measured: --rxd-block-interval-fast-s 2" in msg, msg
+
+
+def test_the_measured_inputs_are_negotiated_inputs():
+    mod = _load("eth_swap_run")
+    assert set(mod._MEASURED_INPUTS) <= set(mod._NEGOTIATED_INPUTS)
 
 
 def test_the_recovery_file_records_every_input_the_t_rxd_bounds_read():
