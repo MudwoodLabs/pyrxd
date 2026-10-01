@@ -178,6 +178,19 @@ DEPTH_SOURCE_TIMEOUT_S = 20.0
 TIP_HEADERS_FOR_WORK = 144
 
 
+def _names_txid(reported: Any, requested: str) -> bool:
+    """Whether a verbose reply's own ``txid`` field names *requested*: both exactly 64 hex characters,
+    equal ignoring case."""
+    if not isinstance(reported, str) or not isinstance(requested, str):
+        return False
+    if len(reported) != 64 or len(requested) != 64:
+        return False
+    hexdigits = set("0123456789abcdefABCDEF")
+    if not (set(reported) <= hexdigits and set(requested) <= hexdigits):
+        return False
+    return reported.lower() == requested.lower()
+
+
 @dataclass(frozen=True)
 class DepthReports:
     """What the configured sources said about one funding's depth, by operator group — nothing proved.
@@ -192,11 +205,12 @@ class DepthReports:
 
     reported: tuple[tuple[str, int], ...]
     funding_tx: tuple[tuple[str, int], ...]
-    #: ``((source, start_height, headers), ...)``: the newest :data:`TIP_HEADERS_FOR_WORK` headers each
-    #: source served below its own tip, as served — for the gate's maximum header work, which they can
-    #: only raise (:func:`pyrxd.gravity.funding_spv.verify_maker_funding` checks each header's own
-    #: proof-of-work and their linkage). A source that did not serve them is absent.
-    tip_headers: tuple[tuple[str, int, tuple[bytes, ...]], ...] = ()
+    #: ``((source, start_height, headers, reported_tip), ...)``: the :data:`TIP_HEADERS_FOR_WORK` headers
+    #: each source served ending at the tip height it reported, as served — for the gate's maximum
+    #: header work, which they can only raise (:func:`pyrxd.gravity.funding_spv.verify_maker_funding`
+    #: checks each header's own proof-of-work, their linkage, that the last is at ``reported_tip``, and
+    #: that the run links to a header the gate verified). A source that did not serve them is absent.
+    tip_headers: tuple[tuple[str, int, tuple[bytes, ...], int], ...] = ()
 
 
 class RadiantChainIO:
@@ -490,16 +504,17 @@ class RadiantChainIO:
         A source's ``reported`` depth is the larger of its verbose ``confirmations`` and its
         ``tip - height + 1``, whichever it answers; its ``funding_tx`` entry is the verbose
         ``confirmations`` alone, present only when it answered the verbose read for THIS txid with a
-        positive count. A source that answers neither is left out of both. Each is labelled by its
+        positive count and a reply whose own ``txid`` names it. A source that answers neither is left out of both. Each is labelled by its
         ``source_key`` (its operator group, :func:`pyrxd.network.source_identity.source_key`), or
         ``"unidentified source #i (<type>)"`` for a client that cannot say — never merged with another.
         ``reported`` RAISES the gate's elapsed upper bound; above dust the gate counts the operators in
         ``funding_tx`` only. The proof does not depend on either.
 
         Each source is also asked for the :data:`TIP_HEADERS_FOR_WORK` headers ending at the tip it
-        reported (``tip_headers``), one header-range read, for the gate's maximum header work — which
-        they can only RAISE: a source that serves none, or headers that do not verify, leaves the gate
-        on the headers of the proof alone, and the gate says so.
+        reported (``tip_headers``, with that tip), one header-range read, for the gate's maximum header
+        work — which they can only RAISE: a source that serves none, or headers that do not count (see
+        :func:`pyrxd.gravity.funding_spv._tip_run_max_work`), leaves the gate on the headers of the
+        proof alone, and the gate says so.
 
         The sources are asked CONCURRENTLY, each under ``depth_timeout_s`` for its depth reads and again
         for its header read; one that times out or fails is left out exactly as one that answers
@@ -523,7 +538,7 @@ class RadiantChainIO:
                     await part.close()
         reported: list[tuple[str, int]] = []
         funding_tx: list[tuple[str, int]] = []
-        tip_headers: list[tuple[str, int, tuple[bytes, ...]]] = []
+        tip_headers: list[tuple[str, int, tuple[bytes, ...], int]] = []
         for label, confs, tip, served in answers:
             tip_depth = tip - height + 1 if tip is not None and tip >= height else None
             found = [d for d in (confs, tip_depth) if d is not None]
@@ -531,8 +546,8 @@ class RadiantChainIO:
                 reported.append((label, max(found)))
             if confs is not None:
                 funding_tx.append((label, confs))
-            if served is not None:
-                tip_headers.append((label, *served))
+            if served is not None and tip is not None:
+                tip_headers.append((label, served[0], served[1], tip))
         return DepthReports(reported=tuple(reported), funding_tx=tuple(funding_tx), tip_headers=tuple(tip_headers))
 
     async def _ask_depths(
@@ -597,7 +612,12 @@ class RadiantChainIO:
                 return None
             try:
                 info = await verbose(txid)
-                confs = finite_int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
+                # The reply must NAME the transaction asked about: a report of some other transaction's
+                # confirmations is not a report of this one (every shipped mainnet operator's reply carries
+                # a `txid` equal to the one requested, measured 2026-10-01). Hex, compared ignoring case.
+                if not isinstance(info, dict) or not _names_txid(info.get("txid"), txid):
+                    return None
+                confs = finite_int(info.get("confirmations", 0) or 0)
                 return confs if confs > 0 else None
             except Exception:
                 logger.debug("depth source %d gave no confirmations", index, exc_info=True)

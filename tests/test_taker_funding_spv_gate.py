@@ -218,7 +218,7 @@ class _DepthReader:
         self._view = view
 
     async def get_transaction_verbose(self, txid):
-        return {"confirmations": self._view.confs}
+        return {"txid": txid, "confirmations": self._view.confs}
 
 
 def _real_leg(view, *, network: str, min_confirmations: int = 1, depth_sources=None) -> RadiantCovenantLeg:
@@ -1209,7 +1209,7 @@ class _TipServer(_DepthReader):
         self.real, self._tip_headers, self.fail_headers, self.header_reads = real, tip_headers, fail_headers, []
 
     async def get_transaction_verbose(self, txid):
-        return {"confirmations": self.real.top - self.real.height + 1}
+        return {"txid": txid, "confirmations": self.real.top - self.real.height + 1}
 
     async def get_tip_height(self):
         return self.real.top
@@ -1265,9 +1265,14 @@ async def test_recent_harder_headers_a_server_leaves_out_still_raise_max_work_an
 
 def test_tip_headers_can_only_raise_max_work_never_lower_it(monkeypatch):
     """At the gate: a source's tip headers that are EASIER than what the proof served change nothing
-    (the maximum cannot fall); headers that fail their own proof-of-work, or do not link to one
-    another, are ignored and named; and an absent read leaves the gate on the proof's headers, said
-    in ``bound_note``."""
+    (the maximum cannot fall); a run that does not count is ignored and named, for each reason — headers
+    that fail their own proof-of-work or do not link to one another, a run that does not end at the tip
+    height its source reported, and a run that does not link to any header the gate verified; and an
+    absent read leaves the gate on the proof's headers, said in ``bound_note``. Only a run on the
+    verified chain, ending at its reported tip, raises ``max_header_work``."""
+    from pyrxd.gravity.funding_spv import TIP_RUN_NOT_AT_TIP, TIP_RUN_UNANCHORED, TIP_RUN_UNVERIFIED
+    from tests._funding_chain import REGTEST_BITS
+
     chain, terms, spk, real, served, value, easy_work, hard_work = _recent_hashrate_case(monkeypatch)
     kw = dict(chain=chain, expected_spk=spk, expected_value=terms.radiant_amount, burial_blocks=6, now_unix_s=_NOW)
     b = str(_SHIPPED_OPERATORS[1])
@@ -1280,9 +1285,14 @@ def test_tip_headers_can_only_raise_max_work_never_lower_it(monkeypatch):
     plain = run(())
     assert plain.max_header_work == easy_work and "no source served its tip headers" in plain.bound_note
 
-    # Easier: a valid, linked run of regtest-difficulty headers. Cannot lower anything.
-    easy_run = build_funding_chain(spk=b"\x51", value=1, confs=20).headers
-    easier = run(((b, 0, tuple(easy_run[h] for h in sorted(easy_run))),))
+    # Easier: a valid run at regtest difficulty, forking off a header the gate verified and ending at the
+    # tip its source reported — it counts, and cannot lower anything.
+    fork_at = max(served.headers) - 5
+    prev, t0, easy_run = radiant_block_hash(served.headers[fork_at]), _time(served.headers[fork_at]), []
+    for i in range(4):
+        easy_run.append(mine(prev, os.urandom(32), t0 + 300 * (i + 1), REGTEST_BITS))
+        prev = radiant_block_hash(easy_run[-1])
+    easier = run(((b, fork_at + 1, tuple(easy_run), fork_at + 4),))
     assert dict(easier.operator_tip_work)[b] < easy_work
     assert (
         easier.max_header_work == plain.max_header_work
@@ -1294,16 +1304,107 @@ def test_tip_headers_can_only_raise_max_work_never_lower_it(monkeypatch):
     # A hard header whose proof-of-work fails: one byte of its nonce changed.
     bad_pow = list(tip)
     bad_pow[-1] = bad_pow[-1][:76] + bytes([bad_pow[-1][76] ^ 1]) + bad_pow[-1][77:]
-    # Real hard headers that do not link: one header dropped from the middle.
+    # Real hard headers that do not link: one header dropped from the middle (still ending at the tip).
     unlinked = tip[:4] + tip[5:]
-    for broken in (bad_pow, unlinked):
-        r = run(((b, real.top - 9, tuple(broken)),))
-        assert dict(r.operator_tip_work)[b] is None
-        assert r.max_header_work == plain.max_header_work, "an unverified run must change nothing"
-        assert f"the tip headers of {b} did not verify and were ignored" in r.bound_note, r.bound_note
+    # Hard headers mined SOMEWHERE ELSE — a separate chain on the same checkpoints, every header meeting
+    # its own (harder) target and linked to the next — labelled as this source's tip: the shape of a replay
+    # of real historical headers. Before, it counted.
+    elsewhere = build_funding_chain(spk=b"\x52", value=1, confs=12, base=_base_of(served), bits=_HARDER_BITS)
+    replay = tuple(elsewhere.headers[h] for h in range(elsewhere.top - 9, elsewhere.top + 1))
+    assert max(radiant_header_work(h, pow_limit=chain.pow_limit) for h in replay) > easy_work
+    for entry, why in (
+        ((b, real.top - 9, tuple(bad_pow), real.top), TIP_RUN_UNVERIFIED),
+        ((b, real.top - 8, tuple(unlinked), real.top), TIP_RUN_UNVERIFIED),
+        ((b, real.top - 9, tuple(tip), real.top + 1), TIP_RUN_NOT_AT_TIP),  # not the tip it reported
+        ((b, real.top - 9, tuple(tip[1:]), real.top - 1), TIP_RUN_UNANCHORED),  # labelled one height low
+        ((b, real.top - 9, replay, real.top), TIP_RUN_UNANCHORED),
+    ):
+        r = run((entry,))
+        assert dict(r.operator_tip_work)[b] is None, why
+        assert r.max_header_work == plain.max_header_work, f"an ignored run must change nothing ({why})"
+        assert r.required_confirmations == plain.required_confirmations
+        assert f"the tip headers of {b} {why}, and were ignored" in r.bound_note, r.bound_note
 
-    good = run(((b, real.top - 9, tuple(tip)),))
+    good = run(((b, real.top - 9, tuple(tip), real.top),))
     assert good.max_header_work == hard_work and good.required_confirmations > plain.required_confirmations
+    assert dict(good.operator_tip_work)[b] == hard_work
+
+
+def _base_of(served):
+    """The checkpoint headers *served* was built on (heights up to the newest checkpoint, 4)."""
+    return {h: served.headers[h] for h in range(0, 5)}
+
+
+def test_a_replay_of_real_historical_mainnet_headers_as_a_tip_run_is_ignored():
+    """The reviewer's replay, on REAL mainnet data: 12 real headers from blocks 290,132..290,143
+    (``tests/fixtures/mainnet_headers_290132_290143.json``; each meets its own proof-of-work at mainnet's
+    limit and links to the next), served as a source's "tip headers" ending at the recorded proof's tip
+    (block 460,580 of ``mark_block_fixtures_2026-09-30.json``). They are about 8.6 times harder than the
+    hardest header the proof checked, and free to replay. Counted, they raised ``max_header_work`` that
+    far and ``k`` with it; they link to no header the gate verified, so they are ignored, named, and
+    change nothing. The same source's REAL tip headers (460,569..460,580) count."""
+    import dataclasses
+    import json as _json
+
+    from pyrxd.gravity.funding_spv import TIP_RUN_UNANCHORED, MakerFundingEvidence
+    from tests.test_mark_block_verification import MARKS
+
+    m = MARKS["reference_460572"]
+    hist = _json.loads((ROOT / "tests" / "fixtures" / "mainnet_headers_290132_290143.json").read_text())
+    replay = tuple(bytes.fromhex(h) for h in hist["headers_hex"])
+    assert radiant_block_hash(replay[-1]) == hist["last_block_hash"]
+    tx = Transaction.from_hex(m.raw_tx)
+    pl = funding_spv.MAINNET_CHAIN.pow_limit
+    chain = RadiantChain(
+        name="mainnet",
+        checkpoints=(
+            (460_564, radiant_block_hash(m.headers[460_564])),
+            (460_566, radiant_block_hash(m.headers[460_566])),
+        ),
+        pow_limit=pl,
+        subsidy_halving_interval=210_000,
+        value_bearing=True,
+    )
+    ev = _two_operators(
+        MakerFundingEvidence(
+            txid=m.txid,
+            vout=0,
+            height=m.height,
+            raw_tx=m.raw_tx,
+            merkle=m.merkle,
+            coinbase_merkle=m.coinbase,
+            headers=m.headers,
+        )
+    )
+    top = max(m.headers)
+    served_max = max(radiant_header_work(m.headers[h], pow_limit=pl) for h in m.headers)
+    replay_max = max(radiant_header_work(h, pow_limit=pl) for h in replay)
+    assert replay_max > 8 * served_max  # what counting it would have done to C (and k)
+    floor = radiant_header_work(m.headers[460_566], pow_limit=pl) // 16
+    cost = block_subsidy_photons(460_572, chain) * floor // served_max
+    common = dict(
+        chain=chain,
+        expected_spk=tx.outputs[0].locking_script.serialize(),
+        expected_value=tx.outputs[0].satoshis,
+        burial_blocks=6,
+        now_unix_s=_time(m.headers[top]),
+        value_at_stake_photons=2 * cost,
+    )
+    b = str(_SHIPPED_OPERATORS[1])
+    plain = verify_maker_funding(ev, **common)
+    replayed = verify_maker_funding(
+        dataclasses.replace(ev, operator_tip_headers=((b, top - len(replay) + 1, replay, top),)), **common
+    )
+    assert replayed.max_header_work == plain.max_header_work == served_max
+    assert replayed.required_confirmations == plain.required_confirmations == 6
+    assert dict(replayed.operator_tip_work)[b] is None
+    assert f"the tip headers of {b} {TIP_RUN_UNANCHORED}, and were ignored" in replayed.bound_note
+    honest_run = tuple(m.headers[h] for h in range(top - 11, top + 1))
+    honest = verify_maker_funding(
+        dataclasses.replace(ev, operator_tip_headers=((b, top - 11, honest_run, top),)), **common
+    )
+    assert dict(honest.operator_tip_work)[b] == max(radiant_header_work(h, pow_limit=pl) for h in honest_run)
+    assert honest.max_header_work == served_max and "did not raise it" in honest.bound_note
 
 
 async def test_a_tip_header_read_that_fails_leaves_the_gate_as_it_was(monkeypatch):
@@ -2052,7 +2153,7 @@ async def test_the_leg_reports_each_configured_source_by_its_operator():
             self._confs, self._tip = confs, tip
 
         async def get_transaction_verbose(self, txid):
-            return {"confirmations": self._confs}
+            return {"txid": txid, "confirmations": self._confs}
 
         async def get_tip_height(self):
             return self._tip
@@ -2578,6 +2679,56 @@ async def test_a_tip_height_alone_is_not_an_operator_reporting_the_funding(monke
     assert proof.reporting_operators == (str(view.source_key),)
     assert (proof.elapsed_blocks_upper, proof.bound_term) == (tip + 500 - view.chain.height + 1, "reported")
     assert f"of which {b} gave only a tip height" in proof.bound_note, proof.bound_note
+
+
+class _NamesTx(_DepthReader):
+    """A second operator whose verbose reply carries *names* as its own ``txid`` field (``None``: absent)."""
+
+    def __init__(self, view, *, names):
+        super().__init__(view)
+        self.names = names
+
+    async def get_transaction_verbose(self, txid):
+        reply = {"confirmations": self._view.confs}
+        if self.names is not None:
+            reply["txid"] = self.names(txid) if callable(self.names) else self.names
+        return reply
+
+
+async def test_a_verbose_reply_that_names_another_transaction_is_not_a_report_of_this_one(monkeypatch):
+    """The verbose reply's own ``txid`` field was never compared with the txid asked about, so a source
+    could answer with ANOTHER transaction's confirmations and be counted as an operator reporting this
+    funding. Through the real leg: a reply naming a different txid, one with no ``txid`` field, and ones
+    whose field is not 64 hex characters are not counted (above dust the gate refuses, naming the
+    operator as having given only a tip height when it gave one); the same reply naming this txid — in
+    either case — is counted and the swap locks."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
+    b = str(_SHIPPED_OPERATORS[1])
+    above = 10_000 * PHOTONS_PER_RXD
+
+    async def gate_with(names):
+        coord, btc_view = _btc_coord(
+            terms,
+            _real_leg(view, network="bc", depth_sources=(_NamesTx(view, names=names),)),
+            policy=_vb_policy(value_at_risk_photons=above),
+            accept_nondurable_seen=True,
+        )
+        return await coord.pre_btc_lock_check(terms, now_unix_s=_NOW), coord, btc_view
+
+    other = os.urandom(32).hex()
+    for names in (other, None, lambda t: t[:-1], lambda t: t + "00", lambda t: t[:-1] + "g", 7):
+        gate, _coord, btc_view = await gate_with(names)
+        assert gate.ok is False, names
+        assert f"1 answered ({view.source_key}), and {b} did not" in gate.reason, gate.reason
+        assert btc_view.broadcasts == []
+    for names in (lambda t: t, lambda t: t.upper()):
+        gate, coord, _ = await gate_with(names)
+        assert gate.ok is True, gate.reason
+        assert coord.last_maker_funding.reporting_operators == (str(view.source_key), b)
 
 
 async def test_a_client_over_several_operators_is_asked_once_per_operator(monkeypatch):

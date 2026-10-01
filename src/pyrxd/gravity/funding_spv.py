@@ -41,15 +41,17 @@ proved here, never a server's figure:
 * ``max_header_work`` — the MOST work any header carries, over every header the verifier checked
   in this run, the whole last checkpoint interval (linked between the two newest shipped
   checkpoints), AND each configured source's own newest headers
-  (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` ending at its tip; a run counts only when
-  every header in it meets its own proof-of-work target and links to the one before). The maximum,
+  (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` ending at the tip height it reports; a run
+  counts only when every header in it meets its own proof-of-work target and links to the one before,
+  its last header is at that reported tip, and it links to a header this gate verified — so it is the
+  chain the proof is on, not headers mined somewhere else, such as real historical ones). The maximum,
   because a higher real work makes the floor a smaller fraction of a real block, i.e. a cheaper
   forgery and a smaller ``C``. The checkpoint interval keeps a server from lowering it by serving
   only easy headers above the checkpoint; the other sources' tip headers keep the proof's server from
   hiding the chain's recent difficulty by leaving the newest, harder headers out. A source can only
-  RAISE it (a hostile one can ask more of the funding, never less); a source that serves no tip
-  headers, or ones that do not verify, leaves it at what the proof's headers give, and the result's
-  ``bound_note`` says which.
+  RAISE it (a hostile one can ask more of the funding, never less, and only with headers on the
+  verified chain); a source that serves no tip headers, or ones that do not count, leaves it at what
+  the proof's headers give, and the result's ``bound_note`` says which and why.
 
 ``burial`` is the swap's existing Radiant reorg burial (the policy's measured claim burial, raised by
 the value-scaled burial of :func:`pyrxd.gravity.swap_coordinator._value_scaled_burial_blocks`), and
@@ -926,11 +928,13 @@ class MakerFundingEvidence:
     #: tip height said nothing about this transaction, so it may raise the bound (through
     #: ``reported_depths``) but is not an operator reporting the funding.
     funding_tx_depths: tuple[tuple[str, int], ...] = ()
-    #: ``((source, start_height, headers), ...)``: the headers each source served ending at its own
-    #: tip (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` of them). Each run whose headers
-    #: all meet their own proof-of-work target and link to one another RAISES ``max_header_work`` to
-    #: its hardest header; it can never lower anything, and a run that does not verify is ignored.
-    operator_tip_headers: tuple[tuple[str, int, tuple[bytes, ...]], ...] = ()
+    #: ``((source, start_height, headers, reported_tip), ...)``: the headers each source served ending
+    #: at the tip height it reported (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` of them).
+    #: A run counts only when its headers each meet their own proof-of-work target and link to one
+    #: another, it is linked to a header this gate verified (see :func:`_tip_run_max_work`), and its
+    #: last header is at ``reported_tip``; a counted run RAISES ``max_header_work`` to its hardest
+    #: header. It can never lower anything, and a run that does not count is ignored and named.
+    operator_tip_headers: tuple[tuple[str, int, tuple[bytes, ...], int], ...] = ()
     #: The operator groups the leg was configured to ask (whether or not they answered), for a
     #: refusal to name. Not evidence of anything.
     configured_operators: tuple[str, ...] = ()
@@ -957,7 +961,7 @@ class VerifiedMakerFunding:
     floor_work: int
     max_header_work: int
     #: ``((source, work), ...)``: the hardest header in each source's tip headers, or ``None`` where
-    #: they did not verify (ignored). ``max_header_work`` is at least each of these.
+    #: they did not count (ignored; ``bound_note`` says why). ``max_header_work`` is at least each.
     operator_tip_work: tuple[tuple[str, int | None], ...]
     #: The most work in the last checkpoint interval, as linked in this run (``None`` with one
     #: checkpoint). The shipped table records the same number for the negotiation-time check.
@@ -1035,28 +1039,56 @@ def counted_operators(labels: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(k) for k in labels if not str(k).startswith(UNIDENTIFIED_SOURCE_PREFIX)))
 
 
-def _tip_run_max_work(run: Any, pow_limit: int) -> tuple[str, int | None] | None:
-    """``(source, hardest work)`` for one source's served tip headers, or ``(source, None)`` when any
-    header fails its own proof-of-work or the run does not link header to header; ``None`` for an
-    entry that is not ``(source, start, headers)`` at all."""
-    if not (isinstance(run, (tuple, list)) and len(run) == 3):
+#: Why a source's tip headers were ignored, as :func:`_tip_run_max_work` reports it.
+TIP_RUN_UNVERIFIED = "did not verify (a header failed its own proof-of-work, or they did not link to one another)"
+TIP_RUN_NOT_AT_TIP = "did not end at the tip height the source reported"
+TIP_RUN_UNANCHORED = "did not link to a header this gate verified"
+
+
+def _tip_run_max_work(run: Any, pow_limit: int, *, verified: Mapping[int, str]) -> tuple[str, int | None, str] | None:
+    """``(source, hardest work, "")`` for one source's tip headers that COUNT, ``(source, None, why)``
+    for a run that does not, or ``None`` for an entry that is not ``(source, start, headers, tip)``.
+
+    A run counts when (1) every header meets its own proof-of-work target and links to the one before,
+    (2) its heights are ``start .. start + len - 1`` and the last is the ``tip`` the source reported, and
+    (3) it is ANCHORED to the chain this gate proved: *verified* maps heights to the hashes of headers
+    the gate verified (linked to a checkpoint), and either the run's first header names the verified
+    header at ``start - 1`` as its parent or one of its headers IS the verified header at its height.
+    Linked header to header, that pins every header in the run to the verified chain.
+
+    Without (3) a run proves only that its headers were mined SOMEWHERE: real historical headers are
+    free to replay and can be far harder than the recent ones, so an unanchored run labelled as a tip
+    could raise ``max_header_work`` — and ``k`` — at no cost to whoever served it."""
+    if not (isinstance(run, (tuple, list)) and len(run) == 4):
         return None
-    label, _start, headers = run
+    label, start, headers, tip = run
+    label = str(label)
     if not isinstance(headers, (tuple, list)) or not headers:
-        return (str(label), None)
+        return (label, None, TIP_RUN_UNVERIFIED)
+    for v in (start, tip):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            return (label, None, TIP_RUN_NOT_AT_TIP)
+    if start + len(headers) - 1 != tip:
+        return (label, None, TIP_RUN_NOT_AT_TIP)
     try:
         best = 0
         below: str | None = None
+        hashes: list[str] = []
         for hdr in headers:
             raw = bytes(hdr)
             block_hash = verify_radiant_header_pow(raw, pow_limit=pow_limit)
             if below is not None and radiant_header_prev_hash(raw) != below:
-                return (str(label), None)
+                return (label, None, TIP_RUN_UNVERIFIED)
             below = block_hash
+            hashes.append(block_hash)
             best = max(best, radiant_header_work(raw, pow_limit=pow_limit))
+        parent = radiant_header_prev_hash(bytes(headers[0]))
     except (TypeError, ValueError, ValidationError, SpvVerificationError):
-        return (str(label), None)
-    return (str(label), best)
+        return (label, None, TIP_RUN_UNVERIFIED)
+    anchored = verified.get(start - 1) == parent or any(verified.get(start + i) == h for i, h in enumerate(hashes))
+    if not anchored:
+        return (label, None, TIP_RUN_UNANCHORED)
+    return (label, best, "")
 
 
 def verify_maker_funding(
@@ -1196,23 +1228,32 @@ def verify_maker_funding(
     # The chain's RECENT difficulty, as every source sees it. The headers above were chosen by the
     # proof's server, which could leave out real recent headers harder than any it served — a smaller
     # max_header_work, a larger C, a smaller k. Each source's own tip headers (the newest
-    # TIP_HEADERS_FOR_WORK it serves) are folded in when they verify: each meets its own proof-of-work
-    # target and links to the one before. They can only RAISE max_work, so a source serving easier
-    # headers, or none, or headers that do not verify, changes nothing — the gate is then exactly
-    # what the proof's headers alone give, and bound_note says so. A hostile source can raise it,
-    # which only asks more of the funding (a larger k), never less.
+    # TIP_HEADERS_FOR_WORK it serves, ending at the tip it reported) are folded in when they count:
+    # each meets its own proof-of-work target and links to the one before, the last is at the reported
+    # tip, and the run links to a header verified above (`_tip_run_max_work`). They can only RAISE
+    # max_work, so a source serving easier headers, or none, or headers that do not count, changes
+    # nothing — the gate is then exactly what the proof's headers alone give, and bound_note says so.
+    # A hostile source can raise it only with headers on the verified chain — real recent work — which
+    # only asks more of the funding (a larger k), never less. Unanchored, real HISTORICAL headers
+    # (free to replay, and far harder than recent ones on mainnet) were accepted as a tip run.
     served_max_work = max_work
     tip_work: list[tuple[str, int | None]] = []
+    ignored: dict[str, list[str]] = {}
     runs = evidence.operator_tip_headers if isinstance(evidence.operator_tip_headers, (tuple, list)) else ()
+    # The headers this gate verified so far, by height — each linked to a checkpoint (and, above the
+    # newest, proof-of-work checked). A tip run counts only when it links to one of them.
+    verified_hashes = {h: radiant_block_hash(bytes(headers[h])) for h in verified_heights}
     for run in runs:
-        got = _tip_run_max_work(run, chain.pow_limit)
+        got = _tip_run_max_work(run, chain.pow_limit, verified=verified_hashes)
         if got is None:
             continue
-        tip_work.append(got)
-        if got[1] is not None and got[1] > max_work:
-            max_work = got[1]
+        label, work, why_ignored = got
+        tip_work.append((label, work))
+        if work is None:
+            ignored.setdefault(why_ignored, []).append(label)
+        elif work > max_work:
+            max_work = work
     raisers = [k for k, w in tip_work if w is not None and w == max_work and w > served_max_work]
-    unverified = [k for k, w in tip_work if w is None]
     if not tip_work:
         work_part = (
             "no source served its tip headers, so max header work is from the proof's headers and the last "
@@ -1220,13 +1261,18 @@ def verify_maker_funding(
         )
     elif raisers:
         work_part = f"max header work {_log2(max_work)} raised by the tip headers of {', '.join(raisers)}"
-    else:
+    elif any(w is not None for _k, w in tip_work):
         work_part = (
             f"max header work {_log2(max_work)}; the tip headers of "
-            f"{', '.join(k for k, w in tip_work if w is not None) or 'no source'} did not raise it"
+            f"{', '.join(k for k, w in tip_work if w is not None)} did not raise it"
         )
-    if unverified:
-        work_part += f"; the tip headers of {', '.join(unverified)} did not verify and were ignored"
+    else:
+        work_part = (
+            f"max header work {_log2(max_work)}, from the proof's headers and the last checkpoint interval "
+            "alone: no source's tip headers counted"
+        )
+    for why_ignored, labels in ignored.items():
+        work_part += f"; the tip headers of {', '.join(labels)} {why_ignored}, and were ignored"
     subsidy = block_subsidy_photons(height, chain)
     cost = subsidy * floor_work // max_work if max_work > 0 else 0
 

@@ -340,11 +340,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     photon cost of one forged confirmation: the block subsidy at the funding height (Radiant
     Core's `GetBlockSubsidy` and `nSubsidyHalvingInterval`, vendored and re-derived by a test) ×
     the floor work ÷ the most work of any header checked, in the last checkpoint interval, or in
-    the newest 144 headers each configured source serves below its own tip (one header-range read
-    per operator, concurrent; a run counts only when each header meets its own proof-of-work target
-    and links to the one before). Those tip headers can only raise it: a source that serves none,
-    easier ones, or ones that do not verify leaves `C` where the proof's own headers put it, and the
-    result's `bound_note` says which sources raised it, which did not, and which were ignored.
+    the 144 headers each configured source serves ending at the tip height it reports (one
+    header-range read per operator, concurrent). A run counts only when each header meets its own
+    proof-of-work target and links to the one before, its last header is at that reported tip, and it
+    links to a header the gate verified, so it is on the proof's chain: real historical headers,
+    free to replay and far harder than recent ones on mainnet, are ignored. Those tip headers can
+    only raise `C`'s denominator: a source that serves none, easier ones, or ones that do not count
+    leaves `C` where the proof's own headers put it, and the result's `bound_note` says which sources
+    raised it, which did not, and which were ignored and why.
     `burial` is the swap's existing reorg burial, value-scaled; the value is the swap's own
     assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
     With no value to size `k` from, the lock is refused. Regtest runs the same proof against its
@@ -393,8 +396,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     server's word, not a proof): on a value-bearing network, when the value at stake exceeds
     `ElapsedBoundPolicy.dust_threshold_photons` (1,000 RXD by default), the gate refuses the lock
     unless at least two operator groups (`source_key`; the user's own node is its own group) report
-    confirmations for the funding transaction itself — their verbose reply for its txid — and the
-    refusal names how many answered and which. An operator that answers only its tip height (its
+    confirmations for the funding transaction itself — their verbose reply for its txid, which must
+    name that txid in its own `txid` field — and the refusal names how many answered and which. An operator that answers only its tip height (its
     verbose read of the txid failed, as it does for a transaction the server does not know) is not
     counted; its `tip - H + 1` can still raise the elapsed-depth bound, and the refusal and the
     result's `bound_note` say it gave only a tip height (`RadiantChainIO.depth_reports`,
