@@ -263,7 +263,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     runner through its own entry point and asserts that order.
   - `dust_swap_run.py --stage dry-run` reported success on terms the broadcast stages refused, since
     it never built the coordinator. It now builds the same one on offline transports and reports its
-    verdict; without `--rxd-block-interval-fast-s` it says that the broadcast stages need it.
+    verdict; without `--rxd-block-interval-fast-s` it says that the broadcast stages need it. Its
+    seen-store is in memory, so it creates and modifies no state file beyond the recovery file and
+    report it always wrote.
   - `eth_swap_grief_run.py` raised `AttributeError` building its terms (`asset_variant`).
   - `eth_swap_two_host.py`'s taker phase called `taker_verify_asset_funding` without the wall clock
     and printed its third value as "buried N conf(s)". It passes `now_unix_s` now and prints the
