@@ -242,11 +242,20 @@ _SPLIT_FROM: dict[str, tuple[str, ...]] = {
     "transaction": ("txpreimage",),
     "dmint": ("dmintchain", "dmintminer"),
     "verdicts": ("mutchain", "waveverdicts"),
-    "covenants": ("htlccovenant", "radiantleg", "rswpcovenant"),
+    "covenants": ("htlccovenant", "rswpcovenant"),
     "gravitycore": ("gravitystate", "gravitymaker", "gravitylegs"),
     "cryptoprim": ("cryptokeys", "cryptosec", "cryptoutils", "cryptohash"),
     "glyphverify": ("glyphscan", "glyphinspector", "waverules", "inspectcore"),
     "wire": ("hashmark", "wiretx"),
+}
+
+#: A split child that runs its parent's EXACT command plus named extra test files, appended. Pinned,
+#: not derived: each extra is a measured judgement (see the comment on the child in
+#: scripts/mutation_test.sh). `radiantleg` keeps the taker gate's test file, which kills radiant_leg
+#: mutants nothing else in the list kills; its `covenants` siblings dropped it, since it reaches none
+#: of their modules' functions.
+_SPLIT_WITH_EXTRA: dict[str, tuple[str, tuple[str, ...]]] = {
+    "radiantleg": ("covenants", ("tests/test_taker_funding_spv_gate.py",)),
 }
 
 
@@ -288,6 +297,17 @@ def test_a_split_group_keeps_its_parents_exact_test_command() -> None:
     groups = _script_groups()
     stale = sorted({g for pair in families for g in pair} - groups)
     assert not stale, f"_SPLIT_FROM names groups the script no longer defines: {stale}"
+
+    # A child that runs MORE than its parent: exactly the parent's command, the extras appended.
+    extra = _group_settings(sorted({c for c in _SPLIT_WITH_EXTRA} | {p for p, _x in _SPLIT_WITH_EXTRA.values()}))
+    for child, (parent, extras) in _SPLIT_WITH_EXTRA.items():
+        tests, timeout, marker = extra[parent]
+        assert tests.startswith("tests/"), f"{parent}: group_tests is empty; the evaluation broke"
+        assert extra[child] == (" ".join([tests, *extras]), timeout, marker), (
+            f"{child} must run {parent}'s exact command plus {list(extras)}:\n"
+            f"  {parent}: {extra[parent]}\n  {child}: {extra[child]}"
+        )
+        assert not set(extras) & set(tests.split()), f"{child}: an 'extra' is already in {parent}'s list"
 
 
 def test_the_split_check_fires_on_a_child_with_a_different_marker() -> None:

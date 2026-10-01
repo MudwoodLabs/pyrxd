@@ -45,6 +45,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Mutation CI: the taker gate (`gravity/funding_spv`) is its own group, `fundingspv`, sharded in
+  two, with its own test list.** It had joined `radiantleg`, and its test file had joined all four
+  `covenants` lists, putting `radiantleg` at an ESTIMATED 317-379 minutes against the 330-minute job
+  timeout. `radiantleg` (now `gravity/radiant_leg` alone) is sharded in two and keeps the gate's test
+  file, which killed radiant_leg mutants nothing else in its list killed (4 of a 30-mutant sample);
+  `covenants`, `htlccovenant` and `rswpcovenant` drop it: it runs no function of soulbound_covenant or
+  swap/rswp/covenant and only import-time lines of gravity/covenant, and every htlc_covenant mutant it
+  killed in a 40-mutant sample the rest of the list killed too. Per-job minutes for the two new
+  sharded groups are ESTIMATED from local samples, not measured on the runner.
+
 - **`verify_mark_block` and `plan_block_verification` take `max_headers_from_checkpoint`
   (default 4,032, unchanged) and `verify_mark_block` takes `pow_limit`** (default `None`,
   unchanged); `radiant_header_target`, `radiant_header_work` and `verify_radiant_header_pow` take

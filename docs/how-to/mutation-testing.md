@@ -31,7 +31,8 @@ poetry run task mutate markblock          # a mark's block: Radiant header PoW, 
 poetry run task mutate btcleg            # the BTC HTLC leg — taproot refund/claim leafs, payment parse, key handling
 poetry run task mutate covenants         # consensus-enforced covenant bytes — the Gravity covenant, soulbound
 poetry run task mutate htlccovenant      # gravity/htlc_covenant.py — the HTLC covenant bytes (2 shards in CI)
-poetry run task mutate radiantleg        # gravity/radiant_leg.py — the Radiant HTLC leg
+poetry run task mutate radiantleg        # gravity/radiant_leg.py — the Radiant HTLC leg (2 shards in CI)
+poetry run task mutate fundingspv        # gravity/funding_spv.py — the swap taker gate (2 shards in CI)
 poetry run task mutate rswpcovenant      # swap/rswp/covenant.py — the RSWP covenant bytes (2 shards in CI)
 poetry run task mutate gravitycore       # gravity/transactions.py — the Gravity transaction builders (2 shards in CI)
 poetry run task mutate gravitystate      # the Gravity swap state and trade
@@ -64,7 +65,7 @@ poetry run task mutate ethleg             # eth_wallet/ — the EVM counter leg 
 poetry run task mutate ethtimelock        # gravity/eth_rxd_timelock.py — cross-clock timelock arithmetic
 
 poetry run task mutate consensus          # the original four groups, now seven after the timeout split
-poetry run task mutate value              # the forty-four value-moving groups
+poetry run task mutate value              # the forty-five value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 
@@ -614,7 +615,8 @@ mutant (low end) or the group's highest sampled rate (high end). Every count (lo
 | `dmintminer` ×3 | glyph/dmint/types, miner | 115-160 each | miner S (3,001 mutants, 296-381 minutes alone), types E |
 | `covenants` | gravity/covenant, glyph/soulbound_covenant | 122-125 | covenant M, soulbound E |
 | `htlccovenant` ×2 | gravity/htlc_covenant | 106 each | M (12,693 s) |
-| `radiantleg` | gravity/radiant_leg | 73-87 | S; ≥ 43 minutes spent on it when cancelled |
+| `radiantleg` ×2 | gravity/radiant_leg | ~80 each, ESTIMATED | local 30-mutant sample (2026-09-30), not scaled to the runner: 970 mutants × 9.84 s; it was 73-87 (S) before the taker gate's test file joined its list |
+| `fundingspv` ×2 | gravity/funding_spv | ~82 each, ESTIMATED | local 30-mutant sample (2026-09-30), not scaled to the runner: 2,860 mutants × 3.42 s |
 | `rswpcovenant` ×2 | swap/rswp/covenant | 62-97 each | S (1,273 mutants) |
 | `gravitycore` ×2 | gravity/transactions | 102 each | M (12,218 s) |
 | `gravitystate` | gravity/swap_state, trade | 124 | M |
