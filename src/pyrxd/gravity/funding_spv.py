@@ -76,6 +76,11 @@ used is::
 
 * ``R`` is the REFERENCE header: the one ``max(1, value_term)`` deep below the newest header served
   (the newest counting as 1). The blocks from the funding up to ``R`` are proved.
+* ``E`` is never negative, but a local clock BEHIND the chain is not clamped into a fresh-looking
+  tip: on a value-bearing network, ``now`` more than :data:`LOCAL_CLOCK_BEHIND_TOLERANCE_S` (Radiant
+  Core's ``MAX_FUTURE_BLOCK_TIME``, 7,200 s) before the newest verified header's timestamp REFUSES,
+  naming the clock. Within that tolerance ``now`` can still fall before ``MTP(R)``; ``E`` is then 0
+  and ``bound_note`` says so.
 * ``MTP(R)`` is the reference time: the MEDIAN TIME PAST at ``R`` — the median of the timestamps of
   the :data:`MEDIAN_TIME_SPAN` (11) headers ending at ``R``, exactly as Radiant Core's
   ``CBlockIndex::GetMedianTimePast`` computes it (``tests/vendor/radiant_core/chain.h`` lines
@@ -193,6 +198,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FORGERY_COST_FACTOR",
+    "LOCAL_CLOCK_BEHIND_TOLERANCE_S",
     "LOCAL_DEVNET_CHAIN_IDS",
     "MAX_HEADERS_FROM_CHECKPOINT_SDK",
     "MEDIAN_TIME_SPAN",
@@ -248,6 +254,14 @@ MAX_HEADERS_FROM_CHECKPOINT_SDK = 20_160
 #: Radiant Core's ``CBlockIndex::nMedianTimeSpan`` (``tests/vendor/radiant_core/chain.h`` line 195):
 #: how many headers, ending at a block, its median time past is taken over. A test re-reads it.
 MEDIAN_TIME_SPAN = 11
+
+#: Radiant Core's ``MAX_FUTURE_BLOCK_TIME`` (``tests/vendor/radiant_core/chain.h`` line 27, ``2 * 60 *
+#: 60``), in seconds: a node rejects a block whose timestamp is more than this past its own
+#: network-adjusted time (``validation.cpp`` line 3936). So a local clock more than this far BEHIND
+#: the newest verified header's timestamp is behind the chain, and the gate refuses rather than count
+#: zero elapsed time. It is the tolerance for an honest clock: a header the network accepted can be
+#: stamped up to this far ahead of the clocks that accepted it. A test re-reads it.
+LOCAL_CLOCK_BEHIND_TOLERANCE_S = 2 * 60 * 60
 
 #: Radiant's nominal block spacing, ``consensus.nPowTargetSpacing`` (``chainparams.cpp`` line 117,
 #: ``5 * 60``, the same on every network), in seconds. A test re-reads it.
@@ -1302,6 +1316,7 @@ def verify_maker_funding(
         want = radiant_header_prev_hash(bytes(below_hdr))
     mtp = median_time_past([_header_time(bytes(headers[h])) for h in range(window_lo, ref_h + 1)])
     eps = bound_policy.epsilon(value_at_stake_photons)
+    clock_note = ""
     if now_unix_s is None:
         if chain.value_bearing:
             raise refuse(
@@ -1314,7 +1329,31 @@ def verify_maker_funding(
         elapsed_s: int | None = None
         time_blocks: int | None = None
     else:
+        # A SLOW LOCAL CLOCK. `E = now - MTP(R)` counted as zero whenever `now` fell before the
+        # reference time, so a clock hours behind made a stale tip look fresh and shrank the bound to
+        # the proved depth. A clock more than Radiant Core's MAX_FUTURE_BLOCK_TIME behind the newest
+        # header this gate verified (linked to a checkpoint, proof-of-work checked) is behind the
+        # chain, and is refused, not clamped; within that tolerance `now` can still fall before
+        # MTP(R), and the note says when it did. On a value-bearing network only: a test network has
+        # no value to protect, its clock is optional here, and regtest chains (the fixtures', and a
+        # node run with -mocktime) are routinely stamped far from the wall clock.
+        tip_time = _header_time(bytes(headers[top]))
+        if chain.value_bearing and now_unix_s < tip_time - LOCAL_CLOCK_BEHIND_TOLERANCE_S:
+            raise refuse(
+                f"the local clock appears to be behind the chain: now_unix_s {now_unix_s} is "
+                f"{tip_time - now_unix_s} s before the timestamp of block {top}, the newest header verified, "
+                f"more than the {LOCAL_CLOCK_BEHIND_TOLERANCE_S} s a node accepts a block ahead of its own clock "
+                "(Radiant Core's MAX_FUTURE_BLOCK_TIME), so the time since the reference header cannot be "
+                "counted. Correct the system clock and retry",
+                "a wall clock no further behind the newest verified header than that",
+                f"the funding in block {height}, {proved} deep",
+            )
         elapsed_s = max(0, now_unix_s - mtp)
+        if now_unix_s < mtp:
+            clock_note = (
+                f"; the local clock is {mtp - now_unix_s} s before the reference time (within the "
+                f"{LOCAL_CLOCK_BEHIND_TOLERANCE_S} s tolerance), so E was taken as 0"
+            )
         time_blocks = bound_policy.blocks_upper(
             elapsed_s, spacing_s=int(chain.target_spacing_s), value_at_stake_photons=value_at_stake_photons
         )
@@ -1406,8 +1445,8 @@ def verify_maker_funding(
                 "unknown" if value_at_stake_photons is None else format_rxd(value_at_stake_photons),
             )
     note = (
-        f"the {term} term set the bound at {upper}: {time_part}; {report_part}; proved {proved}{one_op}{rule_part}; "
-        f"{work_part}"
+        f"the {term} term set the bound at {upper}: {time_part}{clock_note}; {report_part}; proved {proved}"
+        f"{one_op}{rule_part}; {work_part}"
     )
 
     return VerifiedMakerFunding(

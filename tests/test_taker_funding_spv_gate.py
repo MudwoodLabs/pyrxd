@@ -438,7 +438,9 @@ async def test_honest_regtest_funding_verifies_and_the_lock_proceeds():
 async def test_honest_value_bearing_funding_verifies_and_the_lock_proceeds(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _vb_terms(400)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     coord, _btc_view = _btc_coord(
         terms,
         _real_leg(view, network="bc"),
@@ -465,7 +467,9 @@ async def test_a_value_bearing_policy_without_the_fast_tail_is_refused_at_constr
 
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _vb_terms(400)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     no_tail = MarginPolicy.estimated(accept_flat_burial=True)
     for role in (None, SwapRole.TAKER, SwapRole.MAKER):
         with pytest.raises(
@@ -760,6 +764,80 @@ def test_the_median_time_rule_and_spacing_are_derived_from_the_vendored_radiant_
     assert median_time_past(list(range(11, 0, -1))) == 6
     with pytest.raises(ValidationError):
         median_time_past(list(range(12)))
+
+
+def test_the_local_clock_tolerance_is_radiant_cores_max_future_block_time():
+    """``LOCAL_CLOCK_BEHIND_TOLERANCE_S`` is READ from the vendored ``chain.h`` (``MAX_FUTURE_BLOCK_TIME``),
+    and the consensus check that applies it is found in ``validation.cpp``."""
+    import re
+
+    vendor = ROOT / "tests" / "vendor" / "radiant_core"
+    chain_h = (vendor / "chain.h").read_text()
+    a, b, c = re.search(r"static constexpr int64_t MAX_FUTURE_BLOCK_TIME = (\d+) \* (\d+) \* (\d+);", chain_h).groups()
+    assert int(a) * int(b) * int(c) == funding_spv.LOCAL_CLOCK_BEHIND_TOLERANCE_S == 7200
+    assert "block.GetBlockTime() > nAdjustedTime + MAX_FUTURE_BLOCK_TIME" in (vendor / "validation.cpp").read_text()
+
+
+def test_a_local_clock_behind_the_chain_is_refused_not_clamped(monkeypatch):
+    """``E = now - MTP(R)`` was clamped at zero, so a clock 9,000 s slow made a two-and-a-half-hour-old
+    tip read as fresh: the bound fell to the proved depth and steps 6 and 7 passed on a window that
+    is gone. On a value-bearing network, a clock more than ``MAX_FUTURE_BLOCK_TIME`` (7,200 s) behind
+    the newest verified header is now REFUSED, saying so; a correct clock and any skew up to the
+    tolerance pass, and a skew that puts ``now`` before the reference time is stated in the note."""
+    c, kw = _dust_case(monkeypatch)  # value-bearing, newest header stamped _NOW
+    ev = _two_operators(c.evidence())
+    tip_time = _time(c.headers[c.top])
+    assert tip_time == _NOW
+
+    def run(now):
+        return verify_maker_funding(ev, **{**kw, "now_unix_s": now}, value_at_stake_photons=10_000 * PHOTONS_PER_RXD)
+
+    honest = run(_NOW)
+    assert "E was taken as 0" not in honest.bound_note
+    stated = 0
+    for skew in (60, 300, 1800, 7200):
+        r = run(_NOW - skew)
+        assert r.elapsed_blocks_upper >= r.proved_depth
+        if _NOW - skew < r.reference_time:
+            assert "before the reference time (within the 7200 s tolerance), so E was taken as 0" in r.bound_note
+            stated += 1
+    assert stated, "non-vacuity: no skew inside the tolerance put now before the reference time"
+    for skew in (7201, 9000, 86_400):
+        with pytest.raises(MakerFundingNotVerified, match="local clock appears to be behind the chain") as exc:
+            run(_NOW - skew)
+        assert f"{skew} s before the timestamp of block {c.top}" in str(exc.value)
+
+
+async def test_a_slow_clock_cannot_make_the_coordinator_fund(monkeypatch):
+    """Through the coordinator: the same funding, the clock 9,000 s slow — ``pre_btc_lock_check``
+    refuses naming the clock and ``taker_funds_btc`` never reaches ``fund``; with the right clock it
+    locks."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+
+    def coord():
+        view = _ChainView(
+            pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+        )
+        return _btc_coord(
+            terms,
+            _real_leg(view, network="bc"),
+            policy=_vb_policy(value_at_risk_photons=10_000 * PHOTONS_PER_RXD),
+            accept_nondurable_seen=True,
+        )
+
+    slow, btc_view = coord()
+    gate = await slow.pre_btc_lock_check(terms, now_unix_s=_NOW - 9000)
+    assert gate.ok is False and "local clock appears to be behind the chain" in gate.reason, gate.reason
+    with pytest.raises(ValidationError, match="local clock appears to be behind the chain"):
+        await slow.taker_funds_btc(terms, now_unix_s=_NOW - 9000)
+    assert btc_view.broadcasts == []
+
+    right, _ = coord()
+    assert (await right.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
 
 
 def _exact_poisson_quantiles(mean: float, epsilons: list[float]) -> dict[float, int]:
@@ -1432,7 +1510,9 @@ async def test_each_coordinator_entry_point_that_funds_refuses_an_unproved_fundi
 async def test_a_refusal_names_k_the_value_C_and_what_was_proved(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(450)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     # 3.5 × this chain's C: a value term of 7 or more, which proved depth 6 cannot meet, while the
     # negotiation-time check (which models k up to 14) still finds room in t_rxd 450.
     value = 10_937_50 * PHOTONS_PER_RXD // 100
@@ -1459,7 +1539,9 @@ def test_a_swap_whose_t_rxd_cannot_hold_the_bound_is_refused_when_the_coordinato
     locks anything and before any chain read, with C bounded from below by the shipped interval work."""
     base, chain = _value_bearing_chain(monkeypatch)
     terms = _ab_terms(400)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     with pytest.raises(ValidationError, match="refused before anyone locks") as exc:
         _btc_coord(
             terms,
@@ -1498,7 +1580,9 @@ def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monk
         t_rxd=t.Timelock(600, t.TimeUnit.BLOCKS),
         radiant_amount=1000,
     )
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     eth = FakeEthLeg(preimage=p, verdict=_final())
     eth.network, eth.chain_id = "sepolia", 11155111
 
@@ -1685,7 +1769,9 @@ async def test_pre_btc_lock_check_runs_the_same_check_on_the_terms_it_is_handed(
     base, chain = _value_bearing_chain(monkeypatch)
     early = early_elapsed_blocks_upper(chain=chain, value_at_stake_photons=_BIG, burial_blocks=1).elapsed_blocks_upper
     roomy = _wide_terms(early + 1000)
-    view = _ChainView(pays=_covenant(roomy), value=roomy.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(roomy), value=roomy.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     coord, btc_view = _btc_coord(
         roomy, _real_leg(view, network="bc"), policy=_vb_policy(value_at_risk_photons=_BIG), accept_nondurable_seen=True
     )
@@ -1730,7 +1816,9 @@ def test_a_maker_role_coordinator_is_not_refused_for_the_taker_gates_value_input
 
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = dataclasses.replace(_vb_terms(400), asset_variant="ft", genesis_ref=b"\x01" * 36)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     for role in (None, SwapRole.TAKER):
         with pytest.raises(ValidationError, match=r"refused before anyone locks.*taker gate this coordinator runs"):
             _btc_coord(
@@ -2270,7 +2358,9 @@ async def test_step_5_refuses_when_only_one_of_two_configured_operators_answers(
     gate refuses naming who answered and who did not. When both answer, it locks."""
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(3000)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     value = 10_000 * PHOTONS_PER_RXD
 
     class _Silent(_DepthReader):
@@ -2325,7 +2415,9 @@ async def test_a_tip_height_alone_is_not_an_operator_reporting_the_funding(monke
     tip-only report still RAISES the bound, at dust, where one operator suffices."""
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(3000)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     tip = view.chain.top
 
     def coord_for(depth_source, value):
@@ -2564,7 +2656,9 @@ async def test_the_durable_record_carries_the_override_statement(monkeypatch):
     carries the statement, and it survives the JSON round trip."""
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(3000)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     value = 10_000 * PHOTONS_PER_RXD
     written: list[dict] = []
 
