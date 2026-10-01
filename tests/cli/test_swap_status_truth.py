@@ -1036,3 +1036,37 @@ def test_debug_traceback_carries_no_keyed_url(case, mode) -> None:
     for secret in SECRETS:
         assert secret not in out, (secret, out)
     assert "127.0.0.1" in out  # the host is still named
+
+
+def test_debug_traceback_carries_no_keyed_url_that_lives_only_in_the_config_file(tmp_path) -> None:
+    """The key is not on the command line or in the environment — only in ``--config``. ``cli()``
+    registers the config's URLs with the redactor as soon as it loads the file, so a library
+    exception that quotes the URL (here websockets' ``InvalidURI`` for a user-without-password
+    URL) is still scrubbed from the ``--debug`` traceback."""
+    import os
+    import subprocess
+    import sys
+
+    keyed = f"wss://{FAKE_PATH_SECRET}@127.0.0.1:1/"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'network = "mainnet"\nelectrumx_servers = ["{keyed}"]\n')
+    argv = [
+        sys.executable,
+        "-m",
+        "pyrxd.cli",
+        "--debug",
+        "--config",
+        str(cfg),
+        "glyph",
+        "inspect",
+        "--fetch",
+        "ab" * 32,
+    ]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYRXD_")}
+    assert not any(FAKE_PATH_SECRET in a for a in argv)  # the config file is the only place it is
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=90)
+    out = proc.stdout + proc.stderr
+    # Non-vacuity: a traceback was printed, and it is the exception that quotes the URI.
+    assert "Traceback (most recent call last)" in out, out
+    assert "InvalidURI" in out, out
+    assert FAKE_PATH_SECRET not in out, out

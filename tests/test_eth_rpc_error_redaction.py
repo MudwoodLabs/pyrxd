@@ -458,3 +458,96 @@ def test_an_error_body_with_no_secret_reaches_web3_unchanged(echoing_url):
     ours = raised(lambda: EthRpc(url, expected_chain_id=1).w3)
     assert ours == plain
     assert "0x560ff900" in ours[1]
+
+
+# ── EVERY response shape, not only `error` as an object ─────────────────────────────────────────
+
+#: How a server can put the request path (key included) into an HTTP-200 response. Each builds the
+#: body from the request id and the echoed path. web3 raises from every one of them.
+_MALFORMED = {
+    "error-object": lambda rid, echo: {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": echo}},
+    "error-string": lambda rid, echo: {"jsonrpc": "2.0", "id": rid, "error": echo},
+    "error-list": lambda rid, echo: {"jsonrpc": "2.0", "id": rid, "error": [echo]},
+    "no-error-no-result": lambda rid, echo: {"jsonrpc": "2.0", "id": rid, "note": echo},
+    "top-level-list": lambda rid, echo: [{"jsonrpc": "2.0", "id": rid, "error": {"code": -1, "message": echo}}],
+}
+
+
+def _serve(make_body):
+    hits = {"n": 0}
+
+    class _H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            hits["n"] += 1
+            body = json.dumps(make_body(req["id"], f"denied for {self.path}")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, hits
+
+
+@pytest.mark.parametrize("shape", sorted(_MALFORMED))
+def test_no_response_shape_carries_the_key_into_a_raw_w3_read(shape):
+    import web3
+
+    srv, hits = _serve(_MALFORMED[shape])
+    url = f"http://127.0.0.1:{srv.server_port}/v3/{_KEY}"
+
+    def raised(make_w3):
+        async def go():
+            w3 = make_w3()
+            try:
+                await w3.eth.get_balance("0x" + "11" * 20)
+            finally:
+                await w3.provider.disconnect()
+
+        with pytest.raises(Exception) as caught:
+            asyncio.run(go())
+        return _full_text(caught.value)
+
+    try:
+        # Control, per shape: through a plain provider this shape DOES carry the key.
+        assert _KEY in raised(lambda: web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(url)))
+        before = hits["n"]
+        text = raised(lambda: EthRpc(url, expected_chain_id=1).w3)
+        assert hits["n"] > before
+        assert _KEY not in text, text
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_an_honest_RESULT_is_returned_byte_identical_even_when_it_contains_the_key():
+    """``result`` is never rewritten — not even a string that happens to equal a secret part. The
+    whole response, as web3 receives it, is identical to what a plain provider hands it."""
+    import web3
+
+    weird = {"path": f"/v3/{_KEY}", "nested": [f"{_KEY}", {"k": "0x" + "ab" * 32}], "n": 7}
+    srv, _hits = _serve(lambda rid, _echo: {"jsonrpc": "2.0", "id": rid, "result": weird})
+    url = f"http://127.0.0.1:{srv.server_port}/v3/{_KEY}"
+
+    async def fetch(make_w3):
+        w3 = make_w3()
+        try:
+            return await w3.provider.make_request("pyrxd_test", [])
+        finally:
+            await w3.provider.disconnect()
+
+    try:
+        plain = asyncio.run(fetch(lambda: web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(url))))
+        ours = asyncio.run(fetch(lambda: EthRpc(url, expected_chain_id=1).w3))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert ours == plain
+    assert ours["result"] == weird
+    assert json.dumps(ours["result"]) == json.dumps(weird)

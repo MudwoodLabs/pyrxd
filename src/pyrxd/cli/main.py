@@ -159,6 +159,9 @@ def cli(
     _errors.set_debug(debug)
 
     cfg = _config.load(config_path)
+    # Before anything can fail on one of them: a keyed URL that lives only in the config file must
+    # be as redactable in an error or a --debug traceback as one passed on the command line.
+    _errors.register_endpoint_urls(cfg.every_endpoint_url())
 
     # Resolve final network: flag > env (already in cfg) > built-in default.
     #

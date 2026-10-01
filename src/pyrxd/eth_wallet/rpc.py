@@ -116,18 +116,20 @@ class _RedactingLogger:
         return getattr(self._logger, name)
 
 
-def _scrub_rpc_error(response: Any, url: str) -> Any:
-    """*response* with the endpoint's credential parts removed from its JSON-RPC ``error`` object.
+def _scrub_response(response: Any, url: str) -> Any:
+    """*response* with the endpoint's credential parts removed from every string in it, EXCEPT
+    the ``result`` of a response object — which is returned exactly as the server sent it.
 
-    A JSON-RPC error arrives as a SUCCESSFUL HTTP response, so it never reaches the ``except`` in
-    ``make_request``; web3 raises ``Web3RPCError`` from it later, quoting ``error.message`` and
-    ``error.data`` as the server wrote them — and a server can echo the request path, key included.
-    Only the strings inside ``error`` are touched: ``result`` is never rewritten, and revert data
-    (one long hex run) cannot match a whole-token secret.
+    A JSON-RPC error, or a malformed response, arrives as a SUCCESSFUL HTTP response, so it never
+    reaches the ``except`` in ``make_request``; web3 raises from it later (``Web3RPCError``,
+    ``BadResponseFormat``) and quotes what the server wrote — which can echo the request path, key
+    included. Which field the server puts that text in is the server's choice (``error`` as an
+    object, a string, a list; a stray top-level field; a bare list), so nothing but ``result`` is
+    trusted to be free of it. ``result`` is the data the caller asked for and is never rewritten.
     """
-    if isinstance(response, dict) and isinstance(response.get("error"), (dict, str)):
-        return {**response, "error": redact_endpoints_in(response["error"], url)}
-    return response
+    if isinstance(response, dict):
+        return {k: (v if k == "result" else redact_endpoints_in(v, url)) for k, v in response.items()}
+    return redact_endpoints_in(response, url)
 
 
 _PROVIDER_CLASS: Any = None
@@ -136,8 +138,8 @@ _PROVIDER_CLASS: Any = None
 def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
     """``AsyncHTTPProvider`` for *rpc_url* whose transport failures never quote the URL's secrets.
 
-    It also removes them from a JSON-RPC ``error`` object before web3 raises from it
-    (:func:`_scrub_rpc_error`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
+    It also removes them from every part of a response except its ``result`` before web3 raises
+    from it (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
     the legs make through ``rpc.w3`` / :func:`~pyrxd.eth_wallet.multi_rpc.read_contract`, which
     never pass through an :class:`EthRpc` method and so are not covered by :meth:`EthRpc._failed`.
     A failure whose chain quotes nothing secret is re-raised UNCHANGED (same type, so web3's own
@@ -166,7 +168,7 @@ def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
                     raise _scrubbed(
                         NetworkError, f"{method} transport failure: {exc}", exc, str(self.endpoint_uri)
                     ) from None
-                return _scrub_rpc_error(response, str(self.endpoint_uri))
+                return _scrub_response(response, str(self.endpoint_uri))
 
             async def make_batch_request(self, batch_requests: Any) -> Any:
                 try:
@@ -178,8 +180,8 @@ def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
                         NetworkError, f"batch request transport failure: {exc}", exc, str(self.endpoint_uri)
                     ) from None
                 if isinstance(response, list):
-                    return [_scrub_rpc_error(r, str(self.endpoint_uri)) for r in response]
-                return _scrub_rpc_error(response, str(self.endpoint_uri))
+                    return [_scrub_response(r, str(self.endpoint_uri)) for r in response]
+                return _scrub_response(response, str(self.endpoint_uri))
 
         _PROVIDER_CLASS = _RedactingAsyncHTTPProvider
     return _PROVIDER_CLASS(rpc_url)

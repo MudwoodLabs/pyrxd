@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import traceback
+from collections.abc import Iterable
 
 import click
 
@@ -60,15 +61,27 @@ def is_debug() -> bool:
 
 _URL_IN_ARG = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 
+#: URLs that came from somewhere other than argv and the environment — the config file — added by
+#: ``main.cli()`` through :func:`register_endpoint_urls` as soon as the config is loaded.
+_REGISTERED_URLS: list[str] = []
+
+
+def register_endpoint_urls(urls: Iterable[str]) -> None:
+    """Make *urls* known to :func:`endpoint_urls_in_invocation` for the rest of this process."""
+    for url in urls:
+        if isinstance(url, str) and url and url not in _REGISTERED_URLS:
+            _REGISTERED_URLS.append(url)
+
 
 def endpoint_urls_in_invocation() -> list[str]:
-    """Every URL on this process's command line or in a ``PYRXD_*`` variable.
+    """Every endpoint URL this invocation may use: the command line, ``PYRXD_*`` variables and
+    the loaded config file (:func:`register_endpoint_urls`).
 
     The URLs whose credential parts must not appear in text the CLI prints but did not write — a
     library exception's message, or its ``--debug`` traceback.
     """
     sources = [*sys.argv[1:], *(v for k, v in os.environ.items() if k.startswith("PYRXD_"))]
-    return [m for text in sources for m in _URL_IN_ARG.findall(text)]
+    return [*(m for text in sources for m in _URL_IN_ARG.findall(text)), *_REGISTERED_URLS]
 
 
 class CliError(click.ClickException):
