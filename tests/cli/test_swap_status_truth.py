@@ -557,8 +557,12 @@ def refusing(request) -> Iterator[ThreadingHTTPServer]:
         srv.server_close()
 
 
+#: The request path :func:`_keyed_url` produces — what a server that echoes its request would quote.
+_KEYED_PATH = f"/v2/{FAKE_PATH_SECRET}?apikey={FAKE_QUERY_SECRET}"
+
+
 def _keyed_url(srv: ThreadingHTTPServer) -> str:
-    return f"http://{FAKE_USER_SECRET}:pw@127.0.0.1:{srv.server_port}/v2/{FAKE_PATH_SECRET}?apikey={FAKE_QUERY_SECRET}"
+    return f"http://{FAKE_USER_SECRET}:pw@127.0.0.1:{srv.server_port}{_KEYED_PATH}"
 
 
 def _url_taking_commands() -> dict[str, Any]:
@@ -958,3 +962,119 @@ def test_a_malformed_eth_chain_id_in_the_file_is_refused_not_ignored(case, eth_r
     res = _eth_status(case, eth_rpc)
     assert res.exit_code != 0
     assert "eth_chain_id must be a positive integer" in res.output
+
+
+class _EchoOrRedirect(BaseHTTPRequestHandler):
+    """``server.mode`` ``"echo"``: a 401 whose reason and body repeat the request path (key
+    included). ``"redirect"``: a 307 to the same keyed path with ``&hop=1`` appended, which then
+    answers 401 — so the redirect history in the exception carries the key too."""
+
+    def _reply(self) -> None:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        self.server.seen.append(self.path)  # type: ignore[attr-defined]
+        if self.server.mode == "redirect" and "hop=1" not in self.path:  # type: ignore[attr-defined]
+            self.send_response(307, "Moved")
+            # Built from the test's own constants, not the request line: the path is the same, and a
+            # header copied from a request is HTTP response splitting to CodeQL even in a test server.
+            self.send_header("Location", _KEYED_PATH + "&hop=1")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = json.dumps({"error": f"unauthorized for {self.path}"}).encode()
+        self.send_response(401, f"Unauthorized {_KEYED_PATH}")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _reply
+
+    def log_message(self, *a: Any) -> None:
+        return None
+
+
+@pytest.mark.parametrize("mode", ["echo", "redirect"])
+def test_debug_traceback_carries_no_keyed_url(case, mode) -> None:
+    """``--debug`` prints the wrapped library exception's traceback (``CliError.show`` ->
+    ``__cause__``). That text is aiohttp's, and it quotes the request URL — and here the server
+    echoes the key back or redirects to it — so the traceback must go through the redactor too.
+    Through the real entry point, so the flag, the command and the printer are all the shipped ones."""
+    import os
+    import subprocess
+    import sys
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _EchoOrRedirect)
+    srv.mode = mode  # type: ignore[attr-defined]
+    srv.seen = []  # type: ignore[attr-defined]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        _eth_swap(case)
+        url = _keyed_url(srv)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pyrxd.cli",
+                "--debug",
+                "swap",
+                "recover-preimage",
+                "--swap-file",
+                str(case["keys"]),
+                "--eth-contract",
+                ETH_CONTRACT,
+                "--eth-rpc-url",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            timeout=60,
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    out = proc.stdout + proc.stderr
+    # Non-vacuity: the keyed URL was really requested, and a traceback really was printed.
+    assert any(FAKE_PATH_SECRET in p for p in srv.seen), srv.seen  # type: ignore[attr-defined]
+    assert "Traceback (most recent call last)" in out, out
+    if mode == "redirect":
+        assert any("hop=1" in p for p in srv.seen), srv.seen  # type: ignore[attr-defined]
+    for secret in SECRETS:
+        assert secret not in out, (secret, out)
+    assert "127.0.0.1" in out  # the host is still named
+
+
+def test_debug_traceback_carries_no_keyed_url_that_lives_only_in_the_config_file(tmp_path) -> None:
+    """The key is not on the command line or in the environment — only in ``--config``. ``cli()``
+    registers the config's URLs with the redactor as soon as it loads the file, so a library
+    exception that quotes the URL (here websockets' ``InvalidURI`` for a user-without-password
+    URL) is still scrubbed from the ``--debug`` traceback."""
+    import os
+    import subprocess
+    import sys
+
+    keyed = f"wss://{FAKE_PATH_SECRET}@127.0.0.1:1/"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'network = "mainnet"\nelectrumx_servers = ["{keyed}"]\n')
+    argv = [
+        sys.executable,
+        "-m",
+        "pyrxd.cli",
+        "--debug",
+        "--config",
+        str(cfg),
+        "glyph",
+        "inspect",
+        "--fetch",
+        "ab" * 32,
+    ]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYRXD_")}
+    assert not any(FAKE_PATH_SECRET in a for a in argv)  # the config file is the only place it is
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=90)
+    out = proc.stdout + proc.stderr
+    # Non-vacuity: a traceback was printed, and it is the exception that quotes the URI.
+    assert "Traceback (most recent call last)" in out, out
+    assert "InvalidURI" in out, out
+    assert FAKE_PATH_SECRET not in out, out

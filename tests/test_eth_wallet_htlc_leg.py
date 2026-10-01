@@ -80,6 +80,11 @@ def frozen_clock(monkeypatch):
     return fake
 
 
+async def _unsettled_storage(*_a, **_k) -> bytes:
+    """`eth_getStorageAt` for an HTLC whose `settled` flag (slot 0) is clear — every honest one."""
+    return b"\x00" * 32
+
+
 class _Rpc:
     """A single-source EthRpc double for the claim/refund/send paths.
 
@@ -109,6 +114,9 @@ class _Rpc:
                 return _Built()
 
         class _Eth:
+            async def get_storage_at(self, *_a, **_k):
+                return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
             def contract(self_e, address=None, abi=None, **_k):
                 return types.SimpleNamespace(functions=_Fns())
 
@@ -354,7 +362,9 @@ class _FundedRpc:
                 return lambda: _Getter(name)
 
         self.w3 = types.SimpleNamespace(
-            eth=types.SimpleNamespace(contract=lambda **_k: types.SimpleNamespace(functions=_Fns()))
+            eth=types.SimpleNamespace(
+                contract=lambda **_k: types.SimpleNamespace(functions=_Fns()), get_storage_at=_unsettled_storage
+            )
         )
 
     async def assert_chain(self):
@@ -613,7 +623,7 @@ def _override(rpc, name, value):
 
         return types.SimpleNamespace(functions=_Fns())
 
-    rpc.w3 = types.SimpleNamespace(eth=types.SimpleNamespace(contract=contract))
+    rpc.w3 = types.SimpleNamespace(eth=types.SimpleNamespace(contract=contract, get_storage_at=_unsettled_storage))
 
 
 async def test_the_timeout_bind_compares_values_not_int_objects():
@@ -636,9 +646,10 @@ async def test_a_delegated_claimant_does_not_excuse_a_contract_refundee():
 
 def test_expected_runtime_is_exact_and_substitutes_every_immutable_offset():
     """The slot-accurate compare builds the expected runtime by substituting the negotiated value
-    into EVERY immutableReferences offset and requiring EXACT equality — no byte is wildcarded, so
-    a forged immutable copy or a modified logic byte (even a committed-zero one) is caught. Uses a
-    synthetic 2-copy artifact so the two-copy forgery is expressible without Anvil."""
+    into EVERY immutableReferences offset — no byte is wildcarded, so a forged immutable copy or a
+    modified logic byte (even a committed-zero one) DIFFERS from it. Uses a synthetic 2-copy artifact.
+    This checks the construction only; ``test_eth_verify_funded_real_runtime.py`` drives the real
+    ``verify_funded`` compare over the committed artifacts."""
     # Synthetic runtime: 96 bytes. immutable `claimant` (ref id "6") at offsets 0 and 64 (two
     # copies, as Solidity splices); byte at offset 40 is a non-zero LOGIC byte between them.
     runtime = bytearray(96)
@@ -656,11 +667,11 @@ def test_expected_runtime_is_exact_and_substitutes_every_immutable_offset():
     word = b"\x00" * 12 + bytes.fromhex("33" * 20)
     assert expected[0:32] == word and expected[64:96] == word  # BOTH copies substituted
     assert expected[40] == 0xFE  # the logic byte is preserved exactly
-    # Forging ONLY the second (claim/refund) copy is rejected — the getter would read the first.
+    # Forging ONLY the second (claim/refund) copy differs — the getter would read the first.
     forged = bytearray(expected)
     forged[64:96] = b"\x00" * 12 + bytes.fromhex("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
     assert bytes(forged) != expected
-    # A flipped logic byte is rejected too (the old mask ignored higher/lower committed-zero bytes).
+    # So does a flipped logic byte (the old mask ignored higher/lower committed-zero bytes).
     lower = bytearray(expected)
     lower[40] = 0x5F
     higher = bytearray(expected)

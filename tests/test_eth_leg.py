@@ -545,6 +545,9 @@ class _RecordingRpc:
                 return _Getter(loc.timeout)
 
         class _Eth:
+            async def get_storage_at(self, *_a, **_k):
+                return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
             def contract(self, address=None, abi=None):
                 class _C:
                     functions = _Functions()
@@ -669,9 +672,11 @@ def test_expected_runtime_rejects_a_forged_immutable_copy_the_getters_cannot_see
     BETWEEN the 2–3 runtime copies Solidity splices per immutable. A getter reads one copy while
     ``claim()``/``refund()`` read another, so a hostile deployer could set the getter copy of
     ``claimant`` to the negotiated maker (passing verify_funded's getter bind) and the ``claim()``
-    copy to an attacker — draining the ETH on claim. This pins the slot-accurate fix: the expected
-    runtime substitutes the negotiated value into EVERY immutableReferences offset and requires
-    EXACT equality, so forging ANY single copy is caught with no Anvil needed."""
+    copy to an attacker — draining the ETH on claim. This pins how the expected runtime is BUILT:
+    the negotiated value lands in EVERY immutableReferences offset, so a forged copy differs from it.
+    It does NOT run the compare — it compares two byte strings it built itself, and deleting the
+    compare from ``verify_funded`` left it green. ``test_eth_verify_funded_real_runtime.py`` drives
+    the real ``verify_funded`` over every forged copy; that is the per-PR regression for #798."""
     pytest.importorskip("web3")
     leg = EthHtlcContractLeg(
         rpc=object(), signing_key=PrivateKeyMaterial.generate(), chain_id=31337, artifact=_REAL_ART
@@ -688,7 +693,7 @@ def test_expected_runtime_rejects_a_forged_immutable_copy_the_getters_cannot_see
     attacker = bytes.fromhex("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
     forged = bytearray(expected)
     forged[1224 : 1224 + 32] = b"\x00" * 12 + attacker
-    assert bytes(forged) != expected  # the compare verify_funded now runs rejects this
+    assert bytes(forged) != expected  # the forgery is visible to an exact compare (which this does not run)
     # And a byte flipped anywhere in the LOGIC (a committed-zero position the old mask ignored) is
     # likewise rejected: find a non-immutable zero byte and flip it.
     imm_windows = {

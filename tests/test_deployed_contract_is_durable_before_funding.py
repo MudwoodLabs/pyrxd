@@ -114,6 +114,9 @@ def _leg(
             return _Ctor()
 
     class _Eth:
+        async def get_storage_at(self, *_a, **_k):
+            return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
         def contract(self, *a, **k):
             return _Contract()
 
@@ -443,6 +446,9 @@ def _real_verify_leg(
         functions = _Fns()
 
     class _Eth:
+        async def get_storage_at(self, *_a, **_k):
+            return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
         def contract(self, *a, **k):
             return _Contract()
 
@@ -715,6 +721,9 @@ def _native_leg(
             return _Ctor()
 
     class _Eth:
+        async def get_storage_at(self, *_a, **_k):
+            return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
         def contract(self, *a, **k):
             return _Contract()
 

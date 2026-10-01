@@ -528,3 +528,131 @@ async def test_immutable_names_match_what_each_getter_RETURNS(anvil_url, artifac
         assert returned == sentinel
     finally:
         await rpc.close()
+
+
+# ---------------------------------------------------------------------------
+# Storage: a contract whose CODE is exact but whose `settled` flag is already set.
+# ---------------------------------------------------------------------------
+
+
+async def _deploy_presettled(rpc, runtime: bytes, *, value: int) -> str:
+    """Create a contract carrying ``runtime`` verbatim with storage slot 0 already set to 1."""
+    from eth_account import Account
+
+    prefix = bytes.fromhex("6001600055" + f"61{len(runtime):04x}" + "80" + "610012" + "6000" + "39" + "6000" + "f3")
+    assert len(prefix) == 0x12
+    acct = Account.from_key(bytes.fromhex(_KEY_TAKER))
+    tx = {
+        "from": _ADDR_TAKER,
+        "nonce": await rpc.w3.eth.get_transaction_count(_ADDR_TAKER),
+        "value": value,
+        "data": "0x" + (prefix + runtime).hex(),
+        "gas": 3_000_000,
+        "chainId": _CHAIN_ID,
+        "maxFeePerGas": 10**10,
+        "maxPriorityFeePerGas": 10**9,
+    }
+    receipt = await rpc.w3.eth.wait_for_transaction_receipt(
+        await rpc.w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
+    )
+    assert receipt["status"] == 1
+    return receipt["contractAddress"]
+
+
+async def test_SETTLED_SLOT_is_the_flag_an_honest_claim_sets(anvil_url):
+    """The behavioural half of ``test_eth_htlc_settled_slot.py``: on the REAL contract, slot
+    ``SETTLED_SLOT`` is zero after funding and non-zero after a claim. If the flag lived anywhere
+    else, the leg's settled check would be reading the wrong word."""
+    from pyrxd.eth_wallet.htlc_leg import SETTLED_SLOT
+
+    rpc, taker, maker = _legs(anvil_url)
+    try:
+        p, h = _secret()
+        loc = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 3600),
+            amount_wei=_AMOUNT_WEI,
+        )
+        assert not any(bytes(await rpc.w3.eth.get_storage_at(loc.contract_address, SETTLED_SLOT)))
+        await maker.claim(loc, p)
+        assert any(bytes(await rpc.w3.eth.get_storage_at(loc.contract_address, SETTLED_SLOT)))
+    finally:
+        await rpc.close()
+
+
+async def test_a_PRE_SETTLED_exact_runtime_is_refused_and_the_private_claim_never_broadcasts(anvil_url):
+    """A contract with the exact runtime and full balance but its ``settled`` word set is refused
+    by ``verify_funded``, and a claim against it is refused before any transaction from the maker
+    exists — on the private path too, where there is no preflight."""
+    import dataclasses
+
+    rpc, taker, maker = _legs(anvil_url)
+    try:
+        p, h = _secret()
+        honest = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 3600),
+            amount_wei=_AMOUNT_WEI,
+        )
+        settled_addr = await _deploy_presettled(rpc, maker._expected_runtime(honest), value=_AMOUNT_WEI)
+        settled = dataclasses.replace(honest, contract_address=settled_addr)
+        # The code IS exact — this is what makes it the storage check's job and nobody else's.
+        assert bytes(await rpc.get_code(settled_addr)) == maker._expected_runtime(settled)
+
+        with pytest.raises(ValidationError, match="ALREADY SETTLED"):
+            await maker.verify_funded(settled, expected_amount_wei=_AMOUNT_WEI)
+        # Control: the honest contract beside it still verifies.
+        await maker.verify_funded(honest, expected_amount_wei=_AMOUNT_WEI)
+
+        class _ForwardingSubmitter:
+            """A private submitter that forwards to the node."""
+
+            async def submit_raw(self, raw):  # pragma: no cover - reaching it is the failure
+                return "0x" + bytes(await rpc.w3.eth.send_raw_transaction(raw)).hex()
+
+        private_maker = EthHtlcContractLeg(
+            rpc=rpc,
+            signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_MAKER)),
+            chain_id=_CHAIN_ID,
+            artifact=_ARTIFACT,
+            private_submitter=_ForwardingSubmitter(),
+        )
+        nonce_before = await rpc.w3.eth.get_transaction_count(_ADDR_MAKER)
+        with pytest.raises(PreRevealAbort, match="already settled"):
+            await private_maker.claim(settled, p)
+        assert await rpc.w3.eth.get_transaction_count(_ADDR_MAKER) == nonce_before  # nothing was sent
+    finally:
+        await rpc.close()
+
+
+async def test_a_leg_signing_for_another_chain_never_reaches_the_node(anvil_url):
+    """A chain-1 leg over a 31337-pinned rpc is refused before signing; no bytes reach the node."""
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    sent = []
+    real_send = rpc.send_raw
+
+    async def spy(raw):  # pragma: no cover - reaching it is the failure
+        sent.append(raw)
+        return await real_send(raw)
+
+    rpc.send_raw = spy
+    leg = EthHtlcContractLeg(
+        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)), chain_id=1, artifact=_ARTIFACT
+    )
+    try:
+        _, h = _secret()
+        with pytest.raises(ValidationError, match="its rpc is pinned to chain 31337"):
+            await leg.fund(
+                hashlock=h,
+                claimant=_ADDR_MAKER,
+                refundee=_ADDR_TAKER,
+                timeout=await _now_plus(rpc, 3600),
+                amount_wei=_AMOUNT_WEI,
+            )
+        assert sent == []
+    finally:
+        await rpc.close()

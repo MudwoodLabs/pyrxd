@@ -12,10 +12,12 @@ This is the I/O layer; the security-critical preimage parsing is the pure
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from pyrxd.network.redaction import redact_endpoint_secrets, redact_endpoints_in
 from pyrxd.network.source_identity import source_key
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, RxdSdkError, ValidationError
 
 __all__ = ["EthRpc"]
 
@@ -31,6 +33,158 @@ def _require_web3() -> Any:
             "the ETH leg needs web3 (a Phase-3 network dependency); install it with: pip install 'pyrxd[eth]'"
         ) from exc
     return web3
+
+
+def _chain_quotes_a_secret(exc: BaseException, url: str) -> bool:
+    """Whether *exc*, or anything chained under it, quotes a credential-bearing part of *url*.
+
+    The chain matters as much as the message. ``logger.exception`` and ``--debug`` print every
+    ``__cause__`` and ``__context__``, so an error whose own text was redacted still leaks the key
+    if the aiohttp exception it was raised ``from`` is printed underneath it.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = f"{type(cur).__name__}: {cur}"
+        # The SECRET parts only: `redact_endpoints_in` also normalises a keyless URL's spelling
+        # (drops a trailing "/"), which is a change but not a leak.
+        if redact_endpoint_secrets(text, url) != text:
+            return True
+        nxt = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+        cur = nxt
+    return False
+
+
+def _scrubbed(kind: type[RxdSdkError], message: str, exc: BaseException, url: str) -> RxdSdkError:
+    """*kind*(*message*) with *url*'s credential parts redacted, chained to *exc* only if that is safe.
+
+    The ONE place an :class:`EthRpc` turns a library exception into text. aiohttp's
+    ``ClientResponseError`` quotes the full request URL — ``https://host/v3/<API-KEY>`` — so a 429
+    or a 5xx from a keyed provider put the key into the exception, from there into the watchtower's
+    page text, its log and its webhook. When nothing in the chain quotes a secret the original
+    exception stays attached as ``__cause__`` for debugging; when something does, the chain is cut.
+    """
+    err = kind(str(redact_endpoints_in(message, url)))
+    err.__cause__ = None if _chain_quotes_a_secret(exc, url) else exc
+    err.__suppress_context__ = True
+    return err
+
+
+class _RedactingLogger:
+    """The provider's logger, with the endpoint's credential parts removed from every line.
+
+    web3's ``AsyncHTTPProvider`` logs its full ``endpoint_uri`` — at DEBUG on every request, and at
+    INFO ("Successfully disconnected from: <url>") on ``close()``. The watchtower logs at INFO, so
+    an orderly shutdown wrote the key to its log.
+    """
+
+    def __init__(self, logger: logging.Logger, url: str) -> None:
+        self._logger = logger
+        self._url = url
+
+    def _emit(self, level: int, msg: object, *args: Any, **kwargs: Any) -> None:
+        if not self._logger.isEnabledFor(level):
+            return
+        try:
+            text = (str(msg) % args) if args else str(msg)
+        except (TypeError, ValueError):  # a malformed format string must not lose the line
+            text = " ".join(str(x) for x in (msg, *args))
+        kwargs.setdefault("stacklevel", 3)
+        self._logger.log(level, "%s", redact_endpoints_in(text, self._url), **kwargs)
+
+    def debug(self, msg: object, *args: Any, **kwargs: Any) -> None:
+        self._emit(logging.DEBUG, msg, *args, **kwargs)
+
+    def info(self, msg: object, *args: Any, **kwargs: Any) -> None:
+        self._emit(logging.INFO, msg, *args, **kwargs)
+
+    def warning(self, msg: object, *args: Any, **kwargs: Any) -> None:
+        self._emit(logging.WARNING, msg, *args, **kwargs)
+
+    def error(self, msg: object, *args: Any, **kwargs: Any) -> None:
+        self._emit(logging.ERROR, msg, *args, **kwargs)
+
+    def exception(self, msg: object, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("exc_info", True)
+        self._emit(logging.ERROR, msg, *args, **kwargs)
+
+    def critical(self, msg: object, *args: Any, **kwargs: Any) -> None:
+        self._emit(logging.CRITICAL, msg, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._logger, name)
+
+
+def _scrub_response(response: Any, url: str) -> Any:
+    """*response* with the endpoint's credential parts removed from every string in it, EXCEPT
+    the ``result`` of a response object — which is returned exactly as the server sent it.
+
+    A JSON-RPC error, or a malformed response, arrives as a SUCCESSFUL HTTP response, so it never
+    reaches the ``except`` in ``make_request``; web3 raises from it later (``Web3RPCError``,
+    ``BadResponseFormat``) and quotes what the server wrote — which can echo the request path, key
+    included. Which field the server puts that text in is the server's choice (``error`` as an
+    object, a string, a list; a stray top-level field; a bare list), so nothing but ``result`` is
+    trusted to be free of it. ``result`` is the data the caller asked for and is never rewritten.
+    """
+    if isinstance(response, dict):
+        return {k: (v if k == "result" else redact_endpoints_in(v, url)) for k, v in response.items()}
+    return redact_endpoints_in(response, url)
+
+
+_PROVIDER_CLASS: Any = None
+
+
+def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
+    """``AsyncHTTPProvider`` for *rpc_url* whose transport failures never quote the URL's secrets.
+
+    It also removes them from every part of a response except its ``result`` before web3 raises
+    from it (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
+    the legs make through ``rpc.w3`` / :func:`~pyrxd.eth_wallet.multi_rpc.read_contract`, which
+    never pass through an :class:`EthRpc` method and so are not covered by :meth:`EthRpc._failed`.
+    A failure whose chain quotes nothing secret is re-raised UNCHANGED (same type, so web3's own
+    handling and every caller's ``except`` clause see what they always saw). One that does is
+    replaced by a :class:`NetworkError` carrying the redacted text, with the chain cut. The
+    provider's own log lines go through :class:`_RedactingLogger`.
+
+    NOT covered: web3's ``HTTPSessionManager`` logs the URI at DEBUG when it caches a session. It is
+    a separate object with a class-level logger; at the INFO level the watchtower runs at, it is
+    silent.
+    """
+    global _PROVIDER_CLASS
+    if _PROVIDER_CLASS is None:
+
+        class _RedactingAsyncHTTPProvider(web3.AsyncWeb3.AsyncHTTPProvider):  # type: ignore[misc,name-defined]
+            def __init__(self, endpoint_uri: str) -> None:
+                super().__init__(endpoint_uri)
+                self.logger = _RedactingLogger(type(self).logger, str(endpoint_uri))
+
+            async def make_request(self, method: Any, params: Any) -> Any:
+                try:
+                    response = await super().make_request(method, params)
+                except Exception as exc:
+                    if not _chain_quotes_a_secret(exc, str(self.endpoint_uri)):
+                        raise
+                    raise _scrubbed(
+                        NetworkError, f"{method} transport failure: {exc}", exc, str(self.endpoint_uri)
+                    ) from None
+                return _scrub_response(response, str(self.endpoint_uri))
+
+            async def make_batch_request(self, batch_requests: Any) -> Any:
+                try:
+                    response = await super().make_batch_request(batch_requests)
+                except Exception as exc:
+                    if not _chain_quotes_a_secret(exc, str(self.endpoint_uri)):
+                        raise
+                    raise _scrubbed(
+                        NetworkError, f"batch request transport failure: {exc}", exc, str(self.endpoint_uri)
+                    ) from None
+                if isinstance(response, list):
+                    return [_scrub_response(r, str(self.endpoint_uri)) for r in response]
+                return _scrub_response(response, str(self.endpoint_uri))
+
+        _PROVIDER_CLASS = _RedactingAsyncHTTPProvider
+    return _PROVIDER_CLASS(rpc_url)
 
 
 class EthRpc:
@@ -53,8 +207,26 @@ class EthRpc:
         #: be redacted (:class:`~pyrxd.eth_wallet.multi_rpc.MultiSourceEthRpc` reads it for that only).
         self._rpc_url = rpc_url
         web3 = _require_web3()
-        self._w3 = web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(rpc_url))
+        self._w3 = web3.AsyncWeb3(_redacting_http_provider(web3, rpc_url))
         self._expected_chain_id = expected_chain_id
+
+    @property
+    def expected_chain_id(self) -> int:
+        """The chain this endpoint is pinned to — what :meth:`assert_chain` holds it to.
+
+        Public so a leg can check that the chain id it SIGNS with is this one. ``assert_chain`` only
+        compares the endpoint with this value; a leg signing for a different chain passed it, and
+        its signed bytes then reached a provider on the wrong network.
+        """
+        return self._expected_chain_id
+
+    def _failed(self, what: str, exc: BaseException, *, kind: type[RxdSdkError] = NetworkError) -> RxdSdkError:
+        """The error every method below raises for a failed call: ``"<what>: <exc>"``, redacted.
+
+        Through here, not an f-string at each site, so a new method cannot forget the redaction
+        (see :func:`_scrubbed`). Callers ``raise`` the return value.
+        """
+        return _scrubbed(kind, f"{what}: {exc}", exc, self._rpc_url)
 
     @property
     def w3(self) -> Any:
@@ -90,7 +262,7 @@ class EthRpc:
         try:
             cid = await self._w3.eth.chain_id
         except Exception as exc:
-            raise NetworkError(f"eth_chainId failed: {exc}") from exc
+            raise self._failed("eth_chainId failed", exc)
         if cid != self._expected_chain_id:
             raise ValidationError(f"RPC chain_id {cid} != expected {self._expected_chain_id} (wrong network)")
 
@@ -105,7 +277,7 @@ class EthRpc:
                 else await self._w3.eth.get_code(address, block_identifier)
             )
         except Exception as exc:
-            raise NetworkError(f"eth_getCode failed: {exc}") from exc
+            raise self._failed("eth_getCode failed", exc)
         b = bytes(code)
         if len(b) > _MAX_RESPONSE_BYTES:
             raise NetworkError("eth_getCode response exceeds size cap")
@@ -119,7 +291,7 @@ class EthRpc:
                 else await self._w3.eth.get_balance(address, block_identifier)
             )
         except Exception as exc:
-            raise NetworkError(f"eth_getBalance failed: {exc}") from exc
+            raise self._failed("eth_getBalance failed", exc)
 
     async def get_transaction_count(self, address: str, block: str = "pending") -> int:
         """Nonce for the sender. Defaults to ``pending`` so a freshly built tx does not collide
@@ -133,7 +305,7 @@ class EthRpc:
         try:
             return int(await self._w3.eth.get_transaction_count(address, block))
         except Exception as exc:
-            raise NetworkError(f"eth_getTransactionCount failed: {exc}") from exc
+            raise self._failed("eth_getTransactionCount failed", exc)
 
     async def fee_fields(self) -> dict:
         """EIP-1559 fee fields (maxFeePerGas / maxPriorityFeePerGas) from the node."""
@@ -141,7 +313,7 @@ class EthRpc:
             base = (await self._w3.eth.get_block("pending")).get("baseFeePerGas", 0) or 0
             tip = await self._w3.eth.max_priority_fee
         except Exception as exc:
-            raise NetworkError(f"fee estimation failed: {exc}") from exc
+            raise self._failed("fee estimation failed", exc)
         tip = int(tip)
         return {"maxPriorityFeePerGas": tip, "maxFeePerGas": int(base) * 2 + tip}
 
@@ -175,28 +347,28 @@ class EthRpc:
                 if hasattr(web3.exceptions, n)
             )
             if contract_errors and isinstance(exc, contract_errors):
-                raise ValidationError(f"tx would revert (preflight eth_call): {exc}") from exc
-            raise NetworkError(f"preflight eth_call failed: {exc}") from exc
+                raise self._failed("tx would revert (preflight eth_call)", exc, kind=ValidationError)
+            raise self._failed("preflight eth_call failed", exc)
 
     async def send_raw(self, raw_tx: bytes) -> str:
         try:
             h = await self._w3.eth.send_raw_transaction(raw_tx)
         except Exception as exc:
-            raise NetworkError(f"eth_sendRawTransaction failed: {exc}") from exc
+            raise self._failed("eth_sendRawTransaction failed", exc)
         return h.hex() if hasattr(h, "hex") else str(h)
 
     async def wait_receipt(self, tx_hash: str, *, timeout_s: float = 300.0) -> dict:
         try:
             r = await self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_s)
         except Exception as exc:
-            raise NetworkError(f"wait_for_transaction_receipt failed: {exc}") from exc
+            raise self._failed("wait_for_transaction_receipt failed", exc)
         return dict(r)
 
     async def get_transaction(self, tx_hash: str) -> dict:
         try:
             return dict(await self._w3.eth.get_transaction(tx_hash))
         except Exception as exc:
-            raise NetworkError(f"eth_getTransactionByHash failed: {exc}") from exc
+            raise self._failed("eth_getTransactionByHash failed", exc)
 
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         """A single NON-BLOCKING receipt fetch (`eth_getTransactionReceipt`). Returns ``None`` when
@@ -210,7 +382,7 @@ class EthRpc:
             not_found = getattr(web3.exceptions, "TransactionNotFound", None)
             if not_found is not None and isinstance(exc, not_found):
                 return None
-            raise NetworkError(f"eth_getTransactionReceipt failed: {exc}") from exc
+            raise self._failed("eth_getTransactionReceipt failed", exc)
         return dict(r)
 
     async def finalized_block_number(self) -> int:
@@ -226,7 +398,7 @@ class EthRpc:
             fin = int((await self._w3.eth.get_block("finalized"))["number"])
             head = int((await self._w3.eth.get_block("latest"))["number"])
         except Exception as exc:
-            raise NetworkError(f"eth_getBlock(finalized/latest) failed: {exc}") from exc
+            raise self._failed("eth_getBlock(finalized/latest) failed", exc)
         if fin < 0 or fin > head:
             raise NetworkError(f"incoherent finalized={fin} > latest head={head}; refusing (fail-closed)")
         return fin
@@ -238,7 +410,7 @@ class EthRpc:
         try:
             return int(await self._w3.eth.block_number)
         except Exception as exc:
-            raise NetworkError(f"eth_blockNumber failed: {exc}") from exc
+            raise self._failed("eth_blockNumber failed", exc)
 
     async def canonical_block_hash(self, block_number: int) -> bytes:
         """The canonical block hash at ``block_number`` (eth_getBlockByNumber). Used to bind a
@@ -249,7 +421,7 @@ class EthRpc:
         try:
             blk = await self._w3.eth.get_block(block_number)
         except Exception as exc:
-            raise NetworkError(f"eth_getBlockByNumber({block_number}) failed: {exc}") from exc
+            raise self._failed(f"eth_getBlockByNumber({block_number}) failed", exc)
         h = blk.get("hash")
         return bytes(h) if h is not None else b""
 
@@ -276,7 +448,7 @@ class EthRpc:
         try:
             raw = await self._w3.eth.get_logs(filt)
         except Exception as exc:
-            raise NetworkError(f"eth_getLogs failed: {exc}") from exc
+            raise self._failed("eth_getLogs failed", exc)
         if len(raw) > _MAX_LOG_ENTRIES:
             raise NetworkError(f"eth_getLogs returned {len(raw)} entries (> {_MAX_LOG_ENTRIES} cap); refusing")
         return [dict(log) for log in raw]

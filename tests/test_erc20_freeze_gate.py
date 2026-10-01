@@ -43,6 +43,9 @@ class _Broken:
             functions = _Fns()
 
         class _Eth:
+            async def get_storage_at(self, *_a, **_k):
+                return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
             def contract(self, *a, **k):
                 return _Contract()
 
@@ -205,6 +208,9 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
             functions = _Fns()
 
         class _Eth:
+            async def get_storage_at(self, *_a, **_k):
+                return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
             def contract(self, *a, **k):
                 return _Contract()
 
@@ -411,6 +417,9 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
         functions = _Fns()
 
     class _Eth:
+        async def get_storage_at(self, *_a, **_k):
+            return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
         def contract(self, *a, **k):
             return _Contract()
 

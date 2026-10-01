@@ -51,6 +51,9 @@ class _FakeRpc:
         self.public_sends: list[bytes] = []
 
         class _W3Eth:
+            async def get_storage_at(self, *_a, **_k):
+                return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
             async def get_block(self_inner, _which):
                 # The claim path reads the clock to refuse a claim too close to the HTLC timeout —
                 # a late claim still mines with the preimage in its calldata. Round 5 additionally

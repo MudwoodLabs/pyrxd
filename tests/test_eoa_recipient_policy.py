@@ -114,6 +114,9 @@ def _rpc(artifact: dict, recipient_code: bytes, *, token_balance: int = _AMOUNT)
         functions = _Fns()
 
     class _Eth:
+        async def get_storage_at(self, *_a, **_k):
+            return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
         def contract(self, *a, **k):
             return _Contract()
 

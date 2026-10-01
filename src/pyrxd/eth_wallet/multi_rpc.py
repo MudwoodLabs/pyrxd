@@ -134,10 +134,30 @@ class MultiSourceEthRpc:
                 f"min_agreeing={self._min} exceeds the {len(self._sources)} sources given: this "
                 "quorum can never be reached, so every read would fail closed"
             )
+        # "Each pinned to the same chain id" was documented and not checked. Each source's
+        # `assert_chain` holds its endpoint to ITS OWN expected id, so a Sepolia source pinned to
+        # 11155111 beside a mainnet one pinned to 1 passed every assert_chain while the quorum
+        # spanned two chains — and a leg could not know which id this rpc stands for.
+        declared = {getattr(s, "expected_chain_id", None) for s in self._sources} - {None}
+        if len(declared) > 1:
+            raise ValidationError(
+                f"MultiSourceEthRpc sources are pinned to different chains {sorted(declared)}: a "
+                "quorum spanning two chains is not a weaker guarantee, it is a meaningless one"
+            )
+        self._expected_chain_id: int | None = next(iter(declared), None)
 
     @property
     def sources(self) -> list[Any]:
         return list(self._sources)
+
+    @property
+    def expected_chain_id(self) -> int | None:
+        """The one chain id every source is pinned to (``None`` only if no source declares one).
+
+        A leg compares the chain id it SIGNS with against this — see
+        :meth:`pyrxd.eth_wallet.htlc_leg.EthHtlcContractLeg._sign_tx`.
+        """
+        return self._expected_chain_id
 
     def _failures(self, results: Sequence[Any]) -> str:
         """The exceptions among *results*, as text fit to put in an error message.

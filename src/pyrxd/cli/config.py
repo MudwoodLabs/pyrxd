@@ -235,6 +235,30 @@ class Config:
             return self.electrumx_servers
         return (self.electrumx,) if self.electrumx else ()
 
+    def every_endpoint_url(self) -> tuple[str, ...]:
+        """Every URL this config names, for ANY network — for redacting text the CLI prints.
+
+        Not :attr:`endpoints`: that is the resolved list for one network, and an error can quote a
+        URL from the raw lists before (or instead of) resolution. Walks ``electrumx``,
+        ``electrumx_servers`` and every value under ``[networks.*]``, so a key in a URL that lives
+        only in the config file is known to the redactor as well as one on the command line.
+        """
+        found: list[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, str):
+                if "://" in value:
+                    found.append(value)
+            elif isinstance(value, dict):
+                for v in value.values():
+                    walk(v)
+            elif isinstance(value, (list, tuple)):
+                for v in value:
+                    walk(v)
+
+        walk([self.electrumx, list(self.electrumx_servers), self.networks])
+        return tuple(dict.fromkeys(found))
+
     def for_network(self, network: str, *, electrumx_override: str | None = None) -> Config:
         """Return a copy resolved for *network*.
 

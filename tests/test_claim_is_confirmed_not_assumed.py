@@ -65,6 +65,9 @@ def _leg(receipt, *, sent: list):
         functions = _Fns()
 
     class _Eth:
+        async def get_storage_at(self, *_a, **_k):
+            return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
         def contract(self, *a, **k):
             return _Contract()
 
@@ -218,6 +221,9 @@ class _Source:
                 return _Fn()
 
         class _Eth:
+            async def get_storage_at(self, *_a, **_k):
+                return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
             def contract(self, *a, **k):
                 class _C:
                     functions = _Fns()
@@ -401,6 +407,9 @@ def _leg_with_preflight(reverts: bool, *, sends: list):
             return _Fn()
 
     class _Eth:
+        async def get_storage_at(self, *_a, **_k):
+            return b"\x00" * 32  # `settled` (slot 0) clear: an unsettled HTLC
+
         def contract(self, *a, **k):
             class _C:
                 functions = _Fns()
