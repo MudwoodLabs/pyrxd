@@ -30,10 +30,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY, ElapsedBoundPolicy
+from pyrxd.gravity import funding_spv
+from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY, ElapsedBoundPolicy, MakerFundingNotVerified
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
-from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times
+from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times, taker_gate_early_bound
 from pyrxd.network.bitcoin import MempoolSpaceSource
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight
 
 _MAINNET_BTC_API = "https://mempool.space/api"
@@ -88,6 +90,61 @@ def add_single_operator_override_arg(ap: argparse.ArgumentParser) -> None:
             "is recorded too."
         ),
     )
+
+
+#: The flag that sets ``MarginPolicy.value_at_risk_photons`` — the swap's value in photons, which the
+#: taker gate sizes the depth it requires of the maker's funding from. An RXD swap has one already
+#: (its ``radiant_amount``); an NFT or FT swap has no in-protocol value, so without this flag the
+#: coordinator refuses it. Every script that builds a mainnet coordinator exposes it (derived test).
+VALUE_AT_RISK_FLAG = "--value-at-risk-photons"
+
+
+def parse_positive_photons(text: str) -> int:
+    """A positive whole number of photons. Refuses zero, a negative, a fraction and anything that is
+    not a plain decimal integer."""
+    raw = str(text).strip()
+    if not raw.isdigit():
+        raise argparse.ArgumentTypeError(f"{text!r}: give a positive whole number of photons")
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r}: the value at risk must be more than 0 photons")
+    return value
+
+
+def add_value_at_risk_arg(ap: argparse.ArgumentParser) -> None:
+    """Add ``--value-at-risk-photons`` (``MarginPolicy.value_at_risk_photons``)."""
+    ap.add_argument(
+        VALUE_AT_RISK_FLAG,
+        dest="value_at_risk_photons",
+        metavar="PHOTONS",
+        type=parse_positive_photons,
+        default=None,
+        help=(
+            "the swap's value in photons (MarginPolicy.value_at_risk_photons), from which the taker gate sizes "
+            "the confirmations it requires of the maker's funding. Required for an NFT or FT swap (they have no "
+            "in-protocol value; the coordinator refuses without it); for an RXD swap it may only raise the value "
+            "above the covenant amount."
+        ),
+    )
+
+
+def preflight_coordinator(build: Any, *, before: str) -> Any:
+    """Construct the swap coordinator — every construction-time check it runs — BEFORE *before*.
+
+    *build* is a zero-argument callable returning the ``SwapCoordinator`` the run will use (the same
+    wiring the run uses, with the terms it would negotiate). A refusal becomes a ``SystemExit`` naming
+    what was refused and, where the coordinator asks for a value at risk, the flag that sets it — so a
+    run is refused before anything is minted or broadcast, never after.
+    """
+    try:
+        return build()
+    except ValidationError as exc:
+        hint = ""
+        if "value_at_risk_photons" in str(exc):
+            hint = f"\n  pass {VALUE_AT_RISK_FLAG} with the swap's value in photons"
+        elif "rxd_block_interval_fast_s" in str(exc):
+            hint = "\n  pass --rxd-block-interval-fast-s (the MEASURED p10 Radiant inter-block interval, seconds)"
+        raise SystemExit(f"refused before {before}: the swap coordinator refuses these terms:\n  {exc}{hint}") from None
 
 
 #: The flags naming the user's own mainnet Radiant node, reached as
@@ -446,7 +503,41 @@ def rxd_blockcount(client: Any) -> ChainHeight:
 # ---------------------------------------------------------------------------
 
 
-async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
+class OfflineBtcTransport:
+    """A BTC broadcaster and funding reader for a run that must not touch the network (a dry run):
+    it satisfies the leg's construction checks and refuses every read and broadcast."""
+
+    async def broadcast(self, raw_tx: bytes) -> str:
+        raise NetworkError("offline: this run broadcasts nothing")
+
+    async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
+        raise NetworkError("offline: this run reads no chain")
+
+    async def confirmations(self, txid: str) -> int:
+        raise NetworkError("offline: this run reads no chain")
+
+    async def txid_of(self, raw_tx: bytes) -> str:
+        raise NetworkError("offline: this run reads no chain")
+
+
+class OfflineRadiantClient:
+    """A Radiant client for a run that must not touch the network (a dry run): it satisfies
+    ``RadiantChainIO``'s construction checks and refuses every read and broadcast. It names no
+    operator, so it is not counted as one."""
+
+    source_key = None
+
+    async def broadcast(self, raw_tx: bytes) -> str:
+        raise NetworkError("offline: this run broadcasts nothing")
+
+    async def get_transaction_verbose(self, txid: str) -> dict[str, Any]:
+        raise NetworkError("offline: this run reads no chain")
+
+    async def get_utxos(self, script_hash: bytes) -> list[Any]:
+        raise NetworkError("offline: this run reads no chain")
+
+
+async def measured_margin_from_mainnet(args: argparse.Namespace, *, dry_run: bool = False) -> Any:
     """Read recent MAINNET BTC header timestamps and build a measured ``MarginPolicy``.
 
     Timing always comes from MAINNET BTC data regardless of stage — signet header
@@ -457,9 +548,21 @@ async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
     without it this refuses before any network read. A measured policy requires it, and the swap
     timelock reserves divide by it; there is no value to fall back to that would not
     under-count blocks.
+
+    ``dry_run=True`` words that refusal as the dry run's verdict: the broadcast stages refuse to start
+    without the flag, and the dry run builds the same coordinator they do, so it needs it too.
     """
-    fast = getattr(args, "rxd_block_interval_fast_s", None)
-    if not isinstance(fast, (int, float)) or isinstance(fast, bool) or fast <= 0:
+    raw_fast = getattr(args, "rxd_block_interval_fast_s", None)
+    fast = float(raw_fast) if isinstance(raw_fast, (int, float)) and not isinstance(raw_fast, bool) else 0.0
+    has_fast = fast > 0
+    if not has_fast and dry_run:
+        raise SystemExit(
+            "DRY-RUN VERDICT: the signet and dust stages refuse to start without --rxd-block-interval-fast-s "
+            "(the MEASURED p10 Radiant inter-block interval, seconds): the swap coordinator they build refuses a "
+            "mainnet Radiant leg without it, because the timelock reserves divide by it. This dry run builds the "
+            "same coordinator, so pass the flag here too to see the rest of the verdict."
+        )
+    if not has_fast:
         raise SystemExit(
             "--rxd-block-interval-fast-s is required: the MEASURED p10 Radiant inter-block interval "
             "(seconds). The measured margin policy requires it (the timelock reserves divide by it), and the "
@@ -481,10 +584,12 @@ async def measured_margin_from_mainnet(args: argparse.Namespace) -> Any:
         btc_claim_reorg_depth_blocks=args.btc_claim_reorg_depth,
         rxd_claim_burial_blocks=args.rxd_claim_burial,
         rxd_block_interval_s=args.rxd_block_interval_s,
-        rxd_block_interval_fast_s=float(fast),
+        rxd_block_interval_fast_s=fast,
         # This is a DUST harness (gated on --i-accept-dust-loss): the value is below the Radiant
         # reorg cost, so opt out of value-scaled burial. A real-value run must NOT use this path.
         accept_flat_burial=True,
+        # --value-at-risk-photons, when given: the value the taker gate sizes its depth from.
+        value_at_risk_photons=getattr(args, "value_at_risk_photons", None),
     )
 
 
@@ -738,6 +843,43 @@ async def wait_for_covenant_via_leg(
         await asyncio.sleep(poll_s)
 
 
+def gate_elapsed_reserve_blocks(
+    *,
+    policy: Any,
+    value_at_stake_photons: int | None,
+    funding_bound: ElapsedBoundPolicy,
+    radiant_min_confirmations: int = 1,
+) -> int:
+    """The RADIANT blocks of ``t_rxd`` a MAINNET runner reserves when it derives ``t_btc``: the taker
+    gate's own model of its elapsed-depth bound (``swap_coordinator.taker_gate_early_bound`` — the
+    number the coordinator's negotiation-time check subtracts from ``t_rxd`` before it runs steps 6
+    and 7), from the same inputs the coordinator will use: Radiant mainnet, this policy, this value at
+    stake, this ``funding_bound``.
+
+    The flat :data:`PRE_BTC_LOCK_ELAPSED_RESERVE_BLOCKS` / :func:`elapsed_reserve_blocks` reserve did
+    not: at dust the gate models about 80 blocks, so every ``--t-rxd-blocks`` gave terms the
+    coordinator refused at construction (measured 2026-09-30: 80 to 1000 swept, all refused). Those
+    stay for the test-network two-host runners, where the gate has no value term and no
+    negotiation-time check.
+    """
+    try:
+        early = taker_gate_early_bound(
+            chain=funding_spv.MAINNET_CHAIN,
+            policy=policy,
+            value_at_stake_photons=value_at_stake_photons,
+            funding_bound=funding_bound,
+            radiant_min_confirmations=radiant_min_confirmations,
+        )
+    except MakerFundingNotVerified as exc:
+        hint = (
+            f"\n  pass {VALUE_AT_RISK_FLAG} with the swap's value in photons" if value_at_stake_photons is None else ""
+        )
+        raise SystemExit(
+            f"the taker gate's elapsed-depth bound cannot be modelled for this swap: {exc}{hint}"
+        ) from None
+    return early.elapsed_blocks_upper
+
+
 #: RADIANT blocks of headroom the derived counter leg must survive.
 #:
 #: ``assert_timelock_margin`` is called from ``pre_btc_lock_check`` as
@@ -828,10 +970,11 @@ def derive_counter_timelock(
         # The smallest t_rxd that yields t_btc >= 1, inverted from the relation above.
         need = elapsed_reserve_blocks + int(-(-((margin_blocks + 1) * btc_block_interval_s) // rxd_block_interval_s))
         raise SystemExit(
-            f"{rxd_flag} {t_rxd_blocks} leaves no room for a counter leg: {t_rxd_blocks} Radiant "
-            f"blocks is {t_rxd_blocks * rxd_block_interval_s / 3600:.2f} h, and the "
-            f"{margin_blocks}-block margin alone is "
-            f"{margin_blocks * btc_block_interval_s / 3600:.2f} h.\n"
+            f"{rxd_flag} {t_rxd_blocks} leaves no room for a counter leg: {elapsed_reserve_blocks} of its "
+            f"Radiant blocks are reserved for the blocks that can elapse before the taker locks, and the "
+            f"{margin_blocks}-block margin alone is {margin_blocks * btc_block_interval_s / 3600:.2f} h "
+            f"({t_rxd_blocks} Radiant blocks is {t_rxd_blocks * rxd_block_interval_s / 3600:.2f} h); it is "
+            f"{need - t_rxd_blocks} block{'s' if need - t_rxd_blocks != 1 else ''} short.\n"
             f"  raise {rxd_flag} to at least {need}, or lower --margin-blocks.\n"
             "  (t_btc is derived in WALL CLOCK since #567: a Radiant block is worth about half a "
             "Bitcoin block, so a Radiant leg buys half as many counter-leg blocks as its raw count "

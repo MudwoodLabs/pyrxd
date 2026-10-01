@@ -113,8 +113,10 @@ class FundingChain:
             merkle=dict(self.merkle),
             coinbase_merkle=dict(self.coinbase_merkle),
             headers=headers,
-            # One source reporting, as a single server's verbose ``confirmations`` would.
+            # One source reporting, as a single server's verbose ``confirmations`` for the funding would:
+            # a depth for the bound, and a report of the funding transaction itself.
             reported_depths=() if reported_confirmations is None else (("server", int(reported_confirmations)),),
+            funding_tx_depths=() if reported_confirmations is None else (("server", int(reported_confirmations)),),
         )
         kw.update(over)
         return MakerFundingEvidence(**kw)

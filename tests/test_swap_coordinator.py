@@ -2898,11 +2898,25 @@ def _value_bearing_radiant() -> FakeRadiantLeg:
 
 
 def _construct_eth_coord(*, policy, accept_estimated=False, radiant_leg=None, window=8):
+    """A NEGOTIATED ETH coordinator, built with the clock (``_NOW``). On a value-bearing Radiant leg its
+    ``t_rxd`` also carries the taker gate's modelled elapsed-depth bound, which the negotiation-time
+    check subtracts before it judges the ordering against the absolute deadline."""
     h = hashlib.sha256(os.urandom(32)).digest()
+    terms = _eth_terms(hashlock=h)
+    radiant_leg = radiant_leg if radiant_leg is not None else _value_bearing_radiant()
+    if policy.rxd_block_interval_fast_s is not None and getattr(radiant_leg, "network", None) == "mainnet":
+        from pyrxd.gravity import funding_spv
+        from pyrxd.gravity.swap_coordinator import taker_gate_early_bound
+
+        value = max(policy.value_at_risk_photons or 0, terms.radiant_amount)
+        reserve = taker_gate_early_bound(
+            chain=funding_spv.MAINNET_CHAIN, policy=policy, value_at_stake_photons=value
+        ).elapsed_blocks_upper
+        terms = _eth_terms(hashlock=h, t_rxd_blocks=terms.t_rxd.value + reserve)
     return SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_eth_terms(hashlock=h)),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=FakeEthLeg(preimage=SecretBytes(os.urandom(32)), verdict=_final()),
-        radiant_leg=radiant_leg if radiant_leg is not None else _value_bearing_radiant(),
+        radiant_leg=radiant_leg,
         indexer=FakeIndexer(),
         seen_store=FakeSeenStore(),
         config=CoordinatorConfig(
@@ -2911,6 +2925,7 @@ def _construct_eth_coord(*, policy, accept_estimated=False, radiant_leg=None, wi
             accept_estimated_eth_margins=accept_estimated,
             maker_stall_safety_window_blocks=window,
         ),
+        now_unix_s=_NOW,
     )
 
 
@@ -2928,15 +2943,24 @@ def _with_fast_tail(policy, fast_s: float = 300.0, **over):
     return type(policy)(**{**policy.__dict__, "rxd_block_interval_fast_s": fast_s, **over})
 
 
+#: What step 3's ETH ordering gate needs on the policy; a value-bearing ETH coordinator now runs that
+#: gate when it is built (a policy without these could never pass step 3, after the maker locked).
+_ORDERING_FIELDS = {"cross_clock_margin": _xmargin(), "max_covenant_confirm_wait_s": 3600}
+
+
 def test_value_bearing_eth_estimated_allowed_with_explicit_optin():
     # Conscious dust-run acceptance (accept_estimated_eth_margins=True) -> constructs.
-    coord = _construct_eth_coord(policy=_with_fast_tail(_eth_finality_policy(is_measured=False)), accept_estimated=True)
+    coord = _construct_eth_coord(
+        policy=_with_fast_tail(_eth_finality_policy(is_measured=False), **_ORDERING_FIELDS), accept_estimated=True
+    )
     assert coord is not None
 
 
 def test_value_bearing_eth_allowed_when_measured():
     # A measured policy is the proper fix path; window>=N-floor (8) -> constructs.
-    coord = _construct_eth_coord(policy=_with_fast_tail(_eth_finality_policy(is_measured=True)), window=8)
+    coord = _construct_eth_coord(
+        policy=_with_fast_tail(_eth_finality_policy(is_measured=True), **_ORDERING_FIELDS), window=8
+    )
     assert coord is not None
 
 

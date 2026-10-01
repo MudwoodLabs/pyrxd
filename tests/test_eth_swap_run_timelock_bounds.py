@@ -46,6 +46,12 @@ def _ns(**kw) -> argparse.Namespace:
         maker_stall_safety_window_blocks=30,
         margin_blocks=240,
         btc_block_interval_s=600.0,
+        # What `_policy` reads to model the taker gate's elapsed reserve (the run's value at stake),
+        # as the real parser supplies them.
+        asset_variant="rxd",
+        rxd_photons=1000,
+        value_at_risk_photons=None,
+        accept_single_operator_up_to=None,
     )
     base.update(kw)
     # A p10 cannot be SLOWER than the nominal interval; MarginPolicy refuses the pair outright as
@@ -746,3 +752,16 @@ class TestTheADVICEIsSourcedFromTheFeasibleSet:
                         f"range {lo}..{hi} — advice the next parse would refuse"
                     )
         assert checked, "no refusal carried an 'it is derived' line; this test asserted nothing"
+
+
+def test_a_derivation_under_the_floor_is_raised_to_the_floor_not_to_bip68s_maximum(runner, monkeypatch):
+    """Every bound is a floor (#482), so the feasible range's top is the BIP68 field width. When the
+    library's derivation landed one rounding step under the floor, the recommendation returned that top:
+    a 65,535-block maker lock. It returns the floor now — the fewest blocks that pass."""
+    args = _ns()
+    lo, hi = runner._t_rxd_feasible_range(args)
+    assert hi == 0xFFFF and lo < hi
+    monkeypatch.setattr(runner, "_derivable_t_rxd", lambda *_a, **_k: lo - 1)
+    assert runner._recommended_t_rxd_blocks(args) == lo
+    monkeypatch.setattr(runner, "_derivable_t_rxd", lambda *_a, **_k: None)
+    assert runner._recommended_t_rxd_blocks(args) == lo

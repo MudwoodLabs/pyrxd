@@ -22,7 +22,8 @@
 #   scripts/mutation_test.sh btcleg        # the BTC HTLC leg — taproot refund/claim leafs, payment parse, key handling
 #   scripts/mutation_test.sh covenants     # consensus-enforced covenant bytes — the Gravity covenant, soulbound
 #   scripts/mutation_test.sh htlccovenant  # gravity/htlc_covenant.py — the HTLC covenant bytes (sharded in CI)
-#   scripts/mutation_test.sh radiantleg    # gravity/radiant_leg.py + funding_spv.py — the Radiant HTLC leg and the taker gate
+#   scripts/mutation_test.sh radiantleg    # gravity/radiant_leg.py — the Radiant HTLC leg (sharded in CI)
+#   scripts/mutation_test.sh fundingspv    # gravity/funding_spv.py — the swap taker gate (sharded in CI)
 #   scripts/mutation_test.sh rswpcovenant  # swap/rswp/covenant.py — the RSWP covenant bytes (sharded in CI)
 #   scripts/mutation_test.sh gravitycore   # gravity/transactions.py — the Gravity transaction builders (sharded in CI)
 #   scripts/mutation_test.sh gravitystate  # the Gravity swap state and trade
@@ -170,7 +171,11 @@ group_files() {
     # of 5, 3 of 12 and 5 of 11 modules. Split the same way as `transaction` and `dmint` above.
     covenants)   echo "gravity/covenant glyph/soulbound_covenant" ;;
     htlccovenant) echo "gravity/htlc_covenant" ;;
-    radiantleg)  echo "gravity/radiant_leg gravity/funding_spv" ;;
+    radiantleg)  echo "gravity/radiant_leg" ;;
+    # The taker gate (#809) went into `radiantleg` beside radiant_leg, with its test file added to all
+    # four `covenants` lists; that put `radiantleg` at an ESTIMATED 317-379 minutes against the
+    # 330-minute timeout. It is its own group now, with a test list of its own.
+    fundingspv)  echo "gravity/funding_spv" ;;
     rswpcovenant) echo "swap/rswp/covenant" ;;
     gravitycore) echo "gravity/transactions" ;;
     gravitystate) echo "gravity/swap_state gravity/trade" ;;
@@ -274,10 +279,18 @@ group_tests() {
     markblock)   echo "tests/test_radiant_spv_primitives.py tests/test_radiant_checkpoints.py tests/test_mark_block_verification.py tests/network/test_get_transaction_merkle_real_data.py" ;;
     waveverdicts) echo "tests/test_authority_tokens.py tests/test_inspect_core_classification.py tests/test_fuzz_parsers.py tests/test_dat_and_burn.py tests/test_hashmark_attestation.py tests/test_delegate_refs_authorise_in_and_by.py tests/test_relationship_claims_are_verified.py tests/cli/test_glyph_inspect_cmds.py tests/test_form2_security_hardening.py tests/test_wave_identity_form2.py tests/test_mutable_chain_walk.py tests/test_mark_anchor.py tests/test_wave_fold_fixture_discriminates.py tests/test_multi_glyph_reveal_attribution.py tests/test_mutable_chain_is_discovered_from_the_chain.py tests/test_name_at_mark_reaches_the_cli.py" ;;
     btcleg)      echo "tests/test_watch_claim_executor.py tests/test_watch_v2_execute_invariants.py tests/test_swap_coordinator.py tests/test_btc_htlc_leg.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_builder_relay_fee_floors.py tests/test_btc_wallet.py tests/test_btc_chains.py tests/test_two_host_recovery_phases.py tests/test_watchtower_dust_run_harness.py tests/test_remaining_builder_relay_fee_floors.py tests/test_btc_taproot.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_swap_gate_binding.py" ;;
-    covenants)   echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py tests/test_taker_funding_spv_gate.py" ;;
-    htlccovenant) echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py tests/test_taker_funding_spv_gate.py" ;;
+    covenants)   echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py" ;;
+    htlccovenant) echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py" ;;
+    # `radiantleg` runs the `covenants` list plus the taker gate's test file: on a 30-mutant sample of
+    # radiant_leg (seed 20260930) that file killed 12, 4 of which nothing else in the list killed. The
+    # `covenants` family no longer runs it: it executes no function in soulbound_covenant or
+    # swap/rswp/covenant and only gravity/covenant's import-time lines, and on a 40-mutant sample of
+    # htlc_covenant it killed 8, every one also killed by the rest of the list.
     radiantleg)  echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py tests/test_taker_funding_spv_gate.py" ;;
-    rswpcovenant) echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py tests/test_taker_funding_spv_gate.py" ;;
+    # The taker gate's own test file, the adversarial suite it replaced the server's word in, and the
+    # two runner suites that drive it through the scripts (the elapsed-bound model, the room check).
+    fundingspv)  echo "tests/test_taker_funding_spv_gate.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_runners_build_the_coordinator_first.py tests/test_value_bearing_runners_pass_the_fast_tail.py" ;;
+    rswpcovenant) echo "tests/test_rswp_covenant.py tests/test_gravity_red_team.py tests/test_covenant.py tests/test_gravity_maker.py tests/cli/test_swap_recovery_cmds.py tests/test_radiant_leg.py tests/test_ref_walker_differential.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_radiant_confirmations_fail_closed.py tests/test_rswp_covenant_ft_demand.py tests/test_swap_reserve_floor_covers_its_refund.py tests/test_inspect_script_shapes.py tests/test_soulbound_covenant.py tests/test_two_host_recovery_phases.py" ;;
     gravitycore) echo "tests/test_gravity_trade.py tests/test_gravity_maker.py tests/test_gravity_fee_policy.py tests/test_gravity_maker_offer.py tests/test_remaining_builder_relay_fee_floors.py tests/test_gravity_red_team.py tests/test_swap_coordinator.py tests/test_two_host_recovery_phases.py tests/test_watch_decide.py tests/gravity/test_trade_wait_confirmations.py tests/test_wait_for_claim_respects_wall_clock.py tests/test_builder_relay_fee_floors.py tests/test_watch_pages_name_state_valid_steps.py tests/test_watch_claim_executor.py tests/test_reorg_cost_measurement.py tests/test_stablecoin_value_floor.py tests/test_eth_leg.py tests/test_erc20_verify_funded_reads_the_freeze.py tests/test_swap_record_erc20_migration.py tests/test_swap_gate_binding.py tests/test_gravity_audit_fixes.py tests/test_gravity.py" ;;
     gravitystate) echo "tests/test_gravity_trade.py tests/test_gravity_maker.py tests/test_gravity_fee_policy.py tests/test_gravity_maker_offer.py tests/test_remaining_builder_relay_fee_floors.py tests/test_gravity_red_team.py tests/test_swap_coordinator.py tests/test_two_host_recovery_phases.py tests/test_watch_decide.py tests/gravity/test_trade_wait_confirmations.py tests/test_wait_for_claim_respects_wall_clock.py tests/test_builder_relay_fee_floors.py tests/test_watch_pages_name_state_valid_steps.py tests/test_watch_claim_executor.py tests/test_reorg_cost_measurement.py tests/test_stablecoin_value_floor.py tests/test_eth_leg.py tests/test_erc20_verify_funded_reads_the_freeze.py tests/test_swap_record_erc20_migration.py tests/test_swap_gate_binding.py tests/test_gravity_audit_fixes.py tests/test_gravity.py" ;;
     gravitymaker) echo "tests/test_gravity_trade.py tests/test_gravity_maker.py tests/test_gravity_fee_policy.py tests/test_gravity_maker_offer.py tests/test_remaining_builder_relay_fee_floors.py tests/test_gravity_red_team.py tests/test_swap_coordinator.py tests/test_two_host_recovery_phases.py tests/test_watch_decide.py tests/gravity/test_trade_wait_confirmations.py tests/test_wait_for_claim_respects_wall_clock.py tests/test_builder_relay_fee_floors.py tests/test_watch_pages_name_state_valid_steps.py tests/test_watch_claim_executor.py tests/test_reorg_cost_measurement.py tests/test_stablecoin_value_floor.py tests/test_eth_leg.py tests/test_erc20_verify_funded_reads_the_freeze.py tests/test_swap_record_erc20_migration.py tests/test_swap_gate_binding.py tests/test_gravity_audit_fixes.py tests/test_gravity.py" ;;
@@ -320,7 +333,11 @@ group_tests() {
     markcli)     echo "tests/test_mark_cli_says_what_it_checked.py tests/test_form2_binding_names_the_mint.py tests/test_mark_anchor_is_bound_to_its_block.py tests/test_form2_step_heights_need_two_sources.py tests/test_hashmark_verify_cli.py tests/test_name_at_mark_sees_which_server_answered.py tests/test_name_at_mark_survives_a_hostile_target.py tests/test_hashmark_verify_one_record.py tests/test_signature_backend_differential.py tests/test_verify_names_the_output_you_gave.py tests/test_hashmark_mark_mutant_killers.py tests/test_hashmark_mark_cli.py tests/web/test_verify_page.py" ;;
     inspectcli)  echo "tests/test_glyph_timelock_read_side_is_reachable.py tests/test_hashmark_attestation.py tests/test_authority_tokens.py tests/test_hashmark_wave_identity.py tests/test_confusables_check_is_actually_wired.py tests/test_delegate_refs_authorise_in_and_by.py tests/test_dmint_state_judgement.py tests/test_op_return_verdicts_reach_a_human.py tests/test_attestation_degrades_without_secp256k1.py tests/test_mark_cli_says_what_it_checked.py tests/test_name_at_mark_reaches_the_cli.py tests/test_form2_binding_names_the_mint.py tests/test_mark_anchor_is_bound_to_its_block.py tests/test_form2_step_heights_need_two_sources.py tests/test_hashmark_verify_cli.py tests/test_name_at_mark_sees_which_server_answered.py tests/test_name_at_mark_survives_a_hostile_target.py tests/test_form2_security_hardening.py tests/web/test_a_payload_is_counted_as_minted_only_when_it_is.py tests/web/test_a_multi_glyph_reveal_is_described_once.py tests/test_hashmark_verify_one_record.py tests/test_indexer_reads_fail_over.py tests/test_glyph_update_reaches_a_human.py tests/test_reveal_metadata_says_what_binds_it.py tests/web/test_hashmark_panel_verdict.py tests/web/test_the_headline_prefers_a_bound_payload.py tests/web/test_verify_page.py tests/web/test_inspect_page_is_bounded.py tests/cli/test_glyph_inspect_spent_binding.py tests/cli/test_main.py tests/cli/test_glyph_inspect_cmds.py tests/cli/test_glyph_inspect_hostile_integers.py" ;;
     ethtimelock) echo "tests/test_eth_timelock_mutant_killers.py tests/test_eth_rxd_timelock.py tests/test_t_rxd_sizer_and_gate_agree.py tests/test_eth_swap_run_timelock_bounds.py" ;;
-    coordinator) echo "tests/test_swap_coordinator.py tests/test_swap_coordinator_credential_gate.py tests/test_max_protected_value.py tests/test_finality_verdict.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_radiant_leg.py tests/test_btc_htlc_leg.py $GAPS tests/test_htlc_handshake_conformance_vectors.py" ;;
+    # + the taker gate's test file, LAST (with -x it then runs only for mutants the rest of the list
+    # left alive). It drives the coordinator's negotiation-time check and steps 3/6/7, and kills
+    # swap_coordinator mutants nothing else here kills: 2026-10-01 local samples, 1 of 30 mutants in the
+    # gate's functions and 2 of 30 across the whole module (all in `_funding_proof_room_failure`).
+    coordinator) echo "tests/test_swap_coordinator.py tests/test_swap_coordinator_credential_gate.py tests/test_max_protected_value.py tests/test_finality_verdict.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_radiant_leg.py tests/test_btc_htlc_leg.py $GAPS tests/test_htlc_handshake_conformance_vectors.py tests/test_taker_funding_spv_gate.py" ;;
     # tests/test_glyph_wave.py and tests/test_hashmark_wave_identity.py are glyph-side files that
     # exercise network/rxindexer.py through its production caller (WaveResolver -> RxinDexerClient
     # -> call_extension). They were under `glyphverify` / no group, so the 2026-09-16 network run
@@ -356,6 +373,7 @@ group_timeout() {
     covenants)   echo "60.0" ;;
     htlccovenant) echo "60.0" ;;
     radiantleg)  echo "60.0" ;;
+    fundingspv)  echo "60.0" ;;
     rswpcovenant) echo "60.0" ;;
     gravitycore) echo "60.0" ;;
     gravitystate) echo "60.0" ;;
@@ -384,7 +402,7 @@ group_timeout() {
     # Clean suites measured 2026-09-28 via this script: markcli 5s, inspectcli 19s.
     markcli)     echo "45.0" ;;
     inspectcli)  echo "90.0" ;;
-    coordinator) echo "30.0" ;;
+    coordinator) echo "60.0" ;;  # ~6x the clean list with the taker gate's file (~2.6 s + ~7 s, 2026-10-01)
     network)     echo "30.0" ;;
     *)           echo "45.0" ;;
   esac
@@ -427,6 +445,15 @@ group_shards() {
     # local sample of each module, scaled to the runner by a control module of the same group.
     dmintminer)  echo "3" ;;
     rswpcovenant) echo "2" ;;
+    # ESTIMATED from 30-mutant local samples (2026-09-30, the group's own test command), NOT scaled to
+    # the runner: radiant_leg 970 mutants x 9.84 s = ~159 minutes, funding_spv 2,860 x 3.42 s = ~163
+    # minutes, each before any runner slowdown. Two shards each keep a 2x slower runner under 330.
+    radiantleg)  echo "2" ;;
+    fundingspv)  echo "2" ;;
+    # ESTIMATED from a 30-mutant local sample of the whole module (2026-10-01), NOT scaled to the
+    # runner: 2,960 mutants x ~2.0 s for the list, plus ~7 s of the gate's test file for the ~40% the
+    # rest of the list leaves alive (12 of 30) = ~99 + ~138 = ~237 minutes, before any runner slowdown.
+    coordinator) echo "2" ;;
     cryptoutils) echo "3" ;;
     cryptohash)  echo "6" ;;
     *)           echo "1" ;;
@@ -436,7 +463,7 @@ group_shards() {
 CONSENSUS_GROUPS="spv script transaction txpreimage dmint dmintchain dmintminer"
 # `keys` was in NEITHER meta-group, so `task mutate all` silently skipped the module set that
 # holds secrets, base58 and BIP32 derivation. Reachable only by exact name until now.
-VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network keys ethleg ethtimelock verdicts mutchain waveverdicts markblock btcleg covenants htlccovenant radiantleg rswpcovenant gravitycore gravitystate gravitymaker gravitylegs cryptoprim cryptokeys cryptosec cryptoutils cryptohash glyphverify glyphscan glyphinspector waverules inspectcore glyphlock wire hashmark wiretx hdseed feecore walletcore markcli inspectcli"
+VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network keys ethleg ethtimelock verdicts mutchain waveverdicts markblock btcleg covenants htlccovenant radiantleg fundingspv rswpcovenant gravitycore gravitystate gravitymaker gravitylegs cryptoprim cryptokeys cryptosec cryptoutils cryptohash glyphverify glyphscan glyphinspector waverules inspectcore glyphlock wire hashmark wiretx hdseed feecore walletcore markcli inspectcli"
 
 GROUPS_REQUESTED="${*:-spv}"
 case "$GROUPS_REQUESTED" in

@@ -45,6 +45,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Mutation CI: the taker gate (`gravity/funding_spv`) is its own group, `fundingspv`, sharded in
+  two, with its own test list.** It had joined `radiantleg`, and its test file had joined all four
+  `covenants` lists, putting `radiantleg` at an ESTIMATED 317-379 minutes against the 330-minute job
+  timeout. `radiantleg` (now `gravity/radiant_leg` alone) is sharded in two and keeps the gate's test
+  file, which killed radiant_leg mutants nothing else in its list killed (4 of a 30-mutant sample);
+  `covenants`, `htlccovenant` and `rswpcovenant` drop it: it runs no function of soulbound_covenant or
+  swap/rswp/covenant and only import-time lines of gravity/covenant, and every htlc_covenant mutant it
+  killed in a 40-mutant sample the rest of the list killed too. `coordinator` adds the gate's test
+  file, last in its list: it killed swap_coordinator mutants nothing else in the list killed (1 of
+  a 30-mutant sample of the gate's functions, 2 of 30 across the module). That makes `coordinator`
+  an ESTIMATED ~237 minutes, so it is sharded in two, with a 60 s per-mutant timeout. Per-job
+  minutes for the new sharded groups are ESTIMATED from local samples, not measured on the runner.
+
 - **`verify_mark_block` and `plan_block_verification` take `max_headers_from_checkpoint`
   (default 4,032, unchanged) and `verify_mark_block` takes `pow_limit`** (default `None`,
   unchanged); `radiant_header_target`, `radiant_header_work` and `verify_radiant_header_pow` take
@@ -215,6 +228,64 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The mainnet swap runners construct at their defaults, and build their coordinator before
+  anything is minted or broadcast.** Measured on `scripts/dust_swap_run.py`, `eth_swap_run.py` and
+  `eth_swap_grief_run.py` driven up to their first chain action:
+  - `derive_counter_timelock` reserved a flat 12 Radiant blocks for the blocks that elapse before
+    the taker locks, while the coordinator's negotiation-time check models the taker gate's bound at
+    about 80 at dust value, so no `--t-rxd-blocks` passed `dust_swap_run.py --stage dust` (80 to
+    1000 swept) and `eth_swap_run.py` refused below about 114. The mainnet runners now reserve the
+    gate's own model (`_dust_swap_shared.gate_elapsed_reserve_blocks`, built on the new
+    `swap_coordinator.taker_gate_early_bound`, which the coordinator's check calls too).
+    `dust_swap_run.py` defaults to 120 (smallest that constructed in the probe: 87, with a one-block
+    measured BTC margin it is 84). The refusal no longer prints a negative block count ("the -60
+    blocks of it left"); it says how many blocks short `t_rxd` is.
+  - The negotiation-time check ran the timelock ordering for a BTC counter leg only. An ETH or
+    ERC-20 swap whose `t_rxd` could not outlast its deadline constructed, the maker locked, and the
+    taker's `pre_btc_lock_check` step 3 then refused: `eth_swap_run.py --stage sepolia-dust` at its
+    defaults (`t_rxd` 160 against a 24 h deadline) projected the refund 5,760 s out, and
+    `eth_swap_grief_run.py` (`t_rxd` 120) failed step 7 at the modelled bound of 80. The check now
+    runs step 3 and step 7 on the modelled bound for every counter leg, refusing what they would
+    refuse on an honest chain before anyone locks. An ETH or ERC-20 deadline is absolute, so
+    `SwapCoordinator` takes `now_unix_s` (new) and refuses such a NEGOTIATED value-bearing swap
+    without it. At construction the deadline's claim floor is also judged when the taker's gate can
+    first accept the funding on that chain: the blocks the funding still lacks of `k`, timed at the
+    upper `ε` quantile of the time that many blocks take at the nominal spacing (new
+    `funding_spv.erlang_upper_quantile_s`; `ε` as for the elapsed bound, from the swap's value), plus
+    the bound's slack — 4,937 + 3,600 = 8,537 s at dust (`k` 6, `ε` 1e-3), where `k` nominal spacings
+    (5,400 s) is only the mean, which an honest chain exceeds about half the time. All `k` blocks
+    before the maker funds; fewer, or none, when the caller passes the depth it observed
+    (`SwapCoordinator(maker_funding_confirmations=...)`, new; `eth_swap_run.py --resume` reads it off
+    the node); nothing for a record carrying a pending counter-leg deploy (a resumed fund), which was
+    refused at construction while `pre_btc_lock_check` accepted it. The ETH runners now derive `t_rxd`
+    when `--t-rxd-blocks` is omitted: the deadline's own floor plus the gate's modelled bound
+    (`eth_swap_run.py`, both stages, at a 36 s fast tail: 577 at the new 4 h default deadline of
+    `--stage sepolia-dust` with a throwaway EVM leg, where the 24 h default gave 2,577 — about 9 days
+    of the maker's RXD at 300 s; a real token leg and the dry run keep 24 h. The smallest deadline it
+    accepts at the defaults is 9,702 s, so 2 h is refused; 4 h also leaves a fresh NFT/FT mint's two
+    confirmations of room before the run's coordinator is built. `eth_swap_grief_run.py`: 408 at its
+    new 3 h default deadline, which replaces 1,800 s; the smallest it accepts is 9,522 s). A resume reuses the recorded `t_rxd`, and the
+    derivation's fallback is the smallest feasible value, not the BIP68 maximum. On a resume the
+    `t_rxd` bounds' refusals no longer advise omitting `--t-rxd-blocks` or a "minimum" (omitting it
+    reuses the recorded value, and any other builds a covenant that holds nothing): the recovery file
+    records the inputs those bounds read (`negotiated_inputs`), and a resume that fails them names
+    each changed flag against its recorded value and says to restore it.
+  - NFT and FT swaps had no value at stake, so the coordinator refused them, and without
+    `--*-reuse-reveal-txid` the fresh mainnet mint ran first. `--value-at-risk-photons` (new, on
+    every script that builds a mainnet coordinator; `measure_margin_from_btc_block_times` takes
+    `value_at_risk_photons`) supplies it, and every runner builds its coordinator, with every
+    construction-time check, before the first mint, broadcast or funding prompt. A test drives each
+    runner through its own entry point and asserts that order.
+  - `dust_swap_run.py --stage dry-run` reported success on terms the broadcast stages refused, since
+    it never built the coordinator. It now builds the same one on offline transports and reports its
+    verdict; without `--rxd-block-interval-fast-s` it says that the broadcast stages need it. Its
+    seen-store is in memory, so it creates and modifies no state file beyond the recovery file and
+    report it always wrote.
+  - `eth_swap_grief_run.py` raised `AttributeError` building its terms (`asset_variant`).
+  - `eth_swap_two_host.py`'s taker phase called `taker_verify_asset_funding` without the wall clock
+    and printed its third value as "buried N conf(s)". It passes `now_unix_s` now and prints the
+    proved depth and the elapsed-blocks upper bound as what they are; a test derives every call into
+    the taker gate under `scripts/` and requires the clock on each.
 - **`ElectrumXClient.get_transaction_merkle` raised on real proofs.** It put every sibling hash
   into the first BUMP level, so every proof deeper than one level failed. This was measured on
   two HashMark transactions against both default servers ("Missing hash for index 3 at height
@@ -408,7 +479,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - on mainnet the proved depth must reach `k = max(6, burial, ceil(2 × value ÷ C))`. `C` is the
     photon cost of one forged confirmation: the block subsidy at the funding height (Radiant
     Core's `GetBlockSubsidy` and `nSubsidyHalvingInterval`, vendored and re-derived by a test) ×
-    the floor work ÷ the most work of any header checked or in the last checkpoint interval.
+    the floor work ÷ the most work of any header checked, in the last checkpoint interval, or in
+    the 144 headers each configured source serves ending at the tip height it reports (one
+    header-range read per operator, concurrent). A run counts only when each header meets its own
+    proof-of-work target and links to the one before, its last header is at that reported tip, and it
+    links to a header the gate verified, so it is on the proof's chain: real historical headers,
+    free to replay and far harder than recent ones on mainnet, are ignored. Those tip headers can
+    only raise `C`'s denominator: a source that serves none, easier ones, or ones that do not count
+    leaves `C` where the proof's own headers put it, and the result's `bound_note` says which sources
+    raised it, which did not, and which were ignored and why.
     `burial` is the swap's existing reorg burial, value-scaled; the value is the swap's own
     assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
     With no value to size `k` from, the lock is refused. Regtest runs the same proof against its
@@ -442,17 +521,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     quantile). `reported` is the largest depth any configured source reports, grouped by operator
     (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
     term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
-    `scripts/dust_swap_run.py` passes it. The `now` the gate judges is taken AFTER its reads:
+    `scripts/dust_swap_run.py` passes it. On mainnet a local clock behind the chain's median time is
+    refused with "the local clock appears to be behind the chain", rather than counted as no elapsed
+    time: `now` more than 300 s (`LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S`, one nominal spacing) before
+    the median time past of the newest verified headers. Within that tolerance a `now` before
+    `MTP(R)` gives `E = 0` and `bound_note` says so. The `now` the gate
+    judges is taken AFTER its reads:
     `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
     `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
-    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller;
-  - above dust, the funding's depth must be reported by two independent operators (a report is a
-    server's word — its verbose confirmations or its tip height — not a proof): on a
-    value-bearing network, when the value at stake exceeds `ElapsedBoundPolicy.dust_threshold_photons`
-    (1,000 RXD by default), the gate refuses the lock unless at least two operator groups
-    (`source_key`; the user's own node is its own group) report a depth for the funding, and the
-    refusal names how many answered and which. A source that cannot say which operator runs it is
-    not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
+    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller. The
+    lock-time re-run inside `taker_funds_btc` is judged by steps 6 and 7 on ITS OWN bound, at a
+    `now` taken after its reads, and refuses the lock when they fail: the re-run reads the chain
+    later than the gate, so its bound can be larger;
+  - above dust, two independent operators must report the funding transaction's depth (a
+    server's word, not a proof): on a value-bearing network, when the value at stake exceeds
+    `ElapsedBoundPolicy.dust_threshold_photons` (1,000 RXD by default), the gate refuses the lock
+    unless at least two operator groups (`source_key`; the user's own node is its own group) report
+    confirmations for the funding transaction itself — their verbose reply for its txid, which must
+    name that txid in its own `txid` field — and the refusal names how many answered and which. An operator that answers only its tip height (its
+    verbose read of the txid failed, as it does for a transaction the server does not know) is not
+    counted; its `tip - H + 1` can still raise the elapsed-depth bound, and the refusal and the
+    result's `bound_note` say it gave only a tip height (`RadiantChainIO.depth_reports`,
+    `MakerFundingEvidence.funding_tx_depths`, both new). A source that cannot say which operator
+    runs it is not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
     configured to ask fewer than two operators for such a swap, naming them. At or below dust one
     operator suffices and the result says so. pyrxd's shipped mainnet endpoints are two operators;
     the node-over-ssh scripts ask the node and those endpoints.

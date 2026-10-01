@@ -39,10 +39,19 @@ proved here, never a server's figure:
   at the pinned tag and a test re-derives these constants from them.
 * ``floor_work`` — the newest shipped checkpoint's header work ÷ 16, the floor the verifier enforces.
 * ``max_header_work`` — the MOST work any header carries, over every header the verifier checked
-  in this run AND the whole last checkpoint interval (linked between the two newest shipped
-  checkpoints). The maximum, because a higher real work makes the floor a smaller fraction of a real
-  block, i.e. a cheaper forgery and a smaller ``C``; including the checkpoint interval keeps a server
-  from lowering it by serving only easy headers above the checkpoint.
+  in this run, the whole last checkpoint interval (linked between the two newest shipped
+  checkpoints), AND each configured source's own newest headers
+  (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` ending at the tip height it reports; a run
+  counts only when every header in it meets its own proof-of-work target and links to the one before,
+  its last header is at that reported tip, and it links to a header this gate verified — so it is the
+  chain the proof is on, not headers mined somewhere else, such as real historical ones). The maximum,
+  because a higher real work makes the floor a smaller fraction of a real block, i.e. a cheaper
+  forgery and a smaller ``C``. The checkpoint interval keeps a server from lowering it by serving
+  only easy headers above the checkpoint; the other sources' tip headers keep the proof's server from
+  hiding the chain's recent difficulty by leaving the newest, harder headers out. A source can only
+  RAISE it (a hostile one can ask more of the funding, never less, and only with headers on the
+  verified chain); a source that serves no tip headers, or ones that do not count, leaves it at what
+  the proof's headers give, and the result's ``bound_note`` says which and why.
 
 ``burial`` is the swap's existing Radiant reorg burial (the policy's measured claim burial, raised by
 the value-scaled burial of :func:`pyrxd.gravity.swap_coordinator._value_scaled_burial_blocks`), and
@@ -69,6 +78,13 @@ used is::
 
 * ``R`` is the REFERENCE header: the one ``max(1, value_term)`` deep below the newest header served
   (the newest counting as 1). The blocks from the funding up to ``R`` are proved.
+* ``E`` is never negative, but a local clock behind the chain's median time is not clamped into a
+  fresh-looking tip: on a value-bearing network, ``now`` more than
+  :data:`LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S` (300 s) before the MEDIAN TIME PAST of the newest
+  verified headers (the :data:`MEDIAN_TIME_SPAN` ending at the newest header served) REFUSES, naming
+  the clock. A median, not the newest header's own timestamp, so one header's stamp does not decide
+  it. Within the tolerance ``now`` can still fall before ``MTP(R)``; ``E`` is then 0 and
+  ``bound_note`` says so.
 * ``MTP(R)`` is the reference time: the MEDIAN TIME PAST at ``R`` — the median of the timestamps of
   the :data:`MEDIAN_TIME_SPAN` (11) headers ending at ``R``, exactly as Radiant Core's
   ``CBlockIndex::GetMedianTimePast`` computes it (``tests/vendor/radiant_core/chain.h`` lines
@@ -88,8 +104,11 @@ used is::
   A report can only RAISE the bound; a source reporting less never lowers it. ABOVE DUST on a
   value-bearing network (a value at stake over ``ElapsedBoundPolicy.dust_threshold_photons``,
   1,000 RXD by default) the gate REFUSES unless at least :data:`MIN_REPORTING_OPERATORS` (two)
-  distinct operators report a depth for the funding — a source that cannot say which operator runs
-  it is not counted — and the refusal names how many answered and which. The coordinator refuses
+  distinct operators report the FUNDING TRANSACTION's depth — their verbose reply for its txid; a
+  source that answered only its tip height said nothing about the funding and is not counted (its
+  ``tip - H + 1`` may still raise the bound), nor is a source that cannot say which operator runs
+  it — and the refusal names how many answered and which. Such a report is a server's word, not a
+  proof. The coordinator refuses
   at construction, before anyone locks, a configuration with fewer operator groups than that. At
   or below dust one operator suffices: with one operator configured, the time term is what stands
   against a source that stops serving early, and the result says so. The user may move that
@@ -173,9 +192,9 @@ from pyrxd.glyph.mark_block import (
 from pyrxd.glyph.wave_rules import format_rxd
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
 from pyrxd.hash import hash256, radiant_block_hash
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.security.types import BlockHeight
-from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work
+from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work, verify_radiant_header_pow
 from pyrxd.spv.radiant_checkpoints import CHECKPOINTS, LAST_INTERVAL_MAX_WORK, NEWEST_CHECKPOINT_WORK
 from pyrxd.transaction.transaction import Transaction
 
@@ -183,6 +202,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FORGERY_COST_FACTOR",
+    "LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S",
     "LOCAL_DEVNET_CHAIN_IDS",
     "MAX_HEADERS_FROM_CHECKPOINT_SDK",
     "MEDIAN_TIME_SPAN",
@@ -199,6 +219,7 @@ __all__ = [
     "counted_operators",
     "early_elapsed_blocks_upper",
     "elapsed_blocks_upper_bound",
+    "erlang_upper_quantile_s",
     "forged_confirmation_cost_floor_photons",
     "funding_header_ranges",
     "median_time_past",
@@ -220,7 +241,8 @@ FORGERY_COST_FACTOR = 2
 
 #: Above the dust threshold (:attr:`ElapsedBoundPolicy.dust_threshold_photons`) on a value-bearing
 #: network, the fewest DISTINCT OPERATORS — operator groups, by
-#: :func:`pyrxd.network.source_identity.source_key` — that must report a depth for the funding.
+#: :func:`pyrxd.network.source_identity.source_key` — that must report the funding transaction's depth
+#: (:attr:`MakerFundingEvidence.funding_tx_depths`; a tip height alone does not count).
 MIN_REPORTING_OPERATORS = 2
 
 #: The prefix of the label a depth report carries when its source cannot say which operator runs it
@@ -237,6 +259,13 @@ MAX_HEADERS_FROM_CHECKPOINT_SDK = 20_160
 #: Radiant Core's ``CBlockIndex::nMedianTimeSpan`` (``tests/vendor/radiant_core/chain.h`` line 195):
 #: how many headers, ending at a block, its median time past is taken over. A test re-reads it.
 MEDIAN_TIME_SPAN = 11
+
+
+#: How far ``now`` may fall below the median time past of the newest verified headers before the gate
+#: refuses the local clock as behind the chain, in seconds: one nominal block spacing. Policy, not
+#: consensus; a clock below that median by more is one the elapsed-time term would otherwise clamp
+#: to zero.
+LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S = 5 * 60
 
 #: Radiant's nominal block spacing, ``consensus.nPowTargetSpacing`` (``chainparams.cpp`` line 117,
 #: ``5 * 60``, the same on every network), in seconds. A test re-reads it.
@@ -451,6 +480,67 @@ def poisson_upper_quantile(mean: float, epsilon: float) -> int:
     while hi - lo > 1:
         mid = (lo + hi) // 2
         if _log_poisson_tail(float(mean), mid) <= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def _log_poisson_lower_tail(mean: float, k: int) -> float:
+    """``log P(X <= k - 1)`` for ``X ~ Poisson(mean)``, ``mean > 0``, ``k >= 1`` — the probability that
+    fewer than ``k`` blocks arrive, i.e. that ``k`` blocks take LONGER than ``mean`` spacings.
+
+    Sums the ``k`` pmf terms from ``k - 1`` downward in scaled form (each the previous times
+    ``j ÷ mean``), starting from ``log pmf(k - 1)`` by ``lgamma``. Every term is summed — no truncated
+    remainder — so the only error is floating-point, which :data:`_QUANTILE_LOG_MARGIN` covers in
+    :func:`erlang_upper_quantile_s`; a test compares it against a 60-digit summation.
+    """
+    top = k - 1
+    log_first = -mean + top * math.log(mean) - math.lgamma(top + 1)
+    total = 1.0
+    term = 1.0
+    for j in range(top, 0, -1):
+        term *= j / mean
+        total += term
+    return log_first + math.log(total)
+
+
+def erlang_upper_quantile_s(blocks: int, *, spacing_s: int, epsilon: float) -> int:
+    """The smallest whole ``t`` seconds with ``P(T > t) <= epsilon``, where ``T`` is the time *blocks*
+    blocks take when they arrive as a Poisson process at one per *spacing_s* — never below the exact
+    value.
+
+    ``T`` is Erlang(``blocks``, ``spacing_s``): ``T > t`` exactly when fewer than ``blocks`` arrive in
+    ``t``, so ``P(T > t)`` is the Poisson lower tail at mean ``t ÷ spacing_s``
+    (:func:`_log_poisson_lower_tail`). ``t`` is accepted only when that computed log-tail is at least
+    :data:`_QUANTILE_LOG_MARGIN` below ``log epsilon`` (the same rule as :func:`poisson_upper_quantile`),
+    so the result is the exact quantile or a second or so above it. ``0`` for ``blocks == 0``.
+
+    Used by the construction-time projection of when the taker's gate can first accept the maker's
+    funding: ``blocks × spacing_s`` is the MEAN of ``T`` and an honest chain exceeds it about half the
+    time; this is the time an honest chain at the nominal rate exceeds with probability at most
+    ``epsilon``.
+    """
+    if not isinstance(blocks, int) or isinstance(blocks, bool) or blocks < 0:
+        raise ValidationError("blocks must be a non-negative int")
+    if not isinstance(spacing_s, int) or isinstance(spacing_s, bool) or spacing_s <= 0:
+        raise ValidationError("spacing_s must be a positive int")
+    if not (isinstance(epsilon, float) and 0 < epsilon < 1):
+        raise ValidationError("epsilon must be a float in (0, 1)")
+    if blocks == 0:
+        return 0
+    target = math.log(epsilon) - _QUANTILE_LOG_MARGIN
+
+    def accepted(t: int) -> bool:
+        return t > 0 and _log_poisson_lower_tail(t / spacing_s, blocks) <= target
+
+    # Invariant: `lo` is not accepted, `hi` is. Doubling from the mean finds an accepted `hi`.
+    lo, hi = 0, blocks * spacing_s
+    while not accepted(hi):
+        lo, hi = hi, hi * 2
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if accepted(mid):
             hi = mid
         else:
             lo = mid
@@ -738,8 +828,9 @@ def early_elapsed_blocks_upper(
     shipped last interval's own price, so this takes the MAXIMUM of that expression over every value
     term the two allow, with ``k = max(6, burial, v)`` as the gate computes it.
 
-    NOT COVERED, stated: a header served above the newest checkpoint carrying more than
-    ``early_work_margin`` times the shipped last interval's hardest (the gate's ``C`` then falls below
+    NOT COVERED, stated: a header served above the newest checkpoint — by the proof's server, or in
+    any source's tip headers — carrying more than ``early_work_margin`` times the shipped last
+    interval's hardest (the gate's ``C`` then falls below
     the floor used here, and its ``k`` and bound grow in proportion); a funding mined below the
     newest checkpoint (a covenant for terms agreed now is mined above it); and a chain whose blocks
     come slower than the nominal spacing by more than ``early_slack_s`` absorbs. In each case step 6
@@ -892,9 +983,21 @@ class MakerFundingEvidence:
     headers: Mapping[int, bytes]
     #: ``((source, depth), ...)``: the depth each configured source REPORTS for the funding (its
     #: verbose ``confirmations``, or its tip height minus the funding height plus one), keyed by the
-    #: source's operator group. Used to RAISE the elapsed upper bound, never as proof of depth, and
-    #: counted by operator for the rule above dust (:data:`MIN_REPORTING_OPERATORS`).
+    #: source's operator group. Used to RAISE the elapsed upper bound, never as proof of depth.
     reported_depths: tuple[tuple[str, int], ...] = ()
+    #: ``((source, confirmations), ...)``: the confirmations each source reports for the funding
+    #: TRANSACTION ITSELF — its verbose reply for this txid — keyed by operator group. Only these count
+    #: toward the rule above dust (:data:`MIN_REPORTING_OPERATORS`): a source that answered only its
+    #: tip height said nothing about this transaction, so it may raise the bound (through
+    #: ``reported_depths``) but is not an operator reporting the funding.
+    funding_tx_depths: tuple[tuple[str, int], ...] = ()
+    #: ``((source, start_height, headers, reported_tip), ...)``: the headers each source served ending
+    #: at the tip height it reported (:data:`pyrxd.gravity.radiant_leg.TIP_HEADERS_FOR_WORK` of them).
+    #: A run counts only when its headers each meet their own proof-of-work target and link to one
+    #: another, it is linked to a header this gate verified (see :func:`_tip_run_max_work`), and its
+    #: last header is at ``reported_tip``; a counted run RAISES ``max_header_work`` to its hardest
+    #: header. It can never lower anything, and a run that does not count is ignored and named.
+    operator_tip_headers: tuple[tuple[str, int, tuple[bytes, ...], int], ...] = ()
     #: The operator groups the leg was configured to ask (whether or not they answered), for a
     #: refusal to name. Not evidence of anything.
     configured_operators: tuple[str, ...] = ()
@@ -920,6 +1023,9 @@ class VerifiedMakerFunding:
     subsidy_photons: int
     floor_work: int
     max_header_work: int
+    #: ``((source, work), ...)``: the hardest header in each source's tip headers, or ``None`` where
+    #: they did not count (ignored; ``bound_note`` says why). ``max_header_work`` is at least each.
+    operator_tip_work: tuple[tuple[str, int | None], ...]
     #: The most work in the last checkpoint interval, as linked in this run (``None`` with one
     #: checkpoint). The shipped table records the same number for the negotiation-time check.
     last_interval_max_work: int | None
@@ -941,7 +1047,8 @@ class VerifiedMakerFunding:
     #: The largest depth each operator group reported, and the largest of them (``None``: no report).
     reported_by_operator: tuple[tuple[str, int], ...]
     reported_depth: int | None
-    #: The distinct operators counted as having reported a depth (:func:`counted_operators`), and how
+    #: The distinct operators counted as having reported the funding transaction's depth
+    #: (:attr:`MakerFundingEvidence.funding_tx_depths`, through :func:`counted_operators`), and how
     #: many this swap required: :data:`MIN_REPORTING_OPERATORS` above dust on a value-bearing
     #: network, else 0.
     reporting_operators: tuple[str, ...]
@@ -993,6 +1100,58 @@ def counted_operators(labels: Sequence[str]) -> tuple[str, ...]:
     """The distinct operator groups among *labels* that count toward :data:`MIN_REPORTING_OPERATORS`:
     every label but an unidentified source's (:data:`UNIDENTIFIED_SOURCE_PREFIX`), each once."""
     return tuple(dict.fromkeys(str(k) for k in labels if not str(k).startswith(UNIDENTIFIED_SOURCE_PREFIX)))
+
+
+#: Why a source's tip headers were ignored, as :func:`_tip_run_max_work` reports it.
+TIP_RUN_UNVERIFIED = "did not verify (a header failed its own proof-of-work, or they did not link to one another)"
+TIP_RUN_NOT_AT_TIP = "did not end at the tip height the source reported"
+TIP_RUN_UNANCHORED = "did not link to a header this gate verified"
+
+
+def _tip_run_max_work(run: Any, pow_limit: int, *, verified: Mapping[int, str]) -> tuple[str, int | None, str] | None:
+    """``(source, hardest work, "")`` for one source's tip headers that COUNT, ``(source, None, why)``
+    for a run that does not, or ``None`` for an entry that is not ``(source, start, headers, tip)``.
+
+    A run counts when (1) every header meets its own proof-of-work target and links to the one before,
+    (2) its heights are ``start .. start + len - 1`` and the last is the ``tip`` the source reported, and
+    (3) it is ANCHORED to the chain this gate proved: *verified* maps heights to the hashes of headers
+    the gate verified (linked to a checkpoint), and either the run's first header names the verified
+    header at ``start - 1`` as its parent or one of its headers IS the verified header at its height.
+    Linked header to header, that pins every header in the run to the verified chain.
+
+    Without (3) a run proves only that its headers were mined SOMEWHERE: real historical headers are
+    free to replay and can be far harder than the recent ones, so an unanchored run labelled as a tip
+    could raise ``max_header_work`` — and ``k`` — at no cost to whoever served it."""
+    if not (isinstance(run, (tuple, list)) and len(run) == 4):
+        return None
+    label, start, headers, tip = run
+    label = str(label)
+    if not isinstance(headers, (tuple, list)) or not headers:
+        return (label, None, TIP_RUN_UNVERIFIED)
+    for v in (start, tip):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            return (label, None, TIP_RUN_NOT_AT_TIP)
+    if start + len(headers) - 1 != tip:
+        return (label, None, TIP_RUN_NOT_AT_TIP)
+    try:
+        best = 0
+        below: str | None = None
+        hashes: list[str] = []
+        for hdr in headers:
+            raw = bytes(hdr)
+            block_hash = verify_radiant_header_pow(raw, pow_limit=pow_limit)
+            if below is not None and radiant_header_prev_hash(raw) != below:
+                return (label, None, TIP_RUN_UNVERIFIED)
+            below = block_hash
+            hashes.append(block_hash)
+            best = max(best, radiant_header_work(raw, pow_limit=pow_limit))
+        parent = radiant_header_prev_hash(bytes(headers[0]))
+    except (TypeError, ValueError, ValidationError, SpvVerificationError):
+        return (label, None, TIP_RUN_UNVERIFIED)
+    anchored = verified.get(start - 1) == parent or any(verified.get(start + i) == h for i, h in enumerate(hashes))
+    if not anchored:
+        return (label, None, TIP_RUN_UNANCHORED)
+    return (label, best, "")
 
 
 def verify_maker_funding(
@@ -1129,6 +1288,54 @@ def verify_maker_funding(
             rule,
             f"the funding in block {height}, at least {proved} deep",
         ) from None
+    # The chain's RECENT difficulty, as every source sees it. The headers above were chosen by the
+    # proof's server, which could leave out real recent headers harder than any it served — a smaller
+    # max_header_work, a larger C, a smaller k. Each source's own tip headers (the newest
+    # TIP_HEADERS_FOR_WORK it serves, ending at the tip it reported) are folded in when they count:
+    # each meets its own proof-of-work target and links to the one before, the last is at the reported
+    # tip, and the run links to a header verified above (`_tip_run_max_work`). They can only RAISE
+    # max_work, so a source serving easier headers, or none, or headers that do not count, changes
+    # nothing — the gate is then exactly what the proof's headers alone give, and bound_note says so.
+    # A hostile source can raise it only with headers on the verified chain — real recent work — which
+    # only asks more of the funding (a larger k), never less. Unanchored, real HISTORICAL headers
+    # (free to replay, and far harder than recent ones on mainnet) were accepted as a tip run.
+    served_max_work = max_work
+    tip_work: list[tuple[str, int | None]] = []
+    ignored: dict[str, list[str]] = {}
+    runs = evidence.operator_tip_headers if isinstance(evidence.operator_tip_headers, (tuple, list)) else ()
+    # The headers this gate verified so far, by height — each linked to a checkpoint (and, above the
+    # newest, proof-of-work checked). A tip run counts only when it links to one of them.
+    verified_hashes = {h: radiant_block_hash(bytes(headers[h])) for h in verified_heights}
+    for run in runs:
+        got = _tip_run_max_work(run, chain.pow_limit, verified=verified_hashes)
+        if got is None:
+            continue
+        label, work, why_ignored = got
+        tip_work.append((label, work))
+        if work is None:
+            ignored.setdefault(why_ignored, []).append(label)
+        elif work > max_work:
+            max_work = work
+    raisers = [k for k, w in tip_work if w is not None and w == max_work and w > served_max_work]
+    if not tip_work:
+        work_part = (
+            "no source served its tip headers, so max header work is from the proof's headers and the last "
+            "checkpoint interval alone"
+        )
+    elif raisers:
+        work_part = f"max header work {_log2(max_work)} raised by the tip headers of {', '.join(raisers)}"
+    elif any(w is not None for _k, w in tip_work):
+        work_part = (
+            f"max header work {_log2(max_work)}; the tip headers of "
+            f"{', '.join(k for k, w in tip_work if w is not None)} did not raise it"
+        )
+    else:
+        work_part = (
+            f"max header work {_log2(max_work)}, from the proof's headers and the last checkpoint interval "
+            "alone: no source's tip headers counted"
+        )
+    for why_ignored, labels in ignored.items():
+        work_part += f"; the tip headers of {', '.join(labels)} {why_ignored}, and were ignored"
     subsidy = block_subsidy_photons(height, chain)
     cost = subsidy * floor_work // max_work if max_work > 0 else 0
 
@@ -1142,9 +1349,10 @@ def verify_maker_funding(
         )
     except MakerFundingNotVerified as exc:
         raise refuse(str(exc), rule, f"the funding in block {height}, at least {proved} deep") from None
+    raised_by = f", raised by the tip headers of {', '.join(raisers)}" if raisers else ""
     pricing = (
         f"C = {cost} photons (subsidy {subsidy} at block {height} × floor work {_log2(floor_work)} ÷ max header "
-        f"work {_log2(max_work)})"
+        f"work {_log2(max_work)}{raised_by})"
     )
     if chain.value_bearing:
         why = (
@@ -1217,6 +1425,7 @@ def verify_maker_funding(
         want = radiant_header_prev_hash(bytes(below_hdr))
     mtp = median_time_past([_header_time(bytes(headers[h])) for h in range(window_lo, ref_h + 1)])
     eps = bound_policy.epsilon(value_at_stake_photons)
+    clock_note = ""
     if now_unix_s is None:
         if chain.value_bearing:
             raise refuse(
@@ -1229,15 +1438,52 @@ def verify_maker_funding(
         elapsed_s: int | None = None
         time_blocks: int | None = None
     else:
+        # A SLOW LOCAL CLOCK. `E = now - MTP(R)` counted as zero whenever `now` fell before the
+        # reference time, so a clock hours behind made a stale tip look fresh and shrank the bound to
+        # the proved depth. A local clock behind the chain's median time is refused, not clamped: the
+        # median time past of the newest headers this gate verified (each linked to a checkpoint, and
+        # proof-of-work checked above the newest), less a small tolerance. A median rather than the
+        # newest header's own timestamp, so one header's stamp does not refuse an honest clock. Within
+        # the tolerance `now` can still fall before MTP(R), and the note says when it did. On a
+        # value-bearing network only: a test network has no value to protect, its clock is optional
+        # here, and regtest chains (the fixtures', and a node run with -mocktime) are routinely stamped
+        # far from the wall clock.
+        linked = verified_heights | set(range(window_lo, ref_h + 1))
+        tip_window = []
+        for h in range(top, max(-1, top - MEDIAN_TIME_SPAN), -1):
+            if h not in linked:
+                break
+            tip_window.append(h)
+        tip_mtp = median_time_past([_header_time(bytes(headers[h])) for h in tip_window])
+        if chain.value_bearing and now_unix_s < tip_mtp - LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S:
+            raise refuse(
+                f"the local clock appears to be behind the chain: now_unix_s {now_unix_s} is "
+                f"{tip_mtp - now_unix_s} s before the median time past of the newest verified headers "
+                f"(blocks {tip_window[-1]} to {top}), more than the {LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S} s "
+                "tolerance, so the time since the reference header cannot be counted. Correct the system "
+                "clock and retry",
+                "a wall clock no further behind the chain's median time than that",
+                f"the funding in block {height}, {proved} deep",
+            )
         elapsed_s = max(0, now_unix_s - mtp)
+        if now_unix_s < mtp:
+            clock_note = (
+                f"; the local clock is {mtp - now_unix_s} s before the reference time (within the "
+                f"{LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S} s tolerance of the chain's median time), so E was "
+                "taken as 0"
+            )
         time_blocks = bound_policy.blocks_upper(
             elapsed_s, spacing_s=int(chain.target_spacing_s), value_at_stake_photons=value_at_stake_photons
         )
-    by_operator = _reported_by_operator(evidence.reported_depths)
+    tx_reports = _reported_by_operator(evidence.funding_tx_depths)
+    by_operator = _reported_by_operator(tuple(evidence.reported_depths or ()) + tuple(tx_reports))
     reported = max((d for _k, d in by_operator), default=None)
-    # Above dust on a value-bearing network, the report term must come from at least two distinct
-    # operators: a depth reported by one operator group alone is not enough to lock against.
-    answered = counted_operators([k for k, d in by_operator if d >= 1])
+    # Above dust on a value-bearing network, at least two distinct operators must report the FUNDING
+    # TRANSACTION's depth: a depth reported by one operator group alone is not enough to lock against,
+    # and a source that answered only its tip height (a failed or absent verbose read of this txid)
+    # said nothing about the funding — it may raise the bound above, never count here.
+    answered = counted_operators([k for k, d in tx_reports if d >= 1])
+    tip_only = tuple(k for k, _d in by_operator if k not in {t for t, d in tx_reports if d >= 1})
     needed = bound_policy.requires_operators(chain, value_at_stake_photons)
     if len(answered) < needed:
         configured = (
@@ -1248,13 +1494,19 @@ def verify_maker_funding(
         silent = [c for c in counted_operators(configured) if c not in answered]
         raise refuse(
             f"the value at stake ({value_at_stake_photons} photons) is above the dust threshold "
-            f"({bound_policy.single_operator_threshold_photons} photons), so the funding's depth must be reported by at "
-            f"least {needed} distinct operators; {len(answered)} answered"
+            f"({bound_policy.single_operator_threshold_photons} photons), so the funding transaction's depth must be "
+            f"reported by at least {needed} distinct operators; {len(answered)} answered"
             + (f" ({', '.join(answered)})" if answered else "")
             + (f", and {', '.join(silent)} did not" if silent else "")
+            + (
+                f" ({', '.join(t for t in tip_only if t in silent)} gave only a tip height, which is not a "
+                "report of the funding transaction)"
+                if any(t in silent for t in tip_only)
+                else ""
+            )
             + ". Configure a depth source run by another operator (RadiantChainIO(..., depth_sources=...)) "
             "and retry" + bound_policy.single_operator_refusal_hint(),
-            f"depth reports from {needed} distinct operators",
+            f"reports of the funding transaction's depth from {needed} distinct operators",
             f"the funding in block {height}, {proved} deep; "
             + (", ".join(f"{k} {d}" for k, d in by_operator) if by_operator else "no depth reports"),
         )
@@ -1279,6 +1531,7 @@ def verify_maker_funding(
         "no source reported a depth"
         if not by_operator
         else f"reports from {ops} operator{'s' if ops != 1 else ''} ({', '.join(f'{k} {d}' for k, d in by_operator)})"
+        + (f", of which {', '.join(tip_only)} gave only a tip height" if tip_only else "")
     )
     one_op = (
         "; with one operator configured, the time term is what stands against a source that stops serving early"
@@ -1286,7 +1539,10 @@ def verify_maker_funding(
         else ""
     )
     if needed:
-        rule_part = f"; {len(answered)} distinct operators reported, {needed} required above the dust threshold"
+        rule_part = (
+            f"; {len(answered)} distinct operators reported the funding transaction, {needed} required above the "
+            "dust threshold"
+        )
     elif chain.value_bearing:
         rule_part = (
             f"; the value at stake is at or below the dust threshold ({bound_policy.single_operator_threshold_photons} "
@@ -1306,7 +1562,10 @@ def verify_maker_funding(
                 override,
                 "unknown" if value_at_stake_photons is None else format_rxd(value_at_stake_photons),
             )
-    note = f"the {term} term set the bound at {upper}: {time_part}; {report_part}; proved {proved}{one_op}{rule_part}"
+    note = (
+        f"the {term} term set the bound at {upper}: {time_part}{clock_note}; {report_part}; proved {proved}"
+        f"{one_op}{rule_part}; {work_part}"
+    )
 
     return VerifiedMakerFunding(
         outpoint=f"{txid}:{vout}",
@@ -1322,6 +1581,7 @@ def verify_maker_funding(
         subsidy_photons=subsidy,
         floor_work=floor_work,
         max_header_work=max_work,
+        operator_tip_work=tuple(tip_work),
         last_interval_max_work=interval_max,
         elapsed_blocks_upper=upper,
         bound_term=term,

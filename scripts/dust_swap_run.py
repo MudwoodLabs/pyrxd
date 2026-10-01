@@ -9,9 +9,10 @@ It DELIBERATELY crosses the audit gate (operator accepts dust loss). The externa
 remains the hard gate for any product claim. Use ONLY for a capped, supervised run.
 
 Staging (--stage), each gating the next (see docs/plans/2026-05-26-...-dust-mainnet-trade-plan.md):
-  dry-run : build the real txs + read-only sanity, NO broadcast. (Honest: mempool.space
-            has no testmempoolaccept, so the BTC leg gets no consensus rehearsal here —
-            signet is that.)
+  dry-run : build the real txs AND the swap coordinator the broadcast stages build (every
+            construction-time check, on offline transports) and report its verdict; NO
+            broadcast. (Honest: mempool.space has no testmempoolaccept, so the BTC leg gets no
+            consensus rehearsal here — signet is that.)
   signet  : real BTC SIGNET (free faucet) ↔ RXD mainnet. First end-to-end run of the new
             broadcaster + the P-SAFE-2 txid serializer + live conf reads against real
             Bitcoin. MANDATORY before any mainnet BTC.
@@ -73,18 +74,22 @@ from pyrxd.security.types import Hex20, Txid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
     CapturingBroadcaster,
+    OfflineBtcTransport,
+    OfflineRadiantClient,
     SshTrFeeSource,
     StepReport,
     add_rxd_node_args,
     add_single_operator_override_arg,
+    add_value_at_risk_arg,
     atomic_write_mode_600,
     confirm,
     covenant_fund_height,
     derive_counter_timelock,
-    elapsed_reserve_blocks,
     funding_bound_from_args,
+    gate_elapsed_reserve_blocks,
     measured_margin_from_mainnet,
     merge_into_mode_600,
+    preflight_coordinator,
     require_rxd_node_args,
     rxd_blockcount,
     validated_resume_deadline_s,
@@ -100,6 +105,10 @@ _STAGES = {
 }
 _MAINNET_BTC_API = "https://mempool.space/api"
 
+#: The Radiant leg's ``min_confirmations``: one constant, because the taker gate's burial (and so the
+#: reserve below) reads it from the leg.
+_RXD_MIN_CONFIRMATIONS = 1
+
 
 # Helpers (CapturingBroadcaster, SshTrFeeSource, StepReport, confirm,
 # atomic_write_mode_600, rxd_blockcount, measured_margin_from_mainnet) live in
@@ -108,6 +117,83 @@ _MAINNET_BTC_API = "https://mempool.space/api"
 
 
 # --------------------------------------------------------------------------- the run
+
+
+def _build_coordinator(
+    args: argparse.Namespace,
+    *,
+    terms: NegotiatedTerms,
+    config: CoordinatorConfig,
+    btc_network: str,
+    taker_btc_kp,
+    claim_xo: bytes,
+    maker_btc,
+    taker_pkh: bytes,
+    maker_pkh: bytes,
+    funding_utxo: BtcUtxo,
+    claim_to: bytes,
+    refund_to: bytes,
+    btc_broadcaster,
+    btc_reader,
+    rxd_client,
+    audit_cleared: bool,
+    seen_store_path: str | None = None,
+) -> SwapCoordinator:
+    """The run's coordinator and both legs — ONE wiring, used for the preflight (before anything is
+    funded, with a placeholder BTC UTXO), for the dry run's verdict (offline transports) and for the
+    run itself. *seen_store_path* overrides where the durable H-freshness store lives: the dry run
+    passes ``":memory:"`` so it creates and modifies no state file."""
+    btc_leg = BitcoinTaprootLeg(
+        network=btc_network,
+        taker_keypair=taker_btc_kp,
+        funding_utxo=funding_utxo,
+        maker_claim_pubkey_xonly=claim_xo,
+        broadcaster=btc_broadcaster,
+        funding_reader=btc_reader,
+        refund_to_scriptpubkey=refund_to,
+        claim_to_scriptpubkey=claim_to,
+        # FundingPolicy groups the operational knobs: fee, conf depth, input type, AND
+        # the post-broadcast readback poll. The poll is the bug-1 fix — on mainnet the
+        # just-broadcast HTLC funding tx is 0-conf when fund() reads back its amount,
+        # so we wait up to fund_confirm_timeout_s instead of failing instantly.
+        policy=FundingPolicy(
+            fee_sats=args.btc_fee_sats,
+            min_confirmations=1,
+            funding_input_type="p2wpkh",
+            fund_confirm_poll_s=args.poll_interval_s,
+            fund_confirm_timeout_s=args.fund_confirm_timeout_s,
+        ),
+        maker_claim_privkey=maker_btc.secret,
+        audit_cleared=audit_cleared,
+    )
+    rxd_leg = RadiantCovenantLeg(
+        network=SshTrRadiantClient.NETWORK,
+        taker_pkh=taker_pkh,
+        maker_pkh=maker_pkh,
+        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
+        fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
+        min_confirmations=_RXD_MIN_CONFIRMATIONS,
+        audit_cleared=audit_cleared,
+    )
+    return SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        btc_leg=btc_leg,
+        radiant_leg=rxd_leg,
+        indexer=None,
+        # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
+        # so the SEEN-1 replay/free-option reservation survives a restart or a second
+        # process (durable-by-default; no accept_nondurable_seen opt-in needed).
+        seen_store=DurableSeenStore(
+            seen_store_path if seen_store_path is not None else str(Path(args.keys_out).expanduser()) + ".seen.sqlite"
+        ),
+        config=config,
+    )
+
+
+def _placeholder_utxo(value_sats: int) -> BtcUtxo:
+    """The BTC UTXO the preflight coordinator is built with before the real one exists. No
+    construction-time check reads it; the real UTXO replaces it before anything is funded."""
+    return BtcUtxo(txid="00" * 32, vout=0, value=int(value_sats))
 
 
 async def run_dust_swap(args: argparse.Namespace) -> None:
@@ -130,10 +216,10 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
             f"--rxd-network={args.rxd_network!r} cannot override the RXD transport's network "
             f"({rxd_network!r}, mainnet); the SshTr shim only targets the mainnet node — use --rxd-network bc"
         )
-    btc_claim_payout = bytes.fromhex(args.btc_claim_payout)
-    btc_refund_payout = bytes.fromhex(args.btc_refund_payout)
-
-    policy, provenance = await measured_margin_from_mainnet(args)
+    # A dry run builds the coordinator the broadcast stages build, so it needs what they need; a
+    # missing fast tail is reported as its verdict.
+    policy, provenance = await measured_margin_from_mainnet(args, dry_run=not do_broadcast)
+    config = CoordinatorConfig(margin_policy=policy, funding_bound=funding_bound_from_args(args))
     report = StepReport(args.stage, provenance)
     print(f"  measured margin: {json.dumps(provenance)}")
 
@@ -152,14 +238,16 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
             margin_blocks=margin_blocks,
             rxd_block_interval_s=policy.rxd_block_interval_s,
             btc_block_interval_s=policy.block_interval_s,
-            # COUPLED to the depth the taker must wait (step 5) before the gate re-runs at
-            # step 7 with elapsed_blocks=cov_confs. A flat constant refused any measured
-            # burial above it, blaming the maker's terms. RADIANT interval: this is a
-            # Radiant-chain quantity, and policy.block_interval_s is the Bitcoin one.
-            elapsed_reserve_blocks=elapsed_reserve_blocks(
-                rxd_claim_burial_blocks=policy.rxd_claim_burial.normalize_to(
-                    bt.TimeUnit.BLOCKS, block_interval_s=policy.rxd_block_interval_s
-                ).value
+            # THE TAKER GATE'S OWN MODEL of the blocks that can elapse before the taker locks: the
+            # coordinator subtracts it from t_rxd before it judges the ordering (pre_btc_lock_check
+            # steps 6 and 7, and its negotiation-time check at construction). The flat 12-block
+            # reserve this replaced gave terms that check refused at every --t-rxd-blocks.
+            elapsed_reserve_blocks=gate_elapsed_reserve_blocks(
+                policy=policy,
+                # What the coordinator will assess: the covenant amount, or more by the flag.
+                value_at_stake_photons=max(args.rxd_photons, args.value_at_risk_photons or 0),
+                funding_bound=config.funding_bound,
+                radiant_min_confirmations=_RXD_MIN_CONFIRMATIONS,
             ),
         ),
         bt.TimeUnit.BLOCKS,
@@ -252,8 +340,46 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     print(f"  BTC HTLC funding address ({btc_network}): {htlc.address}")
     print(f"  RXD covenant SPK (fund this as the maker): {cov.funded_spk.hex()}")
 
+    coordinator_kw = dict(
+        # The payouts are required for the broadcast stages (_parse_args); a dry run may omit them,
+        # and no construction-time check reads them, so it is handed an empty script in their place.
+        claim_to=bytes.fromhex(args.btc_claim_payout),
+        refund_to=bytes.fromhex(args.btc_refund_payout),
+        terms=terms,
+        config=config,
+        btc_network=btc_network,
+        taker_btc_kp=taker_btc_kp,
+        claim_xo=claim_xo,
+        maker_btc=maker_btc,
+        taker_pkh=taker_pkh,
+        maker_pkh=maker_pkh,
+        audit_cleared=audit_cleared,
+    )
     if not do_broadcast:
-        # dry-run: build the txs, report the addresses/terms, stop before any broadcast.
+        # dry-run: build the txs AND the coordinator the broadcast stages build — every
+        # construction-time check, the taker gate's room check included — on offline transports,
+        # report its verdict, stop before any broadcast. It used to stop at the txs, and so reported
+        # success on terms the real stage refused.
+        offline = OfflineBtcTransport()
+        try:
+            preflight_coordinator(
+                lambda: _build_coordinator(
+                    args,
+                    funding_utxo=_placeholder_utxo(args.btc_sats + args.btc_fee_sats),
+                    btc_broadcaster=offline,
+                    btc_reader=offline,
+                    rxd_client=OfflineRadiantClient(),
+                    # The same durable store type, in memory: a dry run creates and modifies no state
+                    # file (it created `<keys-out>.seen.sqlite`).
+                    seen_store_path=":memory:",
+                    **coordinator_kw,
+                ),
+                before="anything is broadcast (DRY-RUN verdict: the signet and dust stages would refuse it)",
+            )
+        except SystemExit as exc:
+            report.step(name="dry_run_refused", chain="both", reason=str(exc), t_btc=t_btc.value, t_rxd=t_rxd.value)
+            report.dump(args.report_out)
+            raise
         report.step(
             name="dry_run_built",
             chain="both",
@@ -264,7 +390,8 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         )
         report.dump(args.report_out)
         print(
-            "\n  DRY-RUN complete: real txs are buildable; nothing broadcast. "
+            "\n  DRY-RUN complete: real txs are buildable and the swap coordinator accepts these terms "
+            "(every construction-time check, the taker gate's room check included); nothing broadcast. "
             "Next: SIGNET stage for the first real BTC consensus check."
         )
         return
@@ -276,63 +403,29 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     btc_chain_reader = MempoolSpaceSource(base_url=stage["btc_base_url"])  # to fetch the maker claim tx
     rxd_client = SshTrRadiantClient(ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=args.rxd_wallet)
     rxd_client.register_spk(cov.funded_spk)
-
-    print(f"\n  Fund the taker BTC address from your {btc_network} wallet (amount + fee), 1 conf:")
-    print(f"    {taker_btc_kp.p2wpkh_address}")
-    confirm(f"look up the funding UTXO at {taker_btc_kp.p2wpkh_address}", auto_yes=args.yes)
-    utxos = await btc_reader.list_address_utxos(taker_btc_kp.p2wpkh_address)
+    transports = dict(btc_broadcaster=btc_broadcaster, btc_reader=btc_reader, rxd_client=rxd_client)
     need = args.btc_sats + args.btc_fee_sats
-    confirmed = [u for u in utxos if u["confirmed"] and u["value_sats"] >= need]
-    if not confirmed:
-        raise SystemExit(f"no confirmed funding UTXO >= {need} sats at the taker address yet")
-    fu = confirmed[0]
-    funding_utxo = BtcUtxo(txid=fu["txid"], vout=fu["vout"], value=fu["value_sats"])
-
-    btc_leg = BitcoinTaprootLeg(
-        network=btc_network,
-        taker_keypair=taker_btc_kp,
-        funding_utxo=funding_utxo,
-        maker_claim_pubkey_xonly=claim_xo,
-        broadcaster=btc_broadcaster,
-        funding_reader=btc_reader,
-        refund_to_scriptpubkey=btc_refund_payout,
-        claim_to_scriptpubkey=btc_claim_payout,
-        # FundingPolicy groups the operational knobs: fee, conf depth, input type, AND
-        # the post-broadcast readback poll. The poll is the bug-1 fix — on mainnet the
-        # just-broadcast HTLC funding tx is 0-conf when fund() reads back its amount,
-        # so we wait up to fund_confirm_timeout_s instead of failing instantly.
-        policy=FundingPolicy(
-            fee_sats=args.btc_fee_sats,
-            min_confirmations=1,
-            funding_input_type="p2wpkh",
-            fund_confirm_poll_s=args.poll_interval_s,
-            fund_confirm_timeout_s=args.fund_confirm_timeout_s,
-        ),
-        maker_claim_privkey=maker_btc.secret,
-        audit_cleared=audit_cleared,
-    )
-    rxd_leg = RadiantCovenantLeg(
-        network=rxd_network,
-        taker_pkh=taker_pkh,
-        maker_pkh=maker_pkh,
-        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
-        fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
-        min_confirmations=1,
-        audit_cleared=audit_cleared,
-    )
-    coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
-        btc_leg=btc_leg,
-        radiant_leg=rxd_leg,
-        indexer=None,
-        # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
-        # so the SEEN-1 replay/free-option reservation survives a restart or a second
-        # process (durable-by-default; no accept_nondurable_seen opt-in needed).
-        seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=policy, funding_bound=funding_bound_from_args(args)),
-    )
 
     try:
+        # 0. THE COORDINATOR FIRST — every construction-time check, before anyone funds anything.
+        #    It used to be built after the BTC funding lookup, so terms it refuses were discovered
+        #    only after the operator had funded the taker address.
+        preflight_coordinator(
+            lambda: _build_coordinator(args, funding_utxo=_placeholder_utxo(need), **transports, **coordinator_kw),
+            before="you fund anything",
+        )
+
+        print(f"\n  Fund the taker BTC address from your {btc_network} wallet (amount + fee), 1 conf:")
+        print(f"    {taker_btc_kp.p2wpkh_address}")
+        confirm(f"look up the funding UTXO at {taker_btc_kp.p2wpkh_address}", auto_yes=args.yes)
+        utxos = await btc_reader.list_address_utxos(taker_btc_kp.p2wpkh_address)
+        confirmed = [u for u in utxos if u["confirmed"] and u["value_sats"] >= need]
+        if not confirmed:
+            raise SystemExit(f"no confirmed funding UTXO >= {need} sats at the taker address yet")
+        fu = confirmed[0]
+        funding_utxo = BtcUtxo(txid=fu["txid"], vout=fu["vout"], value=fu["value_sats"])
+        coord = _build_coordinator(args, funding_utxo=funding_utxo, **transports, **coordinator_kw)
+
         # 1. MAKER LOCKS THE RXD COVENANT FIRST. The maker is the party that knows p, so a maker
         #    that locks SECOND holds a free option: watch the taker fund, then walk away having
         #    risked nothing. HZ-1 (#392) enforces it from the other side — taker_funds_btc refuses
@@ -521,7 +614,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     ap.add_argument("--btc-claim-payout", default="", help="scriptPubKey hex the maker's BTC claim pays out to")
     ap.add_argument("--btc-refund-payout", default="", help="scriptPubKey hex the taker's BTC refund pays out to")
-    ap.add_argument("--t-rxd-blocks", type=int, default=20)
+    # The taker gate reserves its own model of the blocks that can elapse before the taker locks (about
+    # 80 at dust value) before t_btc gets any of t_rxd, so t_rxd must hold that AND the margin. 87 was
+    # the smallest that constructed with the 2026-09-30 probe's BTC sample; 120 leaves room for a
+    # wider measured margin. Too short is refused before anything is funded, saying how many short.
+    ap.add_argument("--t-rxd-blocks", type=int, default=120)
     ap.add_argument("--rxd-network", default="bc", help="RXD audit-gate network tag")
     ap.add_argument("--rxd-wallet", default="", help="RXD wallet name on your node; empty = the single loaded wallet")
     add_rxd_node_args(ap)
@@ -540,6 +637,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     add_single_operator_override_arg(ap)
+    add_value_at_risk_arg(ap)
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
     ap.add_argument(
         "--resume-deadline-s",

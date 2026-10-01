@@ -58,7 +58,7 @@ from pyrxd.gravity.funding_spv import (
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
-from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
+from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator, taker_gate_early_bound
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.hash import radiant_block_hash
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
@@ -152,7 +152,8 @@ def _two_operators(ev):
     """*ev* with the funding's depth reported honestly (the served tip) by two distinct operators —
     what the gate requires above dust on a value-bearing network."""
     depth = max(ev.headers) - ev.height + 1
-    return dataclasses.replace(ev, reported_depths=tuple((str(k), depth) for k in _SHIPPED_OPERATORS[:2]))
+    reports = tuple((str(k), depth) for k in _SHIPPED_OPERATORS[:2])
+    return dataclasses.replace(ev, reported_depths=reports, funding_tx_depths=reports)
 
 
 class _ChainView:
@@ -217,7 +218,7 @@ class _DepthReader:
         self._view = view
 
     async def get_transaction_verbose(self, txid):
-        return {"confirmations": self._view.confs}
+        return {"txid": txid, "confirmations": self._view.confs}
 
 
 def _real_leg(view, *, network: str, min_confirmations: int = 1, depth_sources=None) -> RadiantCovenantLeg:
@@ -437,7 +438,9 @@ async def test_honest_regtest_funding_verifies_and_the_lock_proceeds():
 async def test_honest_value_bearing_funding_verifies_and_the_lock_proceeds(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _vb_terms(400)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     coord, _btc_view = _btc_coord(
         terms,
         _real_leg(view, network="bc"),
@@ -464,7 +467,9 @@ async def test_a_value_bearing_policy_without_the_fast_tail_is_refused_at_constr
 
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _vb_terms(400)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     no_tail = MarginPolicy.estimated(accept_flat_burial=True)
     for role in (None, SwapRole.TAKER, SwapRole.MAKER):
         with pytest.raises(
@@ -759,6 +764,106 @@ def test_the_median_time_rule_and_spacing_are_derived_from_the_vendored_radiant_
     assert median_time_past(list(range(11, 0, -1))) == 6
     with pytest.raises(ValidationError):
         median_time_past(list(range(12)))
+
+
+def test_the_local_clock_tolerance_is_one_nominal_block_spacing():
+    """``LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S`` is policy, stated: one nominal spacing (300 s)."""
+    assert funding_spv.LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S == funding_spv.TARGET_BLOCK_SPACING_S == 300
+
+
+def test_a_local_clock_behind_the_chain_is_refused_not_clamped(monkeypatch):
+    """``E = now - MTP(R)`` was clamped at zero, so a clock hours slow made a stale tip read as fresh:
+    the bound fell to the proved depth and steps 6 and 7 passed on a window that is gone. On a
+    value-bearing network a local clock behind the chain's median time is now REFUSED, saying so: more
+    than the 300 s tolerance before the median time past of the newest verified headers. A correct clock
+    and any skew within the tolerance pass, and a skew that puts ``now`` before the reference time is
+    stated in the note. Headers 300 s apart, the newest stamped ``_NOW``: that median is ``_NOW - 1500``,
+    so the boundary is a clock 1,800 s slow."""
+    c, kw = _dust_case(monkeypatch)  # value-bearing, newest header stamped _NOW
+    ev = _two_operators(c.evidence())
+    assert _time(c.headers[c.top]) == _NOW
+    tip_mtp = median_time_past([_time(c.headers[h]) for h in range(c.top - 10, c.top + 1)])
+    assert tip_mtp == _NOW - 1500
+
+    def run(now, value=10_000 * PHOTONS_PER_RXD):
+        return verify_maker_funding(ev, **{**kw, "now_unix_s": now}, value_at_stake_photons=value)
+
+    honest = run(_NOW)
+    assert "E was taken as 0" not in honest.bound_note
+    stated = 0
+    # At a small value the reference header is the newest, so MTP(R) is that same median and a clock
+    # within the tolerance below it is clamped — and said so.
+    for skew, value in ((60, None), (300, None), (1500, None), (1800, None), (1600, 1000), (1800, 1000)):
+        r = run(_NOW - skew) if value is None else run(_NOW - skew, value)
+        assert r.elapsed_blocks_upper >= r.proved_depth
+        if _NOW - skew < r.reference_time:
+            assert "before the reference time (within the 300 s tolerance of the chain's median time)" in r.bound_note
+            stated += 1
+    assert stated, "non-vacuity: no skew inside the tolerance put now before the reference time"
+    for skew in (1801, 7200, 9000, 86_400):
+        with pytest.raises(MakerFundingNotVerified, match="local clock appears to be behind the chain") as exc:
+            run(_NOW - skew)
+        assert f"{skew - 1500} s before the median time past of the newest verified headers" in str(exc.value)
+        assert f"(blocks {c.top - 10} to {c.top})" in str(exc.value)
+
+
+def test_an_honest_clock_behind_the_newest_headers_own_timestamp_but_not_the_median_passes(monkeypatch):
+    """The refusal compared ``now`` with the NEWEST header's own timestamp alone, so an honest clock a
+    minute behind that one header's stamp was refused. The median of the newest headers is the reference
+    now: that clock passes, and a clock behind the median is still refused."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    spk = b"\x76\xa9" + bytes(32)
+    probe = build_funding_chain(spk=spk, value=1000, confs=40, base=base, bits=_HARD_BITS, tip_time=_NOW)
+    c = build_funding_chain(
+        spk=spk, value=1000, confs=40, base=base, bits=_HARD_BITS, tip_time=_NOW, time_at={probe.top: _NOW + 7200}
+    )
+    assert _time(c.headers[c.top]) == _NOW + 7200
+    kw = dict(chain=_chain, expected_spk=spk, expected_value=1000, burial_blocks=6)
+    ev = _two_operators(c.evidence())
+    value = 10_000 * PHOTONS_PER_RXD
+    r = verify_maker_funding(ev, now_unix_s=_NOW - 60, value_at_stake_photons=value, **kw)
+    assert r.proved_depth == 40
+    tip_mtp = median_time_past([_time(c.headers[h]) for h in range(c.top - 10, c.top + 1)])
+    assert tip_mtp - funding_spv.LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S < _NOW - 60
+    with pytest.raises(MakerFundingNotVerified, match="local clock appears to be behind the chain"):
+        verify_maker_funding(
+            ev,
+            now_unix_s=tip_mtp - funding_spv.LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S - 1,
+            value_at_stake_photons=value,
+            **kw,
+        )
+
+
+async def test_a_slow_clock_cannot_make_the_coordinator_fund(monkeypatch):
+    """Through the coordinator: the same funding, the clock 9,000 s slow — ``pre_btc_lock_check``
+    refuses naming the clock and ``taker_funds_btc`` never reaches ``fund``; with the right clock it
+    locks."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+
+    def coord():
+        view = _ChainView(
+            pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+        )
+        return _btc_coord(
+            terms,
+            _real_leg(view, network="bc"),
+            policy=_vb_policy(value_at_risk_photons=10_000 * PHOTONS_PER_RXD),
+            accept_nondurable_seen=True,
+        )
+
+    slow, btc_view = coord()
+    gate = await slow.pre_btc_lock_check(terms, now_unix_s=_NOW - 9000)
+    assert gate.ok is False and "local clock appears to be behind the chain" in gate.reason, gate.reason
+    with pytest.raises(ValidationError, match="local clock appears to be behind the chain"):
+        await slow.taker_funds_btc(terms, now_unix_s=_NOW - 9000)
+    assert btc_view.broadcasts == []
+
+    right, _ = coord()
+    assert (await right.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
 
 
 def _exact_poisson_quantiles(mean: float, epsilons: list[float]) -> dict[float, int]:
@@ -1087,6 +1192,268 @@ def test_C_takes_the_hardest_header_of_the_last_checkpoint_interval():
     assert r.forged_confirmation_cost_photons == r.subsidy_photons * (work[4] // 16) // work[3]
 
 
+#: Twice ``_HARD_BITS``' work: target ``0x3fffff…`` against ``0x7fffff…``.
+_HARDER_BITS = 0x1F3FFFFF
+
+
+def _recent_hashrate_case(monkeypatch):
+    """A value-bearing chain whose NEWEST three headers are mined at twice the work of all the others,
+    and a proof server that serves the chain only up to just below them — the real recent headers
+    left out, so every header it serves is easy. The value is sized so ``k``'s value term is ten at the
+    served headers' work and twenty at the withheld ones'."""
+    base, chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    spk = _covenant(terms)
+    probe = build_funding_chain(spk=spk, value=terms.radiant_amount, confs=40, base=base, bits=_HARD_BITS)
+    top = probe.top
+    real = build_funding_chain(
+        spk=spk,
+        value=terms.radiant_amount,
+        confs=40,
+        base=base,
+        bits=_HARD_BITS,
+        tip_time=_NOW,
+        bits_at={h: _HARDER_BITS for h in range(top - 2, top + 1)},
+    )
+    pl = chain.pow_limit
+    easy_work = radiant_header_work(real.headers[top - 3], pow_limit=pl)
+    hard_work = radiant_header_work(real.headers[top], pow_limit=pl)
+    assert hard_work >= 2 * easy_work - 2
+    served = dataclasses.replace(real, headers={h: b for h, b in real.headers.items() if h <= top - 3})
+    subsidy = block_subsidy_photons(real.height, chain)
+    c_easy = subsidy * (chain.newest_checkpoint_work // 16) // easy_work
+    value = 5 * c_easy  # value term ceil(2 × value ÷ C) = 10 at the easy work
+    return chain, terms, spk, real, served, value, easy_work, hard_work
+
+
+class _TipServer(_DepthReader):
+    """A second operator that serves the REAL chain: the funding's confirmations, its tip, and the
+    headers ending at its tip (or ``tip_headers`` instead, when given)."""
+
+    def __init__(self, view, real, *, tip_headers=None, fail_headers=False):
+        super().__init__(view)
+        self.real, self._tip_headers, self.fail_headers, self.header_reads = real, tip_headers, fail_headers, []
+
+    async def get_transaction_verbose(self, txid):
+        return {"txid": txid, "confirmations": self.real.top - self.real.height + 1}
+
+    async def get_tip_height(self):
+        return self.real.top
+
+    async def get_block_headers(self, start, count):
+        self.header_reads.append((start, count))
+        if self.fail_headers:
+            raise NetworkError("headers unavailable")
+        if self._tip_headers is not None:
+            return list(self._tip_headers)
+        return [self.real.headers[h] for h in range(start, start + count) if h in self.real.headers]
+
+
+async def test_recent_harder_headers_a_server_leaves_out_still_raise_max_work_and_k(monkeypatch):
+    """``max_header_work`` was the maximum over the headers the PROOF's server chose to serve and the
+    shipped last checkpoint interval, so a server that left the chain's newest, harder headers out
+    priced ``C`` on easier ones: a larger ``C``, a smaller ``k``.
+
+    Through the real leg and ``RadiantChainIO``: a second operator serving its own newest headers —
+    the real, harder ones — raises ``max_header_work`` to theirs and doubles the value term, and the
+    result says whose headers raised it. One header-range read per operator. Without those headers
+    (a source that serves none) the gate is exactly what it was, and says so."""
+    from pyrxd.gravity.radiant_leg import TIP_HEADERS_FOR_WORK
+
+    _chain, terms, _spk, real, served, value, easy_work, hard_work = _recent_hashrate_case(monkeypatch)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=40, chain=served)
+
+    async def proof_with(second):
+        coord, _ = _btc_coord(
+            terms,
+            _real_leg(view, network="bc", depth_sources=(second,)),
+            policy=_vb_policy(value_at_risk_photons=value),
+            accept_nondurable_seen=True,
+        )
+        await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+        return coord.last_maker_funding
+
+    plain = await proof_with(_DepthReader(view))  # no tip headers served
+    assert plain.max_header_work == easy_work and plain.value_term == 10
+    assert plain.operator_tip_work == ()
+    assert "no source served its tip headers" in plain.bound_note, plain.bound_note
+
+    honest = _TipServer(view, real)
+    raised = await proof_with(honest)
+    b = str(_SHIPPED_OPERATORS[1])
+    start = max(0, real.top - TIP_HEADERS_FOR_WORK + 1)
+    assert honest.header_reads == [(start, real.top - start + 1)]  # one header-range read, ending at its tip
+    assert raised.max_header_work == hard_work and dict(raised.operator_tip_work)[b] == hard_work
+    assert raised.value_term == 20 and raised.required_confirmations == 20 > plain.required_confirmations
+    assert raised.forged_confirmation_cost_photons < plain.forged_confirmation_cost_photons
+    assert f"raised by the tip headers of {b}" in raised.bound_note, raised.bound_note
+
+
+def test_tip_headers_can_only_raise_max_work_never_lower_it(monkeypatch):
+    """At the gate: a source's tip headers that are EASIER than what the proof served change nothing
+    (the maximum cannot fall); a run that does not count is ignored and named, for each reason — headers
+    that fail their own proof-of-work or do not link to one another, a run that does not end at the tip
+    height its source reported, and a run that does not link to any header the gate verified; and an
+    absent read leaves the gate on the proof's headers, said in ``bound_note``. Only a run on the
+    verified chain, ending at its reported tip, raises ``max_header_work``."""
+    from pyrxd.gravity.funding_spv import TIP_RUN_NOT_AT_TIP, TIP_RUN_UNANCHORED, TIP_RUN_UNVERIFIED
+    from tests._funding_chain import REGTEST_BITS
+
+    chain, terms, spk, real, served, value, easy_work, hard_work = _recent_hashrate_case(monkeypatch)
+    kw = dict(chain=chain, expected_spk=spk, expected_value=terms.radiant_amount, burial_blocks=6, now_unix_s=_NOW)
+    b = str(_SHIPPED_OPERATORS[1])
+
+    def run(tip_headers):
+        ev = _two_operators(served.evidence())
+        ev = dataclasses.replace(ev, operator_tip_headers=tip_headers)
+        return verify_maker_funding(ev, value_at_stake_photons=value, **kw)
+
+    plain = run(())
+    assert plain.max_header_work == easy_work and "no source served its tip headers" in plain.bound_note
+
+    # Easier: a valid run at regtest difficulty, forking off a header the gate verified and ending at the
+    # tip its source reported — it counts, and cannot lower anything.
+    fork_at = max(served.headers) - 5
+    prev, t0, easy_run = radiant_block_hash(served.headers[fork_at]), _time(served.headers[fork_at]), []
+    for i in range(4):
+        easy_run.append(mine(prev, os.urandom(32), t0 + 300 * (i + 1), REGTEST_BITS))
+        prev = radiant_block_hash(easy_run[-1])
+    easier = run(((b, fork_at + 1, tuple(easy_run), fork_at + 4),))
+    assert dict(easier.operator_tip_work)[b] < easy_work
+    assert (
+        easier.max_header_work == plain.max_header_work
+        and easier.required_confirmations == plain.required_confirmations
+    )
+    assert "did not raise it" in easier.bound_note, easier.bound_note
+
+    tip = [real.headers[h] for h in range(real.top - 9, real.top + 1)]
+    # A hard header whose proof-of-work fails: one byte of its nonce changed.
+    bad_pow = list(tip)
+    bad_pow[-1] = bad_pow[-1][:76] + bytes([bad_pow[-1][76] ^ 1]) + bad_pow[-1][77:]
+    # Real hard headers that do not link: one header dropped from the middle (still ending at the tip).
+    unlinked = tip[:4] + tip[5:]
+    # Hard headers mined SOMEWHERE ELSE — a separate chain on the same checkpoints, every header meeting
+    # its own (harder) target and linked to the next — labelled as this source's tip: the shape of a replay
+    # of real historical headers. Before, it counted.
+    elsewhere = build_funding_chain(spk=b"\x52", value=1, confs=12, base=_base_of(served), bits=_HARDER_BITS)
+    replay = tuple(elsewhere.headers[h] for h in range(elsewhere.top - 9, elsewhere.top + 1))
+    assert max(radiant_header_work(h, pow_limit=chain.pow_limit) for h in replay) > easy_work
+    for entry, why in (
+        ((b, real.top - 9, tuple(bad_pow), real.top), TIP_RUN_UNVERIFIED),
+        ((b, real.top - 8, tuple(unlinked), real.top), TIP_RUN_UNVERIFIED),
+        ((b, real.top - 9, tuple(tip), real.top + 1), TIP_RUN_NOT_AT_TIP),  # not the tip it reported
+        ((b, real.top - 9, tuple(tip[1:]), real.top - 1), TIP_RUN_UNANCHORED),  # labelled one height low
+        ((b, real.top - 9, replay, real.top), TIP_RUN_UNANCHORED),
+    ):
+        r = run((entry,))
+        assert dict(r.operator_tip_work)[b] is None, why
+        assert r.max_header_work == plain.max_header_work, f"an ignored run must change nothing ({why})"
+        assert r.required_confirmations == plain.required_confirmations
+        assert f"the tip headers of {b} {why}, and were ignored" in r.bound_note, r.bound_note
+
+    good = run(((b, real.top - 9, tuple(tip), real.top),))
+    assert good.max_header_work == hard_work and good.required_confirmations > plain.required_confirmations
+    assert dict(good.operator_tip_work)[b] == hard_work
+
+
+def _base_of(served):
+    """The checkpoint headers *served* was built on (heights up to the newest checkpoint, 4)."""
+    return {h: served.headers[h] for h in range(0, 5)}
+
+
+def test_a_replay_of_real_historical_mainnet_headers_as_a_tip_run_is_ignored():
+    """The reviewer's replay, on REAL mainnet data: 12 real headers from blocks 290,132..290,143
+    (``tests/fixtures/mainnet_headers_290132_290143.json``; each meets its own proof-of-work at mainnet's
+    limit and links to the next), served as a source's "tip headers" ending at the recorded proof's tip
+    (block 460,580 of ``mark_block_fixtures_2026-09-30.json``). They are about 8.6 times harder than the
+    hardest header the proof checked, and free to replay. Counted, they raised ``max_header_work`` that
+    far and ``k`` with it; they link to no header the gate verified, so they are ignored, named, and
+    change nothing. The same source's REAL tip headers (460,569..460,580) count."""
+    import dataclasses
+    import json as _json
+
+    from pyrxd.gravity.funding_spv import TIP_RUN_UNANCHORED, MakerFundingEvidence
+    from tests.test_mark_block_verification import MARKS
+
+    m = MARKS["reference_460572"]
+    hist = _json.loads((ROOT / "tests" / "fixtures" / "mainnet_headers_290132_290143.json").read_text())
+    replay = tuple(bytes.fromhex(h) for h in hist["headers_hex"])
+    assert radiant_block_hash(replay[-1]) == hist["last_block_hash"]
+    tx = Transaction.from_hex(m.raw_tx)
+    pl = funding_spv.MAINNET_CHAIN.pow_limit
+    chain = RadiantChain(
+        name="mainnet",
+        checkpoints=(
+            (460_564, radiant_block_hash(m.headers[460_564])),
+            (460_566, radiant_block_hash(m.headers[460_566])),
+        ),
+        pow_limit=pl,
+        subsidy_halving_interval=210_000,
+        value_bearing=True,
+    )
+    ev = _two_operators(
+        MakerFundingEvidence(
+            txid=m.txid,
+            vout=0,
+            height=m.height,
+            raw_tx=m.raw_tx,
+            merkle=m.merkle,
+            coinbase_merkle=m.coinbase,
+            headers=m.headers,
+        )
+    )
+    top = max(m.headers)
+    served_max = max(radiant_header_work(m.headers[h], pow_limit=pl) for h in m.headers)
+    replay_max = max(radiant_header_work(h, pow_limit=pl) for h in replay)
+    assert replay_max > 8 * served_max  # what counting it would have done to C (and k)
+    floor = radiant_header_work(m.headers[460_566], pow_limit=pl) // 16
+    cost = block_subsidy_photons(460_572, chain) * floor // served_max
+    common = dict(
+        chain=chain,
+        expected_spk=tx.outputs[0].locking_script.serialize(),
+        expected_value=tx.outputs[0].satoshis,
+        burial_blocks=6,
+        now_unix_s=_time(m.headers[top]),
+        value_at_stake_photons=2 * cost,
+    )
+    b = str(_SHIPPED_OPERATORS[1])
+    plain = verify_maker_funding(ev, **common)
+    replayed = verify_maker_funding(
+        dataclasses.replace(ev, operator_tip_headers=((b, top - len(replay) + 1, replay, top),)), **common
+    )
+    assert replayed.max_header_work == plain.max_header_work == served_max
+    assert replayed.required_confirmations == plain.required_confirmations == 6
+    assert dict(replayed.operator_tip_work)[b] is None
+    assert f"the tip headers of {b} {TIP_RUN_UNANCHORED}, and were ignored" in replayed.bound_note
+    honest_run = tuple(m.headers[h] for h in range(top - 11, top + 1))
+    honest = verify_maker_funding(
+        dataclasses.replace(ev, operator_tip_headers=((b, top - 11, honest_run, top),)), **common
+    )
+    assert dict(honest.operator_tip_work)[b] == max(radiant_header_work(h, pow_limit=pl) for h in honest_run)
+    assert honest.max_header_work == served_max and "did not raise it" in honest.bound_note
+
+
+async def test_a_tip_header_read_that_fails_leaves_the_gate_as_it_was(monkeypatch):
+    """Fetch failure: the operator answers its depth but its header read raises. The gate falls back to
+    the proof's headers — same ``max_header_work``, same ``k`` — the operator still counts for the
+    two-operator rule, and ``bound_note`` says no source served its tip headers."""
+    _chain, terms, _spk, real, served, value, easy_work, _hard = _recent_hashrate_case(monkeypatch)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=40, chain=served)
+    failing = _TipServer(view, real, fail_headers=True)
+    coord, _ = _btc_coord(
+        terms,
+        _real_leg(view, network="bc", depth_sources=(failing,)),
+        policy=_vb_policy(value_at_risk_photons=value),
+        accept_nondurable_seen=True,
+    )
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    proof = coord.last_maker_funding
+    assert failing.header_reads, "the header read was attempted"
+    assert proof.max_header_work == easy_work and proof.value_term == 10
+    assert str(_SHIPPED_OPERATORS[1]) in proof.reporting_operators
+    assert "no source served its tip headers" in proof.bound_note, proof.bound_note
+
+
 def test_k_past_the_cap_refuses_with_upgrade_or_use_your_own_node(monkeypatch):
     base, chain = _value_bearing_chain(monkeypatch)
     spk = b"\x76\xa9" + bytes(32)
@@ -1161,6 +1528,14 @@ def test_every_counter_leg_fund_call_crosses_the_gate():
             "taker_verify_asset_funding before it (the verify->lock TOCTOU)"
         )
         assert any(line < call.lineno for line in gate_lines), f"{fn.name} funds without pre_btc_lock_check"
+        # ...and the LAST verification before the lock is judged on its own bound (steps 6 and 7):
+        # a re-run whose elapsed-depth bound is discarded proves the funding exists and nothing more.
+        last_verify = max(line for line in verify_lines if line < call.lineno)
+        judged = _calls_in(fn, "_judge_remaining_window")
+        assert any(last_verify <= line < call.lineno for line in judged), (
+            f"{fn.name} re-runs taker_verify_asset_funding at line {last_verify} but does not judge "
+            f"steps 6 and 7 on its bound before counter_leg.fund at line {call.lineno}"
+        )
     # A leg's own `fund` delegating to an inner leg (the ERC-20 wrapper) is the same lock, reached
     # through the coordinator; anything else outside the coordinator is the reviewed set.
     outside = {
@@ -1262,7 +1637,9 @@ async def test_each_coordinator_entry_point_that_funds_refuses_an_unproved_fundi
 async def test_a_refusal_names_k_the_value_C_and_what_was_proved(monkeypatch):
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(450)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     # 3.5 × this chain's C: a value term of 7 or more, which proved depth 6 cannot meet, while the
     # negotiation-time check (which models k up to 14) still finds room in t_rxd 450.
     value = 10_937_50 * PHOTONS_PER_RXD // 100
@@ -1289,7 +1666,9 @@ def test_a_swap_whose_t_rxd_cannot_hold_the_bound_is_refused_when_the_coordinato
     locks anything and before any chain read, with C bounded from below by the shipped interval work."""
     base, chain = _value_bearing_chain(monkeypatch)
     terms = _ab_terms(400)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     with pytest.raises(ValidationError, match="refused before anyone locks") as exc:
         _btc_coord(
             terms,
@@ -1312,48 +1691,301 @@ def test_a_swap_whose_t_rxd_cannot_hold_the_bound_is_refused_when_the_coordinato
     assert view.reads == []
 
 
-def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monkeypatch):
-    """For an ETH counter leg only the step-6 floor runs early (the ordering needs a clock), so the
-    floor alone must see the bound. A small value constructs; a value whose modelled bound leaves
-    t_rxd 600 no room for a safe claim is refused at construction."""
+def _eth_early_case(monkeypatch, *, t_rxd: int | None = None, deadline_s: int = 86_400):
+    """An ETH counter leg against a value-bearing Radiant leg, as ``eth_swap_run.py --stage sepolia-dust``
+    builds it: the deadline ``deadline_s`` after ``_NOW``, the measured fast tail, the dust margins. Returns
+    ``(build, terms_at, reserve)``: ``build(terms, value, now=_NOW)`` constructs a NEGOTIATED coordinator;
+    ``terms_at(t_rxd)`` the terms; ``reserve(value)`` the taker gate's modelled elapsed bound."""
     import dataclasses
 
     from pyrxd.btc_wallet import taproot as t
+    from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+    from pyrxd.gravity.swap_coordinator import taker_gate_early_bound
 
     base, chain = _value_bearing_chain(monkeypatch)
     p = os.urandom(32)
-    terms = dataclasses.replace(
-        _eth_terms(hashlock=hashlib.sha256(p).digest()),
-        t_btc=t.Timelock(1, t.TimeUnit.BLOCKS),
-        t_rxd=t.Timelock(600, t.TimeUnit.BLOCKS),
-        radiant_amount=1000,
+    margin = CrossClockMargin(
+        eth_reorg_finality_s=768, rxd_claim_burial_s=1800, rxd_confirm_slack_s=600, rounding_slack_s=300
     )
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS)
-    eth = FakeEthLeg(preimage=p, verdict=_final())
-    eth.network, eth.chain_id = "sepolia", 11155111
 
-    def build(value):
+    def policy(value):
+        return _vb_policy(
+            value_at_risk_photons=value,
+            eth_finalization_window_s=768,
+            cross_clock_margin=margin,
+            max_covenant_confirm_wait_s=3600,
+        )
+
+    def terms_at(t_rxd_blocks):
+        terms = dataclasses.replace(
+            _eth_terms(hashlock=hashlib.sha256(p).digest(), eth_timeout_unix_s=_NOW + deadline_s),
+            t_btc=t.Timelock(1, t.TimeUnit.BLOCKS),
+            t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
+            radiant_amount=1000,
+        )
+        cov = build_htlc_covenant_rxd(
+            amount=terms.radiant_amount,
+            taker_pkh=A._TAKER_PKH,
+            maker_pkh=A._MAKER_PKH,
+            hashlock=terms.hashlock,
+            refund_csv=t_rxd_blocks,
+        )
+        # The destinations the real leg's covenant commits to, so an honest funding of it verifies.
+        return dataclasses.replace(
+            terms, taker_dest_hash=cov.expected_taker_hash, maker_dest_hash=cov.expected_maker_hash
+        )
+
+    def build(terms, value=1000, now=_NOW, *, pending=None, observed=None, confs=100, tip_time=_NOW):
+        view = _ChainView(
+            pays=_covenant(terms),
+            value=terms.radiant_amount,
+            confs=confs,
+            base=base,
+            bits=_HARD_BITS,
+            tip_time=tip_time,
+        )
+        eth = FakeEthLeg(preimage=p, verdict=_final())
+        eth.network, eth.chain_id = "sepolia", 11155111
+        record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+        if pending is not None:
+            record = dataclasses.replace(
+                record, pending_counter_contract=pending, pending_counter_deploy_tx="0x" + "ab" * 32
+            )
         return SwapCoordinator(
-            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            record=record,
             counter_leg=eth,
             radiant_leg=_real_leg(view, network="bc"),
             indexer=FakeIndexer(),
             seen_store=FakeSeenStore(),
             config=CoordinatorConfig(
-                margin_policy=_vb_policy(value_at_risk_photons=value, eth_finalization_window_s=768),
+                margin_policy=policy(value),
                 maker_stall_safety_window_blocks=6,
                 accept_estimated_eth_margins=True,
                 accept_nondurable_seen=True,
             ),
+            now_unix_s=now,
+            maker_funding_confirmations=observed,
         )
 
-    assert build(1000) is not None
+    def reserve(value=1000):
+        return taker_gate_early_bound(
+            chain=chain, policy=policy(value), value_at_stake_photons=value
+        ).elapsed_blocks_upper
+
+    floor = -(-(deadline_s + margin.total_s()) // int(_FAST_S))  # the deadline alone, nothing elapsed
+    return build, terms_at, reserve, floor, chain
+
+
+def test_an_eth_swap_that_steps_3_and_7_would_refuse_is_refused_when_the_coordinator_is_built(monkeypatch):
+    """The reviewer's probe (``eth_swap_run.py --stage sepolia-dust`` at its defaults, t_rxd 160 against a
+    24 h deadline): the coordinator CONSTRUCTED, the maker locked, and only then did ``pre_btc_lock_check``
+    step 3 refuse — the projected refund 5,760 s out against a deadline a day away. The negotiation-time
+    check ran the timelock ordering for a BTC counter leg only. It now runs step 3 and step 7 for every
+    counter leg, from the clock the coordinator is built with:
+
+    * t_rxd 160 is refused at construction, naming step 3 (it fails with nothing elapsed);
+    * t_rxd that meets the deadline only with nothing elapsed is refused too — step 7 on the bound;
+    * that plus the modelled bound constructs, and the coordinator's own step 3 and steps 6/7 then pass at
+      ``now`` with the modelled maximum elapsed;
+    * without a clock it is refused, naming ``now_unix_s``."""
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch)
+    e = reserve()
+    assert e >= 1
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 3.*refund could open too EARLY"):
+        build(terms_at(160))
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 7") as exc:
+        build(terms_at(floor + e - 1))
+    assert f"with {e} elapsed the timelock ordering fails" in str(exc.value), str(exc.value)
+    terms = terms_at(floor + e)
+    coord = build(terms)
+    coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # step 3
+    assert coord._judge_remaining_window(terms, cov_confs=e, now_unix_s=_NOW) is None  # steps 6 and 7
+    assert coord._judge_remaining_window(terms, cov_confs=e + 1, now_unix_s=_NOW) is not None  # tight
+    with pytest.raises(ValidationError, match="refused before anyone locks.*pass now_unix_s"):
+        build(terms, now=None)
+
+
+def test_the_early_eth_check_also_refuses_step_3_alone(monkeypatch):
+    """A deadline already past: the step-3 liveness floor refuses at construction (nothing below has a
+    more specific reason, since the ordering trivially holds), naming step 3."""
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=-60)
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 3"):
+        build(terms_at(floor + reserve() + 100))
+
+
+def test_an_eth_deadline_too_near_for_the_takers_gate_is_refused_when_the_coordinator_is_built(monkeypatch):
+    """The deadline's liveness floor runs the other way from the ordering: a LATER clock is nearer the
+    deadline. The taker's gate first accepts the funding once it is ``k`` deep — on the modelled honest
+    chain as late as the upper ``ε`` quantile of the time ``k`` blocks take, plus the bound's slack, after
+    the coordinator is built — so a deadline that clears the floor now but not then (``eth_swap_grief_run.py``'s
+    old 1,800 s and 7,200 s defaults) is refused at construction, naming that wait; a deadline that clears it
+    then constructs. At ``pre_btc_lock_check`` step 3b nothing is added: the funding already exists there,
+    and step 3 judges the real clock."""
+    from pyrxd.gravity.eth_rxd_timelock import assert_eth_deadline_is_claimable
+
+    wait = funding_spv.erlang_upper_quantile_s(6, spacing_s=300, epsilon=1e-3) + 3600
+    assert wait > 6 * 300 + 3600
+    for deadline in (1800, 3600, 7200):
+        build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=deadline)
+        terms = terms_at(floor + reserve())
+        with pytest.raises(
+            ValidationError, match=rf"first accept the funding about {wait} s from now.*too near"
+        ) as exc:
+            build(terms)
+        assert "Negotiate a later counter-leg deadline" in str(exc.value)
+        assert "Negotiate a longer t_rxd" not in str(exc.value)
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=10_800)
+    terms = terms_at(floor + reserve())
+    coord = build(terms)
+    # The same terms judged at step 3b (no wait added) pass, and the floor itself holds at the taker's time.
+    assert coord._funding_proof_room_failure(terms, now_unix_s=_NOW) is None
+    assert_eth_deadline_is_claimable(
+        now_unix_s=_NOW + wait,
+        eth_timeout_unix_s=terms.eth_timeout_unix_s,
+        margin=coord.config.margin_policy.cross_clock_margin,
+    )
+
+
+def _log_erlang_tail_exact(blocks: int, t: int, spacing: int):
+    """``log P(T > t)`` for ``T`` the time *blocks* Poisson blocks at one per *spacing* take — the
+    Poisson lower tail at ``t / spacing`` — by a 60-digit summation, as a ``Decimal``."""
+    from decimal import Decimal, localcontext
+
+    with localcontext() as ctx:
+        ctx.prec = 60
+        mean = Decimal(t) / Decimal(spacing)
+        term, total = Decimal(1), Decimal(0)
+        for j in range(blocks):
+            if j:
+                term = term * mean / j
+            total += term
+        return (total * (-mean).exp()).ln()
+
+
+@pytest.mark.parametrize("blocks", [1, 2, 6, 13, 30, 80, 300])
+@pytest.mark.parametrize("epsilon", [1e-3, 1e-6, 1e-9, 1e-12])
+def test_the_erlang_quantile_matches_a_60_digit_tail_and_is_never_below_it(blocks, epsilon):
+    """``erlang_upper_quantile_s`` against an exact 60-digit tail: at the result the time ``blocks``
+    blocks take exceeds it with probability at most ``ε``; two seconds less, more than ``ε`` (the result
+    is the exact quantile or a second above it, from the shared log margin)."""
+    from decimal import Decimal
+
+    q = funding_spv.erlang_upper_quantile_s(blocks, spacing_s=300, epsilon=epsilon)
+    log_eps = Decimal(epsilon).ln()
+    assert _log_erlang_tail_exact(blocks, q, 300) <= log_eps
+    assert _log_erlang_tail_exact(blocks, q - 2, 300) > log_eps
+    assert q > blocks * 300  # never the mean
+
+
+def test_the_erlang_quantile_refuses_nonsense():
+    q = funding_spv.erlang_upper_quantile_s
+    assert q(0, spacing_s=300, epsilon=1e-3) == 0
+    for bad in (dict(blocks=-1), dict(blocks=True), dict(spacing_s=0), dict(epsilon=1e-3 * 1000), dict(epsilon=0.0)):
+        kw = {"blocks": 6, "spacing_s": 300, "epsilon": 1e-3, **bad}
+        with pytest.raises(ValidationError):
+            q(kw.pop("blocks"), **kw)
+
+
+async def test_a_slow_but_honest_chain_at_the_projected_quantile_still_passes_after_the_maker_locks(monkeypatch):
+    """The projection used ``k`` blocks at exactly the nominal spacing — the MEAN of the time they take,
+    which an honest chain exceeds about half the time — so a deadline the coordinator accepted at
+    construction could be too near by the time the funding really was ``k`` deep, and step 3 refused
+    after the maker had locked. It is the upper ``ε`` quantile now. Through ``pre_btc_lock_check``: at
+    the SMALLEST deadline the coordinator accepts, a chain whose ``k`` blocks took that whole quantile —
+    the funding exactly ``k`` deep, its newest header the bound's slack old — passes; at the projection's
+    own clock one second later than that, it does not (the deadline is the tight one)."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+
+    def constructs(deadline_s: int) -> bool:
+        build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=deadline_s)
+        try:
+            build(terms_at(floor + reserve()))
+        except ValidationError:
+            return False
+        return True
+
+    lo, hi = 1, 40_000
+    assert not constructs(lo) and constructs(hi)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (lo, mid) if constructs(mid) else (mid, hi)
+    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=hi)
+    terms = terms_at(floor + reserve())
+    coord = build(terms)
+    early = taker_gate_early_bound(chain=chain, policy=coord.config.margin_policy, value_at_stake_photons=1000)
+    k = early.required_confirmations
+    blocks_s = funding_spv.erlang_upper_quantile_s(k, spacing_s=300, epsilon=early.epsilon)
+    slack = coord.config.funding_bound.early_slack_s
+    assert hi > k * 300 + slack + 1164, "the smallest accepted deadline is past the old mean-based projection"
+    # The k-th block mined `blocks_s` after construction; the taker checks `slack` later.
+    slow = build(terms, confs=k, tip_time=_NOW + blocks_s)
+    gate = await slow.pre_btc_lock_check(terms, now_unix_s=_NOW + blocks_s + slack)
+    assert gate.ok is True, gate.reason
+    late = build(terms, confs=k, tip_time=_NOW + blocks_s + 1)
+    gate = await late.pre_btc_lock_check(terms, now_unix_s=_NOW + blocks_s + slack + 1)
+    assert gate.ok is False and "too little time to claim" in gate.reason, gate.reason
+
+
+async def test_the_takers_first_acceptance_is_projected_from_where_the_funding_actually_is(monkeypatch):
+    """The reviewer's probe: a deadline 4,000 s away, the maker's funding 100 deep. The construction-time
+    projection treated EVERY NEGOTIATED record as built before the maker funds, so it refused ("first
+    accept the funding about 5400 s from now ... too near") while the same terms on a coordinator built
+    earlier passed ``pre_btc_lock_check``. It now starts from where the funding is:
+
+    * a record carrying a pending counter-leg deploy (a resumed fund) projects nothing, constructs, and
+      ``pre_btc_lock_check`` passes on it at the same clock;
+    * a funding the caller observed ``k`` or more deep waits for nothing, and constructs;
+    * the other branch — nothing observed, or a funding one block short of ``k`` — still projects the
+      wait and is still refused."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=4000)
+    terms = terms_at(floor + reserve() + 200)  # room for the funding's 100 confirmations at step 6
+    with pytest.raises(ValidationError, match=r"first accept the funding about \d+ s from now.*too near"):
+        build(terms)
+    resumed = build(terms, pending="0x" + "44" * 20)
+    gate = await resumed.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is True, gate.reason
+    early = taker_gate_early_bound(chain=chain, policy=resumed.config.margin_policy, value_at_stake_photons=1000)
+    k = early.required_confirmations
+    for deep in (k, 100):
+        assert build(terms, observed=deep) is not None
+    with pytest.raises(ValidationError, match=rf"the funding observed {k - 1} deep, 1 more block.*too near"):
+        build(terms, observed=k - 1)
+    with pytest.raises(ValidationError, match="maker_funding_confirmations must be a non-negative int"):
+        build(terms, observed=-1)
+
+
+async def test_an_honest_eth_swap_passes_pre_btc_lock_check_with_its_clock(monkeypatch):
+    """The other branch: an ETH swap on value-bearing Radiant, built with room for the bound, a real
+    funding 100 blocks deep and the right clock passes ``pre_btc_lock_check`` end to end — step 3b
+    judges the ETH ordering from the clock the call was handed, and never refuses it for want of one."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch)
+    terms = terms_at(floor + reserve() + 200)
+    coord = build(terms)
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is True, gate.reason
+    assert coord.last_maker_funding is not None and coord.last_maker_funding.proved_depth >= 100
+
+
+def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monkeypatch):
+    """The step-6 floor on the bound, for an ETH counter leg: a small value constructs; a value whose
+    modelled bound leaves t_rxd no room for a safe claim is refused at construction, naming step 6."""
+    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=10_800)
+    terms = terms_at(floor + reserve() + 10)
+    assert build(terms) is not None
     big = 150 * funding_spv.forged_confirmation_cost_floor_photons(chain)
-    assert (
-        early_elapsed_blocks_upper(chain=chain, value_at_stake_photons=big, burial_blocks=1).elapsed_blocks_upper > 600
+    assert early_elapsed_blocks_upper(chain=chain, value_at_stake_photons=big, burial_blocks=1).elapsed_blocks_upper > (
+        terms.t_rxd.value
     )
     with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 6"):
-        build(big)
+        build(terms, value=big)
 
 
 #: About three times the work of ``_HARD_BITS`` (its target is a third as large): the hardest header
@@ -1515,7 +2147,9 @@ async def test_pre_btc_lock_check_runs_the_same_check_on_the_terms_it_is_handed(
     base, chain = _value_bearing_chain(monkeypatch)
     early = early_elapsed_blocks_upper(chain=chain, value_at_stake_photons=_BIG, burial_blocks=1).elapsed_blocks_upper
     roomy = _wide_terms(early + 1000)
-    view = _ChainView(pays=_covenant(roomy), value=roomy.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(roomy), value=roomy.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     coord, btc_view = _btc_coord(
         roomy, _real_leg(view, network="bc"), policy=_vb_policy(value_at_risk_photons=_BIG), accept_nondurable_seen=True
     )
@@ -1560,7 +2194,9 @@ def test_a_maker_role_coordinator_is_not_refused_for_the_taker_gates_value_input
 
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = dataclasses.replace(_vb_terms(400), asset_variant="ft", genesis_ref=b"\x01" * 36)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     for role in (None, SwapRole.TAKER):
         with pytest.raises(ValidationError, match=r"refused before anyone locks.*taker gate this coordinator runs"):
             _btc_coord(
@@ -1672,7 +2308,7 @@ async def test_the_leg_reports_each_configured_source_by_its_operator():
             self._confs, self._tip = confs, tip
 
         async def get_transaction_verbose(self, txid):
-            return {"confirmations": self._confs}
+            return {"txid": txid, "confirmations": self._confs}
 
         async def get_tip_height(self):
             return self._tip
@@ -1844,6 +2480,136 @@ async def test_the_lock_time_rerun_alone_catches_a_covenant_that_vanishes_inside
     assert leg.proofs == 2 and "fund" not in eth.calls
 
 
+class _Clock:
+    """A monotonic clock the test advances by hand."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class _SlowSecondProof(_StaleTipLeg):
+    """An honest leg whose SECOND evidence fetch — the lock-time re-run inside ``taker_funds_btc`` —
+    takes ``delay`` seconds of the coordinator's monotonic clock."""
+
+    def __init__(self, *, clock: _Clock, delay: int, tip_time: int) -> None:
+        super().__init__(tip_time=tip_time)
+        self.clock, self.delay, self.proofs = clock, delay, 0
+
+    async def maker_funding_evidence(self, terms, **kw):
+        self.proofs += 1
+        if self.proofs == 2:
+            self.clock.t += self.delay
+        return await super().maker_funding_evidence(terms, **kw)
+
+
+async def _fresh_gate_refusal_delay(build, terms, *, hi: int = 20_000) -> int:
+    """The smallest delay (s) after ``_NOW`` at which a FRESH ``pre_btc_lock_check`` refuses this swap
+    at step 6 or 7 — found by bisection against the real gate, never typed."""
+
+    async def ok(delay):
+        coord = build(_StaleTipLeg(tip_time=_NOW))
+        return (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW + delay)).ok
+
+    lo = 0
+    assert await ok(lo) and not await ok(hi), "the swap must pass now and be refused later"
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if await ok(mid):
+            lo = mid
+        else:
+            hi = mid
+    coord = build(_StaleTipLeg(tip_time=_NOW))
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW + hi)
+    assert "REMAINING window" in gate.reason or "safe claim" in gate.reason, gate.reason
+    return hi
+
+
+async def test_the_lock_time_rerun_judges_steps_6_and_7_on_its_own_bound(monkeypatch, tmp_path):
+    """The lock-time re-run's elapsed-depth bound used to be DISCARDED: the gate inside
+    ``taker_funds_btc`` judged steps 6 and 7 on the first read's bound, and the re-run — which reads
+    later, so its bound can be larger — only had to prove the funding exists. Measured on the code
+    that shipped: a re-run read that took as long as it takes a fresh gate to refuse this swap
+    (1,165 s for the BTC case) still FUNDED.
+
+    Driven through every public entry point that reaches ``fund`` (BTC and ETH ``taker_funds_btc``,
+    ETH ``resume_interrupted_fund``): the first proof is instant and passes, the re-run's read takes
+    exactly the delay at which a fresh gate refuses, and the counter leg is never funded. The same
+    swap with the re-run one second faster than that locks, so the refusal is the window and not the
+    fixture."""
+    import dataclasses
+
+    from pyrxd.gravity import swap_coordinator
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    clock = _Clock()
+    monkeypatch.setattr(swap_coordinator, "_monotonic", clock)
+
+    btc_terms = _terms(variant="rxd")
+    _p = os.urandom(32)
+    eth_terms = _eth_terms(hashlock=hashlib.sha256(_p).digest())
+
+    def btc_build(leg, btc=None):
+        return _coordinator(terms=btc_terms, btc_leg=btc or FakeBtcLeg(), radiant_leg=leg)
+
+    def eth_build(leg, eth=None, **kw):
+        return _eth_coord_full(
+            terms=eth_terms, eth_leg=eth or FakeEthLeg(preimage=_p, verdict=_final()), radiant_leg=leg, **kw
+        )
+
+    async def btc_fund(delay):
+        btc = FakeBtcLeg()
+        leg = _SlowSecondProof(clock=clock, delay=delay, tip_time=_NOW)
+        coord = btc_build(leg, btc)
+        return leg, btc, coord, coord.taker_funds_btc(btc_terms, now_unix_s=_NOW)
+
+    async def eth_fund(delay):
+        eth = FakeEthLeg(preimage=_p, verdict=_final())
+        leg = _SlowSecondProof(clock=clock, delay=delay, tip_time=_NOW)
+        coord = eth_build(leg, eth)
+        return leg, eth, coord, coord.taker_funds_btc(eth_terms, now_unix_s=_NOW)
+
+    async def eth_resume(delay):
+        sink = JsonFileRecordSink(tmp_path / f"swap-{delay}-{os.urandom(4).hex()}.json")
+        await sink(
+            dataclasses.replace(
+                SwapRecord(state=SwapState.NEGOTIATED, terms=eth_terms),
+                pending_counter_contract="0x" + "ab" * 20,
+                pending_counter_deploy_tx="0x" + "cd" * 32,
+            )
+        )
+        seen = FakeSeenStore()
+        seen.reserve(eth_terms.hashlock)
+        eth = FakeEthLeg(preimage=_p, verdict=_final())
+        leg = _SlowSecondProof(clock=clock, delay=delay, tip_time=_NOW)
+        coord = eth_build(leg, eth, seen_store=seen, fund_lock=_MemLock())
+        return leg, eth, coord, coord.resume_interrupted_fund(eth_terms, sink=sink, now_unix_s=_NOW)
+
+    cases = {
+        "taker_funds_btc (btc)": (btc_build, btc_terms, btc_fund),
+        "taker_funds_btc (eth)": (eth_build, eth_terms, eth_fund),
+        "resume_interrupted_fund (eth)": (eth_build, eth_terms, eth_resume),
+    }
+    assert {name.split(" ")[0] for name in cases} == _coordinator_entry_points_that_fund()
+    for name, (build, terms, drive) in cases.items():
+        refuse_at = await _fresh_gate_refusal_delay(build, terms)
+
+        leg, counter, coord, run = await drive(refuse_at)
+        with pytest.raises(ValidationError, match="lock-time re-run refused funding") as exc:
+            await run
+        assert leg.proofs == 2, (name, leg.proofs)
+        assert "fund" not in counter.calls, f"{name}: funded on a window a fresh gate refuses"
+        assert "REMAINING window" in str(exc.value) or "safe claim" in str(exc.value), (name, str(exc.value))
+        assert coord.last_maker_funding.elapsed_s >= refuse_at, name
+
+        # Honest path: one second faster and the same swap locks.
+        leg, counter, coord, run = await drive(refuse_at - 1)
+        await run
+        assert leg.proofs == 2 and "fund" in counter.calls, name
+
+
 # --------------------------------------------------------------------------- (g) two operators above dust
 
 #: The shipped mainnet endpoints, grouped by operator (``source_key``) — derived, never typed.
@@ -1873,7 +2639,9 @@ def test_above_dust_the_gate_refuses_unless_two_distinct_operators_report_the_de
     depth = max(c.headers) - c.height + 1
 
     def run(reports, value=_ABOVE_DUST, configured=(a, b), **extra):
-        ev = c.evidence(reported_depths=tuple(reports), configured_operators=configured)
+        ev = c.evidence(
+            reported_depths=tuple(reports), funding_tx_depths=tuple(reports), configured_operators=configured
+        )
         return verify_maker_funding(ev, value_at_stake_photons=value, **kw, **extra)
 
     for reports in (
@@ -1894,7 +2662,7 @@ def test_above_dust_the_gate_refuses_unless_two_distinct_operators_report_the_de
 
     ok = run([(a, depth), (b, depth)])
     assert ok.reporting_operators == (a, b) and ok.reporting_operators_required == 2
-    assert "2 distinct operators reported, 2 required above the dust threshold" in ok.bound_note
+    assert "2 distinct operators reported the funding transaction, 2 required above the dust threshold" in ok.bound_note
 
     # At the threshold: one operator suffices, and the result says the time term may govern.
     at = run([(a, depth)], value=_ABOVE_DUST - 1)
@@ -1968,7 +2736,9 @@ async def test_step_5_refuses_when_only_one_of_two_configured_operators_answers(
     gate refuses naming who answered and who did not. When both answer, it locks."""
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(3000)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     value = 10_000 * PHOTONS_PER_RXD
 
     class _Silent(_DepthReader):
@@ -1995,6 +2765,125 @@ async def test_step_5_refuses_when_only_one_of_two_configured_operators_answers(
     )
     assert (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
     assert coord.last_maker_funding.reporting_operators == (str(view.source_key), str(_SHIPPED_OPERATORS[1]))
+
+
+class _TipOnly(_DepthReader):
+    """A second operator that does not know the funding transaction — its verbose read fails, as
+    ElectrumX answers a txid it has never seen — but answers its tip height, which can be anything."""
+
+    def __init__(self, view, *, tip, key=_SHIPPED_OPERATORS[1]):
+        super().__init__(view, key=key)
+        self.tip = tip
+
+    async def get_transaction_verbose(self, txid):
+        raise NetworkError("No such mempool or blockchain transaction")
+
+    async def get_tip_height(self):
+        return self.tip
+
+
+async def test_a_tip_height_alone_is_not_an_operator_reporting_the_funding(monkeypatch):
+    """The two-operator rule counted an operator whose verbose read of the funding FAILED, through
+    its tip height: ``tip - H + 1`` is a number for any txid, real or not, so "two operators report
+    the depth" held with one operator knowing nothing about the funding.
+
+    Now: through the real leg and ``RadiantChainIO``, an operator that answers only its tip is in
+    the bound's reports and not among the operators counted, so above dust the gate refuses and
+    names it; the same operator answering the verbose read is counted and the swap locks; and a
+    tip-only report still RAISES the bound, at dust, where one operator suffices."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
+    tip = view.chain.top
+
+    def coord_for(depth_source, value):
+        return _btc_coord(
+            terms,
+            _real_leg(view, network="bc", depth_sources=(depth_source,)),
+            policy=_vb_policy(value_at_risk_photons=value),
+            accept_nondurable_seen=True,
+        )
+
+    # The leg keeps the two kinds of report apart.
+    io = RadiantChainIO(view, depth_sources=(_TipOnly(view, tip=tip),))
+    got = await io.depth_reports(view.chain.txid, view.chain.height)
+    b = str(_SHIPPED_OPERATORS[1])
+    assert dict(got.reported)[b] == tip - view.chain.height + 1
+    assert b not in dict(got.funding_tx) and dict(got.funding_tx) == {str(view.source_key): view.confs}
+
+    above = 10_000 * PHOTONS_PER_RXD
+    coord, btc_view = coord_for(_TipOnly(view, tip=tip), above)
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is False
+    assert f"1 answered ({view.source_key}), and {b} did not" in gate.reason, gate.reason
+    assert f"{b} gave only a tip height" in gate.reason, gate.reason
+    assert btc_view.broadcasts == []
+
+    # Honest path: the same operator answering the funding transaction's verbose read counts.
+    coord, _ = coord_for(_DepthReader(view), above)
+    assert (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
+    assert coord.last_maker_funding.reporting_operators == (str(view.source_key), b)
+
+    # A tip-only report still raises the bound (it can only raise it): at dust, one operator suffices.
+    dust = ElapsedBoundPolicy().dust_threshold_photons
+    coord, _ = coord_for(_TipOnly(view, tip=tip + 500), dust)
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    proof = coord.last_maker_funding
+    assert proof.reporting_operators == (str(view.source_key),)
+    assert (proof.elapsed_blocks_upper, proof.bound_term) == (tip + 500 - view.chain.height + 1, "reported")
+    assert f"of which {b} gave only a tip height" in proof.bound_note, proof.bound_note
+
+
+class _NamesTx(_DepthReader):
+    """A second operator whose verbose reply carries *names* as its own ``txid`` field (``None``: absent)."""
+
+    def __init__(self, view, *, names):
+        super().__init__(view)
+        self.names = names
+
+    async def get_transaction_verbose(self, txid):
+        reply = {"confirmations": self._view.confs}
+        if self.names is not None:
+            reply["txid"] = self.names(txid) if callable(self.names) else self.names
+        return reply
+
+
+async def test_a_verbose_reply_that_names_another_transaction_is_not_a_report_of_this_one(monkeypatch):
+    """The verbose reply's own ``txid`` field was never compared with the txid asked about, so a source
+    could answer with ANOTHER transaction's confirmations and be counted as an operator reporting this
+    funding. Through the real leg: a reply naming a different txid, one with no ``txid`` field, and ones
+    whose field is not 64 hex characters are not counted (above dust the gate refuses, naming the
+    operator as having given only a tip height when it gave one); the same reply naming this txid — in
+    either case — is counted and the swap locks."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
+    b = str(_SHIPPED_OPERATORS[1])
+    above = 10_000 * PHOTONS_PER_RXD
+
+    async def gate_with(names):
+        coord, btc_view = _btc_coord(
+            terms,
+            _real_leg(view, network="bc", depth_sources=(_NamesTx(view, names=names),)),
+            policy=_vb_policy(value_at_risk_photons=above),
+            accept_nondurable_seen=True,
+        )
+        return await coord.pre_btc_lock_check(terms, now_unix_s=_NOW), coord, btc_view
+
+    other = os.urandom(32).hex()
+    for names in (other, None, lambda t: t[:-1], lambda t: t + "00", lambda t: t[:-1] + "g", 7):
+        gate, _coord, btc_view = await gate_with(names)
+        assert gate.ok is False, names
+        assert f"1 answered ({view.source_key}), and {b} did not" in gate.reason, gate.reason
+        assert btc_view.broadcasts == []
+    for names in (lambda t: t, lambda t: t.upper()):
+        gate, coord, _ = await gate_with(names)
+        assert gate.ok is True, gate.reason
+        assert coord.last_maker_funding.reporting_operators == (str(view.source_key), b)
 
 
 async def test_a_client_over_several_operators_is_asked_once_per_operator(monkeypatch):
@@ -2104,7 +2993,7 @@ def _one_operator_run(monkeypatch, *, value, policy):
     c, kw = _dust_case(monkeypatch)
     a, b = (str(k) for k in _SHIPPED_OPERATORS[:2])
     depth = max(c.headers) - c.height + 1
-    ev = c.evidence(reported_depths=((a, depth),), configured_operators=(a, b))
+    ev = c.evidence(reported_depths=((a, depth),), funding_tx_depths=((a, depth),), configured_operators=(a, b))
     return lambda: verify_maker_funding(ev, value_at_stake_photons=value, bound_policy=policy, **kw)
 
 
@@ -2195,7 +3084,9 @@ async def test_the_durable_record_carries_the_override_statement(monkeypatch):
     carries the statement, and it survives the JSON round trip."""
     base, _chain = _value_bearing_chain(monkeypatch)
     terms = _wide_terms(3000)
-    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
     value = 10_000 * PHOTONS_PER_RXD
     written: list[dict] = []
 
@@ -2418,3 +3309,22 @@ async def test_the_reference_time_is_taken_after_the_reads(monkeypatch):
     rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
     assert rec.state is SwapState.BTC_LOCKED
     assert coord.last_maker_funding.elapsed_s == base_elapsed + 1200
+
+
+def test_a_reply_names_a_txid_only_as_exactly_64_hex_characters_ignoring_case():
+    """``_names_txid`` directly: both sides must be 64 hex characters — a shorter or longer string that
+    merely equals the other is not a txid, on either side — compared ignoring case."""
+    from pyrxd.gravity.radiant_leg import _names_txid
+
+    t = os.urandom(32).hex()
+    assert _names_txid(t, t) and _names_txid(t.upper(), t) and _names_txid(t, t.upper())
+    for reported, requested in (
+        (t[:-1], t[:-1]),
+        (t + "00", t + "00"),
+        ("g" * 64, "g" * 64),
+        (os.urandom(32).hex(), t),
+        (None, t),
+        (t, None),
+        (int(t, 16), t),
+    ):
+        assert not _names_txid(reported, requested), (reported, requested)
