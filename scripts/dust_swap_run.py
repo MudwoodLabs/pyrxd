@@ -137,10 +137,12 @@ def _build_coordinator(
     btc_reader,
     rxd_client,
     audit_cleared: bool,
+    seen_store_path: str | None = None,
 ) -> SwapCoordinator:
     """The run's coordinator and both legs — ONE wiring, used for the preflight (before anything is
     funded, with a placeholder BTC UTXO), for the dry run's verdict (offline transports) and for the
-    run itself."""
+    run itself. *seen_store_path* overrides where the durable H-freshness store lives: the dry run
+    passes ``":memory:"`` so it creates and modifies no state file."""
     btc_leg = BitcoinTaprootLeg(
         network=btc_network,
         taker_keypair=taker_btc_kp,
@@ -181,7 +183,9 @@ def _build_coordinator(
         # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
         # so the SEEN-1 replay/free-option reservation survives a restart or a second
         # process (durable-by-default; no accept_nondurable_seen opt-in needed).
-        seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
+        seen_store=DurableSeenStore(
+            seen_store_path if seen_store_path is not None else str(Path(args.keys_out).expanduser()) + ".seen.sqlite"
+        ),
         config=config,
     )
 
@@ -365,6 +369,9 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
                     btc_broadcaster=offline,
                     btc_reader=offline,
                     rxd_client=OfflineRadiantClient(),
+                    # The same durable store type, in memory: a dry run creates and modifies no state
+                    # file (it created `<keys-out>.seen.sqlite`).
+                    seen_store_path=":memory:",
                     **coordinator_kw,
                 ),
                 before="anything is broadcast (DRY-RUN verdict: the signet and dust stages would refuse it)",

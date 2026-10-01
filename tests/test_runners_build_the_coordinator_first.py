@@ -434,6 +434,41 @@ async def test_the_dry_run_builds_the_coordinator_and_reports_its_verdict(tmp_pa
         )
 
 
+async def test_the_dry_run_creates_and_modifies_no_state_file(tmp_path, monkeypatch):
+    """Building the coordinator in the dry run opened its durable H-freshness store on
+    ``<keys-out>.seen.sqlite``, so a dry run left a state file beside the recovery file. It uses the same
+    store type in memory now: the directory holds exactly the recovery file and the report the dry run
+    has always written — on an accepted dry run and on a refused one — and a seen-store a real run left
+    there before is not touched."""
+    import os
+
+    def files(d):
+        return sorted(p.name for p in d.iterdir())
+
+    for sub, extra in (("ok", ()), ("refused", ("--value-at-risk-photons", "500"))):
+        d = tmp_path / sub
+        d.mkdir()
+        argv = ["--stage", "dry-run", "--rxd-block-interval-fast-s", "36"]
+        argv += ["--keys-out", str(d / "k.json"), "--report-out", str(d / "r.json"), *extra]
+        try:
+            await _drive_dust(tmp_path, monkeypatch, argv=argv)
+        except SystemExit:
+            assert sub == "refused"
+        assert files(d) == ["k.json", "r.json"], (sub, files(d))
+
+    d = tmp_path / "existing"
+    d.mkdir()
+    seen = d / "k.json.seen.sqlite"
+    seen.write_bytes(b"a real run's store")
+    before = (seen.read_bytes(), os.stat(seen).st_mtime_ns)
+    argv = ["--stage", "dry-run", "--rxd-block-interval-fast-s", "36"]
+    await _drive_dust(
+        tmp_path, monkeypatch, argv=[*argv, "--keys-out", str(d / "k.json"), "--report-out", str(d / "r.json")]
+    )
+    assert (seen.read_bytes(), os.stat(seen).st_mtime_ns) == before
+    assert files(d) == ["k.json", "k.json.seen.sqlite", "r.json"], files(d)
+
+
 def test_the_value_flag_parses_photons_and_refuses_nonsense():
     shared = _load("_dust_swap_shared")
     import argparse
