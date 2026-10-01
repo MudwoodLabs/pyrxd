@@ -24,6 +24,7 @@ each one needs a driver here or a pinned, asserted exemption.
 from __future__ import annotations
 
 import ast
+import re
 import struct
 import sys
 from pathlib import Path
@@ -762,3 +763,25 @@ def test_the_recovery_file_records_every_input_the_t_rxd_bounds_read():
     not_inputs = {"t_rxd_blocks", "eth_timeout_s", "gate_reserve_blocks", "resumed_record"}
     assert read - not_inputs - set(mod._NEGOTIATED_INPUTS) == set(), sorted(read - not_inputs)
     assert set(mod._NEGOTIATED_INPUTS) <= read, sorted(set(mod._NEGOTIATED_INPUTS) - read)  # no stale entry
+
+
+def test_every_doc_example_that_builds_a_coordinator_passes_the_wall_clock():
+    """``docs/how-to/build-a-cross-chain-swap.md`` built an ETH coordinator without ``now_unix_s``, which
+    mainnet Radiant refuses. Every ``SwapCoordinator(...)`` call in a fenced Python block of the shipped
+    docs (not the historical ``docs/brainstorms`` and ``docs/plans``) and the README passes it."""
+    root = _SCRIPTS.parent
+    docs = [root / "README.md", *sorted((root / "docs").rglob("*.md"))]
+    docs = [d for d in docs if d.exists() and not {"brainstorms", "plans"} & set(d.relative_to(root).parts)]
+    calls = []
+    for doc in docs:
+        text = doc.read_text(encoding="utf-8")
+        for block in re.findall(r"```python\n(.*?)```", text, flags=re.S):
+            for m in re.finditer(r"SwapCoordinator\(", block):
+                depth, i = 1, m.end()
+                while depth and i < len(block):
+                    depth += {"(": 1, ")": -1}.get(block[i], 0)
+                    i += 1
+                calls.append((doc.relative_to(root), block[m.start() : i]))
+    assert len(calls) >= 2, calls
+    missing = [str(doc) for doc, call in calls if "now_unix_s=" not in call]
+    assert not missing, missing

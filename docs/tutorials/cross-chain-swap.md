@@ -77,9 +77,13 @@ here, ETH):
 
 ```python
 # build the covenant + the two real legs + the coordinator (see the e2e test for the full setup)
+import time
+
+# now_unix_s is your wall clock (the e2e test uses Anvil's): an ETH deadline is absolute, and on
+# mainnet Radiant the coordinator refuses to construct without it.
 coord = SwapCoordinator(record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
                         counter_leg=eth_leg, radiant_leg=rxd_leg, indexer=indexer,
-                        seen_store=seen, config=config)
+                        seen_store=seen, config=config, now_unix_s=int(time.time()))
 
 # 0. MAKER funds the Radiant HTLC covenant on chain, and lets it bury.
 #    This is a PRECONDITION, not an ordering preference: the BTC/ETH claim leaf has no
@@ -90,11 +94,11 @@ coord = SwapCoordinator(record=SwapRecord(state=SwapState.NEGOTIATED, terms=term
 # 1. TAKER locks the ETH — deploys + funds the EthHtlc on Anvil, bound to H. The pre-lock gate
 #    reads the Radiant chain itself and REFUSES unless the maker's covenant is funded at the
 #    agreed value and buried; the check is re-run immediately before the broadcast.
-rec = await coord.taker_funds_btc(terms)                 # NEGOTIATED → BTC_LOCKED
+rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))  # NEGOTIATED → BTC_LOCKED
 
 # 2. The taker re-validates the on-chain covenant SPK, the Glyph ref, and the cross-clock
 #    timelock margin, and records the asset lock in the FSM.
-rec = await coord.post_asset_lock_revalidate(cov.funded_spk)   # → BOTH_LOCKED
+rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=int(time.time()))  # → BOTH_LOCKED
 
 # 3. MAKER claims the ETH — revealing p on-chain (the EthHtlc emits Claimed(p)).
 rec = await coord.maker_claims_btc(p)                    # → SECRET_REVEALED

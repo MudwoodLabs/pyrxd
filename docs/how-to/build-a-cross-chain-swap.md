@@ -88,6 +88,8 @@ from pyrxd import (
 The coordinator is constructed with both legs plus its collaborators:
 
 ```python
+import time
+
 coordinator = SwapCoordinator(
     record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
     counter_leg=eth_leg,      # or btc_leg=... for the BTC Taproot-HTLC path
@@ -95,8 +97,18 @@ coordinator = SwapCoordinator(
     indexer=indexer,          # resolves Glyph refs / reads RXD chain state
     seen_store=seen_store,    # dedup / replay durability across restarts
     config=CoordinatorConfig(margin_policy=MarginPolicy.measured(...)),
+    now_unix_s=int(time.time()),  # your wall clock; required for an ETH/ERC-20 leg on mainnet Radiant
 )
 ```
+
+- **`now_unix_s` (your wall clock).** An ETH or ERC-20 deadline is an absolute time, so when the
+  coordinator is built for a NEGOTIATED swap on mainnet Radiant it judges the timelock ordering, and
+  whether the deadline leaves time for the taker's gate to accept the maker's funding, from this
+  clock — and refuses to construct without it. Pass the same clock to the gate's calls
+  (`pre_btc_lock_check`, `taker_funds_btc`, `post_asset_lock_revalidate`, ...). If you build the
+  coordinator after the maker's covenant is already on chain (resuming a swap), also pass
+  `maker_funding_confirmations=` with the depth you read, so it does not project a wait for a
+  funding that already exists.
 
 - **BTC counter-leg.** Use `BitcoinTaprootLeg` from `pyrxd.btc_wallet` — the concrete,
   exported production BTC leg, and what the proven regtest end-to-end drives. Pass it as
