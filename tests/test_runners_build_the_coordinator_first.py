@@ -75,14 +75,57 @@ class _FakeBtcHeaders:
         pass
 
 
+def _judge_at_the_modelled_maximum(coord) -> str:
+    """What ``pre_btc_lock_check`` steps 3, 6 and 7 say about *coord*'s NEGOTIATED terms on an honest
+    chain with the taker gate's modelled maximum of blocks already elapsed (``taker_gate_early_bound``,
+    the bound the gate can reach on such a chain), judged at two clocks: NOW (the runner's, just after it
+    built the coordinator) — the worst case for the ordering, since a later clock only moves the
+    projected refund later — and when the taker's gate can first accept the funding on that chain (``k``
+    blocks at the nominal spacing plus the bound's slack) — the worst case for an ETH deadline's
+    liveness floor. Step 3 is called as ``pre_btc_lock_check`` calls it, not through the
+    negotiation-time check under test. ``"ok"``, or the first refusal."""
+    import time
+
+    from pyrxd.gravity.funding_spv import radiant_chain_for_leg
+    from pyrxd.gravity.swap_coordinator import assert_timelock_margin
+
+    terms, now = coord.record.terms, int(time.time())
+    chain = radiant_chain_for_leg(coord.radiant_leg, counter_leg=coord.counter_leg)
+    early = taker_gate_early_bound(
+        chain=chain,
+        policy=coord.config.margin_policy,
+        value_at_stake_photons=coord._funding_value_at_stake_photons(terms),
+        funding_bound=coord.config.funding_bound,
+        radiant_min_confirmations=int(getattr(coord.radiant_leg, "min_confirmations", 1)),
+    )
+    taker_at = (
+        now + early.required_confirmations * int(chain.target_spacing_s) + int(coord.config.funding_bound.early_slack_s)
+    )
+    for when in (now, taker_at):
+        try:
+            if terms.counter_chain == "btc":
+                assert_timelock_margin(terms.t_btc, terms.t_rxd, coord.config.margin_policy)
+            else:
+                coord._assert_eth_timelock_ordering(terms, now_unix_s=when)
+        except ValidationError as exc:
+            return f"step 3 at now+{when - now}: {exc}"
+        gate = coord._judge_remaining_window(terms, cov_confs=early.elapsed_blocks_upper, now_unix_s=when)
+        if gate is not None:
+            return f"steps 6/7 at {early.elapsed_blocks_upper} elapsed, now+{when - now}: {gate.reason}"
+    return "ok"
+
+
 def _instrument(mod, events: list[str], monkeypatch) -> None:
-    """Record, in order, each coordinator construction and the first broadcast/mint step reached."""
+    """Record, in order, each coordinator construction (with the step 3/6/7 verdict on its terms at
+    the modelled maximum elapsed, for a NEGOTIATED record) and the first broadcast/mint step reached."""
     real = mod.SwapCoordinator
 
     class _Recording(real):
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
             events.append("construct")
+            if self.record.state.value == "negotiated":
+                events.append(f"judged:{_judge_at_the_modelled_maximum(self)}")
 
     monkeypatch.setattr(mod, "SwapCoordinator", _Recording)
     for name in _BROADCASTS:
@@ -221,9 +264,17 @@ def _first(events: list[str], prefix: str) -> int:
 @pytest.mark.parametrize("name", sorted(_DRIVERS))
 async def test_every_mainnet_runner_constructs_at_its_defaults_before_anything_moves(name, tmp_path, monkeypatch):
     """At the shipped defaults each runner constructs its coordinator, and does so before the first
-    step that mints, broadcasts, or asks the operator to fund anything; then that step is reached."""
+    step that mints, broadcasts, or asks the operator to fund anything; then that step is reached.
+
+    AND the terms it built pass ``pre_btc_lock_check`` steps 3, 6 and 7 at the taker gate's modelled
+    maximum elapsed depth. Construction alone was not enough: ``eth_swap_run.py --stage sepolia-dust``
+    constructed at t_rxd 160 against a 24 h deadline and step 3 refused it — after the maker locked —
+    and ``eth_swap_grief_run.py`` constructed at t_rxd 120 and step 7 refused it at the bound (80)."""
     events, outcome = await _DRIVERS[name](tmp_path, monkeypatch)
     assert "construct" in events, (name, events, outcome)
+    verdicts = [e for e in events if e.startswith("judged:")]
+    assert verdicts and set(verdicts) == {"judged:ok"}, (name, verdicts)
+    events = [e for e in events if not e.startswith("judged:")]
     moved = min(_first(events, "broadcast"), _first(events, "operator-funded"), _first(events, "node-rpc"))
     assert events.index("construct") < moved, (name, events)
     assert outcome.startswith("stopped at"), (name, outcome, events)
@@ -262,7 +313,7 @@ async def test_an_nft_or_ft_run_is_refused_before_its_mainnet_mint(variant, tmp_
         tmp_path, monkeypatch, "--asset-variant", variant, "--value-at-risk-photons", "100000"
     )
     assert outcome == f"stopped at mint_{variant}_inline", (outcome, events)
-    assert events[: events.index(f"broadcast:mint_{variant}_inline")] == ["construct"], events
+    assert events[: events.index(f"broadcast:mint_{variant}_inline")] == ["construct", "judged:ok"], events
 
 
 async def test_a_construction_refusal_stops_the_eth_run_before_the_mint(tmp_path, monkeypatch):
@@ -359,7 +410,7 @@ async def test_the_dry_run_builds_the_coordinator_and_reports_its_verdict(tmp_pa
         return [*base, "--keys-out", str(d / "k.json"), "--report-out", str(d / "r.json"), *extra]
 
     events, outcome = await _drive_dust(tmp_path, monkeypatch, argv=argv("ok"))
-    assert outcome == "returned" and events == ["construct"], (outcome, events)
+    assert outcome == "returned" and events == ["construct", "judged:ok"], (outcome, events)
     assert "the swap coordinator accepts these terms" in capsys.readouterr().out
 
     # A value at risk below the covenant amount: the coordinator refuses it at construction.

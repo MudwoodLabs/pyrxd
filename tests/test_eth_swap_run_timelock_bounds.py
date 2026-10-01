@@ -46,6 +46,12 @@ def _ns(**kw) -> argparse.Namespace:
         maker_stall_safety_window_blocks=30,
         margin_blocks=240,
         btc_block_interval_s=600.0,
+        # What `_policy` reads to model the taker gate's elapsed reserve (the run's value at stake),
+        # as the real parser supplies them.
+        asset_variant="rxd",
+        rxd_photons=1000,
+        value_at_risk_photons=None,
+        accept_single_operator_up_to=None,
     )
     base.update(kw)
     # A p10 cannot be SLOWER than the nominal interval; MarginPolicy refuses the pair outright as

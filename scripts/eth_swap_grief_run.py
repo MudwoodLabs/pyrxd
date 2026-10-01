@@ -13,8 +13,11 @@ broadcast (no --yes for the real run). Reuses eth_swap_run.py's building blocks 
 
 Timing: mutual_refund needs BOTH legs matured — the RXD covenant buried t_rxd deep (BIP68 CSV) AND
 the ETH timeout passed. Margin components are set SMALL here (this is a deliberate dust test, not a
-production swap) so the ETH timeout is reachable in ~10-15 min rather than ~1 h. The cross-clock gate
-still runs (eth_timeout > rxd_refund_open + margin); we just size the margin for a fast demo.
+production swap). The ETH timeout defaults to 2 h: on mainnet Radiant the taker's gate first accepts the
+maker's funding once it is k (6 at dust) blocks deep, about 1.5 h on the coordinator's own model, and
+the deadline must still leave the claim floor then — the coordinator refuses a shorter one when it is
+built. t_rxd is derived to outlast it (`derived_t_rxd_blocks`). The cross-clock gate still runs
+(rxd_refund_open > eth_timeout + margin); we just size the margin for a fast demo.
 
 Example:
   python scripts/eth_swap_grief_run.py --i-accept-dust-loss \
@@ -29,6 +32,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -98,6 +102,17 @@ def _policy(args) -> MarginPolicy:
     )
 
 
+def derived_t_rxd_blocks(args, *, elapsed_reserve: int) -> int:
+    """``t_rxd`` when ``--t-rxd-blocks`` is omitted: the fewest Radiant blocks at the measured fast tail
+    that outlast ``--eth-timeout-s`` plus the cross-clock margin, PLUS the taker gate's modelled elapsed
+    bound. The coordinator judges the ordering against the deadline on what remains of ``t_rxd`` once
+    that bound has elapsed (``pre_btc_lock_check`` step 7, and the same check when it is built), so a
+    t_rxd that only meets the deadline with nothing elapsed is refused before anything is broadcast.
+    The fixed default this replaced (120) did exactly that at the gate's bound of 80."""
+    span_s = int(args.eth_timeout_s) + _margin(args).total_s()
+    return math.ceil(span_s / float(args.rxd_block_interval_fast_s)) + int(elapsed_reserve)
+
+
 async def run(args) -> None:
     if not args.i_accept_dust_loss:
         raise SystemExit("requires --i-accept-dust-loss (you are moving REAL mainnet RXD)")
@@ -119,8 +134,11 @@ async def run(args) -> None:
     print("    maker STALLS; the honest taker recovers via mutual_refund (no one-sided loss).")
 
     eth_timeout = int(time.time()) + args.eth_timeout_s
+    elapsed_reserve = _gate_reserve(args, policy, config.funding_bound)
+    if int(args.t_rxd_blocks) == 0:
+        args.t_rxd_blocks = derived_t_rxd_blocks(args, elapsed_reserve=elapsed_reserve)
     terms, cov, p_secret, h, rkeys = _build_terms_and_covenant(
-        args, eth_timeout=eth_timeout, elapsed_reserve=_gate_reserve(args, policy, config.funding_bound)
+        args, eth_timeout=eth_timeout, elapsed_reserve=elapsed_reserve
     )
     report = StepReport(
         "grief-run", {"scenario": "S1 maker-stall -> mutual_refund", "eth_chain": "sepolia", "rxd_network": rxd_network}
@@ -186,6 +204,8 @@ async def run(args) -> None:
             seen_store=InMemSeen(),
             persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
             config=config,
+            # The ETH deadline is absolute: the coordinator judges its ordering from the clock when built.
+            now_unix_s=int(time.time()),
         ),
         before="anything is broadcast",
     )
@@ -270,16 +290,19 @@ def _args():
     ap.add_argument(
         "--eth-artifact", default=str(Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "EthHtlc.json")
     )
-    ap.add_argument("--eth-timeout-s", type=int, default=1800)  # 30 min — clears the 768s finality floor + margin
+    # 2 h. The taker's gate first accepts the funding about k × 300 s + 3,600 s after the coordinator is
+    # built (5,400 s at k = 6), and the deadline must still clear the claim floor (984 s at these margins)
+    # then; the coordinator refuses a shorter deadline at construction. 1800 s was refused.
+    ap.add_argument("--eth-timeout-s", type=int, default=7200)
     ap.add_argument("--rxd-photons", type=int, default=1000)
     # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
     ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)
     ap.add_argument("--rxd-wallet", default="")
-    # As short as the taker gate allows, so the CSV matures as soon as it can: the gate reserves its own
-    # model of the blocks that can elapse before the taker locks (about 80 at dust value) plus what a
-    # safe claim needs; 110 was the smallest that constructed at these defaults (2026-09-30). The old
-    # default of 3 could never pass that check.
-    ap.add_argument("--t-rxd-blocks", type=int, default=120)
+    # 0 (default) DERIVES it (`derived_t_rxd_blocks`): the fewest blocks that outlast the ETH deadline
+    # plus the margin at the fast tail, plus the taker gate's modelled elapsed bound — as short as the
+    # coordinator accepts, so the CSV matures as soon as it can. The fixed 120 this replaced constructed
+    # only while the coordinator judged the ETH ordering after the maker had locked.
+    ap.add_argument("--t-rxd-blocks", type=int, default=0)
     # Margin kept lean for a fast dust demo, EXCEPT eth-finalization-window-s, which is hard-floored at
     # 768s (~2 post-Merge epochs) by MarginPolicy — finalization genuinely takes 2 epochs, not reducible.
     ap.add_argument("--margin-blocks", type=int, default=2)

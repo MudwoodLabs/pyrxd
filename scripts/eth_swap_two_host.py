@@ -1273,6 +1273,9 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
             # `reserve(H)`, which is durable and stronger. Same-host resume is refused too; that is
             # a deliberate over-restriction rather than a lock that lies about its scope.
         ),
+        # The ETH deadline is absolute: on a value-bearing Radiant leg the coordinator judges its
+        # ordering against t_rxd from the clock when it is built (inert on this regtest-pinned leg).
+        now_unix_s=int(time.time()),
     )
 
 

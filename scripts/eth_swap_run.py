@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import hashlib
 import json
 import math
@@ -91,6 +92,7 @@ from pyrxd.eth_wallet.tokens import KNOWN_TOKENS, token_for
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, eth_absolute_to_rxd_relative_blocks
+from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
 from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
@@ -202,8 +204,12 @@ def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> Marg
                 "Radiant blocks by dividing by it, and the coordinator refuses without it. Measure it "
                 "against a mainnet node for THIS run."
             )
+        # DERIVED, as on the real-value stage: the deadline's floor plus the taker gate's modelled
+        # elapsed bound. A fixed default (160) constructed only while the coordinator judged the ETH
+        # ordering after the maker had locked; it never met a 24 h deadline.
+        _reserve_the_gate_bound(args, dict(is_measured=False, **common))
         if int(args.t_rxd_blocks) == 0:
-            args.t_rxd_blocks = _SEPOLIA_DEFAULT_T_RXD_BLOCKS
+            args.t_rxd_blocks = _derived_t_rxd_blocks(args, remaining_s=remaining_s)
         return MarginPolicy(
             is_measured=False, rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s), **common
         )
@@ -232,8 +238,9 @@ def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> Marg
     # flag and derive it — which derives 86. That sends someone to re-type the one argument that
     # cannot help, during a run, with a covenant possibly already funded. Name the real constraint.
     _assert_the_eth_deadline_can_hold_the_margins(args, remaining_s=remaining_s)
+    _reserve_the_gate_bound(args, dict(is_measured=True, require_measured=True, **common))
     if int(args.t_rxd_blocks) == 0:
-        args.t_rxd_blocks = _recommended_t_rxd_blocks(args, remaining_s=remaining_s)
+        args.t_rxd_blocks = _derived_t_rxd_blocks(args, remaining_s=remaining_s)
     # The three bounds now run against a value the library derived rather than one an operator
     # typed. That is deliberate: they are the check on the derivation, not a substitute for it, and
     # a derivation nothing verifies is how the exact-division off-by-one survived in the first place.
@@ -246,6 +253,31 @@ def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> Marg
         rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s),
         **common,
     )
+
+
+def _reserve_the_gate_bound(args: argparse.Namespace, policy_kwargs: dict) -> None:
+    """Record on *args* the Radiant blocks of ``t_rxd`` the taker gate's elapsed-depth bound spends
+    (``_gate_reserve``: the coordinator's own model, from the policy ``_policy`` is building — passed as
+    its keyword arguments — and this run's value). The coordinator judges the ordering against the
+    deadline on what REMAINS of ``t_rxd`` once that many blocks have elapsed (``pre_btc_lock_check``
+    step 7, and the same check when it is built), so the derivation and every "it is derived" message
+    add it. Refuses here, before any mint, where it cannot be modelled (an NFT or FT swap without
+    --value-at-risk-photons)."""
+    policy = MarginPolicy(rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s), **policy_kwargs)
+    # The run's funding bound, without `funding_bound_from_args`' printed statement (the run prints it
+    # once, building its CoordinatorConfig); the override does not move the elapsed bound in any case.
+    bound = dataclasses.replace(
+        DEFAULT_ELAPSED_BOUND_POLICY,
+        accept_single_operator_up_to_photons=getattr(args, "accept_single_operator_up_to", None),
+    )
+    args.gate_reserve_blocks = _gate_reserve(args, policy, bound)
+
+
+def _derived_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = None) -> int:
+    """The ``t_rxd`` this run derives when ``--t-rxd-blocks`` is omitted: the deadline's own floor
+    (:func:`_recommended_t_rxd_blocks`) plus the taker gate's reserve (:func:`_reserve_the_gate_bound`).
+    Every bound here is a floor, so adding the reserve only lengthens the window."""
+    return _recommended_t_rxd_blocks(args, remaining_s=remaining_s) + int(getattr(args, "gate_reserve_blocks", 0))
 
 
 #: BIP68's relative-lock cap in blocks. The search space for `--t-rxd-blocks`; the converter
@@ -405,7 +437,7 @@ def _a_workable_t_rxd_exists(args: argparse.Namespace, *, remaining_s: int | Non
 def _recommended_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = None) -> int:
     """The value this run should USE, and the only value any message here should ADVISE.
 
-    The library's derivation when it satisfies every enforced bound; the top of the feasible range
+    The library's derivation when it satisfies every enforced bound; the bottom of the feasible range
     when it does not. Those differ, and an earlier version of this fix got the consequence wrong in
     both directions at once. It folded "the derivation lands inside the range" into the DEADLINE
     guard, so on a fractional fast tail it refused 254 of 950 measured parameter rows whose feasible
@@ -420,10 +452,11 @@ def _recommended_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | No
     derived: <that same value>". Sourcing the recommendation from the feasible SET instead makes the
     contradiction unrepresentable: a value that is advised is, by construction, a value that passes.
 
-    Clamping UP is the safe direction, not merely the convenient one. The derivation can only be at
-    or below `hi` (it asks the gate, which IS bound B), so the fix-up only ever LENGTHENS the RXD
-    window: a longer maker lock, which is a liveness cost, and a longer taker claim window, which is
-    the safety-relevant one. `eth_rxd_timelock` states that split explicitly.
+    Clamping UP to the floor is the safe direction, not merely the convenient one: the fix-up only
+    ever LENGTHENS the RXD window, by the fewest blocks that pass — a longer maker lock, which is a
+    liveness cost, and a longer taker claim window, which is the safety-relevant one.
+    `eth_rxd_timelock` states that split explicitly. This does NOT include the taker gate's elapsed
+    reserve; :func:`_derived_t_rxd_blocks` adds it.
     """
     window = _t_rxd_feasible_range(args, remaining_s=remaining_s)
     if window is None:
@@ -435,7 +468,10 @@ def _recommended_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | No
     derived = _derivable_t_rxd(args, remaining_s)
     if derived is not None and lo <= derived <= hi:
         return derived
-    return hi
+    # The SMALLEST feasible value, not the largest. Every bound is a floor now (#482) and `hi` is the
+    # BIP68 field width, so returning `hi` here advised a 65,535-block (about 227 days at 300 s) maker
+    # lock for a derivation one rounding step under the floor.
+    return lo
 
 
 def _largest_workable_eth_timeout_s(args: argparse.Namespace) -> int | None:
@@ -597,7 +633,7 @@ def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_
         f"through {margin_s}s ({margin_s / 3600:.2f} h) of cross-clock margin — ETH finality, the "
         f"stall budget, claim burial and slack. The maker could refund the asset while the taker "
         f"was still waiting.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_recommended_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
         f"  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
         f"window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
     )
@@ -636,18 +672,11 @@ def _assert_t_rxd_outlasts_the_eth_deadline(args: argparse.Namespace, *, remaini
         f"{required_s / 3600:.1f} h this swap requires (--eth-timeout-s PLUS the {margin_s}s "
         f"cross-clock margin). The maker's Radiant refund would open while it can still claim the "
         f"ETH leg with p — it could take both legs.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_recommended_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
-        f"  minimum: --t-rxd-blocks {lo}\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
+        f"  minimum: --t-rxd-blocks {lo + int(getattr(args, 'gate_reserve_blocks', 0))}\n"
         f"  NOTE the direction: before #482 this bound was a CAP and this message said 'too LONG'. "
         f"Lengthening t_rxd is the fix now; shortening it was never safe."
     )
-
-
-#: The sepolia-dust default when ``--t-rxd-blocks`` is omitted. ``t_btc`` (decorative for ETH, but
-#: checked against t_rxd in the same unit) is derived after the taker gate's own model of the elapsed
-#: blocks is reserved — about 80 at dust value — so with the default 36-block margin the smallest
-#: that constructs is 154 (measured 2026-09-30). 60 constructed nothing.
-_SEPOLIA_DEFAULT_T_RXD_BLOCKS = 160
 
 
 def _derive_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = None) -> int:
@@ -711,7 +740,7 @@ def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace, *, rema
         f"window — the span where the maker's covenant refund has matured AND the counter leg is "
         f"still claimable with the preimage, so the maker can end up holding both legs. It should "
         f"be bounded by the {margin_s / 3600:.2f} h cross-clock margin.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_recommended_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
+        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
         f"  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
         f"the taker safety. Only one of those is recoverable."
     )
@@ -1144,6 +1173,10 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # parse-time answer means something on a resume too.
     restore = _load_restore(args)
     eth_timeout = resolve_eth_timeout(restore, now_unix_s=int(time.time()), eth_timeout_s=args.eth_timeout_s)
+    # A resume rebuilds the covenant it funded, so t_rxd is the one it recorded — re-deriving it from
+    # what is LEFT of the deadline gives a different covenant, which the resume then refuses.
+    if restore is not None and int(args.t_rxd_blocks) == 0 and restore.get("t_rxd_blocks") is not None:
+        args.t_rxd_blocks = int(restore["t_rxd_blocks"])
     # Only a RESUME has a deadline that is not `now + --eth-timeout-s`. Passing the remaining time
     # unconditionally made a fresh run's refusals talk about "the resumed swap's deadline".
     policy = _policy(args, remaining_s=(eth_timeout - int(time.time())) if restore is not None else None)
@@ -1203,10 +1236,10 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         network=evm_chain_by_id(int(args.eth_chain_id)).network,
     )
     try:
-        # The Radiant blocks t_btc reserves for the taker gate's elapsed-depth bound — the gate's own
-        # model, from this run's policy and value. Refuses here, before any mint, when it cannot be
-        # modelled (an NFT/FT swap without --value-at-risk-photons).
-        elapsed_reserve = _gate_reserve(args, policy, cfg.funding_bound)
+        # The Radiant blocks t_rxd and t_btc reserve for the taker gate's elapsed-depth bound — the
+        # gate's own model, from this run's policy and value, computed by `_policy` (which refused,
+        # before any mint, where it cannot be modelled: an NFT/FT swap without --value-at-risk-photons).
+        elapsed_reserve = int(args.gate_reserve_blocks)
 
         def coordinator_for(terms, rkeys, *, indexer=None, record=None):
             """The run's coordinator — ONE wiring, for the preflight below and for the run."""
@@ -1232,6 +1265,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 # recoverable. The coordinator refuses an ETH counter-leg without it.
                 persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
                 config=cfg,
+                # The ETH deadline is absolute, so the coordinator judges its ordering against t_rxd
+                # from the clock when it is built (a NEGOTIATED record on mainnet Radiant).
+                now_unix_s=int(time.time()),
             )
 
         minted = None
@@ -1257,8 +1293,15 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         pre_terms, _pre_cov, _pre_p, _pre_h, pre_rkeys = _build_terms_and_covenant(
             args, eth_timeout=eth_timeout, elapsed_reserve=elapsed_reserve, minted=stand_in, restore=restore
         )
+        # On a resume the swap may be past NEGOTIATED; the preflight then builds on the persisted
+        # record, so an in-flight swap is not refused the negotiation-time checks it already passed.
+        persisted = (
+            JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json").load_record()
+            if args.resume
+            else None
+        )
         preflight_coordinator(
-            lambda: coordinator_for(pre_terms, pre_rkeys),
+            lambda: coordinator_for(pre_terms, pre_rkeys, record=persisted),
             before="anything is minted or broadcast",
         )
 
@@ -1655,7 +1698,8 @@ def _args() -> argparse.Namespace:
         "--t-rxd-blocks",
         type=int,
         default=0,
-        help="0 (default) DERIVES it from --eth-timeout-s and the measured fast tail. Pass a "
+        help="0 (default) DERIVES it from --eth-timeout-s, the measured fast tail and the taker gate's "
+        "modelled elapsed bound. Pass a "
         "value only to override a rehearsal; it is checked against the same bounds either way.",
     )
     # asset: plain RXD (default) or a freshly-minted NFT Glyph (Glyph↔ETH).

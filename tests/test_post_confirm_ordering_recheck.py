@@ -370,9 +370,10 @@ def test_the_btc_ordering_gate_still_runs_only_at_fund_time() -> None:
 
     One lives inside `pre_btc_lock_check` (step 3); one inside `_judge_remaining_window` (step 7),
     which is called only from `pre_btc_lock_check` and from the lock-time re-run in
-    `taker_funds_btc`, immediately before `counter_leg.fund`; two inside `_funding_proof_room_failure`,
-    the negotiation-time check, which is itself called only from the constructor (for a NEGOTIATED
-    record) and from `pre_btc_lock_check`. Pre-fund, all of them, and pinned below. Anything else
+    `taker_funds_btc`, immediately before `counter_leg.fund`; one inside `_timelock_ordering_failure`,
+    which is called only from `_funding_proof_room_failure`, the negotiation-time check, itself called
+    only from the constructor (for a NEGOTIATED record) and from `pre_btc_lock_check`. Pre-fund, all of
+    them, and pinned below. Anything else
     would be the post-confirm rerun the test above measured as refusing honest terms — so this fails
     and points at that measurement rather than letting the rerun land on the strength of the
     symmetry argument alone.
@@ -387,15 +388,23 @@ def test_the_btc_ordering_gate_still_runs_only_at_fund_time() -> None:
                     enclosing.setdefault(sub.lineno, node.name)
     assert enclosing, "no assert_timelock_margin call found in the coordinator — the scan has broken"
     assert sorted(set(enclosing.values())) == [
-        "_funding_proof_room_failure",
         "_judge_remaining_window",
+        "_timelock_ordering_failure",
         "pre_btc_lock_check",
     ], (
         f"assert_timelock_margin is now called from {sorted(set(enclosing.values()))}. If that is a "
         "post-confirm rerun, read the measurement on _assert_btc_counter_funding_verified first: "
         "both shapes of it refuse honest, production-derived terms."
     )
-    assert len(enclosing) == 4, f"expected the four pre-fund call sites, found {len(enclosing)}"
+    assert len(enclosing) == 3, f"expected the three pre-fund call sites, found {len(enclosing)}"
+    ordering_callers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "self._timelock_ordering_failure"
+    }
+    assert ordering_callers == {"_funding_proof_room_failure"}, ordering_callers
     room_callers = {
         node.name
         for node in ast.walk(tree)

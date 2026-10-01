@@ -233,11 +233,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     about 80 at dust value, so no `--t-rxd-blocks` passed `dust_swap_run.py --stage dust` (80 to
     1000 swept) and `eth_swap_run.py` refused below about 114. The mainnet runners now reserve the
     gate's own model (`_dust_swap_shared.gate_elapsed_reserve_blocks`, built on the new
-    `swap_coordinator.taker_gate_early_bound`, which the coordinator's check calls too). New
-    defaults: `dust_swap_run.py` 120 (smallest that constructed in the probe: 87, with a one-block
-    measured BTC margin it is 84), `eth_swap_run.py` sepolia-dust 160 (154 at the default 36-block
-    margin), `eth_swap_grief_run.py` 120 (110). The refusal no longer prints a negative block count
-    ("the -60 blocks of it left"); it says how many blocks short `t_rxd` is.
+    `swap_coordinator.taker_gate_early_bound`, which the coordinator's check calls too).
+    `dust_swap_run.py` defaults to 120 (smallest that constructed in the probe: 87, with a one-block
+    measured BTC margin it is 84). The refusal no longer prints a negative block count ("the -60
+    blocks of it left"); it says how many blocks short `t_rxd` is.
+  - The negotiation-time check ran the timelock ordering for a BTC counter leg only. An ETH or
+    ERC-20 swap whose `t_rxd` could not outlast its deadline constructed, the maker locked, and the
+    taker's `pre_btc_lock_check` step 3 then refused: `eth_swap_run.py --stage sepolia-dust` at its
+    defaults (`t_rxd` 160 against a 24 h deadline) projected the refund 5,760 s out, and
+    `eth_swap_grief_run.py` (`t_rxd` 120) failed step 7 at the modelled bound of 80. The check now
+    runs step 3 and step 7 on the modelled bound for every counter leg, refusing what they would
+    refuse on an honest chain before anyone locks. An ETH or ERC-20 deadline is absolute, so
+    `SwapCoordinator` takes `now_unix_s` (new) and refuses such a NEGOTIATED value-bearing swap
+    without it. At construction the deadline's claim floor is also judged when the taker's gate can
+    first accept the funding on that chain (`k` nominal spacings plus the bound's slack, 5,400 s at
+    dust). The ETH runners now derive `t_rxd` when `--t-rxd-blocks` is omitted: the deadline's own
+    floor plus the gate's modelled bound (`eth_swap_run.py`, both stages: 2,577 at the 24 h default
+    and a 36 s fast tail; `eth_swap_grief_run.py`: 308 at its new 2 h default deadline, which
+    replaces 1,800 s). A resume reuses the recorded `t_rxd`, and the derivation's fallback is the
+    smallest feasible value, not the BIP68 maximum.
   - NFT and FT swaps had no value at stake, so the coordinator refused them, and without
     `--*-reuse-reveal-txid` the fresh mainnet mint ran first. `--value-at-risk-photons` (new, on
     every script that builds a mainnet coordinator; `measure_margin_from_btc_block_times` takes

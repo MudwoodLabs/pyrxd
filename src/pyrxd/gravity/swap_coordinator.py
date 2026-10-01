@@ -1267,6 +1267,15 @@ def _funding_burial(
     return max(depth, _value_scaled_burial_blocks(policy, value_at_stake))
 
 
+#: The refusal for an ETH or ERC-20 counter leg judged without a clock (see
+#: :meth:`SwapCoordinator._timelock_ordering_failure`).
+_NO_CLOCK_FOR_AN_ABSOLUTE_DEADLINE = (
+    "the counter leg's deadline (counter_chain {chain!r}) is an absolute time, so its ordering against t_rxd "
+    "is judged from the wall clock and none was supplied; pass now_unix_s (the coordinator never reads the "
+    "clock itself)"
+)
+
+
 def taker_gate_early_bound(
     *,
     chain: RadiantChain,
@@ -1637,6 +1646,11 @@ class SwapCoordinator:
         between "BTC is locked on-chain" and "record advanced" cannot double-fund on
         retry (kieran-python HIGH). ``None`` disables durability (tests that do not
         exercise crash-atomicity); the in-memory record still advances.
+    now_unix_s:
+        The caller's wall clock at construction (the coordinator never reads it itself). Used only
+        by the negotiation-time check on a NEGOTIATED record on a value-bearing Radiant network,
+        where an ETH or ERC-20 counter leg's timelock ordering is judged against the absolute
+        ``eth_timeout_unix_s`` from ``now`` — so such a coordinator is refused without it.
     """
 
     def __init__(
@@ -1651,6 +1665,7 @@ class SwapCoordinator:
         config: CoordinatorConfig,
         persist: PersistHook | None = None,
         credential_resolver=None,
+        now_unix_s: int | None = None,
     ) -> None:
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
@@ -1816,8 +1831,10 @@ class SwapCoordinator:
         # The terms, the value and the policy are all known here, so refuse now. Only for a
         # NEGOTIATED record: a coordinator built to recover an in-flight swap must construct whatever
         # its terms were.
+        if now_unix_s is not None and (not isinstance(now_unix_s, int) or isinstance(now_unix_s, bool)):
+            raise ValidationError("now_unix_s must be an int or None")
         if record.state is SwapState.NEGOTIATED:
-            room = self._funding_proof_room_failure(record.terms)
+            room = self._funding_proof_room_failure(record.terms, now_unix_s=now_unix_s, at_construction=True)
             if room is not None:
                 raise ValidationError(room)
 
@@ -1972,7 +1989,7 @@ class SwapCoordinator:
         # 3b. The same timelocks against the SMALLEST depth the taker gate can require of the maker's
         #     funding (see `_funding_proof_room_failure`) — before the chain is read. The constructor
         #     ran it on the record's terms; these are the terms this call was handed.
-        room = self._funding_proof_room_failure(terms)
+        room = self._funding_proof_room_failure(terms, now_unix_s=now_unix_s)
         if room is not None:
             return PreBtcLockGate(ok=False, reason=room)
 
@@ -2176,11 +2193,39 @@ class SwapCoordinator:
             radiant_min_confirmations=int(getattr(self.radiant_leg, "min_confirmations", 1)),
         )
 
-    def _funding_proof_room_failure(self, terms: NegotiatedTerms) -> str | None:
+    def _timelock_ordering_failure(
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None, elapsed_blocks: int
+    ) -> str | None:
+        """The cross-chain timelock ordering :meth:`pre_btc_lock_check` judges at step 3
+        (``elapsed_blocks=0``) and step 7 (the elapsed-depth bound), for EVERY counter leg: why it
+        fails with *elapsed_blocks* of ``t_rxd`` spent, or None.
+
+        BTC: :func:`assert_timelock_margin`. ETH and ERC-20: :meth:`_assert_eth_timelock_ordering`,
+        which judges the absolute ``eth_timeout_unix_s`` from *now_unix_s* and so cannot be judged
+        without it — that is a failure here, never a skip."""
+        try:
+            if terms.counter_chain == "btc":
+                assert_timelock_margin(
+                    terms.t_btc, terms.t_rxd, self.config.margin_policy, elapsed_blocks=elapsed_blocks
+                )
+            else:
+                if now_unix_s is None:
+                    return _NO_CLOCK_FOR_AN_ABSOLUTE_DEADLINE.format(chain=terms.counter_chain)
+                self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s, elapsed_blocks=elapsed_blocks)
+        except ValidationError as exc:
+            return str(exc)
+        return None
+
+    def _funding_proof_room_failure(
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None = None, at_construction: bool = False
+    ) -> str | None:
         """Why *terms* are refused BEFORE ANYONE LOCKS on a value-bearing Radiant network, or None.
 
-        Run when the coordinator is built for a NEGOTIATED record and again at
-        :meth:`pre_btc_lock_check` step 3b, before the chain is read. Four checks:
+        Run when the coordinator is built for a NEGOTIATED record (with the ``now_unix_s`` it was
+        built with) and again at :meth:`pre_btc_lock_check` step 3b (with that call's), before the
+        chain is read. The maker locks its covenant BEFORE the taker's gate runs steps 3, 6 and 7, so
+        anything those steps would refuse on an honest chain has to be refused here instead, or the
+        maker's asset sits locked for ``t_rxd`` behind a swap that cannot proceed. Five checks:
 
         1. THE MEASURED FAST TAIL (every role). ``MarginPolicy.rxd_block_interval_fast_s`` is what
            time spans are converted into Radiant blocks by (:func:`_dividing_interval_s`); unset,
@@ -2207,14 +2252,24 @@ class SwapCoordinator:
            nominal spacing, the newest header up to ``funding_bound.early_slack_s`` old, no header
            above the newest checkpoint harder than ``funding_bound.early_work_margin`` times the
            shipped last interval's hardest) — and runs steps 6 and 7 on it with this coordinator's
-           policy. So a swap this accepts is not refused at step 6 on such a chain; what the model
-           does not cover is listed on that function, and step 6 on the proved bound stays
-           authoritative.
+           policy, for EVERY counter leg (:meth:`_timelock_ordering_failure`). So a swap this accepts
+           is not refused at step 6 or 7 on such a chain at a ``now`` no earlier than this one; what
+           the model does not cover is listed on that function, and steps 6 and 7 on the proved bound
+           stay authoritative.
+        5. STEP 3 ITSELF (every role, every counter leg): the timelock ordering with nothing elapsed.
+           An ETH or ERC-20 counter leg's deadline is absolute, so it is judged from ``now_unix_s``
+           and refused without one. A later ``now`` only moves the projected Radiant refund later, so
+           the ordering judged here still holds at the taker's steps 3 and 7. The deadline's own
+           liveness floor (:func:`assert_eth_deadline_is_claimable`) runs the other way — a later
+           ``now`` is nearer the deadline — so AT CONSTRUCTION (``at_construction``) it is also judged
+           at the time the taker's gate can first accept the funding on the modelled honest chain:
+           ``k`` nominal spacings after now (the funding mined one spacing after the maker broadcasts,
+           ``k - 1`` more to reach ``k`` deep) plus ``funding_bound.early_slack_s`` (the newest header up
+           to that old). At step 3b the funding already exists and step 3 has just judged it at the
+           real ``now``, so nothing is added there.
 
-        None — no check — on a test network, where there is no value term; when the configuration
-        has no Radiant chain, which the gate itself refuses; and where the negotiated terms already
-        fail step 3's own ordering check, which owns that refusal. The ETH ordering needs a clock,
-        so for an ETH counter leg only the step-6 floor runs here.
+        None — no check — on a test network, where there is no value term; and when the
+        configuration has no Radiant chain, which the gate itself refuses.
         """
         try:
             chain = radiant_chain_for_leg(self.radiant_leg, counter_leg=self.counter_leg)
@@ -2232,11 +2287,22 @@ class SwapCoordinator:
                 "far fewer blocks than a measured p10. Measure it for this run and set it "
                 "(MarginPolicy.measured(rxd_block_interval_fast_s=...))"
             )
+        if terms.counter_chain != "btc" and now_unix_s is None:
+            return before + _NO_CLOCK_FOR_AN_ABSOLUTE_DEADLINE.format(chain=terms.counter_chain)
+        # 5. Step 3 itself — the ordering with nothing elapsed. At step 3b it already passed; at
+        #    construction nothing else has run it, and the maker locks before the taker's step 3 does.
+        #    Reported only when nothing below has a more specific reason (step 6 or 7 on the bound).
+        ordering = self._timelock_ordering_failure(terms, now_unix_s=now_unix_s, elapsed_blocks=0)
+        step3 = (
+            None
+            if ordering is None
+            else before + f"the timelock ordering fails (pre_btc_lock_check step 3): {ordering}"
+        )
         runs_taker_gate = self.config.role is not SwapRole.MAKER
         value = self._funding_value_at_stake_photons(terms)
         if value is None or value <= 0:
             if not runs_taker_gate:
-                return None
+                return step3
             return before + (
                 "the taker gate this coordinator runs needs a value at stake to size the confirmations it "
                 "requires of the maker's funding, and refuses without one at step 5 — after the maker has "
@@ -2272,6 +2338,7 @@ class SwapCoordinator:
             return before + f"the taker gate's elapsed-depth bound cannot be modelled: {exc}"
         elapsed = early.elapsed_blocks_upper
         why = None
+        remedy = "Negotiate a longer t_rxd or a smaller value"
         floor = self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=elapsed)
         if floor is not None:
             t_rxd = int(terms.t_rxd.value)
@@ -2290,17 +2357,35 @@ class SwapCoordinator:
                     f"{left} once {elapsed} have elapsed, and a safe claim needs {need - elapsed} "
                     f"(pre_btc_lock_check step 6): t_rxd is {need - t_rxd} blocks short of the {need} this needs"
                 )
-        elif terms.counter_chain == "btc":
-            try:
-                assert_timelock_margin(terms.t_btc, terms.t_rxd, mp)
-            except ValidationError:
-                return None
-            try:
-                assert_timelock_margin(terms.t_btc, terms.t_rxd, mp, elapsed_blocks=elapsed)
-            except ValidationError as exc:
-                why = f"with {elapsed} elapsed the timelock ordering fails (pre_btc_lock_check step 7): {exc}"
+        else:
+            # Step 7, for EVERY counter leg. This ran for a BTC counter leg only, so an ETH or ERC-20
+            # swap whose t_rxd could not outlast its deadline once the bound had elapsed constructed,
+            # the maker locked, and the taker's step 3 or 7 refused.
+            step7 = (
+                None
+                if step3 is not None  # nothing elapsed already fails: step 3's reason is the one to give
+                else self._timelock_ordering_failure(terms, now_unix_s=now_unix_s, elapsed_blocks=elapsed)
+            )
+            if step7 is not None:
+                why = f"with {elapsed} elapsed the timelock ordering fails (pre_btc_lock_check step 7): {step7}"
+            elif step3 is None and at_construction and terms.counter_chain != "btc" and now_unix_s is not None:
+                spacing = int(chain.target_spacing_s)
+                wait_s = early.required_confirmations * spacing + int(fb.early_slack_s)
+                try:
+                    assert_eth_deadline_is_claimable(
+                        now_unix_s=now_unix_s + wait_s,
+                        eth_timeout_unix_s=terms.eth_timeout_unix_s,
+                        margin=mp.cross_clock_margin,
+                    )
+                except ValidationError as exc:
+                    why = (
+                        f"the taker's gate can first accept the funding about {wait_s} s from now ({early.required_confirmations} "
+                        f"blocks at {spacing} s, the newest header up to {fb.early_slack_s} s old), and by then the "
+                        f"counter leg's deadline is too near (pre_btc_lock_check steps 3 and 7): {exc}"
+                    )
+                    remedy = "Negotiate a later counter-leg deadline, and a t_rxd that outlasts it"
         if why is None:
-            return None
+            return step3
         return before + (
             f"with this coordinator's policy the taker gate can require the maker's funding up to {early.required_confirmations} "
             f"blocks deep (k = max({MIN_FUNDING_CONFIRMATIONS}, burial {burial}, ceil(2 × value {value} photons ÷ C) "
@@ -2308,8 +2393,7 @@ class SwapCoordinator:
             f"its upper bound on the blocks elapsed since the funding can then be {elapsed} on an honest chain "
             f"(blocks every {int(chain.target_spacing_s)} s, the newest up to {fb.early_slack_s} s old; the blocks after "
             f"the reference header {early.reference_depth} deep counted at {fb.surge_factor:g}× that rate, "
-            f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why}. Negotiate a longer "
-            "t_rxd or a smaller value"
+            f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why}. {remedy}"
         )
 
     async def taker_verify_asset_funding(

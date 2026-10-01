@@ -76,13 +76,26 @@ def _sepolia_dust_args(mod, monkeypatch, *extra: str, node=_NODE_FLAGS) -> argpa
 def _eth_coord_on_mainnet_radiant(monkeypatch, policy):
     """The reviewer's shape: an ETH (Sepolia) counter leg, the Radiant leg tagged 'bc' — mainnet,
     as ``SshTrRadiantClient.NETWORK`` is — and a fresh NEGOTIATED record."""
+    import math
+
+    from pyrxd.gravity import funding_spv
+    from pyrxd.gravity.swap_coordinator import taker_gate_early_bound
+    from tests.test_swap_coordinator import _NOW
+
     base, _chain = _value_bearing_chain(monkeypatch)
     p = os.urandom(32)
-    terms = dataclasses.replace(
-        _eth_terms(hashlock=hashlib.sha256(p).digest()),
-        t_rxd=bt.Timelock(120, bt.TimeUnit.BLOCKS),
-        radiant_amount=1000,
-    )
+    terms = dataclasses.replace(_eth_terms(hashlock=hashlib.sha256(p).digest()), radiant_amount=1000)
+    # t_rxd that outlasts the absolute deadline at the fast tail once the taker gate's modelled
+    # elapsed-depth bound is spent — the ordering the coordinator now judges when it is built.
+    fast = policy.rxd_block_interval_fast_s
+    if fast and policy.cross_clock_margin is not None:
+        reserve = taker_gate_early_bound(
+            chain=funding_spv.MAINNET_CHAIN, policy=policy, value_at_stake_photons=terms.radiant_amount
+        ).elapsed_blocks_upper
+        span = terms.eth_timeout_unix_s - _NOW + policy.cross_clock_margin.total_s()
+        terms = dataclasses.replace(terms, t_rxd=bt.Timelock(math.ceil(span / fast) + reserve, bt.TimeUnit.BLOCKS))
+    else:
+        terms = dataclasses.replace(terms, t_rxd=bt.Timelock(120, bt.TimeUnit.BLOCKS))
     view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
     eth = FakeEthLeg(preimage=p, verdict=_final())
     eth.network = "sepolia"
@@ -99,6 +112,7 @@ def _eth_coord_on_mainnet_radiant(monkeypatch, policy):
             accept_estimated_eth_margins=True,
             accept_nondurable_seen=True,
         ),
+        now_unix_s=_NOW,
     )
 
 

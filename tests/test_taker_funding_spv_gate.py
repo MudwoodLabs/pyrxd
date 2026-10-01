@@ -1564,29 +1564,45 @@ def test_a_swap_whose_t_rxd_cannot_hold_the_bound_is_refused_when_the_coordinato
     assert view.reads == []
 
 
-def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monkeypatch):
-    """For an ETH counter leg only the step-6 floor runs early (the ordering needs a clock), so the
-    floor alone must see the bound. A small value constructs; a value whose modelled bound leaves
-    t_rxd 600 no room for a safe claim is refused at construction."""
+def _eth_early_case(monkeypatch, *, t_rxd: int | None = None, deadline_s: int = 86_400):
+    """An ETH counter leg against a value-bearing Radiant leg, as ``eth_swap_run.py --stage sepolia-dust``
+    builds it: the deadline ``deadline_s`` after ``_NOW``, the measured fast tail, the dust margins. Returns
+    ``(build, terms_at, reserve)``: ``build(terms, value, now=_NOW)`` constructs a NEGOTIATED coordinator;
+    ``terms_at(t_rxd)`` the terms; ``reserve(value)`` the taker gate's modelled elapsed bound."""
     import dataclasses
 
     from pyrxd.btc_wallet import taproot as t
+    from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+    from pyrxd.gravity.swap_coordinator import taker_gate_early_bound
 
     base, chain = _value_bearing_chain(monkeypatch)
     p = os.urandom(32)
-    terms = dataclasses.replace(
-        _eth_terms(hashlock=hashlib.sha256(p).digest()),
-        t_btc=t.Timelock(1, t.TimeUnit.BLOCKS),
-        t_rxd=t.Timelock(600, t.TimeUnit.BLOCKS),
-        radiant_amount=1000,
+    margin = CrossClockMargin(
+        eth_reorg_finality_s=768, rxd_claim_burial_s=1800, rxd_confirm_slack_s=600, rounding_slack_s=300
     )
-    view = _ChainView(
-        pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS, tip_time=_NOW
-    )
-    eth = FakeEthLeg(preimage=p, verdict=_final())
-    eth.network, eth.chain_id = "sepolia", 11155111
 
-    def build(value):
+    def policy(value):
+        return _vb_policy(
+            value_at_risk_photons=value,
+            eth_finalization_window_s=768,
+            cross_clock_margin=margin,
+            max_covenant_confirm_wait_s=3600,
+        )
+
+    def terms_at(t_rxd_blocks):
+        return dataclasses.replace(
+            _eth_terms(hashlock=hashlib.sha256(p).digest(), eth_timeout_unix_s=_NOW + deadline_s),
+            t_btc=t.Timelock(1, t.TimeUnit.BLOCKS),
+            t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
+            radiant_amount=1000,
+        )
+
+    def build(terms, value=1000, now=_NOW):
+        view = _ChainView(
+            pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS, tip_time=_NOW
+        )
+        eth = FakeEthLeg(preimage=p, verdict=_final())
+        eth.network, eth.chain_id = "sepolia", 11155111
         return SwapCoordinator(
             record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
             counter_leg=eth,
@@ -1594,20 +1610,100 @@ def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monk
             indexer=FakeIndexer(),
             seen_store=FakeSeenStore(),
             config=CoordinatorConfig(
-                margin_policy=_vb_policy(value_at_risk_photons=value, eth_finalization_window_s=768),
+                margin_policy=policy(value),
                 maker_stall_safety_window_blocks=6,
                 accept_estimated_eth_margins=True,
                 accept_nondurable_seen=True,
             ),
+            now_unix_s=now,
         )
 
-    assert build(1000) is not None
+    def reserve(value=1000):
+        return taker_gate_early_bound(
+            chain=chain, policy=policy(value), value_at_stake_photons=value
+        ).elapsed_blocks_upper
+
+    floor = -(-(deadline_s + margin.total_s()) // int(_FAST_S))  # the deadline alone, nothing elapsed
+    return build, terms_at, reserve, floor, chain
+
+
+def test_an_eth_swap_that_steps_3_and_7_would_refuse_is_refused_when_the_coordinator_is_built(monkeypatch):
+    """The reviewer's probe (``eth_swap_run.py --stage sepolia-dust`` at its defaults, t_rxd 160 against a
+    24 h deadline): the coordinator CONSTRUCTED, the maker locked, and only then did ``pre_btc_lock_check``
+    step 3 refuse — the projected refund 5,760 s out against a deadline a day away. The negotiation-time
+    check ran the timelock ordering for a BTC counter leg only. It now runs step 3 and step 7 for every
+    counter leg, from the clock the coordinator is built with:
+
+    * t_rxd 160 is refused at construction, naming step 3 (it fails with nothing elapsed);
+    * t_rxd that meets the deadline only with nothing elapsed is refused too — step 7 on the bound;
+    * that plus the modelled bound constructs, and the coordinator's own step 3 and steps 6/7 then pass at
+      ``now`` with the modelled maximum elapsed;
+    * without a clock it is refused, naming ``now_unix_s``."""
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch)
+    e = reserve()
+    assert e >= 1
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 3.*refund could open too EARLY"):
+        build(terms_at(160))
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 7") as exc:
+        build(terms_at(floor + e - 1))
+    assert f"with {e} elapsed the timelock ordering fails" in str(exc.value), str(exc.value)
+    terms = terms_at(floor + e)
+    coord = build(terms)
+    coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # step 3
+    assert coord._judge_remaining_window(terms, cov_confs=e, now_unix_s=_NOW) is None  # steps 6 and 7
+    assert coord._judge_remaining_window(terms, cov_confs=e + 1, now_unix_s=_NOW) is not None  # tight
+    with pytest.raises(ValidationError, match="refused before anyone locks.*pass now_unix_s"):
+        build(terms, now=None)
+
+
+def test_the_early_eth_check_also_refuses_step_3_alone(monkeypatch):
+    """A deadline already past: the step-3 liveness floor refuses at construction (nothing below has a
+    more specific reason, since the ordering trivially holds), naming step 3."""
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=-60)
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 3"):
+        build(terms_at(floor + reserve() + 100))
+
+
+def test_an_eth_deadline_too_near_for_the_takers_gate_is_refused_when_the_coordinator_is_built(monkeypatch):
+    """The deadline's liveness floor runs the other way from the ordering: a LATER clock is nearer the
+    deadline. The taker's gate first accepts the funding once it is ``k`` deep — on the modelled honest
+    chain ``k`` nominal spacings plus the bound's slack after the coordinator is built — so a deadline that
+    clears the floor now but not then (``eth_swap_grief_run.py``'s old 1,800 s default) is refused at
+    construction, naming that wait; a deadline that clears it then constructs. At ``pre_btc_lock_check``
+    step 3b nothing is added: the funding already exists there, and step 3 judges the real clock."""
+    from pyrxd.gravity.eth_rxd_timelock import assert_eth_deadline_is_claimable
+
+    for deadline in (1800, 3600):
+        build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=deadline)
+        terms = terms_at(floor + reserve())
+        with pytest.raises(ValidationError, match=r"first accept the funding about 5400 s from now.*too near") as exc:
+            build(terms)
+        assert "Negotiate a later counter-leg deadline" in str(exc.value)
+        assert "Negotiate a longer t_rxd" not in str(exc.value)
+    build, terms_at, reserve, floor, _chain = _eth_early_case(monkeypatch, deadline_s=7200)
+    terms = terms_at(floor + reserve())
+    coord = build(terms)
+    # The same terms judged at step 3b (no wait added) pass, and the floor itself holds at the taker's time.
+    assert coord._funding_proof_room_failure(terms, now_unix_s=_NOW) is None
+    assert_eth_deadline_is_claimable(
+        now_unix_s=_NOW + 5400,
+        eth_timeout_unix_s=terms.eth_timeout_unix_s,
+        margin=coord.config.margin_policy.cross_clock_margin,
+    )
+
+
+def test_the_early_check_runs_the_step_6_floor_on_the_bound_for_an_eth_swap(monkeypatch):
+    """The step-6 floor on the bound, for an ETH counter leg: a small value constructs; a value whose
+    modelled bound leaves t_rxd no room for a safe claim is refused at construction, naming step 6."""
+    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=7200)
+    terms = terms_at(floor + reserve() + 10)
+    assert build(terms) is not None
     big = 150 * funding_spv.forged_confirmation_cost_floor_photons(chain)
-    assert (
-        early_elapsed_blocks_upper(chain=chain, value_at_stake_photons=big, burial_blocks=1).elapsed_blocks_upper > 600
+    assert early_elapsed_blocks_upper(chain=chain, value_at_stake_photons=big, burial_blocks=1).elapsed_blocks_upper > (
+        terms.t_rxd.value
     )
     with pytest.raises(ValidationError, match=r"refused before anyone locks.*step 6"):
-        build(big)
+        build(terms, value=big)
 
 
 #: About three times the work of ``_HARD_BITS`` (its target is a third as large): the hardest header
