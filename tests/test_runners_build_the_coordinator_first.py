@@ -571,3 +571,87 @@ async def test_a_resumed_eth_run_rebuilds_the_covenant_it_recorded_at_the_derive
     second = await _run(mod.run_sepolia_dust(args))
     assert second == "stopped at wait_for_covenant_funding", (second, events)
     assert int(args.t_rxd_blocks) == recorded
+
+
+async def test_a_resumed_eth_run_near_its_deadline_is_not_refused_for_a_wait_already_behind_it(tmp_path, monkeypatch):
+    """The reviewer's probe through ``eth_swap_run.py --resume``: the deadline 4,000 s away. The
+    construction-time projection treated every NEGOTIATED record as built before the maker funds, so the
+    resume's preflight refused ("first accept the funding about 5400 s from now ... too near") although
+    the taker's gate, judging the real chain, accepts. Two resumes, each reaching the run's next step:
+
+    * an interrupted FUND (the swap record carries the pending deploy): nothing is projected;
+    * a covenant already funded 100 deep, with no swap record: the runner reads the depth off the node
+      and the coordinator waits for nothing.
+
+    And the other branch: the same resume with the node unable to say (no funding seen) is still
+    refused at the preflight."""
+    import dataclasses
+    import json
+    import time as real_time
+
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    mod = _load("eth_swap_run")
+    events: list[str] = []
+    _instrument(mod, events, monkeypatch)
+    built: list = []
+    recording = mod.SwapCoordinator
+
+    class _Capture(recording):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            built.append(self)
+
+    monkeypatch.setattr(mod, "SwapCoordinator", _Capture)
+    argv = _eth_argv(tmp_path)
+    monkeypatch.setattr(sys, "argv", argv)
+    assert await _run(mod.run_sepolia_dust(mod._args())) == "stopped at wait_for_covenant_funding", events
+    record = built[-1].record
+    keys_out = argv[argv.index("--keys-out") + 1]
+    restore = json.loads(Path(keys_out).read_text())
+    offset = record.terms.eth_timeout_unix_s - 4000 - int(real_time.time())
+
+    class _NearTheDeadline:
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        @staticmethod
+        def time():
+            return real_time.time() + offset
+
+    monkeypatch.setattr(mod, "time", _NearTheDeadline())
+    resume_argv = [*argv, "--resume"]
+
+    # The other branch first: nothing observed (the node stub raises), no swap record — refused.
+    monkeypatch.setattr(sys, "argv", resume_argv)
+    with pytest.raises(SystemExit, match=r"(?s)refused before anything is minted.*first accept the funding.*too near"):
+        await _run(mod.run_sepolia_dust(mod._args()))
+
+    # An interrupted fund: the record carries the pending deploy.
+    sink = JsonFileRecordSink(keys_out + ".swaprec.json")
+    await sink(
+        dataclasses.replace(
+            record, pending_counter_contract="0x" + "44" * 20, pending_counter_deploy_tx="0x" + "ab" * 32
+        )
+    )
+    built.clear()
+    assert await _run(mod.run_sepolia_dust(mod._args())) == "stopped at wait_for_covenant_funding"
+    assert len(built) == 2 and all(c.record.pending_counter_contract for c in built)
+    Path(keys_out + ".swaprec.json").unlink()
+
+    # A covenant already funded 100 deep, read off the node.
+    shim = sys.modules["radiant_mainnet_chainio"]
+    funded_at = 470_000
+
+    async def node(self, *cli):
+        if cli[0] == "scantxoutset":
+            assert f"raw({restore['rxd_covenant_spk']})" in cli[2]
+            amount = restore["rxd_covenant_amount"] / 1e8
+            return {"unspents": [{"txid": "55" * 32, "vout": 0, "amount": amount, "height": funded_at}]}
+        raise _Stop(f"node RPC {cli[0]}")
+
+    monkeypatch.setattr(shim.SshTrRadiantClient, "_run", node)
+    monkeypatch.setattr(shim.SshTrRadiantClient, "_run_sync", lambda self, *cli: funded_at + 99)
+    built.clear()
+    assert await _run(mod.run_sepolia_dust(mod._args())) == "stopped at wait_for_covenant_funding"
+    assert [c._maker_funding_confirmations for c in built] == [100, 100]

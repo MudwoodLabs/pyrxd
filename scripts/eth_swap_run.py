@@ -1115,6 +1115,32 @@ async def run_dry(args: argparse.Namespace) -> None:
         proc.terminate()
 
 
+async def _observed_covenant_confirmations(rxd_client, restore: dict, *, expected_photons: int) -> int | None:
+    """The confirmations of the recorded covenant's funding on the node right now, or ``None``.
+
+    A resumed run builds its coordinator for a swap whose covenant the maker may already have funded.
+    Without the depth the coordinator projects the taker gate's first acceptance as if the funding
+    were still to be broadcast, and refuses a deadline the gate itself would accept. A read that fails
+    returns ``None``: the full projection, the stricter of the two.
+    """
+    spk_hex = restore.get("rxd_covenant_spk")
+    if not spk_hex:
+        return None
+    try:
+        height = await scan_covenant_fund_height(
+            rxd_client, covenant_spk=bytes.fromhex(spk_hex), expected_photons=int(expected_photons)
+        )
+        tip = rxd_blockcount(rxd_client)
+    except Exception as exc:  # any failure falls back to the stricter projection
+        print(f"  covenant funding depth not read ({exc}); the coordinator projects the whole wait for it")
+        return None
+    confs = int(tip) - int(height) + 1
+    if confs < 1:
+        return None
+    print(f"  covenant already funded: {confs} confirmation(s) at height {int(height)}")
+    return confs
+
+
 def _which(name: str) -> str:
     import shutil
 
@@ -1241,7 +1267,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # before any mint, where it cannot be modelled: an NFT/FT swap without --value-at-risk-photons).
         elapsed_reserve = int(args.gate_reserve_blocks)
 
-        def coordinator_for(terms, rkeys, *, indexer=None, record=None):
+        def coordinator_for(terms, rkeys, *, indexer=None, record=None, funding_confs=None):
             """The run's coordinator — ONE wiring, for the preflight below and for the run."""
             rxd_leg = RadiantCovenantLeg(
                 network=rxd_network,
@@ -1268,6 +1294,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 # The ETH deadline is absolute, so the coordinator judges its ordering against t_rxd
                 # from the clock when it is built (a NEGOTIATED record on mainnet Radiant).
                 now_unix_s=int(time.time()),
+                # On a resume the maker's funding may already be on chain: the depth read below, so
+                # the construction-time projection waits only for the blocks it still lacks.
+                maker_funding_confirmations=funding_confs,
             )
 
         minted = None
@@ -1300,8 +1329,15 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             if args.resume
             else None
         )
+        # On a resume the covenant may already be funded (and deep): read its depth, so the
+        # coordinator does not project the whole wait for a funding that already exists.
+        funding_confs = (
+            await _observed_covenant_confirmations(rxd_client, restore, expected_photons=pre_terms.radiant_amount)
+            if restore is not None
+            else None
+        )
         preflight_coordinator(
-            lambda: coordinator_for(pre_terms, pre_rkeys, record=persisted),
+            lambda: coordinator_for(pre_terms, pre_rkeys, record=persisted, funding_confs=funding_confs),
             before="anything is minted or broadcast",
         )
 
@@ -1427,7 +1463,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                     "the persisted record is for a DIFFERENT swap (hashlock mismatch) — refusing to "
                     "drive it with these terms."
                 )
-        coord = coordinator_for(terms, _rkeys, indexer=indexer, record=_loaded)
+        coord = coordinator_for(terms, _rkeys, indexer=indexer, record=_loaded, funding_confs=funding_confs)
 
         # Before funding the counter-leg, wait for the NFT genesis to reach the REF-gate reorg depth
         # (the pre-lock gate fails CLOSED on a shallow genesis). No-op for plain RXD (no genesis ref).

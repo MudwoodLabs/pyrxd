@@ -1651,6 +1651,15 @@ class SwapCoordinator:
         by the negotiation-time check on a NEGOTIATED record on a value-bearing Radiant network,
         where an ETH or ERC-20 counter leg's timelock ordering is judged against the absolute
         ``eth_timeout_unix_s`` from ``now`` — so such a coordinator is refused without it.
+    maker_funding_confirmations:
+        The confirmations of the maker's covenant funding the CALLER has already observed at
+        ``now_unix_s``, or ``None`` (the default: not observed, e.g. a coordinator built before the
+        maker funds). Read only by the construction-time projection of when the taker's gate can first
+        accept the funding (:meth:`_taker_gate_first_acceptance_wait`): ``k`` minus this many blocks
+        remain to wait for. A runner resuming a swap whose funding is already on chain passes the depth
+        it read. It can only shorten that projection; steps 3, 5, 6 and 7 read the chain themselves.
+        Passing a depth for a funding that does not exist removes the one check that keeps the maker
+        from locking into terms whose deadline the taker's gate cannot meet.
     """
 
     def __init__(
@@ -1666,6 +1675,7 @@ class SwapCoordinator:
         persist: PersistHook | None = None,
         credential_resolver=None,
         now_unix_s: int | None = None,
+        maker_funding_confirmations: int | None = None,
     ) -> None:
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
@@ -1833,6 +1843,13 @@ class SwapCoordinator:
         # its terms were.
         if now_unix_s is not None and (not isinstance(now_unix_s, int) or isinstance(now_unix_s, bool)):
             raise ValidationError("now_unix_s must be an int or None")
+        if maker_funding_confirmations is not None and (
+            not isinstance(maker_funding_confirmations, int)
+            or isinstance(maker_funding_confirmations, bool)
+            or maker_funding_confirmations < 0
+        ):
+            raise ValidationError("maker_funding_confirmations must be a non-negative int or None")
+        self._maker_funding_confirmations = maker_funding_confirmations
         if record.state is SwapState.NEGOTIATED:
             room = self._funding_proof_room_failure(record.terms, now_unix_s=now_unix_s, at_construction=True)
             if room is not None:
@@ -2262,11 +2279,13 @@ class SwapCoordinator:
            the ordering judged here still holds at the taker's steps 3 and 7. The deadline's own
            liveness floor (:func:`assert_eth_deadline_is_claimable`) runs the other way — a later
            ``now`` is nearer the deadline — so AT CONSTRUCTION (``at_construction``) it is also judged
-           at the time the taker's gate can first accept the funding on the modelled honest chain:
-           ``k`` nominal spacings after now (the funding mined one spacing after the maker broadcasts,
-           ``k - 1`` more to reach ``k`` deep) plus ``funding_bound.early_slack_s`` (the newest header up
-           to that old). At step 3b the funding already exists and step 3 has just judged it at the
-           real ``now``, so nothing is added there.
+           at the time the taker's gate can first accept the funding on the modelled honest chain
+           (:meth:`_taker_gate_first_acceptance_wait`): the blocks the funding still lacks of ``k``
+           (all ``k`` before the maker funds; fewer, or none, when the caller observed it on chain)
+           plus ``funding_bound.early_slack_s`` (the newest header up to that old). Not for a record
+           carrying a pending counter-leg deploy (a resumed fund: the taker already passed its gate).
+           At step 3b the funding already exists and step 3 has just judged it at the real ``now``,
+           so nothing is added there.
 
         None — no check — on a test network, where there is no value term; and when the
         configuration has no Radiant chain, which the gate itself refuses.
@@ -2369,21 +2388,21 @@ class SwapCoordinator:
             if step7 is not None:
                 why = f"with {elapsed} elapsed the timelock ordering fails (pre_btc_lock_check step 7): {step7}"
             elif step3 is None and at_construction and terms.counter_chain != "btc" and now_unix_s is not None:
-                spacing = int(chain.target_spacing_s)
-                wait_s = early.required_confirmations * spacing + int(fb.early_slack_s)
-                try:
-                    assert_eth_deadline_is_claimable(
-                        now_unix_s=now_unix_s + wait_s,
-                        eth_timeout_unix_s=terms.eth_timeout_unix_s,
-                        margin=mp.cross_clock_margin,
-                    )
-                except ValidationError as exc:
-                    why = (
-                        f"the taker's gate can first accept the funding about {wait_s} s from now ({early.required_confirmations} "
-                        f"blocks at {spacing} s, the newest header up to {fb.early_slack_s} s old), and by then the "
-                        f"counter leg's deadline is too near (pre_btc_lock_check steps 3 and 7): {exc}"
-                    )
-                    remedy = "Negotiate a later counter-leg deadline, and a t_rxd that outlasts it"
+                projected = self._taker_gate_first_acceptance_wait(chain, early)
+                if projected is not None:
+                    wait_s, basis = projected
+                    try:
+                        assert_eth_deadline_is_claimable(
+                            now_unix_s=now_unix_s + wait_s,
+                            eth_timeout_unix_s=terms.eth_timeout_unix_s,
+                            margin=mp.cross_clock_margin,
+                        )
+                    except ValidationError as exc:
+                        why = (
+                            f"the taker's gate can first accept the funding about {wait_s} s from now ({basis}), and "
+                            f"by then the counter leg's deadline is too near (pre_btc_lock_check steps 3 and 7): {exc}"
+                        )
+                        remedy = "Negotiate a later counter-leg deadline, and a t_rxd that outlasts it"
         if why is None:
             return step3
         return before + (
@@ -2394,6 +2413,42 @@ class SwapCoordinator:
             f"(blocks every {int(chain.target_spacing_s)} s, the newest up to {fb.early_slack_s} s old; the blocks after "
             f"the reference header {early.reference_depth} deep counted at {fb.surge_factor:g}× that rate, "
             f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why.rstrip('.')}. {remedy}"
+        )
+
+    def _taker_gate_first_acceptance_wait(
+        self, chain: RadiantChain, early: EarlyElapsedBound
+    ) -> tuple[int, str] | None:
+        """How long after construction the taker's gate can first accept the maker's funding, as
+        ``(seconds, how it was projected)`` — or ``None`` where nothing is waited for.
+
+        The gate accepts the funding once it is ``k`` deep (``early.required_confirmations``, the
+        largest ``k`` it can require). A coordinator built BEFORE the maker funds waits for all ``k``:
+        the funding mined one block after the maker broadcasts, ``k - 1`` more after it. One built
+        after the funding is already on chain waits only for the blocks it still lacks — none once
+        it is ``k`` deep — so the caller passes the depth it observed
+        (``maker_funding_confirmations``). Each wait is ``k`` blocks at the nominal spacing plus
+        ``funding_bound.early_slack_s`` (the newest header up to that old).
+
+        ``None`` for a record carrying a pending counter-leg deploy: the taker has already passed its
+        gate and started funding, so there is no first acceptance ahead to project. The lock-time
+        judgement (steps 3, 6 and 7 on the bound) still runs on it.
+        """
+        if self.record.pending_counter_contract:  # a resumed fund: the taker already passed its gate
+            return None
+        k = early.required_confirmations
+        seen = self._maker_funding_confirmations
+        remaining = k if seen is None else max(0, k - seen)
+        if remaining == 0:
+            return (
+                0,
+                f"the maker's funding was observed {seen} deep when the coordinator was built, at least the {k} the gate can require",
+            )
+        spacing = int(chain.target_spacing_s)
+        slack = int(self.config.funding_bound.early_slack_s)
+        start = "" if seen is None else f"the funding observed {seen} deep, "
+        return (
+            remaining * spacing + slack,
+            f"{start}{remaining} more block{'s' if remaining != 1 else ''} at {spacing} s, the newest header up to {slack} s old",
         )
 
     async def taker_verify_asset_funding(

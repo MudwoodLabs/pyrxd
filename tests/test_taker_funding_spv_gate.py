@@ -58,7 +58,7 @@ from pyrxd.gravity.funding_spv import (
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
-from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
+from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator, taker_gate_early_bound
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.hash import radiant_block_hash
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
@@ -1735,14 +1735,19 @@ def _eth_early_case(monkeypatch, *, t_rxd: int | None = None, deadline_s: int = 
             terms, taker_dest_hash=cov.expected_taker_hash, maker_dest_hash=cov.expected_maker_hash
         )
 
-    def build(terms, value=1000, now=_NOW):
+    def build(terms, value=1000, now=_NOW, *, pending=None, observed=None):
         view = _ChainView(
             pays=_covenant(terms), value=terms.radiant_amount, confs=100, base=base, bits=_HARD_BITS, tip_time=_NOW
         )
         eth = FakeEthLeg(preimage=p, verdict=_final())
         eth.network, eth.chain_id = "sepolia", 11155111
+        record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+        if pending is not None:
+            record = dataclasses.replace(
+                record, pending_counter_contract=pending, pending_counter_deploy_tx="0x" + "ab" * 32
+            )
         return SwapCoordinator(
-            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            record=record,
             counter_leg=eth,
             radiant_leg=_real_leg(view, network="bc"),
             indexer=FakeIndexer(),
@@ -1754,6 +1759,7 @@ def _eth_early_case(monkeypatch, *, t_rxd: int | None = None, deadline_s: int = 
                 accept_nondurable_seen=True,
             ),
             now_unix_s=now,
+            maker_funding_confirmations=observed,
         )
 
     def reserve(value=1000):
@@ -1828,6 +1834,37 @@ def test_an_eth_deadline_too_near_for_the_takers_gate_is_refused_when_the_coordi
         eth_timeout_unix_s=terms.eth_timeout_unix_s,
         margin=coord.config.margin_policy.cross_clock_margin,
     )
+
+
+async def test_the_takers_first_acceptance_is_projected_from_where_the_funding_actually_is(monkeypatch):
+    """The reviewer's probe: a deadline 4,000 s away, the maker's funding 100 deep. The construction-time
+    projection treated EVERY NEGOTIATED record as built before the maker funds, so it refused ("first
+    accept the funding about 5400 s from now ... too near") while the same terms on a coordinator built
+    earlier passed ``pre_btc_lock_check``. It now starts from where the funding is:
+
+    * a record carrying a pending counter-leg deploy (a resumed fund) projects nothing, constructs, and
+      ``pre_btc_lock_check`` passes on it at the same clock;
+    * a funding the caller observed ``k`` or more deep waits for nothing, and constructs;
+    * the other branch — nothing observed, or a funding one block short of ``k`` — still projects the
+      wait and is still refused."""
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+    build, terms_at, reserve, floor, chain = _eth_early_case(monkeypatch, deadline_s=4000)
+    terms = terms_at(floor + reserve() + 200)  # room for the funding's 100 confirmations at step 6
+    with pytest.raises(ValidationError, match=r"first accept the funding about \d+ s from now.*too near"):
+        build(terms)
+    resumed = build(terms, pending="0x" + "44" * 20)
+    gate = await resumed.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is True, gate.reason
+    early = taker_gate_early_bound(chain=chain, policy=resumed.config.margin_policy, value_at_stake_photons=1000)
+    k = early.required_confirmations
+    for deep in (k, 100):
+        assert build(terms, observed=deep) is not None
+    with pytest.raises(ValidationError, match=rf"the funding observed {k - 1} deep, 1 more block.*too near"):
+        build(terms, observed=k - 1)
+    with pytest.raises(ValidationError, match="maker_funding_confirmations must be a non-negative int"):
+        build(terms, observed=-1)
 
 
 async def test_an_honest_eth_swap_passes_pre_btc_lock_check_with_its_clock(monkeypatch):
