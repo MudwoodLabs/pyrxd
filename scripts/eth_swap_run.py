@@ -53,12 +53,15 @@ from _dust_swap_shared import (
     add_eth_key_arguments,
     add_rxd_node_args,
     add_single_operator_override_arg,
+    add_value_at_risk_arg,
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
     funding_bound_from_args,
+    gate_elapsed_reserve_blocks,
     merge_into_mode_600,
+    preflight_coordinator,
     read_own_private_file,
     require_rxd_node_args,
     resolve_eth_key_file,
@@ -184,6 +187,9 @@ def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> Marg
         max_covenant_confirm_wait_s=args.max_covenant_confirm_wait_s,
         # Dust harness: value below the Radiant reorg cost → opt out of value-scaled burial.
         accept_flat_burial=True,
+        # --value-at-risk-photons, when given: the value the taker gate sizes its depth from (an NFT or
+        # FT swap has no other; the coordinator refuses it without one).
+        value_at_risk_photons=getattr(args, "value_at_risk_photons", None),
     )
     if not _token_leg_is_real(args):
         # The Radiant leg is MAINNET on this stage whatever the EVM leg is, so the coordinator refuses
@@ -637,7 +643,11 @@ def _assert_t_rxd_outlasts_the_eth_deadline(args: argparse.Namespace, *, remaini
     )
 
 
-_SEPOLIA_DEFAULT_T_RXD_BLOCKS = 60
+#: The sepolia-dust default when ``--t-rxd-blocks`` is omitted. ``t_btc`` (decorative for ETH, but
+#: checked against t_rxd in the same unit) is derived after the taker gate's own model of the elapsed
+#: blocks is reserved — about 80 at dust value — so with the default 36-block margin the smallest
+#: that constructs is 154 (measured 2026-09-30). 60 constructed nothing.
+_SEPOLIA_DEFAULT_T_RXD_BLOCKS = 160
 
 
 def _derive_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | None = None) -> int:
@@ -760,7 +770,34 @@ def resolve_eth_timeout(restore: dict | None, *, now_unix_s: int, eth_timeout_s:
     return int(restore["eth_timeout_unix_s"])
 
 
-def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: dict | None = None):
+def _value_at_stake_photons(args) -> int | None:
+    """The value the coordinator will assess for this run's taker gate: ``--value-at-risk-photons``,
+    raised for a plain-RXD swap to its covenant amount. ``None`` for an NFT or FT swap without the
+    flag — which the coordinator refuses, and the preflight says so before anything is minted."""
+    candidates = [int(v) for v in (getattr(args, "value_at_risk_photons", None),) if v is not None]
+    if getattr(args, "asset_variant", "rxd") == "rxd":
+        candidates.append(int(args.rxd_photons))
+    return max(candidates) if candidates else None
+
+
+def _gate_reserve(args, policy, funding_bound) -> int:
+    """The Radiant blocks ``t_btc`` reserves for the taker gate's elapsed-depth bound (see
+    ``_dust_swap_shared.gate_elapsed_reserve_blocks``), for this run's policy and value."""
+    return gate_elapsed_reserve_blocks(
+        policy=policy,
+        value_at_stake_photons=_value_at_stake_photons(args),
+        funding_bound=funding_bound,
+        radiant_min_confirmations=_RXD_MIN_CONFIRMATIONS,
+    )
+
+
+#: The Radiant leg's ``min_confirmations`` — the taker gate's burial reads it.
+_RXD_MIN_CONFIRMATIONS = 1
+
+
+def _build_terms_and_covenant(
+    args, *, eth_timeout: int, elapsed_reserve: int, minted=None, restore: dict | None = None
+):
     """Build the HTLC covenant + negotiated terms. ``minted`` (a MintedNft) is REQUIRED for the
     NFT variant — the covenant binds the genesis ref ``reveal_txid:0`` of the freshly-minted NFT``.
 
@@ -794,10 +831,10 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None, restore: d
             margin_blocks=args.margin_blocks,
             rxd_block_interval_s=args.rxd_block_interval_s,
             btc_block_interval_s=args.btc_block_interval_s,
-            # COUPLED to the taker's required covenant depth; see elapsed_reserve_blocks().
-            elapsed_reserve_blocks=elapsed_reserve_blocks(
-                rxd_claim_burial_blocks=getattr(args, "rxd_claim_burial", ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS)
-            ),
+            # The caller's reserve: on a run that locks mainnet RXD, the taker gate's own model of the
+            # blocks that can elapse before the taker locks (_gate_reserve); see
+            # _dust_swap_shared.gate_elapsed_reserve_blocks.
+            elapsed_reserve_blocks=elapsed_reserve,
         ),
         bt.TimeUnit.BLOCKS,
     )
@@ -1009,7 +1046,16 @@ async def run_dry(args: argparse.Namespace) -> None:
                 time.sleep(0.1)
         now = int(_anvil_rpc(url, "eth_getBlockByNumber", ["latest", False])["result"]["timestamp"], 16)
         eth_timeout = now + args.eth_timeout_s
-        terms, cov, _p_secret, _h, _keys = _build_terms_and_covenant(args, eth_timeout=eth_timeout)
+        terms, cov, _p_secret, _h, _keys = _build_terms_and_covenant(
+            args,
+            eth_timeout=eth_timeout,
+            # A local anvil rehearsal of the ETH wiring: no Radiant chain, no taker gate and no
+            # coordinator, so nothing models an elapsed-depth bound; the flat reserve the test-network
+            # runners use stands in. The sepolia-dust stage reserves the gate's own model.
+            elapsed_reserve=elapsed_reserve_blocks(
+                rxd_claim_burial_blocks=getattr(args, "rxd_claim_burial", ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS)
+            ),
+        )
         rpc, eth_leg = _eth_leg(
             args,
             rpc_url=url,
@@ -1047,6 +1093,15 @@ def _which(name: str) -> str:
 
 
 # --------------------------------------------------------------------------- sepolia-dust
+
+
+class _PreflightAsset:
+    """Stands in for the NFT/FT a fresh run is about to mint, so the coordinator can be built — every
+    construction-time check — BEFORE the mint. The genesis outpoint is a placeholder (no
+    construction-time check reads it); the FT amount is the one the mint will create."""
+
+    def __init__(self, *, genesis_txid: str, genesis_vout: int, ft_amount: int) -> None:
+        self.genesis_txid, self.genesis_vout, self.ft_amount = genesis_txid, genesis_vout, ft_amount
 
 
 async def run_sepolia_dust(args: argparse.Namespace) -> None:
@@ -1092,6 +1147,25 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # Only a RESUME has a deadline that is not `now + --eth-timeout-s`. Passing the remaining time
     # unconditionally made a fresh run's refusals talk about "the resumed swap's deadline".
     policy = _policy(args, remaining_s=(eth_timeout - int(time.time())) if restore is not None else None)
+    # accept_estimated_eth_margins: this is an operator-gated DUST run that consciously
+    # accepts estimated-margin risk (is_measured=False) on negligible value (MEDIUM-1). A
+    # real (non-dust) value-bearing ETH swap MUST use MarginPolicy.measured(...) instead.
+    # accept_estimated_eth_margins stays (a separate ETH-margin dust opt-in, MEDIUM-1);
+    # accept_nondurable_seen is dropped — the seen-store below is durable-by-default.
+    cfg = CoordinatorConfig(
+        maker_stall_safety_window_blocks=args.maker_stall_safety_window_blocks,
+        margin_policy=policy,
+        # Only for a throwaway token leg. With a real one the policy above is MEASURED, so this
+        # opt-in is not merely unnecessary — passing it would re-disable the two defences the
+        # measured policy just switched on, and it would do so silently.
+        accept_estimated_eth_margins=not _token_leg_is_real(args),
+        # Exclusive across processes: `reserve(H)` was the only mutual exclusion in the funding
+        # path, and resuming an interrupted fund skips it.
+        fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+        # The taker gate's single-operator threshold: the shipped default unless the user passed
+        # --accept-single-operator-up-to.
+        funding_bound=funding_bound_from_args(args),
+    )
     provenance = {
         "stage": "sepolia-dust",
         "eth_finalization_window_s": args.eth_finalization_window_s,
@@ -1114,112 +1188,6 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     report = StepReport("sepolia-dust", provenance)
 
     rxd_client = SshTrRadiantClient(ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=args.rxd_wallet)
-    minted = None
-    if args.asset_variant == "nft":
-        if args.nft_reuse_reveal_txid:
-            if not args.nft_owner_wif:
-                raise SystemExit("--nft-reuse-reveal-txid requires --nft-owner-wif (to spend the singleton)")
-            print(f"\n  --- NFT path: REUSING already-minted NFT at reveal {args.nft_reuse_reveal_txid} (no mint) ---")
-            minted = load_minted_nft(rxd_client, reveal_txid=args.nft_reuse_reveal_txid, owner_wif=args.nft_owner_wif)
-        else:
-            print("\n  --- NFT path: minting a fresh throwaway NFT on RXD MAINNET (commit→reveal, real-value) ---")
-            minted = mint_nft_inline(
-                rxd_client,
-                name=args.nft_name,
-                commit_photons=args.nft_commit_photons,
-                fee_photons=args.rxd_mint_fee_photons,
-                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
-                poll_s=args.confirm_poll_s,
-            )
-        print(f"  minted NFT genesis ref: {minted.ref_str}")
-    elif args.asset_variant == "ft":
-        if args.ft_reuse_reveal_txid:
-            if not args.ft_owner_wif:
-                raise SystemExit("--ft-reuse-reveal-txid requires --ft-owner-wif (to spend the FT)")
-            print(f"\n  --- FT path: REUSING already-minted FT at reveal {args.ft_reuse_reveal_txid} (no mint) ---")
-            minted = load_minted_ft(rxd_client, reveal_txid=args.ft_reuse_reveal_txid, owner_wif=args.ft_owner_wif)
-        else:
-            print("\n  --- FT path: minting a fresh throwaway Glyph FT on RXD MAINNET (commit→reveal premine) ---")
-            minted = mint_ft_inline(
-                rxd_client,
-                name=args.ft_name,
-                ticker=args.ft_ticker,
-                premine_amount=args.ft_premine_photons,
-                fee_photons=args.rxd_mint_fee_photons,
-                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
-                poll_s=args.confirm_poll_s,
-            )
-        print(f"  minted FT genesis ref: {minted.ref_str}  ({minted.ft_amount} units)")
-    # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
-    terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(
-        args, eth_timeout=eth_timeout, minted=minted, restore=restore
-    )
-    if restore is not None:
-        # THE load-bearing check. If any restored input is wrong the rebuilt covenant will not be
-        # the one that holds the money, and continuing would fund a second swap while the first
-        # stays stranded. Compare the actual script, not the inputs that produced it.
-        if cov.funded_spk.hex() != restore["rxd_covenant_spk"]:
-            raise SystemExit(
-                "resume rebuilt a DIFFERENT covenant than the funded one — refusing.\n"
-                f"  funded : {restore['rxd_covenant_spk']}\n"
-                f"  rebuilt: {cov.funded_spk.hex()}\n"
-                "  the run's parameters (t-rxd-blocks, asset, amounts) must match the original."
-            )
-        print(f"  RESUMED: rebuilt covenant matches the funded SPK, eth_timeout pinned at {eth_timeout}")
-
-    # Persist ALL run state (mode 600) BEFORE any broadcast — recovery/sweep. Holds the preimage p
-    # + the ETH signing key + the RXD keys + the covenant SPK; single point of total compromise.
-    keys_path = Path(args.keys_out).expanduser()
-    if restore is None:
-        atomic_write_mode_600(
-            keys_path,
-            json.dumps(
-                {
-                    "created_unix": int(time.time()),
-                    "stage": "sepolia-dust",
-                    # The CHAIN and the AMOUNT, recorded as they actually are rather than as the stage
-                    # name assumes. Both were wrong for a token run on L1: "sepolia" was hardcoded, and
-                    # the amount logged `--eth-amount-wei` (the NATIVE flag, untouched at its 0.0001 ETH
-                    # default) instead of the token base units actually locked. The run itself was
-                    # unaffected — the coordinator takes `_counter_value(args)` — but this file is the
-                    # RECOVERY path, and a hand-recovery driven from it would have had the wrong chain,
-                    # an amount off by ~10^8, and no idea which token the HTLC even holds.
-                    "eth_chain": evm_chain_by_id(int(args.eth_chain_id)).name,
-                    "eth_chain_id": int(args.eth_chain_id),
-                    "counter_asset": args.counter_asset,
-                    "token_address": (None if _counter_token(args) is None else _counter_token(args).address),
-                    "token_decimals": (None if _counter_token(args) is None else _counter_token(args).decimals),
-                    "rxd_network": rxd_network,
-                    "hashlock_H": h.hex(),
-                    "preimage_p_hex": p_secret.unsafe_raw_bytes().hex(),  # recovery only; same trust domain as keys
-                    "eth_key_hex": args.eth_key_hex,
-                    "eth_claim_to": args.eth_claim_to,
-                    "eth_refund_to": args.eth_refund_to,
-                    "eth_timeout_unix_s": eth_timeout,
-                    # Base units for a token leg, wei for native — the same value the coordinator locks.
-                    "counter_amount": _counter_value(args),
-                    "eth_amount_wei": args.eth_amount_wei,  # the native flag, kept for older readers
-                    "taker_rxd_wif": _rkeys[0].wif(),
-                    "maker_rxd_wif": _rkeys[1].wif(),
-                    "rxd_covenant_spk": cov.funded_spk.hex(),
-                    "t_rxd_blocks": terms.t_rxd.value,
-                    # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
-                    # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
-                    # need it to rebuild the covenant they spend. Nothing used to persist it.
-                    "rxd_covenant_amount": terms.radiant_amount,
-                    "asset_variant": args.asset_variant,
-                    "asset_genesis_ref": minted.ref_str if minted else None,
-                    "asset_owner_wif": minted.owner_key.wif() if minted else None,
-                    # NFT carries reveal_value; FT carries ft_amount — persist whichever the mint produced.
-                    "asset_reveal_value": getattr(minted, "reveal_value", None) if minted else None,
-                    "asset_ft_amount": getattr(minted, "ft_amount", None) if minted else None,
-                    "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
-                },
-                indent=2,
-            ),
-        )
-        print(f"  run keys persisted -> {keys_path} (mode 600)")
-
     rpc, eth_leg = _eth_leg(
         args,
         rpc_url=args.eth_rpc_url,
@@ -1234,86 +1202,197 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # names for one chain is how a per-chain constant gets applied to the wrong chain.
         network=evm_chain_by_id(int(args.eth_chain_id)).network,
     )
-    rxd_client.register_spk(cov.funded_spk)
-    rxd_leg = RadiantCovenantLeg(
-        network=rxd_network,
-        taker_pkh=_rkeys[2],
-        maker_pkh=_rkeys[3],
-        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
-        fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
-        min_confirmations=1,
-        audit_cleared=True,
-    )
-    # NFT/FT both carry a genesis ref → the REAL RXinDexer is the genesis-ref authenticity oracle
-    # (R1 fake-singleton defense). Plain RXD has no ref → no indexer needed. Default to the REST
-    # adapter over ssh-tr (the mainnet deployment runs only the HTTP api, no glyph electrumx ws);
-    # use the electrumx-ws adapter only when a --rxd-indexer-ws is explicitly given.
-    indexer = None
-    if args.asset_variant in ("nft", "ft"):
-        chain_io = RadiantChainIO(rxd_client)
-        if args.rxd_indexer_ws:
-            ex = ElectrumXClient(urls=[args.rxd_indexer_ws], allow_insecure=args.rxd_indexer_insecure)
-            indexer = RxinDexerRefAdapter(RxinDexerClient(ex), chain_io)
-            print(f"  REF gate: electrumx-ws RxinDexerRefAdapter @ {args.rxd_indexer_ws}")
-        else:
-            indexer = SshTrHttpRefAdapter(chain_io=chain_io, ssh_host=args.rxd_ssh_host, api_base=args.rxd_api_base)
-            print(f"  REF gate: REST SshTrHttpRefAdapter via ssh {args.rxd_ssh_host} -> {args.rxd_api_base}")
-    # accept_estimated_eth_margins: this is an operator-gated DUST run that consciously
-    # accepts estimated-margin risk (is_measured=False) on negligible value (MEDIUM-1). A
-    # real (non-dust) value-bearing ETH swap MUST use MarginPolicy.measured(...) instead.
-    # accept_estimated_eth_margins stays (a separate ETH-margin dust opt-in, MEDIUM-1);
-    # accept_nondurable_seen is dropped — the seen-store below is durable-by-default.
-    cfg = CoordinatorConfig(
-        maker_stall_safety_window_blocks=args.maker_stall_safety_window_blocks,
-        margin_policy=policy,
-        # Only for a throwaway token leg. With a real one the policy above is MEASURED, so this
-        # opt-in is not merely unnecessary — passing it would re-disable the two defences the
-        # measured policy just switched on, and it would do so silently.
-        accept_estimated_eth_margins=not _token_leg_is_real(args),
-        # Exclusive across processes: `reserve(H)` was the only mutual exclusion in the funding
-        # path, and resuming an interrupted fund skips it.
-        fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
-        # The taker gate's single-operator threshold: the shipped default unless the user passed
-        # --accept-single-operator-up-to.
-        funding_bound=funding_bound_from_args(args),
-    )
-    # RESUME FROM THE PERSISTED STATE, not from NEGOTIATED. The sink has always had `load_record`
-    # and nothing called it: the coordinator was constructed fresh every time, so a resumed run
-    # believed the swap had not started while the durable record said otherwise. That is why
-    # `resume_interrupted_fund` was the ONLY resumable point — anything past the fund had a record
-    # the coordinator never read, and the run could not continue from it.
-    _sink = JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json")
-    _loaded = _sink.load_record() if args.resume else None
-    if _loaded is not None:
-        print(f"  RESUMED record: state={_loaded.state.value}")
-        if _loaded.terms.hashlock != terms.hashlock:
-            raise SystemExit(
-                "the persisted record is for a DIFFERENT swap (hashlock mismatch) — refusing to "
-                "drive it with these terms."
-            )
-    coord = SwapCoordinator(
-        record=_loaded if _loaded is not None else SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
-        counter_leg=eth_leg,
-        radiant_leg=rxd_leg,
-        indexer=indexer,
-        # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
-        # so the SEEN-1 reservation survives a restart / second process (was InMemSeen).
-        seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
-        # An ETH contract address depends on the deployer's nonce and exists nowhere until the
-        # deploy receipt returns, so this hook is the ONLY thing that makes a mid-fund crash
-        # recoverable. The coordinator refuses an ETH counter-leg without it.
-        persist=_sink,
-        config=cfg,
-    )
+    try:
+        # The Radiant blocks t_btc reserves for the taker gate's elapsed-depth bound — the gate's own
+        # model, from this run's policy and value. Refuses here, before any mint, when it cannot be
+        # modelled (an NFT/FT swap without --value-at-risk-photons).
+        elapsed_reserve = _gate_reserve(args, policy, cfg.funding_bound)
 
-    # Before funding the counter-leg, wait for the NFT genesis to reach the REF-gate reorg depth
-    # (the pre-lock gate fails CLOSED on a shallow genesis). No-op for plain RXD (no genesis ref).
-    if minted is not None:
-        wait_genesis_mature(
-            rxd_client, minted.genesis_txid, need_confs=cfg.min_ref_confirmations, poll_s=args.confirm_poll_s
+        def coordinator_for(terms, rkeys, *, indexer=None, record=None):
+            """The run's coordinator — ONE wiring, for the preflight below and for the run."""
+            rxd_leg = RadiantCovenantLeg(
+                network=rxd_network,
+                taker_pkh=rkeys[2],
+                maker_pkh=rkeys[3],
+                chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
+                fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
+                min_confirmations=_RXD_MIN_CONFIRMATIONS,
+                audit_cleared=True,
+            )
+            return SwapCoordinator(
+                record=record if record is not None else SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+                counter_leg=eth_leg,
+                radiant_leg=rxd_leg,
+                indexer=indexer,
+                # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
+                # so the SEEN-1 reservation survives a restart / second process (was InMemSeen).
+                seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
+                # An ETH contract address depends on the deployer's nonce and exists nowhere until the
+                # deploy receipt returns, so this hook is the ONLY thing that makes a mid-fund crash
+                # recoverable. The coordinator refuses an ETH counter-leg without it.
+                persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+                config=cfg,
+            )
+
+        minted = None
+        # A REUSED asset is only READ here (no mint), so it is loaded before the preflight, which then
+        # builds the coordinator on the real asset; a fresh mint is stood in for until it exists.
+        if args.asset_variant == "nft" and args.nft_reuse_reveal_txid:
+            if not args.nft_owner_wif:
+                raise SystemExit("--nft-reuse-reveal-txid requires --nft-owner-wif (to spend the singleton)")
+            print(f"\n  --- NFT path: REUSING already-minted NFT at reveal {args.nft_reuse_reveal_txid} (no mint) ---")
+            minted = load_minted_nft(rxd_client, reveal_txid=args.nft_reuse_reveal_txid, owner_wif=args.nft_owner_wif)
+        elif args.asset_variant == "ft" and args.ft_reuse_reveal_txid:
+            if not args.ft_owner_wif:
+                raise SystemExit("--ft-reuse-reveal-txid requires --ft-owner-wif (to spend the FT)")
+            print(f"\n  --- FT path: REUSING already-minted FT at reveal {args.ft_reuse_reveal_txid} (no mint) ---")
+            minted = load_minted_ft(rxd_client, reveal_txid=args.ft_reuse_reveal_txid, owner_wif=args.ft_owner_wif)
+
+        # THE COORDINATOR FIRST — every construction-time check (the value at stake, the operators, the
+        # fast tail, the taker gate's room in t_rxd), before anything is minted or broadcast. A swap the
+        # coordinator refuses used to be found out only AFTER the fresh NFT/FT had been minted on mainnet.
+        stand_in = minted
+        if stand_in is None and args.asset_variant in ("nft", "ft"):
+            stand_in = _PreflightAsset(genesis_txid="11" * 32, genesis_vout=0, ft_amount=int(args.ft_premine_photons))
+        pre_terms, _pre_cov, _pre_p, _pre_h, pre_rkeys = _build_terms_and_covenant(
+            args, eth_timeout=eth_timeout, elapsed_reserve=elapsed_reserve, minted=stand_in, restore=restore
+        )
+        preflight_coordinator(
+            lambda: coordinator_for(pre_terms, pre_rkeys),
+            before="anything is minted or broadcast",
         )
 
-    try:
+        if minted is None and args.asset_variant == "nft":
+            print("\n  --- NFT path: minting a fresh throwaway NFT on RXD MAINNET (commit→reveal, real-value) ---")
+            minted = mint_nft_inline(
+                rxd_client,
+                name=args.nft_name,
+                commit_photons=args.nft_commit_photons,
+                fee_photons=args.rxd_mint_fee_photons,
+                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
+                poll_s=args.confirm_poll_s,
+            )
+        elif minted is None and args.asset_variant == "ft":
+            print("\n  --- FT path: minting a fresh throwaway Glyph FT on RXD MAINNET (commit→reveal premine) ---")
+            minted = mint_ft_inline(
+                rxd_client,
+                name=args.ft_name,
+                ticker=args.ft_ticker,
+                premine_amount=args.ft_premine_photons,
+                fee_photons=args.rxd_mint_fee_photons,
+                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
+                poll_s=args.confirm_poll_s,
+            )
+        if minted is not None:
+            units = f"  ({minted.ft_amount} units)" if args.asset_variant == "ft" else ""
+            print(f"  {args.asset_variant.upper()} genesis ref: {minted.ref_str}{units}")
+        terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(
+            args, eth_timeout=eth_timeout, elapsed_reserve=elapsed_reserve, minted=minted, restore=restore
+        )
+        if restore is not None:
+            # THE load-bearing check. If any restored input is wrong the rebuilt covenant will not be
+            # the one that holds the money, and continuing would fund a second swap while the first
+            # stays stranded. Compare the actual script, not the inputs that produced it.
+            if cov.funded_spk.hex() != restore["rxd_covenant_spk"]:
+                raise SystemExit(
+                    "resume rebuilt a DIFFERENT covenant than the funded one — refusing.\n"
+                    f"  funded : {restore['rxd_covenant_spk']}\n"
+                    f"  rebuilt: {cov.funded_spk.hex()}\n"
+                    "  the run's parameters (t-rxd-blocks, asset, amounts) must match the original."
+                )
+            print(f"  RESUMED: rebuilt covenant matches the funded SPK, eth_timeout pinned at {eth_timeout}")
+
+        # Persist ALL run state (mode 600) BEFORE any broadcast — recovery/sweep. Holds the preimage p
+        # + the ETH signing key + the RXD keys + the covenant SPK; single point of total compromise.
+        keys_path = Path(args.keys_out).expanduser()
+        if restore is None:
+            atomic_write_mode_600(
+                keys_path,
+                json.dumps(
+                    {
+                        "created_unix": int(time.time()),
+                        "stage": "sepolia-dust",
+                        # The CHAIN and the AMOUNT, recorded as they actually are rather than as the stage
+                        # name assumes. Both were wrong for a token run on L1: "sepolia" was hardcoded, and
+                        # the amount logged `--eth-amount-wei` (the NATIVE flag, untouched at its 0.0001 ETH
+                        # default) instead of the token base units actually locked. The run itself was
+                        # unaffected — the coordinator takes `_counter_value(args)` — but this file is the
+                        # RECOVERY path, and a hand-recovery driven from it would have had the wrong chain,
+                        # an amount off by ~10^8, and no idea which token the HTLC even holds.
+                        "eth_chain": evm_chain_by_id(int(args.eth_chain_id)).name,
+                        "eth_chain_id": int(args.eth_chain_id),
+                        "counter_asset": args.counter_asset,
+                        "token_address": (None if _counter_token(args) is None else _counter_token(args).address),
+                        "token_decimals": (None if _counter_token(args) is None else _counter_token(args).decimals),
+                        "rxd_network": rxd_network,
+                        "hashlock_H": h.hex(),
+                        "preimage_p_hex": p_secret.unsafe_raw_bytes().hex(),  # recovery only; same trust domain as keys
+                        "eth_key_hex": args.eth_key_hex,
+                        "eth_claim_to": args.eth_claim_to,
+                        "eth_refund_to": args.eth_refund_to,
+                        "eth_timeout_unix_s": eth_timeout,
+                        # Base units for a token leg, wei for native — the same value the coordinator locks.
+                        "counter_amount": _counter_value(args),
+                        "eth_amount_wei": args.eth_amount_wei,  # the native flag, kept for older readers
+                        "taker_rxd_wif": _rkeys[0].wif(),
+                        "maker_rxd_wif": _rkeys[1].wif(),
+                        "rxd_covenant_spk": cov.funded_spk.hex(),
+                        "t_rxd_blocks": terms.t_rxd.value,
+                        # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
+                        # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
+                        # need it to rebuild the covenant they spend. Nothing used to persist it.
+                        "rxd_covenant_amount": terms.radiant_amount,
+                        "asset_variant": args.asset_variant,
+                        "asset_genesis_ref": minted.ref_str if minted else None,
+                        "asset_owner_wif": minted.owner_key.wif() if minted else None,
+                        # NFT carries reveal_value; FT carries ft_amount — persist whichever the mint produced.
+                        "asset_reveal_value": getattr(minted, "reveal_value", None) if minted else None,
+                        "asset_ft_amount": getattr(minted, "ft_amount", None) if minted else None,
+                        "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
+                    },
+                    indent=2,
+                ),
+            )
+            print(f"  run keys persisted -> {keys_path} (mode 600)")
+
+        rxd_client.register_spk(cov.funded_spk)
+        # NFT/FT both carry a genesis ref → the REAL RXinDexer is the genesis-ref authenticity oracle
+        # (R1 fake-singleton defense). Plain RXD has no ref → no indexer needed. Default to the REST
+        # adapter over ssh-tr (the mainnet deployment runs only the HTTP api, no glyph electrumx ws);
+        # use the electrumx-ws adapter only when a --rxd-indexer-ws is explicitly given.
+        indexer = None
+        if args.asset_variant in ("nft", "ft"):
+            chain_io = RadiantChainIO(rxd_client)
+            if args.rxd_indexer_ws:
+                ex = ElectrumXClient(urls=[args.rxd_indexer_ws], allow_insecure=args.rxd_indexer_insecure)
+                indexer = RxinDexerRefAdapter(RxinDexerClient(ex), chain_io)
+                print(f"  REF gate: electrumx-ws RxinDexerRefAdapter @ {args.rxd_indexer_ws}")
+            else:
+                indexer = SshTrHttpRefAdapter(chain_io=chain_io, ssh_host=args.rxd_ssh_host, api_base=args.rxd_api_base)
+                print(f"  REF gate: REST SshTrHttpRefAdapter via ssh {args.rxd_ssh_host} -> {args.rxd_api_base}")
+        # RESUME FROM THE PERSISTED STATE, not from NEGOTIATED. The sink has always had `load_record`
+        # and nothing called it: the coordinator was constructed fresh every time, so a resumed run
+        # believed the swap had not started while the durable record said otherwise. That is why
+        # `resume_interrupted_fund` was the ONLY resumable point — anything past the fund had a record
+        # the coordinator never read, and the run could not continue from it.
+        _sink = JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json")
+        _loaded = _sink.load_record() if args.resume else None
+        if _loaded is not None:
+            print(f"  RESUMED record: state={_loaded.state.value}")
+            if _loaded.terms.hashlock != terms.hashlock:
+                raise SystemExit(
+                    "the persisted record is for a DIFFERENT swap (hashlock mismatch) — refusing to "
+                    "drive it with these terms."
+                )
+        coord = coordinator_for(terms, _rkeys, indexer=indexer, record=_loaded)
+
+        # Before funding the counter-leg, wait for the NFT genesis to reach the REF-gate reorg depth
+        # (the pre-lock gate fails CLOSED on a shallow genesis). No-op for plain RXD (no genesis ref).
+        if minted is not None:
+            wait_genesis_mature(
+                rxd_client, minted.genesis_txid, need_confs=cfg.min_ref_confirmations, poll_s=args.confirm_poll_s
+            )
+
         # 1. MAKER LOCKS THE RADIANT ASSET FIRST. This ordering is the protocol, not a preference:
         #    the maker is the party that knows p, so a maker who locks SECOND holds a free option —
         #    it can watch the taker fund and walk away having risked nothing. HZ-1 enforces it from
@@ -1665,6 +1744,7 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
     add_single_operator_override_arg(ap)
+    add_value_at_risk_arg(ap)
     # NOT /tmp. It is world-writable and shared with every process on the box: the report from the
     # first real-value RXD/USDT swap was deleted there by an unrelated cleanup the same day. The
     # report is the run's only off-chain provenance — txids, timings, the margins actually used —

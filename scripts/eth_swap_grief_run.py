@@ -41,15 +41,17 @@ from _dust_swap_shared import (
     add_eth_key_arguments,
     add_rxd_node_args,
     add_single_operator_override_arg,
+    add_value_at_risk_arg,
     atomic_write_mode_600,
     confirm,
     funding_bound_from_args,
     merge_into_mode_600,
+    preflight_coordinator,
     require_rxd_node_args,
     resolve_eth_key_file,
     wait_for_covenant_funding,
 )
-from eth_swap_run import _build_terms_and_covenant, _eth_leg
+from eth_swap_run import _RXD_MIN_CONFIRMATIONS, _build_terms_and_covenant, _eth_leg, _gate_reserve
 from radiant_mainnet_chainio import SshTrRadiantClient, mainnet_proof_client
 
 from pyrxd.btc_wallet import taproot as bt
@@ -91,6 +93,8 @@ def _policy(args) -> MarginPolicy:
         max_covenant_confirm_wait_s=args.max_covenant_confirm_wait_s,
         # Dust grief-test harness: opt out of value-scaled burial (value below the reorg cost).
         accept_flat_burial=True,
+        # --value-at-risk-photons, when given: the value the taker gate sizes its depth from.
+        value_at_risk_photons=getattr(args, "value_at_risk_photons", None),
     )
 
 
@@ -101,12 +105,23 @@ async def run(args) -> None:
         if not getattr(args, req):
             raise SystemExit(f"requires --{req.replace('_', '-')}")
     policy = _policy(args)  # refuses at startup, before any key or covenant is made
+    # accept_estimated_eth_margins: operator-gated DUST griefing run; consciously accepts
+    # estimated-margin risk on negligible value (MEDIUM-1). Non-dust value → measured policy.
+    config = CoordinatorConfig(
+        margin_policy=policy,
+        accept_nondurable_seen=True,
+        accept_estimated_eth_margins=True,
+        fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+        funding_bound=funding_bound_from_args(args),
+    )
     rxd_network = SshTrRadiantClient.NETWORK
     print(f"=== ETH↔RXD GRIEFING run (S1) — ETH=sepolia, RXD={rxd_network} mainnet ===")
     print("    maker STALLS; the honest taker recovers via mutual_refund (no one-sided loss).")
 
     eth_timeout = int(time.time()) + args.eth_timeout_s
-    terms, cov, p_secret, h, rkeys = _build_terms_and_covenant(args, eth_timeout=eth_timeout)
+    terms, cov, p_secret, h, rkeys = _build_terms_and_covenant(
+        args, eth_timeout=eth_timeout, elapsed_reserve=_gate_reserve(args, policy, config.funding_bound)
+    )
     report = StepReport(
         "grief-run", {"scenario": "S1 maker-stall -> mutual_refund", "eth_chain": "sepolia", "rxd_network": rxd_network}
     )
@@ -157,25 +172,22 @@ async def run(args) -> None:
         maker_pkh=rkeys[3],
         chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
         fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
-        min_confirmations=1,
+        min_confirmations=_RXD_MIN_CONFIRMATIONS,
         audit_cleared=True,
     )
-    coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
-        counter_leg=eth_leg,
-        radiant_leg=rxd_leg,
-        indexer=None,
-        seen_store=InMemSeen(),
-        persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
-        # accept_estimated_eth_margins: operator-gated DUST griefing run; consciously accepts
-        # estimated-margin risk on negligible value (MEDIUM-1). Non-dust value → measured policy.
-        config=CoordinatorConfig(
-            margin_policy=policy,
-            accept_nondurable_seen=True,
-            accept_estimated_eth_margins=True,
-            fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
-            funding_bound=funding_bound_from_args(args),
+    # Construction runs every check the coordinator makes before anyone locks; refused, the run stops
+    # here, before anything is broadcast, naming what was refused.
+    coord = preflight_coordinator(
+        lambda: SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            counter_leg=eth_leg,
+            radiant_leg=rxd_leg,
+            indexer=None,
+            seen_store=InMemSeen(),
+            persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+            config=config,
         ),
+        before="anything is broadcast",
     )
 
     try:
@@ -263,7 +275,11 @@ def _args():
     # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
     ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)
     ap.add_argument("--rxd-wallet", default="")
-    ap.add_argument("--t-rxd-blocks", type=int, default=3)  # small CSV so it matures fast on mainnet
+    # As short as the taker gate allows, so the CSV matures as soon as it can: the gate reserves its own
+    # model of the blocks that can elapse before the taker locks (about 80 at dust value) plus what a
+    # safe claim needs; 110 was the smallest that constructed at these defaults (2026-09-30). The old
+    # default of 3 could never pass that check.
+    ap.add_argument("--t-rxd-blocks", type=int, default=120)
     # Margin kept lean for a fast dust demo, EXCEPT eth-finalization-window-s, which is hard-floored at
     # 768s (~2 post-Merge epochs) by MarginPolicy — finalization genuinely takes 2 epochs, not reducible.
     ap.add_argument("--margin-blocks", type=int, default=2)
@@ -284,7 +300,11 @@ def _args():
     ap.add_argument("--keys-out", default="~/.eth_grief_run_keys.json")
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
     add_single_operator_override_arg(ap)
+    add_value_at_risk_arg(ap)
     add_rxd_node_args(ap)
+    # The terms builder this run shares with eth_swap_run.py reads these; this run is always plain RXD
+    # against native Sepolia ETH, and without them it raised AttributeError building the terms.
+    ap.set_defaults(asset_variant="rxd", counter_asset="native")
     args = ap.parse_args()
     require_rxd_node_args(ap, args)
     resolve_eth_key_file(args)

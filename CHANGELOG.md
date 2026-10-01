@@ -215,6 +215,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The mainnet swap runners construct at their defaults, and build their coordinator before
+  anything is minted or broadcast.** Measured on `scripts/dust_swap_run.py`, `eth_swap_run.py` and
+  `eth_swap_grief_run.py` driven up to their first chain action:
+  - `derive_counter_timelock` reserved a flat 12 Radiant blocks for the blocks that elapse before
+    the taker locks, while the coordinator's negotiation-time check models the taker gate's bound at
+    about 80 at dust value, so no `--t-rxd-blocks` passed `dust_swap_run.py --stage dust` (80 to
+    1000 swept) and `eth_swap_run.py` refused below about 114. The mainnet runners now reserve the
+    gate's own model (`_dust_swap_shared.gate_elapsed_reserve_blocks`, built on the new
+    `swap_coordinator.taker_gate_early_bound`, which the coordinator's check calls too). New
+    defaults: `dust_swap_run.py` 120 (smallest that constructed in the probe: 87, with a one-block
+    measured BTC margin it is 84), `eth_swap_run.py` sepolia-dust 160 (154 at the default 36-block
+    margin), `eth_swap_grief_run.py` 120 (110). The refusal no longer prints a negative block count
+    ("the -60 blocks of it left"); it says how many blocks short `t_rxd` is.
+  - NFT and FT swaps had no value at stake, so the coordinator refused them, and without
+    `--*-reuse-reveal-txid` the fresh mainnet mint ran first. `--value-at-risk-photons` (new, on
+    every script that builds a mainnet coordinator; `measure_margin_from_btc_block_times` takes
+    `value_at_risk_photons`) supplies it, and every runner builds its coordinator, with every
+    construction-time check, before the first mint, broadcast or funding prompt. A test drives each
+    runner through its own entry point and asserts that order.
+  - `dust_swap_run.py --stage dry-run` reported success on terms the broadcast stages refused, since
+    it never built the coordinator. It now builds the same one on offline transports and reports its
+    verdict; without `--rxd-block-interval-fast-s` it says that the broadcast stages need it.
+  - `eth_swap_grief_run.py` raised `AttributeError` building its terms (`asset_variant`).
 - **`ElectrumXClient.get_transaction_merkle` raised on real proofs.** It put every sibling hash
   into the first BUMP level, so every proof deeper than one level failed. This was measured on
   two HashMark transactions against both default servers ("Missing hash for index 3 at height

@@ -55,6 +55,7 @@ from _dust_swap_shared import (
     SshTrFeeSource,
     add_rxd_node_args,
     add_single_operator_override_arg,
+    add_value_at_risk_arg,
     confirm,
     funding_bound_from_args,
     measured_margin_from_mainnet,
@@ -386,6 +387,7 @@ def _parse_args(argv):
         ),
     )
     add_single_operator_override_arg(ap)
+    add_value_at_risk_arg(ap)
     add_rxd_node_args(ap)
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument(

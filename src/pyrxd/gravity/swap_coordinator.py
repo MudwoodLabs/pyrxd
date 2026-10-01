@@ -71,6 +71,7 @@ from .finality import CounterClaimFinality, CounterClaimState
 from .funding_spv import (
     DEFAULT_ELAPSED_BOUND_POLICY,
     MIN_FUNDING_CONFIRMATIONS,
+    EarlyElapsedBound,
     ElapsedBoundPolicy,
     MakerFundingNotVerified,
     RadiantChain,
@@ -111,6 +112,7 @@ __all__ = [
     "generate_secret",
     "measure_margin_from_btc_block_times",
     "should_taker_refund_proactively",  # deprecated alias of taker_refund_window_open
+    "taker_gate_early_bound",
     "taker_refund_window_open",
 ]
 
@@ -668,6 +670,7 @@ def measure_margin_from_btc_block_times(
     rxd_block_interval_s: float,
     rxd_block_interval_fast_s: float | None = None,
     accept_flat_burial: bool = False,
+    value_at_risk_photons: int | None = None,
 ) -> tuple[MarginPolicy, dict]:
     """Build a MEASURED MarginPolicy from real mainnet BTC inter-block data (pure).
 
@@ -734,6 +737,9 @@ def measure_margin_from_btc_block_times(
         # Dust runs opt out of value-scaled burial (the value is below the Radiant reorg cost);
         # a real-value run leaves this False and supplies rxd_reorg_cost_per_block + value_at_risk.
         accept_flat_burial=accept_flat_burial,
+        # The swap's value in photons, when the caller states one (the taker gate sizes the depth it
+        # requires of the maker's funding from it; an NFT/FT swap has no other value source).
+        value_at_risk_photons=value_at_risk_photons,
     )
     provenance = {
         "measured": {
@@ -751,6 +757,7 @@ def measure_margin_from_btc_block_times(
             "rxd_block_interval_s": rxd_block_interval_s,
             "min_reorg_depth_floor_blocks": _MIN_REORG_DEPTH_BLOCKS,
             "accept_flat_burial": accept_flat_burial,
+            "value_at_risk_photons": value_at_risk_photons,
         },
         "note": (
             "margin + block_interval_s are MEASURED from observed BTC block timestamps; "
@@ -1228,6 +1235,63 @@ def _claim_floor_blocks(policy: MarginPolicy, *, burial: int, counter_reserve: i
     #531 and the runner's empty-feasible-set class. Derived once here instead.
     """
     return burial + counter_reserve + _radiant_reserve_blocks(policy, policy.rxd_claim_inclusion)
+
+
+def _funding_value_at_stake(terms: NegotiatedTerms, policy: MarginPolicy, counter_leg: Any) -> int | None:
+    """The swap's value in photons, for the taker gate's ``k`` (see
+    :meth:`SwapCoordinator._funding_value_at_stake_photons`, which this is)."""
+    candidates: list[int] = []
+    if policy.value_at_risk_photons is not None:
+        candidates.append(int(policy.value_at_risk_photons))
+    if terms.asset_variant == "rxd":
+        candidates.append(int(terms.radiant_amount))
+    implied = _stablecoin_value_floor_photons(terms, policy, counter_leg)
+    if implied is not None:
+        candidates.append(int(implied))
+    return max(candidates) if candidates else None
+
+
+def _funding_burial(
+    policy: MarginPolicy, chain: RadiantChain, value_at_stake: int | None, *, radiant_min_confirmations: int
+) -> int:
+    """The ``burial`` term of the taker gate's ``k`` (see :meth:`SwapCoordinator._funding_burial_blocks`,
+    which this is): the measured claim burial, else the Radiant leg's ``min_confirmations``, raised on a
+    value-bearing network by the value-scaled burial."""
+    depth = (
+        _radiant_reserve_blocks(policy, policy.rxd_claim_burial)
+        if policy.is_measured
+        else int(radiant_min_confirmations)
+    )
+    if not chain.value_bearing:
+        return depth
+    return max(depth, _value_scaled_burial_blocks(policy, value_at_stake))
+
+
+def taker_gate_early_bound(
+    *,
+    chain: RadiantChain,
+    policy: MarginPolicy,
+    value_at_stake_photons: int | None,
+    funding_bound: ElapsedBoundPolicy = DEFAULT_ELAPSED_BOUND_POLICY,
+    radiant_min_confirmations: int = 1,
+) -> EarlyElapsedBound:
+    """The elapsed-depth bound the taker gate's negotiation-time check models for steps 6 and 7 —
+    :func:`~pyrxd.gravity.funding_spv.early_elapsed_blocks_upper` with the SAME burial the coordinator
+    computes (:meth:`SwapCoordinator._funding_proof_room_failure` calls this), for a runner choosing
+    terms BEFORE a coordinator exists.
+
+    A runner that derives ``t_btc`` from ``t_rxd`` must reserve ``elapsed_blocks_upper`` Radiant blocks
+    of ``t_rxd`` for it: the gate subtracts that bound from ``t_rxd`` before it judges the ordering, so
+    a derivation that reserves less produces terms the coordinator refuses at construction.
+    ``value_at_stake_photons`` is the value the coordinator will assess (the largest of
+    ``value_at_risk_photons``, ``radiant_amount`` for an RXD swap, and a stablecoin counter leg's
+    floor). Raises :class:`~pyrxd.gravity.funding_spv.MakerFundingNotVerified` where the gate cannot be
+    modelled (no value on a value-bearing network; no shipped checkpoint work).
+    """
+    burial = _funding_burial(policy, chain, value_at_stake_photons, radiant_min_confirmations=radiant_min_confirmations)
+    return early_elapsed_blocks_upper(
+        chain=chain, value_at_stake_photons=value_at_stake_photons, burial_blocks=burial, policy=funding_bound
+    )
 
 
 def assess_claim_finality(
@@ -2041,27 +2105,19 @@ class SwapCoordinator:
         """
         mp = self.config.margin_policy
         try:
-            flat_burial = _radiant_reserve_blocks(mp, mp.rxd_claim_burial)
-            burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
-            # max(flat, value-scaled) — the SAME term the claim-time gate uses. Checking only the
-            # value-scaled component let the FLAT burial dominate unnoticed, and made this inert
-            # whenever `rxd_reorg_cost_per_block` was unset, since that term is 0 there.
-            counter_reserve = 0
-            if terms.counter_chain != "btc" and mp.eth_finalization_window_s is not None:
-                counter_reserve = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
-            # The SHARED floor (#511) — the claim-time assessor computes it from the same
-            # function, so this gate and that one cannot drift apart again.
-            required = _claim_floor_blocks(mp, burial=burial, counter_reserve=counter_reserve)
+            burial, counter_reserve, required = self._safe_claim_terms(terms)
             elapsed = max(0, int(cov_confs))
             remaining = int(terms.t_rxd.value) - elapsed
             if remaining < required:
+                leaving = f"leaving {remaining}" if remaining > 0 else "leaving none"
                 return PreBtcLockGate(
                     ok=False,
                     reason=(
                         f"t_rxd is {int(terms.t_rxd.value)} blocks and the maker's covenant is already "
-                        f"{elapsed} deep, leaving {remaining} — but a safe claim needs {required} "
+                        f"{elapsed} deep, {leaving}; a safe claim needs {required} "
                         f"(burial {burial} + counter-leg reserve {counter_reserve} + "
-                        f"{_radiant_reserve_blocks(mp, mp.rxd_claim_inclusion)} to be mined). "
+                        f"{_radiant_reserve_blocks(mp, mp.rxd_claim_inclusion)} to be mined), so t_rxd is "
+                        f"{required - remaining} blocks short. "
                         "This swap can NEVER reach a safe claim: the taker would reveal, find every "
                         "claim SQUEEZED, and be left choosing between a reorg-reversible claim and "
                         "walking away from a funded counter leg. Negotiate a longer t_rxd, fund "
@@ -2071,6 +2127,27 @@ class SwapCoordinator:
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})")
         return None
+
+    def _safe_claim_terms(self, terms: NegotiatedTerms) -> tuple[int, int, int]:
+        """``(burial, counter_reserve, required)``: the blocks of ``t_rxd`` a safe claim still needs once
+        the covenant is on chain — step 6's floor, :func:`_claim_floor_blocks` on the burial and the
+        counter-leg reserve."""
+        mp = self.config.margin_policy
+        flat_burial = _radiant_reserve_blocks(mp, mp.rxd_claim_burial)
+        burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
+        # max(flat, value-scaled) — the SAME term the claim-time gate uses. Checking only the
+        # value-scaled component let the FLAT burial dominate unnoticed, and made this inert
+        # whenever `rxd_reorg_cost_per_block` was unset, since that term is 0 there.
+        counter_reserve = 0
+        if terms.counter_chain != "btc" and mp.eth_finalization_window_s is not None:
+            counter_reserve = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
+        # The SHARED floor (#511) — the claim-time assessor computes it from the same
+        # function, so this gate and that one cannot drift apart again.
+        return burial, counter_reserve, _claim_floor_blocks(mp, burial=burial, counter_reserve=counter_reserve)
+
+    def _safe_claim_blocks(self, terms: NegotiatedTerms) -> int:
+        """Step 6's floor: the blocks of ``t_rxd`` a safe claim needs after the elapsed depth."""
+        return self._safe_claim_terms(terms)[2]
 
     def _funding_value_at_stake_photons(self, terms: NegotiatedTerms) -> int | None:
         """The swap's value in photons, for the taker gate's ``k`` — the coordinator's own assessment.
@@ -2082,16 +2159,7 @@ class SwapCoordinator:
         no in-protocol value, so they carry the operator's figure or nothing — and nothing refuses
         on a value-bearing network (:func:`pyrxd.gravity.funding_spv.required_funding_confirmations`).
         """
-        mp = self.config.margin_policy
-        candidates: list[int] = []
-        if mp.value_at_risk_photons is not None:
-            candidates.append(int(mp.value_at_risk_photons))
-        if terms.asset_variant == "rxd":
-            candidates.append(int(terms.radiant_amount))
-        implied = _stablecoin_value_floor_photons(terms, mp, self.counter_leg)
-        if implied is not None:
-            candidates.append(int(implied))
-        return max(candidates) if candidates else None
+        return _funding_value_at_stake(terms, self.config.margin_policy, self.counter_leg)
 
     def _funding_burial_blocks(self, chain: RadiantChain, value_at_stake: int | None) -> int:
         """The ``burial`` term of the taker gate's ``k`` — the swap's existing reorg burial.
@@ -2101,12 +2169,12 @@ class SwapCoordinator:
         one that removes the taker's claim, so it is priced the same way. A test network has no value
         to scale by, so its configured depth stands.
         """
-        depth = self._asset_funding_depth()
-        if depth is None:
-            depth = int(getattr(self.radiant_leg, "min_confirmations", 1))
-        if not chain.value_bearing:
-            return depth
-        return max(depth, _value_scaled_burial_blocks(self.config.margin_policy, value_at_stake))
+        return _funding_burial(
+            self.config.margin_policy,
+            chain,
+            value_at_stake,
+            radiant_min_confirmations=int(getattr(self.radiant_leg, "min_confirmations", 1)),
+        )
 
     def _funding_proof_room_failure(self, terms: NegotiatedTerms) -> str | None:
         """Why *terms* are refused BEFORE ANYONE LOCKS on a value-bearing Radiant network, or None.
@@ -2193,18 +2261,35 @@ class SwapCoordinator:
                 )
         burial = self._funding_burial_blocks(chain, value)
         try:
-            early = early_elapsed_blocks_upper(
-                chain=chain, value_at_stake_photons=value, burial_blocks=burial, policy=self.config.funding_bound
+            early = taker_gate_early_bound(
+                chain=chain,
+                policy=mp,
+                value_at_stake_photons=value,
+                funding_bound=self.config.funding_bound,
+                radiant_min_confirmations=int(getattr(self.radiant_leg, "min_confirmations", 1)),
             )
         except MakerFundingNotVerified as exc:
             return before + f"the taker gate's elapsed-depth bound cannot be modelled: {exc}"
         elapsed = early.elapsed_blocks_upper
         why = None
-        if self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=elapsed) is not None:
-            why = (
-                f"the {int(terms.t_rxd.value) - elapsed} blocks of it left once {elapsed} have elapsed are fewer "
-                "than a safe claim needs (pre_btc_lock_check step 6)"
-            )
+        floor = self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=elapsed)
+        if floor is not None:
+            t_rxd = int(terms.t_rxd.value)
+            try:
+                need = elapsed + self._safe_claim_blocks(terms)
+            except ValidationError:
+                why = f"pre_btc_lock_check step 6 refuses on it: {floor.reason}"
+            else:
+                n_left = t_rxd - elapsed
+                left = (
+                    f"only {n_left} block{'s' if n_left != 1 else ''} of it {'are' if n_left != 1 else 'is'} left"
+                    if n_left > 0
+                    else "none of it is left"
+                )
+                why = (
+                    f"{left} once {elapsed} have elapsed, and a safe claim needs {need - elapsed} "
+                    f"(pre_btc_lock_check step 6): t_rxd is {need - t_rxd} blocks short of the {need} this needs"
+                )
         elif terms.counter_chain == "btc":
             try:
                 assert_timelock_margin(terms.t_btc, terms.t_rxd, mp)

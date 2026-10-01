@@ -22,6 +22,11 @@ import pytest
 
 _RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "eth_swap_run.py"
 
+#: The Radiant blocks the terms builder reserves before deriving t_btc. The sepolia-dust stage passes
+#: the taker gate's own model (about 80 at dust value); these tests are about the covenant's identity
+#: across a resume, not the reserve, so they fix it.
+_RESERVE = 80
+
 
 @pytest.fixture(scope="module")
 def runner():
@@ -42,7 +47,7 @@ def _args(runner, *argv):
 
 def _fresh(runner, eth_timeout=2_000_000_000):
     a = _args(runner, "--t-rxd-blocks", "240", "--rxd-photons", "1000")
-    return a, runner._build_terms_and_covenant(a, eth_timeout=eth_timeout)
+    return a, runner._build_terms_and_covenant(a, elapsed_reserve=_RESERVE, eth_timeout=eth_timeout)
 
 
 def _recovery_from(terms_bundle, eth_timeout=2_000_000_000):
@@ -64,7 +69,7 @@ class TestResumeRebuildsTheSameSwap:
         args, first = _fresh(runner)
         rec = _recovery_from(first)
         _t2, cov2, p2, h2, _k2 = runner._build_terms_and_covenant(
-            args, eth_timeout=rec["eth_timeout_unix_s"], restore=rec
+            args, elapsed_reserve=_RESERVE, eth_timeout=rec["eth_timeout_unix_s"], restore=rec
         )
         assert cov2.funded_spk.hex() == rec["rxd_covenant_spk"]
         assert h2.hex() == rec["hashlock_H"]
@@ -75,7 +80,9 @@ class TestResumeRebuildsTheSameSwap:
         why the guard above cannot be assumed: two runs with identical arguments legitimately
         produce different covenants, so 'the arguments matched' proves nothing."""
         args, first = _fresh(runner)
-        _t2, cov2, _p2, h2, _k2 = runner._build_terms_and_covenant(args, eth_timeout=2_000_000_000)
+        _t2, cov2, _p2, h2, _k2 = runner._build_terms_and_covenant(
+            args, elapsed_reserve=_RESERVE, eth_timeout=2_000_000_000
+        )
         assert cov2.funded_spk.hex() != first[1].funded_spk.hex()
         assert h2 != first[3]
 
@@ -86,7 +93,7 @@ class TestResumeRebuildsTheSameSwap:
         rec = _recovery_from(first)
         rec["preimage_p_hex"] = "00" * 32
         with pytest.raises(SystemExit, match="sha256\\(p\\) != recorded hashlock_H"):
-            runner._build_terms_and_covenant(args, eth_timeout=2_000_000_000, restore=rec)
+            runner._build_terms_and_covenant(args, elapsed_reserve=_RESERVE, eth_timeout=2_000_000_000, restore=rec)
 
     def test_a_MISMATCHED_parameter_is_caught_by_the_SPK_comparison(self, runner) -> None:
         """The keys and preimage can all restore correctly and still produce the wrong covenant if
@@ -98,7 +105,7 @@ class TestResumeRebuildsTheSameSwap:
         rec = _recovery_from(first)
         other = _args(runner, "--t-rxd-blocks", "241", "--rxd-photons", "1000")
         _t2, cov2, _p2, _h2, _k2 = runner._build_terms_and_covenant(
-            other, eth_timeout=rec["eth_timeout_unix_s"], restore=rec
+            other, elapsed_reserve=_RESERVE, eth_timeout=rec["eth_timeout_unix_s"], restore=rec
         )
         assert cov2.funded_spk.hex() != rec["rxd_covenant_spk"], (
             "a different t_rxd must change the covenant — otherwise the SPK check cannot catch it"
