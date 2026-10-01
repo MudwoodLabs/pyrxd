@@ -124,6 +124,7 @@ _TIP_REREAD_ATTEMPTS = 2
 __all__ = [
     "ETH_READ_ONLY_RPC_METHODS",
     "ColdSpend",
+    "CounterLegInconclusive",
     "CounterLegStatus",
     "CovenantChainState",
     "PreimageNotRevealed",
@@ -150,7 +151,9 @@ __all__ = [
     "read_fee_utxos",
     "rebuild_covenant",
     "recover_preimage_from_btc_claim",
+    "recover_preimage_from_eth_artifacts",
     "recover_preimage_from_eth_claim",
+    "recover_preimage_from_eth_logs",
     "select_fee_utxo",
     "spent_spender_unknown_reason",
 ]
@@ -170,6 +173,17 @@ class PreimageNotRevealed(ValidationError):
 
     The benign, expected case: a refund spend of our funding outpoint (the counterparty
     timed out rather than claiming), or a claim that has not happened yet.
+    """
+
+
+class CounterLegInconclusive(ValidationError):
+    """The counter-chain read produced NO evidence either way — not "locked", not "not revealed".
+
+    Distinct from :class:`PreimageNotRevealed` because the two call for opposite actions. "Not
+    revealed" tells a taker to keep watching; an absence of evidence must not, because the
+    commonest way to get an empty answer for a CLAIMED contract is a node that does not serve
+    the log history (pruning, or a log-range limit) — and a taker who keeps watching then can
+    lose both legs when the covenant's CSV refund opens.
     """
 
 
@@ -798,6 +812,134 @@ def recover_preimage_from_eth_claim(
     )
 
 
+def _bound_logs(logs: Sequence[Any], contract_address: str) -> list[dict[str, Any]]:
+    """The logs emitted BY the per-swap contract — the ETH analogue of the funding-outpoint bind."""
+    return [lg for lg in logs if isinstance(lg, dict) and _same_address(lg.get("address"), contract_address)]
+
+
+def _log_topic0(log: dict[str, Any]) -> str | None:
+    """The lower-case 0x-hex of a log's first topic (its event selector), or ``None``."""
+    topics = log.get("topics") or []
+    if not isinstance(topics, list) or not topics:
+        return None
+    blob = _hex_blob(topics[0])
+    return "0x" + blob.hex() if blob else None
+
+
+def recover_preimage_from_eth_logs(
+    *, hashlock: bytes, contract_address: str, logs: Sequence[dict[str, Any]]
+) -> PreimageRecovery:
+    """Scrape ``p`` from the contract's OWN logs. Pure — and independent of any tx lookup.
+
+    The contract emits ``Claimed(bytes32 preimage)`` with ``p`` in the log ``data``, so a log
+    that has already been fetched carries the preimage by itself. This used to be reachable only
+    through :func:`recover_preimage_from_eth_claim`, which needs the transaction too: when the
+    ``eth_getTransactionByHash`` lookup came back null (a node that serves logs but not that
+    transaction), ``swap status`` reported the leg LOCKED and ``recover-preimage`` said "no
+    preimage has been revealed yet" — with ``p`` sitting in a log already in hand.
+
+    Provenance is the per-swap contract address (only logs emitted BY it are scanned), and the
+    value is re-verified as ``sha256(p) == H`` before it is returned. A log that merely LOOKS like
+    a claim but carries no value hashing to ``H`` is never returned as the preimage.
+
+    Raises
+    ------
+    PreimageNotRevealed
+        No log bound to the contract carries a value hashing to ``H``.
+    """
+    if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
+        raise ValidationError("hashlock must be 32 bytes")
+    if not isinstance(contract_address, str) or not contract_address:
+        raise ValidationError("contract_address is required for ETH preimage provenance")
+    for lg in _bound_logs(logs, contract_address):
+        blobs = [_hex_blob(lg.get("data"))]
+        topics = lg.get("topics")
+        if isinstance(topics, list):
+            blobs.extend(_hex_blob(t) for t in topics)
+        try:
+            p = recover_secret(blobs, bytes(hashlock))
+        except (ValidationError, ValueError):
+            continue
+        _verify_hashes_to(p, bytes(hashlock))
+        tx_hash = lg.get("transactionHash")
+        return PreimageRecovery(
+            preimage_hex=bytes(p).hex(),
+            hashlock_hex=bytes(hashlock).hex(),
+            counter_chain="eth",
+            source="eth_claim_log_data",
+            claim_txid=tx_hash if isinstance(tx_hash, str) else None,
+            provenance=(
+                f"log emitted by our per-swap HTLC contract {contract_address}",
+                "sha256(p) == H re-verified independently of the scraper",
+            ),
+        )
+    raise PreimageNotRevealed(f"no log emitted by {contract_address} carries a value hashing to the swap's hashlock")
+
+
+def recover_preimage_from_eth_artifacts(
+    *,
+    hashlock: bytes,
+    contract_address: str,
+    claim_tx: dict[str, Any] | None,
+    logs: Sequence[dict[str, Any]],
+    source: str,
+) -> PreimageRecovery:
+    """Decide the ETH counter-leg from ``(claim_tx, logs)`` — the ONE function both commands use.
+
+    ``swap status`` and ``recover-preimage`` used to decide this separately, and both read a null
+    transaction as "no claim". In order:
+
+    1. **No logs and no transaction** — :class:`CounterLegInconclusive`. An unclaimed contract
+       returns no logs, but so does a pruned node or a log-range limit for a CLAIMED one; an
+       empty answer is not evidence the leg is locked.
+    2. **A log already carries p** — returned, verified, whether or not the transaction lookup
+       succeeded (:func:`recover_preimage_from_eth_logs`).
+    3. **A ``Claimed`` event whose value does not hash to H** — :class:`ProvenanceRefused`. The
+       swap's own contract only emits ``Claimed`` for a preimage of ITS hashlock, so this is the
+       wrong contract for this swap or a server that is not telling the truth. Never shown as p.
+    4. **The transaction is in hand** — the calldata path, :func:`recover_preimage_from_eth_claim`.
+    5. **Only ``Refunded()`` events** — :class:`PreimageNotRevealed` (the leg was refunded).
+    6. **Anything else** (logs that carry no p, transaction not retrievable) —
+       :class:`CounterLegInconclusive`.
+    """
+    from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+
+    bound = _bound_logs(logs, contract_address)
+    if not bound and claim_tx is None:
+        raise CounterLegInconclusive(
+            f"{source} returned NO logs from the HTLC contract {contract_address}. An unclaimed contract "
+            "looks like that, but so does a CLAIMED one read through a pruned node or a log-range limit, "
+            "so this is NOT evidence the leg is locked or that p is unrevealed. Re-check against an RPC "
+            "that serves the contract's full log history before relying on it."
+        )
+    try:
+        return recover_preimage_from_eth_logs(hashlock=hashlock, contract_address=contract_address, logs=bound)
+    except PreimageNotRevealed:
+        pass
+    topic0s = [_log_topic0(lg) for lg in bound]
+    if CLAIMED_TOPIC0 in topic0s:
+        raise ProvenanceRefused(
+            f"the HTLC contract {contract_address} emitted a Claimed event, but no value in it hashes to this "
+            "swap's hashlock H. This swap's own contract can only emit Claimed for a preimage of H, so this is "
+            "the wrong contract address for this swap, or the RPC is not telling the truth. Nothing was taken "
+            "as the preimage."
+        )
+    if claim_tx is not None:
+        return recover_preimage_from_eth_claim(
+            hashlock=hashlock, contract_address=contract_address, claim_tx=claim_tx, logs=logs
+        )
+    if bound and all(t == REFUNDED_TOPIC0 for t in topic0s):
+        raise PreimageNotRevealed(
+            f"the HTLC contract {contract_address} emitted only Refunded() — the leg was refunded and no "
+            "preimage was revealed by it"
+        )
+    raise CounterLegInconclusive(
+        f"{source} returned {len(bound)} log(s) from the HTLC contract {contract_address}; none carries a "
+        "value hashing to H and the transaction that emitted them could not be retrieved, so whether p "
+        "is public is UNKNOWN — not 'locked'. Re-check against another RPC."
+    )
+
+
 # --------------------------------------------------------------------------- counter-leg reads
 
 #: Every Ethereum JSON-RPC method this toolkit is permitted to call. Ethereum has no
@@ -828,7 +970,7 @@ class CounterLegStatus:
     """
 
     chain: str  # "btc" | "eth"
-    state: str  # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | ERROR
+    state: str  # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | UNKNOWN | ERROR
     reason: str
     claim_txid: str | None = None
     preimage_available: bool = False
@@ -1035,25 +1177,21 @@ async def fetch_eth_claim_artifacts(
 async def read_eth_counter_leg(
     session: Any, rpc_url: str, *, contract_address: str, hashlock: bytes, timeout_s: float = 15.0
 ) -> CounterLegStatus:
-    """Classify the ETH counter-leg through the SAME provenance-checked path as recovery."""
+    """Classify the ETH counter-leg through the SAME decision as recovery.
+
+    There is no ``LOCKED`` verdict on this chain: the contract emits nothing until it is claimed
+    or refunded, so "no logs" is all an unclaimed contract can show — and a pruned node shows a
+    claimed one the same way. That is reported ``UNKNOWN``, never ``LOCKED``.
+    """
     tx, logs = await fetch_eth_claim_artifacts(session, rpc_url, contract_address=contract_address, timeout_s=timeout_s)
     source = endpoint_source_label(rpc_url)
-    if tx is None:
-        return CounterLegStatus(
-            chain="eth",
-            state="LOCKED",
-            source=source,
-            reason=(
-                f"{source} reports no retrievable claim activity from the HTLC "
-                f"contract {contract_address} — no preimage has been revealed. That is one server's "
-                "answer, not a verified fact."
-            ),
-        )
-    tx_hash = tx.get("hash") if isinstance(tx.get("hash"), str) else None
+    tx_hash = tx.get("hash") if tx is not None and isinstance(tx.get("hash"), str) else None
     try:
-        rec = recover_preimage_from_eth_claim(
-            hashlock=hashlock, contract_address=contract_address, claim_tx=tx, logs=logs
+        rec = recover_preimage_from_eth_artifacts(
+            hashlock=hashlock, contract_address=contract_address, claim_tx=tx, logs=logs, source=source
         )
+    except CounterLegInconclusive as exc:
+        return CounterLegStatus(chain="eth", state="UNKNOWN", reason=str(exc), claim_txid=tx_hash, source=source)
     except PreimageNotRevealed as exc:
         return CounterLegStatus(
             chain="eth", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=tx_hash, source=source
@@ -1064,9 +1202,9 @@ async def read_eth_counter_leg(
         chain="eth",
         state="CLAIMED_PREIMAGE_REVEALED",
         reason=(
-            f"the counterparty CLAIMED in {rec.claim_txid} and the preimage p is now PUBLIC on ETH. "
-            "Extract it with `pyrxd swap recover-preimage`, then `pyrxd swap build-claim` while the "
-            "covenant's CSV refund window is still shut."
+            f"the counterparty CLAIMED in {rec.claim_txid or 'a transaction the RPC did not name'} and the "
+            "preimage p is now PUBLIC on ETH. Extract it with `pyrxd swap recover-preimage`, then "
+            "`pyrxd swap build-claim` while the covenant's CSV refund window is still shut."
         ),
         claim_txid=rec.claim_txid,
         preimage_available=True,

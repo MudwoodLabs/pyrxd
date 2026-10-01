@@ -44,6 +44,7 @@ from .format import emit, sanitize_terminal
 from .swap_cmds import parse_recovery_file
 from .swap_recovery import (
     ColdSpend,
+    CounterLegInconclusive,
     PreimageNotRevealed,
     PreimageRecovery,
     ProvenanceRefused,
@@ -61,7 +62,7 @@ from .swap_recovery import (
     read_fee_utxos,
     rebuild_covenant,
     recover_preimage_from_btc_claim,
-    recover_preimage_from_eth_claim,
+    recover_preimage_from_eth_artifacts,
     select_fee_utxo,
     spent_spender_unknown_reason,
 )
@@ -244,12 +245,13 @@ async def _recover(
         tx, logs = await fetch_eth_claim_artifacts(
             session, eth_rpc_url, contract_address=eth_contract, timeout_s=timeout_s
         )
-    if tx is None:
-        raise PreimageNotRevealed(
-            f"{endpoint_source_label(eth_rpc_url)} reports no retrievable claim activity from the HTLC "
-            f"contract {eth_contract} — no preimage yet. That is one server's answer, not a verified fact."
-        )
-    return recover_preimage_from_eth_claim(hashlock=hashlock, contract_address=eth_contract, claim_tx=tx, logs=logs)
+    return recover_preimage_from_eth_artifacts(
+        hashlock=hashlock,
+        contract_address=eth_contract,
+        claim_tx=tx,
+        logs=logs,
+        source=endpoint_source_label(eth_rpc_url),
+    )
 
 
 @click.command(name="recover-preimage")
@@ -325,12 +327,26 @@ def swap_recover_preimage_cmd(
                 timeout_s=timeout_s,
             )
         )
+    except CounterLegInconclusive as exc:
+        # Before PreimageNotRevealed (both are ValidationErrors): "no evidence" must never be
+        # rendered as "not revealed yet — keep watching".
+        raise NetworkBoundaryError(
+            "the counter-chain read is inconclusive — no preimage was taken",
+            cause=sanitize_terminal(str(exc), max_len=400),
+            fix="re-run against an RPC that serves the contract's full log history, or read the contract's "
+            "events on a block explorer — nothing was broadcast",
+        ) from exc
     except ProvenanceRefused as exc:
         raise UserError(
             "REFUSED on provenance — no preimage was taken",
             cause=sanitize_terminal(str(exc), max_len=400),
-            fix="confirm --btc-funding-outpoint is THIS swap's funding output; a transaction that only "
-            "shares the hashlock is not this swap's claim",
+            fix=(
+                "confirm --eth-contract is THIS swap's per-swap HTLC contract; a contract that does not "
+                "reveal a preimage of this swap's hashlock is not this swap's"
+                if facts.counter_chain == "eth" and offline_raw is None
+                else "confirm --btc-funding-outpoint is THIS swap's funding output; a transaction that only "
+                "shares the hashlock is not this swap's claim"
+            ),
         ) from exc
     except PreimageNotRevealed as exc:
         raise UserError(

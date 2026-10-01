@@ -225,6 +225,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returns the txid for that one-leaf, offset-0 path. No pyrxd command called this method.
 ### Fixed
 
+- **`swap status` and `swap recover-preimage` could tell a taker to keep waiting while the ETH
+  preimage was already public.** When the RPC returned the contract's `Claimed(p)` log but
+  `eth_getTransactionByHash` returned null for its transaction, `status` reported the ETH leg
+  `LOCKED` ("no preimage has been revealed") and `recover-preimage` said "no preimage has been
+  revealed yet", although `p` was in the log already fetched. A taker who kept watching could lose
+  both legs when the covenant's CSV refund opened. Present since the ETH counter-leg read was added
+  in 0.14.0. Both commands now go through one decision: `p` is taken from the contract's own logs
+  (bound to the per-swap contract address, and only if `sha256(p)` equals the swap's hashlock),
+  whether or not the transaction lookup succeeds. A `Claimed` event whose value does not hash to the
+  hashlock is refused (`ERROR` in `status`, a provenance refusal in `recover-preimage`), never shown
+  as the preimage. An empty log set is no longer `LOCKED`: an unclaimed contract emits no logs, but
+  neither does a claimed one read through a pruned node or a log-range limit, so `status` now
+  reports the ETH leg as the new state `UNKNOWN` and `recover-preimage` exits 2 as an inconclusive
+  read. With a spent covenant, pruned logs used to produce `COUNTER_LEG_LOCKED` ("your ETH is still
+  locked — refund it now"); they now produce `COVENANT_SPENT`. The ETH counter-leg no longer has a
+  `LOCKED` state at all, since nothing the contract emits can show it.
 - **`swap status` and `swap recover-preimage` no longer report a spent BTC HTLC as UNSPENT.** An
   Esplora answer of `{"spent": true}` with the spending txid missing or malformed was folded into
   the unspent case, so `status` printed "UNSPENT — the counterparty has not claimed" and

@@ -1027,9 +1027,12 @@ async def test_btc_counter_leg_states_for_unspent_refund_and_bad_provenance(monk
 
 @pytest.mark.asyncio
 async def test_eth_counter_leg_states(monkeypatch) -> None:
+    # No logs and no transaction is NO EVIDENCE: a pruned node answers a claimed contract this way.
+    # It used to read LOCKED ("no preimage has been revealed ... keep watching").
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(None, [])))
-    locked = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
-    assert locked.state == "LOCKED"
+    empty = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
+    assert empty.state == "UNKNOWN"
+    assert "NOT evidence the leg is locked" in empty.reason
 
     monkeypatch.setattr(
         sr,

@@ -623,10 +623,12 @@ def test_online_eth_recovery_fetches_verifies_and_prints(swap, monkeypatch, no_r
 
 
 def test_online_eth_recovery_reports_no_claim_activity(swap, monkeypatch, no_real_http) -> None:
+    # An empty log set is inconclusive (exit 2), never "no preimage has been revealed yet".
     monkeypatch.setattr(swap_recovery_cmds, "fetch_eth_claim_artifacts", AsyncMock(return_value=(None, [])))
     res = _recover(_eth_swap(swap), "--eth-contract", ETH_CONTRACT, "--eth-rpc-url", "http://x")
-    assert res.exit_code == 1
-    assert "no retrievable claim activity" in res.output
+    assert res.exit_code == 2, res.output
+    assert "inconclusive" in res.output
+    assert "no preimage has been revealed yet" not in res.output
 
 
 def test_eth_recovery_needs_a_contract_and_an_rpc_url(swap) -> None:
