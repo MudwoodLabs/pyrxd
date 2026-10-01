@@ -152,7 +152,8 @@ def _two_operators(ev):
     """*ev* with the funding's depth reported honestly (the served tip) by two distinct operators —
     what the gate requires above dust on a value-bearing network."""
     depth = max(ev.headers) - ev.height + 1
-    return dataclasses.replace(ev, reported_depths=tuple((str(k), depth) for k in _SHIPPED_OPERATORS[:2]))
+    reports = tuple((str(k), depth) for k in _SHIPPED_OPERATORS[:2])
+    return dataclasses.replace(ev, reported_depths=reports, funding_tx_depths=reports)
 
 
 class _ChainView:
@@ -2011,7 +2012,9 @@ def test_above_dust_the_gate_refuses_unless_two_distinct_operators_report_the_de
     depth = max(c.headers) - c.height + 1
 
     def run(reports, value=_ABOVE_DUST, configured=(a, b), **extra):
-        ev = c.evidence(reported_depths=tuple(reports), configured_operators=configured)
+        ev = c.evidence(
+            reported_depths=tuple(reports), funding_tx_depths=tuple(reports), configured_operators=configured
+        )
         return verify_maker_funding(ev, value_at_stake_photons=value, **kw, **extra)
 
     for reports in (
@@ -2032,7 +2035,7 @@ def test_above_dust_the_gate_refuses_unless_two_distinct_operators_report_the_de
 
     ok = run([(a, depth), (b, depth)])
     assert ok.reporting_operators == (a, b) and ok.reporting_operators_required == 2
-    assert "2 distinct operators reported, 2 required above the dust threshold" in ok.bound_note
+    assert "2 distinct operators reported the funding transaction, 2 required above the dust threshold" in ok.bound_note
 
     # At the threshold: one operator suffices, and the result says the time term may govern.
     at = run([(a, depth)], value=_ABOVE_DUST - 1)
@@ -2133,6 +2136,73 @@ async def test_step_5_refuses_when_only_one_of_two_configured_operators_answers(
     )
     assert (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
     assert coord.last_maker_funding.reporting_operators == (str(view.source_key), str(_SHIPPED_OPERATORS[1]))
+
+
+class _TipOnly(_DepthReader):
+    """A second operator that does not know the funding transaction — its verbose read fails, as
+    ElectrumX answers a txid it has never seen — but answers its tip height, which can be anything."""
+
+    def __init__(self, view, *, tip, key=_SHIPPED_OPERATORS[1]):
+        super().__init__(view, key=key)
+        self.tip = tip
+
+    async def get_transaction_verbose(self, txid):
+        raise NetworkError("No such mempool or blockchain transaction")
+
+    async def get_tip_height(self):
+        return self.tip
+
+
+async def test_a_tip_height_alone_is_not_an_operator_reporting_the_funding(monkeypatch):
+    """The two-operator rule counted an operator whose verbose read of the funding FAILED, through
+    its tip height: ``tip - H + 1`` is a number for any txid, real or not, so "two operators report
+    the depth" held with one operator knowing nothing about the funding.
+
+    Now: through the real leg and ``RadiantChainIO``, an operator that answers only its tip is in
+    the bound's reports and not among the operators counted, so above dust the gate refuses and
+    names it; the same operator answering the verbose read is counted and the swap locks; and a
+    tip-only report still RAISES the bound, at dust, where one operator suffices."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(3000)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=70, base=base, bits=_HARD_BITS)
+    tip = view.chain.top
+
+    def coord_for(depth_source, value):
+        return _btc_coord(
+            terms,
+            _real_leg(view, network="bc", depth_sources=(depth_source,)),
+            policy=_vb_policy(value_at_risk_photons=value),
+            accept_nondurable_seen=True,
+        )
+
+    # The leg keeps the two kinds of report apart.
+    io = RadiantChainIO(view, depth_sources=(_TipOnly(view, tip=tip),))
+    got = await io.depth_reports(view.chain.txid, view.chain.height)
+    b = str(_SHIPPED_OPERATORS[1])
+    assert dict(got.reported)[b] == tip - view.chain.height + 1
+    assert b not in dict(got.funding_tx) and dict(got.funding_tx) == {str(view.source_key): view.confs}
+
+    above = 10_000 * PHOTONS_PER_RXD
+    coord, btc_view = coord_for(_TipOnly(view, tip=tip), above)
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert gate.ok is False
+    assert f"1 answered ({view.source_key}), and {b} did not" in gate.reason, gate.reason
+    assert f"{b} gave only a tip height" in gate.reason, gate.reason
+    assert btc_view.broadcasts == []
+
+    # Honest path: the same operator answering the funding transaction's verbose read counts.
+    coord, _ = coord_for(_DepthReader(view), above)
+    assert (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok is True
+    assert coord.last_maker_funding.reporting_operators == (str(view.source_key), b)
+
+    # A tip-only report still raises the bound (it can only raise it): at dust, one operator suffices.
+    dust = ElapsedBoundPolicy().dust_threshold_photons
+    coord, _ = coord_for(_TipOnly(view, tip=tip + 500), dust)
+    await coord.taker_verify_asset_funding(terms, now_unix_s=_NOW)
+    proof = coord.last_maker_funding
+    assert proof.reporting_operators == (str(view.source_key),)
+    assert (proof.elapsed_blocks_upper, proof.bound_term) == (tip + 500 - view.chain.height + 1, "reported")
+    assert f"of which {b} gave only a tip height" in proof.bound_note, proof.bound_note
 
 
 async def test_a_client_over_several_operators_is_asked_once_per_operator(monkeypatch):
@@ -2242,7 +2312,7 @@ def _one_operator_run(monkeypatch, *, value, policy):
     c, kw = _dust_case(monkeypatch)
     a, b = (str(k) for k in _SHIPPED_OPERATORS[:2])
     depth = max(c.headers) - c.height + 1
-    ev = c.evidence(reported_depths=((a, depth),), configured_operators=(a, b))
+    ev = c.evidence(reported_depths=((a, depth),), funding_tx_depths=((a, depth),), configured_operators=(a, b))
     return lambda: verify_maker_funding(ev, value_at_stake_photons=value, bound_policy=policy, **kw)
 
 

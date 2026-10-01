@@ -88,8 +88,11 @@ used is::
   A report can only RAISE the bound; a source reporting less never lowers it. ABOVE DUST on a
   value-bearing network (a value at stake over ``ElapsedBoundPolicy.dust_threshold_photons``,
   1,000 RXD by default) the gate REFUSES unless at least :data:`MIN_REPORTING_OPERATORS` (two)
-  distinct operators report a depth for the funding — a source that cannot say which operator runs
-  it is not counted — and the refusal names how many answered and which. The coordinator refuses
+  distinct operators report the FUNDING TRANSACTION's depth — their verbose reply for its txid; a
+  source that answered only its tip height said nothing about the funding and is not counted (its
+  ``tip - H + 1`` may still raise the bound), nor is a source that cannot say which operator runs
+  it — and the refusal names how many answered and which. Such a report is a server's word, not a
+  proof. The coordinator refuses
   at construction, before anyone locks, a configuration with fewer operator groups than that. At
   or below dust one operator suffices: with one operator configured, the time term is what stands
   against a source that stops serving early, and the result says so. The user may move that
@@ -220,7 +223,8 @@ FORGERY_COST_FACTOR = 2
 
 #: Above the dust threshold (:attr:`ElapsedBoundPolicy.dust_threshold_photons`) on a value-bearing
 #: network, the fewest DISTINCT OPERATORS — operator groups, by
-#: :func:`pyrxd.network.source_identity.source_key` — that must report a depth for the funding.
+#: :func:`pyrxd.network.source_identity.source_key` — that must report the funding transaction's depth
+#: (:attr:`MakerFundingEvidence.funding_tx_depths`; a tip height alone does not count).
 MIN_REPORTING_OPERATORS = 2
 
 #: The prefix of the label a depth report carries when its source cannot say which operator runs it
@@ -892,9 +896,14 @@ class MakerFundingEvidence:
     headers: Mapping[int, bytes]
     #: ``((source, depth), ...)``: the depth each configured source REPORTS for the funding (its
     #: verbose ``confirmations``, or its tip height minus the funding height plus one), keyed by the
-    #: source's operator group. Used to RAISE the elapsed upper bound, never as proof of depth, and
-    #: counted by operator for the rule above dust (:data:`MIN_REPORTING_OPERATORS`).
+    #: source's operator group. Used to RAISE the elapsed upper bound, never as proof of depth.
     reported_depths: tuple[tuple[str, int], ...] = ()
+    #: ``((source, confirmations), ...)``: the confirmations each source reports for the funding
+    #: TRANSACTION ITSELF — its verbose reply for this txid — keyed by operator group. Only these count
+    #: toward the rule above dust (:data:`MIN_REPORTING_OPERATORS`): a source that answered only its
+    #: tip height said nothing about this transaction, so it may raise the bound (through
+    #: ``reported_depths``) but is not an operator reporting the funding.
+    funding_tx_depths: tuple[tuple[str, int], ...] = ()
     #: The operator groups the leg was configured to ask (whether or not they answered), for a
     #: refusal to name. Not evidence of anything.
     configured_operators: tuple[str, ...] = ()
@@ -941,7 +950,8 @@ class VerifiedMakerFunding:
     #: The largest depth each operator group reported, and the largest of them (``None``: no report).
     reported_by_operator: tuple[tuple[str, int], ...]
     reported_depth: int | None
-    #: The distinct operators counted as having reported a depth (:func:`counted_operators`), and how
+    #: The distinct operators counted as having reported the funding transaction's depth
+    #: (:attr:`MakerFundingEvidence.funding_tx_depths`, through :func:`counted_operators`), and how
     #: many this swap required: :data:`MIN_REPORTING_OPERATORS` above dust on a value-bearing
     #: network, else 0.
     reporting_operators: tuple[str, ...]
@@ -1233,11 +1243,15 @@ def verify_maker_funding(
         time_blocks = bound_policy.blocks_upper(
             elapsed_s, spacing_s=int(chain.target_spacing_s), value_at_stake_photons=value_at_stake_photons
         )
-    by_operator = _reported_by_operator(evidence.reported_depths)
+    tx_reports = _reported_by_operator(evidence.funding_tx_depths)
+    by_operator = _reported_by_operator(tuple(evidence.reported_depths or ()) + tuple(tx_reports))
     reported = max((d for _k, d in by_operator), default=None)
-    # Above dust on a value-bearing network, the report term must come from at least two distinct
-    # operators: a depth reported by one operator group alone is not enough to lock against.
-    answered = counted_operators([k for k, d in by_operator if d >= 1])
+    # Above dust on a value-bearing network, at least two distinct operators must report the FUNDING
+    # TRANSACTION's depth: a depth reported by one operator group alone is not enough to lock against,
+    # and a source that answered only its tip height (a failed or absent verbose read of this txid)
+    # said nothing about the funding — it may raise the bound above, never count here.
+    answered = counted_operators([k for k, d in tx_reports if d >= 1])
+    tip_only = tuple(k for k, _d in by_operator if k not in {t for t, d in tx_reports if d >= 1})
     needed = bound_policy.requires_operators(chain, value_at_stake_photons)
     if len(answered) < needed:
         configured = (
@@ -1248,13 +1262,19 @@ def verify_maker_funding(
         silent = [c for c in counted_operators(configured) if c not in answered]
         raise refuse(
             f"the value at stake ({value_at_stake_photons} photons) is above the dust threshold "
-            f"({bound_policy.single_operator_threshold_photons} photons), so the funding's depth must be reported by at "
-            f"least {needed} distinct operators; {len(answered)} answered"
+            f"({bound_policy.single_operator_threshold_photons} photons), so the funding transaction's depth must be "
+            f"reported by at least {needed} distinct operators; {len(answered)} answered"
             + (f" ({', '.join(answered)})" if answered else "")
             + (f", and {', '.join(silent)} did not" if silent else "")
+            + (
+                f" ({', '.join(t for t in tip_only if t in silent)} gave only a tip height, which is not a "
+                "report of the funding transaction)"
+                if any(t in silent for t in tip_only)
+                else ""
+            )
             + ". Configure a depth source run by another operator (RadiantChainIO(..., depth_sources=...)) "
             "and retry" + bound_policy.single_operator_refusal_hint(),
-            f"depth reports from {needed} distinct operators",
+            f"reports of the funding transaction's depth from {needed} distinct operators",
             f"the funding in block {height}, {proved} deep; "
             + (", ".join(f"{k} {d}" for k, d in by_operator) if by_operator else "no depth reports"),
         )
@@ -1279,6 +1299,7 @@ def verify_maker_funding(
         "no source reported a depth"
         if not by_operator
         else f"reports from {ops} operator{'s' if ops != 1 else ''} ({', '.join(f'{k} {d}' for k, d in by_operator)})"
+        + (f", of which {', '.join(tip_only)} gave only a tip height" if tip_only else "")
     )
     one_op = (
         "; with one operator configured, the time term is what stands against a source that stops serving early"
@@ -1286,7 +1307,10 @@ def verify_maker_funding(
         else ""
     )
     if needed:
-        rule_part = f"; {len(answered)} distinct operators reported, {needed} required above the dust threshold"
+        rule_part = (
+            f"; {len(answered)} distinct operators reported the funding transaction, {needed} required above the "
+            "dust threshold"
+        )
     elif chain.value_bearing:
         rule_part = (
             f"; the value at stake is at or below the dust threshold ({bound_policy.single_operator_threshold_photons} "

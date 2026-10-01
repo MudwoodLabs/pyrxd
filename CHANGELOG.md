@@ -329,13 +329,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     lock-time re-run inside `taker_funds_btc` is judged by steps 6 and 7 on ITS OWN bound, at a
     `now` taken after its reads, and refuses the lock when they fail: the re-run reads the chain
     later than the gate, so its bound can be larger;
-  - above dust, the funding's depth must be reported by two independent operators (a report is a
-    server's word — its verbose confirmations or its tip height — not a proof): on a
-    value-bearing network, when the value at stake exceeds `ElapsedBoundPolicy.dust_threshold_photons`
-    (1,000 RXD by default), the gate refuses the lock unless at least two operator groups
-    (`source_key`; the user's own node is its own group) report a depth for the funding, and the
-    refusal names how many answered and which. A source that cannot say which operator runs it is
-    not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
+  - above dust, two independent operators must report the funding transaction's depth (a
+    server's word, not a proof): on a value-bearing network, when the value at stake exceeds
+    `ElapsedBoundPolicy.dust_threshold_photons` (1,000 RXD by default), the gate refuses the lock
+    unless at least two operator groups (`source_key`; the user's own node is its own group) report
+    confirmations for the funding transaction itself — their verbose reply for its txid — and the
+    refusal names how many answered and which. An operator that answers only its tip height (its
+    verbose read of the txid failed, as it does for a transaction the server does not know) is not
+    counted; its `tip - H + 1` can still raise the elapsed-depth bound, and the refusal and the
+    result's `bound_note` say it gave only a tip height (`RadiantChainIO.depth_reports`,
+    `MakerFundingEvidence.funding_tx_depths`, both new). A source that cannot say which operator
+    runs it is not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
     configured to ask fewer than two operators for such a swap, naming them. At or below dust one
     operator suffices and the result says so. pyrxd's shipped mainnet endpoints are two operators;
     the node-over-ssh scripts ask the node and those endpoints.

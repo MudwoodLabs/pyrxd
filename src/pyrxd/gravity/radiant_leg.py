@@ -47,6 +47,7 @@ import contextlib
 import logging
 import math
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
@@ -166,9 +167,25 @@ class RadiantBroadcaster(Protocol):
         ...
 
 
-#: How long :meth:`RadiantChainIO.reported_depths` waits for any one depth source before dropping
+#: How long :meth:`RadiantChainIO.depth_reports` waits for any one depth source before dropping
 #: it. The sources are asked concurrently, so this bounds the whole call, not each source in turn.
 DEPTH_SOURCE_TIMEOUT_S = 20.0
+
+
+@dataclass(frozen=True)
+class DepthReports:
+    """What the configured sources said about one funding's depth, by operator group — nothing proved.
+
+    ``reported``: each source's larger of its verbose ``confirmations`` for the funding and its
+    ``tip - height + 1`` (what may RAISE the gate's elapsed-depth upper bound). ``funding_tx``: the
+    confirmations each source reported for the funding TRANSACTION ITSELF, from its verbose reply for
+    that txid — the only reports the gate counts toward its two-operator rule above dust. A source
+    whose verbose read failed (a txid it does not know, an error, a timeout) and that answered only
+    its tip height appears in ``reported`` and not in ``funding_tx``.
+    """
+
+    reported: tuple[tuple[str, int], ...]
+    funding_tx: tuple[tuple[str, int], ...]
 
 
 class RadiantChainIO:
@@ -355,7 +372,7 @@ class RadiantChainIO:
         The funding transaction's raw bytes, its merkle branch in block *height*, that block's
         coinbase branch (which pins the tree's depth), the header ranges the coordinator planned
         (:func:`pyrxd.gravity.funding_spv.funding_header_ranges`), and the depth each configured
-        source reports (:meth:`reported_depths`). :func:`pyrxd.gravity.funding_spv.verify_maker_funding`
+        source reports (:meth:`depth_reports`). :func:`pyrxd.gravity.funding_spv.verify_maker_funding`
         decides what they prove; a reply this cannot fetch raises ``NetworkError``, and the gate
         refuses on it.
 
@@ -395,6 +412,7 @@ class RadiantChainIO:
             raise NetworkError(
                 f"could not fetch the proof of the maker's funding: {type(exc).__name__}: {exc}"
             ) from exc
+        reports = await self.depth_reports(txid, int(height))
         return MakerFundingEvidence(
             txid=txid.lower(),
             vout=int(vout_s),
@@ -403,7 +421,8 @@ class RadiantChainIO:
             merkle=merkle,
             coinbase_merkle=coinbase,
             headers=headers,
-            reported_depths=await self.reported_depths(txid, int(height)),
+            reported_depths=reports.reported,
+            funding_tx_depths=reports.funding_tx,
             configured_operators=self.configured_depth_operators(),
         )
 
@@ -445,17 +464,25 @@ class RadiantChainIO:
         return tuple(dict.fromkeys(out))
 
     async def reported_depths(self, txid: str, height: int) -> tuple[tuple[str, int], ...]:
-        """``((operator, depth), ...)``: the depth of *txid* (mined at *height*) each configured
-        source REPORTS — ``client``, ``proof_client`` and every ``depth_sources`` reader, each once,
-        and a client over several operators' URLs once per operator (on clients made for this call
-        and closed before it returns).
+        """``((operator, depth), ...)``: :attr:`DepthReports.reported` of :meth:`depth_reports` — the
+        depth each configured source reports for *txid* (mined at *height*), the larger of its
+        verbose ``confirmations`` and its ``tip - height + 1``."""
+        return (await self.depth_reports(txid, height)).reported
 
-        A source's depth is the larger of its verbose ``confirmations`` and its ``tip - height + 1``,
-        whichever it answers; a source that answers neither is left out. Each is labelled by its
+    async def depth_reports(self, txid: str, height: int) -> DepthReports:
+        """What each configured source REPORTS about the depth of *txid* (mined at *height*) —
+        ``client``, ``proof_client`` and every ``depth_sources`` reader, each once, and a client over
+        several operators' URLs once per operator (on clients made for this call and closed before it
+        returns).
+
+        A source's ``reported`` depth is the larger of its verbose ``confirmations`` and its
+        ``tip - height + 1``, whichever it answers; its ``funding_tx`` entry is the verbose
+        ``confirmations`` alone, present only when it answered the verbose read for THIS txid with a
+        positive count. A source that answers neither is left out of both. Each is labelled by its
         ``source_key`` (its operator group, :func:`pyrxd.network.source_identity.source_key`), or
         ``"unidentified source #i (<type>)"`` for a client that cannot say — never merged with another.
-        These RAISE the gate's elapsed upper bound, and above dust the gate counts the operators
-        among them; the proof does not depend on them.
+        ``reported`` RAISES the gate's elapsed upper bound; above dust the gate counts the operators in
+        ``funding_tx`` only. The proof does not depend on either.
 
         The sources are asked CONCURRENTLY, each under ``depth_timeout_s``; one that times out or
         fails is left out exactly as one that answers neither. So an unresponsive operator costs the
@@ -471,24 +498,37 @@ class RadiantChainIO:
             else:
                 asked.append((index, src))
         try:
-            return await self._ask_depths(asked, txid, height)
+            answers = await self._ask_depths(asked, txid, height)
         finally:
             for part in made:
                 with contextlib.suppress(Exception):
                     await part.close()
+        reported: list[tuple[str, int]] = []
+        funding_tx: list[tuple[str, int]] = []
+        for label, confs, tip_depth in answers:
+            found = [d for d in (confs, tip_depth) if d is not None]
+            if found:
+                reported.append((label, max(found)))
+            if confs is not None:
+                funding_tx.append((label, confs))
+        return DepthReports(reported=tuple(reported), funding_tx=tuple(funding_tx))
 
-    async def _ask_depths(self, asked: list[tuple[int, Any]], txid: str, height: int) -> tuple[tuple[str, int], ...]:
-        async def one(index: int, src: Any) -> tuple[str, int] | None:
+    async def _ask_depths(
+        self, asked: list[tuple[int, Any]], txid: str, height: int
+    ) -> tuple[tuple[str, int | None, int | None], ...]:
+        async def one(index: int, src: Any) -> tuple[str, int | None, int | None] | None:
             try:
-                depths = await asyncio.wait_for(self._ask_one(index, src, txid, height), self._depth_timeout_s)
+                confs, tip_depth = await asyncio.wait_for(
+                    self._ask_one(index, src, txid, height), self._depth_timeout_s
+                )
             except asyncio.TimeoutError:
                 logger.debug("depth source %d did not answer within %.1f s", index, self._depth_timeout_s)
                 return None
-            if not depths:
+            if confs is None and tip_depth is None:
                 return None
             key = getattr(src, "source_key", None)
             label = str(key) if key else self._unidentified_label(index, src)
-            return (label, max(depths))
+            return (label, confs, tip_depth)
 
         # Concurrently: one unresponsive operator costs one timeout, not one per source in turn.
         # `gather` keeps the order they were asked in.
@@ -496,9 +536,10 @@ class RadiantChainIO:
         return tuple(a for a in answers if a is not None)
 
     @staticmethod
-    async def _ask_one(index: int, src: Any, txid: str, height: int) -> list[int]:
-        """The depths one source reports: its verbose ``confirmations`` and ``tip - height + 1``,
-        whichever it answers; a read that fails is left out.
+    async def _ask_one(index: int, src: Any, txid: str, height: int) -> tuple[int | None, int | None]:
+        """``(confirmations, tip_depth)`` one source reports: its verbose ``confirmations`` for *txid*
+        (``None`` unless it answered that read with a positive count) and ``tip - height + 1``
+        (``None`` unless it answered its tip at or above *height*); a read that fails is ``None``.
 
         The two reads are asked ONE AFTER THE OTHER. Only different sources run concurrently: two
         concurrent first calls on one fresh ``ElectrumXClient`` would each open a connection, and
@@ -527,8 +568,7 @@ class RadiantChainIO:
                 logger.debug("depth source %d gave no tip height", index, exc_info=True)
                 return None
 
-        found = [await confirmations(), await from_tip()]
-        return [d for d in found if d is not None]
+        return await confirmations(), await from_tip()
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to

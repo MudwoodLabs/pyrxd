@@ -2129,7 +2129,7 @@ class SwapCoordinator:
         3. TWO OPERATORS ABOVE DUST (a coordinator that runs the taker gate). Above
            ``funding_bound.single_operator_threshold_photons`` (``dust_threshold_photons`` unless the
            user override ``accept_single_operator_up_to_photons`` is set) the gate refuses unless at
-           least two distinct operators report the funding's depth (:data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`);
+           least two distinct operators report the funding transaction's depth (:data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`);
            a Radiant leg configured to ask fewer operator groups (``configured_depth_operators``,
            derived from each source's ``source_key``) is refused here, naming them.
         4. ROOM IN ``t_rxd``. Step 6 subtracts the gate's elapsed-depth UPPER bound from ``t_rxd``, and
