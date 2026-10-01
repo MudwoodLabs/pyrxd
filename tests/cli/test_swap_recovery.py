@@ -1818,3 +1818,27 @@ def test_has_keys_agrees_with_the_gate_on_a_public_file_too(tmp_path: Path) -> N
     facts = parse_recovery_file(p)
     assert facts.has_keys is False
     assert facts.has_preimage is True
+
+
+def test_verify_raw_eth_tx_refuses_bytes_that_hash_to_another_transaction() -> None:
+    """The computed hash is checked HERE, not only downstream: ``verify_raw_eth_tx`` is the one
+    place a raw transaction becomes a VerifiedEthTx, so it must refuse a mismatched pair itself."""
+    eth_account = pytest.importorskip("eth_account")
+    from eth_utils import to_checksum_address
+
+    signed = eth_account.Account.create().sign_transaction(
+        {
+            "nonce": 0,
+            "gas": 60_000,
+            "gasPrice": 10**9,
+            "to": to_checksum_address(CONTRACT),
+            "value": 0,
+            "data": sr.ETH_REFUND_SELECTOR,
+            "chainId": 1,
+        }
+    )
+    raw = bytes(signed.raw_transaction)
+    real = "0x" + bytes(signed.hash).hex()
+    assert sr.verify_raw_eth_tx(raw, real).hash == real
+    with pytest.raises(sr.ProvenanceRefused, match="different transaction"):
+        sr.verify_raw_eth_tx(raw, "0x" + "aa" * 32)
