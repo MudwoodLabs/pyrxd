@@ -6,6 +6,294 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **ETH/ERC-20 HTLC: the counterparty runtime check is now slot-exact, closing a fund-theft path
+  proven on a local Anvil chain. Affects v0.6.0 through v0.25.1; upgrade before running an ETH or
+  ERC-20 swap.** The affected surface is a MAKER verifying a counterparty-deployed ETH or ERC-20
+  HTLC (`EthHtlcContractLeg.verify_funded`, and `Erc20HtlcLeg.verify_funded`, which inherits it,
+  since that leg shipped in v0.21.0). The masked compare arrived with #155, was first released in
+  v0.6.0, and is in every release through v0.25.1. It compared the deployed runtime to the
+  committed artifact with a *value-masked* compare that wildcarded every committed-zero byte — a
+  superset of the immutable slots. Solidity splices each `immutable` into 2–3 SEPARATE runtime
+  offsets; a getter reads one copy while `claim()`/`refund()` read another. So a hostile TAKER
+  (who deploys the ETH side first) could deploy a runtime whose `claimant` getter-copy held the
+  negotiated maker (passing every `verify_funded` getter bind) while the `claim()`-copy held an
+  attacker address. `verify_funded` passed, the maker revealed the preimage, and `claim(p)` sent
+  the entire funded balance to the attacker — who then also held `p` to take the RXD leg. The prior
+  docstring's "Not exploitable in the current self-deploy wiring" was wrong for the taker-deploys
+  role. The fix (`_expected_runtime`) rebuilds the expected runtime by substituting each negotiated
+  immutable into EVERY `immutableReferences` offset and requires EXACT byte equality — no byte is
+  wildcarded, so a forged immutable copy or any modified logic byte is rejected. The token leg
+  extends it to its `token`/`amount` immutables.
+- **The slot-exact runtime fix above now has a per-PR regression test.** Until now only the
+  nightly Anvil job could catch a revert of it: with the compare deleted, the default suite stayed
+  green (19103 passed, measured by the 2026-09-30 review panel). The offline tests that described
+  themselves as its regression compared two byte strings they had built themselves, and their
+  docstrings now say so. `tests/test_eth_verify_funded_real_runtime.py` runs the real
+  `verify_funded`, for both legs, over the committed artifacts' runtimes. It forges every copy of
+  every immutable in turn, plus a logic byte, and nothing on the leg is stubbed.
+- **ETH/ERC-20 HTLC: a counterparty contract that is already SETTLED is refused.** The exact
+  runtime compare covers the contract's code, not its storage, so `verify_funded` accepted a
+  contract with the exact code and full balance whose `settled` flag (storage slot 0) was already
+  set. Such a contract cannot pay out: `claim()` and `refund()` both revert `AlreadySettled`.
+  `verify_funded` now reads slot `SETTLED_SLOT` at the same pinned block as its other reads and
+  refuses a non-zero word. `claim` re-reads it at the tip before building the transaction and
+  raises `PreRevealAbort` if it is set, so nothing is sent, on the private path too. The slot is
+  derived per PR from the vendored runtimes' bytecode, and the nightly Anvil job checks it by
+  execution.
+- **A keyed `--eth-rpc-url` no longer leaks into error text, watchtower pages or logs.**
+  aiohttp's error for a 429 or 5xx quotes the full request URL, so a key in the URL path
+  (`https://host/v3/<KEY>`) went through `EthRpc`'s `NetworkError` into the watchtower's
+  CRITICAL page, its webhook and its `logger.exception` traceback. #819 redacted the watchtower's
+  startup line and `MultiSourceEthRpc`'s quorum errors, but not this path. Two things fix it:
+  - `EthRpc` now uses a provider that redacts transport failures. This also covers contract reads
+    that go through `rpc.w3` directly. An exception whose chain quotes a secret is replaced by a
+    redacted `NetworkError` with the chain cut. Other exceptions are re-raised unchanged.
+  - Every `EthRpc` error is built through one redacting helper.
+
+  The provider's own log lines are redacted too. These include the INFO-level "Successfully
+  disconnected from: <url>" written on `close()`. Not covered: web3's HTTP session manager logs the
+  URI at DEBUG level, and the watchtower runs at INFO.
+- **An ETH leg refuses to sign for a chain other than the one its rpc is pinned to.**
+  `assert_chain` checks the endpoint against the rpc's own `expected_chain_id`, but nothing checked
+  the leg's `chain_id` against that id, so a leg and an rpc built with different ids could sign for
+  one chain and send to another. `_sign_tx`, which every
+  leg transaction is signed in, now refuses that pairing before signing. `EthRpc` and
+  `MultiSourceEthRpc` expose `expected_chain_id`, and a `MultiSourceEthRpc` whose sources are
+  pinned to different chains is refused at construction. The shipped scripts always passed the
+  same id to both, so only direct library callers were exposed.
+- **`swap status` and `swap recover-preimage` printed the operator's keyed endpoint URL.** An HTTP
+  error (401, 429, 5xx) from `--eth-rpc-url` or `--btc-api-url` was rendered with `{exc}`, and
+  aiohttp's `ClientResponseError` quotes the full URL, so an API key in its path or query appeared
+  in `status`'s counter-leg row, in `status --json`, and in `recover-preimage`'s error. There it was
+  worse: `ClientResponseError` is not an `OSError`, so it escaped as "unexpected failure", exit 4,
+  with the URL as the printed cause. Present since the counter-leg read was added in 0.14.0. A
+  transport exception from a counter-leg read is now rendered by `describe_network_error`: the
+  exception type, its HTTP status, and the endpoint's host, never the URL; a library exception's
+  own text is dropped. pyrxd's own error text (which can wrap an RPC error body echoing the key)
+  is printed through `redact_endpoint_secrets`, which removes the credential-bearing parts of each
+  endpoint URL the command used (the rule, and its limit, are in the next entry). `recover-preimage`, `build-claim` and `build-refund` now map an
+  aiohttp error, a timeout, or a 200 whose body is not JSON to a clean exit 2 instead of
+  "unexpected failure", exit 4. The ElectrumX error paths in `swap status --check-chain`,
+  `build-claim`, `build-refund` and the reserve/post/take/cancel/refund orderbook commands scrub
+  every configured ElectrumX URL; `swap orders`, which reads through `--node-rpc`, scrubs that URL.
+- **Endpoint credentials were printed outside the swap commands too.** The ElectrumX failover client
+  logged `<call> failed on <URL>` to stderr for every failed read, with the URL's user name,
+  password, path and query; more than twenty other places — mostly `fix: check that <URL> is
+  reachable` hints in the glyph, wallet, query, hashmark and setup commands — and the TLS-pin
+  errors did the same; and the `swap orders` node-RPC transport wrapped failures as the aiohttp
+  exception's repr, which quotes the full request URL (a redirect loop printed the API key), and
+  passed a node error body that echoed the request path through verbatim. Every one of those now
+  names the endpoint as `scheme://host:port` (`pyrxd.network.redaction.redacted_url`), and the
+  node-RPC transport scrubs a node's error text of its URL. So do the config-file errors for an
+  endpoint declared with a bad or a second operator, `Endpoint`'s "insecure endpoint" and
+  missing-scheme refusals (the latter printed the text before the first `:`, which for a URL
+  missing its scheme is the user name), and the watchtower's startup and source-grouping log lines
+  (`--rxd-electrumx-url`, `--mempool-base-url`, `--eth-rpc-url`); the "names no host" refusal,
+  which has no host to name, prints the URL with its credential parts removed. `setup --json`
+  reports `electrumx_url` as `scheme://host:port`.
+
+  `verify --wave-name` and `glyph inspect --wave-name` labelled every source in the name-at-mark
+  verdict by its full endpoint URL, so `--json` printed the URL's credentials in `binding_source`,
+  `anchor_source`, `chain.discovery_source` and `tip_source`, `heights.by_source[].source` and
+  `heights.agreed_by`, the anchor's `source` and `block_verification.source`, and every reason
+  that quotes them; plain `verify` did the same in its anchor, and its "`<endpoint>` answered, but
+  …" hint. These are now `scheme://host:port` too. The labels stay full URLs inside the verdict,
+  where the source-identity rules compare them, and are redacted where they become output
+  (`pyrxd.network.redaction.redact_endpoints_in`), so those `--json` values change shape (a
+  trailing `/` or a path is no longer part of them).
+
+  `redact_endpoint_secrets`, for text pyrxd did not write, matched exact strings of six or more
+  characters, so it missed a short password, a key a server re-encoded (`~` as `%7E`) or
+  upper-cased, and a fragment. It now derives each URL's user name, password, query values and
+  fragment (always removed, at any length) and the path segments that look like a credential (16
+  or more characters, 8 or more mixing letters and digits, or anything but a trivially common
+  token after a `/key/`, `/token/` or `/v3/`-style marker), and matches them case-insensitively,
+  percent-encoded, and as whole tokens only, so a value that merely occurs inside a txid, a
+  hostname or a word, and a plain path word such as `testnet` or a block height, is left alone.
+  The limit that follows from that: a key carried as a short, letters-only path segment that does
+  not follow such a marker is treated as a word, and is not removed from text a server echoes
+  back. `redacted_url`, used wherever pyrxd itself names an endpoint, never prints the path. The
+  exit-4 "unexpected failure" path scrubs every URL on the command line.
+- **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
+  exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
+  from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no
+  header: a server that invented the covenant got the real coordinator to lock the taker's BTC
+  against an output on no chain. It now PROVES the funding (`pyrxd.gravity.funding_spv`), on every
+  path that calls a counter leg's `fund` — `pre_btc_lock_check` step 5 and the re-run inside
+  `taker_funds_btc`, on the BTC and the ETH/ERC-20 branch, and `resume_interrupted_fund` through
+  `taker_funds_btc`. Anything short of a verified inclusion at the required depth refuses the lock.
+  What is now enforced:
+  - the covenant script and value are read from the funding transaction's own raw bytes, which
+    must hash to its txid — no longer from `listunspent`;
+  - the transaction's merkle branch must lead to the header served for its height, at the depth
+    the block's coinbase branch pins, and that header must link hash by hash to a checkpoint pyrxd
+    ships, through headers that each meet their own proof-of-work target and 1/16 of the newest
+    checkpoint's work (`verify_mark_block`, the verifier `pyrxd verify` runs);
+  - on mainnet the proved depth must reach `k = max(6, burial, ceil(2 × value ÷ C))`. `C` is the
+    photon cost of one forged confirmation: the block subsidy at the funding height (Radiant
+    Core's `GetBlockSubsidy` and `nSubsidyHalvingInterval`, vendored and re-derived by a test) ×
+    the floor work ÷ the most work of any header checked, in the last checkpoint interval, or in
+    the 144 headers each configured source serves ending at the tip height it reports (one
+    header-range read per operator, concurrent). A run counts only when each header meets its own
+    proof-of-work target and links to the one before, its last header is at that reported tip, and it
+    links to a header the gate verified, so it is on the proof's chain: real historical headers,
+    free to replay and far harder than recent ones on mainnet, are ignored. Those tip headers can
+    only raise `C`'s denominator: a source that serves none, easier ones, or ones that do not count
+    leaves `C` where the proof's own headers put it, and the result's `bound_note` says which sources
+    raised it, which did not, and which were ignored and why.
+    `burial` is the swap's existing reorg burial, value-scaled; the value is the swap's own
+    assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
+    With no value to size `k` from, the lock is refused. Regtest runs the same proof against its
+    genesis, with no value term. A refusal names `k`, the value, `C` and what was proved;
+  - the chain is chosen from BOTH legs: a Radiant leg tagged for a test network (or untagged)
+    beside a counter leg that moves real value is refused, never proved against regtest. A BTC leg
+    moves value by its tag; an EVM leg by the chain id it signs for (`EthLeg.chain_id`, new), unless
+    that is a known testnet or a local development chain (31337);
+  - a swap whose `t_rxd` cannot hold the bound the gate will judge is refused BEFORE ANYONE
+    LOCKS: when its `SwapCoordinator` is built for a NEGOTIATED record, and again at
+    `pre_btc_lock_check` step 3b, before the chain is read. `funding_spv.early_elapsed_blocks_upper`
+    models step 6's bound to be at least what step 6 computes on an honest chain: `C` at its lowest
+    (`funding_spv.forged_confirmation_cost_floor_photons`: the shipped last interval's hardest
+    header times `early_work_margin`, and the lowest subsidy the walk cap allows), the largest `k`
+    and value term that follow, blocks at the nominal spacing, and the newest header up to
+    `early_slack_s` old. What it does not cover is stated on that function (a header served above
+    the newest checkpoint harder than the margin allows, which a test pins); steps 6 and 7 on the
+    proved bound stay authoritative;
+  - the gate links at most 20,160 headers above the newest checkpoint (the pages and
+    `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
+  - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the
+    blocks since funding: `max(proved, (R - H + 1) + blocks_upper(E), reported)`. `R` is the
+    reference header, `max(1, value term)` deep below the newest header served, so changing any
+    header of its window costs as much as the value term of `k` already demands of the depth (on
+    regtest it is the newest header). `E = now - MTP(R)`, the median time past at `R` — the median
+    of the 11 header timestamps ending there, as Radiant Core computes it (`chain.h`, now vendored
+    at the pinned tag and re-read by a test) — over headers the gate has verified. `blocks_upper(E)`
+    is a statistical upper bound: the smallest `n` with `P(Poisson(λ·E) > n) <= ε`, at `λ` =
+    `surge_factor` over the nominal 300 s spacing and a confidence `ε = clamp(1 RXD ÷ value, 1e-12,
+    1e-3)` scaled by the value (`funding_spv.poisson_upper_quantile`, never below the exact
+    quantile). `reported` is the largest depth any configured source reports, grouped by operator
+    (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
+    term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
+    `scripts/dust_swap_run.py` passes it. On mainnet a local clock behind the chain's median time is
+    refused with "the local clock appears to be behind the chain", rather than counted as no elapsed
+    time: `now` more than 300 s (`LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S`, one nominal spacing) before
+    the median time past of the newest verified headers. Within that tolerance a `now` before
+    `MTP(R)` gives `E = 0` and `bound_note` says so. The `now` the gate
+    judges is taken AFTER its reads:
+    `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
+    `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
+    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller. The
+    lock-time re-run inside `taker_funds_btc` is judged by steps 6 and 7 on ITS OWN bound, at a
+    `now` taken after its reads, and refuses the lock when they fail: the re-run reads the chain
+    later than the gate, so its bound can be larger;
+  - above dust, two independent operators must report the funding transaction's depth (a
+    server's word, not a proof): on a value-bearing network, when the value at stake exceeds
+    `ElapsedBoundPolicy.dust_threshold_photons` (1,000 RXD by default), the gate refuses the lock
+    unless at least two operator groups (`source_key`; the user's own node is its own group) report
+    confirmations for the funding transaction itself — their verbose reply for its txid, which must
+    name that txid in its own `txid` field — and the refusal names how many answered and which. An operator that answers only its tip height (its
+    verbose read of the txid failed, as it does for a transaction the server does not know) is not
+    counted; its `tip - H + 1` can still raise the elapsed-depth bound, and the refusal and the
+    result's `bound_note` say it gave only a tip height (`RadiantChainIO.depth_reports`,
+    `MakerFundingEvidence.funding_tx_depths`, both new). A source that cannot say which operator
+    runs it is not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
+    configured to ask fewer than two operators for such a swap, naming them. At or below dust one
+    operator suffices and the result says so. pyrxd's shipped mainnet endpoints are two operators;
+    the node-over-ssh scripts ask the node and those endpoints.
+    `ElapsedBoundPolicy.accept_single_operator_up_to_photons` (default `None`) is an explicit user
+    override of that threshold, in photons; every script that builds a mainnet coordinator sets it
+    with `--accept-single-operator-up-to RXD`, and nothing sets it from the environment. It may
+    raise or lower the threshold and has no cap. When it raises it, the gate logs a WARNING naming
+    the value; whenever it is set, the gate's result (`single_operator_override`, `bound_note`) and
+    the durable swap record (`SwapRecord.single_operator_override`, written only when set) say
+    "single-operator depth accepted up to X RXD by user override (default Y RXD)". The two-operator
+    refusals, at construction and at step 5, name the override and what it gives up: the funding's
+    depth then rests on that one operator's report.
+
+  What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
+  non-spend; the `listunspent` read that locates it is kept for that). The elapsed-depth bound is a
+  statistical upper bound, at the confidence and block rate above, not a proof. Neither the
+  most-work chain nor each header's nBits is checked; the checkpoint table is only as good as its
+  sources. `GravityTrade` is not gated.
+- **Every source count keys on ONE host identity, so one server can no longer corroborate
+  itself.** Each quorum had its own idea of "a different source", and the cheap ones counted
+  spellings. The watchtower's RXD quorum folded only case and a trailing slash, so `wss://h`,
+  `wss://h:443`, `wss://h/x` and `wss://h.` were four sources: one server behind two URLs gave
+  `corroborated=True`, and its "not locked" answer became a corroborated absence that can permit
+  an autonomous refund. `MultiSourceEthRpc([r, r])` was accepted as a 2-of-2 quorum, and
+  `scripts/eth_swap_run.py` counted one URL typed three times as the "THREE" endpoints a
+  real-value token leg requires. The Esplora host helper (`endpoint_host`) only lower-cased, so
+  `mempool.space` and `mempool.space.`, or `127.0.0.1` and `2130706433`, were two hosts.
+  `MultiSourceBtcDataSource` checked no host at all, and `MultiSourceBtcFundingReader` checked
+  host diversity only in `from_endpoints`, then built one voting reader per URL, so
+  `[h/a, h/b, g]` at quorum 2 let host `h` agree with itself. HashMark §7.6 form 2's public
+  `judge_name_at_mark` and `walk_mutable_chain` compared raw labels, so only the CLI, which picked
+  a second host itself, was protected. Every one of these now counts through
+  `pyrxd.network.source_identity.source_key`, the canonical host (`Endpoint.source` already used
+  that logic), and the judge and the walker compare by host inside themselves. An unbracketed IPv6
+  literal, as an ssh destination is written (`--ssh-host 2001:db8::1`), is read as that address:
+  parsed as a URL it was host `2001`, i.e. `0.0.7.209`, so the node over ssh and
+  `wss://[2001:db8::1]:50022` on the same machine were two sources, and any two bare IPv6 hosts
+  were one. Several URLs on one host remain a failover list for ONE source: the watchtower hands
+  them to one `ElectrumXClient`, which races them, and logs a warning that they are one source
+  (and that corroboration is off, when that leaves one); `MultiSourceBtcFundingReader.from_endpoints`
+  wraps them in one failover reader (`SameSourceFailover`; see below).
+
+### Changed (breaking)
+
+- **Sources are counted by OPERATOR, as declared, or by registered domain — not by host.** The key
+  every quorum counts through (`pyrxd.network.source_identity.source_key`) is now an operator
+  group: an operator declared for that URL (`operator = "…"`, below — it reaches HashMark form 2
+  only), else an operator pyrxd ships
+  knowledge of (`pyrxd.network.registry.KNOWN_OPERATORS`: radiant4people.com, radiantcore.org and
+  bladenet.online, three different operators per the Radiant maintainer's statement of
+  2026-09-29), else the host's REGISTERED DOMAIN (eTLD+1, by the Public Suffix List, vendored at
+  `src/pyrxd/network/data/` and sha256-pinned), else, for an IP address, that address. So
+  `x.example.com` and `y.example.com` are ONE source while `a.co.uk` and `b.co.uk` stay two. Every
+  loopback spelling (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`) is ONE source, `localhost`:
+  `ws://localhost:50022` and `ws://127.0.0.1:50022` gave the watchtower `corroborated=True` from
+  one local node. This
+  is breaking for any list whose endpoints share a registered domain: the watchtower's RXD quorum,
+  the BTC Esplora quorums, the ETH RPC quorum, `scripts/eth_swap_run.py`'s endpoint gate,
+  `scripts/swap_run_verify.py`'s cross-check and HashMark §7.6 form 2 now count them once, and the
+  quorums that refused one host twice now refuse one operator twice (`ValidationError` "the same
+  source"). The watchtower still accepts such URLs as one failover source and warns that
+  corroboration is off when that leaves one. For its own defaults, whose two radiant4people
+  servers are one failover source by design beside radiantcore, the grouping is logged at INFO,
+  so the WARNING fires only for a list the operator supplied. `SameHostFailover` (unreleased) is renamed
+  `SameSourceFailover`, and its members may be several hosts of one operator.
+- **Input that names no host is refused.** `source_key` raised nothing for `[bad`, `wss://[::1`,
+  `[::1]x` or `wss://` and made each its own key, so a typo counted as a source. They now raise
+  `ValidationError`, and so does `Endpoint(...)` at construction; so does brackets around anything
+  that is not an IPv6 address. No shipped default is affected.
+- **Quorums refuse two sources on one host, and every source must name its host.**
+  `MultiSourceRxdChainSource`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
+  `MultiSourceEthRpc` raise `ValidationError` when two sources share a host, and when a source
+  carries no `source_key` built by `pyrxd.network.source_identity.source_key`. Every shipped
+  reader derives one from its own URL: `EthRpc`, `ElectrumXClient` (when all its URLs are one
+  host), `ElectrumRxdChainSource`, `SshTrRxdReader`, `MempoolSpaceSource`, `BlockstreamSource`,
+  `BitcoinCoreRpcSource`, `MempoolSpaceFundingReader`, and `BitcoinCoreFundingReader` when its
+  `rpc` is a bound method of a client that has one. A custom source sets
+  `source_key = source_key(<its URL>)`. `pyrxd.network.bitcoin.endpoint_host` and
+  `count_distinct_hosts` are removed: they were the Esplora quorum's second identity, and nothing
+  shipped calls them now. Use `source_key` and `group_by_source` from
+  `pyrxd.network.source_identity`, which refuse a blank URL rather than counting it as a host.
+  `scripts/eth_swap_run.py` refuses an `--eth-rpc-url` list that names one host twice, and its
+  three-endpoint gate counts distinct hosts.
+- **The injected ETH/ERC-20 HTLC artifact must now carry `immutableReferences` and
+  `immutable_names`, and a leg built from one that does not is refused at CONSTRUCTION.** The exact
+  compare cannot be built without them. Checking only inside `verify_funded` let a leg deploy and
+  fund its own contract first (native `fund` sends the value with the deploy), leaving the ETH
+  locked until the refund timeout. An empty map, an unnamed reference id, a name for an id the
+  build does not have, or a slot outside the runtime is refused the same way. A plain Foundry
+  build output does not qualify; `load_artifact`'s docstring says how to produce one that does.
+  Regression cover: an Anvil forged-copy test for each of `EthHtlc` and the real `Erc20Htlc` (the
+  latter forging every copy of every immutable in turn), an Anvil test that checks each
+  `immutable_names` entry by executing its getter, a default-suite test that derives the same map
+  from the bytecode without reading it, and construction-refusal tests with their honest paths.
+
 ### Added
 
 - **`pyrxd.glyph.mark_block.verify_mark_block`, which checks the block a HashMark is in.**
@@ -42,6 +330,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   server's tip) is returned as it is. The second returns a txid and its merkle branch
   (`blockchain.transaction.id_from_pos`, with the branch), shape-checked. Neither checks what the
   data says; `verify_mark_block` does.
+- **Declare who runs an ElectrumX server: `operator = "…"`.** An entry of `electrumx_servers` (or
+  `electrumx`), top-level or under `[networks.<name>]`, may be `{ url = "wss://...", operator =
+  "acme" }`. The declaration overrides the registered-domain grouping for THAT endpoint
+  (`Endpoint.source`) and for HashMark §7.6 form 2's judge and walker, which the CLI hands the
+  config's declarations explicitly (`Config.declared_operators()`); so two domains declared as one
+  operator count once and two hosts of one domain declared as two operators count twice. Nothing
+  else sees it: there is no process-wide registry, so the watchtower, BTC and ETH quorums, another
+  profile, and a later load without the declaration all group by domain. Library callers pass
+  declarations the same way, as `operators=` to `NetworkProfile.build`, `judge_name_at_mark`,
+  `walk_mutable_chain` and `source_keys`. Refused when the list is read — at `load()` for the
+  top-level list, and when `for_network()` selects a `[networks.<name>]` list: an id that is not
+  1-64 lower-case letters, digits, `.` or `-`; unknown keys in the table; one host counted as two
+  sources (two operators on its URLs, or an operator on one and not another); a declared host next
+  to an UNDECLARED host of the same registered domain (or shipped operator, IP address or loopback)
+  — a declaration may merge sources, and may split a group only when every host of it in the list
+  is declared; and a declaration that contradicts a shipped operator. A profile, form 2's judge
+  and walker, and a quorum of client objects refuse the two set-level cases too
+  (`require_one_key_per_host`), so a library caller handing them such a map directly is refused
+  rather than counted. pyrxd believes the declaration; it is only as good as
+  what is written. Documented in `pyrxd.cli.config` and `docs/how-to/troubleshoot-common-errors.md`
+  (7c).
+- **`wss://electrumx2.radiant4people.com:50022/` is a shipped mainnet default, for failover.** It is
+  radiant4people's second server, so it is ONE source with `electrumx.radiant4people.com` and never
+  a second vote; it comes last so form 2's endpoint pair reaches radiantcore first. Each shipped
+  endpoint now carries its operator (`registry.SHIPPED_ENDPOINTS`; `DEFAULT_ENDPOINTS` is derived
+  from it, and the watchtower's `DEFAULT_RXD_ELECTRUMX` is `DEFAULT_ENDPOINTS["mainnet"]`). Probed
+  2026-09-29 from one vantage point: radiantcore and both radiant4people servers served the mainnet
+  genesis at tip 468,606. Photonic's other three mainnet servers (bladenet: `radiant2`, `radiantus`
+  and `radiant4.bladenet.online:50022`, Radiant-Core/Photonic-Wallet @ `becf41a`) are not shipped:
+  none answered that day (timeouts, no route, and a failed TLS handshake on radiant2 :443).
 
 ### Changed
 
@@ -63,7 +381,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   field, an endpoint with no parseable host, a verifier endpoint a party also used, a manifest that
   is not a JSON object) instead of a traceback and exit 1. 3 is the code it already used for parties
   disagreeing on a cited txid; the exit codes are now in its docstring.
-
 - **Mutation CI: the taker gate (`gravity/funding_spv`) is its own group, `fundingspv`, sharded in
   two, with its own test list.** It had joined `radiantleg`, and its test file had joined all four
   `covenants` lists, putting `radiantleg` at an ESTIMATED 317-379 minutes against the 330-minute job
@@ -76,7 +393,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a 30-mutant sample of the gate's functions, 2 of 30 across the module). That makes `coordinator`
   an ESTIMATED ~237 minutes, so it is sharded in two, with a 60 s per-mutant timeout. Per-job
   minutes for the new sharded groups are ESTIMATED from local samples, not measured on the runner.
-
 - **`verify_mark_block` and `plan_block_verification` take `max_headers_from_checkpoint`
   (default 4,032, unchanged) and `verify_mark_block` takes `pow_limit`** (default `None`,
   unchanged); `radiant_header_target`, `radiant_header_work` and `verify_radiant_header_pow` take
@@ -235,6 +551,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   degrades now carries the same caveat the block line does (the claim, or the inclusion-only
   caveat) in its `name_at_mark.caveat`. `glyph inspect --wave-name` does not verify the block, so its caveat is
   unchanged.
+- **"Distinct operators (as declared, or by registered domain)".** The prose that #801 changed to
+  "distinct host" now says what is counted, and the operator limit in
+  `pyrxd.network.source_identity` states both halves once: one party can register several domains,
+  and a declared operator is only as good as the declaration. `verify --wave-name`'s ESTABLISHED
+  explanation, `--help` and the form-2 caveat say it rests on two distinct operators as declared or
+  by registered domain, which is not proof that different parties run them. The same module
+  documents one known IDNA deviation: Python's codec (IDNA2003) makes `faß.de` and `fass.de` one
+  key while yarl/aiohttp (IDNA2008) treat them as two hosts — rare, and it can only lower a count.
+  A comment that read `203.113.7` as `203.0.113.7` now says `inet_aton` reads it as `203.113.0.7`.
+- **"Distinct host", never "independent operator".** A URL can show that two servers are on
+  different hosts, and nothing about who runs them. Docstrings, CLI help and the threat model now
+  say "distinct host", and that limit is stated once, in the `pyrxd.network.source_identity`
+  module docstring ("the operator limit"), which the other places point to. The
+  `registry.py` note on the two shipped ElectrumX servers no longer says "distinct operators": on
+  2026-09-29 they resolved to different IP addresses under different DNS providers, which is
+  separate infrastructure and not proof of separate operators. `verify --wave-name` keeps the
+  verdict name ESTABLISHED, and its explanation, `--help` and the form-2 caveat now say that it
+  rests on two distinct hosts and that one party running both would defeat it.
+  `docs/threat-model.md` no longer says form 2 is the only place the default pair is counted as
+  two sources (the watchtower's RXD quorum counts it too), and no longer says multi-source
+  ElectrumX is unimplemented.
 
 ### Deprecated
 
@@ -266,7 +603,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `token_address` key it omitted. `tests/test_doc_citations_resolve.py` now reads every range of
   a multi-range citation, checks a keyed table row's citations against the row's name, and refuses
   a bare `:N` that names no file.
-
 - **The mainnet swap runners construct at their defaults, and build their coordinator before
   anything is minted or broadcast.** Measured on `scripts/dust_swap_run.py`, `eth_swap_run.py` and
   `eth_swap_grief_run.py` driven up to their first chain action:
@@ -333,8 +669,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stands in for a smaller position. A block holding a single transaction (empty branch, root
   equal to the txid, as in real mainnet block 1) raised too; `MerklePath.compute_root` now
   returns the txid for that one-leaf, offset-0 path. No pyrxd command called this method.
-### Fixed
-
 - **`swap status` and `swap recover-preimage` could tell a taker to keep waiting while the ETH
   preimage was already public.** When the RPC returned the contract's `Claimed(p)` log but
   `eth_getTransactionByHash` returned null for its transaction, `status` reported the ETH leg
@@ -445,317 +779,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   builder, the watchtower README, `docs/concepts/architecture.md`,
   `docs/how-to/build-a-cross-chain-swap.md` and `docs/red-team-checklist.md` said a value-bearing
   network needed an opt-in to construct. None does. The gate stays a no-op.
-### Security
-
-- **`swap status` and `swap recover-preimage` printed the operator's keyed endpoint URL.** An HTTP
-  error (401, 429, 5xx) from `--eth-rpc-url` or `--btc-api-url` was rendered with `{exc}`, and
-  aiohttp's `ClientResponseError` quotes the full URL, so an API key in its path or query appeared
-  in `status`'s counter-leg row, in `status --json`, and in `recover-preimage`'s error. There it was
-  worse: `ClientResponseError` is not an `OSError`, so it escaped as "unexpected failure", exit 4,
-  with the URL as the printed cause. Present since the counter-leg read was added in 0.14.0. A
-  transport exception from a counter-leg read is now rendered by `describe_network_error`: the
-  exception type, its HTTP status, and the endpoint's host, never the URL; a library exception's
-  own text is dropped. pyrxd's own error text (which can wrap an RPC error body echoing the key)
-  is printed through `redact_endpoint_secrets`, which removes the credential-bearing parts of each
-  endpoint URL the command used (the rule, and its limit, are in the next entry). `recover-preimage`, `build-claim` and `build-refund` now map an
-  aiohttp error, a timeout, or a 200 whose body is not JSON to a clean exit 2 instead of
-  "unexpected failure", exit 4. The ElectrumX error paths in `swap status --check-chain`,
-  `build-claim`, `build-refund` and the reserve/post/take/cancel/refund orderbook commands scrub
-  every configured ElectrumX URL; `swap orders`, which reads through `--node-rpc`, scrubs that URL.
-- **Endpoint credentials were printed outside the swap commands too.** The ElectrumX failover client
-  logged `<call> failed on <URL>` to stderr for every failed read, with the URL's user name,
-  password, path and query; more than twenty other places — mostly `fix: check that <URL> is
-  reachable` hints in the glyph, wallet, query, hashmark and setup commands — and the TLS-pin
-  errors did the same; and the `swap orders` node-RPC transport wrapped failures as the aiohttp
-  exception's repr, which quotes the full request URL (a redirect loop printed the API key), and
-  passed a node error body that echoed the request path through verbatim. Every one of those now
-  names the endpoint as `scheme://host:port` (`pyrxd.network.redaction.redacted_url`), and the
-  node-RPC transport scrubs a node's error text of its URL. So do the config-file errors for an
-  endpoint declared with a bad or a second operator, `Endpoint`'s "insecure endpoint" and
-  missing-scheme refusals (the latter printed the text before the first `:`, which for a URL
-  missing its scheme is the user name), and the watchtower's startup and source-grouping log lines
-  (`--rxd-electrumx-url`, `--mempool-base-url`, `--eth-rpc-url`); the "names no host" refusal,
-  which has no host to name, prints the URL with its credential parts removed. `setup --json`
-  reports `electrumx_url` as `scheme://host:port`.
-
-  `verify --wave-name` and `glyph inspect --wave-name` labelled every source in the name-at-mark
-  verdict by its full endpoint URL, so `--json` printed the URL's credentials in `binding_source`,
-  `anchor_source`, `chain.discovery_source` and `tip_source`, `heights.by_source[].source` and
-  `heights.agreed_by`, the anchor's `source` and `block_verification.source`, and every reason
-  that quotes them; plain `verify` did the same in its anchor, and its "`<endpoint>` answered, but
-  …" hint. These are now `scheme://host:port` too. The labels stay full URLs inside the verdict,
-  where the source-identity rules compare them, and are redacted where they become output
-  (`pyrxd.network.redaction.redact_endpoints_in`), so those `--json` values change shape (a
-  trailing `/` or a path is no longer part of them).
-
-  `redact_endpoint_secrets`, for text pyrxd did not write, matched exact strings of six or more
-  characters, so it missed a short password, a key a server re-encoded (`~` as `%7E`) or
-  upper-cased, and a fragment. It now derives each URL's user name, password, query values and
-  fragment (always removed, at any length) and the path segments that look like a credential (16
-  or more characters, 8 or more mixing letters and digits, or anything but a trivially common
-  token after a `/key/`, `/token/` or `/v3/`-style marker), and matches them case-insensitively,
-  percent-encoded, and as whole tokens only, so a value that merely occurs inside a txid, a
-  hostname or a word, and a plain path word such as `testnet` or a block height, is left alone.
-  The limit that follows from that: a key carried as a short, letters-only path segment that does
-  not follow such a marker is treated as a word, and is not removed from text a server echoes
-  back. `redacted_url`, used wherever pyrxd itself names an endpoint, never prints the path. The
-  exit-4 "unexpected failure" path scrubs every URL on the command line.
-- **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
-  exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
-  from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no
-  header: a server that invented the covenant got the real coordinator to lock the taker's BTC
-  against an output on no chain. It now PROVES the funding (`pyrxd.gravity.funding_spv`), on every
-  path that calls a counter leg's `fund` — `pre_btc_lock_check` step 5 and the re-run inside
-  `taker_funds_btc`, on the BTC and the ETH/ERC-20 branch, and `resume_interrupted_fund` through
-  `taker_funds_btc`. Anything short of a verified inclusion at the required depth refuses the lock.
-  What is now enforced:
-  - the covenant script and value are read from the funding transaction's own raw bytes, which
-    must hash to its txid — no longer from `listunspent`;
-  - the transaction's merkle branch must lead to the header served for its height, at the depth
-    the block's coinbase branch pins, and that header must link hash by hash to a checkpoint pyrxd
-    ships, through headers that each meet their own proof-of-work target and 1/16 of the newest
-    checkpoint's work (`verify_mark_block`, the verifier `pyrxd verify` runs);
-  - on mainnet the proved depth must reach `k = max(6, burial, ceil(2 × value ÷ C))`. `C` is the
-    photon cost of one forged confirmation: the block subsidy at the funding height (Radiant
-    Core's `GetBlockSubsidy` and `nSubsidyHalvingInterval`, vendored and re-derived by a test) ×
-    the floor work ÷ the most work of any header checked, in the last checkpoint interval, or in
-    the 144 headers each configured source serves ending at the tip height it reports (one
-    header-range read per operator, concurrent). A run counts only when each header meets its own
-    proof-of-work target and links to the one before, its last header is at that reported tip, and it
-    links to a header the gate verified, so it is on the proof's chain: real historical headers,
-    free to replay and far harder than recent ones on mainnet, are ignored. Those tip headers can
-    only raise `C`'s denominator: a source that serves none, easier ones, or ones that do not count
-    leaves `C` where the proof's own headers put it, and the result's `bound_note` says which sources
-    raised it, which did not, and which were ignored and why.
-    `burial` is the swap's existing reorg burial, value-scaled; the value is the swap's own
-    assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
-    With no value to size `k` from, the lock is refused. Regtest runs the same proof against its
-    genesis, with no value term. A refusal names `k`, the value, `C` and what was proved;
-  - the chain is chosen from BOTH legs: a Radiant leg tagged for a test network (or untagged)
-    beside a counter leg that moves real value is refused, never proved against regtest. A BTC leg
-    moves value by its tag; an EVM leg by the chain id it signs for (`EthLeg.chain_id`, new), unless
-    that is a known testnet or a local development chain (31337);
-  - a swap whose `t_rxd` cannot hold the bound the gate will judge is refused BEFORE ANYONE
-    LOCKS: when its `SwapCoordinator` is built for a NEGOTIATED record, and again at
-    `pre_btc_lock_check` step 3b, before the chain is read. `funding_spv.early_elapsed_blocks_upper`
-    models step 6's bound to be at least what step 6 computes on an honest chain: `C` at its lowest
-    (`funding_spv.forged_confirmation_cost_floor_photons`: the shipped last interval's hardest
-    header times `early_work_margin`, and the lowest subsidy the walk cap allows), the largest `k`
-    and value term that follow, blocks at the nominal spacing, and the newest header up to
-    `early_slack_s` old. What it does not cover is stated on that function (a header served above
-    the newest checkpoint harder than the margin allows, which a test pins); steps 6 and 7 on the
-    proved bound stay authoritative;
-  - the gate links at most 20,160 headers above the newest checkpoint (the pages and
-    `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
-  - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the
-    blocks since funding: `max(proved, (R - H + 1) + blocks_upper(E), reported)`. `R` is the
-    reference header, `max(1, value term)` deep below the newest header served, so changing any
-    header of its window costs as much as the value term of `k` already demands of the depth (on
-    regtest it is the newest header). `E = now - MTP(R)`, the median time past at `R` — the median
-    of the 11 header timestamps ending there, as Radiant Core computes it (`chain.h`, now vendored
-    at the pinned tag and re-read by a test) — over headers the gate has verified. `blocks_upper(E)`
-    is a statistical upper bound: the smallest `n` with `P(Poisson(λ·E) > n) <= ε`, at `λ` =
-    `surge_factor` over the nominal 300 s spacing and a confidence `ε = clamp(1 RXD ÷ value, 1e-12,
-    1e-3)` scaled by the value (`funding_spv.poisson_upper_quantile`, never below the exact
-    quantile). `reported` is the largest depth any configured source reports, grouped by operator
-    (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
-    term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
-    `scripts/dust_swap_run.py` passes it. On mainnet a local clock behind the chain's median time is
-    refused with "the local clock appears to be behind the chain", rather than counted as no elapsed
-    time: `now` more than 300 s (`LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S`, one nominal spacing) before
-    the median time past of the newest verified headers. Within that tolerance a `now` before
-    `MTP(R)` gives `E = 0` and `bound_note` says so. The `now` the gate
-    judges is taken AFTER its reads:
-    `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
-    `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
-    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller. The
-    lock-time re-run inside `taker_funds_btc` is judged by steps 6 and 7 on ITS OWN bound, at a
-    `now` taken after its reads, and refuses the lock when they fail: the re-run reads the chain
-    later than the gate, so its bound can be larger;
-  - above dust, two independent operators must report the funding transaction's depth (a
-    server's word, not a proof): on a value-bearing network, when the value at stake exceeds
-    `ElapsedBoundPolicy.dust_threshold_photons` (1,000 RXD by default), the gate refuses the lock
-    unless at least two operator groups (`source_key`; the user's own node is its own group) report
-    confirmations for the funding transaction itself — their verbose reply for its txid, which must
-    name that txid in its own `txid` field — and the refusal names how many answered and which. An operator that answers only its tip height (its
-    verbose read of the txid failed, as it does for a transaction the server does not know) is not
-    counted; its `tip - H + 1` can still raise the elapsed-depth bound, and the refusal and the
-    result's `bound_note` say it gave only a tip height (`RadiantChainIO.depth_reports`,
-    `MakerFundingEvidence.funding_tx_depths`, both new). A source that cannot say which operator
-    runs it is not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
-    configured to ask fewer than two operators for such a swap, naming them. At or below dust one
-    operator suffices and the result says so. pyrxd's shipped mainnet endpoints are two operators;
-    the node-over-ssh scripts ask the node and those endpoints.
-    `ElapsedBoundPolicy.accept_single_operator_up_to_photons` (default `None`) is an explicit user
-    override of that threshold, in photons; every script that builds a mainnet coordinator sets it
-    with `--accept-single-operator-up-to RXD`, and nothing sets it from the environment. It may
-    raise or lower the threshold and has no cap. When it raises it, the gate logs a WARNING naming
-    the value; whenever it is set, the gate's result (`single_operator_override`, `bound_note`) and
-    the durable swap record (`SwapRecord.single_operator_override`, written only when set) say
-    "single-operator depth accepted up to X RXD by user override (default Y RXD)". The two-operator
-    refusals, at construction and at step 5, name the override and what it gives up: the funding's
-    depth then rests on that one operator's report.
-
-  What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
-  non-spend; the `listunspent` read that locates it is kept for that). The elapsed-depth bound is a
-  statistical upper bound, at the confidence and block rate above, not a proof. Neither the
-  most-work chain nor each header's nBits is checked; the checkpoint table is only as good as its
-  sources. `GravityTrade` is not gated.
-
-- **Every source count keys on ONE host identity, so one server can no longer corroborate
-  itself.** Each quorum had its own idea of "a different source", and the cheap ones counted
-  spellings. The watchtower's RXD quorum folded only case and a trailing slash, so `wss://h`,
-  `wss://h:443`, `wss://h/x` and `wss://h.` were four sources: one server behind two URLs gave
-  `corroborated=True`, and its "not locked" answer became a corroborated absence that can permit
-  an autonomous refund. `MultiSourceEthRpc([r, r])` was accepted as a 2-of-2 quorum, and
-  `scripts/eth_swap_run.py` counted one URL typed three times as the "THREE" endpoints a
-  real-value token leg requires. The Esplora host helper (`endpoint_host`) only lower-cased, so
-  `mempool.space` and `mempool.space.`, or `127.0.0.1` and `2130706433`, were two hosts.
-  `MultiSourceBtcDataSource` checked no host at all, and `MultiSourceBtcFundingReader` checked
-  host diversity only in `from_endpoints`, then built one voting reader per URL, so
-  `[h/a, h/b, g]` at quorum 2 let host `h` agree with itself. HashMark §7.6 form 2's public
-  `judge_name_at_mark` and `walk_mutable_chain` compared raw labels, so only the CLI, which picked
-  a second host itself, was protected. Every one of these now counts through
-  `pyrxd.network.source_identity.source_key`, the canonical host (`Endpoint.source` already used
-  that logic), and the judge and the walker compare by host inside themselves. An unbracketed IPv6
-  literal, as an ssh destination is written (`--ssh-host 2001:db8::1`), is read as that address:
-  parsed as a URL it was host `2001`, i.e. `0.0.7.209`, so the node over ssh and
-  `wss://[2001:db8::1]:50022` on the same machine were two sources, and any two bare IPv6 hosts
-  were one. Several URLs on one host remain a failover list for ONE source: the watchtower hands
-  them to one `ElectrumXClient`, which races them, and logs a warning that they are one source
-  (and that corroboration is off, when that leaves one); `MultiSourceBtcFundingReader.from_endpoints`
-  wraps them in one failover reader (`SameSourceFailover`; see below).
-
-### Changed (breaking)
-
-- **Sources are counted by OPERATOR, as declared, or by registered domain — not by host.** The key
-  every quorum counts through (`pyrxd.network.source_identity.source_key`) is now an operator
-  group: an operator declared for that URL (`operator = "…"`, below — it reaches HashMark form 2
-  only), else an operator pyrxd ships
-  knowledge of (`pyrxd.network.registry.KNOWN_OPERATORS`: radiant4people.com, radiantcore.org and
-  bladenet.online, three different operators per the Radiant maintainer's statement of
-  2026-09-29), else the host's REGISTERED DOMAIN (eTLD+1, by the Public Suffix List, vendored at
-  `src/pyrxd/network/data/` and sha256-pinned), else, for an IP address, that address. So
-  `x.example.com` and `y.example.com` are ONE source while `a.co.uk` and `b.co.uk` stay two. Every
-  loopback spelling (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`) is ONE source, `localhost`:
-  `ws://localhost:50022` and `ws://127.0.0.1:50022` gave the watchtower `corroborated=True` from
-  one local node. This
-  is breaking for any list whose endpoints share a registered domain: the watchtower's RXD quorum,
-  the BTC Esplora quorums, the ETH RPC quorum, `scripts/eth_swap_run.py`'s endpoint gate,
-  `scripts/swap_run_verify.py`'s cross-check and HashMark §7.6 form 2 now count them once, and the
-  quorums that refused one host twice now refuse one operator twice (`ValidationError` "the same
-  source"). The watchtower still accepts such URLs as one failover source and warns that
-  corroboration is off when that leaves one. For its own defaults, whose two radiant4people
-  servers are one failover source by design beside radiantcore, the grouping is logged at INFO,
-  so the WARNING fires only for a list the operator supplied. `SameHostFailover` (unreleased) is renamed
-  `SameSourceFailover`, and its members may be several hosts of one operator.
-- **Input that names no host is refused.** `source_key` raised nothing for `[bad`, `wss://[::1`,
-  `[::1]x` or `wss://` and made each its own key, so a typo counted as a source. They now raise
-  `ValidationError`, and so does `Endpoint(...)` at construction; so does brackets around anything
-  that is not an IPv6 address. No shipped default is affected.
-- **Quorums refuse two sources on one host, and every source must name its host.**
-  `MultiSourceRxdChainSource`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
-  `MultiSourceEthRpc` raise `ValidationError` when two sources share a host, and when a source
-  carries no `source_key` built by `pyrxd.network.source_identity.source_key`. Every shipped
-  reader derives one from its own URL: `EthRpc`, `ElectrumXClient` (when all its URLs are one
-  host), `ElectrumRxdChainSource`, `SshTrRxdReader`, `MempoolSpaceSource`, `BlockstreamSource`,
-  `BitcoinCoreRpcSource`, `MempoolSpaceFundingReader`, and `BitcoinCoreFundingReader` when its
-  `rpc` is a bound method of a client that has one. A custom source sets
-  `source_key = source_key(<its URL>)`. `pyrxd.network.bitcoin.endpoint_host` and
-  `count_distinct_hosts` are removed: they were the Esplora quorum's second identity, and nothing
-  shipped calls them now. Use `source_key` and `group_by_source` from
-  `pyrxd.network.source_identity`, which refuse a blank URL rather than counting it as a host.
-  `scripts/eth_swap_run.py` refuses an `--eth-rpc-url` list that names one host twice, and its
-  three-endpoint gate counts distinct hosts.
-
-### Added
-
-- **Declare who runs an ElectrumX server: `operator = "…"`.** An entry of `electrumx_servers` (or
-  `electrumx`), top-level or under `[networks.<name>]`, may be `{ url = "wss://...", operator =
-  "acme" }`. The declaration overrides the registered-domain grouping for THAT endpoint
-  (`Endpoint.source`) and for HashMark §7.6 form 2's judge and walker, which the CLI hands the
-  config's declarations explicitly (`Config.declared_operators()`); so two domains declared as one
-  operator count once and two hosts of one domain declared as two operators count twice. Nothing
-  else sees it: there is no process-wide registry, so the watchtower, BTC and ETH quorums, another
-  profile, and a later load without the declaration all group by domain. Library callers pass
-  declarations the same way, as `operators=` to `NetworkProfile.build`, `judge_name_at_mark`,
-  `walk_mutable_chain` and `source_keys`. Refused when the list is read — at `load()` for the
-  top-level list, and when `for_network()` selects a `[networks.<name>]` list: an id that is not
-  1-64 lower-case letters, digits, `.` or `-`; unknown keys in the table; one host counted as two
-  sources (two operators on its URLs, or an operator on one and not another); a declared host next
-  to an UNDECLARED host of the same registered domain (or shipped operator, IP address or loopback)
-  — a declaration may merge sources, and may split a group only when every host of it in the list
-  is declared; and a declaration that contradicts a shipped operator. A profile, form 2's judge
-  and walker, and a quorum of client objects refuse the two set-level cases too
-  (`require_one_key_per_host`), so a library caller handing them such a map directly is refused
-  rather than counted. pyrxd believes the declaration; it is only as good as
-  what is written. Documented in `pyrxd.cli.config` and `docs/how-to/troubleshoot-common-errors.md`
-  (7c).
-- **`wss://electrumx2.radiant4people.com:50022/` is a shipped mainnet default, for failover.** It is
-  radiant4people's second server, so it is ONE source with `electrumx.radiant4people.com` and never
-  a second vote; it comes last so form 2's endpoint pair reaches radiantcore first. Each shipped
-  endpoint now carries its operator (`registry.SHIPPED_ENDPOINTS`; `DEFAULT_ENDPOINTS` is derived
-  from it, and the watchtower's `DEFAULT_RXD_ELECTRUMX` is `DEFAULT_ENDPOINTS["mainnet"]`). Probed
-  2026-09-29 from one vantage point: radiantcore and both radiant4people servers served the mainnet
-  genesis at tip 468,606. Photonic's other three mainnet servers (bladenet: `radiant2`, `radiantus`
-  and `radiant4.bladenet.online:50022`, Radiant-Core/Photonic-Wallet @ `becf41a`) are not shipped:
-  none answered that day (timeouts, no route, and a failed TLS handshake on radiant2 :443).
-
-### Changed
-
-- **"Distinct operators (as declared, or by registered domain)".** The prose that #801 changed to
-  "distinct host" now says what is counted, and the operator limit in
-  `pyrxd.network.source_identity` states both halves once: one party can register several domains,
-  and a declared operator is only as good as the declaration. `verify --wave-name`'s ESTABLISHED
-  explanation, `--help` and the form-2 caveat say it rests on two distinct operators as declared or
-  by registered domain, which is not proof that different parties run them. The same module
-  documents one known IDNA deviation: Python's codec (IDNA2003) makes `faß.de` and `fass.de` one
-  key while yarl/aiohttp (IDNA2008) treat them as two hosts — rare, and it can only lower a count.
-  A comment that read `203.113.7` as `203.0.113.7` now says `inet_aton` reads it as `203.113.0.7`.
-- **"Distinct host", never "independent operator".** A URL can show that two servers are on
-  different hosts, and nothing about who runs them. Docstrings, CLI help and the threat model now
-  say "distinct host", and that limit is stated once, in the `pyrxd.network.source_identity`
-  module docstring ("the operator limit"), which the other places point to. The
-  `registry.py` note on the two shipped ElectrumX servers no longer says "distinct operators": on
-  2026-09-29 they resolved to different IP addresses under different DNS providers, which is
-  separate infrastructure and not proof of separate operators. `verify --wave-name` keeps the
-  verdict name ESTABLISHED, and its explanation, `--help` and the form-2 caveat now say that it
-  rests on two distinct hosts and that one party running both would defeat it.
-  `docs/threat-model.md` no longer says form 2 is the only place the default pair is counted as
-  two sources (the watchtower's RXD quorum counts it too), and no longer says multi-source
-  ElectrumX is unimplemented.
-- **ETH/ERC-20 HTLC: the counterparty runtime check is now slot-exact, closing a fund-theft path
-  proven on a local Anvil chain. Affects v0.6.0 through v0.25.1; upgrade before running an ETH or
-  ERC-20 swap.** The affected surface is a MAKER verifying a counterparty-deployed ETH or ERC-20
-  HTLC (`EthHtlcContractLeg.verify_funded`, and `Erc20HtlcLeg.verify_funded`, which inherits it,
-  since that leg shipped in v0.21.0). The masked compare arrived with #155, was first released in
-  v0.6.0, and is in every release through v0.25.1. It compared the deployed runtime to the
-  committed artifact with a *value-masked* compare that wildcarded every committed-zero byte — a
-  superset of the immutable slots. Solidity splices each `immutable` into 2–3 SEPARATE runtime
-  offsets; a getter reads one copy while `claim()`/`refund()` read another. So a hostile TAKER
-  (who deploys the ETH side first) could deploy a runtime whose `claimant` getter-copy held the
-  negotiated maker (passing every `verify_funded` getter bind) while the `claim()`-copy held an
-  attacker address. `verify_funded` passed, the maker revealed the preimage, and `claim(p)` sent
-  the entire funded balance to the attacker — who then also held `p` to take the RXD leg. The prior
-  docstring's "Not exploitable in the current self-deploy wiring" was wrong for the taker-deploys
-  role. The fix (`_expected_runtime`) rebuilds the expected runtime by substituting each negotiated
-  immutable into EVERY `immutableReferences` offset and requires EXACT byte equality — no byte is
-  wildcarded, so a forged immutable copy or any modified logic byte is rejected. The token leg
-  extends it to its `token`/`amount` immutables.
-
-### Changed (breaking)
-
-- **The injected ETH/ERC-20 HTLC artifact must now carry `immutableReferences` and
-  `immutable_names`, and a leg built from one that does not is refused at CONSTRUCTION.** The exact
-  compare cannot be built without them. Checking only inside `verify_funded` let a leg deploy and
-  fund its own contract first (native `fund` sends the value with the deploy), leaving the ETH
-  locked until the refund timeout. An empty map, an unnamed reference id, a name for an id the
-  build does not have, or a slot outside the runtime is refused the same way. A plain Foundry
-  build output does not qualify; `load_artifact`'s docstring says how to produce one that does.
-  Regression cover: an Anvil forged-copy test for each of `EthHtlc` and the real `Erc20Htlc` (the
-  latter forging every copy of every immutable in turn), an Anvil test that checks each
-  `immutable_names` entry by executing its getter, a default-suite test that derives the same map
-  from the bytecode without reading it, and construction-refusal tests with their honest paths.
 
 ## [0.25.1] — 2026-09-29
 
