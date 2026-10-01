@@ -112,15 +112,46 @@ human sizing the fee is the only remaining control.
   safe next action. ``--check-chain`` also reads the BTC/ETH counter-leg, so it can report that
   the counterparty's claim has revealed the preimage — the difference between "keep waiting"
   and "claim now", which the RXD covenant alone cannot show. With no counter-leg locator or
-  endpoint configured it reports ``NOT_CHECKED`` with the reason rather than failing. The
-  situations:
+  endpoint configured it reports ``NOT_CHECKED`` with the reason rather than failing.
 
-  - ``NOT_FUNDED`` — the covenant is not on chain.
+  The covenant is ONE output, identified by provenance. Its script is a pure function of the
+  swap's public terms, so anyone can pay it, and other outputs at the script are counted
+  (``chain.ignored_outputs``) and otherwise ignored. The covenant is the outpoint the recovery file
+  pins (``rxd_covenant_outpoint``, which the in-tree harnesses write once the covenant is pinned)
+  or ``--covenant-outpoint TXID:VOUT``; without either, it is the earliest-confirmed payment to
+  the script (of the amount the recovery file records — ``rxd_covenant_amount``, or for an ft
+  file without it ``asset_ft_amount``; on Radiant 1 photon = 1 token unit, so that is the funded
+  output's value for every variant), in
+  the ordering the automated leg uses. Unlike the automated leg, which sees only live outputs, it
+  looks through the script's history, so a covenant that was already spent is found even when a
+  later payment of another value is still live. ``chain.covenant_outpoint`` and
+  ``chain.covenant_identified_by`` say which output was taken and how. The situations:
+
+  - ``NOT_FUNDED`` — the covenant is not on chain (one ElectrumX server's answer), or a pinned
+    outpoint is not found and nothing else is live at the script (the reason says which).
+  - ``COVENANT_UNIDENTIFIED`` — no output is named, because naming one would be a guess. The
+    reason line says which of these applies; the remedy is ``--covenant-outpoint`` (or fixing the
+    pin):
+
+    - unpinned, the earliest output carrying the recorded amount (any output, when no amount is
+      recorded) is SPENT while a later one is LIVE — either could be the swap's;
+    - unpinned, outputs are live at the script but none carries the recorded amount;
+    - unpinned, the history entries that would rule out an earlier, spent covenant could not be
+      read, or there are more of them than the read fetches;
+    - pinned, the outpoint is neither live nor in the script's history while other outputs are
+      live (they are listed; nothing is assumed about them);
+    - pinned, the outpoint does not pay the covenant script, or does not carry the recorded amount.
   - ``LOCKED`` — the covenant is live and only the taker's claim can be mined yet.
   - ``REFUND_OPEN`` — the covenant is live and deep enough that the maker's CSV refund is valid.
   For a spent covenant ``--check-chain`` also fetches the spending transaction and reads which
   branch took it — the taker's claim (``<p> OP_0``) or the maker's CSV refund (``OP_1``) — and
-  reports it as ``chain.covenant_spend`` (``TAKER_CLAIM``, ``MAKER_REFUND`` or ``UNKNOWN``).
+  reports it as ``chain.covenant_spend`` (``TAKER_CLAIM``, ``MAKER_REFUND`` or ``UNKNOWN``). A
+  refund reported at a height below the covenant's funding height plus ``t_rxd`` cannot be mined,
+  and is reported ``UNKNOWN``.
+
+  Every verdict rests on one ElectrumX server and one counter-chain server. None of them says
+  outright that nothing is left to claim or refund; the "both legs spent" ones ask for a second,
+  independent source first.
 
   - ``SETTLED`` — both legs are spent and consistent: the taker claimed the covenant and the
     counter-leg was claimed with ``p`` (the swap completed), or the maker refunded the covenant
@@ -136,9 +167,15 @@ human sizing the fee is the only remaining control.
     maker's refund the taker must refund its own counter-leg; a BTC HTLC's claim branch has no
     timelock, so until then a maker holding ``p`` can still sweep it. After a taker's claim the
     maker must claim the counter-leg with ``p`` before the taker's refund opens.
+  - ``COUNTER_LEG_REFUND_UNCONFIRMED`` — the covenant is spent and the BTC counter-leg is spent by
+    a refund the explorer reports NOT confirmed (``status.confirmed`` is not true). The HTLC's
+    claim branch has no timelock, so until the refund confirms a claim with ``p`` can still
+    replace it: after a taker's claim the maker is told to claim now; otherwise the taker is told
+    to watch the refund until it confirms. A BTC refund the explorer reports confirmed is
+    ``SPENT_NO_PREIMAGE``, one server's answer, and the text says so.
   - ``COVENANT_SPENT`` — the covenant is spent and the counter-leg was not checked, its read
-    failed, or its state is ``UNKNOWN`` or ``REFUND_REPORTED_UNCONFIRMED``. It does not mean the
-    swap is over.
+    failed, or its state is ``UNKNOWN`` or (ETH) ``REFUND_REPORTED_UNCONFIRMED``. It does not mean
+    the swap is over.
 
   The ETH counter-leg has no ``LOCKED`` state: a log can show that the HTLC contract was claimed
   (``Claimed``) or refunded (``Refunded``), never that it was not, and an empty log set is also
@@ -180,11 +217,15 @@ human sizing the fee is the only remaining control.
   scraped, so a transaction that merely shares the hashlock is refused. ``--claim-tx-hex`` /
   ``--claim-tx-file`` run it fully offline, with the same requirement. It never reads the
   recovery file's own ``preimage_p_hex`` — on a maker's host that copy may still be a
-  pre-reveal secret.
+  pre-reveal secret. An outpoint spent by a transaction that reveals no ``p`` (a refund) is
+  reported as such, not as "not revealed yet": no preimage will appear on it.
 - ``pyrxd swap build-claim`` / ``build-refund`` — build the covenant spend and print its raw
   hex, alongside the decoded output and who it pays, the fee, the node's relay floor, the
   deadline-aware target, and the timing state. ``build-refund`` refuses an immature CSV
-  unless you pass ``--allow-immature`` to pre-build it for broadcast at maturity.
+  unless you pass ``--allow-immature`` to pre-build it for broadcast at maturity. The covenant
+  output is identified as ``status`` identifies it; other outputs at the covenant script are
+  reported and left alone, and ``--covenant-outpoint TXID:VOUT`` names the covenant when the
+  recovery file does not. A covenant that is already spent is refused as spent.
 
 Local dev chain
 ---------------

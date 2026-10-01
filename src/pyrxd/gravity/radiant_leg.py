@@ -54,6 +54,7 @@ from typing import Any, Protocol, runtime_checkable
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
 from pyrxd.btc_wallet.taproot import TimeUnit
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.covenant_selection import earliest_confirmed_key
 from pyrxd.gravity.fee_policy import (
     DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
     DeadlineFeePolicy,
@@ -394,7 +395,7 @@ class RadiantChainIO:
             # this exact line into a poison-selector — the mainnet ssh-tr shim did, and every
             # real-value run inherited the inversion. The producer contract (height, 0=unconfirmed)
             # is enforced per producer by tests/test_utxo_record_units.py.
-            utxos = sorted(utxos, key=lambda u: (int(u.height) if int(u.height) > 0 else 1 << 62, u.tx_hash, u.tx_pos))
+            utxos = sorted(utxos, key=lambda u: earliest_confirmed_key(int(u.height), u.tx_hash, u.tx_pos))
             _LOG.warning(
                 "covenant scriptPubKey has %d matching UTXOs; selecting the earliest-confirmed "
                 "(%s:%d at height %s). Extra payments to a covenant address are anyone's to make "

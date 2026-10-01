@@ -49,6 +49,7 @@ __all__ = [
     "OutspendBtcClaimSource",
     "WebhookAlertChannel",
     "mempool_space_outspend",
+    "mempool_space_outspend_status",
     "mempool_space_tx_hex",
     "page_to_dict",
 ]
@@ -334,6 +335,24 @@ async def mempool_space_outspend(
     spent and the server reports a 64-char txid. An explicit per-REQUEST ``timeout_s`` (red-team LOW)
     bounds a slow source: without it the call inherits aiohttp's 300s session default, so one slow
     Esplora can outlast the dead-man's-switch window and trip a false "tower DOWN" page.
+
+    :func:`mempool_space_outspend_status` is the same read plus whether the spend is CONFIRMED.
+    """
+    spent, spender, _confirmed = await mempool_space_outspend_status(
+        session, base_url, funding_txid, vout, timeout_s=timeout_s
+    )
+    return spent, spender
+
+
+async def mempool_space_outspend_status(
+    session, base_url: str, funding_txid: str, vout: int, *, timeout_s: float = 15.0
+) -> tuple[bool, str | None, bool]:
+    """:func:`mempool_space_outspend` plus ``confirmed``: ``(spent, spending_txid, confirmed)``.
+
+    ``confirmed`` is True only when the server says so (``status.confirmed`` is JSON ``true``); a
+    mempool spend, or an answer without that field, is ``False``. A spend that is still in the
+    mempool can be replaced — a BTC HTLC refund by a claim, since the claim branch has no timelock
+    — so a reader that treats it as final tells the operator to stop watching too early.
     """
     url = f"{base_url.rstrip('/')}/api/tx/{funding_txid}/outspend/{vout}"
     async with session.get(url, timeout=aiohttp_timeout(timeout_s)) as resp:
@@ -356,7 +375,9 @@ async def mempool_space_outspend(
     # `/`, `?` or `#` is a path-injection primitive.
     if not (isinstance(spender, str) and len(spender) == 64 and _is_hex64(spender)):
         spender = None
-    return spent, spender
+    status = data.get("status") if spent else None
+    confirmed = isinstance(status, dict) and status.get("confirmed") is True
+    return spent, spender, confirmed
 
 
 async def mempool_space_tx_hex(session, base_url: str, txid: str, *, timeout_s: float = 15.0) -> bytes | None:

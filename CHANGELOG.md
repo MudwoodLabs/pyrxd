@@ -247,6 +247,51 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`swap status`, `build-claim` and `build-refund` identify the RXD covenant by its funding
+  outpoint, not by "any output at the covenant script" (#816).** The covenant script is a pure
+  function of the swap's public terms, so other outputs can sit at it. `swap status --check-chain`
+  read any unspent output there as a live covenant, and reported the sum of their values and the
+  lowest of their heights as the covenant's; a spent covenant with another output at its script
+  therefore read as live. `build-claim` and `build-refund` refused outright when the script held a
+  second output, with no way to name the right one. The covenant is now the outpoint the recovery file pins
+  (`rxd_covenant_outpoint`, which `dust_swap_run.py`, `dust_swap_resume.py`, `eth_swap_run.py` and
+  `eth_swap_grief_run.py` now write once the coordinator pins it) or `--covenant-outpoint
+  TXID:VOUT` (new on `status`, `build-claim` and `build-refund`); without either it is the
+  earliest-confirmed payment to the script, of the recorded amount where one is known, in the
+  ordering `RadiantChainIO.find_covenant_utxo` uses (now shared through
+  `pyrxd.gravity.covenant_selection.earliest_confirmed_key`). The read also looks through the
+  script's history, so a covenant that was already spent is found even when a later payment of
+  another value is live — when the file records the amount (`rxd_covenant_amount`, or for ft
+  `asset_ft_amount`, which on Radiant is the funded output's value too); with no amount recorded,
+  that case reads `COVENANT_UNIDENTIFIED`. Other outputs at the script are counted (`ignored_outputs`) and do not
+  change the verdict, the value or the height. Where naming an output would be a guess — the
+  earliest candidate is spent while a later candidate is live, no live output carries the recorded
+  amount, the history cannot be read, or a pin is not found while something else is live —
+  `status` reports `COVENANT_UNIDENTIFIED` and the builders refuse, both listing the candidates and
+  naming `--covenant-outpoint`. Without a pin or a recorded amount, a LIVE payment confirmed BEFORE
+  the funding is still taken for the covenant; the pin is the remedy. The automated leg is
+  unchanged: it selects among live outputs of the agreed value (or its pin), each spendable under
+  the same covenant terms.
+- **`swap status` no longer reads a BTC refund in the mempool as a finished leg.** The counter-leg
+  read ignored Esplora's `status.confirmed`, so a refund still in the mempool gave `SETTLED` or
+  `TAKER_CLAIMED_AND_REFUNDED` and "there is nothing left to claim or refund" — while the HTLC's
+  claim branch, which has no timelock, could still replace that refund. An unconfirmed refund (or
+  an answer that does not say) is now `REFUND_REPORTED_UNCONFIRMED`, as an ETH refund from one RPC
+  already was, and the new situation `COUNTER_LEG_REFUND_UNCONFIRMED` tells the maker to claim
+  with `p` (after a taker claim) or the taker to watch its refund until it confirms.
+  `pyrxd.gravity.watch.adapters.mempool_space_outspend_status` is the outspend read with the
+  confirmation flag; `mempool_space_outspend` is unchanged.
+- **`swap status` no longer says outright that nothing is left to claim or refund.** Every "both
+  legs spent" verdict rests on one ElectrumX server and one counter-chain server, and now says so
+  and asks for a second, independent source; `BOTH_SPENT_OUTCOME_UNKNOWN` tells a taker holding `p`
+  to read the covenant on another ElectrumX server and claim it if it is still unspent there, and
+  `NOT_FUNDED` notes it is one server's answer. A covenant refund reported at a height below the
+  funding height plus `t_rxd`, which the CSV makes impossible, is now `UNKNOWN` instead of
+  `MAKER_REFUND`.
+- **`swap recover-preimage` no longer says "keep watching" for an outpoint a refund already spent.**
+  It said "no preimage has been revealed yet" for every spend without `p`; it now says the
+  outpoint was spent without revealing a preimage, and notes when that spend is unconfirmed
+  (`SpentWithoutPreimage`, a `PreimageNotRevealed`).
 - **Outpoint vouts are parsed as ASCII `0-9`.** The Radiant leg's covenant outpoint parsing used
   `str.isdigit()`, which accepts `"²"` (then a bare `ValueError`) and Arabic-Indic or full-width
   digits (silently converted to a vout); it now raises `ValidationError` before any read. The same

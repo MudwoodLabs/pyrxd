@@ -171,7 +171,7 @@ group_files() {
     # of 5, 3 of 12 and 5 of 11 modules. Split the same way as `transaction` and `dmint` above.
     covenants)   echo "gravity/covenant glyph/soulbound_covenant" ;;
     htlccovenant) echo "gravity/htlc_covenant" ;;
-    radiantleg)  echo "gravity/radiant_leg" ;;
+    radiantleg)  echo "gravity/radiant_leg gravity/covenant_selection" ;;
     # The taker gate (#809) went into `radiantleg` beside radiant_leg, with its test file added to all
     # four `covenants` lists; that put `radiantleg` at an ESTIMATED 317-379 minutes against the
     # 330-minute timeout. It is its own group now, with a test list of its own.

@@ -176,10 +176,13 @@ def test_a_foreign_claim_sharing_the_hashlock_is_refused_and_leaks_nothing(swap)
     assert P.hex() not in res.output
 
 
-def test_a_refund_reports_no_preimage_yet(swap) -> None:
+def test_a_refund_reports_that_this_leg_will_reveal_no_preimage(swap) -> None:
+    # A refund SPENDS the outpoint: no preimage will ever appear on it, so this is not the
+    # "not revealed yet — keep watching" answer an unspent outpoint gets.
     res = _recover(swap, "--claim-tx-hex", _refund_tx().hex(), "--btc-funding-outpoint", f"{OUR_FUNDING.txid}:1")
     assert res.exit_code == 1
-    assert "no preimage has been revealed yet" in res.output
+    assert "spent without revealing a preimage" in res.output
+    assert "no preimage has been revealed yet" not in res.output
 
 
 def test_recovery_json_marks_that_nothing_was_broadcast(swap) -> None:
@@ -581,7 +584,7 @@ def test_online_btc_recovery_fetches_verifies_and_prints(swap, monkeypatch, no_r
     monkeypatch.setattr(
         swap_recovery_cmds,
         "fetch_btc_claim_bytes",
-        AsyncMock(return_value=(True, btc_txid_from_raw(raw), raw)),
+        AsyncMock(return_value=(True, btc_txid_from_raw(raw), raw, True)),
     )
     res = _recover(swap, "--btc-funding-outpoint", f"{OUR_FUNDING.txid}:1")
     assert res.exit_code == 0, res.output
@@ -589,7 +592,7 @@ def test_online_btc_recovery_fetches_verifies_and_prints(swap, monkeypatch, no_r
 
 
 def test_online_btc_recovery_reports_an_unspent_htlc(swap, monkeypatch, no_real_http) -> None:
-    monkeypatch.setattr(swap_recovery_cmds, "fetch_btc_claim_bytes", AsyncMock(return_value=(False, None, None)))
+    monkeypatch.setattr(swap_recovery_cmds, "fetch_btc_claim_bytes", AsyncMock(return_value=(False, None, None, False)))
     res = _recover(swap, "--btc-funding-outpoint", f"{OUR_FUNDING.txid}:1")
     assert res.exit_code == 1
     assert "UNSPENT" in res.output
@@ -598,7 +601,9 @@ def test_online_btc_recovery_reports_an_unspent_htlc(swap, monkeypatch, no_real_
 def test_online_btc_recovery_refuses_unverifiable_bytes(swap, monkeypatch, no_real_http) -> None:
     # Spent, but the explorer cannot serve the transaction: proceeding would mean
     # trusting a txid nobody re-derived.
-    monkeypatch.setattr(swap_recovery_cmds, "fetch_btc_claim_bytes", AsyncMock(return_value=(True, "cc" * 32, None)))
+    monkeypatch.setattr(
+        swap_recovery_cmds, "fetch_btc_claim_bytes", AsyncMock(return_value=(True, "cc" * 32, None, False))
+    )
     res = _recover(swap, "--btc-funding-outpoint", f"{OUR_FUNDING.txid}:1")
     assert res.exit_code == 1
     assert "not retrievable" in res.output
@@ -1042,7 +1047,10 @@ def test_both_legs_spent_still_reads_settled(swap, monkeypatch) -> None:
 def test_a_settled_swap_on_a_refunded_counter_leg_names_the_one_server_that_said_so(swap, monkeypatch) -> None:
     raw = _refund_tx()
     spender = btc_txid_from_raw(raw)
-    _serve(monkeypatch, _FakeEsplora({"spent": True, "txid": spender}, tx_hex={spender: raw.hex()}))
+    # Esplora's shape for a CONFIRMED spend. An unconfirmed refund is not a finished leg
+    # (test_swap_covenant_provenance.py), so this case needs the server to say it is mined.
+    outspend = {"spent": True, "txid": spender, "status": {"confirmed": True}}
+    _serve(monkeypatch, _FakeEsplora(outspend, tx_hex={spender: raw.hex()}))
     # Both refunded: the maker CSV-refunded the covenant and the taker refunded the BTC.
     res = _checked_status(swap, client=_spent_by(swap, "refund"))
     assert res.exit_code == 0, res.output

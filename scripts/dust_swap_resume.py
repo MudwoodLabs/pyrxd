@@ -59,6 +59,7 @@ from _dust_swap_shared import (
     confirm,
     funding_bound_from_args,
     measured_margin_from_mainnet,
+    merge_into_mode_600,
     require_rxd_node_args,
     rxd_blockcount,
     validated_resume_deadline_s,
@@ -259,6 +260,12 @@ async def resume(args) -> None:
         print(f"  covenant fund height = {rxd_locked_at} (block height, read from the covenant UTXO)")
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
         print(f"  post_asset_lock_revalidate -> {rec.state.value}")
+        # PERSIST the pinned covenant outpoint (as dust_swap_run.py does): a keys file written before
+        # the forward runner recorded it gains it here, for `pyrxd swap status` / `build-claim`.
+        if rec.radiant_covenant_outpoint:
+            merge_into_mode_600(
+                Path(args.keys_out).expanduser(), {"rxd_covenant_outpoint": rec.radiant_covenant_outpoint}
+            )
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant mismatch -> {rec.state.value}; refund both legs after their timelocks")
 

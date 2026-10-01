@@ -68,6 +68,10 @@ e.g. `age`/`gpg` to an offline key. Verify perms stay `0600` on restore.
    `build-refund` to print the raw hex. **Neither broadcasts** — read the decoded output, the fee, the
    relay floor and the deadline-aware target, then broadcast from your own node. Radiant has no RBF
    and no CPFP: an under-fee'd spend cannot be repaired, so this decision is deliberately yours.
+   Anyone can pay the covenant's script, so both commands (and `swap status`) report other outputs
+   there and ignore them. If the recovery file does not record `rxd_covenant_outpoint` and the
+   command picked the wrong output, pass `--covenant-outpoint TXID:VOUT` (the covenant funding from
+   your run log).
 
 ### Recovering the seen-store
 
