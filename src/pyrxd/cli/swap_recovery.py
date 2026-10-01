@@ -872,7 +872,13 @@ def _keccak256(data: bytes) -> bytes:
 
 
 def _rlp_item(data: bytes, pos: int, depth: int = 0) -> tuple[bytes | list[Any], int]:
-    """Decode one RLP item at *pos*: ``(item, end)``. Raises ``ValueError`` on anything malformed."""
+    """Decode one RLP item at *pos*: ``(item, end)``. Raises ``ValueError`` on anything malformed.
+
+    CANONICAL encodings only, as pyrlp's strict decoder: a single byte below ``0x80`` must be
+    encoded as itself (``0x81 0x05`` is refused), and a long-form length must have no leading zero
+    and must exceed 55 (anything shorter has a short form). Each value then has exactly one
+    encoding, so the bytes pyrxd hashes are the bytes it decoded and no other spelling of them.
+    """
     if depth > _RLP_MAX_DEPTH:
         raise ValueError("RLP nested too deeply")
     if pos >= len(data):
@@ -887,11 +893,17 @@ def _rlp_item(data: bytes, pos: int, depth: int = 0) -> tuple[bytes | list[Any],
         start = pos + 1 + len_len
         if start > len(data):
             raise ValueError("RLP length runs past the end")
+        if data[pos + 1] == 0:
+            raise ValueError("non-canonical RLP: long-form length with a leading zero")
         length = int.from_bytes(data[pos + 1 : start], "big")
+        if length <= 55:
+            raise ValueError("non-canonical RLP: long-form length for a payload that has a short form")
     end = start + length
     if end > len(data):
         raise ValueError("RLP payload runs past the end")
     if b0 < 0xC0:
+        if length == 1 and data[start] < 0x80:
+            raise ValueError("non-canonical RLP: a single byte below 0x80 must encode as itself")
         return data[start:end], end
     items: list[Any] = []
     p = start

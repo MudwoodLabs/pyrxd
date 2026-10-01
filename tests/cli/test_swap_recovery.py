@@ -1289,6 +1289,55 @@ def test_undecodable_raw_bytes_are_refused_on_provenance(raw) -> None:
         sr.verify_raw_eth_tx(raw, computed)
 
 
+@pytest.mark.parametrize(
+    "enc",
+    [
+        "8105",  # a single byte below 0x80 wrapped in a string header
+        "b80100",  # long-form length 1: has a short form
+        "b837" + "00" * 55,  # long-form length 55: the largest short form
+        "b90038" + "00" * 56,  # long-form length with a leading zero
+        "f80100",  # the same three for a list
+        "f837" + "00" * 55,
+        "f90038" + "00" * 56,
+    ],
+)
+def test_non_canonical_rlp_is_refused(enc) -> None:
+    """Strict like pyrlp: each value has exactly one encoding the reader accepts."""
+    with pytest.raises(ValueError, match="non-canonical"):
+        sr._rlp_item(bytes.fromhex(enc), 0)
+
+
+@pytest.mark.parametrize(
+    "enc",
+    ["05", "8180", "81ff", "b838" + "00" * 56, "f838" + "00" * 56, "c0", "80", "b90100" + "00" * 256],
+)
+def test_canonical_rlp_still_decodes_and_matches_pyrlp(enc) -> None:
+    """Honest-path pair for the refusals above, checked against an independent decoder."""
+    rlp = pytest.importorskip("rlp")
+    raw = bytes.fromhex(enc)
+    item, end = sr._rlp_item(raw, 0)
+    assert end == len(raw)
+    assert item == rlp.decode(raw, strict=True)
+
+
+def test_a_signed_transaction_respelled_non_canonically_is_refused() -> None:
+    """A real signed legacy transaction with its nonce re-encoded ``0x81 0x05`` instead of ``0x05``:
+    the same values, different bytes, so a different keccak. Refused on decode, never read."""
+    rlp = pytest.importorskip("rlp")
+    eth_account = pytest.importorskip("eth_account")
+    signed = eth_account.Account.create().sign_transaction(
+        {"nonce": 5, "gas": 60_000, "gasPrice": 10**9, "to": "0x" + "12" * 20, "value": 0, "data": b"", "chainId": 1}
+    )
+    raw = bytes(signed.raw_transaction)
+    fields = rlp.decode(raw)
+    assert fields[0] == b"\x05"
+    payload = b"\x81\x05" + b"".join(rlp.encode(f) for f in fields[1:])
+    respelled = rlp.codec.length_prefix(len(payload), 0xC0) + payload
+    assert sr.verify_raw_eth_tx(raw, "0x" + sr._keccak256(raw).hex()).chain_id == 1  # control: canonical reads
+    with pytest.raises(sr.ProvenanceRefused, match="non-canonical"):
+        sr.verify_raw_eth_tx(respelled, "0x" + sr._keccak256(respelled).hex())
+
+
 @pytest.mark.asyncio
 async def test_fetch_btc_claim_bytes_reuses_the_watchtower_esplora_gets(monkeypatch) -> None:
     from pyrxd.gravity.watch import adapters
