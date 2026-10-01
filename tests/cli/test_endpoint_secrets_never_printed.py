@@ -588,3 +588,26 @@ def test_verify_names_the_endpoint_that_answered_without_its_secrets(tmp_path, m
     assert "wss://only.example.invalid:50022 answered, but its index and its node disagree" in flat, flat
     for s in (USER, PW, PATH, QUERY):
         assert s.lower() not in (r.output + caplog.text).lower(), f"{s} in:\n{r.output}"
+
+
+@pytest.mark.parametrize("where", ["config file", "--electrumx"])
+def test_debug_traceback_never_prints_a_url_websockets_refuses(tmp_path, where) -> None:
+    """Panel finding (LOW): a key-as-username URL (``wss://<key>@host/``) passes pyrxd's own checks;
+    websockets then refuses it with ``InvalidURI``, whose message quotes the whole URI, and
+    ``--debug`` printed that chained cause — key included. The connect error is now redacted where it
+    is raised, and the original is not chained."""
+    url = f"wss://{USER}@127.0.0.1:1/"
+    argv = ["--debug", "--network", "mainnet"]
+    if where == "config file":
+        cfg = tmp_path / "pyrxd.toml"
+        cfg.write_text(f'electrumx_servers = ["{url}"]\n', encoding="utf-8")
+        argv += ["--config", str(cfg)]
+    else:
+        argv += ["--electrumx", url]
+    for json_flag in ((), ("--json",)):
+        rc, out, err = _pyrxd_in(tmp_path, [*json_flag, *argv, "glyph", "inspect", "--fetch", TXID], None)
+        assert USER.lower() not in (out + err).lower(), f"{where} {json_flag}:\n{out}\n{err}"
+        assert rc != 0
+        if not json_flag:
+            # Non-vacuity: the traceback was printed, and it is the path where websockets refused the URL.
+            assert "Traceback" in err and "InvalidURI" in err and "<redacted>@127.0.0.1" in err, err

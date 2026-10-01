@@ -71,6 +71,7 @@ from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_r
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
 from pyrxd.network._guards import finite_int
+from pyrxd.network.source_identity import SourceKey, source_key_of
 from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.security.units import ChainHeight, Confirmations, PhotonValue
@@ -480,6 +481,18 @@ class RadiantChainIO:
     def _unidentified_label(index: int, src: Any) -> str:
         return f"{UNIDENTIFIED_SOURCE_PREFIX} #{index} ({type(src).__name__})"
 
+    @classmethod
+    def _operator_label(cls, index: int, src: Any) -> str:
+        """*src*'s operator group, through the ONE funnel every quorum counts by
+        (:func:`pyrxd.network.source_identity.source_key_of`): a :class:`SourceKey` derived from its
+        URL. Anything else — no key, or a hand-chosen plain string, which would let one server
+        wrapped twice as ``"a"`` and ``"b"`` count as two operators — is an unidentified source:
+        its report can still raise the bound, and it never counts as an operator."""
+        try:
+            return str(source_key_of(src))
+        except ValidationError:
+            return cls._unidentified_label(index, src)
+
     @staticmethod
     def _splits(src: Any) -> bool:
         """A client over several operators' URLs that can be asked once per operator."""
@@ -500,10 +513,12 @@ class RadiantChainIO:
         out: list[str] = []
         for index, src in enumerate(self._distinct_sources()):
             if self._splits(src):
-                out.extend(str(k) for k in src.source_keys)
+                out.extend(
+                    str(k) if isinstance(k, SourceKey) else self._unidentified_label(index, src)
+                    for k in src.source_keys
+                )
                 continue
-            key = getattr(src, "source_key", None)
-            out.append(str(key) if key else self._unidentified_label(index, src))
+            out.append(self._operator_label(index, src))
         return tuple(dict.fromkeys(out))
 
     async def reported_depths(self, txid: str, height: int) -> tuple[tuple[str, int], ...]:
@@ -588,9 +603,7 @@ class RadiantChainIO:
                     logger.debug("depth source %d served no tip headers within %.1f s", index, self._depth_timeout_s)
             if confs is None and tip is None:
                 return None
-            key = getattr(src, "source_key", None)
-            label = str(key) if key else self._unidentified_label(index, src)
-            return (label, confs, tip, served)
+            return (self._operator_label(index, src), confs, tip, served)
 
         # Concurrently: one unresponsive operator costs one timeout, not one per source in turn.
         # `gather` keeps the order they were asked in.

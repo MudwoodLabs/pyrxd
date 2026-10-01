@@ -368,9 +368,10 @@ def test_the_btc_derivation_leaves_no_headroom_for_a_post_confirm_rerun(
 def test_the_btc_ordering_gate_still_runs_only_at_fund_time() -> None:
     """The membership half of the same exemption: `assert_timelock_margin`'s production call sites.
 
-    One lives inside `pre_btc_lock_check` (step 3); one inside `_judge_remaining_window` (step 7),
-    which is called only from `pre_btc_lock_check` and from the lock-time re-run in
-    `taker_funds_btc`, immediately before `counter_leg.fund`; one inside `_timelock_ordering_failure`,
+    One lives inside `pre_btc_lock_check` (step 3); one inside `_remaining_window_failure` (step 7),
+    which is called only from `_judge_remaining_window` (at the elapsed bound, and again at the
+    proved depth to classify a refusal), itself called only from `pre_btc_lock_check` and from the
+    lock-time re-run in `taker_funds_btc`, immediately before `counter_leg.fund`; one inside `_timelock_ordering_failure`,
     which is called only from `_funding_proof_room_failure`, the negotiation-time check, itself called
     only from the constructor (for a NEGOTIATED record) and from `pre_btc_lock_check`. Pre-fund, all of
     them, and pinned below. Anything else
@@ -388,7 +389,7 @@ def test_the_btc_ordering_gate_still_runs_only_at_fund_time() -> None:
                     enclosing.setdefault(sub.lineno, node.name)
     assert enclosing, "no assert_timelock_margin call found in the coordinator — the scan has broken"
     assert sorted(set(enclosing.values())) == [
-        "_judge_remaining_window",
+        "_remaining_window_failure",
         "_timelock_ordering_failure",
         "pre_btc_lock_check",
     ], (
@@ -421,3 +422,11 @@ def test_the_btc_ordering_gate_still_runs_only_at_fund_time() -> None:
         if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "self._judge_remaining_window"
     }
     assert window_callers == {"pre_btc_lock_check", "taker_funds_btc"}, window_callers
+    failure_callers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "self._remaining_window_failure"
+    }
+    assert failure_callers == {"_judge_remaining_window"}, failure_callers

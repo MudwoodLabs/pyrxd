@@ -108,6 +108,37 @@ def unit_test_mocks(monkeypatch: None):
     pass
 
 
+#: How long after the newest shipped checkpoint the pinned horizon clock may read.
+_PINNED_HORIZON_AGE_S = 86_400
+
+
+@pytest.fixture(autouse=True)
+def _pin_the_checkpoint_horizon_clock(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the taker coordinator's checkpoint-horizon check from reading the table's real age.
+
+    The construction-time check (``funding_spv.checkpoint_horizon_failure``, called by
+    ``SwapCoordinator``) refuses once the shipped checkpoint table is too old for the clock it is
+    given — and many tests build mainnet coordinators or run the swap scripts with the wall clock,
+    so without this they would start failing on a calendar date unrelated to anything they test.
+    The REAL function still runs; only the ``now`` it is handed is capped at one day after the
+    newest checkpoint's timestamp (an earlier clock, such as a test's fixed ``_NOW``, is passed
+    through). A test about the horizon itself opts out with ``@pytest.mark.real_checkpoint_clock``.
+    """
+    if request.node.get_closest_marker("real_checkpoint_clock"):
+        return
+    from pyrxd.gravity import swap_coordinator
+
+    real = swap_coordinator.checkpoint_horizon_failure
+
+    def pinned(*, chain, now_unix_s, **kw):  # type: ignore[no-untyped-def]
+        t0 = chain.newest_checkpoint_time
+        if t0 is not None:
+            now_unix_s = min(int(now_unix_s), int(t0) + _PINNED_HORIZON_AGE_S)
+        return real(chain=chain, now_unix_s=now_unix_s, **kw)
+
+    monkeypatch.setattr(swap_coordinator, "checkpoint_horizon_failure", pinned)
+
+
 # ---------------------------------------------------------------------------------
 # Unexpected-skip guard
 #

@@ -1604,7 +1604,7 @@ class MultiSourceBtcFundingReader:
         a log-only clamp could arm single-source above-dust custody (the F-17 SPOF) on a misconfig.
 
         Pass ``allow_insufficient_diversity=True`` to explicitly accept the degraded low-/single-source
-        posture (mirrors the executor's ``--accept-single-source`` dust opt-in); the clamp is then logged
+        posture (mirrors the refund executor's ``--auto-refund-on-single-source`` dust opt-in); the clamp is then logged
         loudly so the operator sees the real corroboration level."""
         if not urls:
             raise ValidationError("from_endpoints requires at least one endpoint URL")

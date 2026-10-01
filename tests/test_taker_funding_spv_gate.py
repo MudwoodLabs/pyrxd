@@ -29,7 +29,9 @@ import ast
 import dataclasses
 import hashlib
 import json
+import math
 import os
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,7 @@ import websockets
 from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg, BtcUtxo, FundingPolicy
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.gravity import funding_spv
+from pyrxd.gravity import swap_coordinator as swap_coordinator_module
 from pyrxd.gravity.funding_spv import (
     FORGERY_COST_FACTOR,
     MAX_HEADERS_FROM_CHECKPOINT_SDK,
@@ -78,6 +81,7 @@ from tests.test_swap_coordinator import (
     FakeSeenStore,
     _coordinator,
     _eth_coord_full,
+    _eth_fund_policy,
     _eth_terms,
     _final,
     _MemLock,
@@ -107,7 +111,8 @@ def _covenant(terms: NegotiatedTerms) -> bytes:
 def _vb_chain(headers: dict[int, bytes], heights: tuple[int, ...]) -> RadiantChain:
     """A value-bearing chain (mainnet's subsidy schedule; regtest's proof-of-work limit so the genesis
     decodes) with checkpoints at *heights* of *headers*, shipping the last interval's work exactly as
-    ``scripts/refresh_radiant_checkpoints.py`` computes it for the real table."""
+    ``scripts/refresh_radiant_checkpoints.py`` computes it for the real table. No checkpoint timestamp,
+    so the construction-time horizon projection is off (as on regtest); the horizon tests set one."""
     pow_limit = (1 << 255) - 1
     lo, hi = heights[-2], heights[-1]
     works = [radiant_header_work(headers[h], pow_limit=pow_limit) for h in range(lo, hi + 1)]
@@ -1456,7 +1461,7 @@ async def test_a_tip_header_read_that_fails_leaves_the_gate_as_it_was(monkeypatc
     assert "no source served its tip headers" in proof.bound_note, proof.bound_note
 
 
-def test_k_past_the_cap_refuses_with_upgrade_or_use_your_own_node(monkeypatch):
+def test_k_past_the_cap_refuses_with_upgrade_pyrxd(monkeypatch):
     base, chain = _value_bearing_chain(monkeypatch)
     spk = b"\x76\xa9" + bytes(32)
     c = build_funding_chain(spk=spk, value=1000, confs=8, base=base, bits=_HARD_BITS)
@@ -1469,10 +1474,147 @@ def test_k_past_the_cap_refuses_with_upgrade_or_use_your_own_node(monkeypatch):
         now_unix_s=_NOW,
     )
     # cap 6: block 5 + k(10) - 1 = 14 is 10 past checkpoint 4.
+    # The remedy is upgrading: nothing lets the gate link to a taker's own anchor, so it is not offered.
     with pytest.raises(
-        MakerFundingNotVerified, match="upgrade pyrxd .newer checkpoints. or verify against your own node"
-    ):
+        MakerFundingNotVerified, match="upgrade pyrxd .newer checkpoints.; the taker gate has no other"
+    ) as e:
         verify_maker_funding(c.evidence(), cap=6, **kw)
+    assert "own node" not in str(e.value)
+
+
+# --------------------------------------------------------------------------- the checkpoint horizon, before anyone locks
+
+
+def _horizon_case(monkeypatch, *, seconds_past_checkpoint: int, cap: int | None = None):
+    """The honest value-bearing fixture, with the newest checkpoint stamped *seconds_past_checkpoint*
+    before ``_NOW``; ``cap`` stands in for an older table by shrinking the gate's horizon everywhere
+    (step 5's two functions AND the construction-time projection). Returns ``(build, chain, terms, view)``:
+    ``build()`` constructs the NEGOTIATED coordinator at ``_NOW``."""
+    base, chain = _value_bearing_chain(monkeypatch)
+    chain = dataclasses.replace(chain, newest_checkpoint_time=_NOW - seconds_past_checkpoint)
+    monkeypatch.setattr(funding_spv, "MAINNET_CHAIN", chain)
+    # A BTC coordinator is built without a clock, so the projection reads the system clock: pin it.
+    monkeypatch.setattr(swap_coordinator_module.time, "time", lambda: float(_NOW))
+    if cap is not None:
+        for fn in (
+            funding_spv.funding_header_ranges,
+            funding_spv.verify_maker_funding,
+            funding_spv.checkpoint_horizon_failure,
+        ):
+            monkeypatch.setattr(fn, "__kwdefaults__", {**fn.__kwdefaults__, "cap": cap})
+    terms = _vb_terms(400)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
+    policy = _vb_policy()
+
+    def build():
+        coord, _ = _btc_coord(terms, _real_leg(view, network="bc"), policy=policy, accept_nondurable_seen=True)
+        return coord
+
+    return build, chain, terms, view
+
+
+@pytest.mark.real_checkpoint_clock
+async def test_a_swap_past_the_checkpoint_horizon_is_refused_when_the_coordinator_is_built(monkeypatch):
+    """Panel finding (MEDIUM): with the table old enough, the coordinator CONSTRUCTED, the maker locked,
+    and step 5 refused every value-bearing swap ("upgrade pyrxd"). The projection now refuses it at
+    construction, before anyone locks, and reads nothing from the chain to do so."""
+    build, _, terms, _ = _horizon_case(monkeypatch, seconds_past_checkpoint=0, cap=3)
+    # Control, the pre-fix shape: without the projection the coordinator constructs and step 5 refuses.
+    monkeypatch.setattr(swap_coordinator_module, "checkpoint_horizon_failure", lambda **kw: None)
+    coord = build()
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert not gate.ok and "upgrade pyrxd" in gate.reason, gate
+    monkeypatch.undo()
+    build, chain, _, view = _horizon_case(monkeypatch, seconds_past_checkpoint=0, cap=3)
+    with pytest.raises(ValidationError, match="refused before anyone locks") as e:
+        build()
+    msg = str(e.value)
+    assert "Upgrade pyrxd (newer checkpoints) before negotiating this swap" in msg
+    assert f"newest checkpoint is block {chain.checkpoints[-1][0]}" in msg and "links at most 3 blocks past it" in msg
+    assert view.reads == []
+
+
+@pytest.mark.real_checkpoint_clock
+async def test_inside_the_horizon_the_projection_passes_and_the_gate_agrees(monkeypatch):
+    """Honest path: the shipped cap, the checkpoint an hour old — constructs, and step 5 accepts."""
+    build, _, terms, _ = _horizon_case(monkeypatch, seconds_past_checkpoint=3600)
+    coord = build()
+    assert (await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)).ok
+
+
+@pytest.mark.real_checkpoint_clock
+def test_the_projection_moves_with_the_clock_and_refuses_at_the_gates_own_boundary():
+    """The projected tip is the newest checkpoint plus the blocks since its timestamp at the rate
+    factor; a funding mined in the next block is k deep at tip + k. Refused exactly when that is
+    past newest + cap — the boundary step 5 itself uses (H + k - 1 > newest + cap, H = tip + 1)."""
+    chain = funding_spv.MAINNET_CHAIN
+    newest = chain.checkpoints[-1][0]
+    t0 = chain.newest_checkpoint_time
+    cap, k, f = MAX_HEADERS_FROM_CHECKPOINT_SDK, 30, funding_spv.CHECKPOINT_HORIZON_RATE_FACTOR
+
+    def fails(now, seen=None):
+        return funding_spv.checkpoint_horizon_failure(
+            chain=chain, now_unix_s=now, required_confirmations=k, observed_confirmations=seen, slack_s=0
+        )
+
+    # Largest `now` whose projected tip still leaves room: ceil(f * s / 300) <= cap - k.
+    s = int((cap - k) * 300 / f)
+    while math.ceil(Fraction(f).limit_denominator(1_000_000) * (s + 1) / 300) <= cap - k:
+        s += 1
+    tip = newest + math.ceil(Fraction(f).limit_denominator(1_000_000) * s / 300)
+    assert fails(t0 + s) is None
+    assert (tip + 1) + k - 1 == newest + cap  # a funding at tip + 1 reaches k exactly at step 5's limit
+    tip_next = newest + math.ceil(Fraction(f).limit_denominator(1_000_000) * (s + 1) / 300)
+    assert (tip_next + 1) + k - 1 > newest + cap  # one second later step 5 would refuse it ...
+    assert fails(t0 + s + 1) is not None  # ... and so does the projection
+    # A funding already observed deep reaches k sooner.
+    assert fails(t0 + s + 600, seen=k) is None
+    # Before the checkpoint's own timestamp (a clock behind it) nothing has elapsed.
+    assert fails(t0 - 10**6) is None
+
+
+def test_the_shipped_newest_checkpoint_header_is_the_checkpoint_and_carries_its_time():
+    """The projection reads its timestamp from the shipped header — bytes the checkpoint hash commits
+    to, so a wrong time cannot be shipped without failing here."""
+    from pyrxd.spv import radiant_checkpoints as cp
+
+    header = bytes.fromhex(cp.NEWEST_CHECKPOINT_HEADER["mainnet"])
+    assert len(header) == 80
+    assert radiant_block_hash(header) == cp.CHECKPOINTS["mainnet"][-1][1]
+    assert (
+        radiant_header_work(header, pow_limit=funding_spv.MAINNET_CHAIN.pow_limit)
+        == cp.NEWEST_CHECKPOINT_WORK["mainnet"]
+    )
+    assert funding_spv.MAINNET_CHAIN.newest_checkpoint_time == int.from_bytes(header[68:72], "little") > 1_700_000_000
+
+
+@pytest.mark.real_checkpoint_clock
+def test_a_mainnet_taker_coordinator_is_refused_past_the_shipped_horizon_and_accepted_inside_it(monkeypatch):
+    """The real shipped table, through the real constructor, with the clock it is given."""
+    terms = _vb_terms(400)
+    t0 = funding_spv.MAINNET_CHAIN.newest_checkpoint_time
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, bits=_HARD_BITS)
+
+    def build(now):
+        return SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            counter_leg=A._taker_btc_leg(terms=terms, taker_kp=generate_keypair("bcrt"), btc_view=A._BtcChainView()),
+            radiant_leg=_real_leg(view, network="bc"),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(margin_policy=_vb_policy(), accept_nondurable_seen=True),
+            now_unix_s=now,
+        )
+
+    build(t0 + 86_400)  # a day after the newest checkpoint: inside
+    with pytest.raises(ValidationError, match="Upgrade pyrxd"):
+        build(t0 + 80 * 86_400)  # 80 days on: 23,040 nominal blocks, past the 20,160 the gate links
+    # Without a clock (a BTC counter leg needs none otherwise) the system clock is used.
+    monkeypatch.setattr(swap_coordinator_module.time, "time", lambda: float(t0 + 80 * 86_400))
+    with pytest.raises(ValidationError, match="Upgrade pyrxd"):
+        build(None)
 
 
 # --------------------------------------------------------------------------- (d) every lock path
@@ -1631,6 +1773,205 @@ async def test_each_coordinator_entry_point_that_funds_refuses_an_unproved_fundi
             assert "fund" not in calls, f"{name} reached counter_leg.fund with an unproved maker funding"
             # ...and it was the GATE that refused, not some unrelated precondition of the driver.
             assert "maker's Radiant covenant not verified" in reason, (name, reason)
+
+
+#: A resume run this close to the ETH deadline is refused DEFINITIVELY (the deadline only gets nearer).
+_LATE = _NOW + 39_500
+
+
+def _pending_record(terms, push_nonce=None):
+    return dataclasses.replace(
+        SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+        pending_push_nonce=push_nonce,
+    )
+
+
+def _resume_terms(token: str = ""):
+    _p = os.urandom(32)
+    terms = _eth_terms(hashlock=hashlib.sha256(_p).digest())
+    return _p, (dataclasses.replace(terms, token_address=token) if token else terms)
+
+
+async def _resume(
+    *, covenant_funded: bool, now: int, token: str = "", push_nonce=None, leg=None, persist=True, sink=None, terms=None
+):
+    """A crashed ETH fund (pending deploy on the durable record) resumed; the resume must refuse.
+    Returns ``(coordinator, eth leg, raised exception, sink)``."""
+    import tempfile
+
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    if terms is None:
+        _p, terms = _resume_terms(token)
+    else:
+        _p = os.urandom(32)
+    if sink is None:
+        sink = JsonFileRecordSink(Path(tempfile.mkdtemp()) / "swap.json")
+        await sink(_pending_record(terms, push_nonce))
+    seen = FakeSeenStore()
+    seen.reserve(terms.hashlock)
+    eth = leg or FakeEthLeg(preimage=_p, verdict=_final())
+    coord = _eth_coord_full(
+        terms=terms,
+        eth_leg=eth,
+        radiant_leg=FakeRadiantLeg(asset_funded=covenant_funded),
+        seen_store=seen,
+        fund_lock=_MemLock(),
+    )
+    if not persist:
+        coord._persist = None
+    with pytest.raises(ValidationError) as exc:
+        await coord.resume_interrupted_fund(terms, sink=sink, now_unix_s=now)
+    return coord, eth, exc.value, sink
+
+
+def _eth_decide(record, **obs):
+    from pyrxd.gravity.watch.decide import Observations, decide
+
+    return decide(
+        record=record,
+        observations=Observations(maker_has_claimed_btc=False, now_rxd_height=1000, **obs),
+        policy=_eth_fund_policy(),
+        safety_window_blocks=6,
+    )
+
+
+async def test_a_definitively_refused_native_resume_leaves_a_record_the_watchtower_tracks():
+    """Panel finding (LOW): a resume refused by the gate left the record NEGOTIATED with only the
+    pending handle, so the watchtower saw nothing locked. Refused for a reason a retry cannot change
+    (here: too near the ETH deadline), the native contract — which took its value at deploy — moves
+    to BTC_LOCKED with its locator and the reason, and is refunded at the deadline even with the
+    covenant on chain."""
+    coord, eth, exc, _sink = await _resume(covenant_funded=True, now=_LATE)
+    from pyrxd.gravity.swap_coordinator import DefinitiveFundRefusal
+
+    assert isinstance(exc, DefinitiveFundRefusal) and "fund" not in eth.calls
+    rec = coord.record
+    assert coord.persisted and coord.persisted[-1] == rec
+    assert rec.state is SwapState.BTC_LOCKED and rec.pending_counter_contract is None
+    assert rec.counterchain_locator.contract_address == "0x" + "ab" * 20
+    assert rec.counterchain_locator.deploy_tx_hash == "0x" + "cd" * 32
+    assert "too late" in rec.fund_refusal or "deadline" in rec.fund_refusal, rec.fund_refusal
+    assert "took its value in the deploy" in str(exc) and "now btc_locked" in str(exc)
+    assert SwapRecord.from_dict(json.loads(json.dumps(rec.to_dict()))).fund_refusal == rec.fund_refusal
+    deadline = rec.terms.eth_timeout_unix_s
+    before = _eth_decide(rec, asset_locked_at_height=900, now_unix_s=deadline - 1)
+    assert before.intent.name == "WATCH" and "refused fund" in before.reason
+    after = _eth_decide(rec, asset_locked_at_height=900, now_unix_s=deadline)
+    assert after.intent.name == "PAGE_REFUND" and after.recommended_action == "taker_refund_btc", after
+    # Control, the other branch: an ordinary BTC_LOCKED record with the asset locked still WATCHes.
+    plain = dataclasses.replace(rec, fund_refusal=None)
+    assert _eth_decide(plain, asset_locked_at_height=900, now_unix_s=deadline).intent.name == "WATCH"
+
+
+async def test_a_resume_refused_while_the_covenant_cannot_be_read_stays_retryable():
+    """Review finding (LOW), the repro: an ERC-20 swap with the push nonce recorded, resumed while
+    the covenant is unreadable. That moved the record to btc_locked, and every later retry was
+    refused with "carries no pending counter-leg deploy". A refusal a retry may pass now changes
+    nothing, says so, and the next resume reaches the gate again."""
+    _p, terms = _resume_terms(token="0x" + "77" * 20)
+    coord, eth, exc, sink = await _resume(covenant_funded=False, now=_NOW, push_nonce=7, terms=terms)
+    from pyrxd.gravity.swap_coordinator import DefinitiveFundRefusal
+
+    assert not isinstance(exc, DefinitiveFundRefusal) and "can be retried" in str(exc), str(exc)
+    assert "maker's Radiant covenant not verified" in str(exc) and "fund" not in eth.calls
+    assert coord.record.state is SwapState.NEGOTIATED and coord.record.pending_counter_contract == "0x" + "ab" * 20
+    assert coord.record.fund_refusal is None and coord.persisted == []
+    on_disk = sink.load_record()
+    assert on_disk.state is SwapState.NEGOTIATED and on_disk.pending_counter_contract == "0x" + "ab" * 20
+    # The retry is a resume again — not "carries no pending counter-leg deploy".
+    _c2, _e2, again, _s = await _resume(covenant_funded=False, now=_NOW, terms=terms, sink=sink)
+    assert "can be retried" in str(again) and "no pending counter-leg deploy" not in str(again)
+
+
+async def test_a_retryable_refusal_then_a_clean_retry_completes_the_fund():
+    """Honest path: once the covenant reads, the same durable record resumes to BTC_LOCKED."""
+    import tempfile
+
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    _p, terms = _resume_terms()
+    sink = JsonFileRecordSink(Path(tempfile.mkdtemp()) / "swap.json")
+    await sink(_pending_record(terms))
+    await _resume(covenant_funded=False, now=_NOW, terms=terms, sink=sink)
+    seen = FakeSeenStore()
+    seen.reserve(terms.hashlock)
+    eth = FakeEthLeg(preimage=_p, verdict=_final())
+    coord = _eth_coord_full(
+        terms=terms, eth_leg=eth, radiant_leg=FakeRadiantLeg(asset_funded=True), seen_store=seen, fund_lock=_MemLock()
+    )
+    rec = await coord.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED and "fund" in eth.calls and rec.fund_refusal is None
+
+
+async def test_a_definitively_refused_token_resume_whose_push_was_never_sent_stays_resumable():
+    """A token contract holds nothing until the push, whose nonce is recorded before it is sent:
+    no nonce, nothing locked — the record stays NEGOTIATED (resumable) with the reason."""
+    coord, eth, exc, _ = await _resume(covenant_funded=True, now=_LATE, token="0x" + "77" * 20)
+    rec = coord.record
+    assert rec.state is SwapState.NEGOTIATED and rec.pending_counter_contract == "0x" + "ab" * 20
+    assert rec.counterchain_locator is None and rec.fund_refusal
+    assert "holds nothing" in str(exc) and "reason recorded" in str(exc) and "fund" not in eth.calls
+
+
+async def test_a_definitively_refused_token_resume_whose_push_may_have_been_sent_is_tracked():
+    """The push nonce is recorded before the push is broadcast: with one recorded the contract may
+    hold the tokens, so the record moves to BTC_LOCKED with a TOKEN locator."""
+    from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+    coord, eth, exc, _ = await _resume(covenant_funded=True, now=_LATE, token="0x" + "77" * 20, push_nonce=7)
+    rec = coord.record
+    assert rec.state is SwapState.BTC_LOCKED and isinstance(rec.counterchain_locator, Erc20HtlcLocator)
+    assert rec.counterchain_locator.token_address == "0x" + "77" * 20 and rec.fund_refusal
+    assert "the token push may have been sent" in str(exc) and "fund" not in eth.calls
+
+
+async def test_a_leg_that_cannot_rebuild_the_locator_keeps_the_handle_and_says_so():
+    class _NoExpected(FakeEthLeg):
+        expected_locator = None
+
+    coord, _eth, exc, _ = await _resume(
+        covenant_funded=True, now=_LATE, leg=_NoExpected(preimage=os.urandom(32), verdict=_final())
+    )
+    assert coord.record.state is SwapState.NEGOTIATED and coord.record.fund_refusal
+    assert "cannot rebuild its locator" in str(exc) and "0x" + "ab" * 20 in str(exc)
+
+
+async def test_without_a_persist_hook_the_move_is_saved_through_the_sink_and_the_message_is_true():
+    """Review finding (LOW): with no persist hook the move to btc_locked was in memory only while
+    the message said "the record is now btc_locked ... so the watchtower tracks it". The resume's own
+    sink saves it; the record on disk is what the message says."""
+    coord, _eth, exc, sink = await _resume(covenant_funded=True, now=_LATE, persist=False)
+    assert "now btc_locked" in str(exc)
+    on_disk = sink.load_record()
+    assert on_disk.state is SwapState.BTC_LOCKED and on_disk.fund_refusal == coord.record.fund_refusal
+
+
+async def test_when_nothing_can_save_the_move_the_message_says_it_is_in_memory_only():
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    class _ReadOnly:
+        """A sink that can load and cannot write."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def load_record(self):
+            return self._inner.load_record()
+
+    import tempfile
+
+    _p, terms = _resume_terms()
+    inner = JsonFileRecordSink(Path(tempfile.mkdtemp()) / "swap.json")
+    await inner(_pending_record(terms))
+    coord, _eth, exc, _ = await _resume(
+        covenant_funded=True, now=_LATE, persist=False, sink=_ReadOnly(inner), terms=terms
+    )
+    assert "IN MEMORY ONLY" in str(exc) and "now btc_locked" not in str(exc)
+    assert coord.record.state is SwapState.BTC_LOCKED
+    assert inner.load_record().state is SwapState.NEGOTIATED  # what the message says is on disk
 
 
 # --------------------------------------------------------------------------- (e) the refusal message
@@ -2161,6 +2502,16 @@ async def test_pre_btc_lock_check_runs_the_same_check_on_the_terms_it_is_handed(
     assert gate.ok is False
     assert "refused before anyone locks" in gate.reason and "step 7" in gate.reason, gate.reason
     assert view.reads == [] and btc_view.broadcasts == []
+    # The room in t_rxd on the bound modelled from the SHIPPED table: no source, and a later clock
+    # only tightens it — definitive.
+    assert gate.definitive is True
+    # A CONFIGURATION a retry can change (here the measured fast tail, dropped after construction)
+    # is not.
+    coord.config = dataclasses.replace(
+        coord.config, margin_policy=dataclasses.replace(coord.config.margin_policy, rxd_block_interval_fast_s=None)
+    )
+    gate = await coord.pre_btc_lock_check(roomy, now_unix_s=_NOW)
+    assert not gate.ok and "rxd_block_interval_fast_s" in gate.reason and gate.definitive is False
 
 
 async def test_the_proved_bound_at_step_6_stays_authoritative(monkeypatch):
@@ -3334,3 +3685,360 @@ def test_a_reply_names_a_txid_only_as_exactly_64_hex_characters_ignoring_case():
         (int(t, 16), t),
     ):
         assert not _names_txid(reported, requested), (reported, requested)
+
+
+# --------------------------------------------------------------------------- one source's report, attributed
+
+
+class _UnkeyedTipReporter:
+    """A configured depth source that answers only a tip height, with no ``source_key``."""
+
+    def __init__(self, tip):
+        self._tip = tip
+
+    async def get_tip_height(self):
+        return self._tip
+
+
+#: A third operator group, keyed the way every shipped reader is: source_key of its URL.
+_OTHER_OPERATOR = source_key("wss://node.operator.example/")
+
+
+class _ConfsReporter:
+    """An identified depth source reporting a fixed verbose ``confirmations``."""
+
+    def __init__(self, confs, key):
+        self.source_key = key
+        self._confs = confs
+
+    async def get_transaction_verbose(self, txid):
+        return {"txid": txid, "confirmations": self._confs}
+
+
+async def _gate_with_extra_source(monkeypatch, extra):
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _vb_terms(400)
+    view = _ChainView(
+        pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS, tip_time=_NOW
+    )
+    leg = _real_leg(view, network="bc", depth_sources=(_DepthReader(view), *extra))
+    coord, _ = _btc_coord(terms, leg, policy=_vb_policy(), accept_nondurable_seen=True)
+    return coord, await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+
+
+async def test_one_over_reporting_source_still_refuses_but_the_refusal_names_it_not_the_covenant(monkeypatch):
+    """Panel finding (LOW): a tip-only source with no source_key reporting tip 10,000,000 refused the
+    swap with "the maker's covenant is already 9999996 deep", while the proof showed 6. The bound
+    stays conservative (a report is never capped), and the refusal now says whose report it is."""
+    coord, ok = await _gate_with_extra_source(monkeypatch, ())
+    assert ok.ok, ok  # control: honest sources only
+    coord, gate = await _gate_with_extra_source(monkeypatch, (_UnkeyedTipReporter(10_000_000),))
+    assert not gate.ok
+    f = coord.last_maker_funding
+    assert f.bound_term == "reported" and f.elapsed_blocks_upper == f.reported_depth == 10_000_000 - f.height + 1
+    assert "already" not in gate.reason and "fund sooner" not in gate.reason, gate.reason
+    assert "is not a proved depth" in gate.reason and "REPORTED (unidentified source #" in gate.reason
+    assert (
+        f"proved ({f.proved_depth} deep)" in gate.reason and f"_UnkeyedTipReporter): {f.reported_depth}" in gate.reason
+    )
+
+
+async def test_an_identified_operator_over_reporting_is_named_too(monkeypatch):
+    coord, gate = await _gate_with_extra_source(monkeypatch, (_ConfsReporter(500, _OTHER_OPERATOR),))
+    assert not gate.ok and coord.last_maker_funding.bound_term == "reported"
+    assert "REPORTED (operator.example: 500)" in gate.reason and "already 500 deep" not in gate.reason
+
+
+async def test_a_report_that_only_breaks_step_7_is_attributed_there(monkeypatch):
+    """A report high enough to fail the ordering (step 7) but not the claim floor (step 6)."""
+    _, gate = await _gate_with_extra_source(monkeypatch, (_ConfsReporter(380, _OTHER_OPERATOR),))
+    assert not gate.ok and "margin check failed against the REMAINING window" in gate.reason, gate.reason
+    assert "The elapsed figure there (380) is not a proved depth" in gate.reason
+    assert "operator.example: 380" in gate.reason
+
+
+async def test_when_the_time_term_sets_the_bound_the_refusal_is_unchanged(monkeypatch):
+    """The other branch: no report above the time term, no attribution clause."""
+    coord, gate = await _gate_with_extra_source(monkeypatch, (_ConfsReporter(7, _OTHER_OPERATOR),))
+    assert gate.ok and coord.last_maker_funding.bound_term != "reported"
+    assert coord._elapsed_set_by_a_report(coord.last_maker_funding.elapsed_blocks_upper) is None
+
+
+# --------------------------------------------------------------------------- operator labels go through the funnel
+
+
+class _PlainKeyReader(_DepthReader):
+    """One server's reader carrying a HAND-CHOSEN plain-string label instead of a SourceKey."""
+
+    def __init__(self, view, label):
+        super().__init__(view)
+        self.source_key = label
+
+
+def test_a_plain_string_source_key_is_not_an_operator(monkeypatch):
+    """Panel finding (LOW): the taker gate counted any truthy ``source_key`` as an operator, so one
+    server wrapped twice as ``"a"`` and ``"b"`` met the two-operator rule; every other quorum refuses
+    such a key (``source_key_of``). The gate now labels sources through that funnel."""
+    from pyrxd.network.source_identity import require_distinct_sources
+
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _vb_terms(400)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+    plain = (_PlainKeyReader(view, "a"), _PlainKeyReader(view, "b"))
+    with pytest.raises(ValidationError, match="does not say which source"):
+        require_distinct_sources(list(plain), what="probe")  # the funnel's own verdict on them
+    io = RadiantChainIO(view, depth_sources=plain)
+    labels = io.configured_depth_operators()
+    assert "a" not in labels and "b" not in labels
+    # The client is the first shipped operator; the two plain-keyed readers count as nothing.
+    assert funding_spv.counted_operators(labels) == (str(_SHIPPED_OPERATORS[0]),), labels
+
+
+async def test_plain_string_keys_do_not_meet_the_two_operator_rule_at_the_gate(monkeypatch):
+    """End to end: a value above dust whose only second "operator" is a plain-string label is
+    refused at construction, before anyone locks (it was accepted before)."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _wide_terms(450)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+
+    class _Client(_ChainView):
+        source_key = "a"
+
+    client = _Client(pays=_covenant(terms), value=terms.radiant_amount, confs=6, chain=view.chain)
+    leg = _real_leg(client, network="bc", depth_sources=(_PlainKeyReader(view, "b"),))
+    above_dust = 2_000 * PHOTONS_PER_RXD
+    with pytest.raises(ValidationError, match="distinct operators") as e:
+        _btc_coord(terms, leg, policy=_vb_policy(value_at_risk_photons=above_dust), accept_nondurable_seen=True)
+    assert "unidentified source" in str(e.value)
+    # Honest path: the same shape with SourceKeys of two operators constructs.
+    honest = _real_leg(view, network="bc")
+    _btc_coord(terms, honest, policy=_vb_policy(value_at_risk_photons=above_dust), accept_nondurable_seen=True)
+
+
+def test_a_multi_operator_client_with_plain_string_keys_counts_no_operator(monkeypatch):
+    """The other labelling path: a client over several operators' URLs is asked once per operator
+    (``source_keys``); its keys go through the same rule."""
+    base, _chain = _value_bearing_chain(monkeypatch)
+    terms = _vb_terms(400)
+    view = _ChainView(pays=_covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=_HARD_BITS)
+
+    class _Split:
+        source_key = None
+        source_keys = ("a", "b")
+
+        def per_source_clients(self):
+            return ()
+
+    labels = RadiantChainIO(view, depth_sources=(_Split(),)).configured_depth_operators()
+    assert "a" not in labels and "b" not in labels and any("unidentified" in x for x in labels), labels
+    # Honest path: SourceKeys of two operators are two operators.
+    _Split.source_keys = tuple(source_key(u) for u in ("wss://x.alpha.example/", "wss://y.beta.example/"))
+    labels = RadiantChainIO(view, depth_sources=(_Split(),)).configured_depth_operators()
+    assert {"alpha.example", "beta.example"} <= set(labels), labels
+
+
+async def test_a_completed_resume_clears_an_earlier_refusal_the_record_carried():
+    """A refusal recorded on a still-NEGOTIATED record (a token push never sent) must not survive a
+    later resume that completes: decide() reads ``fund_refusal`` on a BTC_LOCKED record as "refund
+    at the deadline whatever the maker did"."""
+    import tempfile
+
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    _p, terms = _resume_terms()
+    sink = JsonFileRecordSink(Path(tempfile.mkdtemp()) / "swap.json")
+    await sink(dataclasses.replace(_pending_record(terms), fund_refusal="an earlier refusal"))
+    seen = FakeSeenStore()
+    seen.reserve(terms.hashlock)
+    coord = _eth_coord_full(
+        terms=terms,
+        eth_leg=FakeEthLeg(preimage=_p, verdict=_final()),
+        radiant_leg=FakeRadiantLeg(asset_funded=True),
+        seen_store=seen,
+        fund_lock=_MemLock(),
+    )
+    rec = await coord.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED and rec.fund_refusal is None
+
+
+@pytest.mark.parametrize(
+    ("raised", "definitive"),
+    [
+        # Retryable too: the height it is judged at is first the server's report, so one source can
+        # trip it.
+        (MakerFundingNotVerified("the funding is at block 487873, 20161 blocks past this pyrxd's newest"), False),
+        (MakerFundingNotVerified("proved only 3 deep; wait for 3 more"), False),
+        (NetworkError("ElectrumX unreachable"), False),
+    ],
+    ids=["horizon", "not-yet-deep", "unreadable"],
+)
+async def test_step_5_says_which_refusals_a_retry_can_pass(monkeypatch, raised, definitive):
+    _p, terms = _resume_terms()
+    coord = _eth_coord_full(
+        terms=terms, eth_leg=FakeEthLeg(preimage=_p, verdict=_final()), radiant_leg=FakeRadiantLeg(asset_funded=True)
+    )
+
+    async def fail(*_a, **_k):
+        raise raised
+
+    monkeypatch.setattr(coord, "taker_verify_asset_funding", fail)
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert not gate.ok and "maker's Radiant covenant not verified" in gate.reason
+    assert gate.definitive is definitive
+
+
+def test_the_conftest_pins_the_horizon_clock_unless_a_test_opts_out(monkeypatch):
+    """The pin is a clock, not a stub: the real check still runs (here it refuses past a cap of 3
+    blocks), and an aged clock is capped at a day after the newest checkpoint."""
+    chain = funding_spv.MAINNET_CHAIN
+    t0 = chain.newest_checkpoint_time
+    pinned = swap_coordinator_module.checkpoint_horizon_failure
+    assert pinned is not funding_spv.checkpoint_horizon_failure, "the autouse pin is not installed"
+    far = t0 + 365 * 86_400
+    assert pinned(chain=chain, now_unix_s=far, required_confirmations=6, slack_s=0) is None
+    assert funding_spv.checkpoint_horizon_failure(chain=chain, now_unix_s=far, required_confirmations=6, slack_s=0)
+    assert pinned(chain=chain, now_unix_s=far, required_confirmations=6, slack_s=0, cap=3) is not None
+
+
+@pytest.mark.real_checkpoint_clock
+def test_a_test_marked_real_checkpoint_clock_gets_the_real_check():
+    assert swap_coordinator_module.checkpoint_horizon_failure is funding_spv.checkpoint_horizon_failure
+
+
+# --------------------------------------------------------------------------- steps 6/7: definitive only on the PROVED depth
+
+
+async def _vb_eth_resume(monkeypatch, case, *, confs, stale_s=0, extra_sources=(), sink=None):
+    """Resume an interrupted ETH fund through the REAL Radiant leg on a value-bearing chain.
+
+    *case* is ``_eth_early_case(...)``'s tuple; the funding is *confs* deep with the proof's newest
+    header *stale_s* old; *extra_sources* are depth sources added beside the honest second operator.
+    Returns ``(coordinator, the resume's result or exception, sink)``."""
+    import sys
+    import tempfile
+
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    build, terms_at, reserve, floor, _chain = case
+    terms = terms_at(floor + reserve() + 200)
+    if sink is None:
+        sink = JsonFileRecordSink(Path(tempfile.mkdtemp()) / "swap.json")
+        await sink(
+            dataclasses.replace(
+                SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+                pending_counter_contract="0x" + "ab" * 20,
+                pending_counter_deploy_tx="0x" + "cd" * 32,
+            )
+        )
+    here = sys.modules[__name__]
+    with monkeypatch.context() as m:
+        real = here._real_leg
+        m.setattr(
+            here,
+            "_real_leg",
+            lambda view, network, **kw: real(view, network=network, depth_sources=(_DepthReader(view), *extra_sources)),
+        )
+        coord = build(terms, confs=confs, tip_time=_NOW - stale_s)
+    coord.config = dataclasses.replace(coord.config, fund_lock=_MemLock())
+    coord.seen_store.reserve(terms.hashlock)
+    coord.persisted = []
+
+    async def _persist(record):
+        coord.persisted.append(record)
+
+    coord._persist = _persist
+    try:
+        return coord, await coord.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW), sink
+    except ValidationError as exc:
+        return coord, exc, sink
+
+
+@pytest.fixture
+def _vb_eth_case(monkeypatch):
+    from pyrxd.gravity import swap_coordinator
+
+    monkeypatch.setattr(swap_coordinator, "_monotonic", lambda: 0.0)
+    return _eth_early_case(monkeypatch)
+
+
+async def test_one_over_reporting_unkeyed_source_leaves_the_resume_retryable(monkeypatch, _vb_eth_case):
+    """Review finding (MEDIUM): one over-reporting source — here an unidentified tip-only one —
+    tripped step 6, the refusal was DEFINITIVE, and the resume saved the record as btc_locked: no
+    retry possible, while the message said to fix or remove the source and retry. The bound was set
+    by the report, and the proved depth alone passes, so it is retryable; with the source removed,
+    the retry completes."""
+    from pyrxd.gravity.swap_coordinator import DefinitiveFundRefusal
+
+    coord, exc, sink = await _vb_eth_resume(
+        monkeypatch, _vb_eth_case, confs=10, extra_sources=(_UnkeyedTipReporter(10_000_000),)
+    )
+    assert isinstance(exc, ValidationError) and not isinstance(exc, DefinitiveFundRefusal), exc
+    assert coord.last_maker_funding.bound_term == "reported"
+    assert "can be retried" in str(exc) and "REPORTED (unidentified source" in str(exc)
+    assert coord.record.state is SwapState.NEGOTIATED and sink.load_record().state is SwapState.NEGOTIATED
+    _c, rec, _ = await _vb_eth_resume(monkeypatch, _vb_eth_case, confs=10, sink=sink)
+    assert isinstance(rec, SwapRecord) and rec.state is SwapState.BTC_LOCKED, rec
+
+
+async def test_a_stale_header_refusal_is_retryable_and_passes_once_the_header_is_fresh(monkeypatch, _vb_eth_case):
+    """The time term grows with the proof's newest header's age: six hours stale lifts the bound past
+    what t_rxd holds, while the same funding with a fresh header passes. Not definitive."""
+    from pyrxd.gravity.swap_coordinator import DefinitiveFundRefusal
+
+    coord, exc, sink = await _vb_eth_resume(monkeypatch, _vb_eth_case, confs=10, stale_s=6 * 3600)
+    assert isinstance(exc, ValidationError) and not isinstance(exc, DefinitiveFundRefusal), exc
+    f = coord.last_maker_funding
+    assert f.bound_term == "time" and f.proved_depth == 10 and "can be retried" in str(exc)
+    assert sink.load_record().state is SwapState.NEGOTIATED
+    _c, rec, _ = await _vb_eth_resume(monkeypatch, _vb_eth_case, confs=10, sink=sink)
+    assert isinstance(rec, SwapRecord) and rec.state is SwapState.BTC_LOCKED, rec
+
+
+async def test_a_refusal_the_proved_depth_alone_trips_stays_definitive(monkeypatch, _vb_eth_case):
+    """The other branch: the funding PROVED 300 deep already leaves t_rxd too short (step 7). The
+    proved depth and the clock only grow, so no retry can pass: definitive, and the record is tracked."""
+    from pyrxd.gravity.swap_coordinator import DefinitiveFundRefusal
+
+    coord, exc, _ = await _vb_eth_resume(monkeypatch, _vb_eth_case, confs=300)
+    assert isinstance(exc, DefinitiveFundRefusal), exc
+    assert coord.last_maker_funding.proved_depth == 300 and "REMAINING window" in str(exc)
+    assert coord.persisted[-1].state is SwapState.BTC_LOCKED and coord.record.fund_refusal
+
+
+async def test_a_bound_set_by_the_time_term_but_already_tripped_at_the_proved_depth_is_definitive(
+    monkeypatch, _vb_eth_case
+):
+    """Ties and near-ties: when the time term sets the bound but the proved depth alone also fails,
+    the refusal stands — judged at the proved depth, not by which term happened to be largest."""
+    build, terms_at, reserve, floor, _chain = _vb_eth_case
+    coord = build(terms_at(floor + reserve() + 200), confs=300)
+    gate = await coord.pre_btc_lock_check(coord.record.terms, now_unix_s=_NOW)
+    f = coord.last_maker_funding
+    assert not gate.ok and f.bound_term == "time" and f.proved_depth < f.elapsed_blocks_upper
+    assert gate.definitive is True
+
+
+async def test_a_step_6_refusal_without_this_runs_proof_is_retryable():
+    """With no proof of this run to read the proved depth from (a leg that only reports a depth),
+    a step-6/7 refusal cannot be shown to rest on proved depth: retryable."""
+    _p, terms = _resume_terms()
+    coord = _eth_coord_full(
+        terms=terms, eth_leg=FakeEthLeg(preimage=_p, verdict=_final()), radiant_leg=FakeRadiantLeg(asset_funded=True)
+    )
+    assert coord.last_maker_funding is None
+    gate = coord._judge_remaining_window(terms, cov_confs=int(terms.t_rxd.value), now_unix_s=_NOW)
+    assert gate is not None and not gate.ok and gate.definitive is False
+
+
+def test_a_step_6_policy_that_cannot_be_computed_is_a_retryable_configuration_refusal(monkeypatch):
+    _p, terms = _resume_terms()
+    coord = _eth_coord_full(
+        terms=terms, eth_leg=FakeEthLeg(preimage=_p, verdict=_final()), radiant_leg=FakeRadiantLeg(asset_funded=True)
+    )
+
+    def broken(_terms):
+        raise ValidationError("burial policy unusable")
+
+    monkeypatch.setattr(coord, "_safe_claim_terms", broken)
+    gate = coord._remaining_window_failure(terms, cov_confs=1, now_unix_s=_NOW)
+    assert gate is not None and "burial-vs-t_rxd check failed" in gate.reason and gate.definitive is False

@@ -215,3 +215,39 @@ def test_the_refusal_reaches_the_console_script_as_exit_1(tmp_path, capsys):
     assert code == 1
     err = capsys.readouterr().err
     assert "--rxd-quorum 2 but only 1 RXD source(s)" in err and "Traceback" not in err
+
+
+# ---------------------------------------------------------------- starting on one source != auto-refunding on one
+
+_ARMED = [
+    "--network", "regtest", "--rxd-electrumx-url", "wss://only.example",
+    "--refund-spk", "0014" + "00" * 20, "--btc-broadcast-url", "http://127.0.0.1:1",
+]  # fmt: skip
+
+
+async def _executor_for(*extra):
+    args = w._parse_args(["--records-dir", "/tmp/x", *_ARMED, *extra])
+    async with contextlib.AsyncExitStack() as stack:
+        _src, corroborated = await w._build_rxd_source(args, stack)
+        executor = w._build_executor(args, stack)
+        return executor, corroborated
+
+
+@pytest.mark.parametrize(
+    ("extra", "single_source_refund"),
+    [
+        (("--accept-single-source",), False),  # the startup refusal's suggestion: starts, does NOT arm it
+        (("--rxd-quorum", "1"), False),
+        (("--accept-single-source", "--auto-refund-on-single-source"), True),  # its own explicit flag
+        (("--rxd-quorum", "1", "--auto-refund-on-single-source"), True),
+    ],
+)
+async def test_starting_on_one_source_does_not_arm_single_source_auto_refund(extra, single_source_refund):
+    """Panel finding (LOW): --accept-single-source, the way through the below-quorum startup refusal,
+    was also handed to the RefundExecutor and disarmed its low-corroboration hard-stop, so following
+    the refusal's suggestion armed autonomous refunds on uncorroborated reads. It now takes its own
+    flag."""
+    executor, corroborated = await _executor_for(*extra)
+    assert corroborated is False  # one source either way
+    assert executor is not None and executor._b is not None, "the regtest broadcaster is armed"
+    assert executor._accept_single_source is single_source_refund

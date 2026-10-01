@@ -752,7 +752,12 @@ def _decide_eth(
     # every healthy pre-lock tick is its own failure. ``autonomous_btc_refund`` stays False: that
     # discriminator arms the BTC keyless pre-signed refund and has no ETH counterpart.
     if state is SwapState.BTC_LOCKED:
-        if obs.asset_locked_at_height is not None:
+        # A REFUSED RESUME (`record.fund_refusal`): the taker's gate refused to complete the fund, so
+        # this swap will not go on to BOTH_LOCKED, and the counter-leg contract it had already
+        # deployed is refunded at its deadline whether or not the maker locked — the maker can still
+        # claim it with p before then, which the claim race above pages.
+        refused = record.fund_refusal
+        if obs.asset_locked_at_height is not None and refused is None:
             return Decision(
                 Intent.WATCH,
                 reason="asset lock observed on-chain despite a BTC_LOCKED record — the maker locked; not refunding",
@@ -763,10 +768,22 @@ def _decide_eth(
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=(
-                    f"maker never locked the asset; the ETH HTLC timeout {deadline_s} has passed "
+                    f"the taker refused to complete the fund ({refused}); the ETH HTLC timeout {deadline_s} has "
+                    f"passed (now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"
+                    if refused is not None
+                    else f"maker never locked the asset; the ETH HTLC timeout {deadline_s} has passed "
                     f"(now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"
                 ),
                 recommended_action="taker_refund_btc",
+                low_corroboration=corr,
+            )
+        if refused is not None:
+            return Decision(
+                Intent.WATCH,
+                reason=(
+                    f"BTC_LOCKED after a refused fund ({refused}); the ETH counter-leg contract is refunded at its "
+                    f"deadline ({deadline_s}) unless the maker claims it with p first (clock read: {obs.now_unix_s})"
+                ),
                 low_corroboration=corr,
             )
         return Decision(

@@ -1348,12 +1348,16 @@ function answerWhen(anchor, anchorReason) {
     // prints them. The proved depth is a lower bound; the server's number is only a claim.
     const proved = anchor.verified_confirmations;
     const differs = proved !== anchor.confirmations;
+    const linkedTo = checkpointLinkedBelowTheNewest(anchor.height, proved, bv);
     sec.appendChild(para(
-      `In block ${safeText(anchor.height)}, ${provedDepthInWords(proved)}` +
+      `In block ${safeText(anchor.height)}, ${provedDepthInWords(proved, linkedTo)}` +
       (differs ? ` (the server reports ${safeText(anchor.confirmations)})` : "") +
       `. ${knew}`,
     ));
-    dl.appendChild(fact("confirmations verified here", `at least ${safeText(proved)}`));
+    dl.appendChild(fact(
+      linkedTo === null ? "confirmations verified here" : "confirmations, by pyrxd's checkpoints",
+      `at least ${safeText(proved)}`,
+    ));
     if (differs) dl.appendChild(fact("confirmations the server reports", anchor.confirmations));
     sec.appendChild(dl);
     // THE CLAIM IS PYTHON'S, WHOLE: `anchor.caveat` is the verifier's own sentence
@@ -1394,11 +1398,30 @@ function answerWhen(anchor, anchorReason) {
   return sec;
 }
 
+// At the CHECKPOINT level the proved depth runs to the NEWEST checkpoint pyrxd ships
+// (`verified_depth = newest - height + 1`), while this page links headers only from the block to
+// the FIRST checkpoint at or above it. The checkpoint that page linked to, when it is below the
+// newest (the blocks between rest on pyrxd's checkpoint table, not on anything linked here); else
+// null, and every block counted was linked here.
+function checkpointLinkedBelowTheNewest(height, proved, bv) {
+  if (!bv || bv.level !== "checkpoint") return null;
+  const h = Number(height), n = Number(proved), cp = Number(bv.checkpoint_height);
+  if (![h, n, cp].every(Number.isInteger) || n < 1) return null;
+  return cp < h + n - 1 ? cp : null;
+}
+
 // The PROVED depth in words, worded as `pyrxd verify` words it ("at least N confirmation(s)
-// verified"): a lower bound, and the mark's own block counts as the first.
-function provedDepthInWords(proved) {
+// verified"): a lower bound, and the mark's own block counts as the first. "Verified here" only
+// for what this page linked; past a checkpoint below the newest, the count is pyrxd's table's.
+function provedDepthInWords(proved, linkedTo) {
   const n = Number(proved);
   if (!Number.isInteger(n) || n < 1) return `with at least ${safeText(proved)} confirmation(s) verified here`;
+  if (linkedTo !== null && linkedTo !== undefined) {
+    return `with at least ${n} confirmations by the checkpoints pyrxd ships: the block itself and ${n - 1} ` +
+      `built on top of it, counted to the newest checkpoint. This page linked the block to the checkpoint ` +
+      `at block ${safeText(linkedTo)}; the blocks after that rest on pyrxd's checkpoint table, not on ` +
+      "headers linked here";
+  }
   if (n === 1) return "with at least 1 confirmation verified here: the block itself";
   return `with at least ${n} confirmations verified here: the block itself and ${n - 1} built on top of it`;
 }

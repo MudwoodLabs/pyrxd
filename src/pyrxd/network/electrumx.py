@@ -56,6 +56,7 @@ from ..spv.radiant import (
     merkle_branch_from_reply,
 )
 from ._guards import finite_int, hex_str, nonneg_int
+from .redaction import redact_endpoint_secrets, redacted_url
 from .registry import block_hash_hex
 from .source_identity import SourceKey, source_key
 from .tls_pin import normalize_pin, verify_connection_pin
@@ -955,7 +956,17 @@ class ElectrumXClient:
         created: list[Any] = []  # every ws actually returned by websockets.connect
 
         async def _try(url: str) -> Any:
-            ws = await websockets.connect(url)
+            try:
+                ws = await websockets.connect(url)
+            except Exception as exc:
+                # A library error can quote the WHOLE URL, credential and all (websockets' InvalidURI
+                # does, for a key-as-username URL), and a chained cause is printed in full by
+                # `--debug`. So the URL's secrets are removed HERE, before the exception can travel,
+                # and the original is not chained.
+                raise NetworkError(
+                    f"connect to {redacted_url(url)} failed: {type(exc).__name__}: "
+                    f"{redact_endpoint_secrets(str(exc), url)}"
+                ) from None
             # Append BEFORE the pin check so the `finally` block below still closes
             # this socket when the check rejects it.
             created.append(ws)

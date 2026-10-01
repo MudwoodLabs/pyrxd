@@ -1,0 +1,72 @@
+# Radiant checkpoint freshness.
+#
+# `pyrxd verify` and the /verify/ and /inspect/ pages link a mark's block to the
+# newest checkpoint pyrxd ships, through at most 4,032 headers
+# (pyrxd.glyph.mark_block.MAX_HEADERS_FROM_CHECKPOINT). The chain moves on every
+# day and the table does not, so a release whose table is old stops verifying new
+# marks — safely (NOT VERIFIED, never a false VERIFIED), but on its own headline
+# feature. Nothing else reminds anyone: no other test or workflow reads the tip.
+#
+# This job reads the current mainnet tip from pyrxd's shipped public ElectrumX
+# servers and FAILS when fewer than 864 blocks (three days at the 300 s target)
+# remain before that horizon, naming the refresh command. A refresh always turns
+# it green (the arithmetic is on WARN_BLOCKS in the script). It also prints the swap taker gate's
+# longer horizon (20,160). It is READ-ONLY: no secrets, no write permission, and
+# nothing is sent to a server but a tip-height request.
+#
+# Exit 2 means the check could not run (no server answered with a usable tip).
+# That is a broken check, never a fresh table, so it is red too.
+#
+# The decision is tested offline in tests/test_checkpoint_freshness_check.py,
+# which runs in ordinary CI.
+
+name: Checkpoint freshness
+
+on:
+  schedule:
+    # Daily, 06:41 UTC. NOT ON THE HOUR: GitHub's scheduler is most congested at
+    # :00 and documented to delay or drop runs under load (see traffic.yml).
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+  pull_request:
+    # Re-run when the check or the table it reads is edited, so a change to the
+    # mechanism is exercised on the PR that makes it. Not a required check.
+    paths:
+      - "scripts/check_checkpoint_freshness.py"
+      - "src/pyrxd/spv/radiant_checkpoints.py"
+      - ".github/workflows/checkpoint-freshness.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  freshness:
+    name: Do the shipped checkpoints still reach the tip?
+    # Don't spend scheduled minutes on forks; manual dispatch still works anywhere.
+    if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        # Hash-pinned via ci/poetry-pin.txt, as in ci.yml.
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+
+      - name: Install pyrxd
+        run: poetry install --only main --no-interaction
+
+      - name: Check the checkpoint horizon against the mainnet tip
+        run: poetry run python scripts/check_checkpoint_freshness.py

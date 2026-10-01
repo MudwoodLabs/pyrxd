@@ -77,6 +77,43 @@ class _Client:
 
 
 @pytest.mark.parametrize("vout", BAD_DIGITS + TOO_BIG_VOUT)
+def test_the_makers_btc_counterparty_outpoint_parser_refuses_a_vout_that_is_not_ascii_decimal(vout: str) -> None:
+    """The one untrusted input on the maker's BTC gate (``verify_counterparty_funded``) — missed by
+    the first sweep (panel finding): bare ``int()`` took ``"١"``, ``"１"``, ``" 1"``, ``"+1"``, ``"1_0"``."""
+    from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
+
+    with pytest.raises(ValidationError):
+        BitcoinTaprootLeg._counterparty_outpoint(f"{TXID}:{vout}")
+
+
+def test_the_makers_btc_counterparty_outpoint_parser_accepts_an_ascii_vout() -> None:
+    from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
+
+    for vout in (0, 1, 4294967295):
+        assert BitcoinTaprootLeg._counterparty_outpoint(f"{TXID}:{vout}").vout == vout
+
+
+async def test_the_makers_btc_gate_refuses_a_non_ascii_vout_before_any_read() -> None:
+    """Through the production entry point: the refusal comes before the node is asked anything."""
+    from tests.test_btc_htlc_leg import _verify_leg
+
+    leg, terms, reader = _verify_leg()
+    asked = []
+    real = reader.read_confirmed_unspent_output
+
+    async def spy(txid, vout):
+        asked.append((txid, vout))
+        return await real(txid, vout)
+
+    reader.read_confirmed_unspent_output = spy
+    with pytest.raises(ValidationError, match="ASCII decimal"):
+        await leg.verify_counterparty_funded(f"{'cd' * 32}:١", terms)
+    assert asked == []
+    assert (await leg.verify_counterparty_funded(f"{'cd' * 32}:1", terms)).funding_outpoint.vout == 1
+    assert asked == [("cd" * 32, 1)]  # non-vacuity: the honest one does reach the node
+
+
+@pytest.mark.parametrize("vout", BAD_DIGITS + TOO_BIG_VOUT)
 async def test_radiant_leg_refuses_a_vout_that_is_not_ascii_decimal(vout: str) -> None:
     client = _Client()
     io = RadiantChainIO(client)

@@ -17,7 +17,7 @@ answer, read-only; nothing was sent), and it agreed with all three servers on ev
 missing or different answer from any of the four would have refused the write.
 
 Every height is at least 1000 blocks below the lowest tip any source reported
-(468799), far past Radiant Core's default maximum reorg depth of 69.
+(468799), far past Radiant Core's default `-maxreorgdepth` (69).
 
 THE LAST INTERVAL'S WORK. Every one of the 2017 headers from 465696 to 467712 was
 fetched from every source; all three servers and the node served them byte for byte
@@ -27,7 +27,9 @@ alike, and the script linked them hash by hash from checkpoint 465696 to checkpo
 :data:`NEWEST_CHECKPOINT_WORK` the work of the header at 467712, each ``2**256 // (target + 1)``
 at mainnet's proof-of-work limit. The checkpoint hashes commit to those headers, so the numbers are
 fixed by the table above; the swap taker gate recomputes the first from the headers it links on
-every run.
+every run. :data:`NEWEST_CHECKPOINT_HEADER` is the raw header at 467712 itself, one of those; a
+test re-hashes it to the checkpoint. The swap taker gate reads its timestamp to project, before
+anyone locks, whether a funding agreed now can still be linked to this table.
 
 WHAT THEY ARE FOR. :mod:`pyrxd.glyph.mark_block` places a block at a height by linking its header,
 hash by hash, to one of these. The height then rests on this table rather than on the server that
@@ -63,6 +65,11 @@ LAST_INTERVAL_MAX_WORK_HEIGHT: dict[str, int] = {"mainnet": 465703}
 
 #: The work of the newest checkpoint's own header.
 NEWEST_CHECKPOINT_WORK: dict[str, int] = {"mainnet": 38429153133984173}
+
+#: The newest checkpoint's raw 80-byte header, hex. It hashes to the newest entry of :data:`CHECKPOINTS`.
+NEWEST_CHECKPOINT_HEADER: dict[str, str] = {
+    "mainnet": "00000020fc8dcf130333b5935fa8396a9ff4c1f285fb23e9e247c55c99000000000000009e05af73ee5a666ce3ec44c6a4ae73f294fa1b3e30f611a1629dbf40346850658a8bb86a05e0011a7a97c2ba"
+}
 
 #: ``network -> ((height, block hash in display hex), ...)``, heights ascending. Networks with no
 #: entries cannot be verified against a checkpoint, and verification there reports NOT VERIFIED.

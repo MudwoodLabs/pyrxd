@@ -746,3 +746,87 @@ def test_an_ordinary_rate_still_loads_untouched(monkeypatch) -> None:
     for ok in (floor, floor * 2, floor * 9, ceiling):
         monkeypatch.setenv("PYRXD_FEE_RATE", str(ok))
         assert load().fee_rate == ok
+
+
+# --------------------------------------------------------------------------- a refused config is a user error
+
+
+def _run_cli(tmp_path: Path, *args: str) -> tuple[int, str, str]:
+    """The real entry point (``python -m pyrxd.cli`` → ``main.run``), whose bug path is under test."""
+    import os
+    import subprocess
+    import sys
+
+    import pyrxd
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYRXD_")}
+    env["HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = str(Path(pyrxd.__file__).resolve().parents[1])
+    r = subprocess.run([sys.executable, "-m", "pyrxd.cli", *args], capture_output=True, text=True, env=env, timeout=120)
+    return r.returncode, r.stdout, r.stderr
+
+
+_SECRET = "Pw9secretXyz"
+_CONTRADICTING = (
+    "electrumx_servers = [ "
+    f'{{ url = "wss://user:{_SECRET}@127.0.0.1:1/", operator = "acme" }}, "wss://localhost:2/" ]\n'
+)
+
+
+@pytest.mark.parametrize("json_flag", [(), ("--json",)])
+def test_a_refused_config_is_a_user_error_not_the_bug_path(tmp_path, json_flag) -> None:
+    """Panel finding (info): a declaration the loader refuses (here: one host declared, its
+    loopback sibling not) surfaced as "unexpected failure (ValidationError)", exit 4, with a fix
+    telling the user to re-run with --debug. It is bad input: exit 1, the standard error block on
+    stderr and nothing on stdout (as every user error under --json), the URL never printed."""
+    cfg = tmp_path / "pyrxd.toml"
+    cfg.write_text(_CONTRADICTING, encoding="utf-8")
+    rc, out, err = _run_cli(tmp_path, *json_flag, "--config", str(cfg), "address", "--index", "0")
+    assert rc == 1, (rc, err)
+    assert out == ""
+    assert err.startswith("error: invalid configuration") and "unexpected failure" not in err
+    assert "is declared as operator 'acme'" in err and f"fix: correct the config file ({cfg})" in err
+    assert _SECRET not in err and "--debug" not in err
+
+
+def test_a_refused_config_under_debug_prints_no_chained_secret(tmp_path) -> None:
+    cfg = tmp_path / "pyrxd.toml"
+    cfg.write_text(_CONTRADICTING, encoding="utf-8")
+    rc, out, err = _run_cli(tmp_path, "--debug", "--config", str(cfg), "address", "--index", "0")
+    assert rc == 1 and _SECRET not in out + err, err
+
+
+def test_a_valid_config_is_untouched(tmp_path) -> None:
+    """Honest path: the same file with both hosts declared loads, and the command goes on to its own
+    error (no wallet here), not a config one."""
+    cfg = tmp_path / "pyrxd.toml"
+    cfg.write_text(
+        _CONTRADICTING.replace('"wss://localhost:2/"', '{ url = "wss://localhost:2/", operator = "acme" }'),
+        encoding="utf-8",
+    )
+    rc, _out, err = _run_cli(tmp_path, "--config", str(cfg), "address", "--index", "0")
+    assert rc == 1 and "invalid configuration" not in err and "no wallet" in err, err
+
+
+def test_a_config_refusal_quoting_a_url_is_redacted_and_not_chained(monkeypatch) -> None:
+    """Defense in depth. The loader already names URLs by host today (a sweep of its refusals found
+    none quoting a credential), so this drives the boundary with a refusal that DOES quote one, as a
+    future refusal might: the cause names the endpoint by scheme://host:port only, and --debug has
+    no chained exception to print."""
+    from click.testing import CliRunner
+
+    from pyrxd.cli import errors as _errors
+    from pyrxd.cli.main import cli
+
+    def refuse(_path=None):
+        raise ValidationError("bad entry wss://user:SECRETPW@h.example:50022/v2/SECRETPATHKEY0123?apikey=SECRETQ")
+
+    monkeypatch.setattr(_config, "load", refuse)
+    try:
+        result = CliRunner().invoke(cli, ["--debug", "address", "--index", "0"])
+    finally:
+        _errors.set_debug(False)
+    out = result.output
+    assert result.exit_code == 1 and "error: invalid configuration" in out, out
+    assert "wss://h.example:50022" in out and "SECRET" not in out, out
+    assert "Traceback" not in out, "a chained library exception would be printed under --debug"

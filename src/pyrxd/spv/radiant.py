@@ -135,8 +135,11 @@ def verify_radiant_header_pow(header: bytes, *, pow_limit: int | None = None) ->
     Returns the block hash in display hex. Raises ``ValidationError`` for a header that is not 80
     bytes or carries a malformed nBits, and ``SpvVerificationError`` when the hash is above the
     target. ``hash <= target`` passes: that is Bitcoin Core's ``CheckProofOfWork`` rule, which
-    Radiant Core inherits (assumed from lineage; ``pow.cpp`` is not vendored). Equality has
-    probability about 2**-56 at today's mainnet difficulty, so the choice changes nothing in practice.
+    Radiant Core inherits (assumed from lineage; ``pow.cpp`` is not vendored). A hash EQUAL to the
+    target has probability 2**-256 per evaluation, and about 2**-201 for a header that meets its
+    target at the newest shipped checkpoint's difficulty (one in ``target + 1``, a target near
+    2**200.9), so the choice changes nothing in practice. (About 2**-55 is the chance a hash MEETS
+    that target at all.)
 
     Proves only that the header cost about :func:`radiant_header_work` hash evaluations. It does not
     prove the nBits is the value Radiant's rules require, nor that the header is on any chain.
