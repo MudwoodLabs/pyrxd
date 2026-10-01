@@ -52,8 +52,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file, which killed radiant_leg mutants nothing else in its list killed (4 of a 30-mutant sample);
   `covenants`, `htlccovenant` and `rswpcovenant` drop it: it runs no function of soulbound_covenant or
   swap/rswp/covenant and only import-time lines of gravity/covenant, and every htlc_covenant mutant it
-  killed in a 40-mutant sample the rest of the list killed too. Per-job minutes for the two new
-  sharded groups are ESTIMATED from local samples, not measured on the runner.
+  killed in a 40-mutant sample the rest of the list killed too. `coordinator` adds the gate's test
+  file, last in its list: it killed swap_coordinator mutants nothing else in the list killed (1 of
+  a 30-mutant sample of the gate's functions, 2 of 30 across the module). That makes `coordinator`
+  an ESTIMATED ~237 minutes, so it is sharded in two, with a 60 s per-mutant timeout. Per-job
+  minutes for the new sharded groups are ESTIMATED from local samples, not measured on the runner.
 
 - **`verify_mark_block` and `plan_block_verification` take `max_headers_from_checkpoint`
   (default 4,032, unchanged) and `verify_mark_block` takes `pow_limit`** (default `None`,

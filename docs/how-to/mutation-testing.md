@@ -58,7 +58,7 @@ poetry run task mutate walletcore        # consensus constants and the partial/r
 poetry run task mutate markcli           # cli/hashmark_cmds.py — what `pyrxd mark`/`verify` print
 poetry run task mutate inspectcli        # cli/glyph_inspect.py — what `pyrxd glyph inspect` prints (4 shards in CI)
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
-poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
+poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine (2 shards in CI)
 poetry run task mutate network            # network/ — remote-response parsing + failover
 poetry run task mutate keys               # security/secrets + base58 + hd/bip32 + hd/descriptor + watch/cli_secrets
 poetry run task mutate ethleg             # eth_wallet/ — the EVM counter leg (11 modules)
@@ -617,6 +617,7 @@ mutant (low end) or the group's highest sampled rate (high end). Every count (lo
 | `htlccovenant` ×2 | gravity/htlc_covenant | 106 each | M (12,693 s) |
 | `radiantleg` ×2 | gravity/radiant_leg | ~80 each, ESTIMATED | local 30-mutant sample (2026-09-30), not scaled to the runner: 970 mutants × 9.84 s; it was 73-87 (S) before the taker gate's test file joined its list |
 | `fundingspv` ×2 | gravity/funding_spv | ~82 each, ESTIMATED | local 30-mutant sample (2026-09-30), not scaled to the runner: 2,860 mutants × 3.42 s |
+| `coordinator` ×2 | gravity/swap_coordinator | ~119 each, ESTIMATED | local 30-mutant sample of the whole module (2026-10-01), not scaled to the runner: 2,960 mutants × ~2.0 s for the list, plus ~7 s of the taker gate's test file (now last in the list) for the 12 of 30 the rest left alive; that file killed swap_coordinator mutants nothing else in the list killed (1 of 30 in the gate's functions, 2 of 30 across the module) |
 | `rswpcovenant` ×2 | swap/rswp/covenant | 62-97 each | S (1,273 mutants) |
 | `gravitycore` ×2 | gravity/transactions | 102 each | M (12,218 s) |
 | `gravitystate` | gravity/swap_state, trade | 124 | M |

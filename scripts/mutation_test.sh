@@ -333,7 +333,11 @@ group_tests() {
     markcli)     echo "tests/test_mark_cli_says_what_it_checked.py tests/test_form2_binding_names_the_mint.py tests/test_mark_anchor_is_bound_to_its_block.py tests/test_form2_step_heights_need_two_sources.py tests/test_hashmark_verify_cli.py tests/test_name_at_mark_sees_which_server_answered.py tests/test_name_at_mark_survives_a_hostile_target.py tests/test_hashmark_verify_one_record.py tests/test_signature_backend_differential.py tests/test_verify_names_the_output_you_gave.py tests/test_hashmark_mark_mutant_killers.py tests/test_hashmark_mark_cli.py tests/web/test_verify_page.py" ;;
     inspectcli)  echo "tests/test_glyph_timelock_read_side_is_reachable.py tests/test_hashmark_attestation.py tests/test_authority_tokens.py tests/test_hashmark_wave_identity.py tests/test_confusables_check_is_actually_wired.py tests/test_delegate_refs_authorise_in_and_by.py tests/test_dmint_state_judgement.py tests/test_op_return_verdicts_reach_a_human.py tests/test_attestation_degrades_without_secp256k1.py tests/test_mark_cli_says_what_it_checked.py tests/test_name_at_mark_reaches_the_cli.py tests/test_form2_binding_names_the_mint.py tests/test_mark_anchor_is_bound_to_its_block.py tests/test_form2_step_heights_need_two_sources.py tests/test_hashmark_verify_cli.py tests/test_name_at_mark_sees_which_server_answered.py tests/test_name_at_mark_survives_a_hostile_target.py tests/test_form2_security_hardening.py tests/web/test_a_payload_is_counted_as_minted_only_when_it_is.py tests/web/test_a_multi_glyph_reveal_is_described_once.py tests/test_hashmark_verify_one_record.py tests/test_indexer_reads_fail_over.py tests/test_glyph_update_reaches_a_human.py tests/test_reveal_metadata_says_what_binds_it.py tests/web/test_hashmark_panel_verdict.py tests/web/test_the_headline_prefers_a_bound_payload.py tests/web/test_verify_page.py tests/web/test_inspect_page_is_bounded.py tests/cli/test_glyph_inspect_spent_binding.py tests/cli/test_main.py tests/cli/test_glyph_inspect_cmds.py tests/cli/test_glyph_inspect_hostile_integers.py" ;;
     ethtimelock) echo "tests/test_eth_timelock_mutant_killers.py tests/test_eth_rxd_timelock.py tests/test_t_rxd_sizer_and_gate_agree.py tests/test_eth_swap_run_timelock_bounds.py" ;;
-    coordinator) echo "tests/test_swap_coordinator.py tests/test_swap_coordinator_credential_gate.py tests/test_max_protected_value.py tests/test_finality_verdict.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_radiant_leg.py tests/test_btc_htlc_leg.py $GAPS tests/test_htlc_handshake_conformance_vectors.py" ;;
+    # + the taker gate's test file, LAST (with -x it then runs only for mutants the rest of the list
+    # left alive). It drives the coordinator's negotiation-time check and steps 3/6/7, and kills
+    # swap_coordinator mutants nothing else here kills: 2026-10-01 local samples, 1 of 30 mutants in the
+    # gate's functions and 2 of 30 across the whole module (all in `_funding_proof_room_failure`).
+    coordinator) echo "tests/test_swap_coordinator.py tests/test_swap_coordinator_credential_gate.py tests/test_max_protected_value.py tests/test_finality_verdict.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_radiant_leg.py tests/test_btc_htlc_leg.py $GAPS tests/test_htlc_handshake_conformance_vectors.py tests/test_taker_funding_spv_gate.py" ;;
     # tests/test_glyph_wave.py and tests/test_hashmark_wave_identity.py are glyph-side files that
     # exercise network/rxindexer.py through its production caller (WaveResolver -> RxinDexerClient
     # -> call_extension). They were under `glyphverify` / no group, so the 2026-09-16 network run
@@ -398,7 +402,7 @@ group_timeout() {
     # Clean suites measured 2026-09-28 via this script: markcli 5s, inspectcli 19s.
     markcli)     echo "45.0" ;;
     inspectcli)  echo "90.0" ;;
-    coordinator) echo "30.0" ;;
+    coordinator) echo "60.0" ;;  # ~6x the clean list with the taker gate's file (~2.6 s + ~7 s, 2026-10-01)
     network)     echo "30.0" ;;
     *)           echo "45.0" ;;
   esac
@@ -446,6 +450,10 @@ group_shards() {
     # minutes, each before any runner slowdown. Two shards each keep a 2x slower runner under 330.
     radiantleg)  echo "2" ;;
     fundingspv)  echo "2" ;;
+    # ESTIMATED from a 30-mutant local sample of the whole module (2026-10-01), NOT scaled to the
+    # runner: 2,960 mutants x ~2.0 s for the list, plus ~7 s of the gate's test file for the ~40% the
+    # rest of the list leaves alive (12 of 30) = ~99 + ~138 = ~237 minutes, before any runner slowdown.
+    coordinator) echo "2" ;;
     cryptoutils) echo "3" ;;
     cryptohash)  echo "6" ;;
     *)           echo "1" ;;
