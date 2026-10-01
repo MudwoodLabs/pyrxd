@@ -603,6 +603,11 @@ def _as_endpoint_list(value: Any, key: str) -> tuple[tuple[str, ...], dict[str, 
     network command: a malformed id, one contradicting a shipped operator, and one host counted as
     two sources (:func:`pyrxd.network.source_identity.source_keys`). The profile checks the last
     again, for library callers that never read a config.
+
+    An empty or whitespace-only entry, string or table ``url``, is refused with its index. It used
+    to be dropped (a string) or kept (``"  "``), and ``electrumx_servers = [""]`` then resolved to
+    an empty list, i.e. the SHIPPED DEFAULTS: a user who meant to configure their own server was
+    silently sent to someone else's. An empty LIST is still "not configured".
     """
     if value is None:
         return (), {}
@@ -612,10 +617,11 @@ def _as_endpoint_list(value: Any, key: str) -> tuple[tuple[str, ...], dict[str, 
         raise ValidationError(f"config value for {key!r} must be a list of URLs or {{ url, operator }} tables")
     urls: list[str] = []
     operators: dict[str, str] = {}
-    for item in value:
+    for index, item in enumerate(value):
         if isinstance(item, str):
-            if item:
-                urls.append(item)
+            if not item.strip():
+                raise ValidationError(f"empty endpoint in {key} at index {index}")
+            urls.append(item)
             continue
         if not isinstance(item, dict):
             raise ValidationError(f"config value for {key!r} must be a list of URLs or {{ url, operator }} tables")
@@ -623,8 +629,10 @@ def _as_endpoint_list(value: Any, key: str) -> tuple[tuple[str, ...], dict[str, 
         if extra:
             raise ValidationError(f"config entry in {key!r} has unknown key(s) {extra}; allowed: url, operator")
         url = item.get("url")
-        if not isinstance(url, str) or not url.strip():
+        if not isinstance(url, str):
             raise ValidationError(f"config entry in {key!r} needs a non-empty string url")
+        if not url.strip():
+            raise ValidationError(f"empty endpoint in {key} at index {index}")
         urls.append(url)
         if "operator" in item:
             operator = item["operator"]
