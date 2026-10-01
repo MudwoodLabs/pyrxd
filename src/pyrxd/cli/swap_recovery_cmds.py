@@ -30,6 +30,7 @@ flags, formatting, and error mapping only.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ from .swap_recovery import (
     PreimageRecovery,
     ProvenanceRefused,
     RefundReportedUnconfirmed,
+    WrongEthChain,
     assert_covenant_matches,
     build_cold_claim,
     build_cold_refund,
@@ -56,6 +58,7 @@ from .swap_recovery import (
     describe_network_error,
     electrumx_urls,
     endpoint_source_label,
+    eth_chain_note,
     fetch_btc_claim_bytes,
     fetch_eth_claim_artifacts,
     open_http_session,
@@ -269,15 +272,20 @@ async def _recover(
     session = await open_http_session()
     async with session:
         tx, logs = await fetch_eth_claim_artifacts(
-            session, eth_rpc_url, contract_address=eth_contract, timeout_s=timeout_s
+            session,
+            eth_rpc_url,
+            contract_address=eth_contract,
+            expected_chain_id=facts.eth_chain_id,
+            timeout_s=timeout_s,
         )
-    return recover_preimage_from_eth_artifacts(
+    rec = recover_preimage_from_eth_artifacts(
         hashlock=hashlock,
         contract_address=eth_contract,
         claim_tx=tx,
         logs=logs,
         source=endpoint_source_label(eth_rpc_url),
     )
+    return dataclasses.replace(rec, provenance=(*rec.provenance, eth_chain_note(facts.eth_chain_id)))
 
 
 @click.command(name="recover-preimage")
@@ -355,6 +363,12 @@ def swap_recover_preimage_cmd(
             ),
             url=read_url,
         )
+    except WrongEthChain as exc:
+        raise UserError(
+            "REFUSED: the ETH RPC is not on this swap's chain — no preimage was taken",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
+            fix="pass an --eth-rpc-url for the chain the recovery file records (eth_chain_id) — nothing was broadcast",
+        ) from exc
     except RefundReportedUnconfirmed as exc:
         # Before CounterLegInconclusive (its base): the advice differs. Full log history is not the
         # gap here — a refund report from ONE RPC cannot be confirmed by that RPC at all.

@@ -81,7 +81,7 @@ import json
 import logging
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -137,6 +137,7 @@ __all__ = [
     "RecoveryExtras",
     "RefundReportedUnconfirmed",
     "VerifiedEthTx",
+    "WrongEthChain",
     "assert_covenant_matches",
     "build_cold_claim",
     "build_cold_refund",
@@ -215,6 +216,16 @@ class RefundReportedUnconfirmed(CounterLegInconclusive):
     was ever broadcast or mined: ``refund()`` takes no argument and anyone may call it, so a server
     can produce bytes for any key that hash to the transaction its fabricated log names. Checking
     the signature would not help, for the same reason. Only a second, independent source can.
+    """
+
+
+class WrongEthChain(ValidationError):
+    """The ETH RPC is on a different chain than the swap, so nothing it says about the contract counts.
+
+    The same contract address can exist on several EVM chains (a deterministic deployer, or the
+    same deployer nonce), and an RPC pointed at the wrong network answers ``eth_getLogs`` for it
+    without complaint. Its own error, not :class:`ProvenanceRefused`: the fix is a different RPC
+    URL, not a different ``--eth-contract``.
     """
 
 
@@ -892,8 +903,15 @@ def _rlp_item(data: bytes, pos: int, depth: int = 0) -> tuple[bytes | list[Any],
     return items, end
 
 
-def _decode_eth_tx_fields(raw: bytes) -> tuple[int, bytes, bytes]:
-    """``(tx_type, to, data)`` read from a signed transaction's own bytes (legacy or typed envelope)."""
+def _rlp_uint(field: Any, what: str) -> int:
+    """A canonical RLP unsigned integer: a byte string with no leading zero (``b""`` is 0)."""
+    if not isinstance(field, bytes) or field[:1] == b"\x00":
+        raise ValueError(f"malformed {what} field")
+    return int.from_bytes(field, "big")
+
+
+def _decode_eth_tx_fields(raw: bytes) -> tuple[int, bytes, bytes, int | None]:
+    """``(tx_type, to, data, chain_id)`` read from a transaction's own bytes (legacy or typed envelope)."""
     if not raw:
         raise ValueError("empty transaction")
     if raw[0] >= 0xC0:
@@ -911,7 +929,12 @@ def _decode_eth_tx_fields(raw: bytes) -> tuple[int, bytes, bytes]:
     to, data = fields[to_i], fields[data_i]
     if not isinstance(to, bytes) or len(to) not in (0, 20) or not isinstance(data, bytes):
         raise ValueError("malformed to/data field")
-    return tx_type, to, data
+    if tx_type:
+        chain_id: int | None = _rlp_uint(fields[0], "chainId")
+    else:
+        v = _rlp_uint(fields[6], "v")
+        chain_id = (v - 35) // 2 if v >= 35 else None  # EIP-155; 27/28 is a pre-EIP-155 legacy tx
+    return tx_type, to, data, chain_id
 
 
 @dataclass(frozen=True)
@@ -935,6 +958,9 @@ class VerifiedEthTx:
     to: str | None  # 0x-prefixed lower-case address; None for a contract creation
     input: bytes
     tx_type: int
+    #: The chain id the transaction's own bytes name (typed: field 0; legacy: EIP-155 ``v``), or
+    #: ``None`` for a pre-EIP-155 legacy transaction, which names none.
+    chain_id: int | None = None
 
     def as_claim_dict(self) -> dict[str, Any]:
         """The ``{"hash", "to", "input"}`` shape :func:`recover_preimage_from_eth_claim` reads."""
@@ -962,10 +988,12 @@ def verify_raw_eth_tx(raw: bytes | str, expected_hash: str) -> VerifiedEthTx:
             "the RPC served a different transaction; refusing to read it"
         )
     try:
-        tx_type, to, data = _decode_eth_tx_fields(blob)
+        tx_type, to, data, chain_id = _decode_eth_tx_fields(blob)
     except ValueError as exc:
         raise ProvenanceRefused(f"the raw transaction {computed} does not decode: {exc}") from exc
-    return VerifiedEthTx(hash=computed, to=("0x" + to.hex()) if to else None, input=data, tx_type=tx_type)
+    return VerifiedEthTx(
+        hash=computed, to=("0x" + to.hex()) if to else None, input=data, tx_type=tx_type, chain_id=chain_id
+    )
 
 
 def _bound_logs(logs: Sequence[Any], contract_address: str) -> list[dict[str, Any]]:
@@ -1399,15 +1427,60 @@ async def eth_rpc_read(session: Any, rpc_url: str, method: str, params: list[Any
     return body.get("result")
 
 
+def _parse_chain_id(result: Any) -> int:
+    """An ``eth_chainId`` result (a hex QUANTITY) as an int; ``ValidationError`` for anything else."""
+    if isinstance(result, str) and re.fullmatch(r"0x(0|[1-9a-fA-F][0-9a-fA-F]{0,15})", result):
+        return int(result, 16)
+    raise ValidationError(f"eth_chainId returned {str(result)[:40]!r}, not a chain id; the RPC's chain is unknown")
+
+
+def eth_chain_note(expected_chain_id: int | None) -> str:
+    """One sentence saying what was checked about the RPC's chain — for status reasons and provenance."""
+    if expected_chain_id is None:
+        return (
+            "the recovery file records no eth_chain_id, so the RPC's chain was NOT checked against the swap's "
+            "(it was checked against the chain its own transaction bytes name, where there were any)"
+        )
+    return f"the RPC reports chain id {expected_chain_id}, the chain this swap's recovery file records"
+
+
+async def check_eth_chain(session: Any, rpc_url: str, expected_chain_id: int | None, *, timeout_s: float = 15.0) -> int:
+    """Ask the RPC which chain it is on (``eth_chainId``); refuse it unless it is the swap's.
+
+    Returns the RPC's chain id. With ``expected_chain_id=None`` (a recovery file that records none)
+    nothing is compared here, and the caller says so (:func:`eth_chain_note`).
+
+    Raises
+    ------
+    WrongEthChain
+        The RPC is on another chain than the one the swap's recovery file records.
+    """
+    actual = _parse_chain_id(await eth_rpc_read(session, rpc_url, "eth_chainId", [], timeout_s=timeout_s))
+    if expected_chain_id is not None and actual != expected_chain_id:
+        raise WrongEthChain(
+            f"the RPC {endpoint_source_label(rpc_url)} is on chain {actual}, the swap is on chain {expected_chain_id} "
+            "(eth_chain_id in the recovery file). Nothing it reports about the contract applies to this swap; "
+            "use an RPC for the swap's chain."
+        )
+    return actual
+
+
 async def fetch_eth_claim_artifacts(
     session: Any,
     rpc_url: str,
     *,
     contract_address: str,
+    expected_chain_id: int | None,
     from_block: int | str = "0x0",
     timeout_s: float = 15.0,
 ) -> tuple[dict[str, Any] | VerifiedEthTx | None, list[dict[str, Any]]]:
     """Read ``(claim_tx, logs)`` for a per-swap HTLC contract. Read-only RPC only.
+
+    FIRST asks the RPC for its chain (:func:`check_eth_chain`) and refuses one on another chain
+    than ``expected_chain_id`` — the swap's, from its recovery file. Keyword-required with no
+    default, so no caller can skip the decision; ``None`` means the file records no chain id. This
+    is the one fetch both ``swap status`` and ``recover-preimage`` make, so the check covers both.
+    A raw transaction whose own bytes name another chain than the RPC's is refused too.
 
     Scans every log from the contract (selector-agnostic, mirroring
     :class:`~pyrxd.gravity.watch.eth_adapters.RpcEthChainSource`) so a differently
@@ -1419,9 +1492,13 @@ async def fetch_eth_claim_artifacts(
 
     Raises
     ------
+    WrongEthChain
+        The RPC is on another chain than the swap's.
     ProvenanceRefused
-        The raw bytes the RPC returned do not hash to the requested transaction.
+        The raw bytes the RPC returned do not hash to the requested transaction, or name another
+        chain than the RPC's.
     """
+    rpc_chain = await check_eth_chain(session, rpc_url, expected_chain_id, timeout_s=timeout_s)
     logs = await eth_rpc_read(
         session,
         rpc_url,
@@ -1443,27 +1520,59 @@ async def fetch_eth_claim_artifacts(
     except (ValidationError, aiohttp.ClientResponseError):
         raw = None  # the method is not served (a JSON-RPC error, or a provider's 4xx): fall back to JSON
     if isinstance(raw, str) and _hex_blob(raw):
-        return verify_raw_eth_tx(raw, tx_hash), logs
+        verified = verify_raw_eth_tx(raw, tx_hash)
+        if verified.chain_id is not None and verified.chain_id != rpc_chain:
+            raise ProvenanceRefused(
+                f"the transaction {verified.hash} the RPC returned is signed for chain {verified.chain_id}, but the "
+                f"RPC reports chain {rpc_chain} — its answer contradicts itself; refusing to read it"
+            )
+        return verified, logs
     tx = await eth_rpc_read(session, rpc_url, "eth_getTransactionByHash", [tx_hash], timeout_s=timeout_s)
     return (tx if isinstance(tx, dict) else None), logs
 
 
 async def read_eth_counter_leg(
-    session: Any, rpc_url: str, *, contract_address: str, hashlock: bytes, timeout_s: float = 15.0
+    session: Any,
+    rpc_url: str,
+    *,
+    contract_address: str,
+    hashlock: bytes,
+    expected_chain_id: int | None,
+    timeout_s: float = 15.0,
 ) -> CounterLegStatus:
     """Classify the ETH counter-leg through the SAME decision as recovery.
 
     There is no ``LOCKED`` verdict on this chain: a log can show that the contract was claimed or
     refunded, never that it was not, and "no logs" is also what a pruned node or a log-range limit
-    returns for a CLAIMED contract. That is reported ``UNKNOWN``, never ``LOCKED``.
+    returns for a CLAIMED contract. That is reported ``UNKNOWN``, never ``LOCKED``. An RPC on
+    another chain than ``expected_chain_id`` is ``ERROR`` (:class:`WrongEthChain`).
     """
     source = endpoint_source_label(rpc_url)
     try:
         tx, logs = await fetch_eth_claim_artifacts(
-            session, rpc_url, contract_address=contract_address, timeout_s=timeout_s
+            session,
+            rpc_url,
+            contract_address=contract_address,
+            expected_chain_id=expected_chain_id,
+            timeout_s=timeout_s,
         )
-    except ProvenanceRefused as exc:
+    except (ProvenanceRefused, WrongEthChain) as exc:
         return CounterLegStatus(chain="eth", state="ERROR", reason=str(exc), source=source)
+    status = _classify_eth_artifacts(tx, logs, contract_address=contract_address, hashlock=hashlock, source=source)
+    if expected_chain_id is None:
+        return replace(status, reason=f"{status.reason} (Note: {eth_chain_note(None)}.)")
+    return status
+
+
+def _classify_eth_artifacts(
+    tx: dict[str, Any] | VerifiedEthTx | None,
+    logs: list[dict[str, Any]],
+    *,
+    contract_address: str,
+    hashlock: bytes,
+    source: str,
+) -> CounterLegStatus:
+    """The :class:`CounterLegStatus` for ``(tx, logs)`` already read from one RPC."""
     if isinstance(tx, VerifiedEthTx):
         tx_hash: str | None = tx.hash
     else:
@@ -1557,7 +1666,12 @@ async def read_counter_leg(
     session = await open_http_session()
     async with session:
         return await read_eth_counter_leg(
-            session, eth_rpc_url, contract_address=contract, hashlock=hashlock, timeout_s=timeout_s
+            session,
+            eth_rpc_url,
+            contract_address=contract,
+            hashlock=hashlock,
+            expected_chain_id=facts.eth_chain_id,
+            timeout_s=timeout_s,
         )
 
 

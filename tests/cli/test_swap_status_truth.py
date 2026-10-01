@@ -52,13 +52,15 @@ REFUND_TX = "0x" + "aa" * 32
 
 
 class _Rpc(BaseHTTPRequestHandler):
-    """Answers ``eth_getLogs`` / ``eth_getRawTransactionByHash`` / ``eth_getTransactionByHash``."""
+    """Answers ``eth_chainId`` / ``eth_getLogs`` / ``eth_getRawTransactionByHash`` / ``eth_getTransactionByHash``."""
 
     def do_POST(self) -> None:
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         scenario = self.server.scenario  # type: ignore[attr-defined]
-        if req["method"] == "eth_getLogs":
-            result: Any = scenario["logs"]
+        if req["method"] == "eth_chainId":
+            result: Any = scenario.get("chain_id", "0x1")  # chain 1: what _signed_raw signs for
+        elif req["method"] == "eth_getLogs":
+            result = scenario["logs"]
         elif req["method"] == "eth_getTransactionByHash":
             result = scenario["txs"].get(req["params"][0])
         elif req["method"] == "eth_getRawTransactionByHash":
@@ -888,3 +890,69 @@ def test_blocks_to_refund_is_omitted_rather_than_raising_when_depth_is_none(case
     res = _status(case, output_mode="json")
     assert res.exit_code == 0, res.output
     assert "blocks_to_refund" not in json.loads(res.output)["chain"]
+
+
+# --------------------------------------------------------------------------- the RPC's chain (round 4)
+
+
+def _eth_swap_on_chain(case, chain_id: Any) -> None:
+    _eth_swap(case)
+    doc = json.loads(case["keys"].read_text())
+    doc["eth_chain_id"] = chain_id
+    case["keys"].write_text(json.dumps(doc))
+
+
+def test_an_rpc_on_another_chain_is_an_error_for_the_whole_read(case, eth_rpc) -> None:
+    """The swap is on Sepolia; the RPC answers for chain 1. Even a Claimed log carrying a valid p
+    is not read: nothing that RPC says is about this swap's contract."""
+    _eth_swap_on_chain(case, 11155111)
+    eth_rpc.scenario = {"chain_id": "0x1", "logs": [_log(CLAIMED_TOPIC0, P, CLAIM_TX)], "txs": {}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "ERROR", counter
+    assert "is on chain 1, the swap is on chain 11155111" in counter["reason"]
+    rec = _eth_recover(case, eth_rpc)
+    assert rec.exit_code == 1, rec.output
+    assert "not on this swap's chain" in rec.output
+    assert P.hex() not in rec.output
+
+
+def test_an_rpc_on_the_swaps_chain_reads_as_before(case, eth_rpc) -> None:
+    """Honest path: matching chain ids change nothing, and the check is named in the provenance."""
+    _eth_swap_on_chain(case, 11155111)
+    eth_rpc.scenario = {"chain_id": "0xaa36a7", "logs": [_log(CLAIMED_TOPIC0, P, CLAIM_TX)], "txs": {}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "CLAIMED_PREIMAGE_REVEALED", counter
+    assert "NOT checked" not in counter["reason"]
+    doc = json.loads(_eth_recover(case, eth_rpc, output_mode="json").output)
+    assert doc["preimage_hex"] == P.hex()
+    assert "the RPC reports chain id 11155111, the chain this swap's recovery file records" in doc["provenance_checks"]
+
+
+def test_a_file_with_no_chain_id_reads_on_and_says_the_chain_was_not_checked(case, eth_rpc) -> None:
+    """Not refused (older files record no chain id), and not silent either."""
+    _eth_swap(case)
+    eth_rpc.scenario = {"chain_id": "0x5", "logs": [_log(CLAIMED_TOPIC0, P, CLAIM_TX)], "txs": {}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "CLAIMED_PREIMAGE_REVEALED", counter
+    assert "records no eth_chain_id, so the RPC's chain was NOT checked" in counter["reason"]
+    doc = json.loads(_eth_recover(case, eth_rpc, output_mode="json").output)
+    assert any("NOT checked" in c for c in doc["provenance_checks"])
+
+
+def test_a_transaction_signed_for_another_chain_than_the_rpc_is_refused(case, eth_rpc) -> None:
+    """The RPC says chain 1 and serves a refund() signed for chain 5: its answer contradicts itself."""
+    _eth_swap(case)
+    tx_hash, raw = _probe_wrong_chain()
+    eth_rpc.scenario = {"logs": [_log(REFUNDED_TOPIC0, b"", tx_hash)], "txs": {}, "raws": {tx_hash: raw}}
+    counter = _counter(_eth_status(case, eth_rpc, output_mode="json"))
+    assert counter["state"] == "ERROR", counter
+    assert "signed for chain 5, but the RPC reports chain 1" in counter["reason"]
+
+
+@pytest.mark.parametrize("bad", ["11155111", True, 0, -1, 1.5])
+def test_a_malformed_eth_chain_id_in_the_file_is_refused_not_ignored(case, eth_rpc, bad) -> None:
+    """Read as "none recorded", a malformed value would switch the chain check off."""
+    _eth_swap_on_chain(case, bad)
+    res = _eth_status(case, eth_rpc)
+    assert res.exit_code != 0
+    assert "eth_chain_id must be a positive integer" in res.output

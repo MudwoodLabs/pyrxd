@@ -69,6 +69,10 @@ class SwapFacts:
     btc_network: str | None = None
     # ETH counter-leg
     eth_chain: str | None = None
+    #: The EVM chain id the swap's HTLC lives on (``eth_chain_id``, written by
+    #: ``scripts/eth_swap_run.py``), or ``None`` when the file records none. The counter-leg read
+    #: refuses an RPC on any other chain (:func:`~pyrxd.cli.swap_recovery.check_eth_chain`).
+    eth_chain_id: int | None = None
     eth_timeout_unix_s: int | None = None
     eth_amount_wei: int | None = None
     # asset detail (ft/nft)
@@ -209,6 +213,13 @@ def parse_recovery_file(path: Path) -> SwapFacts:
     # ``eth_timeout_unix_s`` too: ``eth_swap_grief_run.py`` writes no ``eth_chain``, so its ETH
     # swap used to be classified BTC and its counter-leg read asked for a BTC outpoint.
     is_eth = ("eth_chain" in d) or ("eth_timeout_unix_s" in d) or (d.get("counter_chain") == "eth")
+    eth_chain_id = d.get("eth_chain_id")
+    if eth_chain_id is not None and (
+        not isinstance(eth_chain_id, int) or isinstance(eth_chain_id, bool) or eth_chain_id <= 0
+    ):
+        # Refused, not ignored: a malformed value silently read as "none recorded" would switch the
+        # counter-leg read's chain check off for exactly the file that tried to pin it.
+        raise ValueError("recovery file eth_chain_id must be a positive integer")
     return SwapFacts(
         counter_chain="eth" if is_eth else "btc",
         hashlock_hex=str(hashlock),
@@ -227,6 +238,7 @@ def parse_recovery_file(path: Path) -> SwapFacts:
         btc_htlc_address=d.get("btc_htlc_address"),
         btc_network=d.get("btc_network"),
         eth_chain=d.get("eth_chain"),
+        eth_chain_id=eth_chain_id,
         eth_timeout_unix_s=d.get("eth_timeout_unix_s"),
         eth_amount_wei=d.get("eth_amount_wei"),
         asset_genesis_ref=d.get("asset_genesis_ref"),

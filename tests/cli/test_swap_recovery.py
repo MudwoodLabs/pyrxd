@@ -960,6 +960,7 @@ class _Facts:
     def __init__(self, counter_chain: str) -> None:
         self.counter_chain = counter_chain
         self.hashlock_hex = H.hex()
+        self.eth_chain_id = 11155111
 
 
 @pytest.mark.asyncio
@@ -1030,7 +1031,9 @@ async def test_eth_counter_leg_states(monkeypatch) -> None:
     # No logs and no transaction is NO EVIDENCE: a pruned node answers a claimed contract this way.
     # It used to read LOCKED ("no preimage has been revealed ... keep watching").
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(None, [])))
-    empty = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
+    empty = await sr.read_eth_counter_leg(
+        MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H, expected_chain_id=1
+    )
     assert empty.state == "UNKNOWN"
     assert "NOT evidence the leg is locked" in empty.reason
 
@@ -1039,14 +1042,18 @@ async def test_eth_counter_leg_states(monkeypatch) -> None:
         "fetch_eth_claim_artifacts",
         AsyncMock(return_value=(_eth_tx(calldata=P), [_eth_log(data=P)])),
     )
-    claimed = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
+    claimed = await sr.read_eth_counter_leg(
+        MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H, expected_chain_id=1
+    )
     assert claimed.state == "CLAIMED_PREIMAGE_REVEALED"
     assert P.hex() not in json.dumps(claimed.to_dict())
 
     # JSON naming a call that carries no p is the server's word (its `hash` is not derived from its
     # contents): no longer a definitive refund, round-3 F2.
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(_eth_tx(calldata=b"\x01\x02"), [])))
-    json_only = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
+    json_only = await sr.read_eth_counter_leg(
+        MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H, expected_chain_id=1
+    )
     assert json_only.state == "UNKNOWN"
 
     from pyrxd.gravity.watch.eth_adapters import REFUNDED_TOPIC0
@@ -1054,13 +1061,17 @@ async def test_eth_counter_leg_states(monkeypatch) -> None:
     verified = sr.VerifiedEthTx(hash="0xfeed", to=CONTRACT.lower(), input=sr.ETH_REFUND_SELECTOR, tx_type=2)
     refund_log = dict(_eth_log(), topics=[REFUNDED_TOPIC0])
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(verified, [refund_log])))
-    refunded = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
+    refunded = await sr.read_eth_counter_leg(
+        MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H, expected_chain_id=1
+    )
     # Bytes pyrxd hashed and decoded are still one server's: never definitive (round 4).
     assert refunded.state == "REFUND_REPORTED_UNCONFIRMED"
     assert refunded.claim_txid == "0xfeed"
 
     monkeypatch.setattr(sr, "fetch_eth_claim_artifacts", AsyncMock(return_value=(_eth_tx(to=OTHER_CONTRACT), [])))
-    unbound = await sr.read_eth_counter_leg(MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H)
+    unbound = await sr.read_eth_counter_leg(
+        MagicMock(), "http://x", contract_address=CONTRACT, hashlock=H, expected_chain_id=1
+    )
     assert unbound.state == "ERROR"
 
 
@@ -1195,25 +1206,27 @@ async def test_eth_rpc_read_surfaces_an_rpc_error_and_a_malformed_body() -> None
 @pytest.mark.asyncio
 async def test_fetch_eth_claim_artifacts_only_ever_posts_allowlisted_methods() -> None:
     log = _eth_log(data=P, tx_hash="0xfeed")
-    session = _SpyRpcSession([{"result": [log]}, {"result": None}, {"result": _eth_tx(calldata=P)}])
-    tx, logs = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
+    session = _SpyRpcSession([{"result": "0x1"}, {"result": [log]}, {"result": None}, {"result": _eth_tx(calldata=P)}])
+    tx, logs = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT, expected_chain_id=1)
     assert tx is not None and logs == [log]
     assert set(session.methods) <= sr.ETH_READ_ONLY_RPC_METHODS
 
 
 @pytest.mark.asyncio
 async def test_fetch_eth_claim_artifacts_handles_no_logs_and_an_unusable_log() -> None:
-    empty = _SpyRpcSession([{"result": []}])
-    tx, logs = await sr.fetch_eth_claim_artifacts(empty, "http://x", contract_address=CONTRACT)
+    empty = _SpyRpcSession([{"result": "0x1"}, {"result": []}])
+    tx, logs = await sr.fetch_eth_claim_artifacts(empty, "http://x", contract_address=CONTRACT, expected_chain_id=1)
     assert tx is None and logs == []
 
     bad = {"address": CONTRACT, "data": "0x"}  # no transactionHash to follow
-    session = _SpyRpcSession([{"result": [bad]}])
-    tx, logs = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
+    session = _SpyRpcSession([{"result": "0x1"}, {"result": [bad]}])
+    tx, logs = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT, expected_chain_id=1)
     assert tx is None and logs == [bad]
 
-    session = _SpyRpcSession([{"result": [_eth_log(data=P)]}, {"result": None}, {"result": "not-a-tx-object"}])
-    tx, _ = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
+    session = _SpyRpcSession(
+        [{"result": "0x1"}, {"result": [_eth_log(data=P)]}, {"result": None}, {"result": "not-a-tx-object"}]
+    )
+    tx, _ = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT, expected_chain_id=None)
     assert tx is None
 
 
@@ -1222,10 +1235,36 @@ async def test_fetch_falls_back_to_json_when_raw_transactions_are_not_served() -
     """A JSON-RPC error for ``eth_getRawTransactionByHash`` (method not found) is a fallback, not a
     failure: the JSON transaction is still read, and is never a VerifiedEthTx."""
     log = _eth_log(data=P, tx_hash="0xfeed")
-    session = _SpyRpcSession([{"result": [log]}, {"error": {"code": -32601}}, {"result": _eth_tx(calldata=P)}])
-    tx, _ = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT)
+    session = _SpyRpcSession(
+        [{"result": "0x1"}, {"result": [log]}, {"error": {"code": -32601}}, {"result": _eth_tx(calldata=P)}]
+    )
+    tx, _ = await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT, expected_chain_id=1)
     assert isinstance(tx, dict) and not isinstance(tx, sr.VerifiedEthTx)
-    assert session.methods == ["eth_getLogs", "eth_getRawTransactionByHash", "eth_getTransactionByHash"]
+    assert session.methods == ["eth_chainId", "eth_getLogs", "eth_getRawTransactionByHash", "eth_getTransactionByHash"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_asks_the_rpc_its_chain_first_and_refuses_another_chain() -> None:
+    """The chain check is inside the one fetch both commands make, before any log is read."""
+    session = _SpyRpcSession([{"result": "0x1"}])
+    with pytest.raises(sr.WrongEthChain, match="is on chain 1, the swap is on chain 11155111"):
+        await sr.fetch_eth_claim_artifacts(session, "http://x", contract_address=CONTRACT, expected_chain_id=11155111)
+    assert session.methods == ["eth_chainId"]  # refused before eth_getLogs
+
+
+@pytest.mark.parametrize("bad", [None, "", "1", "0x", "0x01", "0xzz", 1, "0x" + "f" * 17])
+@pytest.mark.asyncio
+async def test_an_unparseable_chain_id_is_refused_not_compared(bad) -> None:
+    with pytest.raises(ValidationError, match="not a chain id"):
+        await sr.check_eth_chain(_SpyRpcSession([{"result": bad}]), "http://x", 1)
+
+
+@pytest.mark.asyncio
+async def test_a_matching_chain_id_and_no_recorded_chain_id_both_read_on() -> None:
+    """Honest paths: the swap's own chain passes, and a file that records no chain id is not
+    refused (the read goes on, and the caller says the chain was not checked)."""
+    assert await sr.check_eth_chain(_SpyRpcSession([{"result": "0xaa36a7"}]), "http://x", 11155111) == 11155111
+    assert await sr.check_eth_chain(_SpyRpcSession([{"result": "0x1"}]), "http://x", None) == 1
 
 
 def test_refund_selector_is_keccak_of_the_signature() -> None:
@@ -1296,6 +1335,7 @@ async def test_read_counter_leg_dispatches_to_the_configured_chain(monkeypatch) 
         _Facts("eth"), sr.RecoveryExtras(eth_contract_address=CONTRACT), eth_rpc_url="http://x"
     )
     assert got.chain == "eth" and eth_reader.await_count == 1
+    assert eth_reader.await_args.kwargs["expected_chain_id"] == 11155111  # the swap's chain reaches the read
 
 
 # ------------------- audit B4: an unbounded fee overpay burns the whole input ------------------
