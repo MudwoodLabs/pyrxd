@@ -51,8 +51,9 @@ into the same app or receiver changes nothing.
   `--rxd-backend ssh-tr` for the node alone; `--ssh-host <your node host> --ssh-container <your node
   container>`, both required). Sources are counted by operator, so several URLs of one operator count
   once. **Fewer sources than the quorum refuses to start**; `--accept-single-source` starts anyway
-  with a WARNING naming the sources (it also permits an autonomous refund on a single-source read),
-  and `--rxd-quorum 1` asks for single-source operation outright.
+  with a WARNING naming the sources, and `--rxd-quorum 1` asks for single-source operation outright.
+  Neither lets the autonomous refund broadcast on a single-source read: that takes its own flag,
+  `--auto-refund-on-single-source`.
 - BTC depth + claim detection: defaults to mempool.space / Esplora (`--mempool-base-url`, `--quorum`).
 - Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). The finality gate also needs the
   chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes

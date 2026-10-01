@@ -12,6 +12,23 @@ steps looked like beforehand.
 - `CHANGELOG.md` has a `## [X.Y.Z] — YYYY-MM-DD` section.
 - CI is green on the release PR. The `publish.yml` workflow re-checks that the
   version matches the tag, but catching a mismatch here is cheaper.
+- The Radiant checkpoint table is refreshed with the maintainer's node right
+  before the release, and the regenerated `src/pyrxd/spv/radiant_checkpoints.py`
+  is merged:
+
+  ```bash
+  PYTHONPATH=src python scripts/refresh_radiant_checkpoints.py --write \
+      --node-cli "<command that runs radiant-cli against your node>"
+  ```
+
+  `pyrxd verify` and the pages link a block at most 4,032 headers past the
+  newest checkpoint, and the swap taker gate at most 20,160, so a release ships
+  with a fixed horizon. A table refreshed at release time gives the release the
+  longest one; an old table can leave a new release unable to verify new marks
+  on the day it ships. The scheduled `Checkpoint freshness` workflow fails when
+  fewer than 864 blocks (three days) remain before the 4,032 horizon; a refresh
+  always turns it green. The pages pick up the
+  table on their next deploy from `main`.
 
 ## 1. Merge the release PR
 

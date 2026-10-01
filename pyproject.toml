@@ -671,6 +671,7 @@ markers = [
     "gpu: marks as gpu test",
     "slow: marks tests as slow",
     "unit: fast offline tests",
+    "real_checkpoint_clock: the taker coordinator's checkpoint-horizon check reads the clock it is given, not the one tests/conftest.py pins",
 ]
 
 [tool.tox]

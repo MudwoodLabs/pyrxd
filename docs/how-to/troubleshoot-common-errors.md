@@ -377,11 +377,11 @@ means.
 Three real strings from `ElectrumXClient`:
 
 - `"Failed to connect to any ElectrumX server"` —
-  [`src/pyrxd/network/electrumx.py:959`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`src/pyrxd/network/electrumx.py:970`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   every server in your URL list failed to connect. Check the URL(s), your
   network, and that the server is up.
 - `"ElectrumX connection lost"` —
-  [`:717`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`:718`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   the WebSocket dropped mid-session; all pending requests fail with this.
   Reconnect (a fresh `ElectrumXClient` / `async with` block).
 - `"ElectrumX request timed out"` (or `"... (send)"`) —

@@ -134,24 +134,30 @@ def canonical_host(host: str) -> str:
     two NAMES reach one machine is not visible in a URL, and nothing here claims to see it.
     An internationalised name is folded to its punycode A-label, the spelling that is connected to.
 
-    An IPv6 zone id is kept (lower-cased): ``fe80::1%eth0`` and ``fe80::1%eth1`` are different
-    interfaces. Its RFC 6874 URL spelling ``%25eth0`` is decoded by :func:`source_key` before it
-    gets here, so ``[fe80::1%25eth0]`` and a bare ``fe80::1%eth0`` are one key.
+    An IPv6 zone id is kept (lower-cased) only where it selects something: on a link-local or
+    multicast address, ``fe80::1%eth0`` and ``fe80::1%eth1`` are different interfaces. On any other
+    address the kernel ignores it — ``fd00::7%1`` and ``fd00::7%2`` reach the one ``fd00::7`` — so it
+    is dropped, and those spellings are one host; an IPv4-mapped address is folded to its IPv4 form
+    whatever zone it carries, so ``::ffff:127.0.0.1%1`` is ``127.0.0.1`` (and so this machine). Its
+    RFC 6874 URL spelling ``%25eth0`` is decoded by :func:`source_key` before it gets here, so
+    ``[fe80::1%25eth0]`` and a bare ``fe80::1%eth0`` are one key.
 
     Not folded, because the URL does not show them to be one host: a NAT64 (``64:ff9b::/96``) or
     IPv4-compatible IPv6 address next to the IPv4 address it embeds. Whether those reach one
     machine depends on the network, the same limit as a hostname next to its IP address.
     """
     host = host.strip().rstrip(".").lower()
-    if ":" in host:  # IPv6 (urlsplit has already removed the brackets); a zone id is kept verbatim
+    if ":" in host:  # IPv6 (urlsplit has already removed the brackets)
         address, _, zone = host.partition("%")
         try:
             v6 = ipaddress.IPv6Address(address)
         except ValueError:
             return host
-        if v6.ipv4_mapped is not None and not zone:
+        if v6.ipv4_mapped is not None:
             return str(v6.ipv4_mapped)
-        return v6.compressed + (f"%{zone}" if zone else "")
+        # A zone selects an interface only for a scoped address; elsewhere it is ignored on connect.
+        keep_zone = zone and (v6.is_link_local or v6.is_multicast)
+        return v6.compressed + (f"%{zone}" if keep_zone else "")
     if _INET_ATON_FORM.fullmatch(host):
         try:
             return str(ipaddress.IPv4Address(socket.inet_aton(host)))
@@ -326,8 +332,8 @@ _LOOPBACK_KEY = "localhost"
 
 def _is_loopback(host: str) -> bool:
     """Whether canonical *host* is this machine for COUNTING: ``localhost``, any ``*.localhost``
-    (RFC 6761 §6.3), anything in ``127.0.0.0/8``, ``::1`` (``::ffff:127.x`` is already folded to
-    its IPv4 form by :func:`canonical_host`), or the unspecified ``0.0.0.0`` / ``::`` — a
+    (RFC 6761 §6.3), anything in ``127.0.0.0/8``, ``::1`` (``::ffff:127.x``, with or without a zone,
+    is already folded to its IPv4 form by :func:`canonical_host`), or the unspecified ``0.0.0.0`` / ``::`` — a
     connection to either reaches this machine.
 
     Broad on purpose, and the opposite of

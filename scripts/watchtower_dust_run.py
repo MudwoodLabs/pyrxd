@@ -392,7 +392,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     print(f"      --network {state['network']} {cleared}\\")
     print(f"      --refund-spk {state['refund_spk']} \\")
     print(f"      --autonomous-refund-cap-sats {min(int(state['btc_sats']) + 1, 10_000)} \\")
-    print("      --accept-single-source \\")
+    print("      --accept-single-source --auto-refund-on-single-source \\")
     print("      --rxd-backend ssh-tr --ssh-host <your node host> --ssh-container <your node container> \\")
     print("      --measured --poll-interval-s 30 --heartbeat-file ~/.pyrxd/watchtower/heartbeat")
     print()

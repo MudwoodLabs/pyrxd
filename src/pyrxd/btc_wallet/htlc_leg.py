@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -88,6 +89,10 @@ class FundingPolicy:
 
 
 logger = logging.getLogger(__name__)
+
+#: A vout as the counterparty writes it: ASCII decimal digits only, at most ten (a vout is a uint32;
+#: :class:`BtcOutpoint` refuses one above 32 bits).
+_VOUT_RE = re.compile(r"[0-9]{1,10}")
 
 # Isolated test chains that cannot move real value. Everything else (mainnet "bc"/"ltc",
 # and any value-bearing network) is what the coordinator's ``_leg_is_value_bearing`` and
@@ -436,10 +441,11 @@ class BitcoinTaprootLeg:
             txid, sep, vout = funding_ref.rpartition(":")
             if not sep:
                 raise ValidationError("funding outpoint string must be '<txid>:<vout>'")
-            try:
-                return t.BtcOutpoint(txid=txid, vout=int(vout))
-            except ValueError as exc:
-                raise ValidationError("funding outpoint vout must be an integer") from exc
+            # ASCII 0-9 only, like every other outpoint parser: bare int() also takes "١", "１",
+            # " 1", "+1" and "1_0".
+            if not _VOUT_RE.fullmatch(vout):
+                raise ValidationError("funding outpoint vout must be ASCII decimal digits (0-9), at most ten")
+            return t.BtcOutpoint(txid=txid, vout=int(vout))
         raise ValidationError("funding_ref must be a BtcOutpoint, a BtcHtlcLocator, or '<txid>:<vout>'")
 
     async def verify_counterparty_funded(

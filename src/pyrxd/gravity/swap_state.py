@@ -591,6 +591,12 @@ class SwapRecord:
     #: when no override was set. Written by the coordinator when the gate runs; serialised only when
     #: set, so a record without it keeps its existing wire form.
     single_operator_override: str | None = None
+    #: Why the taker's coordinator REFUSED to complete an interrupted fund whose counter-leg contract
+    #: was already deployed (:meth:`pyrxd.gravity.swap_coordinator.SwapCoordinator.resume_interrupted_fund`),
+    #: or ``None``. Set with the move to ``BTC_LOCKED`` when that contract may hold value, so the
+    #: watchtower tracks its refund (and a maker's claim with ``p``) instead of reading a NEGOTIATED
+    #: record as "nothing locked". Serialised only when set.
+    fund_refusal: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -662,6 +668,8 @@ class SwapRecord:
             )
         if self.single_operator_override is not None and not isinstance(self.single_operator_override, str):
             raise ValidationError("single_operator_override must be a str or None")
+        if self.fund_refusal is not None and not isinstance(self.fund_refusal, str):
+            raise ValidationError("fund_refusal must be a str or None")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -701,6 +709,8 @@ class SwapRecord:
         return dataclasses.replace(
             self,
             counterchain_locator=locator,
+            # A completed fund supersedes any earlier refused resume: decide() reads this field.
+            fund_refusal=None,
             pending_counter_contract=None,
             pending_counter_deploy_tx=None,
             pending_push_nonce=None,
@@ -751,6 +761,8 @@ class SwapRecord:
                 d["pending_push_tx_hash"] = self.pending_push_tx_hash
         if self.single_operator_override is not None:
             d["single_operator_override"] = self.single_operator_override
+        if self.fund_refusal is not None:
+            d["fund_refusal"] = self.fund_refusal
         return d
 
     @classmethod
@@ -784,6 +796,7 @@ class SwapRecord:
             pending_push_nonce=d.get("pending_push_nonce"),
             pending_push_tx_hash=d.get("pending_push_tx_hash"),
             single_operator_override=d.get("single_operator_override"),
+            fund_refusal=d.get("fund_refusal"),
         )
 
 

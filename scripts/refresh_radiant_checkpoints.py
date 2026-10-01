@@ -29,6 +29,8 @@ and to link hash by hash from one checkpoint to the other, and records the most 
 carries (:data:`LAST_INTERVAL_MAX_WORK`, with its height) and the newest checkpoint header's own work
 (:data:`NEWEST_CHECKPOINT_WORK`). The swap taker gate's negotiation-time check prices a forged
 confirmation from those two numbers before any server is asked (:mod:`pyrxd.gravity.funding_spv`).
+It also records the newest checkpoint's raw header (:data:`NEWEST_CHECKPOINT_HEADER`, which must hash
+to it), whose timestamp that check projects the chain's height from.
 
 The script refuses to write if any source disagrees with any other at any height, if fewer than two
 sources answered, if block 0 is not the genesis hash pyrxd already declares
@@ -56,7 +58,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TARGET = REPO_ROOT / "src" / "pyrxd" / "spv" / "radiant_checkpoints.py"
 NETWORK = "mainnet"
 INTERVAL = 2016
-DEFAULT_MIN_DEPTH = 1000
+#: Radiant Core's default ``-maxreorgdepth`` (``DEFAULT_MAX_REORG_DEPTH``, ``src/validation.h``) — a
+#: per-node setting, not consensus: no checkpoint may be this close to the tip.
+MAX_REORG_DEPTH = 69
+#: How far below the lowest reported tip the newest checkpoint must sit: one day at the 300 s
+#: target, over four times :data:`MAX_REORG_DEPTH`.
+DEFAULT_MIN_DEPTH = 288
+#: The deepest ``--min-depth`` this script accepts. After a refresh the newest checkpoint sits
+#: between ``min_depth`` and ``min_depth + INTERVAL - 1`` blocks below the tip; the freshness job
+#: (``scripts/check_checkpoint_freshness.py``) turns red once fewer than its ``WARN_BLOCKS`` (864)
+#: remain of the pages' 4,032-header horizon, i.e. past 3,168 blocks. So a refresh turns the job
+#: green only when ``min_depth + 2015 <= 3168`` (1,153), and stays green for at least a day (288
+#: blocks) only at ``min_depth <= 865``. A test pins the two scripts together.
+MAX_MIN_DEPTH = 865
 #: Radiant mainnet's ``consensus.powLimit`` (``tests/vendor/radiant_core/chainparams.cpp``), the limit
 #: the header work is computed at — the same one the swap taker gate uses (a test pins them equal).
 MAINNET_POW_LIMIT = (1 << 224) - 1
@@ -159,6 +173,22 @@ def reconcile_interval(
     return best, min(h for h, w in works.items() if w == best), works[hi]
 
 
+def newest_checkpoint_header(answers: Mapping[str, Mapping[int, bytes]], table: Sequence[tuple[int, str]]) -> str:
+    """The newest checkpoint's raw header, hex — from *answers* that :func:`reconcile_interval` has
+    already accepted (every source byte-identical, linked to the checkpoint). Re-checked here: it
+    must hash to the newest checkpoint."""
+    from pyrxd.hash import radiant_block_hash
+
+    hi, hi_hash = table[-1]
+    got = {bytes(a[hi]) for a in answers.values() if hi in a}
+    if len(got) != 1:
+        raise Disagreement(f"sources disagree on the header at the newest checkpoint {hi}")
+    header = next(iter(got))
+    if radiant_block_hash(header) != hi_hash:
+        raise Disagreement(f"the header served at {hi} does not hash to its checkpoint")
+    return header.hex()
+
+
 def render_module(
     table: Sequence[tuple[int, str]],
     *,
@@ -170,6 +200,7 @@ def render_module(
     last_interval_max_work: int,
     last_interval_max_work_height: int,
     newest_checkpoint_work: int,
+    newest_checkpoint_header: str,
 ) -> str:
     """The text of ``radiant_checkpoints.py``. Pure: the same inputs give the same bytes."""
     server_lines = "\n".join(f"  * ``{u}``" for u in servers)
@@ -227,7 +258,9 @@ alike, and the script linked them hash by hash from checkpoint {interval_lo} to 
 :data:`NEWEST_CHECKPOINT_WORK` the work of the header at {interval_hi}, each ``2**256 // (target + 1)``
 at mainnet's proof-of-work limit. The checkpoint hashes commit to those headers, so the numbers are
 fixed by the table above; the swap taker gate recomputes the first from the headers it links on
-every run.
+every run. :data:`NEWEST_CHECKPOINT_HEADER` is the raw header at {interval_hi} itself, one of those; a
+test re-hashes it to the checkpoint. The swap taker gate reads its timestamp to project, before
+anyone locks, whether a funding agreed now can still be linked to this table.
 
 WHAT THEY ARE FOR. :mod:`pyrxd.glyph.mark_block` places a block at a height by linking its header,
 hash by hash, to one of these. The height then rests on this table rather than on the server that
@@ -261,6 +294,11 @@ LAST_INTERVAL_MAX_WORK_HEIGHT: dict[str, int] = {{"{NETWORK}": {last_interval_ma
 
 #: The work of the newest checkpoint's own header.
 NEWEST_CHECKPOINT_WORK: dict[str, int] = {{"{NETWORK}": {newest_checkpoint_work}}}
+
+#: The newest checkpoint's raw 80-byte header, hex. It hashes to the newest entry of :data:`CHECKPOINTS`.
+NEWEST_CHECKPOINT_HEADER: dict[str, str] = {{
+    "{NETWORK}": "{newest_checkpoint_header}"
+}}
 
 #: ``network -> ((height, block hash in display hex), ...)``, heights ascending. Networks with no
 #: entries cannot be verified against a checkpoint, and verification there reports NOT VERIFIED.
@@ -399,6 +437,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     ap.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH)
     args = ap.parse_args(argv)
+    if not MAX_REORG_DEPTH < args.min_depth <= MAX_MIN_DEPTH:
+        ap.error(
+            f"--min-depth must be above Radiant Core's default `-maxreorgdepth` ({MAX_REORG_DEPTH}) and at most "
+            f"{MAX_MIN_DEPTH}: deeper, and a fresh table can leave the checkpoint-freshness job red within a day"
+        )
 
     servers = _servers()
     node_argv = shlex.split(args.node_cli) if args.node_cli else None
@@ -416,7 +459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         from pyrxd.spv import radiant_checkpoints as shipped
 
-        work = reconcile_interval(_interval_answers(servers, node_argv, table), table)
+        interval = _interval_answers(servers, node_argv, table)
+        work = reconcile_interval(interval, table)
         recorded = (
             shipped.LAST_INTERVAL_MAX_WORK[NETWORK],
             shipped.LAST_INTERVAL_MAX_WORK_HEIGHT[NETWORK],
@@ -424,6 +468,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if work != recorded:
             print(f"MISMATCH in the last interval's work: sources give {work}, the file records {recorded}")
+            return 1
+        header = newest_checkpoint_header(interval, table)
+        if header != shipped.NEWEST_CHECKPOINT_HEADER[NETWORK]:
+            print(f"MISMATCH in the newest checkpoint header: sources give {header}")
             return 1
         from pyrxd.network.source_identity import source_key
 
@@ -436,7 +484,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     tip, heights, answers = asyncio.run(_collect(servers, node_argv, args.min_depth, None))
     table = reconcile(answers, heights, genesis)
-    max_work, max_work_height, cp_work = reconcile_interval(_interval_answers(servers, node_argv, table), table)
+    interval = _interval_answers(servers, node_argv, table)
+    max_work, max_work_height, cp_work = reconcile_interval(interval, table)
     text = render_module(
         table,
         servers=servers,
@@ -447,6 +496,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         last_interval_max_work=max_work,
         last_interval_max_work_height=max_work_height,
         newest_checkpoint_work=cp_work,
+        newest_checkpoint_header=newest_checkpoint_header(interval, table),
     )
     TARGET.write_text(text, encoding="utf-8")
     print(

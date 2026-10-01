@@ -108,6 +108,13 @@ def _https(url: str) -> str:
             "wss://[fe80::1%25eth0]:50022/",
         ],
         ["::ffff:203.0.113.7", "[::ffff:203.0.113.7]:1", "203.0.113.7"],
+        # A zone id on an address that is not link-local or multicast selects nothing: the kernel
+        # ignores it on connect, so these all reach the one fd00::c444 (panel finding, LOW).
+        ["http://[fd00::c444]/", "http://[fd00::c444%251]/", "http://[fd00::c444%252]/", "fd00::c444%eth0"],
+        ["wss://[2001:db8::7%251]/", "wss://[2001:db8::7]/"],
+        # An IPv4-mapped address with a zone is its IPv4 address; a loopback one is this machine.
+        ["::ffff:203.0.113.7%1", "203.0.113.7"],
+        ["ws://127.0.0.1:1/", "ws://[::ffff:127.0.0.1%251]:1/", "ws://[::ffff:127.0.0.1]:1/", "localhost"],
     ],
     ids=[
         "port-path-case-dot-userinfo",
@@ -117,6 +124,10 @@ def _https(url: str) -> str:
         "bare-ipv6",
         "ipv6-zone",
         "ipv4-mapped-bare",
+        "zone-on-a-ula",
+        "zone-on-a-global",
+        "ipv4-mapped-with-zone",
+        "loopback-mapped-with-zone",
     ],
 )
 def test_every_spelling_of_one_host_is_one_key(spellings) -> None:
@@ -143,6 +154,7 @@ def test_distinct_hosts_stay_distinct() -> None:
         ("2001:db8::1", "[2001:db8::2]:50022"),
         ("fe80::1%eth0", "fe80::1%eth1"),  # one address on two interfaces
         ("fe80::1%eth0", "fe80::1"),
+        ("ff02::1%eth0", "ff02::1%eth1"),  # link-scope multicast: the zone selects the interface
         ("2001:db8::1", "0.0.7.209"),  # what the bare literal used to be misread as
         ("2001:db8::1", "2001"),
     ],
@@ -1018,3 +1030,28 @@ def test_a_profile_may_still_list_one_host_twice_for_failover() -> None:
     assert [e.url for e in profile.endpoints] == ["wss://h.example/", "wss://h.example/x", "wss://g.example/"]
     assert len({e.source for e in profile.endpoints}) == 2
     assert [k for k, _ in group_by_source(e.url for e in profile.endpoints)] == ["h.example", "g.example"]
+
+
+def test_zone_spellings_of_one_server_are_refused_as_one_source_by_the_quorum_funnel() -> None:
+    """Panel finding (LOW), through the funnel every client quorum crosses: three spellings of one
+    ULA server were three keys, and a 2-of-3 ETH quorum was built over one socket."""
+    from pyrxd.network.source_identity import require_distinct_sources
+
+    class _Src:
+        def __init__(self, url):
+            self.source_key = source_key(url)
+
+    urls = ("http://[fd00::c444]/", "http://[fd00::c444%251]/", "http://[fd00::c444%252]/")
+    with pytest.raises(ValidationError, match="same source"):
+        require_distinct_sources([_Src(u) for u in urls], what="ETH RPC")
+    # Honest path: two link-local interfaces stay two.
+    require_distinct_sources([_Src("http://[fe80::1%25eth0]/"), _Src("http://[fe80::1%25eth1]/")], what="ETH RPC")
+
+
+async def test_a_zoned_loopback_spelling_does_not_corroborate_the_watchtower(monkeypatch) -> None:
+    """Panel finding (LOW): ``127.0.0.1`` and ``[::ffff:127.0.0.1%251]`` reached one local ElectrumX
+    and the watchtower's builder called them two sources, clearing low-corroboration."""
+    src, corroborated = await _rxd_source_from_run(
+        "wss://127.0.0.1:18765/", "wss://[::ffff:127.0.0.1%251]:18765/", monkeypatch
+    )
+    assert _count_rxd(src) == 1 and corroborated is False

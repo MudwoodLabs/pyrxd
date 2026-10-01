@@ -63,8 +63,10 @@ network's genesis, which is its only checkpoint.
 
 FRESHNESS. The walk from the newest checkpoint is capped at :data:`MAX_HEADERS_FROM_CHECKPOINT_SDK`
 (20,160 headers) here, against the pages' 4,032 (maintainer decision, 2026-09-30). When ``H + k - 1``
-lies past it, the refusal says to upgrade pyrxd (newer checkpoints) or verify against the taker's
-own node — never to proceed.
+lies past it, the refusal says to upgrade pyrxd (newer checkpoints) — never to proceed; the gate links
+only to the checkpoints this pyrxd ships. That refusal comes after the maker has locked, so the
+negotiation-time check projects it first (:func:`checkpoint_horizon_failure`, from the newest
+checkpoint's timestamp) and refuses before anyone locks a swap agreed too close to the horizon.
 
 THE UPPER BOUND ON ELAPSED DEPTH. SPV proves a LOWER bound on how deep the funding is. The timelock
 gates that follow (``pre_btc_lock_check`` steps 6 and 7) need an UPPER bound, because ``t_rxd`` is a
@@ -101,7 +103,12 @@ used is::
   default). The defaults are policy (:class:`ElapsedBoundPolicy`), listed for maintainer sign-off.
 * ``reported`` is the largest depth any configured source reports for the funding — its verbose
   ``confirmations`` or ``tip - H + 1`` — grouped by operator (:func:`pyrxd.network.source_identity.source_key`).
-  A report can only RAISE the bound; a source reporting less never lowers it. ABOVE DUST on a
+  A report can only RAISE the bound; a source reporting less never lowers it. Any ONE configured
+  source — counted as an operator or not — can therefore raise it far enough that steps 6 and 7
+  refuse, after the maker has locked. That is deliberate: capping a report would let the bound fall
+  below a depth a source the taker chose to ask has seen, an under-count. The coordinator's refusal
+  then names the source and what was proved rather than calling the figure the covenant's depth
+  (:meth:`pyrxd.gravity.swap_coordinator.SwapCoordinator._elapsed_set_by_a_report`). ABOVE DUST on a
   value-bearing network (a value at stake over ``ElapsedBoundPolicy.dust_threshold_photons``,
   1,000 RXD by default) the gate REFUSES unless at least :data:`MIN_REPORTING_OPERATORS` (two)
   distinct operators report the FUNDING TRANSACTION's depth — their verbose reply for its txid; a
@@ -195,12 +202,18 @@ from pyrxd.hash import hash256, radiant_block_hash
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.security.types import BlockHeight
 from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work, verify_radiant_header_pow
-from pyrxd.spv.radiant_checkpoints import CHECKPOINTS, LAST_INTERVAL_MAX_WORK, NEWEST_CHECKPOINT_WORK
+from pyrxd.spv.radiant_checkpoints import (
+    CHECKPOINTS,
+    LAST_INTERVAL_MAX_WORK,
+    NEWEST_CHECKPOINT_HEADER,
+    NEWEST_CHECKPOINT_WORK,
+)
 from pyrxd.transaction.transaction import Transaction
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CHECKPOINT_HORIZON_RATE_FACTOR",
     "FORGERY_COST_FACTOR",
     "LOCAL_CLOCK_BEHIND_MEDIAN_TOLERANCE_S",
     "LOCAL_DEVNET_CHAIN_IDS",
@@ -216,6 +229,7 @@ __all__ = [
     "RadiantChain",
     "VerifiedMakerFunding",
     "block_subsidy_photons",
+    "checkpoint_horizon_failure",
     "counted_operators",
     "early_elapsed_blocks_upper",
     "elapsed_blocks_upper_bound",
@@ -253,6 +267,16 @@ UNIDENTIFIED_SOURCE_PREFIX = "unidentified source"
 #: The most headers linked above the newest checkpoint by this gate (ten checkpoint intervals).
 #: The browser pages and ``pyrxd verify`` keep :data:`pyrxd.glyph.mark_block.MAX_HEADERS_FROM_CHECKPOINT`.
 MAX_HEADERS_FROM_CHECKPOINT_SDK = 20_160
+
+#: How much faster than the nominal spacing the negotiation-time check assumes blocks have come since
+#: the newest checkpoint, when it projects the height a funding agreed now reaches the depth the gate
+#: requires — and so whether this pyrxd's checkpoints can still link it
+#: (:func:`checkpoint_horizon_failure`). Above 1 so the projection runs AHEAD of an honest chain: a
+#: swap refused a little early costs an upgrade, one refused late leaves the maker's asset locked.
+#: Measured 2026-10-01 on mainnet headers sampled every 1,008 blocks from 300,000 to the tip
+#: (469,056): the fastest stretch of 20,160 blocks came at 1.032 times the nominal rate, of 10,080 at
+#: 1.058, of 4,032 at 1.263.
+CHECKPOINT_HORIZON_RATE_FACTOR = 1.1
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -578,6 +602,10 @@ class RadiantChain:
     last_interval_max_work: int | None = None
     #: The newest checkpoint header's own work, as shipped; ``None`` where none is shipped.
     newest_checkpoint_work: int | None = None
+    #: The newest checkpoint header's timestamp, read from the shipped header
+    #: (:data:`pyrxd.spv.radiant_checkpoints.NEWEST_CHECKPOINT_HEADER`); ``None`` where none is shipped.
+    #: The negotiation-time check projects the chain's height from it (:func:`checkpoint_horizon_failure`).
+    newest_checkpoint_time: int | None = None
 
 
 #: Radiant mainnet: the shipped checkpoint table and the last interval's work shipped with it;
@@ -591,6 +619,7 @@ MAINNET_CHAIN = RadiantChain(
     value_bearing=True,
     last_interval_max_work=LAST_INTERVAL_MAX_WORK["mainnet"],
     newest_checkpoint_work=NEWEST_CHECKPOINT_WORK["mainnet"],
+    newest_checkpoint_time=int.from_bytes(bytes.fromhex(NEWEST_CHECKPOINT_HEADER["mainnet"])[68:72], "little"),
 )
 
 #: Radiant regtest: no shipped table, so its genesis (``chainparams.cpp`` line 509, and
@@ -896,6 +925,51 @@ def early_elapsed_blocks_upper(
     )
 
 
+def checkpoint_horizon_failure(
+    *,
+    chain: RadiantChain,
+    now_unix_s: int,
+    required_confirmations: int,
+    observed_confirmations: int | None = None,
+    slack_s: int,
+    cap: int = MAX_HEADERS_FROM_CHECKPOINT_SDK,
+    rate_factor: float = CHECKPOINT_HORIZON_RATE_FACTOR,
+) -> str | None:
+    """Why a funding agreed at *now_unix_s* would reach the depth the gate requires PAST what this
+    pyrxd's checkpoints can link — or ``None``. Modelled BEFORE ANYONE LOCKS, from the shipped table.
+
+    :func:`verify_maker_funding` (``pre_btc_lock_check`` step 5) refuses a funding at height ``H``
+    whose ``k``-th block, ``H + k - 1``, lies more than ``cap`` blocks past the newest checkpoint —
+    after the maker's covenant is on chain. No header is read here, so the chain's height is
+    PROJECTED: the newest checkpoint's height, plus the blocks of ``now + slack_s`` since that
+    checkpoint's own timestamp at ``rate_factor`` times the nominal rate (rounded up). The maker
+    funds within ``slack_s``; the funding is mined in the next block; it is ``k`` deep ``k - 1`` blocks
+    later. A funding already observed ``observed_confirmations`` deep reaches ``k`` that many blocks
+    sooner. A chain faster than ``rate_factor`` over the whole stretch since the checkpoint is the
+    case this leaves to step 5, which still refuses before the taker locks.
+
+    ``None`` on a chain that ships no checkpoint timestamp (regtest).
+    """
+    if chain.newest_checkpoint_time is None:
+        return None
+    newest_h = chain.checkpoints[-1][0]
+    spacing = int(chain.target_spacing_s)
+    since_s = max(0, int(now_unix_s) + int(slack_s) - int(chain.newest_checkpoint_time))
+    projected_tip = newest_h + math.ceil(Fraction(rate_factor).limit_denominator(1_000_000) * since_s / spacing)
+    k = int(required_confirmations)
+    seen = 0 if observed_confirmations is None else int(observed_confirmations)
+    depth_at = projected_tip + max(0, k - seen)
+    if depth_at - newest_h <= cap:
+        return None
+    return (
+        f"this pyrxd's newest checkpoint is block {newest_h}, and its taker gate links at most {cap} blocks past it; "
+        f"a funding agreed now would reach the {k} confirmations the gate can require at about block {depth_at} "
+        f"(the chain projected at {rate_factor:g}x the nominal {spacing} s rate since that checkpoint's timestamp), "
+        f"{depth_at - newest_h - cap} blocks beyond that, so the gate would refuse it after the maker had locked. "
+        "Upgrade pyrxd (newer checkpoints) before negotiating this swap"
+    )
+
+
 def _merged_ranges(spans: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
     """Inclusive ``(lo, hi)`` spans, merged, as ``(start, count)`` chunks of at most 2016."""
     out: list[tuple[int, int]] = []
@@ -944,8 +1018,8 @@ def funding_header_ranges(
     if height > top:
         raise MakerFundingNotVerified(
             f"the funding is at block {height}, {height - newest_h} blocks past this pyrxd's newest checkpoint "
-            f"({newest_h}); this gate links at most {cap} — upgrade pyrxd (newer checkpoints) or verify "
-            "against your own node"
+            f"({newest_h}); this gate links at most {cap} — upgrade pyrxd (newer checkpoints); the taker "
+            "gate has no other way to link it"
         )
     plan = plan_block_verification(
         height=height,
@@ -1365,7 +1439,7 @@ def verify_maker_funding(
         raise refuse(
             f"block {height + k - 1}, where the funding would reach the required depth, is "
             f"{height + k - 1 - newest_h} blocks past this pyrxd's newest checkpoint ({newest_h}) and this gate "
-            f"links at most {cap} — upgrade pyrxd (newer checkpoints) or verify against your own node",
+            f"links at most {cap} — upgrade pyrxd (newer checkpoints); the taker gate has no other way to link it",
             why,
             f"the funding in block {height}, {proved} deep",
         )

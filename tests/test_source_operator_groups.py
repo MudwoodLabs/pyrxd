@@ -788,9 +788,10 @@ def test_a_declaring_config_without_a_split_loads_and_an_offline_inspect_runs(tm
     bad = tmp_path / "bad.toml"
     bad.write_text(_ACME_SPLIT_BY_OMISSION)
     result = CliRunner().invoke(cli, ["--config", str(bad), "glyph", "inspect", contract])
-    assert result.exit_code != 0, result.output
-    assert isinstance(result.exception, ValidationError), result.output
-    message = str(result.exception)
+    # A refused config is a USER error (exit 1, the standard block), not the exit-4 bug path.
+    assert result.exit_code == 1, result.output
+    message = " ".join(result.output.split())
+    assert message.startswith("error: invalid configuration"), message
     assert re.search(r"'backup\.acme\.io', of the same registered domain 'acme\.io', is not declared", message), message
 
 

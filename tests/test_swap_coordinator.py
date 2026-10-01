@@ -2086,6 +2086,26 @@ class FakeEthLeg:
             raise ValidationError("verify_funded failed AFTER deploy (contract is live on-chain)")
         return loc
 
+    def expected_locator(self, terms, *, contract_address, deploy_tx_hash=None) -> EthHtlcLocator:
+        """The locator ``fund`` would return for *contract_address*, built from the terms (as the real
+        ``EthLeg.expected_locator`` builds it from its own config) — no chain read. A token locator for
+        token terms, as the real one."""
+        from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+        cls = Erc20HtlcLocator if getattr(terms, "token_address", "") else EthHtlcLocator
+        extra = {"token_address": terms.token_address} if cls is Erc20HtlcLocator else {}
+        return cls(
+            **extra,
+            chain_id=11155111,
+            contract_address=contract_address,
+            deploy_tx_hash=deploy_tx_hash or "0x" + "00" * 32,
+            hashlock="0x" + terms.hashlock.hex(),
+            claimant="0x" + "11" * 20,
+            refundee="0x" + "22" * 20,
+            timeout=terms.eth_timeout_unix_s,
+            amount_wei=int(terms.value_amount),
+        )
+
     async def claim(self, locator, preimage) -> str:
         self.calls.append("claim")
         self.claimed_with = bytes(preimage)

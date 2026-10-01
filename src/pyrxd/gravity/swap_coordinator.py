@@ -76,6 +76,7 @@ from .funding_spv import (
     MakerFundingNotVerified,
     RadiantChain,
     VerifiedMakerFunding,
+    checkpoint_horizon_failure,
     counted_operators,
     early_elapsed_blocks_upper,
     erlang_upper_quantile_s,
@@ -106,6 +107,7 @@ __all__ = [
     "MAINNET_ETH_FINALITY_STALL_FLOOR_S",
     "MAKER_SECRET_TAKER_LOCKS_BTC_FIRST",
     "ClaimFinality",
+    "DefinitiveFundRefusal",
     "MarginPolicy",
     "SwapCoordinator",
     "assert_timelock_margin",
@@ -1500,10 +1502,35 @@ def assess_claim_finality(
 
 @dataclass(frozen=True)
 class PreBtcLockGate:
-    """Result of the pre-BTC-lock validation gate (plan H4(a))."""
+    """Result of the pre-BTC-lock validation gate (plan H4(a)).
+
+    ``definitive``: no retry can pass this refusal. It rests only on the agreed terms, local state,
+    the clock, or a depth this gate PROVED — and the clock and the proved depth only grow, which
+    never loosens one of these checks. False for anything a retry may pass: a chain read, a proof or
+    a store that failed; a bound set by one source's REPORT or by the TIME term (a stale header makes
+    that larger than the chain is); a missing or too-small configuration (adding a source or a
+    setting can undo it). Each classification site says which. :meth:`SwapCoordinator.resume_interrupted_fund`
+    acts on it.
+    """
 
     ok: bool
     reason: str = ""
+    definitive: bool = False
+
+
+class _Refusal(str):
+    """A refusal reason that also says whether it is definitive (see :class:`PreBtcLockGate`)."""
+
+    definitive: bool = False
+
+    def __new__(cls, text: str, *, definitive: bool) -> _Refusal:
+        made = super().__new__(cls, text)
+        made.definitive = definitive
+        return made
+
+
+class DefinitiveFundRefusal(ValidationError):
+    """The taker gate refused funding for a reason a retry cannot change (``PreBtcLockGate.definitive``)."""
 
 
 # ---------------------------------------------------------------------------
@@ -1990,7 +2017,10 @@ class SwapCoordinator:
                 bytes(terms.hashlock) == bytes(self.record.terms.hashlock)
             )
             if not resuming_this_h and self.seen_store.has_seen(terms.hashlock):
-                return PreBtcLockGate(ok=False, reason="hashlock H reused (free-option / preimage-replay risk)")
+                # DEFINITIVE: local state. No source is read, and a reservation never expires.
+                return PreBtcLockGate(
+                    ok=False, reason="hashlock H reused (free-option / preimage-replay risk)", definitive=True
+                )
         except Exception as exc:
             return PreBtcLockGate(ok=False, reason=f"seen-store unavailable; fail-closed ({exc})")
 
@@ -2002,23 +2032,35 @@ class SwapCoordinator:
             else:
                 self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:
-            return PreBtcLockGate(ok=False, reason=f"margin check failed: {exc}")
+            # DEFINITIVE: the terms and the clock only, nothing elapsed. No source is read, and a
+            # later `now` only brings the ETH deadline nearer.
+            return PreBtcLockGate(ok=False, reason=f"margin check failed: {exc}", definitive=True)
 
         # 3b. The same timelocks against the SMALLEST depth the taker gate can require of the maker's
         #     funding (see `_funding_proof_room_failure`) — before the chain is read. The constructor
         #     ran it on the record's terms; these are the terms this call was handed.
         room = self._funding_proof_room_failure(terms, now_unix_s=now_unix_s)
         if room is not None:
-            return PreBtcLockGate(ok=False, reason=room)
+            # Definitive only where `_funding_proof_room_failure` marks it: the ordering on the terms,
+            # and the room in t_rxd on the bound modelled from pyrxd's SHIPPED table and this
+            # policy (no source; a later `now` only tightens it). A missing setting, a value, or too
+            # few configured operators is a configuration a retry can change.
+            return PreBtcLockGate(ok=False, reason=room, definitive=getattr(room, "definitive", False))
 
         # 4. Maker-promised BTC params match locally re-derived funding SPK.
         try:
             expected_spk = self.counter_leg.derive_funding_scriptpubkey(terms)
             promised_spk = self.counter_leg.promised_funding_scriptpubkey(terms)
         except Exception as exc:
-            return PreBtcLockGate(ok=False, reason=f"could not derive BTC funding SPK; fail-closed ({exc})")
+            # DEFINITIVE: a local derivation from the terms; no source, no clock.
+            return PreBtcLockGate(
+                ok=False, reason=f"could not derive BTC funding SPK; fail-closed ({exc})", definitive=True
+            )
         if expected_spk != promised_spk:
-            return PreBtcLockGate(ok=False, reason="maker-promised BTC params do not match re-derived funding SPK")
+            # DEFINITIVE: the maker's own promise against the terms; no source, no clock.
+            return PreBtcLockGate(
+                ok=False, reason="maker-promised BTC params do not match re-derived funding SPK", definitive=True
+            )
 
         # 5. The MAKER'S ASSET IS REALLY LOCKED (HZ-1). Everything above is a re-derivation of what
         #    the swap SHOULD look like; only this reads the Radiant chain. See
@@ -2033,7 +2075,12 @@ class SwapCoordinator:
                 terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
             )
         except (ValidationError, NetworkError) as exc:
-            return PreBtcLockGate(ok=False, reason=f"maker's Radiant covenant not verified; fail-closed ({exc})")
+            # RETRYABLE, every case: a chain read or a proof that failed. Even the checkpoint horizon:
+            # the height it is judged at is first the SERVER'S report, and a source's tip headers can
+            # raise k, so one source can trip it.
+            return PreBtcLockGate(
+                ok=False, reason=f"maker's Radiant covenant not verified; fail-closed ({exc})", definitive=False
+            )
         except Exception as exc:
             return PreBtcLockGate(
                 ok=False, reason=f"could not verify the maker's Radiant covenant; fail-closed ({exc})"
@@ -2049,6 +2096,31 @@ class SwapCoordinator:
         return PreBtcLockGate(ok=True)
 
     def _judge_remaining_window(
+        self, terms: NegotiatedTerms, *, cov_confs: int, now_unix_s: int | None
+    ) -> PreBtcLockGate | None:
+        """Steps 6 and 7 (:meth:`_remaining_window_failure`), with the refusal CLASSIFIED.
+
+        DEFINITIVE only when what this gate PROVED already trips it. ``cov_confs`` is the elapsed
+        UPPER bound, set by whichever term is largest: the proved depth, the TIME term, or one
+        source's REPORT. A report can be one over-reporting source (even an unidentified one), and
+        the time term grows when the proof's newest header is stale — so a refusal they cause may
+        pass on a retry with that source removed or a fresh header. The proved depth is backed by the
+        proof and only grows, as the clock does, and neither ever loosens steps 6 or 7: a refusal at
+        the proved depth stands. Without this run's proof to read the proved depth from, the refusal
+        is retryable.
+        """
+        gate = self._remaining_window_failure(terms, cov_confs=cov_confs, now_unix_s=now_unix_s)
+        if gate is None:
+            return None
+        f = self.last_maker_funding
+        if f is None or f.elapsed_blocks_upper != cov_confs:
+            return dataclasses.replace(gate, definitive=False)
+        if f.proved_depth >= cov_confs:
+            return gate
+        at_proved = self._remaining_window_failure(terms, cov_confs=f.proved_depth, now_unix_s=now_unix_s)
+        return dataclasses.replace(gate, definitive=at_proved is not None and at_proved.definitive)
+
+    def _remaining_window_failure(
         self, terms: NegotiatedTerms, *, cov_confs: int, now_unix_s: int | None
     ) -> PreBtcLockGate | None:
         """Steps 6 and 7 of :meth:`pre_btc_lock_check`: None when the timelocks still hold with
@@ -2075,7 +2147,8 @@ class SwapCoordinator:
         #
         # It moved here rather than reading the chain earlier so the cheap local checks still fail
         # fast; this is the first point where the elapsed depth is known.
-        gate = self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=cov_confs)
+        reported_by = self._elapsed_set_by_a_report(cov_confs)
+        gate = self._assert_t_rxd_can_reach_a_safe_claim(terms, cov_confs=cov_confs, reported_by=reported_by)
         if gate is not None:
             return gate
 
@@ -2106,7 +2179,11 @@ class SwapCoordinator:
             else:
                 self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s, elapsed_blocks=cov_confs)
         except ValidationError as exc:
-            return PreBtcLockGate(ok=False, reason=f"margin check failed against the REMAINING window: {exc}")
+            why = f"margin check failed against the REMAINING window: {exc}"
+            if reported_by is not None:
+                why += f". The elapsed figure there ({cov_confs}) {reported_by}"
+            # Definitive AT THIS DEPTH; `_judge_remaining_window` decides by the proved depth.
+            return PreBtcLockGate(ok=False, reason=why, definitive=True)
         return None
 
     def _asset_funding_depth(self) -> int | None:
@@ -2125,8 +2202,45 @@ class SwapCoordinator:
             return None
         return _radiant_reserve_blocks(policy, policy.rxd_claim_burial)
 
-    def _assert_t_rxd_can_reach_a_safe_claim(self, terms: NegotiatedTerms, *, cov_confs: int) -> PreBtcLockGate | None:
+    def _elapsed_set_by_a_report(self, cov_confs: int) -> str | None:
+        """When the taker gate's last result put the elapsed-depth bound at ``cov_confs`` because a
+        configured source REPORTED that depth (``bound_term == "reported"``: above both what was
+        proved and the time term), the clause naming that source and what was proved; else None.
+
+        THE RULE, and why it is attribution rather than a cap. A report can only RAISE the bound
+        (:func:`~pyrxd.gravity.funding_spv.elapsed_blocks_upper_bound`), from any configured source,
+        including one that never counts as an operator. Capping it would let the bound fall below a
+        depth a source the taker chose to ask has seen — an UNDER-count of the blocks elapsed, the
+        direction that makes the maker's refund look further away than it is. So one source
+        over-reporting can still refuse a swap after the maker has locked (the taker configured that
+        source, and could equally walk away). What it must not do is have the refusal state that
+        figure as the covenant's depth, or point the user at the maker's timing: the refusal says
+        whose report it is and what was proved, so the user can check that source.
+        """
+        f = self.last_maker_funding
+        if f is None or f.bound_term != "reported" or f.elapsed_blocks_upper != cov_confs:
+            return None
+        time_total = None if f.time_blocks is None else f.reference_height - f.height + 1 + f.time_blocks
+        # A report EQUAL to the proved depth (or the time term) changed nothing: "reported" names a
+        # tie there, and the figure is as good as proved. Only a report above both is attributed.
+        if f.reported_depth is None or f.reported_depth <= max(f.proved_depth, time_total or 0):
+            return None
+        who = [k for k, d in f.reported_by_operator if d == f.reported_depth] or ["a configured source"]
+        time_part = "there was no time term" if time_total is None else f"its time term {time_total}"
+        return (
+            f"is not a proved depth: it is the largest depth a configured source REPORTED ({', '.join(who)}: "
+            f"{f.reported_depth}), above what this gate proved ({f.proved_depth} deep) and {time_part}. A report "
+            "can only raise this bound, so one source reporting too high refuses the swap here; if that source is "
+            "wrong, fix or remove it and retry"
+        )
+
+    def _assert_t_rxd_can_reach_a_safe_claim(
+        self, terms: NegotiatedTerms, *, cov_confs: int, reported_by: str | None = None
+    ) -> PreBtcLockGate | None:
         """None when the swap can still reach a SAFE claim; a refusing gate otherwise.
+
+        *reported_by* (:meth:`_elapsed_set_by_a_report`): ``cov_confs`` came from a source's report,
+        not a proof — the refusal then says so and names it instead of calling it the covenant's depth.
 
         `assess_claim_finality` returns SAFE only when `blocks_left - counter_reserve >= burial`,
         and `blocks_left` is `t_rxd` MINUS the covenant confirmations already elapsed. Checking the
@@ -2143,10 +2257,26 @@ class SwapCoordinator:
             burial, counter_reserve, required = self._safe_claim_terms(terms)
             elapsed = max(0, int(cov_confs))
             remaining = int(terms.t_rxd.value) - elapsed
+            # Both refusals below are definitive AT THIS DEPTH; `_judge_remaining_window` decides by
+            # the proved depth whether a retry could pass them.
+            if remaining < required and reported_by is not None:
+                leaving = f"leaving {remaining}" if remaining > 0 else "leaving none"
+                return PreBtcLockGate(
+                    ok=False,
+                    definitive=True,
+                    reason=(
+                        f"t_rxd is {int(terms.t_rxd.value)} blocks, and this gate's upper bound on the blocks "
+                        f"elapsed since the maker's covenant was mined is {elapsed}, {leaving}; a safe claim needs "
+                        f"{required} (burial {burial} + counter-leg reserve {counter_reserve} + "
+                        f"{_radiant_reserve_blocks(mp, mp.rxd_claim_inclusion)} to be mined). That {elapsed} "
+                        f"{reported_by}."
+                    ),
+                )
             if remaining < required:
                 leaving = f"leaving {remaining}" if remaining > 0 else "leaving none"
                 return PreBtcLockGate(
                     ok=False,
+                    definitive=True,
                     reason=(
                         f"t_rxd is {int(terms.t_rxd.value)} blocks and the maker's covenant is already "
                         f"{elapsed} deep, {leaving}; a safe claim needs {required} "
@@ -2160,7 +2290,11 @@ class SwapCoordinator:
                     ),
                 )
         except ValidationError as exc:
-            return PreBtcLockGate(ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})")
+            # RETRYABLE: the policy's burial terms could not be computed — a configuration a retry
+            # can change, not a judgement on the swap.
+            return PreBtcLockGate(
+                ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})", definitive=False
+            )
         return None
 
     def _safe_claim_terms(self, terms: NegotiatedTerms) -> tuple[int, int, int]:
@@ -2243,7 +2377,7 @@ class SwapCoordinator:
         built with) and again at :meth:`pre_btc_lock_check` step 3b (with that call's), before the
         chain is read. The maker locks its covenant BEFORE the taker's gate runs steps 3, 6 and 7, so
         anything those steps would refuse on an honest chain has to be refused here instead, or the
-        maker's asset sits locked for ``t_rxd`` behind a swap that cannot proceed. Five checks:
+        maker's asset sits locked for ``t_rxd`` behind a swap that cannot proceed. Six checks:
 
         1. THE MEASURED FAST TAIL (every role). ``MarginPolicy.rxd_block_interval_fast_s`` is what
            time spans are converted into Radiant blocks by (:func:`_dividing_interval_s`); unset,
@@ -2287,6 +2421,14 @@ class SwapCoordinator:
            carrying a pending counter-leg deploy (a resumed fund: the taker already passed its gate).
            At step 3b the funding already exists and step 3 has just judged it at the real ``now``,
            so nothing is added there.
+        6. THE CHECKPOINT HORIZON (a coordinator that runs the taker gate, AT CONSTRUCTION only, not
+           for a resumed fund). Step 5 refuses a funding whose ``k``-th block lies more than
+           :data:`~pyrxd.gravity.funding_spv.MAX_HEADERS_FROM_CHECKPOINT_SDK` blocks past this pyrxd's
+           newest checkpoint; :func:`~pyrxd.gravity.funding_spv.checkpoint_horizon_failure` projects
+           that height from the newest checkpoint's timestamp and ``now`` (``now_unix_s``, or the
+           system clock when the coordinator was built without one — a BTC counter leg needs no
+           clock otherwise), and refuses with "upgrade pyrxd". At step 3b the funding exists and
+           step 5 judges its real height a moment later, so it is not projected there.
 
         None — no check — on a test network, where there is no value term; and when the
         configuration has no Radiant chain, which the gate itself refuses.
@@ -2316,7 +2458,9 @@ class SwapCoordinator:
         step3 = (
             None
             if ordering is None
-            else before + f"the timelock ordering fails (pre_btc_lock_check step 3): {ordering}"
+            else _Refusal(
+                before + f"the timelock ordering fails (pre_btc_lock_check step 3): {ordering}", definitive=True
+            )
         )
         runs_taker_gate = self.config.role is not SwapRole.MAKER
         value = self._funding_value_at_stake_photons(terms)
@@ -2356,6 +2500,16 @@ class SwapCoordinator:
             )
         except MakerFundingNotVerified as exc:
             return before + f"the taker gate's elapsed-depth bound cannot be modelled: {exc}"
+        if runs_taker_gate and at_construction and not self.record.pending_counter_contract:
+            horizon = checkpoint_horizon_failure(
+                chain=chain,
+                now_unix_s=int(time.time()) if now_unix_s is None else now_unix_s,
+                required_confirmations=early.required_confirmations,
+                observed_confirmations=self._maker_funding_confirmations,
+                slack_s=int(fb.early_slack_s),
+            )
+            if horizon is not None:
+                return before + horizon
         elapsed = early.elapsed_blocks_upper
         why = None
         remedy = "Negotiate a longer t_rxd or a smaller value"
@@ -2406,14 +2560,16 @@ class SwapCoordinator:
                         remedy = "Negotiate a later counter-leg deadline, and a t_rxd that outlasts it"
         if why is None:
             return step3
-        return before + (
-            f"with this coordinator's policy the taker gate can require the maker's funding up to {early.required_confirmations} "
+        return _Refusal(
+            before
+            + f"with this coordinator's policy the taker gate can require the maker's funding up to {early.required_confirmations} "
             f"blocks deep (k = max({MIN_FUNDING_CONFIRMATIONS}, burial {burial}, ceil(2 × value {value} photons ÷ C) "
             f"= {early.value_term}), with C at least {early.cost_floor_photons} photons by pyrxd's shipped checkpoints); "
             f"its upper bound on the blocks elapsed since the funding can then be {elapsed} on an honest chain "
             f"(blocks every {int(chain.target_spacing_s)} s, the newest up to {fb.early_slack_s} s old; the blocks after "
             f"the reference header {early.reference_depth} deep counted at {fb.surge_factor:g}× that rate, "
-            f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why.rstrip('.')}. {remedy}"
+            f"ε = {early.epsilon:.3g}); and t_rxd is {int(terms.t_rxd.value)} blocks: {why.rstrip('.')}. {remedy}",
+            definitive=True,
         )
 
     def _taker_gate_first_acceptance_wait(
@@ -2665,7 +2821,8 @@ class SwapCoordinator:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
         gate = await self.pre_btc_lock_check(terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic)
         if not gate.ok:
-            raise ValidationError(f"pre-BTC-lock gate refused funding: {gate.reason}")
+            refused = DefinitiveFundRefusal if gate.definitive else ValidationError
+            raise refused(f"pre-BTC-lock gate refused funding: {gate.reason}")
 
         # Persist intent BEFORE broadcasting: the SPK is derivable pre-fund, so a
         # crash after this write but before/within the broadcast leaves a record
@@ -2693,7 +2850,7 @@ class SwapCoordinator:
         )
         again = self._judge_remaining_window(terms, cov_confs=rerun_upper, now_unix_s=rerun_now)
         if again is not None:
-            raise ValidationError(
+            raise (DefinitiveFundRefusal if again.definitive else ValidationError)(
                 f"lock-time re-run refused funding (elapsed-depth upper bound {rerun_upper}): {again.reason}"
             )
 
@@ -3398,7 +3555,97 @@ class SwapCoordinator:
                 "resuming would fund the contract from one swap using the parameters of another."
             )
         self.record = rec
-        return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
+        try:
+            return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
+        except ValidationError as exc:
+            if self.record.state is not SwapState.NEGOTIATED or not self.record.pending_counter_contract:
+                raise
+            if isinstance(exc, DefinitiveFundRefusal):
+                raise DefinitiveFundRefusal(await self._track_refused_resume(terms, str(exc), sink=sink)) from exc
+            # A chain read or a store that failed, a proof that did not go through: a retry may pass.
+            # Nothing was sent and nothing is changed, so the record stays resumable.
+            address = self.record.pending_counter_contract
+            raise ValidationError(
+                f"resume refused, and it can be retried: {exc}. Nothing was sent and the record is unchanged "
+                f"(negotiated, with the pending counter-leg contract {address}): resume again once the cause "
+                f"clears. Until a resume completes the watchtower does not track {address}, which may already "
+                "hold value; if the cause never clears, refund it by its address after its deadline"
+            ) from exc
+
+    async def _save_tracked(self, sink: Any) -> bool:
+        """Persist ``self.record`` through the coordinator's persist hook, or else through the *sink*
+        the resume loaded it from when that sink can write; whether it was saved."""
+        if self._persist is not None:
+            await self._persist_record(self.record, shield=True)
+            return True
+        if callable(sink):
+            await asyncio.shield(sink(self.record))
+            return True
+        return False
+
+    async def _track_refused_resume(self, terms: NegotiatedTerms, why: str, *, sink: Any = None) -> str:
+        """Record a REFUSED resume so the watchtower sees what it left on chain; returns the message.
+
+        A resume re-runs the whole taker gate before completing the fund, and a refusal leaves the
+        counter-leg contract this swap already DEPLOYED. A native-ETH contract took its value in
+        the deploy (the payable constructor); a token contract holds tokens only if the push was
+        sent, and the push nonce is recorded before that send. Left NEGOTIATED, the record read as
+        "nothing locked" to the watchtower, which observes a counter leg only through its locator:
+        no refund page at the deadline, and no alert if the maker claimed the value with ``p``.
+
+        So where the contract MAY hold value the record moves to ``BTC_LOCKED`` with the locator of
+        that contract — rebuilt from this swap's own terms and leg (``expected_locator``), the same
+        immutables the deploy used — and ``fund_refusal`` says why. Nothing is broadcast; the
+        refusal still stands (no push is sent). From there ``taker_refund_btc`` refunds it after the
+        deadline, and the watchtower pages for that, or for a claim if the maker reveals ``p``. A
+        token contract whose push was never sent holds nothing: the record stays NEGOTIATED (still
+        resumable) with the reason recorded.
+
+        Only a DEFINITIVE refusal comes here (:class:`DefinitiveFundRefusal`): one about the terms or
+        the time left, which a retry cannot pass. The returned message says what was SAVED: through
+        the persist hook, or the sink the resume read the record from; when neither can write, it
+        says the change is in memory only.
+        """
+        rec = self.record
+        address, deploy_tx = rec.pending_counter_contract, rec.pending_counter_deploy_tx
+        may_hold_value = not terms.token_address or rec.pending_push_nonce is not None
+        build = getattr(self.counter_leg, "expected_locator", None)
+        if may_hold_value and callable(build):
+            locator = build(terms, contract_address=address, deploy_tx_hash=deploy_tx)
+            self.record = dataclasses.replace(rec.with_counter_lock(locator), fund_refusal=why)
+            self._advance(SwapEvent.TAKER_FUNDS_BTC)
+            if not await self._save_tracked(sink):
+                return (
+                    f"resume refused: {why}. The counter-leg contract {address} was already deployed for this swap "
+                    "and may hold value; nothing more was sent. This coordinator has no persist hook and the record "
+                    "sink cannot write, so the move to btc_locked is IN MEMORY ONLY: the record on disk still says "
+                    f"negotiated and the watchtower does not track {address}. Save coordinator.record, or refund "
+                    "the contract by its address after its deadline"
+                )
+            return (
+                f"resume refused: {why}. The counter-leg contract {address} was already deployed for this swap "
+                + (
+                    "and took its value in the deploy"
+                    if not terms.token_address
+                    else "and the token push may have been sent"
+                )
+                + "; nothing more was sent. The record is now btc_locked with that contract's locator and this reason, "
+                "so the watchtower tracks it: refund it after its deadline (taker_refund_btc), or claim the covenant "
+                "if the maker reveals p"
+            )
+        self.record = dataclasses.replace(rec, fund_refusal=why)
+        saved = await self._save_tracked(sink)
+        recorded = "with the reason recorded" if saved else "(the reason is in memory only: nothing could save it)"
+        if may_hold_value:
+            return (
+                f"resume refused: {why}. The counter-leg contract {address} was already deployed for this swap and "
+                "may hold value, and this counter leg cannot rebuild its locator, so the record stays negotiated "
+                f"{recorded}. Recover it by its address ({address}) after its deadline"
+            )
+        return (
+            f"resume refused: {why}. The token contract {address} was deployed but no token push was sent, so it "
+            f"holds nothing; the record stays negotiated {recorded}"
+        )
 
     async def _assert_claim_reached_the_mempool(self) -> None:
         """Confirm the claim actually landed before treating the swap as claimed.

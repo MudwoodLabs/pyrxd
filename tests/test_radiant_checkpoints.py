@@ -32,6 +32,7 @@ _WORK = dict(
     last_interval_max_work=cp.LAST_INTERVAL_MAX_WORK["mainnet"],
     last_interval_max_work_height=cp.LAST_INTERVAL_MAX_WORK_HEIGHT["mainnet"],
     newest_checkpoint_work=cp.NEWEST_CHECKPOINT_WORK["mainnet"],
+    newest_checkpoint_header=cp.NEWEST_CHECKPOINT_HEADER["mainnet"],
 )
 
 
@@ -58,7 +59,7 @@ def test_hashes_are_lowercase_hex_and_distinct() -> None:
 
 
 def test_every_entry_was_deep_when_pinned() -> None:
-    assert all(cp.PINNED_AT_TIP["mainnet"] - h >= cp.MIN_DEPTH_BELOW_TIP >= 1000 for h, _ in MAINNET)
+    assert all(cp.PINNED_AT_TIP["mainnet"] - h >= cp.MIN_DEPTH_BELOW_TIP > refresh.MAX_REORG_DEPTH for h, _ in MAINNET)
     assert cp.PINNED_AT_TIP["mainnet"] - MAINNET[-1][0] < cp.MIN_DEPTH_BELOW_TIP + 2016, "a whole interval was skipped"
 
 
@@ -287,3 +288,15 @@ def test_the_node_interval_hook_asks_getblockhash_then_the_raw_header() -> None:
     got = refresh.node_interval(["ssh", "node.example.com", "radiant-cli"], 10, 12, run=run)
     assert got == {10: bytes.fromhex("ab" * 80), 11: bytes.fromhex("ab" * 80), 12: bytes.fromhex("ab" * 80)}
     assert ["getblockheader", A, "false"] in calls and ["getblockhash", "11"] in calls
+
+
+def test_the_newest_checkpoint_header_is_read_from_agreeing_sources_and_must_hash_to_it() -> None:
+    """The header the taker gate reads the checkpoint's timestamp from: taken from the reconciled
+    interval, and refused unless it hashes to the newest checkpoint."""
+    headers, table = _interval()
+    assert refresh.newest_checkpoint_header({"s1": headers, "node": dict(headers)}, table) == headers[460_570].hex()
+    flipped = bytes(headers[460_570][:-1]) + bytes([headers[460_570][-1] ^ 1])
+    with pytest.raises(refresh.Disagreement, match="does not hash to its checkpoint"):
+        refresh.newest_checkpoint_header({"s1": {**headers, 460_570: flipped}}, table)
+    with pytest.raises(refresh.Disagreement, match="disagree"):
+        refresh.newest_checkpoint_header({"s1": headers, "s2": {**headers, 460_570: flipped}}, table)

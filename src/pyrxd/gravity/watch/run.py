@@ -175,7 +175,10 @@ def _build_executor(args: argparse.Namespace, stack: contextlib.AsyncExitStack) 
         network=args.network,
         cap_sats=args.autonomous_refund_cap_sats,
         refund_spk=refund_spk,
-        accept_single_source=args.accept_single_source,
+        # Its OWN flag. --accept-single-source only lets the tower START below --rxd-quorum; folding
+        # this into it meant an operator who followed the startup refusal's suggestion had also, without
+        # choosing it, armed autonomous refunds on uncorroborated reads.
+        accept_single_source=args.auto_refund_on_single_source,
     )
     if broadcaster is not None:
         logger.warning(
@@ -183,7 +186,9 @@ def _build_executor(args: argparse.Namespace, stack: contextlib.AsyncExitStack) 
             "refunds; external audit is the gate before any non-dust use",
             args.network,
             args.autonomous_refund_cap_sats,
-            ", single-source accepted" if args.accept_single_source else "",
+            ", on single-source reads too (--auto-refund-on-single-source)"
+            if args.auto_refund_on_single_source
+            else "",
         )
     else:
         logger.info(
@@ -243,9 +248,10 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     FEWER SOURCES THAN ``--rxd-quorum`` REFUSES TO START, whatever the shortfall. It used to depend on
     the count: one effective source silently ran single-source while two against a quorum of three
     refused, so the operator who asked for the most corroboration with the least to give it was the
-    one told nothing. ``--accept-single-source`` (the existing opt-in to single-source operation) is
-    the way through: the tower then starts on what it has, with a WARNING naming those sources, and
-    a quorum clamped to their count (one source stays low-corroboration).
+    one told nothing. ``--accept-single-source`` is the way through: the tower then starts on what it
+    has, with a WARNING naming those sources, and a quorum clamped to their count (one source stays
+    low-corroboration). It does not arm the refund executor on single-source reads; that is
+    ``--auto-refund-on-single-source`` (:func:`_build_executor`).
     """
     sources: list[RxdChainSource] = []
     #: What each entry of ``sources`` is, for the quorum messages below.
@@ -945,9 +951,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--accept-single-source",
         action="store_true",
-        help="accept single-source operation: permit an autonomous refund on a single-source (low-corroboration) "
-        "read, and start with fewer RXD sources of distinct operators than --rxd-quorum (a WARNING names them) "
-        "instead of refusing",
+        help="start with fewer RXD sources of distinct operators than --rxd-quorum (a WARNING names them) "
+        "instead of refusing. It does NOT let the autonomous refund broadcast on a single-source read: that "
+        "is --auto-refund-on-single-source",
+    )
+    p.add_argument(
+        "--auto-refund-on-single-source",
+        action="store_true",
+        help="permit the autonomous refund (--refund-spk) to broadcast on a single-source (low-corroboration) "
+        "RXD read. Off by default: a single source's 'not locked' then pages instead of broadcasting. "
+        "Separate from --accept-single-source, which only lets the tower start",
     )
     return p
 

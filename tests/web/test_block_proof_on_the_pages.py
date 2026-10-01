@@ -1197,3 +1197,39 @@ class TestTheInspectPage:
         text = _flat(_harness(_INSPECT_RENDER_HARNESS, {"case": {"result": result}}, "-")["case"]["result_block"])
         card = text.split('"mark_anchor"')[0]
         assert expect in card and forbid not in card
+
+
+class TestTheProvedDepthSaysWhatWasLinkedHere:
+    """Panel finding (info): at the checkpoint level the proved depth counts every block up to the
+    NEWEST checkpoint pyrxd ships, while the page links headers only from the block to the first
+    checkpoint at or above it. "N confirmations verified here: the block itself and N-1 built on top"
+    claimed the page checked blocks it never linked."""
+
+    def _render(self, glue, classified, monkeypatch, table) -> tuple[dict, str]:
+        monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", table)
+        client = _server(C)
+        anchor = page_anchor(glue, C, client)
+        answer, _ = page_proof(glue, C, client, anchor)
+        settled = answer["anchor"]
+        assert settled["height_is_verified"] is True, settled
+        return settled, _flat(_verify_render(classified, C, settled)["text"])
+
+    def test_a_block_linked_to_a_checkpoint_below_the_newest_is_not_all_verified_here(
+        self, glue, classified, monkeypatch
+    ) -> None:
+        mid = C.height + 1
+        assert mid < C.tip, "the premise: a checkpoint between the block and the newest"
+        settled, text = self._render(glue, classified, monkeypatch, ((mid, C.hash_at(mid)), (C.tip, C.hash_at(C.tip))))
+        bv, n = settled["block_verification"], settled["verified_confirmations"]
+        assert bv["level"] == "checkpoint" and bv["checkpoint_height"] == mid and n == C.tip - C.height + 1
+        assert f"This page linked the block to the checkpoint at block {mid}" in text
+        assert "rest on pyrxd's checkpoint table" in text
+        assert "verified here: the block itself" not in text and "confirmations verified here" not in text
+
+    def test_a_block_linked_to_the_newest_checkpoint_is_all_verified_here(self, glue, classified, monkeypatch) -> None:
+        """The other branch: every block counted was linked by this page."""
+        settled, text = self._render(glue, classified, monkeypatch, ((C.tip, C.hash_at(C.tip)),))
+        n = settled["verified_confirmations"]
+        assert settled["block_verification"]["checkpoint_height"] == C.tip
+        assert f"with at least {n} confirmations verified here: the block itself" in text
+        assert "rest on pyrxd's checkpoint table" not in text
