@@ -259,9 +259,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the node); nothing for a record carrying a pending counter-leg deploy (a resumed fund), which was
     refused at construction while `pre_btc_lock_check` accepted it. The ETH runners now derive `t_rxd`
     when `--t-rxd-blocks` is omitted: the deadline's own floor plus the gate's modelled bound
-    (`eth_swap_run.py`, both stages: 2,577 at the 24 h default and a 36 s fast tail;
-    `eth_swap_grief_run.py`: 408 at its new 3 h default deadline, which replaces 1,800 s; the
-    smallest deadline it accepts is 9,522 s). A resume reuses the recorded `t_rxd`, and the
+    (`eth_swap_run.py`, both stages, at a 36 s fast tail: 577 at the new 4 h default deadline of
+    `--stage sepolia-dust` with a throwaway EVM leg, where the 24 h default gave 2,577 — about 9 days
+    of the maker's RXD at 300 s; a real token leg and the dry run keep 24 h. The smallest deadline it
+    accepts at the defaults is 9,702 s, so 2 h is refused; 4 h also leaves a fresh NFT/FT mint's two
+    confirmations of room before the run's coordinator is built. `eth_swap_grief_run.py`: 408 at its
+    new 3 h default deadline, which replaces 1,800 s; the smallest it accepts is 9,522 s). A resume reuses the recorded `t_rxd`, and the
     derivation's fallback is the smallest feasible value, not the BIP68 maximum. On a resume the
     `t_rxd` bounds' refusals no longer advise omitting `--t-rxd-blocks` or a "minimum" (omitting it
     reuses the recorded value, and any other builds a covenant that holds nothing): the recovery file

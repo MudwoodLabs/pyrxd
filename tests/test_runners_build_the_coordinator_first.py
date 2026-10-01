@@ -785,3 +785,49 @@ def test_every_doc_example_that_builds_a_coordinator_passes_the_wall_clock():
     assert len(calls) >= 2, calls
     missing = [str(doc) for doc, call in calls if "now_unix_s=" not in call]
     assert not missing, missing
+
+
+async def test_the_sepolia_dust_default_deadline_is_the_shortest_that_holds_with_room_for_a_mint(tmp_path, monkeypatch):
+    """``eth_swap_run.py --stage sepolia-dust`` defaulted to a 24 h deadline, and since ``t_rxd`` is derived
+    from it at the fast tail that locked the maker's RXD for about 2,577 blocks. With a throwaway EVM leg
+    it defaults to 4 h now (a real token leg, and the dry run, keep 24 h). Through the runner: the default
+    constructs and passes steps 3, 6 and 7 at the modelled maximum (the parametrized test above) with a
+    ``t_rxd`` under 600; 2 h is refused at construction, before anything moves, because the taker's gate can
+    first accept the funding too near that deadline; and the smallest deadline that constructs leaves a
+    fresh mint's two confirmations (at the gate's ε) of room under the default."""
+    import json
+
+    mod = _load("eth_swap_run")
+    monkeypatch.setattr(sys, "argv", _eth_argv(tmp_path))
+    assert mod._args().eth_timeout_s == 14_400
+    monkeypatch.setattr(sys, "argv", _real_token_argv(tmp_path))
+    assert mod._args().eth_timeout_s == 86_400
+    dry = ["eth_swap_run.py", "--stage", "dry-run", "--keys-out", str(tmp_path / "d.json")]
+    monkeypatch.setattr(sys, "argv", dry)
+    assert mod._args().eth_timeout_s == 86_400
+
+    argv = _eth_argv(tmp_path / "default")
+    (tmp_path / "default").mkdir()
+    events, outcome = await _drive_eth(tmp_path / "default", monkeypatch)
+    assert outcome == "stopped at wait_for_covenant_funding" and "judged:ok" in events, (outcome, events)
+    keys = json.loads(Path(argv[argv.index("--keys-out") + 1]).read_text())
+    assert keys["eth_timeout_unix_s"] - keys["created_unix"] in range(14_399, 14_402)
+    assert keys["t_rxd_blocks"] < 600, keys["t_rxd_blocks"]
+
+    with pytest.raises(SystemExit, match=r"(?s)refused before anything is minted.*first accept the funding.*too near"):
+        await _drive_eth(tmp_path, monkeypatch, "--eth-timeout-s", "7200")
+
+    async def constructs(deadline_s: int) -> bool:
+        try:
+            await _drive_eth(tmp_path / f"probe-{deadline_s}", monkeypatch, "--eth-timeout-s", str(deadline_s))
+        except SystemExit:
+            return False
+        return True
+
+    lo, hi = 7_200, 14_400
+    assert await constructs(hi)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (lo, mid) if await constructs(mid) else (mid, hi)
+    two_confirmations = funding_spv.erlang_upper_quantile_s(2, spacing_s=300, epsilon=1e-3)
+    assert hi + two_confirmations <= 14_400, (hi, two_confirmations)

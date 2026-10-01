@@ -1754,6 +1754,29 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         await rpc.close()
 
 
+#: ``--stage sepolia-dust``'s default ETH deadline with a throwaway EVM leg (Sepolia ETH, a testnet
+#: token). ``t_rxd`` is derived from the deadline at the measured fast tail, so 24 h derived about 2,577
+#: blocks — about 9 days of the maker's RXD at the nominal 300 s. Not 2 h: the coordinator refuses
+#: anything below 9,702 s at the defaults, because the taker's gate can first accept the maker's funding
+#: as late as 8,537 s after construction (k = 6 blocks at the ε = 1e-3 quantile, 4,937 s, plus 3,600 s)
+#: and the deadline must still clear the claim floor then (1,164 s: finality 768 + stall 0 + rounding
+#: 300 + claim inclusion 96). 4 h also covers a fresh NFT/FT mint (two confirmations, 2,771 s at the same
+#: ε) spent between fixing the deadline and building the run's coordinator, with room for the
+#: operator's broadcast prompts.
+_SEPOLIA_DUST_DEFAULT_ETH_TIMEOUT_S = 14_400
+
+#: The default ETH deadline for a real token leg (both legs carry value; its measured margins and the
+#: value-scaled gate need more) and for the dry run.
+_DEFAULT_ETH_TIMEOUT_S = 86_400
+
+
+def _default_eth_timeout_s(args: argparse.Namespace) -> int:
+    """``--eth-timeout-s`` when it is not passed (see the two constants above)."""
+    if args.stage == "sepolia-dust" and not _token_leg_is_real(args):
+        return _SEPOLIA_DUST_DEFAULT_ETH_TIMEOUT_S
+    return _DEFAULT_ETH_TIMEOUT_S
+
+
 def _args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="ETH↔RXD dust swap runner (Sepolia↔RXD-mainnet)")
     ap.add_argument("--stage", choices=["dry-run", "sepolia-dust"], required=True)
@@ -1802,7 +1825,16 @@ def _args() -> argparse.Namespace:
         default=1_000_000,
         help="ERC-20 amount in BASE UNITS (USDC is 6-decimal: 1_000_000 == 1.00 USDC). Not wei.",
     )
-    ap.add_argument("--eth-timeout-s", type=int, default=86_400)  # 1 day ETH refund deadline
+    ap.add_argument(
+        "--eth-timeout-s",
+        type=int,
+        default=None,
+        help=(
+            "the ETH refund deadline, seconds from now. Default: 4 h on stage=sepolia-dust with a throwaway "
+            "EVM leg (t_rxd is derived from it at the fast tail, so a longer deadline locks the maker's RXD "
+            "longer); 24 h for a real token leg and for the dry run."
+        ),
+    )
     # RXD
     ap.add_argument("--rxd-photons", type=int, default=1000)
     # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
@@ -1913,6 +1945,8 @@ def _args() -> argparse.Namespace:
     args = ap.parse_args()
     if args.stage == "sepolia-dust":
         require_rxd_node_args(ap, args)
+    if args.eth_timeout_s is None:
+        args.eth_timeout_s = _default_eth_timeout_s(args)
     resolve_eth_key_file(args)
     # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);
