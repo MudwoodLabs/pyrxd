@@ -808,10 +808,9 @@ def test_a_local_clock_behind_the_chain_is_refused_not_clamped(monkeypatch):
 
 
 def test_an_honest_clock_behind_the_newest_headers_own_timestamp_but_not_the_median_passes(monkeypatch):
-    """The refusal compared ``now`` with the NEWEST header's own timestamp, which can sit ahead of the
-    local clock, so an honest clock a minute behind a newest header stamped two hours ahead was refused
-    for about a block. The median of the newest headers is the reference now: that clock passes, and a
-    clock behind the median is still refused."""
+    """The refusal compared ``now`` with the NEWEST header's own timestamp alone, so an honest clock a
+    minute behind that one header's stamp was refused. The median of the newest headers is the reference
+    now: that clock passes, and a clock behind the median is still refused."""
     base, _chain = _value_bearing_chain(monkeypatch)
     spk = b"\x76\xa9" + bytes(32)
     probe = build_funding_chain(spk=spk, value=1000, confs=40, base=base, bits=_HARD_BITS, tip_time=_NOW)
