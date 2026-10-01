@@ -538,7 +538,9 @@ def test_status_survives_a_counter_leg_read_failure(swap, monkeypatch) -> None:
     res = _status(swap)
     assert res.exit_code == 0, res.output
     assert "Counter-leg (BTC): ERROR" in res.output
-    assert "explorer down" in res.output
+    # The type, never the library's own text: that text can quote a keyed endpoint URL.
+    assert "counter-leg read failed: RuntimeError" in res.output
+    assert "explorer down" not in res.output
     assert "situation" in res.output  # the covenant verdict still made it out
 
 
@@ -623,10 +625,12 @@ def test_online_eth_recovery_fetches_verifies_and_prints(swap, monkeypatch, no_r
 
 
 def test_online_eth_recovery_reports_no_claim_activity(swap, monkeypatch, no_real_http) -> None:
+    # An empty log set is inconclusive (exit 2), never "no preimage has been revealed yet".
     monkeypatch.setattr(swap_recovery_cmds, "fetch_eth_claim_artifacts", AsyncMock(return_value=(None, [])))
     res = _recover(_eth_swap(swap), "--eth-contract", ETH_CONTRACT, "--eth-rpc-url", "http://x")
-    assert res.exit_code == 1
-    assert "no retrievable claim activity" in res.output
+    assert res.exit_code == 2, res.output
+    assert "inconclusive" in res.output
+    assert "no preimage has been revealed yet" not in res.output
 
 
 def test_eth_recovery_needs_a_contract_and_an_rpc_url(swap) -> None:
@@ -858,6 +862,59 @@ class _SpentCovenantClient(_NoBroadcastClient):
         return [{"tx_hash": "ef" * 32, "height": 100}] if sh == self._cov_sh else []
 
 
+def _funding_and_spend(swap, kind: str) -> tuple[Any, Any]:
+    """A real funding transaction paying the covenant, and a real spend of it by ``kind``.
+
+    Built by the production builders (``build_htlc_claim_tx`` / ``build_htlc_refund_tx``), so the
+    covenant input's unlocking script is exactly what a mined claim or refund carries."""
+    from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    cov = swap["cov"]
+    funding = Transaction(
+        tx_inputs=[TransactionInput(source_txid="ee" * 32, source_output_index=0, unlocking_script=Script(b"\x51"))],
+        tx_outputs=[TransactionOutput(Script(cov.funded_spk), 100_000)],
+    )
+    fee_key = swap["fee_key"]
+    fee_spk = b"\x76\xa9\x14" + bytes(fee_key.public_key().hash160()) + b"\x88\xac"
+    fee = FeeInput(txid="cd" * 32, vout=1, value=FEE_VALUE, scriptpubkey=fee_spk, wif=fee_key.wif())
+    outpoint = f"{funding.txid()}:0"
+    if kind == "claim":
+        spend = build_htlc_claim_tx(
+            covenant=cov, covenant_outpoint=outpoint, carrier_value=100_000, preimage=P, fee=fee
+        )
+    else:
+        spend = build_htlc_refund_tx(covenant=cov, covenant_outpoint=outpoint, carrier_value=100_000, fee=fee)
+    return funding, spend
+
+
+class _SpentByClient(_NoBroadcastClient):
+    """ElectrumX for a covenant funded by ``funding`` and spent by ``spend`` — real transactions."""
+
+    def __init__(self, swap, funding: Any, spend: Any, *, tip: int = 130, serve_spend: bool = True) -> None:
+        super().__init__({}, tip=tip)
+        self._cov_sh = swap["cov_sh"]
+        self._txs = {funding.txid(): funding.serialize()}
+        if serve_spend:
+            self._txs[spend.txid()] = spend.serialize()
+        self._history = [{"tx_hash": funding.txid(), "height": 100}, {"tx_hash": spend.txid(), "height": 125}]
+
+    async def get_history(self, sh):
+        return self._history if sh == self._cov_sh else []
+
+    async def get_transaction(self, txid):
+        if txid not in self._txs:
+            raise OSError(f"transaction {txid} not found")
+        return self._txs[txid]
+
+
+def _spent_by(swap, kind: str, **kw: Any) -> _SpentByClient:
+    return _SpentByClient(swap, *_funding_and_spend(swap, kind), **kw)
+
+
 _OUTPOINT = f"{OUR_FUNDING.txid}:{OUR_FUNDING.vout}"
 
 #: An explorer that says SPENT but does not say by what. Each one used to read as UNSPENT.
@@ -967,10 +1024,13 @@ def test_both_legs_spent_still_reads_settled(swap, monkeypatch) -> None:
     raw = _claim_tx()
     spender = btc_txid_from_raw(raw)
     _serve(monkeypatch, _FakeEsplora({"spent": True, "txid": spender}, tx_hex={spender: raw.hex()}))
-    res = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130))
+    # The taker claimed the covenant (a real claim spend) and the maker claimed the BTC with p.
+    res = _checked_status(swap, client=_spent_by(swap, "claim"))
     assert res.exit_code == 0, res.output
     assert "Counter-leg (BTC): CLAIMED_PREIMAGE_REVEALED" in res.output
+    assert "spent by   : TAKER_CLAIM" in res.output
     assert "situation  : SETTLED" in res.output
+    assert "The swap COMPLETED" in res.output
     assert "No further action" in res.output
     # SETTLED rests on the explorer's word that the leg is spent; the text says whose, as LOCKED does.
     assert "esplora.example reports the BTC leg claimed with p" in res.output
@@ -983,15 +1043,17 @@ def test_a_settled_swap_on_a_refunded_counter_leg_names_the_one_server_that_said
     raw = _refund_tx()
     spender = btc_txid_from_raw(raw)
     _serve(monkeypatch, _FakeEsplora({"spent": True, "txid": spender}, tx_hex={spender: raw.hex()}))
-    res = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130))
+    # Both refunded: the maker CSV-refunded the covenant and the taker refunded the BTC.
+    res = _checked_status(swap, client=_spent_by(swap, "refund"))
     assert res.exit_code == 0, res.output
     assert "Counter-leg (BTC): SPENT_NO_PREIMAGE" in res.output
     assert "situation  : SETTLED" in res.output
+    assert "ABORTED and both sides refunded" in res.output
     assert "esplora.example reports the BTC leg spent by a transaction that reveals no preimage" in res.output
     assert "one server's answer, not a verified fact" in res.output
     assert "DO-NOT-PRINT" not in res.output
 
-    js = _checked_status(swap, client=_SpentCovenantClient(swap["cov_sh"], tip=130), output_mode="json")
+    js = _checked_status(swap, client=_spent_by(swap, "refund"), output_mode="json")
     doc = json.loads(js.output)
     assert doc["counter_leg"]["source"] == "esplora.example"
     assert "esplora.example reports" in doc["chain"]["next_action"]

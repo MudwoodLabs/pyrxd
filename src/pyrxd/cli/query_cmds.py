@@ -24,6 +24,7 @@ import click
 
 from ..hd.wallet import HdWallet
 from ..network.electrumx import script_hash_for_address
+from ..network.redaction import redacted_url
 from ..security.errors import NetworkError
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
@@ -92,13 +93,13 @@ def refuse_if_incomplete(ctx: CliContext, unread: Sequence[str], used: int, *, w
     """
     if not unread:
         return
-    endpoint_fix = f"retry, or check that {ctx.electrumx_url} is reachable, or use --electrumx URL"
+    reach_fix = f"retry, or check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL"
     if len(unread) >= used:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=f"{len(unread)} of {used} used address reads failed, and an address that could not be read "
             "is not an empty one",
-            fix=endpoint_fix,
+            fix=reach_fix,
         )
     if ctx.output_mode == "human":
         if view:
@@ -110,7 +111,7 @@ def refuse_if_incomplete(ctx: CliContext, unread: Sequence[str], used: int, *, w
     raise NetworkBoundaryError(
         f"{what} is incomplete: {len(unread)} of this wallet's {used} used addresses could not be read",
         cause="an address whose read failed is not an empty one",
-        fix=endpoint_fix,
+        fix=reach_fix,
     )
 
 
@@ -198,7 +199,7 @@ def _scan_or_refuse(ctx: CliContext, wallet: HdWallet) -> None:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=f"{exc}; an address this command cannot show has no history is not handed out",
-            fix=f"retry, or check that {ctx.electrumx_url} is reachable, or use --electrumx URL; "
+            fix=f"retry, or check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL; "
             "--index N prints a specific address without reading the network",
         ) from exc
 
@@ -268,7 +269,7 @@ def balance_cmd(ctx: CliContext, refresh: bool, passphrase: bool) -> None:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL",
         ) from exc
 
     confirmed = sum(int(c) for _address, (c, _u) in reads.answered)
@@ -340,7 +341,7 @@ def utxos_cmd(ctx: CliContext, min_photons: int, addr: str | None, passphrase: b
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL",
         ) from exc
 
     if addr:

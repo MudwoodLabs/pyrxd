@@ -57,6 +57,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..security.errors import TlsPinMismatchError, ValidationError
+from .redaction import redacted_url
 
 __all__ = [
     "PIN_PREFIX",
@@ -138,7 +139,7 @@ def assert_pin_matches(cert_der: bytes, pins: Sequence[str], *, url: str = "") -
         raise ValidationError("assert_pin_matches called with no pins configured")
     observed = spki_pin_from_cert_der(cert_der)
     if observed not in accepted:
-        where = f" for {url}" if url else ""
+        where = f" for {redacted_url(url)}" if url else ""
         raise TlsPinMismatchError(
             f"TLS SPKI pin mismatch{where}: server presented {observed}, "
             f"configured pins are {', '.join(accepted)}. "
@@ -180,7 +181,7 @@ def verify_connection_pin(connection: Any, pins: Sequence[str], *, url: str = ""
     """
     cert_der = peer_certificate_der(connection)
     if cert_der is None:
-        where = f" for {url}" if url else ""
+        where = f" for {redacted_url(url)}" if url else ""
         raise TlsPinMismatchError(
             f"TLS SPKI pinning is enabled{where} but no peer certificate is available "
             "(is the endpoint plaintext ws://?). Refusing to continue unverified."

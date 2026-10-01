@@ -86,6 +86,7 @@ from .errors import UserError
 from .format import emit, sanitize_terminal
 from .glyph_helpers import _BroadcastSummary, _confirm_or_abort
 from .prompts import _load_wallet
+from .swap_recovery import electrumx_urls, redact_endpoint_secrets
 
 # Fee sizing ---------------------------------------------------------------------
 #
@@ -492,7 +493,10 @@ def swap_orders_cmd(ctx: CliContext, token: str, want: bool, node_rpc: str, rpc_
     except RxdSdkError as exc:
         # The error text can embed a hostile node's RPC message — strip terminal-control bytes so it can't
         # inject ANSI/cursor sequences that spoof or hide CLI output (review MEDIUM).
-        raise click.ClickException(f"orderbook read failed: {sanitize_terminal(str(exc), max_len=300)}") from exc
+        raise click.ClickException(
+            "orderbook read failed: "
+            + sanitize_terminal(redact_endpoint_secrets(str(exc), (node_rpc, *electrumx_urls(ctx))), max_len=300)
+        ) from exc
 
     payload = {"token": token, "side": "want" if want else "offer", "count": len(rows), "orders": rows}
     if ctx.output_mode in ("json", "quiet"):
@@ -1033,5 +1037,7 @@ def _finish(ctx: CliContext, run, *, quiet_field: str) -> None:
         raise
     except RxdSdkError as exc:
         # Strip terminal-control bytes: the message can carry a hostile node/server string (review MEDIUM).
-        raise click.ClickException(sanitize_terminal(str(exc), max_len=300)) from exc
+        raise click.ClickException(
+            sanitize_terminal(redact_endpoint_secrets(str(exc), electrumx_urls(ctx)), max_len=300)
+        ) from exc
     click.echo(emit(payload, mode=ctx.output_mode, quiet_field=quiet_field))

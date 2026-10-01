@@ -110,18 +110,32 @@ def test_classify_spent_alone_is_not_settled():
 
 
 @pytest.mark.parametrize(
-    ("counter", "expected"),
+    ("spend", "counter", "expected"),
     [
-        ("CLAIMED_PREIMAGE_REVEALED", "SETTLED"),
-        ("SPENT_NO_PREIMAGE", "SETTLED"),
-        ("LOCKED", "COUNTER_LEG_LOCKED"),
-        ("NOT_CHECKED", "COVENANT_SPENT"),
-        ("ERROR", "COVENANT_SPENT"),
+        ("TAKER_CLAIM", "CLAIMED_PREIMAGE_REVEALED", "SETTLED"),
+        ("MAKER_REFUND", "SPENT_NO_PREIMAGE", "SETTLED"),
+        # The taker lost both legs; this used to read SETTLED "nothing left to claim or refund".
+        ("MAKER_REFUND", "CLAIMED_PREIMAGE_REVEALED", "MAKER_REFUNDED_AND_CLAIMED"),
+        ("TAKER_CLAIM", "SPENT_NO_PREIMAGE", "TAKER_CLAIMED_AND_REFUNDED"),
+        # The covenant's spend could not be read: both spent is not a confirmed settlement.
+        (None, "CLAIMED_PREIMAGE_REVEALED", "BOTH_SPENT_OUTCOME_UNKNOWN"),
+        ("UNKNOWN", "SPENT_NO_PREIMAGE", "BOTH_SPENT_OUTCOME_UNKNOWN"),
+        (None, "LOCKED", "COUNTER_LEG_LOCKED"),
+        ("MAKER_REFUND", "LOCKED", "COUNTER_LEG_LOCKED"),
+        ("TAKER_CLAIM", "LOCKED", "COUNTER_LEG_LOCKED"),
+        (None, "NOT_CHECKED", "COVENANT_SPENT"),
+        ("MAKER_REFUND", "UNKNOWN", "COVENANT_SPENT"),
+        (None, "ERROR", "COVENANT_SPENT"),
     ],
 )
-def test_classify_spent_is_settled_only_when_the_counter_leg_is_resolved(counter, expected):
+def test_classify_spent_is_settled_only_when_both_spends_are_known_and_consistent(spend, counter, expected):
     sit, action = classify_covenant(
-        covenant_state="spent", funding_height=None, now_height=None, t_rxd_blocks=20, counter_leg_state=counter
+        covenant_state="spent",
+        funding_height=None,
+        now_height=None,
+        t_rxd_blocks=20,
+        counter_leg_state=counter,
+        covenant_spend_kind=spend,
     )
     assert sit == expected
     assert ("No further action" in action) is (expected == "SETTLED")

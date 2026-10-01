@@ -345,6 +345,10 @@ _NOT_SOURCE_IDENTITY: dict[tuple[str, str], str] = {
         "canonical_host but not source_key on purpose: source_key keys an unparseable URL by its "
         "whole text, and printing that could print an API key carried in an RPC URL"
     ),
+    ("src/pyrxd/network/redaction.py", "redacted_url"): (
+        "a DISPLAY form (scheme://host:port) for naming an endpoint in a message without its "
+        "credentials; nothing is counted, and it must keep the port the operator typed"
+    ),
 }
 
 #: Inside a counting site, any of these is the site building its own identity: case-folding text,

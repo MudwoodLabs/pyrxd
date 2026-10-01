@@ -70,6 +70,7 @@ from urllib.parse import urlsplit
 
 from ..constants import GENESIS_BLOCK_HASHES, genesis_hash_for
 from ..security.errors import ValidationError
+from .redaction import redacted_url
 from .source_identity import _canonical_host_of, canonical_host, registered_domain, require_one_key_per_host, source_key
 from .tls_pin import normalize_pin
 
@@ -173,7 +174,7 @@ def shipped_operator_domains() -> Mapping[str, str]:
             recorded = KNOWN_OPERATORS.get(registered_domain(host) or "")
             if recorded != endpoint.operator:
                 raise ValidationError(
-                    f"shipped {network} endpoint {endpoint.url!r} declares operator {endpoint.operator!r}, "
+                    f"shipped {network} endpoint {redacted_url(endpoint.url)!r} declares operator {endpoint.operator!r}, "
                     f"but KNOWN_OPERATORS records its domain as {recorded!r}"
                 )
     return MappingProxyType(dict(KNOWN_OPERATORS))
@@ -245,14 +246,14 @@ class Endpoint:
         url = self.url.strip()
         object.__setattr__(self, "url", url)
         if not (url.startswith("wss://") or url.startswith("ws://")):
-            raise ValidationError(f"endpoint url must start with wss:// or ws:// (got {url.split(':', 1)[0]!r})")
+            raise ValidationError(f"endpoint url must start with wss:// or ws:// (got {redacted_url(url)})")
         try:
             urlsplit(url)
         except ValueError as exc:  # e.g. "wss://[::1": an unclosed IPv6 bracket (#754)
             raise ValidationError(f"endpoint url is malformed: {exc}") from exc
         if url.startswith("ws://") and not self.allow_insecure:
             raise ValidationError(
-                f"insecure endpoint {url!r} rejected. Use wss://, or set allow_insecure for this network."
+                f"insecure endpoint {redacted_url(url)} rejected. Use wss://, or set allow_insecure for this network."
             )
         if self.spki_pins and url.startswith("ws://"):
             raise ValidationError("TLS SPKI pinning is meaningless on a plaintext ws:// endpoint")

@@ -112,6 +112,7 @@ from ..network.confirm import (
     wait_for_confirmation,
 )
 from ..network.electrumx import verified_broadcast_txid
+from ..network.redaction import redacted_url
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata
 from ..security.errors import (
@@ -329,7 +330,7 @@ def mint_nft_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     _echo_mint_result(ctx, result)
@@ -464,7 +465,7 @@ def resume_mint_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable, then run resume-mint again",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable, then run resume-mint again",
         ) from exc
     _echo_mint_result(ctx, result)
 
@@ -2369,7 +2370,7 @@ def deploy_ft_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     if ctx.output_mode == "json":
@@ -2627,7 +2628,7 @@ def transfer_ft_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     if ctx.output_mode == "json":
@@ -3186,7 +3187,7 @@ def airdrop_ft_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     if ctx.output_mode == "json":
@@ -3325,7 +3326,7 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     if ctx.output_mode == "json":
@@ -3496,7 +3497,7 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
     if inconsistent:
         # Nothing is listed, not even what the other addresses returned: they came from the same
@@ -3504,7 +3505,7 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
         raise NetworkBoundaryError(
             "the ElectrumX server's answer contradicts its own transactions",
             cause=inconsistent[0] + (f" ({len(inconsistent) - 1} more like it)" if len(inconsistent) > 1 else ""),
-            fix=f"use a different endpoint (--electrumx URL); {ctx.electrumx_url} listed something as this wallet's "
+            fix=f"use a different endpoint (--electrumx URL); {redacted_url(ctx.electrumx_url)} listed something as this wallet's "
             "that its own transaction shows is not",
         )
 
@@ -3930,7 +3931,9 @@ def deploy_dmint_cmd(
         result = asyncio.run(_do())
     except NetworkError as exc:
         raise NetworkBoundaryError(
-            "could not reach ElectrumX", cause=str(exc), fix=f"check that {ctx.electrumx_url} is reachable"
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     if ctx.output_mode == "json":
@@ -4609,7 +4612,9 @@ def claim_dmint_cmd(
         contract_utxo, funding, miner_key, miner_pkh = asyncio.run(_read())
     except NetworkError as exc:
         raise NetworkBoundaryError(
-            "could not reach ElectrumX", cause=str(exc), fix=f"check that {ctx.electrumx_url} is reachable"
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     # Gate ONCE here — before the multi-minute grind. All value facts (contract,
@@ -4784,7 +4789,7 @@ def claim_dmint_cmd(
         raise NetworkBoundaryError(
             "could not broadcast the mint",
             cause=str(exc),
-            fix=f"re-broadcast the signed hex (stderr) via {ctx.electrumx_url}",
+            fix=f"re-broadcast the signed hex (stderr) via {redacted_url(ctx.electrumx_url)}",
         ) from exc
 
     result = {
