@@ -106,9 +106,9 @@ not checked. All 15 were fixed in the change that added the rule. Two needed mor
 than a new line number: ``pre_btc_lock_gate`` is not a function in pyrxd, and
 Glyph spec §16.4 described a ``COMMIT_SCRIPT_RE`` that 0.25.0 had changed.
 
-What the symbol rule cannot see: a citation with no name beside it; a citation
-for a list of names; a bare ``:N`` citation with no file named before it (see
-below); a citation sharing its backticks with more ranges (```x.py:10, 40-41```); a
+What the symbol rule cannot see: a citation with no name beside it (outside a
+keyed table row, below); a citation for a list of names; a citation sharing its
+backticks with more ranges (```x.py:10, 40-41```), except through the row rule; a
 citation that drifted WITHIN its definition (a line of a long function that now
 lands on a different line of the same function); a C++ citation that lands on a
 call rather than the definition, since the occurrence rule accepts both; a real
@@ -127,10 +127,40 @@ A doc often cites a second line of the same file as a bare ``:N`` in backticks
 Glyph spec had drifted off their code when #773 was reviewed. A bare ``:N`` reads
 the file most recently NAMED before it (in backticks, with or without a line) on
 the same line, or else earlier in the same paragraph; a table row does not
-inherit from the row above it, whose file is usually a column's, not a row's. A
-bare ``:N`` with no file named before it is not checked. Once attributed, a bare
-citation is an ordinary one: the blank-line gate reads it, and so does the
-symbol rule when a code name is written beside it.
+inherit from the row above it, whose file is usually a column's, not a row's. Once
+attributed, a bare citation is an ordinary one: the blank-line gate reads it, and
+so does the symbol rule when a code name is written beside it.
+
+A bare ``:N`` with no file named before it is REFUSED in the published docs
+(``test_every_bare_citation_names_its_file``). It used to pass unchecked, and that
+is where most of the handshake spec's rot hid: its ``terms`` and finality tables
+cited ``:288-289``, ``:1517`` and so on with no file in the row, so no rule read
+them, and #815/#817 moved every one onto unrelated code (two past the end of the
+file they were meant for). Writing the file costs one word and makes every rule
+below apply. ``docs/solutions/`` is not held to this, for the same reason it is
+outside the blank-line gate.
+
+Table rows
+----------
+A row whose first cell is exactly one code name (```rxd_claim_burial```, or
+```maker_stall_safety_window_blocks` (`N`)``) is ABOUT that name, so a citation in a
+later cell of the row that names no symbol of its own must have the key in its
+cited lines (``check_row_key``). It is the occurrence rule, not the definition
+rule: a field's row may cite the line that validates it as well as the line that
+declares it.
+
+Measured on ``docs/htlc-handshake-wire-format.md`` as it stood at 6f44969e, where
+every rule above passed it: the row rule refuses 4 citations, the unattributed-bare
+rule 16, and reading further ranges 1 more (``swap_state.py:16-19, 516-517``, whose
+second range had drifted onto a blank line) — 21 in all. The spec had more drifted
+citations than that, in prose with no name beside them; see the note at the bottom.
+
+Further ranges
+--------------
+``x.py:10, 40-41`` is two citations. Only ``:10`` used to be read, so ``40-41``
+could point anywhere, including past the end of the file. Every range is now a
+citation of its own: the blank-line gate reads each, and so does the row rule. None
+of them names a symbol (the citation's subject is not one name).
 
 Measured when bare citations were first read (#773, with a symbol check of its
 own that the symbol rule above has replaced), on the docs as they stood then: 39
@@ -215,6 +245,17 @@ _FILE_MENTION_RE = re.compile(
 
 #: A bare continuation citation, ``:N`` or ``:N-M`` alone in backticks. It names no file.
 _BARE_RE = re.compile(r"`:(\d+)(?:-(\d+))?`")
+
+#: A further range of the same citation: the ``, 40-41`` in ``x.py:10, 40-41``. Matched at the
+#: end of a ``_CITE_RE`` match, repeatedly; no backtick can intervene, so it never leaves the
+#: citation's own code span.
+_MORE_RE = re.compile(r",[ \t]*(\d+)(?:-(\d+))?(?![\d.])")
+
+#: A table row's first cell holding exactly one code name, optionally followed by a short
+#: parenthetical alias: ``| `rxd_claim_burial` |`` or ``| `maker_stall_safety_window_blocks` (`N`) |``.
+_ROW_KEY_RE = re.compile(
+    r"\A[ \t]*\|[ \t]*`(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\(\))?`[ \t]*(?:\([^|\n]*\))?[ \t]*\|"
+)
 
 #: Citations that name a file this repository does not contain, with why.
 #:
@@ -311,6 +352,10 @@ class Citation:
     symbol: str | None = None
     #: Written as a bare ``:N``; ``target`` is the file named before it (see the module docstring).
     bare: bool = False
+    #: The code name a table row is ABOUT, when this citation sits in a later cell of a row whose
+    #: first cell is that one name (```name``` or ```name` (`alias`)``). See "Table rows" in the
+    #: module docstring. ``None`` outside such a row.
+    row_key: str | None = None
 
     @property
     def where(self) -> str:
@@ -443,19 +488,51 @@ def citations_in(doc: str, text: str) -> list[Citation]:
     """
     found: list[Citation] = []
     for match in _CITE_RE.finditer(text):
+        doc_line = text.count("\n", 0, match.start()) + 1
+        key = _row_key_at(text, match.start())
         found.append(
             Citation(
                 doc=doc,
-                doc_line=text.count("\n", 0, match.start()) + 1,
+                doc_line=doc_line,
                 text=match.group(0),
                 target=match.group(1),
                 start=int(match.group(3)),
                 end=int(match.group(4)) if match.group(4) else None,
                 symbol=symbol_named_by(text, match.start(), match.end()),
+                row_key=key,
             )
         )
+        # ``x.py:10, 40-41``: every further range is a citation of the same file. Before these
+        # were read, only ``:10`` was checked and ``40-41`` could point anywhere. A multi-range
+        # citation names no single symbol (``symbol_named_by``), so these carry none either.
+        pos = match.end()
+        while more := _MORE_RE.match(text, pos):
+            found.append(
+                Citation(
+                    doc=doc,
+                    doc_line=doc_line,
+                    text=f"{match.group(1)}:{more.group(0).lstrip(', ')}",
+                    target=match.group(1),
+                    start=int(more.group(1)),
+                    end=int(more.group(2)) if more.group(2) else None,
+                    row_key=key,
+                )
+            )
+            pos = more.end()
     found.extend(_bare_citations_in(doc, text))
     return sorted(found, key=lambda c: c.doc_line)
+
+
+def _row_key_at(text: str, offset: int) -> str | None:
+    """The code name the table row holding ``text[offset]`` is about, if the citation is in a
+    LATER cell of a row whose first cell is that one name (``_ROW_KEY_RE``); else ``None``."""
+    line_start = text.rfind("\n", 0, offset) + 1
+    line_end = text.find("\n", offset)
+    line = text[line_start : len(text) if line_end == -1 else line_end]
+    key = _ROW_KEY_RE.match(line)
+    if key is None or offset - line_start < key.end():
+        return None  # not a keyed row, or the citation is in the key cell itself
+    return _code_name(key.group("name"))
 
 
 def _bare_citations_in(doc: str, text: str) -> list[Citation]:
@@ -497,10 +574,27 @@ def _bare_citations_in(doc: str, text: str) -> list[Citation]:
                     # Inside the backticks, as symbol_named_by expects of a citation.
                     symbol=symbol_named_by(text, offset + match.start() + 1, offset + match.end() - 1),
                     bare=True,
+                    row_key=_row_key_at(text, offset + match.start()),
                 )
             )
         offset += len(line) + 1
     return found
+
+
+def unattributed_bare_citations(doc: str, text: str) -> list[str]:
+    """Every bare ``:N`` in *text* that no file named before it attributes, as ``doc:line `:N```.
+
+    The complement of ``_bare_citations_in``, computed from it rather than by a second copy of
+    the attribution rule, so the two cannot disagree about what "attributed" means.
+    """
+    attributed = {(c.doc_line, c.start, c.end) for c in _bare_citations_in(doc, text)}
+    out: list[str] = []
+    for lineno, line in enumerate(text.split("\n"), 1):
+        for match in _BARE_RE.finditer(line):
+            end = int(match.group(2)) if match.group(2) else None
+            if (lineno, int(match.group(1)), end) not in attributed:
+                out.append(f"{doc}:{lineno} {match.group(0)}")
+    return out
 
 
 def _citations(docs: list[str] | None = None) -> list[Citation]:
@@ -833,6 +927,34 @@ def check_symbol(cit: Citation, path: str, source: str) -> tuple[str, str | None
     return "occurrence", (f"{cit.where}: `{cit.symbol}` does not appear in `{cit.text}` ({path}); {elsewhere}.")
 
 
+def check_row_key(cit: Citation, path: str, source: str) -> str | None:
+    """Return a problem for a citation in a keyed table row whose cited lines never mention the key.
+
+    The rule is occurrence, never definition: a row about a field legitimately cites the line that
+    VALIDATES it (``hashlock`` at ``object.__setattr__(self, "hashlock", _b32(...))``), not only
+    the line that declares it. What it refuses is a citation whose lines do not mention the row's
+    subject at all, which is what every drifted row in the handshake spec looked like: real,
+    non-blank code about something else.
+    """
+    assert cit.row_key is not None, "only a citation in a keyed row has a key to check"
+    last = cit.row_key.split(".")[-1]
+    first, final = cit.start, cit.end if cit.end is not None else cit.start
+    lines = source.splitlines()
+    word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(last)}(?![A-Za-z0-9_])")
+    if any(word.search(line) for line in lines[first - 1 : final]):
+        return None
+    seen = [n for n, line in enumerate(lines, 1) if word.search(line)]
+    where = (
+        f"it does appear at line(s) {', '.join(map(str, seen[:5]))}{' …' if len(seen) > 5 else ''}"
+        if seen
+        else "it appears nowhere in that file"
+    )
+    return (
+        f"{cit.where}: this table row is about `{cit.row_key}`, but `{cit.text}` ({path}) never "
+        f"mentions it; {where}. Re-cite the row's lines, or name what the citation is about beside it."
+    )
+
+
 def _is_symbol(name: str, suffixes: dict[str, list[str]], upstream: dict[str, str]) -> bool:
     """A backticked ``htlc_spend.py`` next to a citation names a FILE, not a symbol."""
     return "." not in name or not _candidates(name, suffixes, upstream)
@@ -854,7 +976,9 @@ def _symbol_scan() -> SymbolScan:
     checked: list[tuple[Citation, str]] = []
     problems: list[str] = []
     for cit in _citations(_docs(_SYMBOL_RULE_ALSO_READS)):
-        if cit.symbol is None or not _is_symbol(cit.symbol, suffixes, upstream):
+        named = cit.symbol is not None and _is_symbol(cit.symbol, suffixes, upstream)
+        keyed = cit.symbol is None and cit.row_key is not None and _is_symbol(cit.row_key, suffixes, upstream)
+        if not (named or keyed):
             continue
         candidates = _candidates(cit.target, suffixes, upstream)
         if not candidates:
@@ -868,9 +992,12 @@ def _symbol_scan() -> SymbolScan:
         # The mechanical checks first: a docs/solutions/ citation is read ONLY here, and a
         # symbol cannot be looked for past the end of a file or in an ambiguous one.
         problem = check_citation(cit, candidates, lines)
-        if problem is None:
+        if problem is None and named:
             rule, problem = check_symbol(cit, candidates[0], sources[candidates[0]])
             checked.append((cit, rule))
+        elif problem is None:
+            problem = check_row_key(cit, candidates[0], sources[candidates[0]])
+            checked.append((cit, "row"))
         if problem:
             problems.append(problem)
     return SymbolScan(checked, problems)
@@ -1006,6 +1133,21 @@ def test_every_cited_line_lands_on_real_code(scan) -> None:
     assert not problems, "doc citations no longer land on the code they name:\n  " + "\n  ".join(problems)
 
 
+def test_every_bare_citation_names_its_file() -> None:
+    """A bare ``:N`` that no file attributes is checked by nothing, so it is refused.
+
+    See "Bare ``:N`` citations" in the module docstring: this is where the handshake spec's
+    ``terms`` and finality tables rotted unseen.
+    """
+    offenders = [
+        o for rel in _scanned_docs() for o in unattributed_bare_citations(rel, (_ROOT / rel).read_text("utf-8"))
+    ]
+    assert not offenders, (
+        "these bare `:N` citations name no file before them, so no rule can check them — write the "
+        "file (`swap_state.py:N`):\n  " + "\n  ".join(offenders)
+    )
+
+
 def test_a_healthy_citation_is_accepted() -> None:
     """The honest path: a correct citation must PASS.
 
@@ -1090,6 +1232,23 @@ class TestTheCheckerFires:
             (3, "adapters.py", 8, None),
         ]
 
+    def test_an_unattributed_bare_citation_is_reported(self) -> None:
+        """The refusal and its honest pair: the same row, with and without the file written."""
+        assert unattributed_bare_citations("d.md", "| `min_ref_confirmations` | 6 | `:1517` |\n") == ["d.md:1 `:1517`"]
+        assert unattributed_bare_citations("d.md", "| `min_ref_confirmations` | 6 | `x.py:1`, `:1517` |\n") == []
+        assert unattributed_bare_citations("d.md", "`a.py:1` then (`:2`)\n\nnew paragraph (`:3`)\n") == ["d.md:3 `:3`"]
+
+    def test_every_range_of_a_multi_range_citation_is_read(self) -> None:
+        """``x.py:10, 40-41`` is two citations; the second used to be invisible to every rule."""
+        got = [(c.target, c.start, c.end, c.symbol) for c in citations_in("d.md", "see `x.py:10, 40-41, 7`")]
+        assert got == [("x.py", 10, None, None), ("x.py", 40, 41, None), ("x.py", 7, None, None)]
+        (late,) = [c for c in citations_in("d.md", "`a.py:1, 9`") if c.start == 9]
+        problem = check_citation(late, ["a.py"], ["x = 1", "y = 2"])
+        assert problem is not None and "past the end" in problem
+        # Not a further range: a closing backtick intervenes, or the number is a version.
+        assert [c.start for c in citations_in("d.md", "`x.py:10`, 40 tests")] == [10]
+        assert [c.start for c in citations_in("d.md", "`x.py:10, 1.5`")] == [10]
+
     def test_a_bare_citation_is_held_to_the_blank_line_check(self) -> None:
         """The #773 shape: a bare ``:N`` that drifted onto a blank line, invisible before."""
         (cit,) = [c for c in citations_in("d.md", "`a.py:1` and then (`:2`)") if c.bare]
@@ -1108,6 +1267,9 @@ class TestTheCheckerFires:
 #: floor sits below it so ordinary doc churn does not trip it, and far above zero so a form
 #: regex that stops matching cannot pass as a clean run.
 _MIN_SYMBOL_CHECKED = 25
+#: The same for the table-row rule. Measured when it was added: 41 row citations checked, 39 of
+#: them in the handshake spec.
+_MIN_ROW_CHECKED = 20
 
 
 @pytest.fixture(scope="module")
@@ -1141,9 +1303,14 @@ def test_the_symbol_rule_is_not_vacuous(symbol_scan) -> None:
         "_CITE_THEN_NAME and _CITE_WITH_NAME before lowering this floor."
     )
     rules = {rule for _, rule in checked}
-    assert rules == {"definition", "occurrence"}, (
+    assert rules == {"definition", "occurrence", "row"}, (
         f"only these rules ran over the real docs: {sorted(rules)}. The definition rule covers "
-        "Python targets; the occurrence rule covers the vendored C++."
+        "Python targets; the occurrence rule covers the vendored C++; the row rule covers keyed "
+        "table rows."
+    )
+    rows = sum(1 for _, rule in checked if rule == "row")
+    assert rows >= _MIN_ROW_CHECKED, (
+        f"the row rule checked only {rows} citations — check _ROW_KEY_RE before lowering this floor."
     )
     subtrees = {cit.doc.split("/")[1] for cit, _ in checked}
     assert subtrees >= _SYMBOL_RULE_ALSO_READS, (
@@ -1241,9 +1408,10 @@ class TestTheSymbolRule:
     )
     def test_a_citation_with_no_single_named_subject_names_none(self, text: str) -> None:
         """A list of names, a citation sharing its backticks, or a name not directly beside
-        it: the citation's subject is not one symbol, so the rule must not pick one."""
-        (cit,) = citations_in("d.md", text)
-        assert cit.symbol is None
+        it: the citation's subject is not one symbol, so the rule must not pick one. (Each
+        range of a multi-range citation is a citation of its own; none names a symbol.)"""
+        cits = citations_in("d.md", text)
+        assert cits and all(cit.symbol is None for cit in cits)
 
     def test_a_file_named_beside_a_citation_is_not_a_symbol(self) -> None:
         suffixes = _suffix_index(["src/pyrxd/gravity/htlc_spend.py"])
@@ -1526,6 +1694,64 @@ class TestTheSymbolRule:
         (honest,) = [c for c in citations_in("d.md", "`a.py:1`. Then `CONSTANT` (`:4`)") if c.bare]
         assert check_symbol(honest, "a.py", self._SOURCE) == ("definition", None)
 
+    # -- keyed table rows -----------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("row", "keys"),
+        [
+            ("| `btc_sats` | int | **yes** | `> 0` | `a.py:4, 20` |", ["btc_sats", "btc_sats"]),
+            ("| `stall_blocks` (`N`) | 6 | policy | `a.py:4` |", ["stall_blocks"]),
+            ("| `RadiantCovenantLeg.min_confirmations` | 1 | `a.py:4` |", ["RadiantCovenantLeg.min_confirmations"]),
+            ("| `t_rxd` | blocks | `a.py:4`; `_validate` (`a.py:9`) |", ["t_rxd", "t_rxd"]),
+            # Not keyed: the first cell is prose, two names, or the citation itself.
+            ("| `ft`/`nft` with an empty ref | `a.py:4` |", [None]),
+            ("| **reorg floor** | 2 | `a.py:4` |", [None]),
+            ("| `a.py:4` | the file |", [None]),
+            ("not a row `btc_sats` `a.py:4`", [None]),
+        ],
+    )
+    def test_a_row_key_is_read_only_from_a_first_cell_holding_one_name(self, row: str, keys: list) -> None:
+        assert [c.row_key for c in citations_in("d.md", row) if not c.bare] == keys
+
+    def test_a_row_citation_must_mention_the_key(self) -> None:
+        """Occurrence, not definition: ``CONSTANT`` is read at line 20 (a use) as well as 4."""
+        for start in (4, 20):
+            (cit,) = citations_in("d.md", f"| `CONSTANT` | 1 | `a.py:{start}` |")
+            assert check_row_key(cit, "a.py", self._SOURCE) is None
+        (cit,) = citations_in("d.md", "| `CONSTANT` | 1 | `a.py:9` |")
+        problem = check_row_key(cit, "a.py", self._SOURCE)
+        assert problem is not None and "about `CONSTANT`" in problem and "does appear at line(s) 4, 20" in problem
+        (cit,) = citations_in("d.md", "| `gone` | 1 | `a.py:9` |")
+        problem = check_row_key(cit, "a.py", self._SOURCE)
+        assert problem is not None and "appears nowhere" in problem
+
+    def test_a_row_citation_naming_its_own_symbol_is_held_to_that_symbol_instead(self) -> None:
+        """``_b32`` (``swap_state.py:N``) in the ``hashlock`` row is about ``_b32``: the symbol rule
+        reads it, and the row rule must not also demand ``hashlock`` there."""
+        (cit,) = citations_in("d.md", "| `hashlock` | 64-hex | `a.py:4`; `decorated` (`a.py:9`) |")[1:]
+        assert (cit.symbol, cit.row_key) == ("decorated", "hashlock")
+        assert check_symbol(cit, "a.py", self._SOURCE) == ("definition", None)
+
+    def test_the_drift_from_817_is_refused_against_the_real_file(self) -> None:
+        """The shape the row rule exists for, through the production path and the real source.
+
+        The finality table cited ``min_ref_confirmations`` at a line that #817 turned into other
+        code. Rebuilt from wherever the field is today: cited at the neighbouring field
+        ``maker_stall_safety_window_blocks`` (real, non-blank, wrong) it must pass the blank-line
+        gate and be refused here; cited at its own line it must pass both.
+        """
+        path = "src/pyrxd/gravity/swap_coordinator.py"
+        source = (_ROOT / path).read_text(encoding="utf-8")
+        defs = {d.qualname: d for d in python_definitions(source)}
+        real = defs["CoordinatorConfig.min_ref_confirmations"].first
+        wrong = defs["CoordinatorConfig.maker_stall_safety_window_blocks"].first
+        (cit,) = citations_in("d.md", f"| `min_ref_confirmations` | 6 | policy | `swap_coordinator.py:{wrong}` |")
+        assert check_citation(cit, [path], source.splitlines()) is None, "the blank-line rule was meant to miss this"
+        problem = check_row_key(cit, path, source)
+        assert problem is not None and str(real) in problem
+        (honest,) = citations_in("d.md", f"| `min_ref_confirmations` | 6 | policy | `swap_coordinator.py:{real}` |")
+        assert check_row_key(honest, path, source) is None
+
 
 # ---------------------------------------------------------------------------
 # 3. The exemption, pinned in both directions
@@ -1603,3 +1829,12 @@ def test_no_out_of_scope_entry_masks_a_checkable_file(scan) -> None:
 # single symbol applies, and a half-converted corpus is worse than either pure
 # form. This test is the floor under the current form, not an argument for
 # keeping it.
+#
+# Why not a sentence-level rule ("the cited lines must contain some name the sentence
+# mentions")? It was tried on the handshake spec when the row rule was added, after every
+# citation in it had been re-checked by hand: it flagged 24 of the 125 citations it could
+# read, and all 24 were correct — a citation inside a method the sentence names by its class,
+# a range covering a list of fields, a sentence naming five methods and citing the state check
+# in each. A gate that is wrong one time in five gets exemptions, and an exemption list is
+# where a real failure hides. The keyed-row rule is the part of that idea whose subject is
+# unambiguous.
