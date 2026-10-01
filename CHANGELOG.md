@@ -225,6 +225,66 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returns the txid for that one-leaf, offset-0 path. No pyrxd command called this method.
 ### Fixed
 
+- **`swap status` and `swap recover-preimage` could tell a taker to keep waiting while the ETH
+  preimage was already public.** When the RPC returned the contract's `Claimed(p)` log but
+  `eth_getTransactionByHash` returned null for its transaction, `status` reported the ETH leg
+  `LOCKED` ("no preimage has been revealed") and `recover-preimage` said "no preimage has been
+  revealed yet", although `p` was in the log already fetched. A taker who kept watching could lose
+  both legs when the covenant's CSV refund opened. Present since the ETH counter-leg read was added
+  in 0.14.0. Both commands now go through one decision: `p` is taken from the contract's own logs
+  (bound to the per-swap contract address, and only if `sha256(p)` equals the swap's hashlock),
+  whether or not the transaction lookup succeeds. A `Claimed` event whose value does not hash to the
+  hashlock is refused (`ERROR` in `status`, a provenance refusal in `recover-preimage`), never shown
+  as the preimage. An empty log set is no longer `LOCKED`: an unclaimed contract emits no logs, but
+  neither does a claimed one read through a pruned node or a log-range limit, so `status` now
+  reports the ETH leg as the new state `UNKNOWN` and `recover-preimage` exits 2 as an inconclusive
+  read. With a spent covenant, pruned logs used to produce `COUNTER_LEG_LOCKED` ("your ETH is still
+  locked — refund it now"); they now produce `COVENANT_SPENT`. The ETH counter-leg no longer has a
+  `LOCKED` state at all: a log can show that the contract was claimed or refunded, never that it
+  was not. A refund read from one RPC is never definitive: it is the new state
+  `REFUND_REPORTED_UNCONFIRMED`, and the ETH leg no longer produces `SPENT_NO_PREIMAGE` at all.
+  One RPC's report of a refund — the `Refunded` log, and any transaction it returns, as
+  `eth_getTransactionByHash` JSON or as raw bytes from `eth_getRawTransactionByHash` — is that
+  server's word and cannot be proven by pyrxd: a server can sign a `refund()` call with any key,
+  never broadcast it, and serve bytes whose keccak256 matches its fabricated log, so checking the
+  signature would not change that. Read as a
+  refund, it let one RPC turn a taker's covenant claim into `TAKER_CLAIMED_AND_REFUNDED`, telling
+  a maker who could still claim the ETH that nothing was left to claim. `status` treats it like
+  `UNKNOWN` (`COVENANT_SPENT`, with the advice to claim), and `recover-preimage` reports it as
+  inconclusive (exit 2) with the advice to check a second, independent RPC; `--eth-rpc-url`
+  takes one URL, so pyrxd cannot make that check itself. The raw bytes are still checked for
+  consistency with the log (their keccak256 must be the log's transaction hash), and `Refunded`
+  logs naming two different transactions, or a transaction signed for another chain than the
+  RPC's, are `ERROR`. The reader of those bytes accepts canonical RLP only, as pyrlp's strict
+  decoder does.
+- **The ETH counter-leg read never checked which chain its RPC was on.** `eth_chainId` was on the
+  read-only allowlist but never called, and the `eth_chain_id` a recovery file records was never
+  compared, so an RPC for another network answered for the swap's contract address. `status` and
+  `recover-preimage` now ask the RPC its chain before reading anything and refuse a mismatch
+  (`ERROR` in `status`, naming both chain ids). A file that records no chain id is still read,
+  and the output says the chain was not checked; a malformed `eth_chain_id` is refused.
+- **`swap status` called a maker's refund plus the maker's counter-leg claim SETTLED.** The covenant
+  read used only `get_utxos` / `get_history`, which cannot tell the taker's claim from the maker's
+  CSV refund, so a maker who refunded the RXD covenant AND claimed the taker's BTC or ETH with `p`
+  (the taker losing both legs) read `SETTLED … nothing left to claim or refund` above a counter-leg
+  row saying the leg had been claimed. Present in every release with the counter-leg read (0.14.0
+  on). `status --check-chain` now fetches the covenant's spending transaction, checks it hashes to
+  the txid asked for, and reads which branch its covenant input took (the claim's `<p> OP_0` or the
+  refund's `OP_1`, the shapes `build_htlc_claim_tx` and `build_htlc_refund_tx` produce). The new
+  `chain.covenant_spend` field (`TAKER_CLAIM`, `MAKER_REFUND` or `UNKNOWN`, with the txid and a
+  reason) is in `--json`, and a `spent by` line in human mode. `SETTLED` now means the swap
+  completed (taker claim + counter-leg claimed) or was aborted with both sides refunded. The two
+  outcomes where one side took both legs have their own situations, `MAKER_REFUNDED_AND_CLAIMED`
+  and `TAKER_CLAIMED_AND_REFUNDED`, in every output mode. When the spending transaction cannot be
+  read, the situation is `BOTH_SPENT_OUTCOME_UNKNOWN`, not `SETTLED`. With the counter-leg still
+  locked or unchecked, the advice now names which side has to act when the spend is known.
+- **`swap status --check-chain` read an unconfirmed covenant as REFUND_OPEN.** ElectrumX reports a
+  height of 0 or -1 for an unconfirmed UTXO, and the funding height was taken by truthiness, so -1
+  became a funding height: the depth came out as the tip plus two and the verdict as `REFUND_OPEN`
+  ("claim IMMEDIATELY or the maker reclaims it") for a covenant not yet in any block. Present since
+  0.10.0, when `swap status --check-chain` was added. Only a positive height is now a funding height; otherwise the depth is
+  `null` and the situation is `LOCKED` with "heights unavailable". A funding height above the tip
+  (a lagging endpoint) is likewise no longer turned into a depth.
 - **`swap status` and `swap recover-preimage` no longer report a spent BTC HTLC as UNSPENT.** An
   Esplora answer of `{"spent": true}` with the spending txid missing or malformed was folded into
   the unspent case, so `status` printed "UNSPENT — the counterparty has not claimed" and
@@ -262,7 +322,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RadiantCovenantLeg.claim_asset` sizes its fee against, and it reported `LOCKED` at the depth
   where the refund is already valid. Both now come from the leg's own
   `blocks_to_claim_deadline`, and `REFUND_OPEN` starts at the same depth where `refund_asset` and
-  `swap build-refund` accept the refund.
+  `swap build-refund` accept the refund. **The `--json` field `chain.blocks_to_refund` changed
+  meaning with it:** it was `funding_height + t_rxd - tip` (one block optimistic: at 0 the refund
+  had already been valid for a block) and is now `t_rxd - depth`, the blocks left before a CSV
+  refund can be mined (a node accepts a CSV-`N` refund once the covenant is `N` confirmations deep,
+  as the regtest test `TestColdRefundOnConsensus` walks block by block). A script that read the old
+  value as "blocks until the refund opens" was one block late; with the new value, 0 means the
+  refund is valid now. The field is now omitted, instead of raising, when the covenant's depth is
+  not known.
 - **Docstrings and docs no longer say `require_audit_cleared` blocks anything.** It has been a
   no-op since 0.9.0. The Radiant, BTC and ETH legs, both chain registries, the SPV sole-authority
   builder, the watchtower README, `docs/concepts/architecture.md`,
@@ -270,6 +337,59 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   network needed an opt-in to construct. None does. The gate stays a no-op.
 ### Security
 
+- **`swap status` and `swap recover-preimage` printed the operator's keyed endpoint URL.** An HTTP
+  error (401, 429, 5xx) from `--eth-rpc-url` or `--btc-api-url` was rendered with `{exc}`, and
+  aiohttp's `ClientResponseError` quotes the full URL, so an API key in its path or query appeared
+  in `status`'s counter-leg row, in `status --json`, and in `recover-preimage`'s error. There it was
+  worse: `ClientResponseError` is not an `OSError`, so it escaped as "unexpected failure", exit 4,
+  with the URL as the printed cause. Present since the counter-leg read was added in 0.14.0. A
+  transport exception from a counter-leg read is now rendered by `describe_network_error`: the
+  exception type, its HTTP status, and the endpoint's host, never the URL; a library exception's
+  own text is dropped. pyrxd's own error text (which can wrap an RPC error body echoing the key)
+  is printed through `redact_endpoint_secrets`, which removes the credential-bearing parts of each
+  endpoint URL the command used (the rule, and its limit, are in the next entry). `recover-preimage`, `build-claim` and `build-refund` now map an
+  aiohttp error, a timeout, or a 200 whose body is not JSON to a clean exit 2 instead of
+  "unexpected failure", exit 4. The ElectrumX error paths in `swap status --check-chain`,
+  `build-claim`, `build-refund` and the reserve/post/take/cancel/refund orderbook commands scrub
+  every configured ElectrumX URL; `swap orders`, which reads through `--node-rpc`, scrubs that URL.
+- **Endpoint credentials were printed outside the swap commands too.** The ElectrumX failover client
+  logged `<call> failed on <URL>` to stderr for every failed read, with the URL's user name,
+  password, path and query; more than twenty other places — mostly `fix: check that <URL> is
+  reachable` hints in the glyph, wallet, query, hashmark and setup commands — and the TLS-pin
+  errors did the same; and the `swap orders` node-RPC transport wrapped failures as the aiohttp
+  exception's repr, which quotes the full request URL (a redirect loop printed the API key), and
+  passed a node error body that echoed the request path through verbatim. Every one of those now
+  names the endpoint as `scheme://host:port` (`pyrxd.network.redaction.redacted_url`), and the
+  node-RPC transport scrubs a node's error text of its URL. So do the config-file errors for an
+  endpoint declared with a bad or a second operator, `Endpoint`'s "insecure endpoint" and
+  missing-scheme refusals (the latter printed the text before the first `:`, which for a URL
+  missing its scheme is the user name), and the watchtower's startup and source-grouping log lines
+  (`--rxd-electrumx-url`, `--mempool-base-url`, `--eth-rpc-url`); the "names no host" refusal,
+  which has no host to name, prints the URL with its credential parts removed. `setup --json`
+  reports `electrumx_url` as `scheme://host:port`.
+
+  `verify --wave-name` and `glyph inspect --wave-name` labelled every source in the name-at-mark
+  verdict by its full endpoint URL, so `--json` printed the URL's credentials in `binding_source`,
+  `anchor_source`, `chain.discovery_source` and `tip_source`, `heights.by_source[].source` and
+  `heights.agreed_by`, the anchor's `source` and `block_verification.source`, and every reason
+  that quotes them; plain `verify` did the same in its anchor, and its "`<endpoint>` answered, but
+  …" hint. These are now `scheme://host:port` too. The labels stay full URLs inside the verdict,
+  where the source-identity rules compare them, and are redacted where they become output
+  (`pyrxd.network.redaction.redact_endpoints_in`), so those `--json` values change shape (a
+  trailing `/` or a path is no longer part of them).
+
+  `redact_endpoint_secrets`, for text pyrxd did not write, matched exact strings of six or more
+  characters, so it missed a short password, a key a server re-encoded (`~` as `%7E`) or
+  upper-cased, and a fragment. It now derives each URL's user name, password, query values and
+  fragment (always removed, at any length) and the path segments that look like a credential (16
+  or more characters, 8 or more mixing letters and digits, or anything but a trivially common
+  token after a `/key/`, `/token/` or `/v3/`-style marker), and matches them case-insensitively,
+  percent-encoded, and as whole tokens only, so a value that merely occurs inside a txid, a
+  hostname or a word, and a plain path word such as `testnet` or a block height, is left alone.
+  The limit that follows from that: a key carried as a short, letters-only path segment that does
+  not follow such a marker is treated as a word, and is not removed from text a server echoes
+  back. `redacted_url`, used wherever pyrxd itself names an endpoint, never prints the path. The
+  exit-4 "unexpected failure" path scrubs every URL on the command line.
 - **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
   exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
   from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no

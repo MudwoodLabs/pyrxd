@@ -83,6 +83,7 @@ from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
 from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
+from pyrxd.network.redaction import redacted_url
 from pyrxd.network.registry import default_endpoints
 from pyrxd.network.source_identity import describe_source, group_by_source
 from pyrxd.security.errors import RxdSdkError, ValidationError
@@ -259,11 +260,11 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     # What the URLs ARE, for the messages below: the flags the operator gave, or pyrxd's defaults.
     # A warning about "--rxd-electrumx-url values" on a run that passed none sent the reader to a
     # flag they never used.
-    what_urls = "--rxd-electrumx-url values"
+    url_origin = "--rxd-electrumx-url values"
     using_defaults = False
     if not urls and args.rxd_backend != "ssh-tr":
         urls = list(DEFAULT_RXD_ELECTRUMX)
-        what_urls = "default RXD ElectrumX endpoints (no --rxd-electrumx-url given)"
+        url_origin = "default RXD ElectrumX endpoints (no --rxd-electrumx-url given)"
         using_defaults = True
     # ONE SOURCE PER OPERATOR GROUP, by the one identity every quorum uses. `wss://h`, `wss://h:443`,
     # `wss://h/x` and `wss://h.` are one server, and `wss://x.d.example` and `wss://y.d.example` one
@@ -287,9 +288,9 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
                 "pyrxd ships knowledge of, else the registered domain; every loopback spelling is this "
                 "machine), so they are one failover source, not %d sources",
                 len(group_urls),
-                what_urls,
+                url_origin,
                 describe_source(key),
-                ", ".join(group_urls),
+                ", ".join(redacted_url(u) for u in group_urls),
                 len(group_urls),
             )
     if not sources:
@@ -305,7 +306,7 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
                 "is low-corroboration). Add a --rxd-electrumx-url of a different operator to corroborate; "
                 "the watchtower takes no operator declaration, so that means a different registered domain.",
                 len(urls),
-                what_urls,
+                url_origin,
             )
         return sources[0], False  # single source → low-corroboration (v1 posture)
     if len(sources) < args.rxd_quorum:
@@ -333,7 +334,7 @@ async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     await rpc.assert_chain()  # fail closed if the endpoint is not the negotiated chain
     logger.info(
         "ETH counter-leg watch ENABLED: rpc=%s chain_id=%d (read-only, no key, single-source → low-corroboration)",
-        args.eth_rpc_url,
+        redacted_url(args.eth_rpc_url),
         args.eth_chain_id,
     )
     return RpcEthChainSource(rpc)
@@ -1088,7 +1089,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
 
         tick_budget = args.tick_timeout_s if args.tick_timeout_s is not None else max(4.0 * args.poll_interval_s, 30.0)
         rxd_desc = (
-            args.rxd_electrumx_url
+            ", ".join(redacted_url(u) for u in (args.rxd_electrumx_url or []))
             if args.rxd_backend == "electrumx"
             else f"ssh-tr:{args.ssh_host}/{args.ssh_container}"
         )
@@ -1101,7 +1102,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
             "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs network=%s — %s",
             args.records_dir,
             rxd_desc,
-            args.mempool_base_url,
+            redacted_url(args.mempool_base_url),
             args.poll_interval_s,
             args.network,
             mode,

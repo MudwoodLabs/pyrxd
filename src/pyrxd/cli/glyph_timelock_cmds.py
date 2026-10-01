@@ -44,6 +44,7 @@ from ..glyph.timelock_reveal_tx import (
     CekCommitmentMismatch,
     TimelockNotExpired,
 )
+from ..network.redaction import redacted_url
 from ..security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
@@ -430,7 +431,7 @@ def timelock_mint_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     payload = {
@@ -667,7 +668,7 @@ def timelock_reveal_cmd(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
     plan = build.plan

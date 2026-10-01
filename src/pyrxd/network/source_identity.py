@@ -88,6 +88,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..security.errors import NetworkError, ValidationError
+from .redaction import redact_endpoint_secrets
 
 __all__ = [
     "SameSourceFailover",
@@ -362,7 +363,8 @@ def _canonical_host_of(url: object) -> str:
     host = _host_in(url.strip())
     if not host:
         raise ValidationError(
-            f"{url.strip()!r} names no host that can be parsed, so it cannot be counted as a source. "
+            f"{redact_endpoint_secrets(url.strip(), url)!r} names no host that can be parsed, so it cannot be "
+            "counted as a source. "
             "Check the URL (an unclosed '[', text after ']', or an empty authority)"
         )
     return canonical_host(host)

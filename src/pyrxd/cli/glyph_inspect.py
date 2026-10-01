@@ -49,6 +49,7 @@ from ..glyph.mark_anchor import MIN_CONFIRMATIONS_MEANING, mark_anchor_dict
 from ..glyph.payload import _MAX_ATTRS_LIST_LEN
 from ..glyph.relationships import resolve_delegated_refs
 from ..glyph.types import GlyphRef
+from ..network.redaction import redact_endpoints_in, redacted_url
 from ..script.timelock import LOCKTIME_THRESHOLD
 from ..security.errors import NetworkError, ValidationError
 from ..security.types import Txid
@@ -1324,6 +1325,17 @@ def _judge_one_name_at_mark(
             "name": shown,
             "reason": _sanitize_display_string(f"lookup failed: {exc}"),
         }
+    # RENDER TIME. Every source in the verdict is labelled by the raw endpoint URL, because the
+    # source-identity rules compare those labels; this is where they become output (both the JSON
+    # and the human lines read this dict), so the URL's credentials are dropped here, once.
+    hm["name_at_mark"] = redact_endpoints_in(hm["name_at_mark"], _endpoint_urls(ctx))
+
+
+def _endpoint_urls(ctx: CliContext) -> tuple[str, ...]:
+    """Every endpoint URL this context may label a source with — for :func:`redact_endpoints_in`."""
+    from .swap_recovery import electrumx_urls
+
+    return electrumx_urls(ctx)
 
 
 async def _name_at_mark(
@@ -2154,7 +2166,7 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str, raw_out: list[
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable",
         ) from exc
 
 
@@ -2211,7 +2223,9 @@ def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
         names = asyncio.run(_do())
     except Exception as exc:
         # The exception text can contain a server-controlled response body.
-        hm["wave_identity"] = {"resolved": False, "reason": _sanitize_display_string(f"lookup failed: {exc}")}
+        hm["wave_identity"] = redact_endpoints_in(
+            {"resolved": False, "reason": _sanitize_display_string(f"lookup failed: {exc}")}, _endpoint_urls(ctx)
+        )
         return
     # SANITIZED AT THE BOUNDARY, like every other name the indexer hands back. A
     # WAVE name is registration text an attacker chooses, and it lands directly

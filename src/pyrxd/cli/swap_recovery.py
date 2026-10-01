@@ -61,7 +61,7 @@ Read-only enforcement
 ---------------------
 * No broadcaster, coordinator, or key-holding leg is imported by name here.
 * The Radiant reads go through the ElectrumX client's ``get_utxos`` / ``get_history`` /
-  ``get_tip_height`` only.
+  ``get_tip_height`` / ``get_transaction`` only.
 * The BTC reads are Esplora **GET**s (``/outspend``, ``/hex``).
 * Ethereum has no read transport other than JSON-RPC over HTTP POST, so the write
   surface is closed the only way it can be: :data:`ETH_READ_ONLY_RPC_METHODS` is a hard
@@ -81,7 +81,7 @@ import json
 import logging
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -105,13 +105,16 @@ from pyrxd.gravity.htlc_covenant import (
 )
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
+from pyrxd.network.redaction import redact_endpoint_secrets as redact_endpoint_secrets  # re-export
 from pyrxd.network.source_identity import canonical_host
+from pyrxd.script.script import Script
 
 # ``_looks_like_mnemonic`` is private to ``security.errors`` but is THE definition of
 # "this string is a seed phrase" in this SDK, and the gate below must agree with the
 # redactor rather than grow a second, drifting copy of the test. Reached by name for the
 # same reason ``load_recovery_json`` reaches ``cli_secrets._tighten_hint``.
-from pyrxd.security.errors import KeyMaterialError, ValidationError, _looks_like_mnemonic
+from pyrxd.security.errors import KeyMaterialError, RxdSdkError, ValidationError, _looks_like_mnemonic
+from pyrxd.transaction.transaction import Transaction
 from pyrxd.utils import decode_wif
 
 logger = logging.getLogger(__name__)
@@ -124,17 +127,25 @@ _TIP_REREAD_ATTEMPTS = 2
 __all__ = [
     "ETH_READ_ONLY_RPC_METHODS",
     "ColdSpend",
+    "CounterLegInconclusive",
     "CounterLegStatus",
     "CovenantChainState",
+    "CovenantSpend",
     "PreimageNotRevealed",
     "PreimageRecovery",
     "ProvenanceRefused",
     "RecoveryExtras",
+    "RefundReportedUnconfirmed",
+    "VerifiedEthTx",
+    "WrongEthChain",
     "assert_covenant_matches",
     "build_cold_claim",
     "build_cold_refund",
+    "classify_covenant_spend_input",
     "covenant_pkhs",
+    "describe_network_error",
     "electrumx_script_hash",
+    "electrumx_urls",
     "endpoint_source_label",
     "eth_rpc_read",
     "fee_scriptpubkey",
@@ -146,13 +157,18 @@ __all__ = [
     "read_btc_counter_leg",
     "read_counter_leg",
     "read_covenant_chain_state",
+    "read_covenant_spend",
     "read_eth_counter_leg",
     "read_fee_utxos",
     "rebuild_covenant",
     "recover_preimage_from_btc_claim",
+    "recover_preimage_from_eth_artifacts",
     "recover_preimage_from_eth_claim",
+    "recover_preimage_from_eth_logs",
+    "redact_endpoint_secrets",
     "select_fee_utxo",
     "spent_spender_unknown_reason",
+    "verify_raw_eth_tx",
 ]
 
 
@@ -170,6 +186,47 @@ class PreimageNotRevealed(ValidationError):
 
     The benign, expected case: a refund spend of our funding outpoint (the counterparty
     timed out rather than claiming), or a claim that has not happened yet.
+    """
+
+
+class CounterLegInconclusive(ValidationError):
+    """The counter-chain read produced NO evidence either way — not "locked", not "not revealed".
+
+    Distinct from :class:`PreimageNotRevealed` because the two call for opposite actions. "Not
+    revealed" tells a taker to keep watching; an absence of evidence must not, because the
+    commonest way to get an empty answer for a CLAIMED contract is a node that does not serve
+    the log history (pruning, or a log-range limit) — and a taker who keeps watching then can
+    lose both legs when the covenant's CSV refund opens.
+    """
+
+
+class RefundReportedUnconfirmed(CounterLegInconclusive):
+    """The ETH contract's logs report only ``Refunded()`` — ALWAYS this, from one RPC, never a verdict.
+
+    A refund carries no self-verifying value (a claim does: ``sha256(p) == H``). Everything a refund
+    report consists of — the ``Refunded`` log, and the transaction bytes behind it — is one server's
+    word, and pyrxd cannot prove from one server that the refund happened. Read as "refunded", it
+    drove ``swap status`` to SPENT_NO_PREIMAGE — and, beside a taker claim of the covenant, to
+    TAKER_CLAIMED_AND_REFUNDED, telling a MAKER who may still be able to claim the ETH that there is
+    nothing left to claim. So it is inconclusive for every decision, however consistent the report.
+
+    Raw signed bytes (:class:`VerifiedEthTx`) do not change that. Their hash and their ``to`` /
+    selector are checked against the log, which catches an honest RPC that served the wrong
+    transaction (that is a :class:`ProvenanceRefused`), but nothing in them shows the transaction
+    was ever broadcast or mined. A server can sign a ``refund()`` call (it takes no argument) with
+    any key it holds and name that transaction's hash in a fabricated log; pyrxd does not check that
+    a transaction succeeded, so checking its signature or sender would not help. Only a second,
+    independent source can.
+    """
+
+
+class WrongEthChain(ValidationError):
+    """The ETH RPC is on a different chain than the swap, so nothing it says about the contract counts.
+
+    The same contract address can exist on several EVM chains (a deterministic deployer, or the
+    same deployer nonce), and an RPC pointed at the wrong network answers ``eth_getLogs`` for it
+    without complaint. Its own error, not :class:`ProvenanceRefused`: the fix is a different RPC
+    URL, not a different ``--eth-contract``.
     """
 
 
@@ -798,6 +855,339 @@ def recover_preimage_from_eth_claim(
     )
 
 
+#: ``refund()``'s 4-byte selector, ``keccak256("refund()")[:4]`` — the same in ``EthHtlc.sol`` and
+#: ``Erc20Htlc.sol`` (pinned against keccak by ``test_refund_selector_is_keccak_of_the_signature``).
+ETH_REFUND_SELECTOR = bytes.fromhex("590e1ae3")
+
+#: Typed-envelope field layouts: ``type -> (index of to, index of data, field count)``.
+#: EIP-2930 (1), EIP-1559 (2), EIP-4844 (3, canonical form without the blob sidecar), EIP-7702 (4).
+_TYPED_TX_LAYOUT = {1: (4, 6, 11), 2: (5, 7, 12), 3: (5, 7, 14), 4: (5, 7, 13)}
+_LEGACY_TX_LAYOUT = (3, 5, 9)
+_RLP_MAX_DEPTH = 8  # an access/authorization list nests 3 deep; bounds recursion on hostile bytes
+
+
+def _keccak256(data: bytes) -> bytes:
+    from Cryptodome.Hash import keccak  # pycryptodomex — a base dependency, not the [eth] extra
+
+    return keccak.new(digest_bits=256, data=bytes(data)).digest()
+
+
+def _rlp_item(data: bytes, pos: int, depth: int = 0) -> tuple[bytes | list[Any], int]:
+    """Decode one RLP item at *pos*: ``(item, end)``. Raises ``ValueError`` on anything malformed.
+
+    CANONICAL encodings only, as pyrlp's strict decoder: a single byte below ``0x80`` must be
+    encoded as itself (``0x81 0x05`` is refused), and a long-form length must have no leading zero
+    and must exceed 55 (anything shorter has a short form). Each value then has exactly one
+    encoding, so the bytes pyrxd hashes are the bytes it decoded and no other spelling of them.
+    """
+    if depth > _RLP_MAX_DEPTH:
+        raise ValueError("RLP nested too deeply")
+    if pos >= len(data):
+        raise ValueError("RLP item runs past the end")
+    b0 = data[pos]
+    if b0 < 0x80:
+        return data[pos : pos + 1], pos + 1
+    if b0 < 0xB8 or 0xC0 <= b0 < 0xF8:
+        length, start = (b0 - 0x80 if b0 < 0xC0 else b0 - 0xC0), pos + 1
+    else:
+        len_len = (b0 - 0xB7) if b0 < 0xC0 else (b0 - 0xF7)
+        start = pos + 1 + len_len
+        if start > len(data):
+            raise ValueError("RLP length runs past the end")
+        if data[pos + 1] == 0:
+            raise ValueError("non-canonical RLP: long-form length with a leading zero")
+        length = int.from_bytes(data[pos + 1 : start], "big")
+        if length <= 55:
+            raise ValueError("non-canonical RLP: long-form length for a payload that has a short form")
+    end = start + length
+    if end > len(data):
+        raise ValueError("RLP payload runs past the end")
+    if b0 < 0xC0:
+        if length == 1 and data[start] < 0x80:
+            raise ValueError("non-canonical RLP: a single byte below 0x80 must encode as itself")
+        return data[start:end], end
+    items: list[Any] = []
+    p = start
+    while p < end:
+        item, p = _rlp_item(data, p, depth + 1)
+        items.append(item)
+    if p != end:
+        raise ValueError("RLP list items overrun the list")
+    return items, end
+
+
+def _rlp_uint(field: Any, what: str) -> int:
+    """A canonical RLP unsigned integer: a byte string with no leading zero (``b""`` is 0)."""
+    if not isinstance(field, bytes) or field[:1] == b"\x00":
+        raise ValueError(f"malformed {what} field")
+    return int.from_bytes(field, "big")
+
+
+def _decode_eth_tx_fields(raw: bytes) -> tuple[int, bytes, bytes, int | None]:
+    """``(tx_type, to, data, chain_id)`` read from a transaction's own bytes (legacy or typed envelope)."""
+    if not raw:
+        raise ValueError("empty transaction")
+    if raw[0] >= 0xC0:
+        tx_type, (to_i, data_i, count), body = 0, _LEGACY_TX_LAYOUT, raw
+    elif raw[0] in _TYPED_TX_LAYOUT:
+        tx_type, body = raw[0], raw[1:]
+        to_i, data_i, count = _TYPED_TX_LAYOUT[tx_type]
+    else:
+        raise ValueError(f"unsupported transaction envelope type 0x{raw[0]:02x}")
+    fields, end = _rlp_item(body, 0)
+    if end != len(body):
+        raise ValueError("trailing bytes after the transaction")
+    if not isinstance(fields, list) or len(fields) != count:
+        raise ValueError(f"a type-{tx_type} transaction has {count} fields")
+    to, data = fields[to_i], fields[data_i]
+    if not isinstance(to, bytes) or len(to) not in (0, 20) or not isinstance(data, bytes):
+        raise ValueError("malformed to/data field")
+    if tx_type:
+        chain_id: int | None = _rlp_uint(fields[0], "chainId")
+    else:
+        v = _rlp_uint(fields[6], "v")
+        chain_id = (v - 35) // 2 if v >= 35 else None  # EIP-155; 27/28 is a pre-EIP-155 legacy tx
+    return tx_type, to, data, chain_id
+
+
+@dataclass(frozen=True)
+class VerifiedEthTx:
+    """An ETH transaction read from its RAW SIGNED BYTES, whose hash pyrxd computed itself.
+
+    Built from RPC data only by :func:`verify_raw_eth_tx`. ``hash`` is ``keccak256(raw)`` and ``to`` /
+    ``input`` are decoded from those same bytes, so one cannot be swapped without changing the
+    other — unlike ``eth_getTransactionByHash`` JSON, where a server can pair any ``hash`` with any
+    ``to`` and ``input``. That makes it a CONSISTENCY check on the server's answer: it catches an
+    RPC that served a different transaction than its log names.
+
+    What it does NOT prove: anything about the chain. Its signature, sender and chain id are not
+    checked, and checking them would not help — the bytes come from the RPC that served the logs,
+    which can sign a ``refund()`` call with any key it holds, never broadcast it, and name its hash in
+    a fabricated ``Refunded`` log. So
+    an ETH refund read from one RPC is never definitive (:class:`RefundReportedUnconfirmed`).
+    """
+
+    hash: str  # 0x-prefixed lower-case keccak256 of the raw bytes
+    to: str | None  # 0x-prefixed lower-case address; None for a contract creation
+    input: bytes
+    tx_type: int
+    #: The chain id the transaction's own bytes name (typed: field 0; legacy: EIP-155 ``v``), or
+    #: ``None`` for a pre-EIP-155 legacy transaction, which names none.
+    chain_id: int | None = None
+
+    def as_claim_dict(self) -> dict[str, Any]:
+        """The ``{"hash", "to", "input"}`` shape :func:`recover_preimage_from_eth_claim` reads."""
+        return {"hash": self.hash, "to": self.to, "input": "0x" + self.input.hex()}
+
+    def is_refund_call_to(self, contract_address: str) -> bool:
+        """True iff this transaction calls ``refund()`` on *contract_address* (read from its bytes)."""
+        return _same_address(self.to, contract_address) and self.input[:4] == ETH_REFUND_SELECTOR
+
+
+def verify_raw_eth_tx(raw: bytes | str, expected_hash: str) -> VerifiedEthTx:
+    """Hash and decode a raw signed ETH transaction; refuse it unless it IS *expected_hash*. Pure.
+
+    Raises
+    ------
+    ProvenanceRefused
+        ``keccak256(raw)`` is not *expected_hash* (the server served a different transaction), or
+        the bytes are not a transaction pyrxd can decode.
+    """
+    blob = _hex_blob(raw) if isinstance(raw, str) else bytes(raw)
+    computed = "0x" + _keccak256(blob).hex()
+    if not blob or not _same_address(computed, expected_hash):
+        raise ProvenanceRefused(
+            f"the raw transaction the RPC returned hashes to {computed}, not the requested {expected_hash!r} — "
+            "the RPC served a different transaction; refusing to read it"
+        )
+    try:
+        tx_type, to, data, chain_id = _decode_eth_tx_fields(blob)
+    except ValueError as exc:
+        raise ProvenanceRefused(f"the raw transaction {computed} does not decode: {exc}") from exc
+    return VerifiedEthTx(
+        hash=computed, to=("0x" + to.hex()) if to else None, input=data, tx_type=tx_type, chain_id=chain_id
+    )
+
+
+def _bound_logs(logs: Sequence[Any], contract_address: str) -> list[dict[str, Any]]:
+    """The logs emitted BY the per-swap contract — the ETH analogue of the funding-outpoint bind."""
+    return [lg for lg in logs if isinstance(lg, dict) and _same_address(lg.get("address"), contract_address)]
+
+
+def _fetched_tx_hash(logs: Sequence[Any], contract_address: str) -> str | None:
+    """The hash of the transaction :func:`fetch_eth_claim_artifacts` asks for: the LAST bound log's."""
+    bound = _bound_logs(logs, contract_address)
+    tx_hash = bound[-1].get("transactionHash") if bound else None
+    return tx_hash if isinstance(tx_hash, str) else None
+
+
+def _log_topic0(log: dict[str, Any]) -> str | None:
+    """The lower-case 0x-hex of a log's first topic (its event selector), or ``None``."""
+    topics = log.get("topics") or []
+    if not isinstance(topics, list) or not topics:
+        return None
+    blob = _hex_blob(topics[0])
+    return "0x" + blob.hex() if blob else None
+
+
+def recover_preimage_from_eth_logs(
+    *, hashlock: bytes, contract_address: str, logs: Sequence[dict[str, Any]]
+) -> PreimageRecovery:
+    """Scrape ``p`` from the contract's OWN logs. Pure — and independent of any tx lookup.
+
+    The contract emits ``Claimed(bytes32 preimage)`` with ``p`` in the log ``data``, so a log
+    that has already been fetched carries the preimage by itself. This used to be reachable only
+    through :func:`recover_preimage_from_eth_claim`, which needs the transaction too: when the
+    ``eth_getTransactionByHash`` lookup came back null (a node that serves logs but not that
+    transaction), ``swap status`` reported the leg LOCKED and ``recover-preimage`` said "no
+    preimage has been revealed yet" — with ``p`` sitting in a log already in hand.
+
+    Provenance is the per-swap contract address (only logs emitted BY it are scanned), and the
+    value is re-verified as ``sha256(p) == H`` before it is returned. A log that merely LOOKS like
+    a claim but carries no value hashing to ``H`` is never returned as the preimage.
+
+    Raises
+    ------
+    PreimageNotRevealed
+        No log bound to the contract carries a value hashing to ``H``.
+    """
+    if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
+        raise ValidationError("hashlock must be 32 bytes")
+    if not isinstance(contract_address, str) or not contract_address:
+        raise ValidationError("contract_address is required for ETH preimage provenance")
+    for lg in _bound_logs(logs, contract_address):
+        blobs = [_hex_blob(lg.get("data"))]
+        topics = lg.get("topics")
+        if isinstance(topics, list):
+            blobs.extend(_hex_blob(t) for t in topics)
+        try:
+            p = recover_secret(blobs, bytes(hashlock))
+        except (ValidationError, ValueError):
+            continue
+        _verify_hashes_to(p, bytes(hashlock))
+        tx_hash = lg.get("transactionHash")
+        return PreimageRecovery(
+            preimage_hex=bytes(p).hex(),
+            hashlock_hex=bytes(hashlock).hex(),
+            counter_chain="eth",
+            source="eth_claim_log_data",
+            claim_txid=tx_hash if isinstance(tx_hash, str) else None,
+            provenance=(
+                f"log emitted by our per-swap HTLC contract {contract_address}",
+                "sha256(p) == H re-verified independently of the scraper",
+            ),
+        )
+    raise PreimageNotRevealed(f"no log emitted by {contract_address} carries a value hashing to the swap's hashlock")
+
+
+def recover_preimage_from_eth_artifacts(
+    *,
+    hashlock: bytes,
+    contract_address: str,
+    claim_tx: dict[str, Any] | VerifiedEthTx | None,
+    logs: Sequence[dict[str, Any]],
+    source: str,
+) -> PreimageRecovery:
+    """Decide the ETH counter-leg from ``(claim_tx, logs)`` — the ONE function both commands use.
+
+    ``swap status`` and ``recover-preimage`` used to decide this separately, and both read a null
+    transaction as "no claim". In order:
+
+    1. **No logs and no transaction** — :class:`CounterLegInconclusive`. An unclaimed contract
+       returns no logs, but so does a pruned node or a log-range limit for a CLAIMED one; an
+       empty answer is not evidence the leg is locked.
+    2. **A log already carries p** — returned, verified, whether or not the transaction lookup
+       succeeded (:func:`recover_preimage_from_eth_logs`).
+    3. **A ``Claimed`` event whose value does not hash to H** — :class:`ProvenanceRefused`. The
+       swap's own contract only emits ``Claimed`` for a preimage of ITS hashlock, so this is the
+       wrong contract for this swap or a server that is not telling the truth. Never shown as p.
+    4. **``Refunded()`` events naming more than one transaction** — :class:`ProvenanceRefused`.
+       The contract settles once (``AlreadySettled``), so this RPC's answer contradicts itself.
+    5. **The transaction is in hand** — the calldata path, :func:`recover_preimage_from_eth_claim`,
+       with the transaction's hash checked against the one requested (the last bound log's).
+    6. **Only ``Refunded()`` events** — :class:`RefundReportedUnconfirmed`, ALWAYS. One RPC's refund
+       report is that server's word and pyrxd cannot prove it, whatever came with the log: no
+       transaction, transaction JSON, or raw signed bytes that hash to the log's transaction and
+       decode to a ``refund()`` call to the contract. Those checks are CONSISTENCY checks (a
+       mismatch is :class:`ProvenanceRefused` above); passing them never makes a refund definitive.
+    7. **Anything else** (logs that carry no p, transaction not retrievable) —
+       :class:`CounterLegInconclusive`.
+
+    It never raises :class:`PreimageNotRevealed`: on ETH, "spent without revealing p" is never
+    reached from one RPC's answer.
+    """
+    from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+
+    bound = _bound_logs(logs, contract_address)
+    if not bound and claim_tx is None:
+        raise CounterLegInconclusive(
+            f"{source} returned NO logs from the HTLC contract {contract_address}. An unclaimed contract "
+            "looks like that, but so does a CLAIMED one read through a pruned node or a log-range limit, "
+            "so this is NOT evidence the leg is locked or that p is unrevealed. Re-check against an RPC "
+            "that serves the contract's full log history before relying on it."
+        )
+    try:
+        return recover_preimage_from_eth_logs(hashlock=hashlock, contract_address=contract_address, logs=bound)
+    except PreimageNotRevealed:
+        pass
+    topic0s = [_log_topic0(lg) for lg in bound]
+    if CLAIMED_TOPIC0 in topic0s:
+        raise ProvenanceRefused(
+            f"the HTLC contract {contract_address} emitted a Claimed event, but no value in it hashes to this "
+            "swap's hashlock H. This swap's own contract can only emit Claimed for a preimage of H, so this is "
+            "the wrong contract address for this swap, or the RPC is not telling the truth. Nothing was taken "
+            "as the preimage."
+        )
+    only_refunded = bool(bound) and all(t == REFUNDED_TOPIC0 for t in topic0s)
+    refund_txs = (
+        {h.lower() for lg in bound if isinstance(h := lg.get("transactionHash"), str)} if only_refunded else set()
+    )
+    if len(refund_txs) > 1:
+        raise ProvenanceRefused(
+            f"{source} reports Refunded() from {contract_address} in {len(refund_txs)} different transactions. The "
+            "per-swap contract settles once, so this answer contradicts itself: the RPC is wrong or not telling "
+            "the truth. Nothing was concluded; read the contract on another RPC or an explorer."
+        )
+    unverified = "did not return the transaction"
+    if claim_tx is not None:
+        verified = claim_tx if isinstance(claim_tx, VerifiedEthTx) else None
+        try:
+            return recover_preimage_from_eth_claim(
+                hashlock=hashlock,
+                contract_address=contract_address,
+                claim_tx=verified.as_claim_dict() if verified is not None else claim_tx,
+                logs=logs,
+                reported_tx_hash=_fetched_tx_hash(logs, contract_address),
+            )
+        except PreimageNotRevealed:
+            # NEVER definitive from one RPC (round 4): even raw bytes that hash to the log's
+            # transaction and decode to refund() on this contract are bytes this server chose.
+            if verified is not None and verified.is_refund_call_to(contract_address):
+                unverified = (
+                    f"its transaction {verified.hash} is consistent with the log (the raw bytes hash to it and "
+                    "decode to a refund() call to the contract) — but that is still this one server's word: "
+                    "pyrxd cannot prove from one RPC that the transaction was ever broadcast or mined"
+                )
+            elif verified is None:
+                unverified = (
+                    "returned the transaction only as JSON, whose hash field pyrxd cannot check against its "
+                    "contents (no raw signed bytes from eth_getRawTransactionByHash)"
+                )
+            else:
+                unverified = f"returned transaction {verified.hash}, which is not a refund() call to the contract"
+    if only_refunded:
+        raise RefundReportedUnconfirmed(
+            f"{source} reports only Refunded() from {contract_address}, and {unverified}, so the refund is "
+            "UNCONFIRMED (one server's report of a refund proves nothing). Check the contract on a second, "
+            "independent ETH RPC or an explorer; MAKER: if the contract still holds the ETH, you can still claim it."
+        )
+    raise CounterLegInconclusive(
+        f"{source} returned {len(bound)} log(s) from the HTLC contract {contract_address}; none carries a "
+        "value hashing to H and the transaction that emitted them could not be retrieved, so whether p "
+        "is public is UNKNOWN — not 'locked'. Re-check against another RPC."
+    )
+
+
 # --------------------------------------------------------------------------- counter-leg reads
 
 #: Every Ethereum JSON-RPC method this toolkit is permitted to call. Ethereum has no
@@ -811,6 +1201,7 @@ ETH_READ_ONLY_RPC_METHODS = frozenset(
         "eth_blockNumber",
         "eth_chainId",
         "eth_getLogs",
+        "eth_getRawTransactionByHash",
         "eth_getTransactionByHash",
         "eth_getTransactionReceipt",
     }
@@ -828,7 +1219,11 @@ class CounterLegStatus:
     """
 
     chain: str  # "btc" | "eth"
-    state: str  # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | ERROR
+    # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | REFUND_REPORTED_UNCONFIRMED
+    # | UNKNOWN | ERROR. REFUND_REPORTED_UNCONFIRMED (ETH): what EVERY refund report from one RPC is —
+    # one server's word, whatever transaction bytes came with it. NOT resolved; swap status treats it
+    # like UNKNOWN for every decision. SPENT_NO_PREIMAGE is never produced for ETH.
+    state: str
     reason: str
     claim_txid: str | None = None
     preimage_available: bool = False
@@ -873,6 +1268,51 @@ def endpoint_source_label(url: str) -> str:
         raw = ""
     host = canonical_host(raw) if raw else ""
     return host or "an endpoint whose URL has no parseable host"
+
+
+def electrumx_urls(ctx: Any) -> tuple[str, ...]:
+    """Every ElectrumX URL a CLI context may read through — for :func:`redact_endpoint_secrets`.
+
+    The failover client may have answered from any configured endpoint, not only the primary
+    ``electrumx_url``, so all of them are scrubbed. Best-effort: a context with no resolvable
+    profile still yields its primary URL.
+    """
+    urls = [getattr(ctx, "electrumx_url", "") or ""]
+    try:
+        urls += list(ctx.config.require_profile().urls)
+    except Exception:  # nosec B110 - no profile means nothing further to scrub
+        pass
+    return tuple(u for u in urls if u)
+
+
+def describe_network_error(exc: BaseException, url: str | None = None, *, scrub: Sequence[str | None] = ()) -> str:
+    """Render an exception from a network call WITHOUT the URL it was raised for.
+
+    THE one rendering for every place the swap CLI prints a failed chain read. aiohttp's
+    ``ClientResponseError`` renders as ``401, message='Unauthorized', url='https://host/<key>?…'``,
+    so printing ``{exc}`` put the operator's keyed ``--eth-rpc-url`` / ``--btc-api-url`` into
+    ``swap status`` (human and ``--json``) and into ``recover-preimage``'s error. This renders the
+    exception TYPE, its HTTP status when it has one, and the host (:func:`endpoint_source_label`)
+    — never the URL. Text from a library exception is dropped entirely: it is not ours, so it
+    cannot be known not to quote the URL. Text from pyrxd's own exceptions is kept (it carries the
+    useful part, e.g. an RPC's "query returned more than 10000 results") but still passed through
+    :func:`redact_endpoint_secrets`, because it can wrap a library message or echo an RPC body.
+
+    ``url`` is the endpoint the call was made to (named by host); ``scrub`` lists any further
+    URLs whose secrets must not appear (e.g. every ElectrumX endpoint a failover client may have
+    used).
+    """
+    text = type(exc).__name__
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        text += f" (HTTP {status})"
+    if url:
+        text += f" from {endpoint_source_label(url)}"
+    if isinstance(exc, RxdSdkError):
+        detail = redact_endpoint_secrets(str(exc), [url, *scrub])
+        if detail:
+            text += f": {detail}"
+    return text
 
 
 async def fetch_btc_claim_bytes(
@@ -1000,21 +1440,79 @@ async def eth_rpc_read(session: Any, rpc_url: str, method: str, params: list[Any
     return body.get("result")
 
 
+def _parse_chain_id(result: Any) -> int:
+    """An ``eth_chainId`` result (a hex QUANTITY) as an int; ``ValidationError`` for anything else."""
+    if isinstance(result, str) and re.fullmatch(r"0x(0|[1-9a-fA-F][0-9a-fA-F]{0,15})", result):
+        return int(result, 16)
+    raise ValidationError(f"eth_chainId returned {str(result)[:40]!r}, not a chain id; the RPC's chain is unknown")
+
+
+def eth_chain_note(expected_chain_id: int | None) -> str:
+    """One sentence saying what was checked about the RPC's chain — for status reasons and provenance."""
+    if expected_chain_id is None:
+        return (
+            "the recovery file records no eth_chain_id, so the RPC's chain was NOT checked against the swap's "
+            "(it was checked against the chain its own transaction bytes name, where there were any)"
+        )
+    return f"the RPC reports chain id {expected_chain_id}, the chain this swap's recovery file records"
+
+
+async def check_eth_chain(session: Any, rpc_url: str, expected_chain_id: int | None, *, timeout_s: float = 15.0) -> int:
+    """Ask the RPC which chain it is on (``eth_chainId``); refuse it unless it is the swap's.
+
+    Returns the RPC's chain id. With ``expected_chain_id=None`` (a recovery file that records none)
+    nothing is compared here, and the caller says so (:func:`eth_chain_note`).
+
+    Raises
+    ------
+    WrongEthChain
+        The RPC is on another chain than the one the swap's recovery file records.
+    """
+    actual = _parse_chain_id(await eth_rpc_read(session, rpc_url, "eth_chainId", [], timeout_s=timeout_s))
+    if expected_chain_id is not None and actual != expected_chain_id:
+        raise WrongEthChain(
+            f"the RPC {endpoint_source_label(rpc_url)} is on chain {actual}, the swap is on chain {expected_chain_id} "
+            "(eth_chain_id in the recovery file). Nothing it reports about the contract applies to this swap; "
+            "use an RPC for the swap's chain."
+        )
+    return actual
+
+
 async def fetch_eth_claim_artifacts(
     session: Any,
     rpc_url: str,
     *,
     contract_address: str,
+    expected_chain_id: int | None,
     from_block: int | str = "0x0",
     timeout_s: float = 15.0,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[dict[str, Any] | VerifiedEthTx | None, list[dict[str, Any]]]:
     """Read ``(claim_tx, logs)`` for a per-swap HTLC contract. Read-only RPC only.
+
+    FIRST asks the RPC for its chain (:func:`check_eth_chain`) and refuses one on another chain
+    than ``expected_chain_id`` — the swap's, from its recovery file. Keyword-required with no
+    default, so no caller can skip the decision; ``None`` means the file records no chain id. This
+    is the one fetch both ``swap status`` and ``recover-preimage`` make, so the check covers both.
+    A raw transaction whose own bytes name another chain than the RPC's is refused too.
 
     Scans every log from the contract (selector-agnostic, mirroring
     :class:`~pyrxd.gravity.watch.eth_adapters.RpcEthChainSource`) so a differently
     shaped claim event is never silently missed, then fetches the transaction that
-    emitted the LAST one.
+    emitted the LAST one: first as raw signed bytes (``eth_getRawTransactionByHash``),
+    hashed and decoded locally into a :class:`VerifiedEthTx`; if the RPC does not serve
+    raw transactions, as ``eth_getTransactionByHash`` JSON (enough for a claim, whose
+    ``p`` verifies itself). Neither form makes a refund definitive: a refund from one RPC is
+    always :class:`RefundReportedUnconfirmed`.
+
+    Raises
+    ------
+    WrongEthChain
+        The RPC is on another chain than the swap's.
+    ProvenanceRefused
+        The raw bytes the RPC returned do not hash to the requested transaction, or name another
+        chain than the RPC's.
     """
+    rpc_chain = await check_eth_chain(session, rpc_url, expected_chain_id, timeout_s=timeout_s)
     logs = await eth_rpc_read(
         session,
         rpc_url,
@@ -1025,48 +1523,94 @@ async def fetch_eth_claim_artifacts(
     logs = [lg for lg in (logs or []) if isinstance(lg, dict)]
     if not logs:
         return None, []
-    tx_hash = logs[-1].get("transactionHash")
-    if not isinstance(tx_hash, str):
+    # The last log emitted BY the contract — never a foreign log the RPC slipped into the answer.
+    tx_hash = _fetched_tx_hash(logs, contract_address)
+    if tx_hash is None:
         return None, logs
+    import aiohttp
+
+    try:
+        raw = await eth_rpc_read(session, rpc_url, "eth_getRawTransactionByHash", [tx_hash], timeout_s=timeout_s)
+    except (ValidationError, aiohttp.ClientResponseError):
+        raw = None  # the method is not served (a JSON-RPC error, or a provider's 4xx): fall back to JSON
+    if isinstance(raw, str) and _hex_blob(raw):
+        verified = verify_raw_eth_tx(raw, tx_hash)
+        if verified.chain_id is not None and verified.chain_id != rpc_chain:
+            raise ProvenanceRefused(
+                f"the transaction {verified.hash} the RPC returned is signed for chain {verified.chain_id}, but the "
+                f"RPC reports chain {rpc_chain} — its answer contradicts itself; refusing to read it"
+            )
+        return verified, logs
     tx = await eth_rpc_read(session, rpc_url, "eth_getTransactionByHash", [tx_hash], timeout_s=timeout_s)
     return (tx if isinstance(tx, dict) else None), logs
 
 
 async def read_eth_counter_leg(
-    session: Any, rpc_url: str, *, contract_address: str, hashlock: bytes, timeout_s: float = 15.0
+    session: Any,
+    rpc_url: str,
+    *,
+    contract_address: str,
+    hashlock: bytes,
+    expected_chain_id: int | None,
+    timeout_s: float = 15.0,
 ) -> CounterLegStatus:
-    """Classify the ETH counter-leg through the SAME provenance-checked path as recovery."""
-    tx, logs = await fetch_eth_claim_artifacts(session, rpc_url, contract_address=contract_address, timeout_s=timeout_s)
+    """Classify the ETH counter-leg through the SAME decision as recovery.
+
+    There is no ``LOCKED`` verdict on this chain: a log can show that the contract was claimed or
+    refunded, never that it was not, and "no logs" is also what a pruned node or a log-range limit
+    returns for a CLAIMED contract. That is reported ``UNKNOWN``, never ``LOCKED``. An RPC on
+    another chain than ``expected_chain_id`` is ``ERROR`` (:class:`WrongEthChain`).
+    """
     source = endpoint_source_label(rpc_url)
-    if tx is None:
-        return CounterLegStatus(
-            chain="eth",
-            state="LOCKED",
-            source=source,
-            reason=(
-                f"{source} reports no retrievable claim activity from the HTLC "
-                f"contract {contract_address} — no preimage has been revealed. That is one server's "
-                "answer, not a verified fact."
-            ),
-        )
-    tx_hash = tx.get("hash") if isinstance(tx.get("hash"), str) else None
     try:
-        rec = recover_preimage_from_eth_claim(
-            hashlock=hashlock, contract_address=contract_address, claim_tx=tx, logs=logs
+        tx, logs = await fetch_eth_claim_artifacts(
+            session,
+            rpc_url,
+            contract_address=contract_address,
+            expected_chain_id=expected_chain_id,
+            timeout_s=timeout_s,
         )
-    except PreimageNotRevealed as exc:
+    except (ProvenanceRefused, WrongEthChain) as exc:
+        return CounterLegStatus(chain="eth", state="ERROR", reason=str(exc), source=source)
+    status = _classify_eth_artifacts(tx, logs, contract_address=contract_address, hashlock=hashlock, source=source)
+    if expected_chain_id is None:
+        return replace(status, reason=f"{status.reason} (Note: {eth_chain_note(None)}.)")
+    return status
+
+
+def _classify_eth_artifacts(
+    tx: dict[str, Any] | VerifiedEthTx | None,
+    logs: list[dict[str, Any]],
+    *,
+    contract_address: str,
+    hashlock: bytes,
+    source: str,
+) -> CounterLegStatus:
+    """The :class:`CounterLegStatus` for ``(tx, logs)`` already read from one RPC."""
+    if isinstance(tx, VerifiedEthTx):
+        tx_hash: str | None = tx.hash
+    else:
+        tx_hash = tx.get("hash") if tx is not None and isinstance(tx.get("hash"), str) else None
+    try:
+        rec = recover_preimage_from_eth_artifacts(
+            hashlock=hashlock, contract_address=contract_address, claim_tx=tx, logs=logs, source=source
+        )
+    except RefundReportedUnconfirmed as exc:
+        # Not SPENT_NO_PREIMAGE: that state is "resolved" for swap status's situation table.
         return CounterLegStatus(
-            chain="eth", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=tx_hash, source=source
+            chain="eth", state="REFUND_REPORTED_UNCONFIRMED", reason=str(exc), claim_txid=tx_hash, source=source
         )
+    except CounterLegInconclusive as exc:
+        return CounterLegStatus(chain="eth", state="UNKNOWN", reason=str(exc), claim_txid=tx_hash, source=source)
     except ProvenanceRefused as exc:
         return CounterLegStatus(chain="eth", state="ERROR", reason=str(exc), claim_txid=tx_hash, source=source)
     return CounterLegStatus(
         chain="eth",
         state="CLAIMED_PREIMAGE_REVEALED",
         reason=(
-            f"the counterparty CLAIMED in {rec.claim_txid} and the preimage p is now PUBLIC on ETH. "
-            "Extract it with `pyrxd swap recover-preimage`, then `pyrxd swap build-claim` while the "
-            "covenant's CSV refund window is still shut."
+            f"the counterparty CLAIMED in {rec.claim_txid or 'a transaction the RPC did not name'} and the "
+            "preimage p is now PUBLIC on ETH. Extract it with `pyrxd swap recover-preimage`, then "
+            "`pyrxd swap build-claim` while the covenant's CSV refund window is still shut."
         ),
         claim_txid=rec.claim_txid,
         preimage_available=True,
@@ -1136,7 +1680,12 @@ async def read_counter_leg(
     session = await open_http_session()
     async with session:
         return await read_eth_counter_leg(
-            session, eth_rpc_url, contract_address=contract, hashlock=hashlock, timeout_s=timeout_s
+            session,
+            eth_rpc_url,
+            contract_address=contract,
+            hashlock=hashlock,
+            expected_chain_id=facts.eth_chain_id,
+            timeout_s=timeout_s,
         )
 
 
@@ -1147,6 +1696,165 @@ def electrumx_script_hash(spk: bytes | str) -> str:
     """ElectrumX ``script_hash`` for a raw scriptPubKey: ``sha256(spk)`` reversed."""
     raw = bytes.fromhex(spk) if isinstance(spk, str) else bytes(spk)
     return hashlib.sha256(raw).digest()[::-1].hex()
+
+
+#: The covenant's history is read in full to find its spend; a covenant SPK is per swap, so its
+#: history is the funding transaction and the one spend. Past this many entries something else
+#: is paying the script, and the read reports UNKNOWN rather than fetch an unbounded list.
+MAX_COVENANT_HISTORY = 16
+
+
+@dataclass(frozen=True)
+class CovenantSpend:
+    """Which covenant branch spent the RXD covenant, read from the spending transaction itself.
+
+    ``kind`` is ``TAKER_CLAIM`` (function 0: ``<p> OP_0``, the covenant then pays the taker),
+    ``MAKER_REFUND`` (function 1: ``OP_1`` after the CSV, the covenant then pays the maker), or
+    ``UNKNOWN`` with the reason. A spent covenant looks the same either way from its UTXO set,
+    which is why ``swap status`` used to call a maker's refund + the maker's counter-leg claim
+    SETTLED. ``p`` itself is never carried here.
+    """
+
+    kind: str
+    reason: str
+    spend_txid: str | None = None
+    height: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "reason": self.reason, "spend_txid": self.spend_txid, "height": self.height}
+
+
+def _push_values(unlocking: bytes) -> list[bytes] | None:
+    """The stack a push-only scriptSig leaves, or ``None`` if it is not push-only / unparseable."""
+    try:
+        chunks = Script(bytes(unlocking)).chunks
+    except Exception:
+        return None
+    out: list[bytes] = []
+    for ch in chunks:
+        op = ch.op[0]
+        if op == 0x00:
+            out.append(b"")
+        elif op == 0x4F:  # OP_1NEGATE
+            out.append(b"\x81")
+        elif 0x51 <= op <= 0x60:  # OP_1 .. OP_16
+            out.append(bytes([op - 0x50]))
+        elif ch.data is not None and op <= 0x4E:
+            out.append(bytes(ch.data))
+        else:
+            return None
+    return out
+
+
+def _script_num(b: bytes) -> int:
+    """Decode a stack item as a script number (little-endian sign-magnitude; empty is 0)."""
+    if not b:
+        return 0
+    mag = int.from_bytes(b[:-1] + bytes([b[-1] & 0x7F]), "little")
+    return -mag if b[-1] & 0x80 else mag
+
+
+def classify_covenant_spend_input(unlocking: bytes, *, hashlock: bytes | None) -> str | None:
+    """``"claim"`` / ``"refund"`` for a covenant input's scriptSig, or ``None`` if neither.
+
+    The covenant dispatches on the TOP stack item (``OP_DUP OP_0 OP_NUMEQUAL OP_IF <claim> OP_ELSE
+    OP_1 OP_NUMEQUALVERIFY <refund>``; see :mod:`pyrxd.gravity.htlc_spend`), so the branch a mined
+    spend took is that item's numeric value — ``build_htlc_claim_tx`` pushes ``<p> OP_0`` and
+    ``build_htlc_refund_tx`` pushes ``OP_1``. Decoded numerically rather than by byte pattern, so a
+    non-minimal encoding the interpreter accepts is classified the same. A claim must also carry a
+    value hashing to ``hashlock`` (the claim branch cannot validate without one).
+    """
+    items = _push_values(unlocking)
+    if not items:
+        return None
+    selector = _script_num(items[-1]) if len(items[-1]) <= 4 else None
+    if selector == 1:
+        return "refund"
+    if selector == 0 and hashlock is not None:
+        h = bytes(hashlock)
+        if any(len(v) == 32 and hashlib.sha256(v).digest() == h for v in items[:-1]):
+            return "claim"
+    return None
+
+
+async def read_covenant_spend(
+    client: Any, spk_hex: str, history: Sequence[dict[str, Any]], *, hashlock: bytes | None
+) -> CovenantSpend:
+    """Find the transaction that spent the covenant and say which branch it took. Read-only.
+
+    Fetches each transaction in the covenant script's history (``get_transaction``), re-derives
+    its txid from the bytes (a server serving the wrong transaction is not believed), finds the
+    covenant output(s) the funding transaction created, and classifies the input that spends one.
+    Anything it cannot establish is ``UNKNOWN`` with the reason — never a guess.
+    """
+    spk = bytes.fromhex(spk_hex)
+    entries = [e for e in history if isinstance(e, dict) and isinstance(e.get("tx_hash"), str)]
+    if not entries:
+        return CovenantSpend("UNKNOWN", "the covenant script's history is empty, so no spend could be read")
+    if len(entries) > MAX_COVENANT_HISTORY:
+        return CovenantSpend(
+            "UNKNOWN",
+            f"the covenant script has {len(entries)} history entries (more than {MAX_COVENANT_HISTORY}); "
+            "something other than this swap is paying it, so its spend was not read",
+        )
+    txs: dict[str, tuple[Transaction, int | None]] = {}
+    for e in entries:
+        txid = e["tx_hash"]
+        raw = await client.get_transaction(txid)
+        tx = Transaction.from_hex(bytes(raw)) if isinstance(raw, (bytes, bytearray)) else None
+        if tx is None or tx.txid() != txid:
+            return CovenantSpend(
+                "UNKNOWN", f"the server's bytes for covenant history transaction {txid} do not parse to that txid"
+            )
+        height = e.get("height")
+        txs[txid] = (tx, height if isinstance(height, int) and height > 0 else None)
+    funded = {
+        (txid, i)
+        for txid, (tx, _) in txs.items()
+        for i, out in enumerate(tx.outputs)
+        if out.locking_script is not None and out.locking_script.serialize() == spk
+    }
+    kinds: set[str] = set()
+    spender: tuple[str, int | None] | None = None
+    for txid, (tx, height) in txs.items():
+        for inp in tx.inputs:
+            if (inp.source_txid, inp.source_output_index) not in funded:
+                continue
+            unlocking = inp.unlocking_script.serialize() if inp.unlocking_script is not None else b""
+            kind = classify_covenant_spend_input(unlocking, hashlock=hashlock)
+            if kind is None:
+                return CovenantSpend(
+                    "UNKNOWN",
+                    f"transaction {txid} spends the covenant with an unlocking script that is neither the "
+                    "claim branch nor the refund branch",
+                    spend_txid=txid,
+                    height=height,
+                )
+            kinds.add(kind)
+            spender = (txid, height)
+    if spender is None:
+        return CovenantSpend(
+            "UNKNOWN",
+            "no transaction in the covenant script's history spends the covenant output — the server's "
+            "history is incomplete, so who spent it is not known",
+        )
+    if len(kinds) > 1:
+        return CovenantSpend("UNKNOWN", "the covenant was spent through BOTH branches (more than one funding)")
+    txid, height = spender
+    when = f"at height {height}" if height is not None else "UNCONFIRMED"
+    if kinds == {"claim"}:
+        return CovenantSpend(
+            "TAKER_CLAIM",
+            f"the taker CLAIMED the covenant in {txid} ({when}); the covenant pays the claim to the taker",
+            spend_txid=txid,
+            height=height,
+        )
+    return CovenantSpend(
+        "MAKER_REFUND",
+        f"the maker CSV-REFUNDED the covenant in {txid} ({when}); the covenant pays the refund to the maker",
+        spend_txid=txid,
+        height=height,
+    )
 
 
 @dataclass(frozen=True)

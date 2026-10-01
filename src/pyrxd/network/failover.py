@@ -69,6 +69,7 @@ from ..security.errors import (
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..spv.radiant import TxMerkleBranch
 from .electrumx import ElectrumXClient, UtxoRecord, verified_broadcast_txid
+from .redaction import redacted_url
 from .registry import Endpoint, NetworkProfile
 
 logger = logging.getLogger(__name__)
@@ -355,7 +356,7 @@ class FailoverElectrumXClient:
                         logger.info(
                             "broadcast: %s already has tx %s after a transport failure elsewhere "
                             "(corroborated by a read-back) — treating as success",
-                            endpoint.url,
+                            redacted_url(endpoint.url),
                             expected_txid,
                         )
                         self._promote(endpoint)
@@ -365,7 +366,7 @@ class FailoverElectrumXClient:
                     logger.warning(
                         "broadcast: %s claimed to already have tx %s but could NOT produce it on read-back; "
                         "refusing to report success — next endpoint",
-                        endpoint.url,
+                        redacted_url(endpoint.url),
                         expected_txid,
                     )
                     continue
@@ -375,7 +376,9 @@ class FailoverElectrumXClient:
             except NetworkError as exc:
                 last_exc = exc
                 attempted += 1
-                logger.warning("broadcast failed on %s (%s); next endpoint", endpoint.url, type(exc).__name__)
+                logger.warning(
+                    "broadcast failed on %s (%s); next endpoint", redacted_url(endpoint.url), type(exc).__name__
+                )
                 await self._discard(endpoint)
                 continue
             # The txid is a pure function of the bytes we sent; a server that returns a
@@ -416,7 +419,7 @@ class FailoverElectrumXClient:
             logger.warning(
                 "broadcast: %s has no get_transaction read surface, so its 'already known' claim "
                 "cannot be corroborated; fail-closed",
-                endpoint.url,
+                redacted_url(endpoint.url),
             )
             return False
         try:
@@ -528,10 +531,10 @@ class FailoverElectrumXClient:
                 # be sent to the next one.
                 if skip_unsupported and retryable and reached_op and isinstance(exc, RpcMethodNotFound):
                     unsupported += 1
-                    logger.info("%s is not implemented by %s; next endpoint", description, endpoint.url)
+                    logger.info("%s is not implemented by %s; next endpoint", description, redacted_url(endpoint.url))
                     continue
                 faulted = True
-                logger.warning("%s failed on %s (%s)", description, endpoint.url, type(exc).__name__)
+                logger.warning("%s failed on %s (%s)", description, redacted_url(endpoint.url), type(exc).__name__)
                 await self._discard(endpoint)
                 if not retryable:
                     raise

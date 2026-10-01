@@ -30,6 +30,7 @@ flags, formatting, and error mapping only.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -44,14 +45,20 @@ from .format import emit, sanitize_terminal
 from .swap_cmds import parse_recovery_file
 from .swap_recovery import (
     ColdSpend,
+    CounterLegInconclusive,
     PreimageNotRevealed,
     PreimageRecovery,
     ProvenanceRefused,
+    RefundReportedUnconfirmed,
+    WrongEthChain,
     assert_covenant_matches,
     build_cold_claim,
     build_cold_refund,
     covenant_pkhs,
+    describe_network_error,
+    electrumx_urls,
     endpoint_source_label,
+    eth_chain_note,
     fetch_btc_claim_bytes,
     fetch_eth_claim_artifacts,
     open_http_session,
@@ -61,7 +68,8 @@ from .swap_recovery import (
     read_fee_utxos,
     rebuild_covenant,
     recover_preimage_from_btc_claim,
-    recover_preimage_from_eth_claim,
+    recover_preimage_from_eth_artifacts,
+    redact_endpoint_secrets,
     select_fee_utxo,
     spent_spender_unknown_reason,
 )
@@ -156,14 +164,36 @@ def _resolve_secret_wif(inline: str | None, from_file: str | None, env_name: str
     return wif.strip()
 
 
-def _run(coro: Any) -> Any:
+def _run(coro: Any, *, url: str | None = None, scrub: tuple[str, ...] = ()) -> Any:
+    """Run a chain read, mapping every transport failure to a clean exit-2 error.
+
+    ``url`` is the endpoint the read goes to; ``scrub`` any further URLs it may use. The cause is
+    rendered by :func:`~pyrxd.cli.swap_recovery.describe_network_error`, never ``{exc}``.
+
+    ``aiohttp.ClientError`` is caught by name: ``ClientResponseError`` (an HTTP 401/429/5xx from
+    ``raise_for_status``) is NOT an ``OSError``, so it used to escape to the top-level handler as
+    "unexpected failure (ClientResponseError)", exit 4, with its full keyed URL printed as the cause.
+    ``asyncio.TimeoutError`` likewise, which on Python 3.10 is not an ``OSError`` either.
+    """
+    import aiohttp
+
     try:
         return asyncio.run(coro)
-    except (NetworkError, OSError) as exc:
+    except (NetworkError, OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
         raise NetworkBoundaryError(
             "a chain read failed",
-            cause=sanitize_terminal(f"{type(exc).__name__}: {exc}", max_len=300),
+            cause=sanitize_terminal(describe_network_error(exc, url, scrub=scrub), max_len=300),
             fix="check the endpoint URL and your connectivity, then retry — nothing was broadcast",
+        ) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # A 200 whose body is not JSON (a captive portal, an HTML error page, a hostile server).
+        # Both are ValueErrors, which the clause above does not catch, so this used to surface as
+        # "unexpected failure (JSONDecodeError)", exit 4 — a bug report for a bad answer.
+        raise NetworkBoundaryError(
+            "a chain read returned a response that is not valid JSON",
+            cause=sanitize_terminal(describe_network_error(exc, url, scrub=scrub), max_len=300),
+            fix="check that the URL points at the right kind of API (Esplora / Ethereum JSON-RPC), or use "
+            "another endpoint — nothing was broadcast",
         ) from exc
 
 
@@ -242,14 +272,20 @@ async def _recover(
     session = await open_http_session()
     async with session:
         tx, logs = await fetch_eth_claim_artifacts(
-            session, eth_rpc_url, contract_address=eth_contract, timeout_s=timeout_s
+            session,
+            eth_rpc_url,
+            contract_address=eth_contract,
+            expected_chain_id=facts.eth_chain_id,
+            timeout_s=timeout_s,
         )
-    if tx is None:
-        raise PreimageNotRevealed(
-            f"{endpoint_source_label(eth_rpc_url)} reports no retrievable claim activity from the HTLC "
-            f"contract {eth_contract} — no preimage yet. That is one server's answer, not a verified fact."
-        )
-    return recover_preimage_from_eth_claim(hashlock=hashlock, contract_address=eth_contract, claim_tx=tx, logs=logs)
+    rec = recover_preimage_from_eth_artifacts(
+        hashlock=hashlock,
+        contract_address=eth_contract,
+        claim_tx=tx,
+        logs=logs,
+        source=endpoint_source_label(eth_rpc_url),
+    )
+    return dataclasses.replace(rec, provenance=(*rec.provenance, eth_chain_note(facts.eth_chain_id)))
 
 
 @click.command(name="recover-preimage")
@@ -312,6 +348,7 @@ def swap_recover_preimage_cmd(
         except ValueError as exc:
             raise UserError("the supplied claim transaction is not valid hex") from exc
 
+    read_url = None if offline_raw is not None else (btc_api_url if facts.counter_chain == "btc" else eth_rpc_url)
     try:
         rec = _run(
             _recover(
@@ -323,24 +360,59 @@ def swap_recover_preimage_cmd(
                 eth_rpc_url=eth_rpc_url,
                 offline_raw=offline_raw,
                 timeout_s=timeout_s,
-            )
+            ),
+            url=read_url,
         )
+    except WrongEthChain as exc:
+        raise UserError(
+            "REFUSED: the ETH RPC is not on this swap's chain — no preimage was taken",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
+            fix="pass an --eth-rpc-url for the chain the recovery file records (eth_chain_id) — nothing was broadcast",
+        ) from exc
+    except RefundReportedUnconfirmed as exc:
+        # Before CounterLegInconclusive (its base): the advice differs. Full log history is not the
+        # gap here — a refund report from ONE RPC cannot be confirmed by that RPC at all.
+        raise NetworkBoundaryError(
+            "the counter-chain read is inconclusive — one RPC reports the ETH leg refunded, which pyrxd cannot "
+            "confirm from one server; no preimage was taken",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=500),
+            fix="read the contract on a second, independent ETH RPC (another operator) or a block explorer before "
+            "acting on a refund — nothing was broadcast",
+        ) from exc
+    except CounterLegInconclusive as exc:
+        # Before PreimageNotRevealed (both are ValidationErrors): "no evidence" must never be
+        # rendered as "not revealed yet — keep watching".
+        raise NetworkBoundaryError(
+            "the counter-chain read is inconclusive — no preimage was taken",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
+            fix="re-run against an RPC that serves the contract's full log history, or read the contract's "
+            "events on a block explorer — nothing was broadcast",
+        ) from exc
     except ProvenanceRefused as exc:
         raise UserError(
             "REFUSED on provenance — no preimage was taken",
-            cause=sanitize_terminal(str(exc), max_len=400),
-            fix="confirm --btc-funding-outpoint is THIS swap's funding output; a transaction that only "
-            "shares the hashlock is not this swap's claim",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
+            fix=(
+                "confirm --eth-contract is THIS swap's per-swap HTLC contract; a contract that does not "
+                "reveal a preimage of this swap's hashlock is not this swap's"
+                if facts.counter_chain == "eth" and offline_raw is None
+                else "confirm --btc-funding-outpoint is THIS swap's funding output; a transaction that only "
+                "shares the hashlock is not this swap's claim"
+            ),
         ) from exc
     except PreimageNotRevealed as exc:
         raise UserError(
             "no preimage has been revealed yet",
-            cause=sanitize_terminal(str(exc), max_len=400),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
             fix="keep watching (`pyrxd swap status --check-chain`); if the covenant's CSV window opens "
             "first, the refund path is the one that applies",
         ) from exc
     except ValidationError as exc:
-        raise UserError("preimage recovery failed", cause=sanitize_terminal(str(exc), max_len=400)) from exc
+        # Can carry an RPC's own error body (``eth_rpc_read``), which may echo the key back.
+        raise UserError(
+            "preimage recovery failed",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), read_url), max_len=400),
+        ) from exc
 
     payload: dict[str, Any] = {
         "counter_chain": rec.counter_chain,
@@ -689,7 +761,8 @@ def swap_build_claim_cmd(
                 policy=policy,
                 kind="claim",
                 allow_overpay=allow_overpay,
-            )
+            ),
+            scrub=electrumx_urls(ctx),
         )
         spend = build_cold_claim(
             covenant=covenant,
@@ -703,7 +776,7 @@ def swap_build_claim_cmd(
     except ValidationError as exc:
         raise UserError(
             "could not build the claim spend",
-            cause=sanitize_terminal(str(exc), max_len=500),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), electrumx_urls(ctx)), max_len=500),
             fix="nothing was broadcast — correct the input above and re-run",
         ) from exc
     _emit_spend(ctx, spend, facts, chain)
@@ -763,7 +836,8 @@ def swap_build_refund_cmd(
                 policy=policy,
                 kind="refund",
                 allow_overpay=allow_overpay,
-            )
+            ),
+            scrub=electrumx_urls(ctx),
         )
         spend = build_cold_refund(
             covenant=covenant,
@@ -777,7 +851,7 @@ def swap_build_refund_cmd(
     except ValidationError as exc:
         raise UserError(
             "could not build the refund spend",
-            cause=sanitize_terminal(str(exc), max_len=500),
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc), electrumx_urls(ctx)), max_len=500),
             fix="nothing was broadcast — correct the input above and re-run",
         ) from exc
     _emit_spend(ctx, spend, facts, chain)

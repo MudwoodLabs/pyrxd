@@ -22,6 +22,7 @@ from ..hd.bip32 import Xpub
 from ..hd.bip39 import mnemonic_from_entropy
 from ..hd.discovery import DEFAULT_ACCOUNTS, DEFAULT_COIN_TYPES, coin_type_label, discover
 from ..hd.wallet import HdWallet, raise_if_reads_failed
+from ..network.redaction import redacted_url
 from ..security.errors import NetworkError, ValidationError
 from ..security.rng import secure_random_bytes
 from ..utils import validate_address
@@ -457,7 +458,7 @@ def wallet_recover(ctx: CliContext, scan: bool, coin_types: str, accounts: str, 
         raise NetworkBoundaryError(
             "could not reach ElectrumX during recovery scan",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL",
         ) from exc
 
     payload = {
@@ -675,7 +676,7 @@ def wallet_sweep(
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL",
         ) from exc
     except ValidationError as exc:
         # build_send_max_tx raises ValidationError when the balance is at or
@@ -897,7 +898,7 @@ def _run_async(ctx: CliContext, coro) -> dict[str, object]:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL",
         ) from exc
 
 

@@ -118,18 +118,61 @@ human sizing the fee is the only remaining control.
   - ``NOT_FUNDED`` — the covenant is not on chain.
   - ``LOCKED`` — the covenant is live and only the taker's claim can be mined yet.
   - ``REFUND_OPEN`` — the covenant is live and deep enough that the maker's CSV refund is valid.
-  - ``SETTLED`` — the covenant is spent and the counter-leg is spent too (claimed, or refunded).
-    The counter-leg half is the word of the one server that answered, and the text names it.
-  - ``COUNTER_LEG_LOCKED`` — the covenant is spent but the counter-leg is still locked. A spent
-    covenant is the taker's claim or the maker's CSV refund, and this read cannot tell which.
-    After a refund the taker must refund its own counter-leg; a BTC HTLC's claim branch has no
-    timelock, so until then a maker holding ``p`` can still sweep it.
-  - ``COVENANT_SPENT`` — the covenant is spent and the counter-leg was not checked, or its read
-    failed. It does not mean the swap is over.
+  For a spent covenant ``--check-chain`` also fetches the spending transaction and reads which
+  branch took it — the taker's claim (``<p> OP_0``) or the maker's CSV refund (``OP_1``) — and
+  reports it as ``chain.covenant_spend`` (``TAKER_CLAIM``, ``MAKER_REFUND`` or ``UNKNOWN``).
 
-  pyrxd has no command that refunds a counter-leg, so for the last two the next action says
-  which harness wrote the recovery file, when that leg's refund opens, and what in the file
-  the refund needs. A two-host harness's ``--local-out`` secret file is not a recovery file
+  - ``SETTLED`` — both legs are spent and consistent: the taker claimed the covenant and the
+    counter-leg was claimed with ``p`` (the swap completed), or the maker refunded the covenant
+    and the counter-leg was refunded (aborted, both sides refunded). The counter-leg half is the
+    word of the one server that answered, and the text names it.
+  - ``MAKER_REFUNDED_AND_CLAIMED`` — the maker CSV-refunded the covenant AND the counter-leg was
+    claimed with ``p``: the maker took both legs.
+  - ``TAKER_CLAIMED_AND_REFUNDED`` — the taker claimed the covenant AND the counter-leg was
+    refunded: the taker took both legs.
+  - ``BOTH_SPENT_OUTCOME_UNKNOWN`` — both legs are spent, but the covenant's spending transaction
+    could not be read, so who received the asset is not known. It is not a confirmed settlement.
+  - ``COUNTER_LEG_LOCKED`` — the covenant is spent but the counter-leg is still locked. After a
+    maker's refund the taker must refund its own counter-leg; a BTC HTLC's claim branch has no
+    timelock, so until then a maker holding ``p`` can still sweep it. After a taker's claim the
+    maker must claim the counter-leg with ``p`` before the taker's refund opens.
+  - ``COVENANT_SPENT`` — the covenant is spent and the counter-leg was not checked, its read
+    failed, or its state is ``UNKNOWN`` or ``REFUND_REPORTED_UNCONFIRMED``. It does not mean the
+    swap is over.
+
+  The ETH counter-leg has no ``LOCKED`` state: a log can show that the HTLC contract was claimed
+  (``Claimed``) or refunded (``Refunded``), never that it was not, and an empty log set is also
+  what a pruned node or a log-range limit returns for a claimed contract. It is reported
+  ``UNKNOWN``. A preimage in a ``Claimed`` log is
+  recovered from the log itself, whether or not the RPC returns the claim transaction, because
+  ``p`` is checked against the hashlock. A refund has nothing like that to check. One RPC's
+  report of a refund — the ``Refunded`` log and whatever transaction it returns with it,
+  including the raw transaction bytes — is that server's word, and pyrxd cannot prove it from
+  that server, which can sign a ``refund()`` call with any key, never broadcast it, and name its
+  hash in a fabricated log. It is therefore always reported
+  ``REFUND_REPORTED_UNCONFIRMED`` (``SPENT_NO_PREIMAGE`` is never produced for ETH), it never
+  produces a situation that says nothing is left to claim, and ``recover-preimage`` reports it
+  as inconclusive. Check the contract on a second, independent RPC or an explorer before acting
+  on a refund; ``--eth-rpc-url`` takes one URL, so pyrxd does not do that for you. The raw bytes
+  (``eth_getRawTransactionByHash``) are still checked for consistency with the log: their
+  keccak256 must equal the log's transaction hash, and ``Refunded`` logs naming two different
+  transactions, or a transaction signed for another chain than the RPC's, are an ``ERROR``.
+
+  Before reading anything, the ETH counter-leg read (``status`` and ``recover-preimage``) asks
+  the RPC its chain (``eth_chainId``) and compares it to the ``eth_chain_id`` the recovery file
+  records; an RPC on another chain is an ``ERROR`` naming both chain ids. A file that records no
+  chain id is still read, and the output says the chain was not checked.
+
+  Errors from a counter-leg endpoint are printed as the exception type, HTTP status and host —
+  never the URL, which may carry an API key. Across the CLI, an endpoint named in an error, a
+  ``fix:`` hint or a failover warning on stderr is shown as ``scheme://host:port`` only, and text
+  an endpoint sends back has the URL's user name, password, query values, fragment and any path
+  segment that looks like a credential removed (matched as whole tokens, case-insensitively and in
+  percent-encoded form).
+
+  pyrxd has no command that refunds a counter-leg, so where the taker may have to refund it the
+  next action says which harness wrote the recovery file, when that leg's refund opens, and
+  what in the file the refund needs. A two-host harness's ``--local-out`` secret file is not a recovery file
   ``status`` reads; it is refused with that harness's own ``--phase abort`` command.
 - ``pyrxd swap recover-preimage`` — scrape the preimage ``p`` from the counterparty's own
   on-chain claim and verify it. Provenance is mandatory: the fetched bytes must re-derive to

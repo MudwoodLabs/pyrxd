@@ -43,6 +43,7 @@ from ..glyph.dmint import (
     live_stats,
     project_mint_eta,
 )
+from ..network.redaction import redacted_url
 from ..security.errors import NetworkError, ValidationError
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
@@ -286,7 +287,7 @@ def _fetch_contract(ctx: CliContext, contract_arg: str | None, token_ref_arg: st
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable, or estimate offline with --difficulty",
+            fix=f"check that {redacted_url(ctx.electrumx_url)} is reachable, or estimate offline with --difficulty",
         ) from exc
 
 
