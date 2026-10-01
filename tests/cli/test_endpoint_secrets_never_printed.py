@@ -377,7 +377,7 @@ def test_every_derived_endpoint_option_is_swept(tmp_path) -> None:
     assert derived == swept, (derived, swept)
 
 
-@pytest.mark.parametrize("mode", ["redirect", "echo"])
+@pytest.mark.parametrize("mode", ["redirect", "echo", "badjson"])
 def test_recover_preimage_endpoint_options_never_print_their_secrets(tmp_path, hostile, mode) -> None:
     hostile.mode = mode
     url = _keyed(f"http://127.0.0.1:{hostile.server_port}")
@@ -477,3 +477,16 @@ def test_the_unexpected_failure_path_scrubs_every_url_on_the_command_line(monkey
     assert "node.example" in err  # the useful part survives
     for s in SECRETS:
         assert s not in err, err
+
+
+@pytest.mark.parametrize("option", ["--btc-api-url", "--eth-rpc-url"])
+def test_recover_preimage_against_a_non_json_200_is_a_clean_network_error(tmp_path, hostile, option) -> None:
+    """A 200 with a body that is not JSON is a bad answer from the endpoint (exit 2), not a bug (exit 4)."""
+    hostile.mode = "badjson"
+    url = _keyed(f"http://127.0.0.1:{hostile.server_port}")
+    args = _recover_commands(tmp_path, url)[("swap recover-preimage", option)]
+    rc, _out, err = _pyrxd(tmp_path, *args)
+    assert hostile.hits >= 1
+    assert rc == 2, err
+    assert "not valid JSON" in err and "JSONDecodeError" in err
+    assert "unexpected failure" not in err

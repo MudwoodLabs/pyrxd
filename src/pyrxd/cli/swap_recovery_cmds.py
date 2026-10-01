@@ -181,6 +181,16 @@ def _run(coro: Any, *, url: str | None = None, scrub: tuple[str, ...] = ()) -> A
             cause=sanitize_terminal(describe_network_error(exc, url, scrub=scrub), max_len=300),
             fix="check the endpoint URL and your connectivity, then retry — nothing was broadcast",
         ) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # A 200 whose body is not JSON (a captive portal, an HTML error page, a hostile server).
+        # Both are ValueErrors, which the clause above does not catch, so this used to surface as
+        # "unexpected failure (JSONDecodeError)", exit 4 — a bug report for a bad answer.
+        raise NetworkBoundaryError(
+            "a chain read returned a response that is not valid JSON",
+            cause=sanitize_terminal(describe_network_error(exc, url, scrub=scrub), max_len=300),
+            fix="check that the URL points at the right kind of API (Esplora / Ethereum JSON-RPC), or use "
+            "another endpoint — nothing was broadcast",
+        ) from exc
 
 
 # --------------------------------------------------------------------------- recover-preimage
