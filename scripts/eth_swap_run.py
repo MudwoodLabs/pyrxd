@@ -471,7 +471,7 @@ def _recommended_t_rxd_blocks(args: argparse.Namespace, *, remaining_s: int | No
     # The SMALLEST feasible value, not the largest. Every bound is a floor now (#482) and `hi` is the
     # BIP68 field width, so returning `hi` here advised a 65,535-block (about 227 days at 300 s) maker
     # lock for a derivation one rounding step under the floor.
-    return lo
+    return lo  # the floor: the fewest blocks that pass
 
 
 def _largest_workable_eth_timeout_s(args: argparse.Namespace) -> int | None:

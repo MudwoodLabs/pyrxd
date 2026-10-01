@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import struct
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -499,3 +500,39 @@ def test_every_script_call_into_the_taker_gate_passes_the_wall_clock():
     assert any(stem == "eth_swap_two_host" and n == "taker_verify_asset_funding" for stem, n, _c in calls)
     missing = [f"{stem}:{c.lineno} {n}" for stem, n, c in calls if not any(kw.arg == "now_unix_s" for kw in c.keywords)]
     assert not missing, missing
+
+
+async def test_a_resumed_eth_run_rebuilds_the_covenant_it_recorded_at_the_derived_t_rxd(tmp_path, monkeypatch):
+    """``t_rxd`` is now DERIVED from the deadline when ``--t-rxd-blocks`` is omitted, and a resume
+    re-derives against what is LEFT of the deadline — a different ``t_rxd``, so a different covenant,
+    which the resume refuses as not the funded one. A resume takes the ``t_rxd`` its recovery file
+    recorded instead. Through the runner's own entry point: a fresh run at the defaults, then
+    ``--resume`` an hour later on the same recovery file, reaches the same step."""
+    mod = _load("eth_swap_run")
+    events: list[str] = []
+    _instrument(mod, events, monkeypatch)
+    argv = _eth_argv(tmp_path)
+    monkeypatch.setattr(sys, "argv", argv)
+    first = await _run(mod.run_sepolia_dust(mod._args()))
+    assert first == "stopped at wait_for_covenant_funding", (first, events)
+    import json
+    import time as real_time
+
+    keys_out = argv[argv.index("--keys-out") + 1]
+    recorded = json.loads(Path(keys_out).read_text())["t_rxd_blocks"]
+
+    class _AnHourLater:
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        @staticmethod
+        def time():
+            return real_time.time() + 3600
+
+    monkeypatch.setattr(mod, "time", _AnHourLater())
+    events.clear()
+    monkeypatch.setattr(sys, "argv", [*argv, "--resume"])
+    args = mod._args()
+    second = await _run(mod.run_sepolia_dust(args))
+    assert second == "stopped at wait_for_covenant_funding", (second, events)
+    assert int(args.t_rxd_blocks) == recorded
