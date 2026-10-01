@@ -246,14 +246,14 @@ class Endpoint:
         url = self.url.strip()
         object.__setattr__(self, "url", url)
         if not (url.startswith("wss://") or url.startswith("ws://")):
-            raise ValidationError(f"endpoint url must start with wss:// or ws:// (got {url.split(':', 1)[0]!r})")
+            raise ValidationError(f"endpoint url must start with wss:// or ws:// (got {redacted_url(url)})")
         try:
             urlsplit(url)
         except ValueError as exc:  # e.g. "wss://[::1": an unclosed IPv6 bracket (#754)
             raise ValidationError(f"endpoint url is malformed: {exc}") from exc
         if url.startswith("ws://") and not self.allow_insecure:
             raise ValidationError(
-                f"insecure endpoint {url!r} rejected. Use wss://, or set allow_insecure for this network."
+                f"insecure endpoint {redacted_url(url)} rejected. Use wss://, or set allow_insecure for this network."
             )
         if self.spki_pins and url.startswith("ws://"):
             raise ValidationError("TLS SPKI pinning is meaningless on a plaintext ws:// endpoint")

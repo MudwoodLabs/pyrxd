@@ -88,6 +88,7 @@ from typing import Any
 
 from ..fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
 from ..gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
+from ..network.redaction import redact_endpoint_secrets, redacted_url
 from ..network.registry import (
     DEFAULT_ENDPOINTS,
     KNOWN_NETWORKS,
@@ -630,9 +631,11 @@ def _as_endpoint_list(value: Any, key: str) -> tuple[tuple[str, ...], dict[str, 
             try:
                 source_key(url, operator=operator)
             except ValidationError as exc:
-                raise ValidationError(f"config entry in {key!r} for {url!r}: {exc}") from exc
+                raise ValidationError(
+                    f"config entry in {key!r} for {redacted_url(url)}: {redact_endpoint_secrets(str(exc), url)}"
+                ) from exc
             if url in operators and operators[url] != operator:
-                raise ValidationError(f"config value for {key!r} declares {url!r} as two operators")
+                raise ValidationError(f"config value for {key!r} declares {redacted_url(url)} as two operators")
             operators[url] = operator
     if operators:
         # Only a list that DECLARES can contradict itself. A plain list is not keyed here, so a

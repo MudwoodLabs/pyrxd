@@ -364,7 +364,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the URL's credentials in `binding_source`, `anchor_source`, `chain.discovery_source` and
   `tip_source`, `heights.by_source[].source` and `heights.agreed_by`, the anchor's `source` and
   `verified_by`, and every reason that quotes them, and `verify`'s "`<endpoint>` answered, but …"
-  hint did the same; these are now `scheme://host:port` too. The labels stay full URLs inside the
+  hint did the same; these are now `scheme://host:port` too. So are the config-file errors for an
+  endpoint declared with a bad or a second operator, `Endpoint`'s "insecure endpoint" and
+  missing-scheme refusals (the latter printed the text before the first `:`, which for a URL
+  missing its scheme is the user name), the "names no host" refusal, and the watchtower's startup
+  and source-grouping log lines (`--rxd-electrumx-url`, `--mempool-base-url`, `--eth-rpc-url`). The labels stay full URLs inside the
   verdict, where the source-identity rules compare them, and are redacted where they become output
   (`pyrxd.network.redaction.redact_endpoints_in`), so those `--json` fields change shape (a
   trailing `/` or path is no longer part of the value). The exit-4 "unexpected failure" path scrubs every URL on

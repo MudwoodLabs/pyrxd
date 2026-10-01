@@ -93,13 +93,13 @@ def refuse_if_incomplete(ctx: CliContext, unread: Sequence[str], used: int, *, w
     """
     if not unread:
         return
-    endpoint_fix = f"retry, or check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL"
+    reach_fix = f"retry, or check that {redacted_url(ctx.electrumx_url)} is reachable, or use --electrumx URL"
     if len(unread) >= used:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
             cause=f"{len(unread)} of {used} used address reads failed, and an address that could not be read "
             "is not an empty one",
-            fix=endpoint_fix,
+            fix=reach_fix,
         )
     if ctx.output_mode == "human":
         if view:
@@ -111,7 +111,7 @@ def refuse_if_incomplete(ctx: CliContext, unread: Sequence[str], used: int, *, w
     raise NetworkBoundaryError(
         f"{what} is incomplete: {len(unread)} of this wallet's {used} used addresses could not be read",
         cause="an address whose read failed is not an empty one",
-        fix=endpoint_fix,
+        fix=reach_fix,
     )
 
 
