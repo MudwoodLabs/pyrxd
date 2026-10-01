@@ -597,6 +597,8 @@ class BtcOutpoint:
             raise ValidationError("BtcOutpoint.txid must be hex") from None
         if not isinstance(self.vout, int) or isinstance(self.vout, bool) or self.vout < 0:
             raise ValidationError("BtcOutpoint.vout must be a non-negative int")
+        if self.vout > 0xFFFFFFFF:  # the wire field is a uint32; prevout_bytes would raise struct.error
+            raise ValidationError("BtcOutpoint.vout must fit in 32 bits")
 
     def prevout_bytes(self) -> bytes:
         """Serialise as the 36-byte wire outpoint (txid LE || vout LE)."""

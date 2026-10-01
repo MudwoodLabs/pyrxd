@@ -48,6 +48,7 @@ import asyncio
 import enum
 import hashlib
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -159,7 +160,9 @@ class Outpoint:
     @classmethod
     def parse(cls, s: str) -> Outpoint:
         txid, _, vout = s.partition(":")
-        if len(txid) != 64 or not vout.isdigit():
+        # ASCII digits only: `isdigit()` passed "²" (then a bare int() error) and Arabic-Indic or
+        # full-width digits (silently converted to a different-looking vout).
+        if len(txid) != 64 or not re.fullmatch(r"[0-9]{1,10}", vout) or int(vout) > 0xFFFFFFFF:
             raise ValueError(f"bad outpoint {s!r} (want 'txid:vout')")
         return cls(txid=txid.lower(), vout=int(vout))
 

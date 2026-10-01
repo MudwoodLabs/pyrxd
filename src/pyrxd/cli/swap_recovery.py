@@ -637,11 +637,11 @@ def parse_outpoint(value: str, *, what: str = "outpoint") -> BtcOutpoint:
     if not isinstance(value, str) or value.count(":") != 1:
         raise ValidationError(f"{what} must be 'txid:vout'")
     txid, vout_s = value.split(":")
-    try:
-        vout = int(vout_s)
-    except ValueError:
-        raise ValidationError(f"{what} vout must be an integer") from None
-    return BtcOutpoint(txid=txid, vout=vout)
+    # ASCII digits only. `int()` also takes " 1", "+1", "1_0" and Arabic-Indic or full-width
+    # digits, none of which is the documented "<txid>:<n>" form.
+    if not re.fullmatch(r"[0-9]{1,10}", vout_s):
+        raise ValidationError(f"{what} vout must be an integer, in ASCII digits 0-9")
+    return BtcOutpoint(txid=txid, vout=int(vout_s))
 
 
 # --------------------------------------------------------------------------- preimage recovery

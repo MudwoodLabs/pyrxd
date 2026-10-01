@@ -348,7 +348,8 @@ _NON_ROUTABLE = (
 
 def _is_routable(ip: str) -> bool:
     octets = ip.split(".")
-    if len(octets) != 4 or any(not o.isdigit() or int(o) > 255 for o in octets):
+    # ASCII digits only: `isdigit()` is true for "²", which int() then refuses with a crash.
+    if len(octets) != 4 or any(not re.fullmatch(r"[0-9]{1,3}", o) or int(o) > 255 for o in octets):
         return False  # not an address at all
     for prefixes in _NON_ROUTABLE:
         if any(ip.startswith(pref) for pref in prefixes):
