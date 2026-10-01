@@ -584,6 +584,44 @@ def _height_client(case, height: int, *, tip: int = 130):
     )
 
 
+@pytest.mark.parametrize("height", [-1, 0], ids=["mempool-unconfirmed-parent", "mempool"])
+def test_a_non_positive_funding_height_is_unconfirmed_not_a_depth(case, height) -> None:
+    """ElectrumX reports 0 / -1 for an unconfirmed UTXO. Truthiness took -1 as a funding HEIGHT,
+    so the depth came out as tip + 2 and the covenant read REFUND_OPEN — 'claim IMMEDIATELY or the
+    maker reclaims it' — for a covenant not yet in any block."""
+    res = _status(case, client=_height_client(case, height), output_mode="json")
+    assert res.exit_code == 0, res.output
+    chain = json.loads(res.output)["chain"]
+    assert chain["funding_height"] is None
+    assert chain["depth"] is None
+    assert chain["situation"] == "LOCKED"
+    assert "heights unavailable" in chain["next_action"]
+    assert "blocks_to_refund" not in chain
+    assert "refund_opens_height" not in chain
+
+    human = _status(case, client=_height_client(case, height))
+    assert human.exit_code == 0, human.output
+    assert "REFUND_OPEN" not in human.output
+    assert "funded@None depth=None" in human.output
+
+
+def test_a_positive_funding_height_still_measures_a_depth(case) -> None:
+    """The honest path beside the refusals above: a mined covenant still gets its depth and count."""
+    chain = json.loads(_status(case, client=_height_client(case, 100, tip=104), output_mode="json").output)["chain"]
+    assert chain["funding_height"] == 100
+    assert chain["depth"] == 5
+    assert chain["blocks_to_refund"] == 15
+    assert chain["refund_opens_height"] == 120
+
+
+def test_a_funding_height_above_the_tip_is_not_turned_into_a_depth(case) -> None:
+    """Two reads of a moving chain (a lagging tip): funding 140 against tip 130 is no depth at all."""
+    chain = json.loads(_status(case, client=_height_client(case, 140, tip=130), output_mode="json").output)["chain"]
+    assert chain["depth"] is None
+    assert "blocks_to_refund" not in chain
+    assert chain["situation"] == "LOCKED"
+
+
 def test_blocks_to_refund_is_omitted_rather_than_raising_when_depth_is_none(case, monkeypatch) -> None:
     """Item 4's guard on its own: a live covenant with a funding height but no measured depth."""
     from pyrxd.cli import swap_cmds

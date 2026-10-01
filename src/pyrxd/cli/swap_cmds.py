@@ -471,7 +471,7 @@ def classify_covenant(
             spend_kind=covenant_spend_kind,
         )
     # live
-    if funding_height is None or now_height is None:
+    if funding_height is None or now_height is None or funding_height > now_height:
         return ("LOCKED", "Covenant is live (unspent); heights unavailable to compute the refund deadline.")
     # Lazy: the leg module pulls in the covenant/fee stack, which `swap status` without
     # --check-chain never needs.
@@ -496,7 +496,7 @@ def classify_covenant(
     )
 
 
-async def _read_covenant(ctx: CliContext, spk_hex: str, hashlock_hex: str | None = None) -> dict:
+async def _read_covenant(ctx: CliContext, spk_hex: str, hashlock_hex: str | None = None) -> dict[str, Any]:
     """Read-only ElectrumX query: covenant liveness + funding height + current tip. Never broadcasts.
 
     For a SPENT covenant it also reads the spending transaction and records which branch took it
@@ -509,11 +509,21 @@ async def _read_covenant(ctx: CliContext, spk_hex: str, hashlock_hex: str | None
         utxos = await client.get_utxos(sh)
         now_height = int(await client.get_tip_height())
         if utxos:
-            funding_height = min(int(u.height) for u in utxos if u.height) if any(u.height for u in utxos) else None
+            # > 0, not truthiness: ElectrumX reports 0 AND -1 for an unconfirmed UTXO (-1 when
+            # a parent is unconfirmed too), and -1 is truthy — it was taken as a funding height,
+            # giving a depth of tip + 2 and a REFUND_OPEN verdict for a covenant in no block.
+            heights = [int(u.height) for u in utxos if int(u.height) > 0]
+            funding_height = min(heights) if heights else None
+            # A funding height above the tip is two reads of a moving chain (a lagging endpoint),
+            # not a depth; reported unmeasured rather than as zero or negative.
             return {
                 "covenant_state": "live",
                 "funding_height": funding_height,
-                "depth": (now_height - funding_height + 1) if funding_height else None,
+                "depth": (
+                    (now_height - funding_height + 1)
+                    if funding_height is not None and funding_height <= now_height
+                    else None
+                ),
                 "value_photons": sum(int(u.value) for u in utxos),
                 "now_height": now_height,
             }

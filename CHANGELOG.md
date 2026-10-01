@@ -256,6 +256,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `TAKER_CLAIMED_AND_REFUNDED`, in every output mode. When the spending transaction cannot be
   read, the situation is `BOTH_SPENT_OUTCOME_UNKNOWN`, not `SETTLED`. With the counter-leg still
   locked or unchecked, the advice now names which side has to act when the spend is known.
+- **`swap status --check-chain` read an unconfirmed covenant as REFUND_OPEN.** ElectrumX reports a
+  height of 0 or -1 for an unconfirmed UTXO, and the funding height was taken by truthiness, so -1
+  became a funding height: the depth came out as the tip plus two and the verdict as `REFUND_OPEN`
+  ("claim IMMEDIATELY or the maker reclaims it") for a covenant not yet in any block. Present since
+  0.10.0, when `swap status --check-chain` was added. Only a positive height is now a funding height; otherwise the depth is
+  `null` and the situation is `LOCKED` with "heights unavailable". A funding height above the tip
+  (a lagging endpoint) is likewise no longer turned into a depth.
 - **`swap status` and `swap recover-preimage` no longer report a spent BTC HTLC as UNSPENT.** An
   Esplora answer of `{"spent": true}` with the spending txid missing or malformed was folded into
   the unspent case, so `status` printed "UNSPENT — the counterparty has not claimed" and
