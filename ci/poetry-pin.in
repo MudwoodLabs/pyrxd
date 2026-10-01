@@ -6,3 +6,10 @@ poetry==2.5.1
 #            (GHSA-g6cj-pr64-35w5). Not a path pyrxd itself uses, but this pin
 #            is what CI installs, so it must not resolve to a flagged version.
 cryptography>=50.0.1
+# Floor for the transitive virtualenv dep (Dependabot alerts #28, #29):
+#   <21.7.11  writes prompt values into pyvenv.cfg without sanitising line
+#             boundaries (configuration injection).
+#   <21.7.12  does not integrity-check the downloaded seed wheels (pip/setuptools)
+#             before use.
+# CI installs this pin, so it must not resolve to a flagged version.
+virtualenv>=21.7.12
