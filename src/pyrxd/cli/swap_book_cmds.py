@@ -495,7 +495,7 @@ def swap_orders_cmd(ctx: CliContext, token: str, want: bool, node_rpc: str, rpc_
         # inject ANSI/cursor sequences that spoof or hide CLI output (review MEDIUM).
         raise click.ClickException(
             "orderbook read failed: "
-            + sanitize_terminal(redact_endpoint_secrets(str(exc), electrumx_urls(ctx)), max_len=300)
+            + sanitize_terminal(redact_endpoint_secrets(str(exc), (node_rpc, *electrumx_urls(ctx))), max_len=300)
         ) from exc
 
     payload = {"token": token, "side": "want" if want else "offer", "count": len(rows), "orders": rows}

@@ -9,13 +9,17 @@ than returning an empty/None answer that would read as a healthy-but-empty
 book (see :class:`pyrxd.swap.rswp.book.OrderbookSource`).
 
 Credentials note: pass ``rpc_user``/``rpc_password`` explicitly rather than
-embedding them in the URL, so they never appear in logs or exception reprs.
+embedding them in the URL. Error text never carries the URL or a transport
+exception's repr (aiohttp's quote the full request URL): it names the endpoint by
+scheme://host:port only, and a node's own error body is scrubbed of the URL's
+credential-bearing parts (:mod:`pyrxd.network.redaction`).
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from ...network.redaction import redact_endpoint_secrets, redacted_url
 from ...security.errors import NetworkError
 from ...security.types import Txid
 
@@ -72,14 +76,24 @@ class NodeRpcSource:
                 body = await resp.json(content_type=None)
                 err = body.get("error") if isinstance(body, dict) else None
                 if err:
-                    raise NetworkError(f"node RPC {method} failed: {err.get('message', err)}")
+                    # The node's own error text can echo the request path/query (a gateway quoting
+                    # the API key it rejected), so it is scrubbed of this URL's secret parts.
+                    message = err.get("message", err) if isinstance(err, dict) else err
+                    raise NetworkError(f"node RPC {method} failed: {redact_endpoint_secrets(str(message), self._url)}")
                 if resp.status != 200:
                     raise NetworkError(f"node RPC {method} failed: HTTP {resp.status}")
                 return body["result"] if isinstance(body, dict) else None
         except NetworkError:
             raise
         except Exception as exc:  # aiohttp/transport/JSON errors — fail closed
-            raise NetworkError(f"node RPC {method} transport error: {exc!r}") from exc
+            # NEVER the exception's text or repr: aiohttp's carry the full request URL (an API key in
+            # the path or query, a password in userinfo). Type, HTTP status and the endpoint's
+            # scheme://host:port are what the operator needs; --debug has the traceback.
+            status = getattr(exc, "status", None)
+            code = f" (HTTP {status})" if isinstance(status, int) and not isinstance(status, bool) else ""
+            raise NetworkError(
+                f"node RPC {method} transport error: {type(exc).__name__}{code} from {redacted_url(self._url)}"
+            ) from exc
 
     async def get_open_orders(self, token_id_hex: str, *, limit: int = 100, offset: int = 0) -> list[dict]:
         rows = await self._call("getopenorders", [token_id_hex, limit, offset])
