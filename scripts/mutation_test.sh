@@ -210,7 +210,7 @@ group_files() {
     walletcore)  echo "constants swap/partial swap/resolve" ;;
     swap)        echo "gravity/htlc_spend swap/rswp/orders" ;;
     coordinator) echo "gravity/swap_coordinator" ;;
-    network)     echo "network/bitcoin network/electrumx network/failover network/confirm security/json_guards network/tls_pin network/registry network/source_identity network/rxindexer network/chaintracker" ;;
+    network)     echo "network/bitcoin network/electrumx network/failover network/confirm security/json_guards network/tls_pin network/registry network/source_identity network/rxindexer network/chaintracker network/redaction" ;;
     keys)        echo "security/errors security/secrets base58 hd/bip32 hd/descriptor gravity/watch/cli_secrets" ;;
     # The EVM counter leg. Added 2026-08-27 after a six-reviewer panel found that essentially every
     # defect of that review lived in these 3,593 lines — and that they had ZERO mutation coverage,
@@ -346,7 +346,11 @@ group_tests() {
     # 2026-09-21: merged with main, which had added tests/security/test_json_guards.py
     # here (security/json_guards moved under the 100%-coverage package and its tests had
     # to run in the group that mutates it). Both additions are kept: they are disjoint.
-    network)     echo "tests/network/test_guards.py tests/network/test_registry.py tests/network/test_bitcoin.py tests/network/test_confirm.py tests/network/test_tls_pin.py tests/network/test_chaintracker.py tests/network/test_rxindexer.py tests/test_glyph_wave.py tests/test_hashmark_wave_identity.py tests/test_mempool_adapters.py tests/test_endpoint_diversity.py tests/test_one_source_identity.py tests/network/test_failover.py tests/network/test_get_transaction_merkle_real_data.py tests/test_network_bitcoin.py tests/security/test_hostile_server_responses.py $GAPS tests/network/test_electrumx.py tests/test_rxindexer_discovery.py tests/security/test_json_guards.py" ;;
+    # 2026-10-01: network/redaction joined this group (from the unmutated backlog) with its unit tests
+    # and the endpoint-naming sites' file (0.4 s and 1.2 s locally). NOT with
+    # tests/cli/test_endpoint_secrets_never_printed.py: it took 28.8 s locally, against this group's
+    # 30 s per-mutant timeout below, so every mutant that reached it would time out.
+    network)     echo "tests/network/test_guards.py tests/network/test_redaction.py tests/test_endpoint_urls_are_named_redacted.py tests/network/test_registry.py tests/network/test_bitcoin.py tests/network/test_confirm.py tests/network/test_tls_pin.py tests/network/test_chaintracker.py tests/network/test_rxindexer.py tests/test_glyph_wave.py tests/test_hashmark_wave_identity.py tests/test_mempool_adapters.py tests/test_endpoint_diversity.py tests/test_one_source_identity.py tests/network/test_failover.py tests/network/test_get_transaction_merkle_real_data.py tests/test_network_bitcoin.py tests/security/test_hostile_server_responses.py $GAPS tests/network/test_electrumx.py tests/test_rxindexer_discovery.py tests/security/test_json_guards.py" ;;
     keys)        echo "tests/security/ tests/test_keys.py tests/test_base58.py tests/test_hd_wallet.py tests/test_hd_descriptor.py tests/cli/test_swap_recovery.py tests/cli/test_swap_cmds.py tests/test_watch_secret_and_ack_hardening.py tests/security/test_errors.py tests/security/test_secrets.py" ;;
   esac
 }

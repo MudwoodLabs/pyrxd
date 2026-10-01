@@ -87,11 +87,6 @@ _NOT_YET_MUTATED = frozenset(
         "gravity/seen_store",
         "gravity/swap_order",
         "gravity/types",
-        # Added 2026-09-30 (PR #815 review round), NOT a judgement that it need not be mutated: its
-        # place is the `network` group in scripts/mutation_test.sh (with tests/network/test_redaction.py
-        # and tests/cli/test_endpoint_secrets_never_printed.py), which another branch was editing
-        # at the time. Move it there and delete this line.
-        "network/redaction",
         "script/unlocking_template",
         "spv/proof",
         "spv/witness",
