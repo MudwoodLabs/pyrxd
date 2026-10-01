@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import re
 
 import pytest
 
@@ -798,3 +799,45 @@ class TestQuorumSizeAndTheQuorumHeadFromTheMutationRun:
         assert got == [a, b]
         got.clear()
         assert rpc.sources == [a, b] and rpc.primary is a
+
+
+# --------------------------------------------------------------------------- keyed URLs in error text
+
+_KEY_A = "k3yAlphaS3cretValue0123456789"
+_KEY_B = "k3yBetaS3cretValue9876543210"
+
+
+def _keyed_rpcs():
+    """Two real ``EthRpc`` endpoints whose URLs carry API keys, each failing with an error that quotes
+    its URL, as an HTTP client's connection error does — and one that quotes the key on its own."""
+    from pyrxd.eth_wallet.rpc import EthRpc
+
+    a = EthRpc(f"https://eth-mainnet.alpha-example.com/v2/{_KEY_A}", expected_chain_id=1)
+    b = EthRpc(f"https://rpc.beta-example.org/?apikey={_KEY_B}", expected_chain_id=1)
+
+    def failing(url: str, extra: str = ""):
+        async def call(*_a, **_k):
+            raise NetworkError(f"Cannot connect to host {url} {extra}".strip())
+
+        return call
+
+    a.assert_chain = failing(a._rpc_url)
+    a.get_code = failing(a._rpc_url)
+    b.assert_chain = failing(b._rpc_url, f"(key {_KEY_B} rejected)")
+    b.get_code = failing(b._rpc_url, f"(key {_KEY_B} rejected)")
+    return a, b
+
+
+@pytest.mark.parametrize("read", ["assert_chain", "get_code"])
+def test_a_below_quorum_error_never_carries_an_endpoints_key(read: str) -> None:
+    """The exceptions are joined into the NetworkError; the URLs in them are redacted to host:port."""
+    rpc = MultiSourceEthRpc(list(_keyed_rpcs()))
+    call = rpc.assert_chain() if read == "assert_chain" else rpc.get_code(_HTLC)
+    with pytest.raises(NetworkError) as exc:
+        asyncio.run(call)
+    msg = str(exc.value)
+    assert _KEY_A not in msg and _KEY_B not in msg, msg
+    # Still says WHICH endpoints failed: the honest half of redaction is that the host survives.
+    assert re.search(r"https://eth-mainnet\.alpha-example\.com(:443)?\b", msg), msg
+    assert re.search(r"https://rpc\.beta-example\.org(:443)?\b", msg), msg
+    assert "only 0 of 2 endpoints" in msg, msg

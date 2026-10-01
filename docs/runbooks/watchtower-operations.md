@@ -45,7 +45,14 @@ into the same app or receiver changes nothing.
 ## Prerequisites
 
 - A `--records-dir` of `SwapRecord` JSON files (what the coordinator persists per swap).
-- An RXD source: `--rxd-electrumx-url wss://…` (or your own node's radiant-cli over ssh: `--rxd-backend ssh-tr --ssh-host <your node host> --ssh-container <your node container>`, both required).
+- RXD sources of at least `--rxd-quorum` (default 2) distinct operators: the shipped defaults (two
+  operators) when no `--rxd-electrumx-url` is given, or your own list (`--rxd-electrumx-url wss://…`,
+  repeatable), optionally plus your own node's radiant-cli over ssh (`--rxd-include-node`, or
+  `--rxd-backend ssh-tr` for the node alone; `--ssh-host <your node host> --ssh-container <your node
+  container>`, both required). Sources are counted by operator, so several URLs of one operator count
+  once. **Fewer sources than the quorum refuses to start**; `--accept-single-source` starts anyway
+  with a WARNING naming the sources (it also permits an autonomous refund on a single-source read),
+  and `--rxd-quorum 1` asks for single-source operation outright.
 - BTC depth + claim detection: defaults to mempool.space / Esplora (`--mempool-base-url`, `--quorum`).
 - Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). The finality gate also needs the
   chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes
@@ -65,6 +72,7 @@ install -m 600 /dev/null /run/wt/acks
 pyrxd-watchtower \
     --records-dir ~/.pyrxd/watchtower/swaps \
     --rxd-electrumx-url wss://electrumx.radiant4people.com:50022 \
+    --rxd-electrumx-url wss://electrumx.radiantcore.org \
     --poll-interval-s 30 \
     --heartbeat-file /run/wt/hb.json \
     --ack-inbox /run/wt/acks \

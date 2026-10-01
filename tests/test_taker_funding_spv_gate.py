@@ -313,19 +313,21 @@ async def test_a_lying_electrumx_that_invents_the_covenant_can_no_longer_make_th
         port = server.sockets[0].getsockname()[1]
         terms = _ab_terms(90)
         client = ElectrumXClient(urls=[f"ws://127.0.0.1:{port}"], allow_insecure=True)
-        leg = _real_leg(RadiantChainIO(client)._client, network="bcrt")
-        coord, btc_view = _btc_coord(terms, leg)
+        try:  # closed even when an assertion below fails, so a failure does not leak the socket
+            leg = _real_leg(RadiantChainIO(client)._client, network="bcrt")
+            coord, btc_view = _btc_coord(terms, leg)
 
-        gate = await coord.pre_btc_lock_check(terms)
-        assert gate.ok is False, "the gate passed on a covenant that exists on no chain"
-        assert "not verified" in gate.reason
-        with pytest.raises((ValidationError, NetworkError)):
-            await coord.taker_funds_btc(terms)
-        assert btc_view.broadcasts == [], "BTC was locked against an invented covenant"
-        assert coord.record.state is SwapState.NEGOTIATED
-        # The gate asked for the PROOF, not only the two reads the old gate trusted.
-        assert "blockchain.scripthash.listunspent" in log and "blockchain.transaction.get" in log
-        await client.close()
+            gate = await coord.pre_btc_lock_check(terms)
+            assert gate.ok is False, "the gate passed on a covenant that exists on no chain"
+            assert "not verified" in gate.reason
+            with pytest.raises((ValidationError, NetworkError)):
+                await coord.taker_funds_btc(terms)
+            assert btc_view.broadcasts == [], "BTC was locked against an invented covenant"
+            assert coord.record.state is SwapState.NEGOTIATED
+            # The gate asked for the PROOF, not only the two reads the old gate trusted.
+            assert "blockchain.scripthash.listunspent" in log and "blockchain.transaction.get" in log
+        finally:
+            await client.close()
     finally:
         server.close()
         await server.wait_closed()
@@ -3209,11 +3211,15 @@ async def test_one_fresh_client_is_asked_its_two_reads_on_one_connection():
     try:
         port = server.sockets[0].getsockname()[1]
         client = ElectrumXClient([f"ws://127.0.0.1:{port}"], allow_insecure=True)
-        io = RadiantChainIO(_ChainView(pays=b"\x51", value=1, confs=9), depth_sources=(client,), depth_timeout_s=2.0)
-        got = await asyncio.wait_for(io.reported_depths(txid, 100), 10)
-        assert (str(client.source_key), 12) in got, got  # max(9 confirmations, 111 - 100 + 1)
-        assert len(connections) == 1, f"{len(connections)} connections for one client's reads"
-        await client.close()
+        try:  # closed even when an assertion below fails, so a failure does not leak the socket
+            io = RadiantChainIO(
+                _ChainView(pays=b"\x51", value=1, confs=9), depth_sources=(client,), depth_timeout_s=2.0
+            )
+            got = await asyncio.wait_for(io.reported_depths(txid, 100), 10)
+            assert (str(client.source_key), 12) in got, got  # max(9 confirmations, 111 - 100 + 1)
+            assert len(connections) == 1, f"{len(connections)} connections for one client's reads"
+        finally:
+            await client.close()
     finally:
         server.close()
         await server.wait_closed()

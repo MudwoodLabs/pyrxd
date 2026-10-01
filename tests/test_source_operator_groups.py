@@ -856,6 +856,7 @@ async def test_the_watchtower_does_not_corroborate_one_machine_with_itself(monke
             "--rxd-electrumx-url",
             second,
             "--allow-insecure",
+            "--accept-single-source",  # one machine is one source: below --rxd-quorum 2 without it
         ]
     )
     async with contextlib.AsyncExitStack() as stack:

@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import struct
 import tempfile
@@ -103,7 +104,9 @@ def parse_positive_photons(text: str) -> int:
     """A positive whole number of photons. Refuses zero, a negative, a fraction and anything that is
     not a plain decimal integer."""
     raw = str(text).strip()
-    if not raw.isdigit():
+    # ASCII digits only: `isdigit()` also passed "²" (a bare int() error) and Arabic-Indic or
+    # full-width digits, which int() silently converts to an amount.
+    if not re.fullmatch(r"[0-9]+", raw):
         raise argparse.ArgumentTypeError(f"{text!r}: give a positive whole number of photons")
     value = int(raw)
     if value <= 0:

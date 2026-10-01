@@ -49,6 +49,9 @@ class EthRpc:
         #: for :class:`~pyrxd.eth_wallet.multi_rpc.MultiSourceEthRpc` to count it by. Derived before
         #: web3 is touched, so an unparseable URL fails here.
         self.source_key = source_key(rpc_url)
+        #: The URL as given, which may carry a key. Never printed: kept so error text that quotes it can
+        #: be redacted (:class:`~pyrxd.eth_wallet.multi_rpc.MultiSourceEthRpc` reads it for that only).
+        self._rpc_url = rpc_url
         web3 = _require_web3()
         self._w3 = web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(rpc_url))
         self._expected_chain_id = expected_chain_id

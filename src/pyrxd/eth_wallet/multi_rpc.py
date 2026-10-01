@@ -48,6 +48,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
+from ..network.redaction import redact_endpoints_in
 from ..network.source_identity import require_distinct_sources
 from ..security.errors import NetworkError, ValidationError
 
@@ -138,6 +139,18 @@ class MultiSourceEthRpc:
     def sources(self) -> list[Any]:
         return list(self._sources)
 
+    def _failures(self, results: Sequence[Any]) -> str:
+        """The exceptions among *results*, as text fit to put in an error message.
+
+        An endpoint's exception may quote its URL, and an RPC URL commonly carries an API key in its
+        path or query. Every source's URL is rendered ``scheme://host:port`` and any key part quoted
+        on its own removed (:func:`pyrxd.network.redaction.redact_endpoints_in`, the rule #815 applied
+        to ``swap status``), so the message names which endpoint failed without carrying its key.
+        """
+        urls = [u for u in (getattr(s, "_rpc_url", None) for s in self._sources) if isinstance(u, str)]
+        text = "; ".join(f"{type(r).__name__}: {r}" for r in results if isinstance(r, BaseException))
+        return str(redact_endpoints_in(text, urls))
+
     @property
     def min_agreeing(self) -> int:
         return self._min
@@ -225,7 +238,7 @@ class MultiSourceEthRpc:
         results = await asyncio.gather(*(call(s) for s in self._sources), return_exceptions=True)
         ok = [r for r in results if not isinstance(r, BaseException)]
         if len(ok) < self._min:
-            errs = "; ".join(f"{type(r).__name__}: {r}" for r in results if isinstance(r, BaseException))
+            errs = self._failures(results)
             raise NetworkError(
                 f"{label}: only {len(ok)} of {len(self._sources)} endpoints answered, quorum is "
                 f"{self._min}. Refusing to act on a reading fewer sources agreed on than required "
@@ -279,7 +292,7 @@ class MultiSourceEthRpc:
                 raise r
         confirmed = sum(1 for r in results if not isinstance(r, BaseException))
         if confirmed < self._min:
-            unreachable = "; ".join(f"{type(r).__name__}: {r}" for r in results if isinstance(r, BaseException))
+            unreachable = self._failures(results)
             raise NetworkError(
                 f"assert_chain: only {confirmed} of {len(self._sources)} endpoints confirmed chain, "
                 f"quorum is {self._min} [{unreachable}]"

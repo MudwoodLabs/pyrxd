@@ -394,6 +394,48 @@ def test_non_list_endpoint_config_is_a_typed_error(tmp_path: Path) -> None:
         _config.load(cfg_file)
 
 
+@pytest.mark.parametrize(
+    ("servers", "index"),
+    [
+        ('[""]', 0),  # used to resolve to the SHIPPED mainnet defaults
+        ('["  "]', 0),  # used to be kept, a "  " endpoint
+        ('["wss://one.example/", ""]', 1),
+        ('["wss://one.example/", "\\t"]', 1),
+        ('[{ url = "" }]', 0),
+        ('["wss://one.example/", { url = "   ", operator = "acme" }]', 1),
+    ],
+)
+def test_an_empty_endpoint_entry_is_refused_with_its_index(tmp_path: Path, servers: str, index: int) -> None:
+    """Never a silent fallback: ``electrumx_servers = [""]`` meant "my server", not "the defaults"."""
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(f'network = "mainnet"\nelectrumx_servers = {servers}\n')
+    with pytest.raises(ValidationError, match=rf"^empty endpoint in electrumx_servers at index {index}$"):
+        _config.load(cfg_file)
+
+
+def test_an_empty_endpoint_in_a_per_network_list_is_refused_when_selected(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "mainnet"\n[networks.testnet]\nelectrumx_servers = ["wss://t1/", ""]\n')
+    cfg = _config.load(cfg_file)
+    with pytest.raises(ValidationError, match="empty endpoint in networks.testnet.electrumx_servers at index 1"):
+        cfg.for_network("testnet")
+
+
+@pytest.mark.parametrize(
+    ("servers", "endpoints"),
+    [
+        ("[]", DEFAULT_ENDPOINTS["mainnet"]),  # an empty LIST is still "not configured"
+        ('["wss://one.example/"]', ("wss://one.example/",)),
+        ('["wss://one.example/", { url = "wss://two.example/" }]', ("wss://one.example/", "wss://two.example/")),
+    ],
+)
+def test_ordinary_server_lists_are_unchanged(tmp_path: Path, servers: str, endpoints: tuple) -> None:
+    """The honest half: normal lists, and the empty list, resolve exactly as before."""
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(f'network = "mainnet"\nelectrumx_servers = {servers}\n')
+    assert _config.load(cfg_file).for_network("mainnet").endpoints == tuple(endpoints)
+
+
 def test_write_default_writes_a_failover_list_for_its_own_network(tmp_path: Path) -> None:
     target = tmp_path / "config.toml"
     _config.write_default(target)

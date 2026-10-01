@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS = str(Path(__file__).resolve().parent.parent / "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
@@ -210,3 +212,81 @@ def test_secret_guard_lists_are_in_parity():
     # the "priv" marker closes the class the enumerated list missed.
     for bad in ("private_key", "priv_key", "privatekey", "master_entropy"):
         assert any(mark in bad for mark in btc._SECRET_FORBIDDEN_KEYS)
+
+
+# --------------------------------------------------------------------------- live entry: malformed input
+
+
+def _write_manifest(tmp_path: Path, doc) -> list[str]:
+    import json
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
+    journal = tmp_path / "journal.json"
+    journal.write_text("{}", encoding="utf-8")
+    return [
+        "--manifest",
+        str(manifest),
+        "--journal",
+        str(journal),
+        "--rxd-electrumx-url",
+        "wss://rxd.verifier.example",
+        "--btc-esplora-url",
+        "https://esplora.verifier.example",
+    ]
+
+
+def _honest_manifest(**over) -> dict:
+    doc = {
+        "swap_id": "t",
+        "asset_variant": "rxd",
+        "counter_chain": "btc",
+        "honest_party": "taker",
+        "h_hex": "11" * 32,
+        "taker_pkh_hex": "22" * 20,
+        "maker_pkh_hex": "33" * 20,
+        "rxd_amount": 1000,
+        "refund_csv": 48,
+        "covenant_funding": "ab" * 32 + ":0",
+        "counter_funding": "cd" * 32 + ":0",
+        "party_endpoints": ["https://maker-node.party.example"],
+    }
+    doc.update(over)
+    return doc
+
+
+@pytest.mark.parametrize(
+    ("over", "reason"),
+    [
+        ({"party_endpoints": ["http://"]}, "names no host"),  # ValidationError from source_key
+        ({"party_endpoints": ["https://esplora.verifier.example"]}, "same source"),  # shared endpoint
+        ({"h_hex": "zz" * 32}, "non-hexadecimal"),  # a bad field
+        ({"rxd_amount": "abc"}, "invalid literal"),
+        ({"covenant_funding": "ab" * 32}, "bad outpoint"),
+        ({"asset_variant": "ft"}, "asset_variant='rxd' only"),
+    ],
+)
+def test_a_malformed_manifest_is_invalid_exit_3_not_a_traceback(tmp_path, capsys, over, reason):
+    """Through ``main``, the script's real entry: the reason on stderr after ``INVALID:``, exit 3."""
+    assert v.main(_write_manifest(tmp_path, _honest_manifest(**over))) == 3
+    err = capsys.readouterr().err
+    assert err.startswith("INVALID: ") and reason in err and "Traceback" not in err
+
+
+@pytest.mark.parametrize("doc", ["{not json", "[1, 2]"])
+def test_a_manifest_that_is_not_a_json_object_is_invalid(tmp_path, capsys, doc):
+    assert v.main(_write_manifest(tmp_path, doc)) == 3
+    assert capsys.readouterr().err.startswith("INVALID: ")
+
+
+def test_an_honest_manifest_gets_past_validation(tmp_path, capsys, monkeypatch):
+    """The honest pair: a well-formed manifest is not refused. The fetch is stubbed to stop at the
+    first network step, so reaching it (exit 4, INCONCLUSIVE) proves validation passed."""
+
+    async def _stop(*_a, **_k):
+        raise v._DiscoveryTruncated("stubbed: no network in this test")
+
+    monkeypatch.setattr(v, "_fetch_for_live", _stop)
+    assert v.main(_write_manifest(tmp_path, _honest_manifest())) == 4
+    err = capsys.readouterr().err
+    assert "INCONCLUSIVE" in err and "INVALID" not in err

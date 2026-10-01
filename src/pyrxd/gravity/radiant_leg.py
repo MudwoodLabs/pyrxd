@@ -46,6 +46,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -211,6 +212,23 @@ class DepthReports:
     #: checks each header's own proof-of-work, their linkage, that the last is at ``reported_tip``, and
     #: that the run links to a header the gate verified). A source that did not serve them is absent.
     tip_headers: tuple[tuple[str, int, tuple[bytes, ...], int], ...] = ()
+
+
+#: An outpoint's vout: ASCII decimal digits only, at most ten (a vout is a uint32).
+_VOUT_RE = re.compile(r"[0-9]{1,10}")
+
+
+def _split_outpoint(outpoint: object) -> tuple[str, int]:
+    """``"<txid>:<vout>"`` -> ``(txid, vout)``, or ``ValidationError``.
+
+    ``str.isdigit`` is the wrong test for a vout: it is true for ``"²"`` (which ``int`` then
+    refuses with a bare ``ValueError``) and for Arabic-Indic or full-width digits (which ``int``
+    silently converts, so ``"txid:١"`` became vout 1). Only ``0-9`` is a vout digit.
+    """
+    txid, sep, vout = str(outpoint).partition(":")
+    if not sep or not _VOUT_RE.fullmatch(vout) or int(vout) > 0xFFFFFFFF:
+        raise ValidationError(f"bad covenant outpoint {outpoint!r}")
+    return txid, int(vout)
 
 
 class RadiantChainIO:
@@ -417,9 +435,7 @@ class RadiantChainIO:
                 f"this Radiant client cannot serve the proof of the maker's funding (it has no {', '.join(missing)}); "
                 "the taker gate refuses without it — use an ElectrumX client"
             )
-        txid, _sep, vout_s = str(outpoint).partition(":")
-        if not _sep or not vout_s.isdigit():
-            raise ValidationError(f"bad covenant outpoint {outpoint!r}")
+        txid, vout = _split_outpoint(outpoint)
         try:
             raw = bytes(await client.get_transaction(txid))
             merkle = await client.get_transaction_merkle_branch(txid, height)
@@ -440,7 +456,7 @@ class RadiantChainIO:
         reports = await self.depth_reports(txid, int(height))
         return MakerFundingEvidence(
             txid=txid.lower(),
-            vout=int(vout_s),
+            vout=vout,
             height=int(height),
             raw_tx=raw,
             merkle=merkle,
@@ -654,10 +670,8 @@ class RadiantChainIO:
         fn = getattr(self._client, "txout_unspent_incl_mempool", None)
         if not callable(fn):
             return None
-        txid, _sep, vout = outpoint.partition(":")
-        if not _sep or not vout.isdigit():
-            raise ValidationError(f"bad covenant outpoint {outpoint!r}")
-        return bool(await fn(txid, int(vout)))
+        txid, vout = _split_outpoint(outpoint)
+        return bool(await fn(txid, vout))
 
 
 class _AlreadyKnown(Exception):

@@ -73,14 +73,14 @@ def _start(daemon: AgentDaemon) -> threading.Thread:
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         if daemon._socket_path.exists():
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe.settimeout(0.2)
-            try:
-                probe.connect(str(daemon._socket_path))
-                probe.close()
-                return t
-            except OSError:
-                pass
+            # `with`: a refused connect used to leave the socket open (close() sat in the try body).
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                try:
+                    probe.connect(str(daemon._socket_path))
+                    return t
+                except OSError:
+                    pass
         time.sleep(0.02)
     raise RuntimeError("daemon did not come up")
 

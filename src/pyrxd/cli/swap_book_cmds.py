@@ -47,6 +47,7 @@ that matters parses v3.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -147,7 +148,8 @@ _SIZING_TRIAL_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protoco
 def _parse_outpoint(value: str) -> tuple[str, int]:
     """``TXID:VOUT`` → (txid, vout)."""
     txid, sep, vout = value.partition(":")
-    if not sep or len(txid) != 64:
+    # ASCII digits only: `int()` also takes " 1", "+1", "1_0" and non-ASCII digits.
+    if not sep or len(txid) != 64 or not re.fullmatch(r"[0-9]{1,10}", vout) or int(vout) > 0xFFFFFFFF:
         raise UserError(
             f"invalid outpoint {sanitize_terminal(value, max_len=80)!r}",
             cause="expected TXID:VOUT (64-hex txid, decimal vout)",

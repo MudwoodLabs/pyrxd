@@ -598,7 +598,11 @@ async def _rxd_source_from_run(a: str, b: str, mp):
     from pyrxd.gravity.watch import run
 
     mp.setattr(run, "ElectrumXClient", _NoConnectElectrumX)
-    args = run._parse_args(["--records-dir", "/nonexistent", "--rxd-electrumx-url", a, "--rxd-electrumx-url", b])
+    # --accept-single-source: this harness measures how many sources the builder COUNTS, and a pair
+    # that is one source would otherwise be refused as below the default --rxd-quorum 2.
+    args = run._parse_args(
+        ["--records-dir", "/nonexistent", "--rxd-electrumx-url", a, "--rxd-electrumx-url", b, "--accept-single-source"]
+    )
     async with contextlib.AsyncExitStack() as stack:
         return await run._build_rxd_source(args, stack)
 

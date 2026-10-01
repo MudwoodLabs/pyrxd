@@ -34,6 +34,11 @@ SCOPE (be honest about it):
     covenant variants; BTC outpoint->spender scanning (the harness must cite the spend txid). Next-cut.
 
 Run `python scripts/swap_run_verify.py --self-check` for the offline engine tests (no network).
+
+Exit codes (live mode): 0 fully-verified PASS · 5 PASS_UNVERIFIED · 2 one-sided / anomalous · 4 pending or
+inconclusive · 3 INVALID — the input cannot be scored: a malformed manifest or journal (a bad field, an
+unparseable endpoint, a verifier endpoint a party also used, a secret in a public file) or parties who
+disagree on a cited txid. INVALID is printed to stderr as `INVALID: <reason>`, never as a traceback.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ import asyncio
 import enum
 import hashlib
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -61,6 +67,7 @@ from pyrxd.btc_wallet.taproot import (
 )
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.network.source_identity import source_key
+from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction import Transaction
 
 # Secret substrings forbidden in any cross-host / journal file (mirrors eth_swap_two_host._assert_public_only).
@@ -153,7 +160,9 @@ class Outpoint:
     @classmethod
     def parse(cls, s: str) -> Outpoint:
         txid, _, vout = s.partition(":")
-        if len(txid) != 64 or not vout.isdigit():
+        # ASCII digits only: `isdigit()` passed "²" (then a bare int() error) and Arabic-Indic or
+        # full-width digits (silently converted to a different-looking vout).
+        if len(txid) != 64 or not re.fullmatch(r"[0-9]{1,10}", vout) or int(vout) > 0xFFFFFFFF:
             raise ValueError(f"bad outpoint {s!r} (want 'txid:vout')")
         return cls(txid=txid.lower(), vout=int(vout))
 
@@ -1901,7 +1910,24 @@ def _append_trust_advisories(res: VerifyResult, m: RunManifest, eth_urls: list[s
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
+    """Run the live verifier; an input that cannot be scored exits 3 with ``INVALID: <reason>``.
+
+    Every validation in this file raises ``ValueError`` (``RunManifest.from_dict``, ``assert_no_secrets``,
+    ``assert_independent_endpoints``, ``Outpoint.parse``) and the shared source-identity code raises
+    ``ValidationError`` (an endpoint with no parseable host). Those reached the operator as a traceback and
+    exit 1, which no automation can tell from a crash.
+    """
+    try:
+        return await _run_cli_unguarded(args)
+    except (ValueError, ValidationError) as exc:
+        print(f"INVALID: {exc}", file=sys.stderr)
+        return 3
+
+
+async def _run_cli_unguarded(args: argparse.Namespace) -> int:
     manifest_doc = _load_json(args.manifest)
+    if not isinstance(manifest_doc, dict):
+        raise ValueError(f"manifest must be a JSON object, got {type(manifest_doc).__name__}")
     journals = [_load_json(p) for p in args.journal]
     # 1) validity gate: no secrets anywhere in the public package.
     assert_no_secrets(manifest_doc, what="manifest")
@@ -1956,7 +1982,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
     _append_trust_advisories(res, m, eth_urls, args.min_confirmations)
     print(json.dumps(res.as_dict(), indent=2))
     # Exit codes: 0 fully-verified PASS · 5 PASS_UNVERIFIED (both-complete but counter not recipient/value
-    # -verified — distinct so CI can't treat it as a clean PASS) · 2 one-sided/anomalous · 4 pending.
+    # -verified — distinct so CI can't treat it as a clean PASS) · 2 one-sided/anomalous · 4 pending ·
+    # 3 INVALID (raised above, caught in _run_cli).
     if res.verdict is Verdict.PASS:
         return 0
     if res.verdict is Verdict.PASS_UNVERIFIED:
@@ -1999,7 +2026,12 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("live verification needs --manifest, --journal (>=1), and --rxd-electrumx-url")
     # the counter-chain source is required for that chain; we can't know which until the manifest is read,
     # so validate inside _run_cli is awkward — peek the counter_chain here.
-    cc = _load_json(args.manifest).get("counter_chain")
+    try:
+        peek = _load_json(args.manifest)
+    except ValueError as exc:  # json.JSONDecodeError is a ValueError
+        print(f"INVALID: manifest {args.manifest!r} is not JSON ({exc})", file=sys.stderr)
+        return 3
+    cc = peek.get("counter_chain") if isinstance(peek, dict) else None
     if cc == "btc" and not args.btc_esplora_url:
         ap.error("btc counter leg needs --btc-esplora-url (an Esplora neither party ran)")
     # Check the FILTERED list, not the raw arg: `--eth-rpc-url ""` makes args.eth_rpc_url == [""] (truthy)

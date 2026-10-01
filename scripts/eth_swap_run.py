@@ -625,6 +625,19 @@ _NEGOTIATED_INPUTS = (
 )
 
 
+#: The :data:`_NEGOTIATED_INPUTS` that are MEASUREMENTS of a chain rather than choices: block intervals
+#: (the fast tail above all) and the ETH finalization window. An operator who changed one on a resume
+#: has usually RE-MEASURED it, and the newer figure may well be the more accurate one, so a refusal must
+#: not tell them to "restore" the old value as if it were still true. What the old value still is, is
+#: the term the swap was negotiated under. See :func:`_t_rxd_remedy`.
+_MEASURED_INPUTS = (
+    "rxd_block_interval_fast_s",
+    "rxd_block_interval_s",
+    "btc_block_interval_s",
+    "eth_finalization_window_s",
+)
+
+
 def _negotiated_inputs(args: argparse.Namespace) -> dict:
     """What :data:`_NEGOTIATED_INPUTS` were for this run, as the recovery file records them."""
     return {name: getattr(args, name, None) for name in _NEGOTIATED_INPUTS}
@@ -637,7 +650,14 @@ def _t_rxd_remedy(args: argparse.Namespace, remaining_s: int | None) -> str:
     funded covenant commits to the ``t_rxd`` the swap recorded, which the resume reuses, and any other
     value rebuilds a covenant that holds nothing. Every bound is a floor that only gets easier as the
     deadline nears, so a recorded ``t_rxd`` that passed when the swap was negotiated fails on a resume
-    only because an input changed. Name it, against the recorded value, and advise restoring it.
+    only because an input changed. Name it, against the recorded value.
+
+    The advice depends on what KIND of input changed. A chosen input (a slack, a burial, the margin)
+    is restored. A MEASURED one (:data:`_MEASURED_INPUTS`) is not simply "restored": the operator has
+    probably re-measured it, and nothing here knows which figure is more accurate. What is known is that
+    the swap's ``t_rxd`` and deadline were negotiated under the recorded value, and that changing it
+    changes the terms the counterparty agreed to. So the safe options are named as such: resume with
+    the recorded value only as the agreed term, or let the swap time out and refund.
     """
     if remaining_s is None:
         return f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
@@ -651,23 +671,45 @@ def _t_rxd_remedy(args: argparse.Namespace, remaining_s: int | None) -> str:
     )
     if not isinstance(recorded, dict):
         return fixed + (
-            "  this recovery file predates recording the run's inputs, so restore the values the interrupted "
-            "run was started with — first --rxd-block-interval-fast-s, then the cross-clock margin flags "
-            "(--eth-finalization-window-s, --eth-finality-stall-tolerance-s, --rxd-claim-burial-s, "
-            "--rxd-confirm-slack-s, --rounding-slack-s) and --max-covenant-confirm-wait-s — and resume again.\n"
+            "  this recovery file predates recording the run's inputs, so the values the interrupted run was "
+            "started with are not on record. Resume only with those values — first --rxd-block-interval-fast-s, "
+            "then the cross-clock margin flags (--eth-finalization-window-s, --eth-finality-stall-tolerance-s, "
+            "--rxd-claim-burial-s, --rxd-confirm-slack-s, --rounding-slack-s) and --max-covenant-confirm-wait-s. "
+            "For the measured ones (the block intervals, the finalization window) that means accepting the "
+            "figures the swap was negotiated under as its terms, not a claim that they are still accurate. "
+            "If you will not, do not resume: let the swap time out and refund.\n"
         )
     now = _negotiated_inputs(args)
-    changed = [
-        f"--{name.replace('_', '-')} {now[name]!r} (the swap was negotiated with {recorded[name]!r})"
-        for name in _NEGOTIATED_INPUTS
-        if name in recorded and recorded[name] != now[name]
-    ]
-    if not changed:
+    differs = [name for name in _NEGOTIATED_INPUTS if name in recorded and recorded[name] != now[name]]
+    if not differs:
         return fixed + (
             "  but no recorded input differs from this run's. Do not change t_rxd or the deadline; if the "
             "swap cannot continue, refund the deployed contract after its timeout.\n"
         )
-    return fixed + "  changed: " + "; ".join(changed) + ". Restore the recorded value and resume again.\n"
+    chosen = [
+        f"--{name.replace('_', '-')} {now[name]!r} (the swap was negotiated with {recorded[name]!r})"
+        for name in differs
+        if name not in _MEASURED_INPUTS
+    ]
+    measured = [
+        f"--{name.replace('_', '-')} {now[name]!r} (the swap was negotiated under {recorded[name]!r})"
+        for name in differs
+        if name in _MEASURED_INPUTS
+    ]
+    out = fixed
+    if chosen:
+        out += "  changed: " + "; ".join(chosen) + ". Restore the recorded value and resume again.\n"
+    if measured:
+        out += (
+            "  re-measured: "
+            + "; ".join(measured)
+            + ". These are measurements, and the newer figure may be the more accurate one; but this swap's "
+            "t_rxd and deadline were negotiated under the recorded value, and changing it changes the terms "
+            "the counterparty agreed to. The safe options: (a) resume with the recorded value only if you "
+            "accept it as the agreed term (that is not a claim it is still accurate); or (b) do not resume, "
+            "let the swap time out and refund.\n"
+        )
+    return out
 
 
 def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
