@@ -96,7 +96,7 @@ tx `8c09738386d84132…:0`.
 
 **Provenance discipline (per global honesty rules):** the three
 statements above are **verified on-chain** (live `testmempoolaccept`
-against the node on `tr`, block 430721, reproduced; consensus source
+against the maintainer's node, block 430721, reproduced; consensus source
 read at the cited file:line). Everything in the Phases below that has
 not yet been broadcast/`testmempoolaccept`-ed is **designed-but-unproven**
 and is flagged as such. The Phase-2 gate exists precisely to convert the
@@ -798,7 +798,7 @@ hardening constraints + phantom-ref guard.
 
 ## Provenance: proven vs. designed-but-unproven
 
-**Proven on-chain (live `testmempoolaccept`, node v2.3.0 on `tr`,
+**Proven on-chain (live `testmempoolaccept`, node v2.3.0 on the maintainer's node host,
 consensus source read):**
 - Layer 1 phantom-ref mechanism + hash-compare fix (phantom-free).
 - Layer 2 conservation gate (FT welded to its code-script).

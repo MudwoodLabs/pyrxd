@@ -42,8 +42,10 @@ Design notes (T7 plan D5/D6, reviewed)
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import math
 from collections.abc import Iterator
 from typing import Any, Protocol, runtime_checkable
 
@@ -55,6 +57,7 @@ from pyrxd.gravity.fee_policy import (
     DeadlineFeePolicy,
     assert_fee_covers,
 )
+from pyrxd.gravity.funding_spv import UNIDENTIFIED_SOURCE_PREFIX, MakerFundingEvidence
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
     build_htlc_covenant_ft,
@@ -163,6 +166,11 @@ class RadiantBroadcaster(Protocol):
         ...
 
 
+#: How long :meth:`RadiantChainIO.reported_depths` waits for any one depth source before dropping
+#: it. The sources are asked concurrently, so this bounds the whole call, not each source in turn.
+DEPTH_SOURCE_TIMEOUT_S = 20.0
+
+
 class RadiantChainIO:
     """Thin chain helper over an ``ElectrumXClient``-like object.
 
@@ -173,13 +181,48 @@ class RadiantChainIO:
     The injected ``client`` must expose ``broadcast(raw)->txid``,
     ``get_transaction_verbose(txid)->dict`` (with ``confirmations``), and
     ``get_utxos(script_hash)->list`` (records with ``tx_hash``/``tx_pos``/``value``).
+
+    ``proof_client``, when given, answers the four reads the swap taker gate PROVES a covenant
+    funding from (:meth:`funding_evidence`); by default ``client`` does. Any server will do for
+    those: the proof rests on the checkpoints pyrxd ships, not on who served it — so a transport
+    that cannot serve them (the operator scripts' node-over-ssh shim) pairs with an ElectrumX client.
+
+    ``depth_sources`` are further Radiant readers (each with ``get_transaction_verbose`` and/or
+    ``get_tip_height``) whose REPORTED depth of the funding the gate's elapsed-depth upper bound may
+    be raised by, beside ``client``'s and ``proof_client``'s. A report never lowers the bound, so a
+    source reporting less costs nothing; each is grouped by its ``source_key`` (its operator). Above
+    dust on a value-bearing network the gate requires reports from at least two distinct operators
+    (:data:`pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`): :meth:`configured_depth_operators`
+    says which this configuration asks. A client over the URLs of several operators — an
+    ``ElectrumXClient`` given pyrxd's shipped mainnet endpoints, which races them — is asked once
+    PER OPERATOR (``ElectrumXClient.per_source_clients``), since one reply from it cannot say which
+    operator sent it. The sources are asked CONCURRENTLY, each under ``depth_timeout_s`` (default
+    :data:`DEPTH_SOURCE_TIMEOUT_S`): a source that does not answer in time is dropped, as one that
+    fails is, and costs the call one timeout, not one per unresponsive source.
     """
 
-    def __init__(self, client: Any) -> None:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        proof_client: Any = None,
+        depth_sources: tuple[Any, ...] = (),
+        depth_timeout_s: float = DEPTH_SOURCE_TIMEOUT_S,
+    ) -> None:
         for m in ("broadcast", "get_transaction_verbose", "get_utxos"):
             if not hasattr(client, m):
                 raise ValidationError(f"RadiantChainIO client must provide {m}()")
+        if (
+            not isinstance(depth_timeout_s, (int, float))
+            or isinstance(depth_timeout_s, bool)
+            or not math.isfinite(depth_timeout_s)
+            or depth_timeout_s <= 0
+        ):
+            raise ValidationError("RadiantChainIO depth_timeout_s must be a finite number > 0")
         self._client = client
+        self._proof_client = client if proof_client is None else proof_client
+        self._depth_sources = tuple(depth_sources)
+        self._depth_timeout_s = float(depth_timeout_s)
 
     async def broadcast(self, raw_tx: bytes) -> str:
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
@@ -303,6 +346,189 @@ class RadiantChainIO:
             )
         u = utxos[0]
         return f"{u.tx_hash}:{u.tx_pos}", PhotonValue(int(u.value)), ChainHeight(int(u.height))
+
+    async def funding_evidence(
+        self, outpoint: str, height: int, *, header_ranges: tuple[tuple[int, int], ...]
+    ) -> MakerFundingEvidence:
+        """Fetch what the swap taker gate needs to PROVE a covenant funding: nothing here is judged.
+
+        The funding transaction's raw bytes, its merkle branch in block *height*, that block's
+        coinbase branch (which pins the tree's depth), the header ranges the coordinator planned
+        (:func:`pyrxd.gravity.funding_spv.funding_header_ranges`), and the depth each configured
+        source reports (:meth:`reported_depths`). :func:`pyrxd.gravity.funding_spv.verify_maker_funding`
+        decides what they prove; a reply this cannot fetch raises ``NetworkError``, and the gate
+        refuses on it.
+
+        Header ranges are fetched in ascending order and fetching stops at the first SHORT reply: a
+        server answers fewer headers past its tip, so everything above that is beyond its chain.
+        """
+        client = self._proof_client
+        needed = (
+            "get_transaction",
+            "get_transaction_merkle_branch",
+            "get_transaction_id_from_pos",
+            "get_block_headers",
+        )
+        missing = [m for m in needed if not callable(getattr(client, m, None))]
+        if missing:
+            raise NetworkError(
+                f"this Radiant client cannot serve the proof of the maker's funding (it has no {', '.join(missing)}); "
+                "the taker gate refuses without it — use an ElectrumX client"
+            )
+        txid, _sep, vout_s = str(outpoint).partition(":")
+        if not _sep or not vout_s.isdigit():
+            raise ValidationError(f"bad covenant outpoint {outpoint!r}")
+        try:
+            raw = bytes(await client.get_transaction(txid))
+            merkle = await client.get_transaction_merkle_branch(txid, height)
+            coinbase = await client.get_transaction_id_from_pos(height, 0)
+            headers: dict[int, bytes] = {}
+            for start, count in sorted(header_ranges):
+                got = list(await client.get_block_headers(start, count))
+                for i, header in enumerate(got):
+                    headers.setdefault(start + i, bytes(header))
+                if len(got) < count:
+                    break
+        except NetworkError:
+            raise
+        except Exception as exc:
+            raise NetworkError(
+                f"could not fetch the proof of the maker's funding: {type(exc).__name__}: {exc}"
+            ) from exc
+        return MakerFundingEvidence(
+            txid=txid.lower(),
+            vout=int(vout_s),
+            height=int(height),
+            raw_tx=raw,
+            merkle=merkle,
+            coinbase_merkle=coinbase,
+            headers=headers,
+            reported_depths=await self.reported_depths(txid, int(height)),
+            configured_operators=self.configured_depth_operators(),
+        )
+
+    def _distinct_sources(self) -> list[Any]:
+        seen: list[Any] = []
+        for src in (self._client, self._proof_client, *self._depth_sources):
+            if not any(src is s for s in seen):
+                seen.append(src)
+        return seen
+
+    @staticmethod
+    def _unidentified_label(index: int, src: Any) -> str:
+        return f"{UNIDENTIFIED_SOURCE_PREFIX} #{index} ({type(src).__name__})"
+
+    @staticmethod
+    def _splits(src: Any) -> bool:
+        """A client over several operators' URLs that can be asked once per operator."""
+        keys = getattr(src, "source_keys", None)
+        return (
+            getattr(src, "source_key", None) is None
+            and isinstance(keys, tuple)
+            and len(keys) > 1
+            and callable(getattr(src, "per_source_clients", None))
+        )
+
+    def configured_depth_operators(self) -> tuple[str, ...]:
+        """The operator groups this configuration asks for a funding's depth — ``client``,
+        ``proof_client`` and every ``depth_sources`` reader — derived from each one's ``source_key``
+        (every group of a client over several operators' URLs), each once. A source that cannot say
+        which operator runs it appears as ``"unidentified source #i (<type>)"``, which
+        :func:`pyrxd.gravity.funding_spv.counted_operators` does not count. Nothing is connected."""
+        out: list[str] = []
+        for index, src in enumerate(self._distinct_sources()):
+            if self._splits(src):
+                out.extend(str(k) for k in src.source_keys)
+                continue
+            key = getattr(src, "source_key", None)
+            out.append(str(key) if key else self._unidentified_label(index, src))
+        return tuple(dict.fromkeys(out))
+
+    async def reported_depths(self, txid: str, height: int) -> tuple[tuple[str, int], ...]:
+        """``((operator, depth), ...)``: the depth of *txid* (mined at *height*) each configured
+        source REPORTS — ``client``, ``proof_client`` and every ``depth_sources`` reader, each once,
+        and a client over several operators' URLs once per operator (on clients made for this call
+        and closed before it returns).
+
+        A source's depth is the larger of its verbose ``confirmations`` and its ``tip - height + 1``,
+        whichever it answers; a source that answers neither is left out. Each is labelled by its
+        ``source_key`` (its operator group, :func:`pyrxd.network.source_identity.source_key`), or
+        ``"unidentified source #i (<type>)"`` for a client that cannot say — never merged with another.
+        These RAISE the gate's elapsed upper bound, and above dust the gate counts the operators
+        among them; the proof does not depend on them.
+
+        The sources are asked CONCURRENTLY, each under ``depth_timeout_s``; one that times out or
+        fails is left out exactly as one that answers neither. So an unresponsive operator costs the
+        call one timeout, not one per source in turn.
+        """
+        asked: list[tuple[int, Any]] = []
+        made: list[Any] = []
+        for index, src in enumerate(self._distinct_sources()):
+            if self._splits(src):
+                parts = tuple(src.per_source_clients())
+                made.extend(parts)
+                asked.extend((index, part) for part in parts)
+            else:
+                asked.append((index, src))
+        try:
+            return await self._ask_depths(asked, txid, height)
+        finally:
+            for part in made:
+                with contextlib.suppress(Exception):
+                    await part.close()
+
+    async def _ask_depths(self, asked: list[tuple[int, Any]], txid: str, height: int) -> tuple[tuple[str, int], ...]:
+        async def one(index: int, src: Any) -> tuple[str, int] | None:
+            try:
+                depths = await asyncio.wait_for(self._ask_one(index, src, txid, height), self._depth_timeout_s)
+            except asyncio.TimeoutError:
+                logger.debug("depth source %d did not answer within %.1f s", index, self._depth_timeout_s)
+                return None
+            if not depths:
+                return None
+            key = getattr(src, "source_key", None)
+            label = str(key) if key else self._unidentified_label(index, src)
+            return (label, max(depths))
+
+        # Concurrently: one unresponsive operator costs one timeout, not one per source in turn.
+        # `gather` keeps the order they were asked in.
+        answers = await asyncio.gather(*(one(index, src) for index, src in asked))
+        return tuple(a for a in answers if a is not None)
+
+    @staticmethod
+    async def _ask_one(index: int, src: Any, txid: str, height: int) -> list[int]:
+        """The depths one source reports: its verbose ``confirmations`` and ``tip - height + 1``,
+        whichever it answers; a read that fails is left out.
+
+        The two reads are asked ONE AFTER THE OTHER. Only different sources run concurrently: two
+        concurrent first calls on one fresh ``ElectrumXClient`` would each open a connection, and
+        the reply to the one whose socket lost the race would never be read."""
+
+        async def confirmations() -> int | None:
+            verbose = getattr(src, "get_transaction_verbose", None)
+            if not callable(verbose):
+                return None
+            try:
+                info = await verbose(txid)
+                confs = finite_int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
+                return confs if confs > 0 else None
+            except Exception:
+                logger.debug("depth source %d gave no confirmations", index, exc_info=True)
+                return None
+
+        async def from_tip() -> int | None:
+            tip = getattr(src, "get_tip_height", None)
+            if not callable(tip):
+                return None
+            try:
+                t = finite_int(await tip())
+                return t - height + 1 if t >= height else None
+            except Exception:
+                logger.debug("depth source %d gave no tip height", index, exc_info=True)
+                return None
+
+        found = [await confirmations(), await from_tip()]
+        return [d for d in found if d is not None]
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to
@@ -602,13 +828,19 @@ class RadiantCovenantLeg:
     async def verify_maker_asset_funded(
         self, terms: NegotiatedTerms, *, min_confirmations: int | None = None
     ) -> tuple[str, int, int]:
-        """TAKER-side fail-closed gate: is the MAKER's asset really locked, at the agreed value,
-        buried deep enough, before the taker funds the counter leg? Returns
-        ``(outpoint, value_photons, confirmations)``; RAISES on anything else — the taker MUST NOT
-        lock BTC/ETH if this raises. The Radiant twin of
-        :meth:`pyrxd.btc_wallet.htlc_leg.BitcoinTaprootLeg.verify_counterparty_funded`.
+        """A SERVER-REPORTED pre-check and locator of the maker's covenant funding — NOT the taker gate.
 
-        WHY: ``docs/htlc-handshake-wire-format.md`` HZ-1 states it normatively — *"a taker MUST NOT
+        Returns ``(outpoint, value_photons, confirmations)`` as ONE server reports them
+        (``listunspent`` and verbose ``confirmations``: no merkle proof, no header), and RAISES on
+        anything short of the checks below. A server that invents the covenant satisfies it, so
+        passing it proves nothing a lying server cannot fake. The taker gate is
+        :meth:`pyrxd.gravity.swap_coordinator.SwapCoordinator.taker_verify_asset_funding`, which
+        PROVES the funding from :meth:`maker_funding_evidence` with
+        :func:`pyrxd.gravity.funding_spv.verify_maker_funding` and no longer calls this. Its
+        production caller is the coordinator's ``_covenant_elapsed_blocks``, the post-confirm
+        ordering recheck's read of the covenant's depth — a measurement there, not a gate.
+
+        The rule it was written for: ``docs/htlc-handshake-wire-format.md`` HZ-1 — *"a taker MUST NOT
         fund the counter leg until it has confirmed the maker's asset lock on chain, at the agreed
         scriptPubKey, for the agreed value, at a depth the taker chose."* Nothing else in the
         handshake gives the taker that. The BTC claim leaf is ``<H> … <makerClaimPk> OP_CHECKSIG``
@@ -656,6 +888,54 @@ class RadiantCovenantLeg:
                 "counter leg is locked. Wait for it to bury, then retry."
             )
         return outpoint, int(value), confs
+
+    async def maker_funding_evidence(
+        self,
+        terms: NegotiatedTerms,
+        *,
+        header_ranges: Any,
+        min_confirmations: int | None = None,
+    ) -> MakerFundingEvidence:
+        """TAKER-side: fetch the evidence the coordinator PROVES the maker's covenant funding from.
+
+        The swap taker gate (``SwapCoordinator.taker_verify_asset_funding``) calls this and runs
+        :func:`pyrxd.gravity.funding_spv.verify_maker_funding` on what it returns; nothing is
+        judged here. The covenant scriptPubKey is re-derived from the taker's own ``terms``, and
+        its ``listunspent`` entry is used only to LOCATE the outpoint and the height the server
+        names for it — the script and value the coordinator accepts are read from the funding
+        transaction's own raw bytes, and the height is proved or refused. The same read is what
+        still stands behind "the output is unspent", which SPV cannot show.
+
+        *header_ranges* is a callable ``height -> ((start, count), ...)``: the coordinator decides
+        what to fetch once the height is known. *min_confirmations*, when given, is the depth the
+        coordinator already knows it will require; a server that itself reports less is refused
+        here before thousands of headers are fetched. That refusal is the only use of the reported
+        depth on this path: a server over-reporting it gains nothing, because the proof decides.
+        """
+        cov = self._build_covenant(terms)
+        outpoint, _listed_value, height = await self.chain_io.find_covenant_utxo(
+            cov.funded_spk, expected_value=terms.radiant_amount
+        )
+        if int(height) <= 0:
+            raise NetworkError(
+                f"the maker's covenant funding {outpoint} is not yet mined (the server lists it unconfirmed); "
+                "wait for it to confirm, then retry"
+            )
+        if min_confirmations is not None:
+            reported = await self.chain_io.confirmations(outpoint.split(":")[0])
+            if reported < int(min_confirmations):
+                raise NetworkError(
+                    f"the maker's Radiant covenant funding {outpoint} has {reported} confirmation(s) by the server's "
+                    f"own count, below the {int(min_confirmations)} this swap requires before it is even proved. "
+                    "Wait for it to bury, then retry."
+                )
+        return await self.chain_io.funding_evidence(outpoint, int(height), header_ranges=header_ranges(int(height)))
+
+    def configured_depth_operators(self) -> tuple[str, ...]:
+        """The operator groups this leg asks for the maker's funding depth
+        (:meth:`RadiantChainIO.configured_depth_operators`): what the coordinator checks, before
+        anyone locks, against the taker gate's two-operator rule above dust."""
+        return self.chain_io.configured_depth_operators()
 
     # -- spends -------------------------------------------------------------
     async def _resolve_covenant(self, record: SwapRecord) -> tuple[HtlcCovenant, str, int, int]:

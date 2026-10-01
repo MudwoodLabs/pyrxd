@@ -206,6 +206,26 @@ class FakeRadiantLeg:
         confs = self.report_confs if self.report_confs is not None else max(int(min_confirmations or 1), 1)
         return ("ef" * 32 + ":0", terms.radiant_amount, int(confs))
 
+    async def maker_funding_evidence(self, terms: NegotiatedTerms, *, header_ranges, min_confirmations=None):
+        """The taker gate's read: a REAL regtest chain proving the covenant funding (see
+        ``tests/_funding_chain.py``), ``report_confs`` deep or exactly the depth asked for. The
+        coordinator proves it with the production verifier — nothing here is taken on trust."""
+        from tests._funding_chain import build_funding_chain
+
+        self.calls.append("maker_funding_evidence")
+        self.verify_min_confirmations.append(min_confirmations)
+        if not self.asset_funded:
+            raise NetworkError("no UTXO found for the covenant scriptPubKey (not yet funded / wrong SPK)")
+        confs = self.report_confs if self.report_confs is not None else max(int(min_confirmations or 1), 1)
+        spk = await self.expected_covenant_scriptpubkey(terms)
+        key = (spk, int(terms.radiant_amount), int(confs))
+        chain = self._chains.get(key) if hasattr(self, "_chains") else None
+        if chain is None:
+            chain = build_funding_chain(spk=spk, value=int(terms.radiant_amount), confs=int(confs))
+            self._chains = {**getattr(self, "_chains", {}), key: chain}
+        header_ranges(chain.height)  # the coordinator's plan must accept the height it is handed
+        return chain.evidence(reported_confirmations=int(confs))
+
     async def expected_covenant_scriptpubkey(self, terms: NegotiatedTerms) -> bytes:
         # Deterministic stand-in for the fused covenant SPK.
         body = (
@@ -2900,15 +2920,23 @@ def test_value_bearing_eth_estimated_policy_refused():
         _construct_eth_coord(policy=_eth_finality_policy(is_measured=False))
 
 
+def _with_fast_tail(policy, fast_s: float = 300.0, **over):
+    """*policy* carrying a fast tail, which a mainnet Radiant leg's coordinator requires to construct
+    (the timelock reserves divide by it). 300 s — the nominal — so the arithmetic these guard tests pin
+    is unchanged; they are about other guards, not the fast tail. *over* sets other fields (a
+    ``value_at_risk_photons`` for an ``ft`` swap, which the taker gate also requires)."""
+    return type(policy)(**{**policy.__dict__, "rxd_block_interval_fast_s": fast_s, **over})
+
+
 def test_value_bearing_eth_estimated_allowed_with_explicit_optin():
     # Conscious dust-run acceptance (accept_estimated_eth_margins=True) -> constructs.
-    coord = _construct_eth_coord(policy=_eth_finality_policy(is_measured=False), accept_estimated=True)
+    coord = _construct_eth_coord(policy=_with_fast_tail(_eth_finality_policy(is_measured=False)), accept_estimated=True)
     assert coord is not None
 
 
 def test_value_bearing_eth_allowed_when_measured():
     # A measured policy is the proper fix path; window>=N-floor (8) -> constructs.
-    coord = _construct_eth_coord(policy=_eth_finality_policy(is_measured=True), window=8)
+    coord = _construct_eth_coord(policy=_with_fast_tail(_eth_finality_policy(is_measured=True)), window=8)
     assert coord is not None
 
 
@@ -2920,14 +2948,17 @@ def test_non_value_bearing_eth_estimated_unaffected():
 
 def test_value_bearing_btc_estimated_unaffected():
     # The guard is ETH-specific; a value-bearing BTC swap on an estimated policy still constructs.
+    # (t_btc 4, t_rxd 200: room for the taker gate's elapsed-depth bound on a mainnet leg; see
+    # _burial_coord.)
     coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms()),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4, t_rxd_blocks=200)),
         btc_leg=FakeBtcLeg(),
         radiant_leg=_value_bearing_radiant(),
         indexer=FakeIndexer(),
         seen_store=FakeSeenStore(),
         config=CoordinatorConfig(
-            margin_policy=MarginPolicy.estimated(accept_flat_burial=True), accept_nondurable_seen=True
+            margin_policy=_with_fast_tail(MarginPolicy.estimated(accept_flat_burial=True), value_at_risk_photons=1_000),
+            accept_nondurable_seen=True,
         ),
     )
     assert coord is not None
@@ -2940,8 +2971,11 @@ def test_value_bearing_btc_estimated_unaffected():
 
 
 def _burial_coord(margin_policy):
+    # t_btc 4 and t_rxd 200 leave the taker gate's negotiation-time check room for the elapsed-depth
+    # bound it models on a mainnet leg (80 blocks for a small value: k = 6, the newest header up to
+    # an hour old, blocks counted at 3× the nominal rate); these tests are about burial.
     return SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms()),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(t_btc_blocks=4, t_rxd_blocks=200)),
         btc_leg=FakeBtcLeg(),
         radiant_leg=_value_bearing_radiant(),
         indexer=FakeIndexer(),
@@ -3124,7 +3158,20 @@ def test_setup_gate_refuses_value_bearing_radiant_without_value_scaling():
 
 
 def test_setup_gate_accepts_dust_optout():
-    assert _burial_coord(MarginPolicy.estimated(accept_flat_burial=True)) is not None
+    # The flat-burial opt-out needs no reorg-cost inputs. The taker gate still needs a value to size
+    # the maker-funding depth from (an ft swap has no in-protocol one), and the fast tail.
+    assert (
+        _burial_coord(_with_fast_tail(MarginPolicy.estimated(accept_flat_burial=True), value_at_risk_photons=1_000))
+        is not None
+    )
+
+
+def test_a_mainnet_swap_with_no_value_to_size_the_funding_depth_is_refused_at_construction():
+    """An ft swap has no in-protocol value; with no value_at_risk_photons the taker gate cannot size
+    the depth it requires of the maker's funding and refuses — at step 5, after the maker locked.
+    So the negotiation-time check refuses it first."""
+    with pytest.raises(ValidationError, match=r"refused before anyone locks.*needs a value at stake"):
+        _burial_coord(_with_fast_tail(MarginPolicy.estimated(accept_flat_burial=True)))
 
 
 def test_setup_gate_accepts_value_scaled_inputs():

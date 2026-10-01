@@ -1,8 +1,9 @@
-"""Mainnet Glyph genesis-ref authenticity adapter over the RXinDexer REST api (via ssh tr).
+"""Mainnet Glyph genesis-ref authenticity adapter over the RXinDexer REST api (over ssh).
 
 The proven REF gate (``pyrxd.gravity.radiant_leg.RxinDexerRefAdapter``) resolves a genesis ref via
-the RXinDexer ElectrumX ws method ``glyph.get_token``. The mainnet RXinDexer deployment on ``tr``
-runs only the **REST api** (``:8000``, bound to tr-localhost — no electrumx glyph ws), so this adapter
+the RXinDexer ElectrumX ws method ``glyph.get_token``. The mainnet RXinDexer deployment on the
+maintainer's node host runs only the **REST api** (``:8000``, bound to that host's localhost — no
+electrumx glyph ws), so this adapter
 resolves the same fact over HTTP instead.
 
 Key fact (read from the RXinDexer source ``electrumx/server/rest_api.py`` + verified live 2026-06-04):
@@ -22,6 +23,7 @@ import struct
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.radiant_leg import RadiantChainIO
 from pyrxd.gravity.ref_authenticity import ResolvedRef
+from pyrxd.gravity.watch.sshtr import _validate_argv_token
 from pyrxd.security.errors import NetworkError, ValidationError
 
 
@@ -35,14 +37,16 @@ class SshTrHttpRefAdapter:
         self,
         *,
         chain_io: RadiantChainIO,
-        ssh_host: str = "tr",
+        ssh_host: str,
         api_base: str = "http://127.0.0.1:8000",
         timeout_s: int = 15,
     ) -> None:
         if not isinstance(chain_io, RadiantChainIO):
             raise ValidationError("SshTrHttpRefAdapter requires a RadiantChainIO")
         self._chain_io = chain_io
-        self._ssh_host = ssh_host
+        # REQUIRED, no default: this file is public and must not name any one operator's host.
+        # It reaches an ssh argv, so it is charset-checked like the node shim's.
+        self._ssh_host = _validate_argv_token(ssh_host, "ssh_host")
         self._base = api_base.rstrip("/")
         self._timeout = int(timeout_s)
 
@@ -78,7 +82,7 @@ class SshTrHttpRefAdapter:
         )
 
     async def _api_get(self, path: str) -> tuple[str, int]:
-        """``ssh <host> curl <api><path>`` → (body, http_status). The api is tr-localhost-bound."""
+        """``ssh <host> curl <api><path>`` → (body, http_status). The api is bound to the ssh host's localhost."""
         remote = f"curl -s -m {self._timeout} -w '\\n%{{http_code}}' {shlex.quote(self._base + path)}"
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", self._ssh_host, remote]
         proc = await asyncio.create_subprocess_exec(

@@ -343,3 +343,12 @@ class EthLeg:
         """The point-in-time ETH finality verdict (FINAL once at/under the ``finalized``
         checkpoint, else NOT_YET_FINAL_LIVE) the reorg gate consumes."""
         return await self._leg.claim_finality_verdict(tx_hash)
+
+    @property
+    def chain_id(self) -> int:
+        """The EIP-155 chain id this leg signs for — what decides whether it moves real value.
+
+        :func:`pyrxd.gravity.funding_spv.radiant_chain_for_leg` reads it: ``network`` cannot say
+        whether an EVM chain carries value (see :mod:`pyrxd.eth_wallet.chains`), the chain id can.
+        """
+        return self._leg.chain_id

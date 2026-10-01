@@ -54,7 +54,7 @@ class TestTheFastTailIsWiredAndTheRegimeIsDISCLOSED:
     omitted flag did not fail — it sized every reserve against 300 s instead of the 36 s measured
     p10. Measured at the shipped defaults: **8.3x looser**.
 
-    `eth_swap_run.py:193` REFUSES a real-value run without it. Refusing HERE would be wrong: this
+    `eth_swap_run.py:206` REFUSES a real-value run without it. Refusing HERE would be wrong: this
     file has no mainnet path at all (`_ALLOWED_*_NETWORKS` is regtest/testnet, and its own header
     says so), so a refusal would block the only work it can legitimately do.
 

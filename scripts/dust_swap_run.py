@@ -23,8 +23,16 @@ tests/test_xchain_swap_regtest_e2e.py). Run under supervision — the maker-stal
 the most likely real loss path; do NOT walk away while BOTH_LOCKED.
 
   python scripts/dust_swap_run.py --stage signet \
-      --btc-claim-payout <addr-spk-hex> --btc-refund-payout <addr-spk-hex>
-  python scripts/dust_swap_run.py --stage dust --i-accept-dust-loss --btc-sats 600 ...
+      --btc-claim-payout <addr-spk-hex> --btc-refund-payout <addr-spk-hex> \
+      --rxd-ssh-host <your node host> --rxd-container <your node container> \
+      --rxd-block-interval-fast-s <measured p10 s>
+  python scripts/dust_swap_run.py --stage dust --i-accept-dust-loss --btc-sats 600 \
+      --rxd-ssh-host <your node host> --rxd-container <your node container> ...
+
+The broadcast stages reach your mainnet Radiant node as
+``ssh <host> 'docker exec <container> radiant-cli ...'``; --rxd-ssh-host and --rxd-container are
+REQUIRED for them (no default). --accept-single-operator-up-to RXD is the taker gate's
+single-operator override (see ``ElapsedBoundPolicy.accept_single_operator_up_to_photons``).
 """
 
 from __future__ import annotations
@@ -67,18 +75,22 @@ from _dust_swap_shared import (
     CapturingBroadcaster,
     SshTrFeeSource,
     StepReport,
+    add_rxd_node_args,
+    add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
     covenant_fund_height,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    funding_bound_from_args,
     measured_margin_from_mainnet,
     merge_into_mode_600,
+    require_rxd_node_args,
     rxd_blockcount,
     validated_resume_deadline_s,
     wait_for_covenant_funding,
 )
-from radiant_mainnet_chainio import SshTrRadiantClient
+from radiant_mainnet_chainio import SshTrRadiantClient, mainnet_proof_client
 
 # Per-stage endpoints. signet uses the "tb" HRP + the mempool.space signet API.
 _STAGES = {
@@ -262,7 +274,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     _btc_bcast = MempoolSpaceBroadcaster(base_url=stage["btc_base_url"])
     btc_broadcaster = CapturingBroadcaster(_btc_bcast)  # capture the claim raw for scraping
     btc_chain_reader = MempoolSpaceSource(base_url=stage["btc_base_url"])  # to fetch the maker claim tx
-    rxd_client = SshTrRadiantClient(rpcwallet=args.rxd_wallet)
+    rxd_client = SshTrRadiantClient(ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=args.rxd_wallet)
     rxd_client.register_spk(cov.funded_spk)
 
     print(f"\n  Fund the taker BTC address from your {btc_network} wallet (amount + fee), 1 conf:")
@@ -303,7 +315,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         network=rxd_network,
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
-        chain_io=RadiantChainIO(rxd_client),
+        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
         fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
         min_confirmations=1,
         audit_cleared=audit_cleared,
@@ -317,7 +329,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         # so the SEEN-1 replay/free-option reservation survives a restart or a second
         # process (durable-by-default; no accept_nondurable_seen opt-in needed).
         seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=policy),
+        config=CoordinatorConfig(margin_policy=policy, funding_bound=funding_bound_from_args(args)),
     )
 
     try:
@@ -347,7 +359,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
 
         # 2. Taker funds the BTC HTLC, then re-validates the covenant pinned to finality.
         confirm(f"taker_funds_btc: broadcast the {btc_network} P2TR HTLC funding tx", auto_yes=args.yes)
-        rec = await coord.taker_funds_btc(terms)
+        rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
         report.step(
             name="taker_funds_btc",
             chain="btc",
@@ -511,12 +523,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--btc-refund-payout", default="", help="scriptPubKey hex the taker's BTC refund pays out to")
     ap.add_argument("--t-rxd-blocks", type=int, default=20)
     ap.add_argument("--rxd-network", default="bc", help="RXD audit-gate network tag")
-    ap.add_argument("--rxd-wallet", default="", help="RXD wallet name on tr; empty = the single loaded wallet")
+    ap.add_argument("--rxd-wallet", default="", help="RXD wallet name on your node; empty = the single loaded wallet")
+    add_rxd_node_args(ap)
     ap.add_argument("--margin-sample-blocks", type=int, default=144)
     ap.add_argument("--btc-tail-percentile", type=float, default=90.0)
     ap.add_argument("--btc-claim-reorg-depth", type=int, default=2)
     ap.add_argument("--rxd-claim-burial", type=int, default=2)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
+    ap.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=0.0,
+        help=(
+            "REQUIRED: the MEASURED p10 Radiant inter-block interval (seconds). The measured policy "
+            "requires it (the timelock reserves divide by it); measure it against a mainnet node for this run."
+        ),
+    )
+    add_single_operator_override_arg(ap)
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
     ap.add_argument(
         "--resume-deadline-s",
@@ -544,6 +567,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     args = ap.parse_args(argv)
     if _STAGES[args.stage]["broadcast"] and (not args.btc_claim_payout or not args.btc_refund_payout):
         ap.error("--btc-claim-payout and --btc-refund-payout (scriptPubKey hex) are required for broadcast stages")
+    if _STAGES[args.stage]["broadcast"]:
+        require_rxd_node_args(ap, args)
     return args
 
 

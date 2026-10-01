@@ -47,6 +47,7 @@ from pyrxd.gravity.eth_rxd_timelock import (
     eth_absolute_to_rxd_relative_blocks,
 )
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
+from pyrxd.gravity.funding_spv import MEDIAN_TIME_SPAN, ElapsedBoundPolicy
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.record_sink import JsonFileRecordSink
@@ -118,6 +119,8 @@ class _RxdNode:
     def __init__(self) -> None:
         self.rpass = secrets.token_hex(12)
         self.raddr = ""
+        #: The swap's wall clock, when the suite runs one (anvil's): see `rxd_mine`.
+        self.clock = None
 
     def _cli(self, wallet, args):
         base = ["docker", "exec", _RXD_CT, "radiant-cli", "-regtest", "-rpcuser=rt_user", f"-rpcpassword={self.rpass}"]
@@ -136,6 +139,14 @@ class _RxdNode:
         return self._cli(wallet, a)
 
     def rxd_mine(self, n=1):
+        # ONE CLOCK FOR BOTH CHAINS. The suites warp anvil's clock forward (to open an ETH refund)
+        # and hand the coordinator anvil's time as `now_unix_s`. Radiant's headers are stamped by
+        # this node's own clock, and the taker gate counts `now` minus the median time past of its newest
+        # headers as time in which blocks may have been mined — so a node stuck hours behind the ETH chain looked,
+        # correctly, like a server hiding hours of blocks. Production has one wall clock; the
+        # fixture now does too.
+        if self.clock is not None:
+            self.rxd("setmocktime", str(int(self.clock())))
         self.rxd("generatetoaddress", str(n), self.raddr, wallet="gravity")
 
     def start(self) -> None:
@@ -280,6 +291,7 @@ def env():
                 time.sleep(0.1)
         else:
             pytest.fail("anvil did not become ready")
+        node.clock = lambda: _anvil_now(url)
         yield node, url
     finally:
         anvil.terminate()
@@ -299,6 +311,13 @@ def _eth_policy():
         max_covenant_confirm_wait_s=600,
     )
 
+
+#: The taker gate's time term on these regtest chains, pre-paid like the confirm-wait. The gate counts
+#: the blocks that could follow its reference header statistically from the median time past there
+#: (``pyrxd.gravity.funding_spv``); the node stamps blocks by a mock clock that follows anvil's,
+#: several a second, so that median trails anvil's clock by a little. This is the gate's own count
+#: for a median up to 30 minutes behind, at the confidence it uses without a value at stake.
+_GATE_TIME_TERM_S = ElapsedBoundPolicy().blocks_upper(1800, spacing_s=300, value_at_stake_photons=None) * 300
 
 #: How far past anvil's clock these swaps put the ETH refund deadline: the one INPUT the timelocks
 #: are derived from. Far enough out that the maker's claim clears the pre-reveal head-room gate
@@ -332,7 +351,7 @@ def _derive_eth_timelocks(url, policy: MarginPolicy) -> tuple[bt.Timelock, bt.Ti
     now = _anvil_now(url)
     eth_timeout = now + _ETH_WINDOW_S
     interval = _dividing_interval_s(policy)
-    wait = int(policy.max_covenant_confirm_wait_s)
+    wait = int(policy.max_covenant_confirm_wait_s) + _GATE_TIME_TERM_S
     t_rxd = eth_absolute_to_rxd_relative_blocks(
         eth_timeout_unix_s=eth_timeout,
         expected_rxd_lock_time_unix_s=now - wait,
@@ -417,6 +436,13 @@ def _build(node, url, *, asset_variant="rxd", role=None, record_path=None):
     carrier = 100_000 if asset_variant == "rxd" else 1000
     policy = _eth_policy()
     t_btc, t_rxd, eth_timeout = _derive_eth_timelocks(url, policy)
+    # A chain that has been producing blocks up to now. Earlier scenarios on this shared node warp
+    # anvil's clock hours ahead without mining Radiant blocks in between, which leaves the node's
+    # last 11 headers — the window the taker gate takes its median time past over — stamped hours
+    # before the clock the coordinator is handed, as if the chain had stalled; the gate then counts
+    # those hours as elapsed time, as it must. A live chain does not stall between scenarios, so
+    # mine a full window at the current clock first.
+    node.rxd_mine(MEDIAN_TIME_SPAN)
 
     taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))

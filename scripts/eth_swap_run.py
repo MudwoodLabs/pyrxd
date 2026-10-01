@@ -20,7 +20,12 @@ Examples:
   python scripts/eth_swap_run.py --stage dry-run
   python scripts/eth_swap_run.py --stage sepolia-dust --i-accept-dust-loss \
       --eth-rpc-url https://sepolia.infura.io/v3/KEY --eth-key-file ~/.swap-eth-key \
-      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet gravity
+      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet gravity \
+      --rxd-ssh-host <your node host> --rxd-container <your node container> \
+      --rxd-block-interval-fast-s <measured p10 s>
+
+--rxd-ssh-host and --rxd-container are REQUIRED on stage=sepolia-dust (no default); the host is also
+where the RXinDexer REST REF gate is reached.
 """
 
 from __future__ import annotations
@@ -46,12 +51,16 @@ from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
     add_eth_key_arguments,
+    add_rxd_node_args,
+    add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    funding_bound_from_args,
     merge_into_mode_600,
     read_own_private_file,
+    require_rxd_node_args,
     resolve_eth_key_file,
     rxd_blockcount,
     scan_covenant_fund_height,
@@ -67,7 +76,7 @@ from _glyph_mainnet import (  # scripts/ sibling (NFT + FT paths)
     wait_genesis_mature,
 )
 from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet REST REF gate)
-from radiant_mainnet_chainio import SshTrRadiantClient
+from radiant_mainnet_chainio import SshTrRadiantClient, mainnet_proof_client
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.eth_wallet.chains import evm_chain_by_id
@@ -177,9 +186,21 @@ def _policy(args: argparse.Namespace, *, remaining_s: int | None = None) -> Marg
         accept_flat_burial=True,
     )
     if not _token_leg_is_real(args):
+        # The Radiant leg is MAINNET on this stage whatever the EVM leg is, so the coordinator refuses
+        # to construct without the measured fast tail: the timelock reserves divide time spans by it.
+        # Refuse here first, with the flag's name, rather than fake a value.
+        if not args.rxd_block_interval_fast_s:
+            raise SystemExit(
+                "stage=sepolia-dust locks MAINNET RXD, so it needs --rxd-block-interval-fast-s (the "
+                "MEASURED p10 Radiant inter-block, seconds): the timelock reserves convert time spans into "
+                "Radiant blocks by dividing by it, and the coordinator refuses without it. Measure it "
+                "against a mainnet node for THIS run."
+            )
         if int(args.t_rxd_blocks) == 0:
             args.t_rxd_blocks = _SEPOLIA_DEFAULT_T_RXD_BLOCKS
-        return MarginPolicy(is_measured=False, **common)
+        return MarginPolicy(
+            is_measured=False, rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s), **common
+        )
     if args.eth_finality_stall_tolerance_s < 3600:
         raise SystemExit(
             "a real-value token counter leg needs --eth-finality-stall-tolerance-s >= 3600. The "
@@ -1092,7 +1113,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     }
     report = StepReport("sepolia-dust", provenance)
 
-    rxd_client = SshTrRadiantClient(rpcwallet=args.rxd_wallet)
+    rxd_client = SshTrRadiantClient(ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=args.rxd_wallet)
     minted = None
     if args.asset_variant == "nft":
         if args.nft_reuse_reveal_txid:
@@ -1218,7 +1239,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         network=rxd_network,
         taker_pkh=_rkeys[2],
         maker_pkh=_rkeys[3],
-        chain_io=RadiantChainIO(rxd_client),
+        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
         fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
         min_confirmations=1,
         audit_cleared=True,
@@ -1252,6 +1273,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # Exclusive across processes: `reserve(H)` was the only mutual exclusion in the funding
         # path, and resuming an interrupted fund skips it.
         fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+        # The taker gate's single-operator threshold: the shipped default unless the user passed
+        # --accept-single-operator-up-to.
+        funding_bound=funding_bound_from_args(args),
     )
     # RESUME FROM THE PERSISTED STATE, not from NEGOTIATED. The sink has always had `load_record`
     # and nothing called it: the coordinator was constructed fresh every time, so a resumed run
@@ -1571,10 +1595,15 @@ def _args() -> argparse.Namespace:
     ap.add_argument(
         "--rxd-indexer-ws",
         default="",
-        help="OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api over ssh-tr",
+        help=(
+            "OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api "
+            "over ssh to --rxd-ssh-host"
+        ),
     )
     ap.add_argument("--rxd-indexer-insecure", action="store_true", help="allow a non-TLS RXinDexer ws")
-    ap.add_argument("--rxd-ssh-host", default="tr", help="ssh host for the RXinDexer REST REF gate (default tr)")
+    # --rxd-ssh-host (also the RXinDexer REST REF gate's ssh host) and --rxd-container: required on
+    # stage=sepolia-dust, which reaches the mainnet node; no default.
+    add_rxd_node_args(ap)
     ap.add_argument("--rxd-api-base", default="http://127.0.0.1:8000", help="RXinDexer REST api base on the ssh host")
     ap.add_argument(
         "--nft-reuse-reveal-txid", default="", help="reuse an already-minted NFT at this reveal txid (skip minting)"
@@ -1598,9 +1627,9 @@ def _args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "MEASURED p10 Radiant inter-block (seconds). Required once the token counter leg is "
-            "real. Reserves DIVIDE by this, so a stale-high value under-counts blocks; measure it "
-            "per run rather than inheriting a number."
+            "MEASURED p10 Radiant inter-block (seconds). Required on stage=sepolia-dust (its Radiant "
+            "leg is mainnet, and the coordinator requires it there). Reserves DIVIDE by this, so a "
+            "stale-high value under-counts blocks; measure it per run rather than inheriting a number."
         ),
     )
     # Default (None) → resolved from the EVM chain registry by --eth-chain-id in _args() below, so a
@@ -1635,6 +1664,7 @@ def _args() -> argparse.Namespace:
     # ops
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
+    add_single_operator_override_arg(ap)
     # NOT /tmp. It is world-writable and shared with every process on the box: the report from the
     # first real-value RXD/USDT swap was deleted there by an unrelated cleanup the same day. The
     # report is the run's only off-chain provenance — txids, timings, the margins actually used —
@@ -1643,6 +1673,8 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--report-out", default="~/.eth_swap_report.json")
     ap.add_argument("--keys-out", default="~/.eth_swap_run_keys.json")
     args = ap.parse_args()
+    if args.stage == "sepolia-dust":
+        require_rxd_node_args(ap, args)
     resolve_eth_key_file(args)
     # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
     # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);

@@ -233,7 +233,6 @@ _OUT_OF_SCOPE: dict[str, str] = {
     # Radiant Core, at paths not vendored under tests/vendor/radiant_core/.
     # Anchored to MANIFEST.json's tag like every other Radiant-Core citation here
     # (tests/vendor/radiant_core/README.md), but with no local copy to check against.
-    "Radiant-Core/src/chainparams.cpp": "Radiant Core, not vendored",
     "feature_swap.py": "Radiant Core, not vendored",
     "src/index/swapindex.cpp": "Radiant Core, not vendored",
     "src/miner.cpp": "Radiant Core, not vendored",
@@ -1360,8 +1359,19 @@ class TestTheSymbolRule:
         path = "src/pyrxd/gravity/swap_state.py"
         source = (_ROOT / path).read_text(encoding="utf-8")
         (real,) = [d for d in python_definitions(source) if d.qualname == "NegotiatedTerms.to_dict"]
-        whole = len(source.splitlines())
-        for start, end in ((real.first - 100, real.last + 100), (1, whole)):
+        lines = source.splitlines()
+        whole = len(lines)
+
+        def non_blank(n: int, step: int) -> int:
+            # A range's ends must be code (a BLANK end is refused by the plain citation rule), so
+            # the "around it" range is widened past any blank line it would otherwise end on —
+            # the file's own edits must not decide whether this case is the one under test.
+            while not lines[n - 1].strip():
+                n += step
+            return n
+
+        around = (non_blank(real.first - 100, -1), non_blank(real.last + 100, 1))
+        for start, end in (around, (1, whole)):
             (cit,) = citations_in("d.md", f"`NegotiatedTerms.to_dict` (`{path}:{start}-{end}`)")
             assert check_citation(cit, [path], source.splitlines()) is None
             rule, problem = check_symbol(cit, path, source)

@@ -709,9 +709,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "domain, or by an operator pyrxd ships knowledge of: several URLs of one count once. There is no "
         "operator declaration here",
     )
-    # No defaults: this ships in the public wheel. The previous "tr" / "radiant-mainnet"
-    # defaults were one operator's private infrastructure, and a user who passed only
-    # --rxd-include-node would silently attempt `ssh tr` — handing whoever answers that
+    # No defaults: this ships in the public wheel. The previous host and container defaults
+    # were one operator's private infrastructure, and a user who passed only
+    # --rxd-include-node would silently ssh to that host alias — handing whoever answers that
     # name the txid set of their in-flight swaps.
     p.add_argument("--ssh-host", help="ssh host for --rxd-backend ssh-tr / --rxd-include-node (required for those)")
     p.add_argument("--ssh-container", help="radiant docker container for ssh-tr (required for those)")

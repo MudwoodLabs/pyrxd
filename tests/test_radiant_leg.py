@@ -1218,8 +1218,11 @@ def _nft_terms(carrier: int = 1000, csv: int = 6) -> NegotiatedTerms:
 
 
 class TestTheFundingGateIsExercisedPerAssetVariant:
-    """`verify_maker_asset_funded` is the HZ-1 gate: the taker MUST NOT fund the counter leg until
-    this confirms the maker's asset is really locked, at the agreed value, buried deep enough.
+    """`verify_maker_asset_funded` is the leg's server-reported pre-check of the maker's funding —
+    the value binding and depth read the HZ-1 rule asks for, on ONE server's word. The taker gate
+    itself PROVES the funding (`SwapCoordinator.taker_verify_asset_funding`, with
+    `pyrxd.gravity.funding_spv`); this read is what the coordinator's post-confirm depth measurement
+    still uses.
 
     It had NO per-variant coverage. Its only real-leg exercise hardcoded the RXD covenant, and the
     coordinator tests use a duck-typed fake that records the call without running it. That is how
@@ -1306,7 +1309,7 @@ class TestTheRefundPathIsReachedThroughTheLegPerAssetVariant:
     variant". The mature case proves each variant can still be recovered.
 
     Measured, planting the variant-specific maturity error #510 item 3 names — reading `t_btc`
-    instead of `t_rxd` for ft/nft at radiant_leg.py:836 — the full suite loses EXACTLY the two
+    instead of `t_rxd` for ft/nft at radiant_leg.py:1088 — the full suite loses EXACTLY the two
     premature cases here (11,417 passed, 2 failed) and nothing else; the rxd peer is untouched,
     which is the point. Planting the mirror error (one block too STRICT for ft/nft) loses the
     two mature cases, so neither half is decorative.

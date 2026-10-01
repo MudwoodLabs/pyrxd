@@ -162,7 +162,7 @@ def _scripted_shim(responses: dict[str, object]) -> SshTrRadiantClient:
     though the fixed code never asks for it: a regression back to confs-arithmetic must
     fail on the UNIT ASSERTION below, not on a missing mock.
     """
-    client = SshTrRadiantClient()
+    client = SshTrRadiantClient(ssh_host="node.example.com", container="radiant-node")
 
     def _fake_run_sync(*cli_args: str) -> object:
         method = cli_args[0]

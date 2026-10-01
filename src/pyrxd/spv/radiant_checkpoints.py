@@ -17,7 +17,17 @@ answer, read-only; nothing was sent), and it agreed with all three servers on ev
 missing or different answer from any of the four would have refused the write.
 
 Every height is at least 1000 blocks below the lowest tip any source reported
-(468715), far past Radiant Core's default maximum reorg depth of 69.
+(468799), far past Radiant Core's default maximum reorg depth of 69.
+
+THE LAST INTERVAL'S WORK. Every one of the 2017 headers from 465696 to 467712 was
+fetched from every source; all three servers and the node served them byte for byte
+alike, and the script linked them hash by hash from checkpoint 465696 to checkpoint 467712.
+:data:`LAST_INTERVAL_MAX_WORK` is the most work any of them carries (at height
+:data:`LAST_INTERVAL_MAX_WORK_HEIGHT`) and
+:data:`NEWEST_CHECKPOINT_WORK` the work of the header at 467712, each ``2**256 // (target + 1)``
+at mainnet's proof-of-work limit. The checkpoint hashes commit to those headers, so the numbers are
+fixed by the table above; the swap taker gate recomputes the first from the headers it links on
+every run.
 
 WHAT THEY ARE FOR. :mod:`pyrxd.glyph.mark_block` places a block at a height by linking its header,
 hash by hash, to one of these. The height then rests on this table rather than on the server that
@@ -33,7 +43,7 @@ MIN_DEPTH_BELOW_TIP = 1000
 GENERATED_UTC = "2026-09-30"
 
 #: The lowest tip height any source reported when the table was generated.
-PINNED_AT_TIP: dict[str, int] = {"mainnet": 468715}
+PINNED_AT_TIP: dict[str, int] = {"mainnet": 468799}
 
 #: True: a node run by pyrxd's maintainer agreed on every entry (``getblockhash``, 2026-09-30).
 NODE_CONFIRMED: dict[str, bool] = {"mainnet": True}
@@ -46,6 +56,13 @@ SOURCES: dict[str, tuple[str, ...]] = {
         "wss://electrumx2.radiant4people.com:50022/",
     )
 }
+
+#: The most header work in the last checkpoint interval (both checkpoints included), and its height.
+LAST_INTERVAL_MAX_WORK: dict[str, int] = {"mainnet": 116065733105651564}
+LAST_INTERVAL_MAX_WORK_HEIGHT: dict[str, int] = {"mainnet": 465703}
+
+#: The work of the newest checkpoint's own header.
+NEWEST_CHECKPOINT_WORK: dict[str, int] = {"mainnet": 38429153133984173}
 
 #: ``network -> ((height, block hash in display hex), ...)``, heights ascending. Networks with no
 #: entries cannot be verified against a checkpoint, and verification there reports NOT VERIFIED.

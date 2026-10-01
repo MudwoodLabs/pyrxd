@@ -19,7 +19,9 @@ still runs (eth_timeout > rxd_refund_open + margin); we just size the margin for
 Example:
   python scripts/eth_swap_grief_run.py --i-accept-dust-loss \
       --eth-rpc-url https://gateway.tenderly.co/public/sepolia --eth-key-file ~/.swap-taker-eth-key \
-      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet ''
+      --eth-claim-to 0x<maker> --eth-refund-to 0x<taker> --rxd-wallet '' \
+      --rxd-ssh-host <your node host> --rxd-container <your node container> \
+      --rxd-block-interval-fast-s <measured p10 s>
 """
 
 from __future__ import annotations
@@ -37,14 +39,18 @@ from _dust_swap_shared import (
     SshTrFeeSource,
     StepReport,
     add_eth_key_arguments,
+    add_rxd_node_args,
+    add_single_operator_override_arg,
     atomic_write_mode_600,
     confirm,
+    funding_bound_from_args,
     merge_into_mode_600,
+    require_rxd_node_args,
     resolve_eth_key_file,
     wait_for_covenant_funding,
 )
 from eth_swap_run import _build_terms_and_covenant, _eth_leg
-from radiant_mainnet_chainio import SshTrRadiantClient
+from radiant_mainnet_chainio import SshTrRadiantClient, mainnet_proof_client
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
@@ -65,11 +71,21 @@ def _margin(args) -> CrossClockMargin:
 
 
 def _policy(args) -> MarginPolicy:
+    # The Radiant leg is MAINNET (SshTrRadiantClient.NETWORK), so the coordinator refuses to
+    # construct without the measured fast tail: the timelock reserves divide time spans by it.
+    # Refuse here first, with the flag's name, rather than fake a value.
+    if not args.rxd_block_interval_fast_s:
+        raise SystemExit(
+            "this run locks MAINNET RXD, so it needs --rxd-block-interval-fast-s (the MEASURED p10 Radiant "
+            "inter-block, seconds): the timelock reserves convert time spans into Radiant blocks by dividing "
+            "by it, and the coordinator refuses without it. Measure it against a mainnet node for THIS run."
+        )
     return MarginPolicy(
         margin=bt.Timelock(args.margin_blocks, bt.TimeUnit.BLOCKS),
         block_interval_s=args.btc_block_interval_s,
         is_measured=False,
         rxd_block_interval_s=args.rxd_block_interval_s,
+        rxd_block_interval_fast_s=float(args.rxd_block_interval_fast_s),
         eth_finalization_window_s=args.eth_finalization_window_s,
         cross_clock_margin=_margin(args),
         max_covenant_confirm_wait_s=args.max_covenant_confirm_wait_s,
@@ -84,6 +100,7 @@ async def run(args) -> None:
     for req in ("eth_rpc_url", "eth_key_hex", "eth_claim_to", "eth_refund_to"):
         if not getattr(args, req):
             raise SystemExit(f"requires --{req.replace('_', '-')}")
+    policy = _policy(args)  # refuses at startup, before any key or covenant is made
     rxd_network = SshTrRadiantClient.NETWORK
     print(f"=== ETH↔RXD GRIEFING run (S1) — ETH=sepolia, RXD={rxd_network} mainnet ===")
     print("    maker STALLS; the honest taker recovers via mutual_refund (no one-sided loss).")
@@ -132,13 +149,13 @@ async def run(args) -> None:
         eth_timeout=eth_timeout,
         network="sepolia",
     )
-    rxd_client = SshTrRadiantClient(rpcwallet=args.rxd_wallet)
+    rxd_client = SshTrRadiantClient(ssh_host=args.rxd_ssh_host, container=args.rxd_container, rpcwallet=args.rxd_wallet)
     rxd_client.register_spk(cov.funded_spk)
     rxd_leg = RadiantCovenantLeg(
         network=rxd_network,
         taker_pkh=rkeys[2],
         maker_pkh=rkeys[3],
-        chain_io=RadiantChainIO(rxd_client),
+        chain_io=RadiantChainIO(rxd_client, proof_client=mainnet_proof_client()),
         fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
         min_confirmations=1,
         audit_cleared=True,
@@ -153,10 +170,11 @@ async def run(args) -> None:
         # accept_estimated_eth_margins: operator-gated DUST griefing run; consciously accepts
         # estimated-margin risk on negligible value (MEDIUM-1). Non-dust value → measured policy.
         config=CoordinatorConfig(
-            margin_policy=_policy(args),
+            margin_policy=policy,
             accept_nondurable_seen=True,
             accept_estimated_eth_margins=True,
             fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+            funding_bound=funding_bound_from_args(args),
         ),
     )
 
@@ -251,6 +269,12 @@ def _args():
     ap.add_argument("--margin-blocks", type=int, default=2)
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=120.0)
+    ap.add_argument(
+        "--rxd-block-interval-fast-s",
+        type=float,
+        default=0.0,
+        help="MEASURED p10 Radiant inter-block (seconds). Required: the Radiant leg is mainnet.",
+    )
     ap.add_argument("--eth-finalization-window-s", type=int, default=768)  # hard floor (2 epochs)
     ap.add_argument("--rxd-claim-burial-s", type=int, default=60)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=60)
@@ -259,7 +283,10 @@ def _args():
     ap.add_argument("--report-out", default="/tmp/eth_grief_report.json")  # noqa: S108
     ap.add_argument("--keys-out", default="~/.eth_grief_run_keys.json")
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
+    add_single_operator_override_arg(ap)
+    add_rxd_node_args(ap)
     args = ap.parse_args()
+    require_rxd_node_args(ap, args)
     resolve_eth_key_file(args)
     return args
 

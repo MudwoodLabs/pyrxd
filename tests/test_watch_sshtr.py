@@ -1,6 +1,6 @@
 """Tests for the read-only ssh-tr RXD reader (``scripts/watchtower_sshtr.py``).
 
-``subprocess.run`` is patched so nothing ever shells out to the real ``tr`` host —
+``subprocess.run`` is patched so nothing ever shells out to a real node host —
 we test the ssh argv construction, JSON parsing, error handling, and that the reader
 composes with ``ElectrumRxdChainSource``.
 """
@@ -42,7 +42,7 @@ def _patch_run(monkeypatch, *, stdout="", returncode=0, stderr=""):
 # host / docker container name). These are just arbitrary-but-realistic stand-ins for tests
 # that don't care about the exact value.
 _HOST = "radiant-node"
-_CONTAINER = "radiant-mainnet"
+_CONTAINER = "radiant-node"
 
 
 def test_cli_argv_is_shell_safe():
@@ -145,7 +145,7 @@ from pyrxd.security.errors import ValidationError
 def test_hostile_ssh_host_is_refused(hostile):
     """A host that could be read as an ssh option or shell metacharacter must not construct."""
     with pytest.raises(ValidationError):
-        SshTrRxdReader(ssh_host=hostile, container="radiant-mainnet")
+        SshTrRxdReader(ssh_host=hostile, container="radiant-node")
 
 
 @pytest.mark.parametrize("hostile", ["-u", "-v", "--user=root", "c;id", "c d", ""])
@@ -157,15 +157,15 @@ def test_hostile_container_is_refused(hostile):
 
 @pytest.mark.parametrize(
     "ok",
-    ["tr", "node.example.com", "user@host", "host:2222", "10.0.0.5", "my-node_1"],
+    ["mynode", "node.example.com", "user@host", "host:2222", "10.0.0.5", "my-node_1"],
 )
 def test_legitimate_hosts_still_accepted(ok):
     """The guard must not break real hostnames, user@host, or ports."""
-    assert SshTrRxdReader(ssh_host=ok, container="radiant-mainnet") is not None
+    assert SshTrRxdReader(ssh_host=ok, container="radiant-node") is not None
 
 
 def test_argv_uses_end_of_options_terminator():
     """Belt-and-braces: `--` stops getopt reading a later token as an option."""
-    argv = SshTrRxdReader(ssh_host="node.example.com", container="radiant-mainnet")._cli_argv("getblockcount")
+    argv = SshTrRxdReader(ssh_host="node.example.com", container="radiant-node")._cli_argv("getblockcount")
     assert "--" in argv
     assert argv.index("--") < argv.index("node.example.com")

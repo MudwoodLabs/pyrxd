@@ -45,6 +45,71 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`verify_mark_block` and `plan_block_verification` take `max_headers_from_checkpoint`
+  (default 4,032, unchanged) and `verify_mark_block` takes `pow_limit`** (default `None`,
+  unchanged); `radiant_header_target`, `radiant_header_work` and `verify_radiant_header_pow` take
+  `pow_limit` too. With a limit, nBits is decoded by Radiant Core's own compact rule and refused
+  above it, which regtest's `0x207fffff` needs. The pages and `pyrxd verify` pass neither.
+- **A Radiant leg must now serve `maker_funding_evidence`** for the taker gate (see Security);
+  `RadiantCovenantLeg` does, through `RadiantChainIO.funding_evidence`, which needs a client with
+  `get_transaction`, `get_transaction_merkle_branch`, `get_transaction_id_from_pos` and
+  `get_block_headers`. `RadiantChainIO(client, proof_client=...)` fetches those from a second
+  client; the node-over-ssh operator scripts pass pyrxd's shipped mainnet ElectrumX endpoints
+  (`scripts/radiant_mainnet_chainio.py:mainnet_proof_client`). The third value
+  `taker_verify_asset_funding` returns is now that elapsed-depth upper bound; what was proved is on
+  `SwapCoordinator.last_maker_funding`.
+- **A value-bearing swap needs `MarginPolicy.rxd_block_interval_fast_s`** (the measured p10
+  Radiant inter-block interval) before anyone locks: `SwapCoordinator` refuses to CONSTRUCT a
+  negotiated swap on a value-bearing Radiant network without it (every role), and
+  `pre_btc_lock_check` step 3b refuses a policy that lost it. Time spans are converted into Radiant
+  blocks by dividing by it, and without it that falls back to the nominal interval. Where it is read
+  differs by corridor: for an ETH/ERC-20 counter leg, at fund time (the finalization reserve and the
+  projection of where the maker's Radiant refund opens) and at claim time; for BTC, only at claim
+  time (`assess_claim_finality`'s counter-leg reserve), since the BTC fund-time ordering check
+  projects the refund at the nominal interval. The taker gate's own elapsed-depth bound does not
+  read it (see Security). A coordinator that runs the taker gate
+  (any role but `SwapRole.MAKER`) is also refused without a value at stake to size the required
+  depth from. Every script that builds a coordinator on the mainnet node client takes
+  `--rxd-block-interval-fast-s`, refuses at startup without it, and passes it into its policy:
+  `scripts/dust_swap_run.py` and `scripts/dust_swap_resume.py` (their measured policy already
+  required it), and `scripts/eth_swap_run.py --stage sepolia-dust` and
+  `scripts/eth_swap_grief_run.py`, whose estimated policies did not carry it.
+  `eth_swap_grief_run.py`'s default `--t-rxd-blocks 3` cannot hold the depth the gate requires and
+  is refused at construction.
+- **`CoordinatorConfig.funding_bound`** (`pyrxd.gravity.funding_spv.ElapsedBoundPolicy`) carries the
+  taker gate's elapsed-depth bound policy: `surge_factor` 3.0 (the maintainer's decision; a backtest
+  over every mainnet header from height 14,088, after the chain's launch, found the bound short of
+  no block count at 3.0, and short near height 98,705 at 2.0), `loss_budget_photons` 1 RXD with
+  `epsilon` clamped to 1e-12..1e-3, `dust_threshold_photons` 1,000 RXD (above it, two distinct
+  operators must report the funding's depth; see Security), `accept_single_operator_up_to_photons`
+  `None` (the user override of that threshold; see Security), and, for the negotiation-time check
+  only, `early_slack_s` 3600 and `early_work_margin` 2.0. The defaults other than `surge_factor`
+  and `dust_threshold_photons` await the maintainer's sign-off.
+- **The operator scripts no longer default to any one operator's node.**
+  `scripts/radiant_mainnet_chainio.py:SshTrRadiantClient` and `scripts/_glyph_ref_http.py:SshTrHttpRefAdapter`
+  take `ssh_host` (and the shim `container`) with no default, charset-checked as the watchtower's
+  reader checks them. `dust_swap_run.py` (broadcast stages), `dust_swap_resume.py`,
+  `eth_swap_run.py --stage sepolia-dust` (whose `--rxd-ssh-host` had a default) and
+  `eth_swap_grief_run.py` take `--rxd-ssh-host` and `--rxd-container` and refuse at startup
+  without them, naming the missing flag; `dmint_v2_mainnet_run.py` takes both as required flags.
+- **`ElectrumXClient.source_keys`** lists every operator group among a client's URLs, and
+  **`ElectrumXClient.per_source_clients()`** returns one new client per group. A client over
+  several operators' URLs races them, so one reply from it cannot say which operator sent it;
+  `RadiantChainIO` asks such a client once per operator for a funding's depth, on clients it closes
+  afterwards. It asks its depth sources concurrently, each under `depth_timeout_s` (new, default
+  20 s); a source that does not answer in time is dropped as a failing one is, so an unresponsive
+  operator costs the call one timeout rather than one per source in turn. **`RadiantChainIO.configured_depth_operators()`** (and
+  `RadiantCovenantLeg.configured_depth_operators()`) names the operator groups a configuration asks,
+  derived from each source's `source_key`. The mainnet node client in
+  `scripts/radiant_mainnet_chainio.py` now carries a `source_key` (its ssh destination), so the
+  user's own node counts as its own operator.
+- **`src/pyrxd/spv/radiant_checkpoints.py` ships the last checkpoint interval's work**:
+  `LAST_INTERVAL_MAX_WORK` (and its height, `LAST_INTERVAL_MAX_WORK_HEIGHT`) and
+  `NEWEST_CHECKPOINT_WORK`. `scripts/refresh_radiant_checkpoints.py` fetches every header of that
+  interval from every source (the servers, and the node with `--node-cli`), refuses unless they are
+  byte-identical and link between the two checkpoints, and records the numbers; `--check`
+  re-verifies them. Regenerated 2026-09-30 with the maintainer's node: 465,696..467,712, the hardest
+  header at 465,703 (3.02 times the newest checkpoint's work).
 - **`pyrxd verify` now verifies the mark's block, on by default.** It fetches the transaction's
   merkle branch, the block's coinbase branch and the header ranges `verify_mark_block` asks for,
   from one configured endpoint, and checks them with the raw transaction it already fetched.
@@ -204,6 +269,88 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/how-to/build-a-cross-chain-swap.md` and `docs/red-team-checklist.md` said a value-bearing
   network needed an opt-in to construct. None does. The gate stays a no-op.
 ### Security
+
+- **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
+  exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
+  from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no
+  header: a server that invented the covenant got the real coordinator to lock the taker's BTC
+  against an output on no chain. It now PROVES the funding (`pyrxd.gravity.funding_spv`), on every
+  path that calls a counter leg's `fund` — `pre_btc_lock_check` step 5 and the re-run inside
+  `taker_funds_btc`, on the BTC and the ETH/ERC-20 branch, and `resume_interrupted_fund` through
+  `taker_funds_btc`. Anything short of a verified inclusion at the required depth refuses the lock.
+  What is now enforced:
+  - the covenant script and value are read from the funding transaction's own raw bytes, which
+    must hash to its txid — no longer from `listunspent`;
+  - the transaction's merkle branch must lead to the header served for its height, at the depth
+    the block's coinbase branch pins, and that header must link hash by hash to a checkpoint pyrxd
+    ships, through headers that each meet their own proof-of-work target and 1/16 of the newest
+    checkpoint's work (`verify_mark_block`, the verifier `pyrxd verify` runs);
+  - on mainnet the proved depth must reach `k = max(6, burial, ceil(2 × value ÷ C))`. `C` is the
+    photon cost of one forged confirmation: the block subsidy at the funding height (Radiant
+    Core's `GetBlockSubsidy` and `nSubsidyHalvingInterval`, vendored and re-derived by a test) ×
+    the floor work ÷ the most work of any header checked or in the last checkpoint interval.
+    `burial` is the swap's existing reorg burial, value-scaled; the value is the swap's own
+    assessment (`value_at_risk_photons`, `radiant_amount` for an RXD swap, the stablecoin floor).
+    With no value to size `k` from, the lock is refused. Regtest runs the same proof against its
+    genesis, with no value term. A refusal names `k`, the value, `C` and what was proved;
+  - the chain is chosen from BOTH legs: a Radiant leg tagged for a test network (or untagged)
+    beside a counter leg that moves real value is refused, never proved against regtest. A BTC leg
+    moves value by its tag; an EVM leg by the chain id it signs for (`EthLeg.chain_id`, new), unless
+    that is a known testnet or a local development chain (31337);
+  - a swap whose `t_rxd` cannot hold the bound the gate will judge is refused BEFORE ANYONE
+    LOCKS: when its `SwapCoordinator` is built for a NEGOTIATED record, and again at
+    `pre_btc_lock_check` step 3b, before the chain is read. `funding_spv.early_elapsed_blocks_upper`
+    models step 6's bound to be at least what step 6 computes on an honest chain: `C` at its lowest
+    (`funding_spv.forged_confirmation_cost_floor_photons`: the shipped last interval's hardest
+    header times `early_work_margin`, and the lowest subsidy the walk cap allows), the largest `k`
+    and value term that follow, blocks at the nominal spacing, and the newest header up to
+    `early_slack_s` old. What it does not cover is stated on that function (a header served above
+    the newest checkpoint harder than the margin allows, which a test pins); steps 6 and 7 on the
+    proved bound stay authoritative;
+  - the gate links at most 20,160 headers above the newest checkpoint (the pages and
+    `pyrxd verify` keep 4,032); past that it refuses and says to upgrade pyrxd or use your own node;
+  - steps 6 and 7 (the `t_rxd` floor and the timelock ordering) now use an UPPER bound on the
+    blocks since funding: `max(proved, (R - H + 1) + blocks_upper(E), reported)`. `R` is the
+    reference header, `max(1, value term)` deep below the newest header served, so changing any
+    header of its window costs as much as the value term of `k` already demands of the depth (on
+    regtest it is the newest header). `E = now - MTP(R)`, the median time past at `R` — the median
+    of the 11 header timestamps ending there, as Radiant Core computes it (`chain.h`, now vendored
+    at the pinned tag and re-read by a test) — over headers the gate has verified. `blocks_upper(E)`
+    is a statistical upper bound: the smallest `n` with `P(Poisson(λ·E) > n) <= ε`, at `λ` =
+    `surge_factor` over the nominal 300 s spacing and a confidence `ε = clamp(1 RXD ÷ value, 1e-12,
+    1e-3)` scaled by the value (`funding_spv.poisson_upper_quantile`, never below the exact
+    quantile). `reported` is the largest depth any configured source reports, grouped by operator
+    (`RadiantChainIO(..., depth_sources=...)`); it can only raise the bound. The result says which
+    term set it. A mainnet swap therefore needs `now_unix_s` on this path too;
+    `scripts/dust_swap_run.py` passes it. The `now` the gate judges is taken AFTER its reads:
+    `now_unix_s` advanced by the monotonic time elapsed since it was sampled (from the entry of
+    `taker_funds_btc`, `pre_btc_lock_check` or `taker_verify_asset_funding`, or the new
+    `now_sampled_monotonic`), rounded up, so a slow read makes `E` larger, never smaller;
+  - above dust, the funding's depth must be reported by two independent operators (a report is a
+    server's word — its verbose confirmations or its tip height — not a proof): on a
+    value-bearing network, when the value at stake exceeds `ElapsedBoundPolicy.dust_threshold_photons`
+    (1,000 RXD by default), the gate refuses the lock unless at least two operator groups
+    (`source_key`; the user's own node is its own group) report a depth for the funding, and the
+    refusal names how many answered and which. A source that cannot say which operator runs it is
+    not counted. The coordinator refuses at construction, before anyone locks, a Radiant leg
+    configured to ask fewer than two operators for such a swap, naming them. At or below dust one
+    operator suffices and the result says so. pyrxd's shipped mainnet endpoints are two operators;
+    the node-over-ssh scripts ask the node and those endpoints.
+    `ElapsedBoundPolicy.accept_single_operator_up_to_photons` (default `None`) is an explicit user
+    override of that threshold, in photons; every script that builds a mainnet coordinator sets it
+    with `--accept-single-operator-up-to RXD`, and nothing sets it from the environment. It may
+    raise or lower the threshold and has no cap. When it raises it, the gate logs a WARNING naming
+    the value; whenever it is set, the gate's result (`single_operator_override`, `bound_note`) and
+    the durable swap record (`SwapRecord.single_operator_override`, written only when set) say
+    "single-operator depth accepted up to X RXD by user override (default Y RXD)". The two-operator
+    refusals, at construction and at step 5, name the override and what it gives up: the funding's
+    depth then rests on that one operator's report.
+
+  What remains the server's word: that the covenant output is still UNSPENT (SPV cannot show a
+  non-spend; the `listunspent` read that locates it is kept for that). The elapsed-depth bound is a
+  statistical upper bound, at the confidence and block rate above, not a proof. Neither the
+  most-work chain nor each header's nBits is checked; the checkpoint table is only as good as its
+  sources. `GravityTrade` is not gated.
 
 - **Every source count keys on ONE host identity, so one server can no longer corroborate
   itself.** Each quorum had its own idea of "a different source", and the cheap ones counted

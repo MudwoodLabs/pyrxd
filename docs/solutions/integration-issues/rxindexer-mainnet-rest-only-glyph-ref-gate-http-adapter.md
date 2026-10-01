@@ -7,7 +7,7 @@ date_solved: 2026-06-04
 status: solved
 symptoms:
   - The proven RxinDexerRefAdapter resolves a genesis ref via the ElectrumX-ws method glyph.get_token, which works on the glyph-enabled regtest electrumx but has NO endpoint on the mainnet RXinDexer deployment.
-  - The mainnet RXinDexer on host tr (/srv/rxindexer) listens ONLY on the REST api (127.0.0.1:8000); the glyph electrumx-ws ports (50010/50011/50012) are not listening.
+  - The mainnet RXinDexer on the maintainer's node host (/srv/rxindexer) listens ONLY on the REST api (127.0.0.1:8000); the glyph electrumx-ws ports (50010/50011/50012) are not listening.
   - First REST attempts 404'd because I queried GET /tokens/{bare_txid} instead of the 72-hex wire ref.
   - The radiant MCP (radiant_get_token) returned "unknown method glyph.get_token_info" against a public vanilla Radiant electrumx that does not serve glyph methods.
   - pyrxd's ElectrumXClient is WebSocket-only and cannot connect to a raw-TCP/SSL electrumx port (e.g. :50012).
@@ -42,7 +42,7 @@ surfaced that the production indexer doesn't serve that interface.
 - `RxinDexerRefAdapter` (`src/pyrxd/gravity/radiant_leg.py`) resolves a ref via the ElectrumX-ws
   method `glyph.get_token` over `wss://…`. This works against the regtest stack's glyph-enabled
   electrumx but there is **no such endpoint on mainnet**.
-- The mainnet RXinDexer on host `tr` (`/srv/rxindexer`) runs **only** the indexer + REST api
+- The mainnet RXinDexer on the maintainer's node host (`/srv/rxindexer`) runs **only** the indexer + REST api
   (`rxindexer-api` on `127.0.0.1:8000`). The glyph electrumx-ws SERVICES (50010 tcp / 50011 wss /
   50012 ssl) are **not listening**.
 - A public vanilla Radiant electrumx (`electrumx.radiant4people.com:50012`, raw SSL) does **not**
@@ -59,7 +59,7 @@ chain where real value moves.
    the raw-SSL `:50012`.
 2. **Query the mainnet REST api with the bare txid** (`GET /tokens/{txid}`). Returned 404. The api
    keys a token on its **72-hex wire ref**, not a bare txid.
-3. **Stand up / sync a glyph electrumx-ws on tr.** Rejected — a full electrumx sync is heavy and
+3. **Stand up / sync a glyph electrumx-ws on that host.** Rejected — a full electrumx sync is heavy and
    unnecessary once the REST resolution path was understood.
 
 ## Root cause
@@ -67,8 +67,8 @@ chain where real value moves.
 Two independent facts had to line up:
 
 1. **Deployment shape.** RXinDexer ships both an ElectrumX-ws interface *and* a FastAPI REST api,
-   but a given deployment may run only one. Mainnet `tr` runs the REST api only. (Verified live:
-   `ss -tlnp` / the running services on `tr` show `:8000` bound to localhost; 50010/11/12 absent.)
+   but a given deployment may run only one. The maintainer's mainnet host runs the REST api only. (Verified live:
+   `ss -tlnp` / the running services on that host show `:8000` bound to localhost; 50010/11/12 absent.)
 2. **Lookup key + byte order.** The REST per-token route keys on the **72-hex wire ref**
    (`GlyphRef.to_bytes().hex()` = 36 bytes = txid + vout). And there is a **byte-order asymmetry**
    between the URL key and the returned identifier (see below).
@@ -77,7 +77,7 @@ Two independent facts had to line up:
 
 A small HTTP adapter, `scripts/_glyph_ref_http.py::SshTrHttpRefAdapter`, that implements the same
 `RefAuthenticityIndexer` protocol (one async `resolve_ref`) and resolves the ref over the REST api
-via `ssh tr curl`. It is wired into `scripts/eth_swap_run.py` as the **default** mainnet NFT REF
+via `curl` on the indexer's host, over ssh. It is wired into `scripts/eth_swap_run.py` as the **default** mainnet NFT REF
 gate (used whenever `--rxd-indexer-ws` is omitted); the ElectrumX-ws adapter remains available for
 the regtest path.
 
@@ -133,7 +133,7 @@ and the local RXinDexer source checkout (`~/apps/RXinDexer`):
   **`ref`** field formatted as display `txid_vout` (e.g. `abcd…_0`), with the `/tokens/{ref}/…`
   routes being the holders/supply/history siblings. That does **not** match the live `/tokens/{ref}`
   + `token_id` contract the adapter relies on — i.e. the checkout is a different version than what
-  runs on `tr`.
+  runs on the maintainer's node host.
 
 This skew is *safe but brittle*: if the deployed api ever changes the field name or shape, the
 adapter's `token.get("token_id")` check returns `None` and the gate **fails closed** (blocks the

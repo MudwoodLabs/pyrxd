@@ -444,7 +444,12 @@ class TestEthAdversarial:
 
             # The honest maker verifies the taker's contract through the COORDINATOR → must RAISE
             # (the maker's expected claimant is _ADDR_MAKER; the on-chain claimant is the attacker).
-            with pytest.raises(ValidationError, match="claimant"):
+            # Since #798 the refusal comes from the slot-exact runtime compare, which substitutes the
+            # NEGOTIATED claimant into every immutable slot — it fires before the getter read-back
+            # that used to name "claimant" (EthHtlcContractLeg.verify_funded).
+            with pytest.raises(
+                ValidationError, match="does not EXACTLY equal the runtime expected for the negotiated terms"
+            ):
                 await coord.maker_verify_counter_funding(malicious.contract_address)
 
             # And the maker recorded NOTHING from the malicious contract: the coordinator raises
