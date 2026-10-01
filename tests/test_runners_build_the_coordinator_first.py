@@ -656,3 +656,109 @@ async def test_a_resumed_eth_run_near_its_deadline_is_not_refused_for_a_wait_alr
     built.clear()
     assert await _run(mod.run_sepolia_dust(mod._args())) == "stopped at wait_for_covenant_funding"
     assert [c._maker_funding_confirmations for c in built] == [100, 100]
+
+
+def _real_token_argv(tmp_path) -> list[str]:
+    """``eth_swap_run.py --stage sepolia-dust`` with a REAL token counter leg (USDC on Ethereum L1) — the
+    leg on which the three parse-time ``t_rxd`` bounds are enforced — over a three-operator quorum."""
+    argv = _eth_argv(
+        tmp_path,
+        "--counter-asset",
+        "usdc",
+        "--eth-chain-id",
+        "1",
+        "--eth-finality-stall-tolerance-s",
+        "3600",
+        "--maker-stall-safety-window-blocks",
+        "30",
+    )
+    argv[argv.index("--eth-rpc-url") + 1] = (
+        "https://rpc.alpha-example.com,https://rpc.beta-example.org,https://rpc.gamma-example.net"
+    )
+    return argv
+
+
+async def test_a_resume_refused_on_its_t_rxd_names_the_changed_input_and_never_says_change_t_rxd(tmp_path, monkeypatch):
+    """A resume's ``t_rxd`` is the one the swap recorded, and the funded covenant commits to it. The bounds'
+    refusals told a resuming operator to "OMIT --t-rxd-blocks ... derived: 2983" — but omitting it reuses
+    the recorded value (2677), and passing 2983 builds a covenant that holds nothing — and never named the
+    flag that had changed. Through ``eth_swap_run.py``: a fresh real-token run records the inputs it was
+    negotiated with; a resume with a smaller ``--rxd-block-interval-fast-s`` is refused naming that flag
+    against the recorded value, with no advice to change ``t_rxd``; the same resume with the recorded
+    inputs reaches the run's next step (the honest path); and a recovery file that predates recording
+    them is told which inputs to restore."""
+    import json
+
+    mod = _load("eth_swap_run")
+    events: list[str] = []
+    _instrument(mod, events, monkeypatch)
+    argv = _real_token_argv(tmp_path)
+    monkeypatch.setattr(sys, "argv", argv)
+    assert await _run(mod.run_sepolia_dust(mod._args())) == "stopped at wait_for_covenant_funding", events
+    keys = Path(argv[argv.index("--keys-out") + 1])
+    recorded = json.loads(keys.read_text())
+    assert recorded["negotiated_inputs"]["rxd_block_interval_fast_s"] == 36.0
+
+    def resume(*extra):
+        argv2 = [*argv, "--resume", *extra]
+        monkeypatch.setattr(sys, "argv", argv2)
+        return mod.run_sepolia_dust(mod._args())
+
+    with pytest.raises(SystemExit) as exc:
+        await _run(resume("--rxd-block-interval-fast-s", "30"))
+    msg = str(exc.value)
+    assert "this is a RESUME" in msg and f"t_rxd {recorded['t_rxd_blocks']} is the one this swap recorded" in msg, msg
+    assert "--rxd-block-interval-fast-s 30.0 (the swap was negotiated with 36.0)" in msg, msg
+    assert "OMIT --t-rxd-blocks" not in msg and "minimum: --t-rxd-blocks" not in msg, msg
+
+    assert await _run(resume()) == "stopped at wait_for_covenant_funding"
+
+    del recorded["negotiated_inputs"]
+    keys.write_text(json.dumps(recorded))
+    keys.chmod(0o600)
+    with pytest.raises(SystemExit) as exc:
+        await _run(resume("--rxd-block-interval-fast-s", "30"))
+    msg = str(exc.value)
+    assert "predates recording the run's inputs" in msg and "--rxd-block-interval-fast-s" in msg, msg
+    assert "OMIT --t-rxd-blocks" not in msg, msg
+
+
+def test_the_recovery_file_records_every_input_the_t_rxd_bounds_read():
+    """DERIVED: every ``args.<field>`` read by ``_policy`` and the functions it reaches in
+    ``eth_swap_run.py`` is in ``_NEGOTIATED_INPUTS`` (which the recovery file records and a resume compares),
+    except the deadline and ``t_rxd`` themselves (recorded on their own) and the runner's own scratch fields."""
+    mod = _load("eth_swap_run")
+    tree = ast.parse((_SCRIPTS / "eth_swap_run.py").read_text(encoding="utf-8"))
+    functions = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    reached, todo = set(), ["_policy"]
+    while todo:
+        name = todo.pop()
+        if name in reached or name not in functions:
+            continue
+        reached.add(name)
+        todo += [
+            c.func.id for c in ast.walk(functions[name]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        ]
+    read: set[str] = set()
+    for name in reached:
+        for node in ast.walk(functions[name]):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in ("args", "probe")
+            ):
+                read.add(node.attr)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "args"
+                and isinstance(node.args[1], ast.Constant)
+            ):
+                read.add(node.args[1].value)
+    assert {"_policy", "_cross_clock_margin", "_value_at_stake_photons", "_t_rxd_remedy"} <= reached, sorted(reached)
+    assert "rxd_block_interval_fast_s" in read and "eth_finality_stall_tolerance_s" in read, sorted(read)
+    not_inputs = {"t_rxd_blocks", "eth_timeout_s", "gate_reserve_blocks", "resumed_record"}
+    assert read - not_inputs - set(mod._NEGOTIATED_INPUTS) == set(), sorted(read - not_inputs)
+    assert set(mod._NEGOTIATED_INPUTS) <= read, sorted(set(mod._NEGOTIATED_INPUTS) - read)  # no stale entry

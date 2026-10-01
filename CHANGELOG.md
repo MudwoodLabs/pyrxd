@@ -262,7 +262,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`eth_swap_run.py`, both stages: 2,577 at the 24 h default and a 36 s fast tail;
     `eth_swap_grief_run.py`: 408 at its new 3 h default deadline, which replaces 1,800 s; the
     smallest deadline it accepts is 9,522 s). A resume reuses the recorded `t_rxd`, and the
-    derivation's fallback is the smallest feasible value, not the BIP68 maximum.
+    derivation's fallback is the smallest feasible value, not the BIP68 maximum. On a resume the
+    `t_rxd` bounds' refusals no longer advise omitting `--t-rxd-blocks` or a "minimum" (omitting it
+    reuses the recorded value, and any other builds a covenant that holds nothing): the recovery file
+    records the inputs those bounds read (`negotiated_inputs`), and a resume that fails them names
+    each changed flag against its recorded value and says to restore it.
   - NFT and FT swaps had no value at stake, so the coordinator refused them, and without
     `--*-reuse-reveal-txid` the fresh mainnet mint ran first. `--value-at-risk-photons` (new, on
     every script that builds a mainnet coordinator; `measure_margin_from_btc_block_times` takes

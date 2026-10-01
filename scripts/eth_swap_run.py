@@ -601,6 +601,75 @@ def _eth_budget_s(args: argparse.Namespace, remaining_s: int | None) -> int:
     return int(args.eth_timeout_s) if remaining_s is None else int(remaining_s)
 
 
+#: The run inputs the three ``t_rxd`` bounds and the taker gate's reserve read, recorded in the recovery
+#: file (``negotiated_inputs``) so a resume that refuses can name the one that changed. Not the deadline
+#: (recorded as ``eth_timeout_unix_s``) or ``t_rxd`` itself (``t_rxd_blocks``). A test derives the
+#: ``args`` fields those functions read and requires each to be here or one of those two.
+_NEGOTIATED_INPUTS = (
+    "rxd_block_interval_fast_s",
+    "rxd_block_interval_s",
+    "eth_finalization_window_s",
+    "eth_finality_stall_tolerance_s",
+    "rxd_claim_burial_s",
+    "rxd_confirm_slack_s",
+    "rounding_slack_s",
+    "max_covenant_confirm_wait_s",
+    "margin_blocks",
+    "btc_block_interval_s",
+    "asset_variant",
+    "rxd_photons",
+    "value_at_risk_photons",
+    "accept_single_operator_up_to",
+    "counter_asset",
+    "eth_chain_id",
+)
+
+
+def _negotiated_inputs(args: argparse.Namespace) -> dict:
+    """What :data:`_NEGOTIATED_INPUTS` were for this run, as the recovery file records them."""
+    return {name: getattr(args, name, None) for name in _NEGOTIATED_INPUTS}
+
+
+def _t_rxd_remedy(args: argparse.Namespace, remaining_s: int | None) -> str:
+    """The advice a ``t_rxd`` refusal ends with.
+
+    A fresh run derives ``t_rxd``, so the advice is to omit the flag. A RESUME cannot change it: the
+    funded covenant commits to the ``t_rxd`` the swap recorded, which the resume reuses, and any other
+    value rebuilds a covenant that holds nothing. Every bound is a floor that only gets easier as the
+    deadline nears, so a recorded ``t_rxd`` that passed when the swap was negotiated fails on a resume
+    only because an input changed. Name it, against the recorded value, and advise restoring it.
+    """
+    if remaining_s is None:
+        return f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
+    restore = getattr(args, "resumed_record", None) or {}
+    recorded = restore.get("negotiated_inputs")
+    fixed = (
+        f"  this is a RESUME: t_rxd {int(args.t_rxd_blocks)} is the one this swap recorded, and the funded "
+        "covenant commits to it. Do NOT change --t-rxd-blocks: a different value builds a covenant that "
+        "holds nothing. These bounds held when the swap was negotiated and only get easier as the deadline "
+        "nears, so an input changed since then.\n"
+    )
+    if not isinstance(recorded, dict):
+        return fixed + (
+            "  this recovery file predates recording the run's inputs, so restore the values the interrupted "
+            "run was started with — first --rxd-block-interval-fast-s, then the cross-clock margin flags "
+            "(--eth-finalization-window-s, --eth-finality-stall-tolerance-s, --rxd-claim-burial-s, "
+            "--rxd-confirm-slack-s, --rounding-slack-s) and --max-covenant-confirm-wait-s — and resume again.\n"
+        )
+    now = _negotiated_inputs(args)
+    changed = [
+        f"--{name.replace('_', '-')} {now[name]!r} (the swap was negotiated with {recorded[name]!r})"
+        for name in _NEGOTIATED_INPUTS
+        if name in recorded and recorded[name] != now[name]
+    ]
+    if not changed:
+        return fixed + (
+            "  but no recorded input differs from this run's. Do not change t_rxd or the deadline; if the "
+            "swap cannot continue, refund the deployed contract after its timeout.\n"
+        )
+    return fixed + "  changed: " + "; ".join(changed) + ". Restore the recorded value and resume again.\n"
+
+
 def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_s: int | None = None) -> None:
     """The RXD refund must not open before the taker has finished waiting for ETH finality.
 
@@ -633,9 +702,9 @@ def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_
         f"through {margin_s}s ({margin_s / 3600:.2f} h) of cross-clock margin — ETH finality, the "
         f"stall budget, claim burial and slack. The maker could refund the asset while the taker "
         f"was still waiting.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
-        f"  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
-        f"window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
+        + _t_rxd_remedy(args, remaining_s)
+        + "  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
+        "window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
     )
 
 
@@ -672,10 +741,14 @@ def _assert_t_rxd_outlasts_the_eth_deadline(args: argparse.Namespace, *, remaini
         f"{required_s / 3600:.1f} h this swap requires (--eth-timeout-s PLUS the {margin_s}s "
         f"cross-clock margin). The maker's Radiant refund would open while it can still claim the "
         f"ETH leg with p — it could take both legs.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
-        f"  minimum: --t-rxd-blocks {lo + int(getattr(args, 'gate_reserve_blocks', 0))}\n"
-        f"  NOTE the direction: before #482 this bound was a CAP and this message said 'too LONG'. "
-        f"Lengthening t_rxd is the fix now; shortening it was never safe."
+        + _t_rxd_remedy(args, remaining_s)
+        + (
+            f"  minimum: --t-rxd-blocks {lo + int(getattr(args, 'gate_reserve_blocks', 0))}\n"
+            if remaining_s is None
+            else ""
+        )
+        + "  NOTE the direction: before #482 this bound was a CAP and this message said 'too LONG'. "
+        "Lengthening t_rxd is the fix now; shortening it was never safe."
     )
 
 
@@ -740,9 +813,9 @@ def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace, *, rema
         f"window — the span where the maker's covenant refund has matured AND the counter leg is "
         f"still claimable with the preimage, so the maker can end up holding both legs. It should "
         f"be bounded by the {margin_s / 3600:.2f} h cross-clock margin.\n"
-        f"  OMIT --t-rxd-blocks entirely and it is derived: {_derived_t_rxd_blocks(args, remaining_s=remaining_s)}\n"
-        f"  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
-        f"the taker safety. Only one of those is recoverable."
+        + _t_rxd_remedy(args, remaining_s)
+        + "  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
+        "the taker safety. Only one of those is recoverable."
     )
 
 
@@ -1198,6 +1271,8 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # confirm-wait reserve. Resolve the deadline, hand the bounds what is actually left, and the
     # parse-time answer means something on a resume too.
     restore = _load_restore(args)
+    # A refusal on a resume names the input that changed against the record (`_t_rxd_remedy`).
+    args.resumed_record = restore
     eth_timeout = resolve_eth_timeout(restore, now_unix_s=int(time.time()), eth_timeout_s=args.eth_timeout_s)
     # A resume rebuilds the covenant it funded, so t_rxd is the one it recorded — re-deriving it from
     # what is LEFT of the deadline gives a different covenant, which the resume then refuses.
@@ -1417,6 +1492,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                         "maker_rxd_wif": _rkeys[1].wif(),
                         "rxd_covenant_spk": cov.funded_spk.hex(),
                         "t_rxd_blocks": terms.t_rxd.value,
+                        # What the t_rxd bounds and the taker gate's reserve read, so a resume that
+                        # refuses can name the input that changed (`_t_rxd_remedy`).
+                        "negotiated_inputs": _negotiated_inputs(args),
                         # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
                         # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
                         # need it to rebuild the covenant they spend. Nothing used to persist it.
