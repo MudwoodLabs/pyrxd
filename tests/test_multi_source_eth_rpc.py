@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import re
 
 import pytest
 
@@ -837,5 +838,6 @@ def test_a_below_quorum_error_never_carries_an_endpoints_key(read: str) -> None:
     msg = str(exc.value)
     assert _KEY_A not in msg and _KEY_B not in msg, msg
     # Still says WHICH endpoints failed: the honest half of redaction is that the host survives.
-    assert "eth-mainnet.alpha-example.com" in msg and "rpc.beta-example.org" in msg, msg
+    assert re.search(r"https://eth-mainnet\.alpha-example\.com(:443)?\b", msg), msg
+    assert re.search(r"https://rpc\.beta-example\.org(:443)?\b", msg), msg
     assert "only 0 of 2 endpoints" in msg, msg
