@@ -696,3 +696,17 @@ def test_the_contiguity_check_fires_on_the_list_that_broke_glyphverify() -> None
     # Honest path: the same files, contiguous, are fine wherever the run sits.
     assert _conftest_splits([old[0], old[2], old[1], old[3]]) == []
     assert _conftest_splits([old[1], old[3], old[0], old[2]]) == []
+
+
+def test_the_coordinator_group_runs_the_taker_gates_test_file_last() -> None:
+    """REVIEWED, not derived: a measured judgement (scripts/mutation_test.sh, 2026-10-01 samples). The
+    taker gate's test file kills swap_coordinator mutants nothing else in the coordinator list kills,
+    and it is the slowest file there, so it runs LAST — with -x, only for mutants the rest left alive.
+    Moving it earlier would charge its ~7 s to every mutant; dropping it would score those mutants as
+    survivors."""
+    tests, timeout, _marker = _group_settings(["coordinator"])["coordinator"]
+    files = tests.split()
+    assert files[-1] == "tests/test_taker_funding_spv_gate.py", files[-3:]
+    assert files.count("tests/test_taker_funding_spv_gate.py") == 1
+    assert float(timeout) >= 60.0, timeout
+    assert _script_shards().get("coordinator") == 2
