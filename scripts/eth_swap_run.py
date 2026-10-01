@@ -696,14 +696,15 @@ def _assert_t_rxd_covers_the_takers_wait(args: argparse.Namespace, *, remaining_
     fast = float(args.rxd_block_interval_fast_s or 0)
     margin_s = _cross_clock_margin(args).total_s()
     have = int(args.t_rxd_blocks)
+    remedy = _t_rxd_remedy(args, remaining_s)
     raise SystemExit(
         f"--t-rxd-blocks {have} is too SHORT for a real-value run. At the measured fast tail of "
         f"{fast:.0f}s/block it matures in {have * fast / 3600:.2f} h, but the taker must first sit "
         f"through {margin_s}s ({margin_s / 3600:.2f} h) of cross-clock margin — ETH finality, the "
         f"stall budget, claim burial and slack. The maker could refund the asset while the taker "
         f"was still waiting.\n"
-        + _t_rxd_remedy(args, remaining_s)
-        + "  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
+        f"{remedy}"
+        "  Size it at the FAST tail, not the median: fast blocks are what shrink the taker's "
         "window. A slow chain only lengthens the maker's lock, which costs liveness, not safety."
     )
 
@@ -735,19 +736,21 @@ def _assert_t_rxd_outlasts_the_eth_deadline(args: argparse.Namespace, *, remaini
     nominal = float(args.rxd_block_interval_fast_s or args.rxd_block_interval_s)
     margin_s = _cross_clock_margin(args).total_s()
     required_s = _eth_budget_s(args, remaining_s) + margin_s
+    remedy = _t_rxd_remedy(args, remaining_s)
+    # A resume cannot change t_rxd, so it gets no minimum to type in.
+    minimum = (
+        f"  minimum: --t-rxd-blocks {lo + int(getattr(args, 'gate_reserve_blocks', 0))}\n"
+        if remaining_s is None
+        else ""
+    )
     raise SystemExit(
         f"--t-rxd-blocks {have} is too SHORT. The coordinator projects the RXD refund forward at "
         f"the {nominal:.0f}s interval, giving {have * nominal / 3600:.1f} h against the "
         f"{required_s / 3600:.1f} h this swap requires (--eth-timeout-s PLUS the {margin_s}s "
         f"cross-clock margin). The maker's Radiant refund would open while it can still claim the "
         f"ETH leg with p — it could take both legs.\n"
-        + _t_rxd_remedy(args, remaining_s)
-        + (
-            f"  minimum: --t-rxd-blocks {lo + int(getattr(args, 'gate_reserve_blocks', 0))}\n"
-            if remaining_s is None
-            else ""
-        )
-        + "  NOTE the direction: before #482 this bound was a CAP and this message said 'too LONG'. "
+        f"{remedy}{minimum}"
+        "  NOTE the direction: before #482 this bound was a CAP and this message said 'too LONG'. "
         "Lengthening t_rxd is the fix now; shortening it was never safe."
     )
 
@@ -808,13 +811,14 @@ def _assert_t_rxd_bounds_the_vulnerable_window(args: argparse.Namespace, *, rema
         return
     margin_s = _cross_clock_margin(args).total_s()
     window_s = _asset_vulnerable_window_s(args, remaining_s)
+    remedy = _t_rxd_remedy(args, remaining_s)
     raise SystemExit(
         f"--t-rxd-blocks {args.t_rxd_blocks} leaves a {window_s / 3600:.2f} h ASSET_VULNERABLE "
         f"window — the span where the maker's covenant refund has matured AND the counter leg is "
         f"still claimable with the preimage, so the maker can end up holding both legs. It should "
         f"be bounded by the {margin_s / 3600:.2f} h cross-clock margin.\n"
-        + _t_rxd_remedy(args, remaining_s)
-        + "  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
+        f"{remedy}"
+        "  a LONGER t_rxd costs the maker liveness (its asset stays locked); a shorter one costs "
         "the taker safety. Only one of those is recoverable."
     )
 
