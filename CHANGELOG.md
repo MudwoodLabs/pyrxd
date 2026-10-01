@@ -337,43 +337,50 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transport exception from a counter-leg read is now rendered by `describe_network_error`: the
   exception type, its HTTP status, and the endpoint's host, never the URL; a library exception's
   own text is dropped. pyrxd's own error text (which can wrap an RPC error body echoing the key)
-  is printed through `redact_endpoint_secrets`, which removes every credential-bearing part of each
-  endpoint URL the command used. `recover-preimage`, `build-claim` and `build-refund` now map an
+  is printed through `redact_endpoint_secrets`, which removes the credential-bearing parts of each
+  endpoint URL the command used (the rule, and its limit, are in the next entry). `recover-preimage`, `build-claim` and `build-refund` now map an
   aiohttp error, a timeout, or a 200 whose body is not JSON to a clean exit 2 instead of
   "unexpected failure", exit 4. The ElectrumX error paths in `swap status --check-chain`,
   `build-claim`, `build-refund` and the reserve/post/take/cancel/refund orderbook commands scrub
   every configured ElectrumX URL; `swap orders`, which reads through `--node-rpc`, scrubs that URL.
 - **Endpoint credentials were printed outside the swap commands too.** The ElectrumX failover client
   logged `<call> failed on <URL>` to stderr for every failed read, with the URL's user name,
-  password, path and query; 28 other places — mostly `fix: check that <URL> is reachable` hints in
-  the glyph, wallet, query, hashmark and setup commands — and the TLS-pin errors did the same; and
-  the `swap orders`
-  node-RPC transport wrapped failures as the aiohttp exception's repr, which quotes the full
-  request URL (a redirect loop printed the API key), and passed a node error body that echoed the
-  request path through verbatim. Every one of those now names the endpoint as
-  `scheme://host:port` (`pyrxd.network.redaction.redacted_url`), and the node-RPC transport scrubs
-  a node's error text of its URL. `redact_endpoint_secrets` matched exact strings of six or more
+  password, path and query; more than twenty other places — mostly `fix: check that <URL> is
+  reachable` hints in the glyph, wallet, query, hashmark and setup commands — and the TLS-pin
+  errors did the same; and the `swap orders` node-RPC transport wrapped failures as the aiohttp
+  exception's repr, which quotes the full request URL (a redirect loop printed the API key), and
+  passed a node error body that echoed the request path through verbatim. Every one of those now
+  names the endpoint as `scheme://host:port` (`pyrxd.network.redaction.redacted_url`), and the
+  node-RPC transport scrubs a node's error text of its URL. So do the config-file errors for an
+  endpoint declared with a bad or a second operator, `Endpoint`'s "insecure endpoint" and
+  missing-scheme refusals (the latter printed the text before the first `:`, which for a URL
+  missing its scheme is the user name), and the watchtower's startup and source-grouping log lines
+  (`--rxd-electrumx-url`, `--mempool-base-url`, `--eth-rpc-url`); the "names no host" refusal,
+  which has no host to name, prints the URL with its credential parts removed. `setup --json`
+  reports `electrumx_url` as `scheme://host:port`.
+
+  `verify --wave-name` and `glyph inspect --wave-name` labelled every source in the name-at-mark
+  verdict by its full endpoint URL, so `--json` printed the URL's credentials in `binding_source`,
+  `anchor_source`, `chain.discovery_source` and `tip_source`, `heights.by_source[].source` and
+  `heights.agreed_by`, the anchor's `source` and `block_verification.source`, and every reason
+  that quotes them; plain `verify` did the same in its anchor, and its "`<endpoint>` answered, but
+  …" hint. These are now `scheme://host:port` too. The labels stay full URLs inside the verdict,
+  where the source-identity rules compare them, and are redacted where they become output
+  (`pyrxd.network.redaction.redact_endpoints_in`), so those `--json` values change shape (a
+  trailing `/` or a path is no longer part of them).
+
+  `redact_endpoint_secrets`, for text pyrxd did not write, matched exact strings of six or more
   characters, so it missed a short password, a key a server re-encoded (`~` as `%7E`) or
-  upper-cased, and a fragment; it now derives each URL's user name, password, query values and
-  fragment (always redacted, at any length) and the path segments that look like a credential (16
+  upper-cased, and a fragment. It now derives each URL's user name, password, query values and
+  fragment (always removed, at any length) and the path segments that look like a credential (16
   or more characters, 8 or more mixing letters and digits, or anything but a trivially common
   token after a `/key/`, `/token/` or `/v3/`-style marker), and matches them case-insensitively,
   percent-encoded, and as whole tokens only, so a value that merely occurs inside a txid, a
-  hostname or a word, and a plain path word such as `testnet` or a block height, is left alone. `setup --json` reports
-  `electrumx_url` as `scheme://host:port`. `verify --wave-name` and `glyph inspect --wave-name`
-  labelled every source in the name-at-mark verdict by its full endpoint URL, so `--json` printed
-  the URL's credentials in `binding_source`, `anchor_source`, `chain.discovery_source` and
-  `tip_source`, `heights.by_source[].source` and `heights.agreed_by`, the anchor's `source` and
-  `verified_by`, and every reason that quotes them, and `verify`'s "`<endpoint>` answered, but …"
-  hint did the same; these are now `scheme://host:port` too. So are the config-file errors for an
-  endpoint declared with a bad or a second operator, `Endpoint`'s "insecure endpoint" and
-  missing-scheme refusals (the latter printed the text before the first `:`, which for a URL
-  missing its scheme is the user name), the "names no host" refusal, and the watchtower's startup
-  and source-grouping log lines (`--rxd-electrumx-url`, `--mempool-base-url`, `--eth-rpc-url`). The labels stay full URLs inside the
-  verdict, where the source-identity rules compare them, and are redacted where they become output
-  (`pyrxd.network.redaction.redact_endpoints_in`), so those `--json` fields change shape (a
-  trailing `/` or path is no longer part of the value). The exit-4 "unexpected failure" path scrubs every URL on
-  the command line.
+  hostname or a word, and a plain path word such as `testnet` or a block height, is left alone.
+  The limit that follows from that: a key carried as a short, letters-only path segment that does
+  not follow such a marker is treated as a word, and is not removed from text a server echoes
+  back. `redacted_url`, used wherever pyrxd itself names an endpoint, never prints the path. The
+  exit-4 "unexpected failure" path scrubs every URL on the command line.
 - **The swap taker no longer locks its counter leg on one server's word that the maker's covenant
   exists.** `SwapCoordinator.taker_verify_asset_funding` read the covenant's script, value and depth
   from a single ElectrumX `listunspent` and verbose `confirmations`, with no merkle proof and no
