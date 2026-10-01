@@ -557,8 +557,12 @@ def refusing(request) -> Iterator[ThreadingHTTPServer]:
         srv.server_close()
 
 
+#: The request path :func:`_keyed_url` produces — what a server that echoes its request would quote.
+_KEYED_PATH = f"/v2/{FAKE_PATH_SECRET}?apikey={FAKE_QUERY_SECRET}"
+
+
 def _keyed_url(srv: ThreadingHTTPServer) -> str:
-    return f"http://{FAKE_USER_SECRET}:pw@127.0.0.1:{srv.server_port}/v2/{FAKE_PATH_SECRET}?apikey={FAKE_QUERY_SECRET}"
+    return f"http://{FAKE_USER_SECRET}:pw@127.0.0.1:{srv.server_port}{_KEYED_PATH}"
 
 
 def _url_taking_commands() -> dict[str, Any]:
@@ -970,12 +974,14 @@ class _EchoOrRedirect(BaseHTTPRequestHandler):
         self.server.seen.append(self.path)  # type: ignore[attr-defined]
         if self.server.mode == "redirect" and "hop=1" not in self.path:  # type: ignore[attr-defined]
             self.send_response(307, "Moved")
-            self.send_header("Location", self.path + "&hop=1")
+            # Built from the test's own constants, not the request line: the path is the same, and a
+            # header copied from a request is HTTP response splitting to CodeQL even in a test server.
+            self.send_header("Location", _KEYED_PATH + "&hop=1")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         body = json.dumps({"error": f"unauthorized for {self.path}"}).encode()
-        self.send_response(401, f"Unauthorized {self.path}")
+        self.send_response(401, f"Unauthorized {_KEYED_PATH}")
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
