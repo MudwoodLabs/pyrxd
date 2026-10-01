@@ -569,3 +569,29 @@ def test_the_branch_is_read_from_the_selector(script_hex, expected) -> None:
     from pyrxd.cli.swap_recovery import classify_covenant_spend_input
 
     assert classify_covenant_spend_input(bytes.fromhex(script_hex), hashlock=H) == expected
+
+
+# --------------------------------------------------------------------------- 4/5. depth that was not measured
+
+
+def _height_client(case, height: int, *, tip: int = 130):
+    from pyrxd.network.electrumx import UtxoRecord
+
+    from .test_swap_recovery_cmds import _NoBroadcastClient
+
+    return _NoBroadcastClient(
+        {case["cov_sh"]: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=height)]}, tip=tip
+    )
+
+
+def test_blocks_to_refund_is_omitted_rather_than_raising_when_depth_is_none(case, monkeypatch) -> None:
+    """Item 4's guard on its own: a live covenant with a funding height but no measured depth."""
+    from pyrxd.cli import swap_cmds
+
+    async def _read(ctx, spk_hex, hashlock_hex=None):
+        return {"covenant_state": "live", "funding_height": 100, "depth": None, "value_photons": 1, "now_height": 130}
+
+    monkeypatch.setattr(swap_cmds, "_read_covenant", _read)
+    res = _status(case, output_mode="json")
+    assert res.exit_code == 0, res.output
+    assert "blocks_to_refund" not in json.loads(res.output)["chain"]

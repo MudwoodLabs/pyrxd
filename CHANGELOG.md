@@ -293,7 +293,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RadiantCovenantLeg.claim_asset` sizes its fee against, and it reported `LOCKED` at the depth
   where the refund is already valid. Both now come from the leg's own
   `blocks_to_claim_deadline`, and `REFUND_OPEN` starts at the same depth where `refund_asset` and
-  `swap build-refund` accept the refund.
+  `swap build-refund` accept the refund. **The `--json` field `chain.blocks_to_refund` changed
+  meaning with it:** it was `funding_height + t_rxd - tip` (one block optimistic: at 0 the refund
+  had already been valid for a block) and is now `t_rxd - depth`, the blocks left before a CSV
+  refund can be mined (a node accepts a CSV-`N` refund once the covenant is `N` confirmations deep,
+  as the regtest test `TestColdRefundOnConsensus` walks block by block). A script that read the old
+  value as "blocks until the refund opens" was one block late; with the new value, 0 means the
+  refund is valid now. The field is now omitted, instead of raising, when the covenant's depth is
+  not known.
 - **Docstrings and docs no longer say `require_audit_cleared` blocks anything.** It has been a
   no-op since 0.9.0. The Radiant, BTC and ETH legs, both chain registries, the SPV sole-authority
   builder, the watchtower README, `docs/concepts/architecture.md`,

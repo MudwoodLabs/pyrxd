@@ -661,10 +661,15 @@ def swap_status_cmd(
         )
         chain["situation"] = situation
         chain["next_action"] = next_action
-        if chain["covenant_state"] == "live" and chain["funding_height"] is not None:
+        # Both fields only where a depth was MEASURED. `blocks_to_claim_deadline(t, None)` raises
+        # TypeError, and a depth that was not measured must not be turned into a count either.
+        if chain["covenant_state"] == "live" and chain["funding_height"] is not None and chain["depth"] is not None:
             from pyrxd.gravity.radiant_leg import blocks_to_claim_deadline
 
             chain["refund_opens_height"] = chain["funding_height"] + facts.t_rxd_blocks
+            # `t_rxd - depth`: the refund is valid once the covenant is t_rxd deep (a CSV-N spend
+            # is accepted at depth N). This field used to be `funding_height + t_rxd - tip`, one
+            # block more — see the CHANGELOG.
             chain["blocks_to_refund"] = blocks_to_claim_deadline(facts.t_rxd_blocks, chain["depth"])
         payload["chain"] = chain
         payload["situation"] = situation  # top-level for quiet mode
