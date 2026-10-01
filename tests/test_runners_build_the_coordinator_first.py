@@ -428,3 +428,23 @@ def test_every_mainnet_coordinator_script_exposes_the_value_flag_and_its_policy_
                 )
                 checked += 1
     assert checked >= len(scripts)
+
+
+#: The coordinator methods that run the taker gate on a lock path; each takes the caller's wall clock.
+_GATE_METHODS = ("taker_verify_asset_funding", "pre_btc_lock_check", "taker_funds_btc", "resume_interrupted_fund")
+
+
+def test_every_script_call_into_the_taker_gate_passes_the_wall_clock():
+    """The gate's elapsed-depth bound counts the time since its reference header, and refuses on
+    mainnet without a clock. ``eth_swap_two_host.py`` called ``taker_verify_asset_funding(terms)`` with
+    none (and printed the bound as "buried N conf(s)"). Every call under ``scripts/`` — DERIVED from
+    the source — now passes ``now_unix_s``."""
+    calls = []
+    for path in sorted(_SCRIPTS.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for name in _GATE_METHODS:
+            calls += [(path.stem, name, c) for c in _calls(tree, name)]
+    assert len({stem for stem, _n, _c in calls}) >= 5, sorted({stem for stem, _n, _c in calls})
+    assert any(stem == "eth_swap_two_host" and n == "taker_verify_asset_funding" for stem, n, _c in calls)
+    missing = [f"{stem}:{c.lineno} {n}" for stem, n, c in calls if not any(kw.arg == "now_unix_s" for kw in c.keywords)]
+    assert not missing, missing

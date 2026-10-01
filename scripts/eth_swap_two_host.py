@@ -601,13 +601,22 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
         # the higher rxd_claim_burial instead — coordinator._asset_funding_depth).
         confirm("verify the maker funded the RXD covenant on-chain before funding ETH", auto_yes=args.yes)
         try:
-            fop, fval, confs = await coord.taker_verify_asset_funding(terms)
+            # The wall clock: the gate's elapsed-depth bound counts the time since the reference header
+            # (and on mainnet it refuses without it).
+            fop, fval, elapsed_upper = await coord.taker_verify_asset_funding(terms, now_unix_s=int(time.time()))
         except (ValidationError, NetworkError) as exc:
             raise SystemExit(
                 "REFUSING to fund ETH: the maker's RXD covenant is not verifiably locked at the agreed value "
                 f"and depth — {exc}. A hostile maker may not have locked RXD; aborting before our ETH is at risk."
             ) from None
-        print(f"  -> RXD covenant confirmed funded on-chain at {fop} ({fval} photons), buried {confs} conf(s)")
+        # The third value is an UPPER bound on the blocks mined since the funding (what the timelock
+        # checks subtract from t_rxd), not a proved burial depth: the proved depth is on
+        # coord.last_maker_funding.
+        proved = getattr(coord.last_maker_funding, "proved_depth", None)
+        print(
+            f"  -> RXD covenant proved funded on-chain at {fop} ({fval} photons): proved {proved} block(s) deep; "
+            f"at most {elapsed_upper} block(s) elapsed since the funding (upper bound)"
+        )
 
         confirm("taker_funds_btc: deploy+fund the ETH HTLC (taker pays gas; claim pays the maker)", auto_yes=args.yes)
         rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))

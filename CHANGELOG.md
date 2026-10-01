@@ -238,6 +238,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     it never built the coordinator. It now builds the same one on offline transports and reports its
     verdict; without `--rxd-block-interval-fast-s` it says that the broadcast stages need it.
   - `eth_swap_grief_run.py` raised `AttributeError` building its terms (`asset_variant`).
+  - `eth_swap_two_host.py`'s taker phase called `taker_verify_asset_funding` without the wall clock
+    and printed its third value as "buried N conf(s)". It passes `now_unix_s` now and prints the
+    proved depth and the elapsed-blocks upper bound as what they are; a test derives every call into
+    the taker gate under `scripts/` and requires the clock on each.
 - **`ElectrumXClient.get_transaction_merkle` raised on real proofs.** It put every sibling hash
   into the first BUMP level, so every proof deeper than one level failed. This was measured on
   two HashMark transactions against both default servers ("Missing hash for index 3 at height

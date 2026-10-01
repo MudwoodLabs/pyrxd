@@ -51,7 +51,7 @@ re-derive from it.
 | BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:387-413` |
 | ETH counter-leg binding | `src/pyrxd/gravity/eth_leg.py:152-193`, `src/pyrxd/eth_wallet/locator.py:33-104` |
 | Counter-leg locators (durable, JSON) | `src/pyrxd/btc_wallet/taproot.py:526-601`, `src/pyrxd/eth_wallet/locator.py:33-121` |
-| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-59, 641-700`, `scripts/eth_swap_two_host.py:585-645` |
+| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-59, 641-700`, `scripts/eth_swap_two_host.py:585-654` |
 | Conformance vectors | `conformance/htlc-handshake-vectors.json`, guarded by `tests/test_htlc_handshake_conformance_vectors.py` |
 
 ## Roles, and the one invariant everything rests on
@@ -99,7 +99,7 @@ Every message is a JSON object carrying a `schema` string:
 | Value | Meaning |
 |---|---|
 | `btc_rxd_two_host_envelope_v1` | BTC counter leg (`scripts/btc_swap_two_host.py:798`) |
-| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:774`) |
+| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:783`) |
 
 **A conforming implementation MUST read `schema` and MUST refuse an unrecognised value**, exactly
 as `gravity/watch/escalation.py:210-214` does for the watchtower heartbeat ("Refusing to guess at
@@ -121,7 +121,7 @@ The taker's public key material, so the maker can build the covenant and the tap
 | `taker_btc_refund_xonly_hex` | 64-hex | BTC only | Taker's x-only key for the BTC refund leaf. |
 | `eth_taker_refund_addr` | `0x`+40-hex | ETH only | Taker's address; becomes the contract's immutable `refundee`. |
 
-Source: `scripts/btc_swap_two_host.py:548-552`, `scripts/eth_swap_two_host.py:635`.
+Source: `scripts/btc_swap_two_host.py:548-552`, `scripts/eth_swap_two_host.py:644`.
 
 ### 2. `envelope` (maker → taker)
 
@@ -139,7 +139,7 @@ The core message. Carries `H` — never `p`.
 | `eth_chain_id` | int | ETH only | **not validated** | EIP-155 chain id. See **HZ-5**. |
 | `btc_network` / `rxd_network` | string | yes | **not validated** | Network tags. See **HZ-5**. |
 
-Source: `scripts/btc_swap_two_host.py:799-807`, `scripts/eth_swap_two_host.py:773-782`.
+Source: `scripts/btc_swap_two_host.py:799-807`, `scripts/eth_swap_two_host.py:782-791`.
 
 The maker MUST NOT place a private key, WIF, seed, or the preimage in this document. The harnesses
 enforce this with a recursive key-name and WIF-shape scan before every write
@@ -215,7 +215,7 @@ The maker's counter-chain claim, which reveals `p` on chain.
 | `btc_claim_tx_hex` | hex | BTC — the raw claim transaction |
 | `eth_claim_tx_hash` | `0x`-hex | ETH — the claim transaction hash |
 
-Source: `scripts/btc_swap_two_host.py:884`, `scripts/eth_swap_two_host.py:711`.
+Source: `scripts/btc_swap_two_host.py:884`, `scripts/eth_swap_two_host.py:720`.
 
 This message is a **convenience pointer, not a channel**. `p` is public on chain the moment the
 claim confirms; the taker can and should find it by watching the counter chain. A conforming taker
@@ -584,7 +584,7 @@ funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG ent
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**
-(`scripts/btc_swap_two_host.py:798, 1316`; `scripts/eth_swap_two_host.py:633, 838` — the second of
+(`scripts/btc_swap_two_host.py:798, 1316`; `scripts/eth_swap_two_host.py:642, 847` — the second of
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only
@@ -705,7 +705,7 @@ omit the checks that actually bind.
 ### HZ-5: Network identity is carried but never checked
 
 `envelope` carries `btc_network`, `rxd_network` and (ETH) `eth_chain_id`
-(`scripts/btc_swap_two_host.py:802-803`, `scripts/eth_swap_two_host.py:779-780`), but no reader
+(`scripts/btc_swap_two_host.py:802-803`, `scripts/eth_swap_two_host.py:788-789`), but no reader
 compares them to its own configuration — the taker phases read `maker_pkh_hex`,
 `covenant_spk_hex` and the payout fields and nothing else. `terms` carries no network at all, and
 `BtcHtlcLocator.network` defaults to `"bc"` (`taproot.py:628`).
