@@ -31,7 +31,7 @@ from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.htlc_leg import SETTLED_SLOT, EthHtlcContractLeg
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.eth_wallet.tokens import token_for
-from pyrxd.security.errors import ClaimNotConfirmed, PreRevealAbort, ValidationError
+from pyrxd.security.errors import ClaimNotConfirmed, PreRevealAbort, PreRevealExpired, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 _FIX = pathlib.Path(__file__).parent / "fixtures"
@@ -322,6 +322,9 @@ def test_a_claim_against_a_contract_SETTLED_AT_THE_TIP_is_refused_before_reveal(
     with pytest.raises(PreRevealAbort, match="already settled") as exc:
         asyncio.run(leg.claim(loc(), os.urandom(32)))
     assert sub.submitted == [] and rpc.preflights == []
+    # Permanent: the flag is never cleared, so a driver must stop rather than retry to the deadline.
+    # Still a PreRevealAbort (caught above), so the caller keeps `p`.
+    assert isinstance(exc.value, PreRevealExpired) and exc.value.retryable is False
     # Its own message, not the generic "claim abandoned" wrapper's, and it must not claim p is
     # still secret in the case where OUR earlier claim is what settled the contract.
     assert "If a claim from this address already succeeded" in str(exc.value)

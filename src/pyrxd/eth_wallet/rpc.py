@@ -116,13 +116,28 @@ class _RedactingLogger:
         return getattr(self._logger, name)
 
 
+def _scrub_rpc_error(response: Any, url: str) -> Any:
+    """*response* with the endpoint's credential parts removed from its JSON-RPC ``error`` object.
+
+    A JSON-RPC error arrives as a SUCCESSFUL HTTP response, so it never reaches the ``except`` in
+    ``make_request``; web3 raises ``Web3RPCError`` from it later, quoting ``error.message`` and
+    ``error.data`` as the server wrote them — and a server can echo the request path, key included.
+    Only the strings inside ``error`` are touched: ``result`` is never rewritten, and revert data
+    (one long hex run) cannot match a whole-token secret.
+    """
+    if isinstance(response, dict) and isinstance(response.get("error"), (dict, str)):
+        return {**response, "error": redact_endpoints_in(response["error"], url)}
+    return response
+
+
 _PROVIDER_CLASS: Any = None
 
 
 def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
     """``AsyncHTTPProvider`` for *rpc_url* whose transport failures never quote the URL's secrets.
 
-    This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
+    It also removes them from a JSON-RPC ``error`` object before web3 raises from it
+    (:func:`_scrub_rpc_error`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
     the legs make through ``rpc.w3`` / :func:`~pyrxd.eth_wallet.multi_rpc.read_contract`, which
     never pass through an :class:`EthRpc` method and so are not covered by :meth:`EthRpc._failed`.
     A failure whose chain quotes nothing secret is re-raised UNCHANGED (same type, so web3's own
@@ -144,23 +159,27 @@ def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
 
             async def make_request(self, method: Any, params: Any) -> Any:
                 try:
-                    return await super().make_request(method, params)
+                    response = await super().make_request(method, params)
                 except Exception as exc:
                     if not _chain_quotes_a_secret(exc, str(self.endpoint_uri)):
                         raise
                     raise _scrubbed(
                         NetworkError, f"{method} transport failure: {exc}", exc, str(self.endpoint_uri)
                     ) from None
+                return _scrub_rpc_error(response, str(self.endpoint_uri))
 
             async def make_batch_request(self, batch_requests: Any) -> Any:
                 try:
-                    return await super().make_batch_request(batch_requests)
+                    response = await super().make_batch_request(batch_requests)
                 except Exception as exc:
                     if not _chain_quotes_a_secret(exc, str(self.endpoint_uri)):
                         raise
                     raise _scrubbed(
                         NetworkError, f"batch request transport failure: {exc}", exc, str(self.endpoint_uri)
                     ) from None
+                if isinstance(response, list):
+                    return [_scrub_rpc_error(r, str(self.endpoint_uri)) for r in response]
+                return _scrub_rpc_error(response, str(self.endpoint_uri))
 
         _PROVIDER_CLASS = _RedactingAsyncHTTPProvider
     return _PROVIDER_CLASS(rpc_url)

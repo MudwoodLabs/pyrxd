@@ -998,8 +998,10 @@ class EthHtlcContractLeg:
         except _AlreadySettled as exc:
             # Its own message, not the generic wrapper's: "the preimage is still secret" is true of
             # THIS call, but if our own earlier claim is what settled the contract, p is already
-            # public, and the message must not tell the operator otherwise.
-            raise PreRevealAbort(str(exc)) from exc
+            # public, and the message must not tell the operator otherwise. NOT retryable: the flag
+            # is never cleared, so a retry can only refuse again — PreRevealExpired tells a driver
+            # to stop, while still keeping `p` (it is a PreRevealAbort).
+            raise PreRevealExpired(str(exc)) from exc
         except _ClaimTooLate as exc:
             # Permanent -> PreRevealExpired, so a driver stops and refunds rather than spinning
             # until the deadline it is already too close to (#485). Both keep `p`: nothing was

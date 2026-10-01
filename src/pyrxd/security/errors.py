@@ -411,6 +411,9 @@ class PreRevealExpired(PreRevealAbort):
     late still publishes the preimage in its calldata while paying nothing, which hands the
     counterparty both legs — so refusing is right, and refusing again a second later is still
     right, forever.
+
+    Also raised when the HTLC is already SETTLED at the tip: the contract never clears that flag,
+    so a retry can only be refused again. Same handling — keep ``p``, stop retrying.
     """
 
     retryable: ClassVar[bool] = False

@@ -18,8 +18,10 @@ import inspect
 import io
 import json
 import logging
+import os
 import pathlib
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -302,3 +304,157 @@ def test_failed_redacts_text_that_did_NOT_come_through_the_provider():
 
     clean = rpc._failed("eth_getCode failed", RuntimeError("timeout"))
     assert isinstance(clean.__cause__, RuntimeError)  # nothing secret: the chain is kept for debugging
+
+
+# ── a JSON-RPC ERROR BODY that echoes the key: HTTP 200, so no transport exception ─────────────
+
+
+@pytest.fixture
+def echoing_url():
+    """Answers every call with HTTP 200 and a JSON-RPC error whose ``message`` and ``data`` repeat
+    the request path. web3 raises ``Web3RPCError`` from that body AFTER ``make_request`` returned,
+    so the transport-failure redaction never sees it. ``server.revert`` switches to a typed revert
+    (code 3 with hex ``data``) for the honest-path check."""
+    state = {"revert": False, "hits": 0}
+
+    class _H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            state["hits"] += 1
+            if state["revert"]:
+                err = {"code": 3, "message": "execution reverted", "data": "0x560ff900"}
+            else:
+                err = {"code": -32000, "message": f"denied for {self.path}", "data": f"path={self.path}"}
+            body = json.dumps({"jsonrpc": "2.0", "id": req["id"], "error": err}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_port}/v3/{_KEY}", state
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_the_echoing_server_really_puts_the_key_in_web3s_error(echoing_url):
+    """Control: through a plain provider the same body DOES carry the key into the exception."""
+    import web3
+
+    url, _state = echoing_url
+
+    async def go():
+        w3 = web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(url))
+        try:
+            await w3.eth.get_storage_at("0x" + "11" * 20, 0)
+        finally:
+            await w3.provider.disconnect()
+
+    with pytest.raises(Exception) as caught:
+        asyncio.run(go())
+    assert _KEY in _full_text(caught.value)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda r: r.w3.eth.get_storage_at("0x" + "11" * 20, 0),
+        lambda r: r.w3.eth.get_balance("0x" + "11" * 20),
+        lambda r: r.get_code("0x" + "11" * 20),
+    ],
+    ids=["raw-w3-get_storage_at", "raw-w3-get_balance", "EthRpc.get_code"],
+)
+def test_a_json_rpc_error_body_echoing_the_key_is_redacted(echoing_url, call):
+    url, state = echoing_url
+
+    async def go():
+        rpc = EthRpc(url, expected_chain_id=1)
+        try:
+            await call(rpc)
+        finally:
+            await rpc.close()
+
+    with pytest.raises(Exception) as caught:
+        asyncio.run(go())
+    assert state["hits"] > 0
+    text = _full_text(caught.value)
+    assert _KEY not in text, text
+    assert "denied for /v3/" in text  # the server's message survives, minus the key
+
+
+def test_a_claim_refused_on_an_echoed_error_does_not_carry_the_key(echoing_url):
+    """The reviewer's path: the claim's settled read fails with the echoing body, and the
+    PreRevealAbort it raises quotes that error."""
+    from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+    from pyrxd.eth_wallet.locator import EthHtlcLocator
+    from pyrxd.security.errors import PreRevealAbort
+    from pyrxd.security.secrets import PrivateKeyMaterial
+
+    url, _state = echoing_url
+    loc = EthHtlcLocator(
+        chain_id=1,
+        contract_address="0x" + "11" * 20,
+        deploy_tx_hash="0x" + "22" * 32,
+        hashlock="0x" + "33" * 32,
+        claimant="0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        refundee="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        timeout=4_000_000_000,
+        amount_wei=1,
+    )
+
+    async def go():
+        rpc = EthRpc(url, expected_chain_id=1)
+        leg = EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART)
+        # Reach the settled read: the head reads succeed (fresh head), everything else hits the server.
+        now = int(time.time())
+
+        async def _head():
+            return now
+
+        rpc.latest_block_timestamp = rpc.latest_block_timestamp_quorum = _head  # type: ignore[method-assign]
+        rpc.assert_chain = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+        try:
+            await leg.claim(loc, os.urandom(32))
+        finally:
+            await rpc.close()
+
+    with pytest.raises(PreRevealAbort) as caught:
+        asyncio.run(go())
+    text = _full_text(caught.value)
+    assert "denied for /v3/" in text  # it really failed on the echoed body
+    assert _KEY not in text, text
+
+
+def test_an_error_body_with_no_secret_reaches_web3_unchanged(echoing_url):
+    """Honest path: scrubbing must not change what web3 makes of an error that quotes nothing
+    secret. A revert-shaped body (code 3, hex ``data``) raises the same exception type with the
+    same text through the scrubbing provider as through a plain one."""
+    import web3
+
+    url, state = echoing_url
+    state["revert"] = True
+    tx = {"from": "0x" + "11" * 20, "to": "0x" + "22" * 20, "data": "0x"}
+
+    def raised(make_w3):
+        async def go():
+            w3 = make_w3()
+            try:
+                await w3.eth.call(tx)
+            finally:
+                await w3.provider.disconnect()
+
+        with pytest.raises(Exception) as caught:
+            asyncio.run(go())
+        return type(caught.value), str(caught.value)
+
+    plain = raised(lambda: web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(url)))
+    ours = raised(lambda: EthRpc(url, expected_chain_id=1).w3)
+    assert ours == plain
+    assert "0x560ff900" in ours[1]

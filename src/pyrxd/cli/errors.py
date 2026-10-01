@@ -30,9 +30,14 @@ a Python program. We do NOT use ``capture_locals=True`` anywhere.
 
 from __future__ import annotations
 
+import os
+import re
+import sys
 import traceback
 
 import click
+
+from ..network.redaction import redact_endpoint_secrets
 
 # Set by main.run() when --debug is passed. Read by CliError.show().
 _DEBUG: bool = False
@@ -51,6 +56,19 @@ def set_debug(enabled: bool) -> None:
 
 def is_debug() -> bool:
     return _DEBUG
+
+
+_URL_IN_ARG = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+
+
+def endpoint_urls_in_invocation() -> list[str]:
+    """Every URL on this process's command line or in a ``PYRXD_*`` variable.
+
+    The URLs whose credential parts must not appear in text the CLI prints but did not write — a
+    library exception's message, or its ``--debug`` traceback.
+    """
+    sources = [*sys.argv[1:], *(v for k, v in os.environ.items() if k.startswith("PYRXD_"))]
+    return [m for text in sources for m in _URL_IN_ARG.findall(text)]
 
 
 class CliError(click.ClickException):
@@ -104,7 +122,11 @@ class CliError(click.ClickException):
                 self.__cause__,
                 self.__cause__.__traceback__,
             )
-            click.echo("".join(tb_lines), file=file, err=True, nl=False)
+            # The traceback is a library's text: aiohttp quotes the request URL, and a server can
+            # echo it back or redirect to it. Every command prints its --debug traceback here, so
+            # this is where the endpoint credentials named on the command line are removed.
+            text = redact_endpoint_secrets("".join(tb_lines), endpoint_urls_in_invocation())
+            click.echo(text, file=file, err=True, nl=False)
 
 
 class UserError(CliError):

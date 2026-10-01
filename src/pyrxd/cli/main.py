@@ -27,8 +27,6 @@ not hold, raised only by ``verify``. See ``hashmark_cmds.EXIT_VERDICT_DOES_NOT_H
 
 from __future__ import annotations
 
-import os
-import re
 import sys
 from pathlib import Path
 
@@ -200,15 +198,6 @@ def cli(
 # (bug path, exit code 4) here.
 
 
-_URL_IN_ARG = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
-
-
-def _endpoint_urls_in_invocation() -> list[str]:
-    """Every URL on this process's command line or in a ``PYRXD_*`` variable — for the bug path."""
-    sources = [*sys.argv[1:], *(v for k, v in os.environ.items() if k.startswith("PYRXD_"))]
-    return [m for text in sources for m in _URL_IN_ARG.findall(text)]
-
-
 def run() -> None:
     """Top-level entry point used by ``[project.scripts]`` and ``__main__``.
 
@@ -228,7 +217,7 @@ def run() -> None:
         click.echo(f"error: unexpected failure ({type(exc).__name__})", err=True)
         # An unexpected exception's text is not ours and can quote an endpoint URL (aiohttp's do).
         # The context is gone by now, so scrub every URL on the command line and in the env.
-        click.echo(f"  cause: {redact_endpoint_secrets(str(exc), _endpoint_urls_in_invocation())}", err=True)
+        click.echo(f"  cause: {redact_endpoint_secrets(str(exc), _errors.endpoint_urls_in_invocation())}", err=True)
         click.echo("  fix: re-run with --debug to see the full traceback", err=True)
         sys.exit(4)
 

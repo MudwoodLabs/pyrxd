@@ -956,3 +956,83 @@ def test_a_malformed_eth_chain_id_in_the_file_is_refused_not_ignored(case, eth_r
     res = _eth_status(case, eth_rpc)
     assert res.exit_code != 0
     assert "eth_chain_id must be a positive integer" in res.output
+
+
+class _EchoOrRedirect(BaseHTTPRequestHandler):
+    """``server.mode`` ``"echo"``: a 401 whose reason and body repeat the request path (key
+    included). ``"redirect"``: a 307 to the same keyed path with ``&hop=1`` appended, which then
+    answers 401 — so the redirect history in the exception carries the key too."""
+
+    def _reply(self) -> None:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        self.server.seen.append(self.path)  # type: ignore[attr-defined]
+        if self.server.mode == "redirect" and "hop=1" not in self.path:  # type: ignore[attr-defined]
+            self.send_response(307, "Moved")
+            self.send_header("Location", self.path + "&hop=1")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = json.dumps({"error": f"unauthorized for {self.path}"}).encode()
+        self.send_response(401, f"Unauthorized {self.path}")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _reply
+
+    def log_message(self, *a: Any) -> None:
+        return None
+
+
+@pytest.mark.parametrize("mode", ["echo", "redirect"])
+def test_debug_traceback_carries_no_keyed_url(case, mode) -> None:
+    """``--debug`` prints the wrapped library exception's traceback (``CliError.show`` ->
+    ``__cause__``). That text is aiohttp's, and it quotes the request URL — and here the server
+    echoes the key back or redirects to it — so the traceback must go through the redactor too.
+    Through the real entry point, so the flag, the command and the printer are all the shipped ones."""
+    import os
+    import subprocess
+    import sys
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _EchoOrRedirect)
+    srv.mode = mode  # type: ignore[attr-defined]
+    srv.seen = []  # type: ignore[attr-defined]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        _eth_swap(case)
+        url = _keyed_url(srv)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pyrxd.cli",
+                "--debug",
+                "swap",
+                "recover-preimage",
+                "--swap-file",
+                str(case["keys"]),
+                "--eth-contract",
+                ETH_CONTRACT,
+                "--eth-rpc-url",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            timeout=60,
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    out = proc.stdout + proc.stderr
+    # Non-vacuity: the keyed URL was really requested, and a traceback really was printed.
+    assert any(FAKE_PATH_SECRET in p for p in srv.seen), srv.seen  # type: ignore[attr-defined]
+    assert "Traceback (most recent call last)" in out, out
+    if mode == "redirect":
+        assert any("hop=1" in p for p in srv.seen), srv.seen  # type: ignore[attr-defined]
+    for secret in SECRETS:
+        assert secret not in out, (secret, out)
+    assert "127.0.0.1" in out  # the host is still named

@@ -39,22 +39,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   set. Such a contract cannot pay out: `claim()` and `refund()` both revert `AlreadySettled`.
   `verify_funded` now reads slot `SETTLED_SLOT` at the same pinned block as its other reads and
   refuses a non-zero word. `claim` re-reads it at the tip before building the transaction and
-  raises `PreRevealAbort` if it is set, so nothing is sent, on the private path too. The slot is
+  raises `PreRevealExpired` if it is set (a `PreRevealAbort`, so the preimage is kept, but not
+  retryable: the flag is never cleared), so nothing is sent, on the private path too. The slot is
   derived per PR from the vendored runtimes' bytecode, and the nightly Anvil job checks it by
   execution.
 - **A keyed `--eth-rpc-url` no longer leaks into error text, watchtower pages or logs.**
   aiohttp's error for a 429 or 5xx quotes the full request URL, so a key in the URL path
   (`https://host/v3/<KEY>`) went through `EthRpc`'s `NetworkError` into the watchtower's
   CRITICAL page, its webhook and its `logger.exception` traceback. #819 redacted the watchtower's
-  startup line and `MultiSourceEthRpc`'s quorum errors, but not this path. Two things fix it:
-  - `EthRpc` now uses a provider that redacts transport failures. This also covers contract reads
-    that go through `rpc.w3` directly. An exception whose chain quotes a secret is replaced by a
-    redacted `NetworkError` with the chain cut. Other exceptions are re-raised unchanged.
+  startup line and `MultiSourceEthRpc`'s quorum errors, but not this path. The fix:
+  - `EthRpc` now uses a provider that redacts transport failures. An exception whose chain quotes
+    a secret is replaced by a redacted `NetworkError` with the chain cut; other exceptions are
+    re-raised unchanged.
+  - The same provider redacts the strings in a JSON-RPC `error` object before web3 raises from
+    it, so an endpoint that echoes the request path in its error body does not put the key into
+    `Web3RPCError`.
+  - Both apply to every request the provider sends, including contract reads that go through
+    `rpc.w3` directly.
   - Every `EthRpc` error is built through one redacting helper.
 
   The provider's own log lines are redacted too. These include the INFO-level "Successfully
   disconnected from: <url>" written on `close()`. Not covered: web3's HTTP session manager logs the
   URI at DEBUG level, and the watchtower runs at INFO.
+- **`--debug` tracebacks no longer print an endpoint's credentials.** `CliError.show` printed
+  the wrapped library exception's traceback as written, and aiohttp's quotes the request URL — so
+  `pyrxd --debug swap recover-preimage --eth-rpc-url <keyed>` printed the key on a 401 whose
+  response repeats the path, or after a redirect. Every command's `--debug` traceback now goes
+  through the whole-token redactor, with the URLs on the command line and in `PYRXD_*` variables.
+  Not covered: a URL that appears only in the config file.
 - **An ETH leg refuses to sign for a chain other than the one its rpc is pinned to.**
   `assert_chain` checks the endpoint against the rpc's own `expected_chain_id`, but nothing checked
   the leg's `chain_id` against that id, so a leg and an rpc built with different ids could sign for
