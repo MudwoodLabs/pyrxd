@@ -494,7 +494,7 @@ The values a second implementation should know about:
 | **ETH finalization window floor** | **768 s** (2 post-Merge epochs) | **not a knob** | `swap_coordinator.py:238, 510-515` |
 | `min_ref_confirmations` | 6 | policy | `swap_coordinator.py:1524` |
 | `min_credential_confirmations` | 6 | policy | `swap_coordinator.py:1551` |
-| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:850` |
+| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:851` |
 | `maker_stall_safety_window_blocks` (`N`) | 6 | policy | `swap_coordinator.py:1520` |
 
 The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1307-1462`), returns

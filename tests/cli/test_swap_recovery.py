@@ -554,14 +554,25 @@ def test_covenant_chain_state_refuses_impossible_depth_triples() -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_covenant_chain_state_refuses_an_ambiguous_covenant() -> None:
+async def test_read_covenant_chain_state_selects_rather_than_refusing_a_second_output() -> None:
+    """Two outputs at the covenant script: the earliest-confirmed is the covenant, never a refusal.
+
+    The covenant script is a pure function of public terms, so more than one output can sit at it.
+    The rule is ``find_covenant_utxo``'s (``earliest_confirmed_key``): here a same-height tie,
+    broken on txid."""
     sh = sr.electrumx_script_hash(COV_SPK)
     utxos = [
-        UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=1, height=100),
         UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=2, height=100),
+        UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=1, height=100),
     ]
-    with pytest.raises(ValidationError, match="cannot resolve a single covenant"):
-        await sr.read_covenant_chain_state(_NoBroadcastClient({sh: utxos}, tip=105), COV_SPK)
+    state = await sr.read_covenant_chain_state(_NoBroadcastClient({sh: utxos}, tip=105), COV_SPK)
+    assert state.outpoint == "ab" * 32 + ":0"
+    assert state.carrier_value == 1
+    assert state.ignored_outputs == 1
+    pinned = await sr.read_covenant_chain_state(
+        _NoBroadcastClient({sh: utxos}, tip=105), COV_SPK, pin_outpoint="cd" * 32 + ":0"
+    )
+    assert pinned.outpoint == "cd" * 32 + ":0" and pinned.identified_by == "pinned"
 
 
 # --------------------------------------------------------------------------- fee selection
@@ -994,7 +1005,9 @@ async def test_counter_leg_reports_a_malformed_outpoint_as_error_not_a_crash() -
 async def test_btc_counter_leg_detects_the_claim_but_withholds_p(monkeypatch) -> None:
     raw = _claim_tx()
     spender = btc_txid_from_raw(raw)
-    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=(True, spender, raw)), raising=True)
+    monkeypatch.setattr(
+        sr, "fetch_btc_claim_bytes", AsyncMock(return_value=sr.BtcSpendRead(True, spender, raw, True)), raising=True
+    )
     status = await sr.read_btc_counter_leg(MagicMock(), "https://x", funding_outpoint=OUR_FUNDING, hashlock=H)
     assert status.state == "CLAIMED_PREIMAGE_REVEALED"
     assert status.preimage_available is True
@@ -1005,23 +1018,31 @@ async def test_btc_counter_leg_detects_the_claim_but_withholds_p(monkeypatch) ->
 
 @pytest.mark.asyncio
 async def test_btc_counter_leg_states_for_unspent_refund_and_bad_provenance(monkeypatch) -> None:
-    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=(False, None, None)))
+    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=sr.BtcSpendRead(False, None, None)))
     unspent = await sr.read_btc_counter_leg(MagicMock(), "https://x", funding_outpoint=OUR_FUNDING, hashlock=H)
     assert unspent.state == "LOCKED"
 
     refund = _refund_tx()
-    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=(True, btc_txid_from_raw(refund), refund)))
+    confirmed = sr.BtcSpendRead(True, btc_txid_from_raw(refund), refund, True)
+    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=confirmed))
     spent = await sr.read_btc_counter_leg(MagicMock(), "https://x", funding_outpoint=OUR_FUNDING, hashlock=H)
     assert spent.state == "SPENT_NO_PREIMAGE"
 
+    # The same refund still in the mempool: a claim with p can replace it, so it is not a finished leg.
+    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=confirmed._replace(confirmed=False)))
+    pending = await sr.read_btc_counter_leg(MagicMock(), "https://x", funding_outpoint=OUR_FUNDING, hashlock=H)
+    assert pending.state == "REFUND_REPORTED_UNCONFIRMED"
+
     foreign = _claim_tx(outpoint=FOREIGN_FUNDING)
     monkeypatch.setattr(
-        sr, "fetch_btc_claim_bytes", AsyncMock(return_value=(True, btc_txid_from_raw(foreign), foreign))
+        sr,
+        "fetch_btc_claim_bytes",
+        AsyncMock(return_value=sr.BtcSpendRead(True, btc_txid_from_raw(foreign), foreign, True)),
     )
     bad = await sr.read_btc_counter_leg(MagicMock(), "https://x", funding_outpoint=OUR_FUNDING, hashlock=H)
     assert bad.state == "ERROR"
 
-    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=(True, "cc" * 32, None)))
+    monkeypatch.setattr(sr, "fetch_btc_claim_bytes", AsyncMock(return_value=sr.BtcSpendRead(True, "cc" * 32, None)))
     unfetchable = await sr.read_btc_counter_leg(MagicMock(), "https://x", funding_outpoint=OUR_FUNDING, hashlock=H)
     assert unfetchable.state == "ERROR"
 
@@ -1344,12 +1365,12 @@ async def test_fetch_btc_claim_bytes_reuses_the_watchtower_esplora_gets(monkeypa
 
     raw = _claim_tx()
     spender = btc_txid_from_raw(raw)
-    monkeypatch.setattr(adapters, "mempool_space_outspend", AsyncMock(return_value=(True, spender)))
+    monkeypatch.setattr(adapters, "mempool_space_outspend_status", AsyncMock(return_value=(True, spender, True)))
     monkeypatch.setattr(adapters, "mempool_space_tx_hex", AsyncMock(return_value=raw))
-    assert await sr.fetch_btc_claim_bytes(MagicMock(), "https://x", OUR_FUNDING) == (True, spender, raw)
+    assert await sr.fetch_btc_claim_bytes(MagicMock(), "https://x", OUR_FUNDING) == (True, spender, raw, True)
 
-    monkeypatch.setattr(adapters, "mempool_space_outspend", AsyncMock(return_value=(False, None)))
-    assert await sr.fetch_btc_claim_bytes(MagicMock(), "https://x", OUR_FUNDING) == (False, None, None)
+    monkeypatch.setattr(adapters, "mempool_space_outspend_status", AsyncMock(return_value=(False, None, False)))
+    assert await sr.fetch_btc_claim_bytes(MagicMock(), "https://x", OUR_FUNDING) == (False, None, None, False)
 
 
 @pytest.mark.asyncio

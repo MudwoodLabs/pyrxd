@@ -1710,6 +1710,11 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             covenant_outpoint=rec.radiant_covenant_outpoint,
         )
         print(f"  -> {rec.state.value}")
+        # PERSIST the covenant's funding outpoint now that the coordinator has pinned it. The covenant
+        # script is a pure function of public terms, so anyone can pay it: this outpoint is what tells
+        # THE covenant from those payments for `pyrxd swap status` / `build-claim` / `build-refund`.
+        if rec.radiant_covenant_outpoint:
+            merge_into_mode_600(keys_path, {"rxd_covenant_outpoint": rec.radiant_covenant_outpoint})
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after the timeout")
 

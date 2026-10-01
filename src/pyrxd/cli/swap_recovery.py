@@ -83,7 +83,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from pyrxd.base58 import base58check_decode
@@ -96,6 +96,7 @@ from pyrxd.btc_wallet.taproot import (
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE as MAX_FEE_OVERPAY_MULTIPLE  # re-export
 from pyrxd.fee_sizing import fee_overpay_ceiling, fee_overpay_multiple
+from pyrxd.gravity.covenant_selection import earliest_confirmed_key
 from pyrxd.gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
@@ -126,16 +127,20 @@ _TIP_REREAD_ATTEMPTS = 2
 
 __all__ = [
     "ETH_READ_ONLY_RPC_METHODS",
+    "BtcSpendRead",
     "ColdSpend",
     "CounterLegInconclusive",
     "CounterLegStatus",
     "CovenantChainState",
+    "CovenantFunding",
     "CovenantSpend",
+    "CovenantUnidentified",
     "PreimageNotRevealed",
     "PreimageRecovery",
     "ProvenanceRefused",
     "RecoveryExtras",
     "RefundReportedUnconfirmed",
+    "SpentWithoutPreimage",
     "VerifiedEthTx",
     "WrongEthChain",
     "assert_covenant_matches",
@@ -151,6 +156,7 @@ __all__ = [
     "fee_scriptpubkey",
     "fetch_btc_claim_bytes",
     "fetch_eth_claim_artifacts",
+    "locate_covenant_funding",
     "not_checked",
     "parse_outpoint",
     "parse_recovery_extras",
@@ -186,6 +192,15 @@ class PreimageNotRevealed(ValidationError):
 
     The benign, expected case: a refund spend of our funding outpoint (the counterparty
     timed out rather than claiming), or a claim that has not happened yet.
+    """
+
+
+class SpentWithoutPreimage(PreimageNotRevealed):
+    """The funding outpoint IS spent, by a transaction of ours that reveals no ``p`` — a refund.
+
+    A :class:`PreimageNotRevealed` (callers that only ask "did we get p?" keep working), but not
+    the "not yet" kind: no preimage will ever appear on an outpoint that is already spent, so
+    "keep watching" is the wrong advice for it. ``recover-preimage`` says so.
     """
 
 
@@ -265,6 +280,10 @@ class RecoveryExtras:
     rxd_covenant_amount: int | None = None
     taker_rxd_pkh_hex: str | None = None
     maker_rxd_pkh_hex: str | None = None
+    #: The covenant's funding outpoint ``txid:vout``, as the harness pinned it
+    #: (``SwapRecord.radiant_covenant_outpoint``). The covenant script is a pure function of
+    #: public terms, so anyone can pay it; this is what tells THE covenant from those payments.
+    rxd_covenant_outpoint: str | None = None
 
 
 def _opt_str(d: dict[str, Any], key: str) -> str | None:
@@ -569,7 +588,23 @@ def parse_recovery_extras(path: Path) -> RecoveryExtras:
         rxd_covenant_amount=_opt_int(d, "rxd_covenant_amount"),
         taker_rxd_pkh_hex=_opt_str(d, "taker_rxd_pkh"),
         maker_rxd_pkh_hex=_opt_str(d, "maker_rxd_pkh"),
+        rxd_covenant_outpoint=_opt_str(d, "rxd_covenant_outpoint"),
     )
+
+
+def recorded_covenant_value(asset_variant: str, extras: RecoveryExtras) -> int | None:
+    """The covenant output's value as the recovery file records it, or ``None`` when it does not.
+
+    ``rxd_covenant_amount`` for every variant; for an ``ft`` file written before that field, the
+    ``asset_ft_amount``. Both are the covenant's funded output value: for rxd and nft the amount
+    parameter is the carrier value, and for ft 1 photon = 1 token unit on Radiant
+    (:data:`pyrxd.security.units.TokenUnits`), so the output carrying the token amount has that value.
+    """
+    if extras.rxd_covenant_amount is not None:
+        return int(extras.rxd_covenant_amount)
+    if asset_variant == "ft" and extras.asset_ft_amount is not None:
+        return int(extras.asset_ft_amount)
+    return None
 
 
 def _pkh_from_wif(wif: str) -> bytes:
@@ -732,7 +767,7 @@ def recover_preimage_from_btc_claim(
     try:
         p = scrape_secret(raw, bytes(hashlock))
     except (ValidationError, ValueError) as exc:
-        raise PreimageNotRevealed(
+        raise SpentWithoutPreimage(
             f"transaction {derived} spends our funding outpoint but reveals no preimage "
             "(this is what a REFUND looks like — the counterparty timed out rather than claiming)"
         ) from exc
@@ -1221,8 +1256,9 @@ class CounterLegStatus:
     chain: str  # "btc" | "eth"
     # NOT_CHECKED | LOCKED | CLAIMED_PREIMAGE_REVEALED | SPENT_NO_PREIMAGE | REFUND_REPORTED_UNCONFIRMED
     # | UNKNOWN | ERROR. REFUND_REPORTED_UNCONFIRMED (ETH): what EVERY refund report from one RPC is —
-    # one server's word, whatever transaction bytes came with it. NOT resolved; swap status treats it
-    # like UNKNOWN for every decision. SPENT_NO_PREIMAGE is never produced for ETH.
+    # one server's word, whatever transaction bytes came with it. (BTC): a refund the Esplora reports
+    # NOT confirmed, which a claim with p can still replace. NOT resolved on either chain; swap status
+    # never reads it as a finished leg. SPENT_NO_PREIMAGE is never produced for ETH.
     state: str
     reason: str
     claim_txid: str | None = None
@@ -1315,22 +1351,35 @@ def describe_network_error(exc: BaseException, url: str | None = None, *, scrub:
     return text
 
 
+class BtcSpendRead(NamedTuple):
+    """What one Esplora says about a BTC funding outpoint (:func:`fetch_btc_claim_bytes`)."""
+
+    spent: bool
+    spender: str | None
+    raw: bytes | None
+    #: The server reports the spend CONFIRMED (``status.confirmed``). ``False`` for a mempool
+    #: spend and for an answer that does not say — a refund in the mempool can still be replaced
+    #: by a claim, so nothing may treat it as final.
+    confirmed: bool = False
+
+
 async def fetch_btc_claim_bytes(
     session: Any, base_url: str, funding_outpoint: BtcOutpoint, *, timeout_s: float = 15.0
-) -> tuple[bool, str | None, bytes | None]:
-    """Esplora GET pair: ``(spent, spender_txid, raw_bytes)`` for a funding outpoint.
+) -> BtcSpendRead:
+    """Esplora GET pair: ``(spent, spender_txid, raw_bytes, confirmed)`` for a funding outpoint.
 
     Three shapes, and callers must tell all three apart:
 
-    * ``(False, None, None)`` — the server says UNSPENT.
-    * ``(True, None, None)`` — the server says SPENT but gave no well-formed spending
+    * ``(False, None, None, False)`` — the server says UNSPENT.
+    * ``(True, None, None, _)`` — the server says SPENT but gave no well-formed spending
       txid. The spend exists and cannot be fetched or verified. This is NOT unspent: it
       used to be returned as ``(False, None, None)``, so an explorer answering
       ``{"spent": true}`` with the txid missing or malformed made both ``swap status``
       and ``recover-preimage`` report the counterparty had not claimed — the one
       answer that tells a taker to keep waiting while ``p`` may already be public.
-    * ``(True, txid, raw_or_None)`` — spent by ``txid``; ``raw`` is ``None`` when the
-      bytes are not retrievable yet.
+    * ``(True, txid, raw_or_None, confirmed)`` — spent by ``txid``; ``raw`` is ``None`` when
+      the bytes are not retrievable yet; ``confirmed`` is the server's word on whether that
+      spend is in a block.
 
     Reuses the watchtower's proven keyless read helpers rather than re-implementing
     them. They are imported lazily: ``pyrxd.gravity.watch``'s package ``__init__``
@@ -1338,17 +1387,17 @@ async def fetch_btc_claim_bytes(
     ``sys.modules``, and the CLI must not pay that on every invocation just to own a
     command it may not run.
     """
-    from pyrxd.gravity.watch.adapters import mempool_space_outspend, mempool_space_tx_hex
+    from pyrxd.gravity.watch.adapters import mempool_space_outspend_status, mempool_space_tx_hex
 
-    spent, spender = await mempool_space_outspend(
+    spent, spender, confirmed = await mempool_space_outspend_status(
         session, base_url, funding_outpoint.txid, funding_outpoint.vout, timeout_s=timeout_s
     )
     if not spent:
-        return False, None, None
+        return BtcSpendRead(False, None, None)
     if not spender:
-        return True, None, None
+        return BtcSpendRead(True, None, None, confirmed)
     raw = await mempool_space_tx_hex(session, base_url, spender, timeout_s=timeout_s)
-    return True, spender, raw
+    return BtcSpendRead(True, spender, raw, confirmed)
 
 
 def spent_spender_unknown_reason(source: str, funding_outpoint: BtcOutpoint) -> str:
@@ -1364,8 +1413,17 @@ def spent_spender_unknown_reason(source: str, funding_outpoint: BtcOutpoint) -> 
 async def read_btc_counter_leg(
     session: Any, base_url: str, *, funding_outpoint: BtcOutpoint, hashlock: bytes, timeout_s: float = 15.0
 ) -> CounterLegStatus:
-    """Classify the BTC counter-leg through the SAME provenance-checked path as recovery."""
-    spent, spender, raw = await fetch_btc_claim_bytes(session, base_url, funding_outpoint, timeout_s=timeout_s)
+    """Classify the BTC counter-leg through the SAME provenance-checked path as recovery.
+
+    A spend that reveals no ``p`` (a refund) is ``SPENT_NO_PREIMAGE`` only when the server reports
+    it CONFIRMED. In the mempool it is ``REFUND_REPORTED_UNCONFIRMED``: the HTLC's claim branch has
+    no timelock, so whoever holds ``p`` can still replace an unconfirmed refund with a claim, and
+    ``swap status`` must not call the leg finished. Either way the verdict is one server's word,
+    and says so.
+    """
+    spent, spender, raw, confirmed = await fetch_btc_claim_bytes(
+        session, base_url, funding_outpoint, timeout_s=timeout_s
+    )
     source = endpoint_source_label(base_url)
     if not spent:
         return CounterLegStatus(
@@ -1395,8 +1453,25 @@ async def read_btc_counter_leg(
             raw, hashlock=hashlock, funding_outpoint=funding_outpoint, reported_txid=spender
         )
     except PreimageNotRevealed as exc:
+        if not confirmed:
+            return CounterLegStatus(
+                chain="btc",
+                state="REFUND_REPORTED_UNCONFIRMED",
+                # Short enough for the status row's 400-character cut to keep the advice at its end.
+                reason=(
+                    f"transaction {spender} spends our funding outpoint and reveals no preimage (a refund). "
+                    f"{source} reports it NOT CONFIRMED: until it confirms, a claim with p can still replace "
+                    "it. One server's answer — check another explorer or your own node."
+                ),
+                claim_txid=spender,
+                source=source,
+            )
         return CounterLegStatus(
-            chain="btc", state="SPENT_NO_PREIMAGE", reason=str(exc), claim_txid=spender, source=source
+            chain="btc",
+            state="SPENT_NO_PREIMAGE",
+            reason=f"{exc}. {source} reports it confirmed — one server's answer, not a verified fact.",
+            claim_txid=spender,
+            source=source,
         )
     except ProvenanceRefused as exc:
         return CounterLegStatus(chain="btc", state="ERROR", reason=str(exc), claim_txid=spender, source=source)
@@ -1777,15 +1852,255 @@ def classify_covenant_spend_input(unlocking: bytes, *, hashlock: bytes | None) -
     return None
 
 
+class CovenantUnidentified(ValidationError):
+    """No output at the covenant script can be shown to be THIS swap's covenant, so none is named.
+
+    Raised by :func:`locate_covenant_funding` instead of guessing. The remedy is always the same:
+    name the funding outpoint — ``--covenant-outpoint TXID:VOUT``, or the recovery file's
+    ``rxd_covenant_outpoint``.
+    """
+
+
+@dataclass(frozen=True)
+class CovenantFunding:
+    """THE swap's covenant output, identified by provenance — never "any output at the covenant script".
+
+    The covenant scriptPubKey is a pure function of the swap's PUBLIC terms, so other outputs can
+    sit at it. This names one output as the covenant and says how it was chosen; every verdict
+    about the covenant is about that output alone.
+
+    ``state`` is ``live`` (the output is in the script's UTXO set), ``spent`` (it was created and
+    is not), or ``absent`` (no payment to the script was found — ``outpoint`` is the pin when one
+    was given, else ``None``). A ``spent`` covenant has ``outpoint=None`` only when the script's
+    history exists but no transaction in it that could be read pays the script: the history is
+    incomplete, and which output was the covenant cannot be named.
+
+    ``identified_by`` is ``pinned`` (the recovery file's ``rxd_covenant_outpoint`` or
+    ``--covenant-outpoint``) or ``earliest-confirmed``
+    (:func:`pyrxd.gravity.covenant_selection.earliest_confirmed_key`, the ordering the automated
+    leg's ``find_covenant_utxo`` applies). ``ignored_outputs`` counts the OTHER live outputs at the
+    script, which were not taken as the covenant and change nothing here.
+    """
+
+    state: str  # "live" | "spent" | "absent"
+    outpoint: str | None
+    value: int | None
+    height: int | None  # the block height the covenant was mined at; None when unconfirmed / unknown
+    identified_by: str  # "pinned" | "earliest-confirmed"
+    ignored_outputs: int
+    tip_height: int
+    history: tuple[dict[str, Any], ...] = ()
+
+
+def _history_entries(history: Any) -> tuple[dict[str, Any], ...]:
+    return tuple(e for e in (history or ()) if isinstance(e, dict) and isinstance(e.get("tx_hash"), str))
+
+
+def _entry_height(entry: dict[str, Any]) -> int:
+    """A history entry's block height; ``0`` for an unconfirmed one (ElectrumX reports 0 or -1)."""
+    h = entry.get("height")
+    return h if isinstance(h, int) and not isinstance(h, bool) and h > 0 else 0
+
+
+def _list_outpoints(outputs: dict[tuple[str, int], Any], limit: int = 3) -> str:
+    names = sorted(f"{txid}:{vout}" for txid, vout in outputs)
+    more = f", and {len(names) - limit} more" if len(names) > limit else ""
+    return ", ".join(names[:limit]) + more
+
+
+def _pays(output: Any, spk: bytes) -> bool:
+    return output.locking_script is not None and output.locking_script.serialize() == spk
+
+
+async def _fetch_tx(client: Any, txid: str) -> Transaction:
+    """One covenant-history transaction, believed only if its bytes re-derive to ``txid``."""
+    raw = await client.get_transaction(txid)
+    tx = Transaction.from_hex(bytes(raw)) if isinstance(raw, (bytes, bytearray)) else None
+    if tx is None or tx.txid() != txid:
+        raise CovenantUnidentified(
+            f"the server's bytes for covenant history transaction {txid} do not parse to that txid"
+        )
+    return tx
+
+
+async def locate_covenant_funding(
+    client: Any,
+    spk_hex: str,
+    *,
+    pin_outpoint: str | None = None,
+    expected_value: int | None = None,
+) -> CovenantFunding:
+    """Find THE covenant output for ``spk_hex`` and whether it is still live. Read-only.
+
+    A ``pin_outpoint`` selects. Otherwise candidates are ordered by
+    :func:`~pyrxd.gravity.covenant_selection.earliest_confirmed_key` — the ordering
+    :meth:`pyrxd.gravity.radiant_leg.RadiantChainIO.find_covenant_utxo` uses — over outputs paying
+    the script (of ``expected_value``, when given). Unlike that method this one also sees outputs
+    that are already SPENT, through the script's history, because it answers a question that
+    method does not: whether THIS swap's covenant is still live.
+
+    It names an output only when the answer does not depend on a guess:
+
+    * the earliest candidate is LIVE: it is the covenant (later outputs are reported, not taken);
+    * the earliest candidate is SPENT and no candidate is live: the covenant is spent;
+    * the earliest candidate is SPENT and a later candidate is LIVE: either could be this swap's,
+      so :class:`CovenantUnidentified` names both and asks for ``--covenant-outpoint``.
+
+    Only the history entries that sort BEFORE the earliest live candidate are fetched (none, for
+    an honest swap whose covenant is still live), each believed only if its bytes re-derive to
+    its txid. If those entries cannot be read, the covenant is not named
+    (:class:`CovenantUnidentified`) rather than guessed — unless nothing at the script is live,
+    in which case it is reported ``spent`` with ``outpoint=None``, the conservative answer.
+
+    A pin that is neither live nor in the script's history is ``absent`` when nothing else is
+    live there, and :class:`CovenantUnidentified` when something is: that output is listed, and
+    nothing is claimed about it.
+    """
+    spk = bytes.fromhex(spk_hex)
+    sh = electrumx_script_hash(spk_hex)
+    utxos = list(await client.get_utxos(sh))
+    tip = int(await client.get_tip_height())
+    live = {(str(u.tx_hash), int(u.tx_pos)): u for u in utxos}
+
+    def value_ok(v: int) -> bool:
+        return expected_value is None or int(v) == int(expected_value)
+
+    if pin_outpoint is not None:
+        op = parse_outpoint(pin_outpoint, what="the covenant outpoint")
+        pinned = f"{op.txid}:{op.vout}"
+        u = live.get((op.txid, op.vout))
+        if u is not None:
+            if not value_ok(int(u.value)):
+                raise CovenantUnidentified(
+                    f"the pinned covenant outpoint {pinned} holds {int(u.value)} photons, not the covenant amount "
+                    f"{expected_value}; the pin or the amount is wrong"
+                )
+            h = int(u.height)
+            return CovenantFunding("live", pinned, int(u.value), h if h > 0 else None, "pinned", len(utxos) - 1, tip)
+        history = _history_entries(await client.get_history(sh))
+        entry = next((e for e in history if e["tx_hash"] == op.txid), None)
+        if entry is None:
+            if live:
+                raise CovenantUnidentified(
+                    f"the pinned covenant outpoint {pinned} was not found: it is neither live at the covenant "
+                    f"script nor in the script's history. {len(utxos)} output(s) are live at the script "
+                    f"({_list_outpoints(live)}); nothing is assumed about them. Check the pinned outpoint."
+                )
+            return CovenantFunding("absent", pinned, None, None, "pinned", len(utxos), tip, history)
+        tx = await _fetch_tx(client, op.txid)
+        if op.vout >= len(tx.outputs) or not _pays(tx.outputs[op.vout], spk):
+            raise CovenantUnidentified(
+                f"the pinned covenant outpoint {pinned} does not pay this swap's covenant script; the pin is wrong"
+            )
+        value = int(tx.outputs[op.vout].satoshis)
+        if not value_ok(value):
+            raise CovenantUnidentified(
+                f"the pinned covenant outpoint {pinned} held {value} photons, not the covenant amount "
+                f"{expected_value}; the pin or the amount is wrong"
+            )
+        h = _entry_height(entry)
+        return CovenantFunding("spent", pinned, value, h or None, "pinned", len(utxos), tip, history)
+
+    raw_history = await client.get_history(sh)
+    history = _history_entries(raw_history)
+    best: tuple[tuple[int, str, int], int, int] | None = None  # (key, value, height)
+    for (txid, vout), u in live.items():
+        if value_ok(int(u.value)):
+            key = earliest_confirmed_key(int(u.height), txid, vout)
+            if best is None or key < best[0]:
+                best = (key, int(u.value), int(u.height))
+    unreadable: str | None = None
+    ordered = sorted(history, key=lambda e: earliest_confirmed_key(_entry_height(e), e["tx_hash"], 0))
+    # Every pass of this loop either stops or fetches, so the index IS the count already fetched.
+    for fetched, e in enumerate(ordered):
+        ekey = earliest_confirmed_key(_entry_height(e), e["tx_hash"], 0)
+        if best is not None and ekey[:2] >= best[0][:2]:
+            break  # sorted: nothing from here on can be earlier, and the best's own tx needs no fetch
+        if fetched >= MAX_COVENANT_HISTORY:
+            unreadable = (
+                f"more than {MAX_COVENANT_HISTORY} transactions in the covenant script's history would have to be "
+                "read to find its funding"
+            )
+            break
+        try:
+            tx = await _fetch_tx(client, e["tx_hash"])
+        except CovenantUnidentified as exc:
+            unreadable = str(exc)
+            break
+        except Exception as exc:  # a server that will not serve the bytes: named by type, never by text
+            unreadable = f"covenant history transaction {e['tx_hash']} could not be read ({type(exc).__name__})"
+            break
+        hit = next((i for i, out in enumerate(tx.outputs) if _pays(out, spk) and value_ok(int(out.satoshis))), None)
+        if hit is not None:
+            best = (
+                earliest_confirmed_key(_entry_height(e), e["tx_hash"], hit),
+                int(tx.outputs[hit].satoshis),
+                _entry_height(e),
+            )
+            break  # sorted: this is the earliest payment there is
+    name_it = "Name the covenant's funding outpoint with --covenant-outpoint TXID:VOUT."
+    if unreadable is not None and live:
+        raise CovenantUnidentified(
+            f"{unreadable}, so whether an earlier, already-spent output was this swap's covenant cannot be "
+            f"ruled out; {len(utxos)} output(s) at the script are live. {name_it}"
+        )
+    if best is None:
+        if live:
+            raise CovenantUnidentified(
+                f"{len(utxos)} live output(s) pay the covenant script, but none carries the covenant amount "
+                f"{expected_value} photons. {name_it}"
+            )
+        # Any history at all — even entries this reader cannot use — means the script was used.
+        return CovenantFunding(
+            "spent" if raw_history else "absent", None, None, None, "earliest-confirmed", 0, tip, history
+        )
+    key, value, height = best
+    _hkey, txid, vout = key
+    is_live = (txid, vout) in live
+    live_candidates = {op: u for op, u in live.items() if value_ok(int(u.value))}
+    if not is_live and live_candidates:
+        # The earliest candidate is spent and a later one is live. Either could be this swap's
+        # covenant (the script and, where recorded, the amount are the same for both), and which
+        # one it is decides "spent" against "live" — so neither is named.
+        what = f"the covenant amount {expected_value} photons" if expected_value is not None else "no amount recorded"
+        raise CovenantUnidentified(
+            f"outputs at the covenant script ({what}) include an earlier, SPENT one ({txid}:{vout}) and "
+            f"{len(live_candidates)} later, LIVE one(s) ({_list_outpoints(live_candidates)}); which is this "
+            f"swap's covenant cannot be told from the chain. {name_it}"
+        )
+    return CovenantFunding(
+        "live" if is_live else "spent",
+        f"{txid}:{vout}",
+        value,
+        height if height > 0 else None,
+        "earliest-confirmed",
+        len(utxos) - (1 if is_live else 0),
+        tip,
+        history,
+    )
+
+
 async def read_covenant_spend(
-    client: Any, spk_hex: str, history: Sequence[dict[str, Any]], *, hashlock: bytes | None
+    client: Any,
+    spk_hex: str,
+    history: Sequence[dict[str, Any]],
+    *,
+    hashlock: bytes | None,
+    outpoint: str | None = None,
+    funding_height: int | None = None,
+    t_rxd_blocks: int | None = None,
 ) -> CovenantSpend:
     """Find the transaction that spent the covenant and say which branch it took. Read-only.
 
     Fetches each transaction in the covenant script's history (``get_transaction``), re-derives
     its txid from the bytes (a server serving the wrong transaction is not believed), finds the
-    covenant output(s) the funding transaction created, and classifies the input that spends one.
-    Anything it cannot establish is ``UNKNOWN`` with the reason — never a guess.
+    covenant output — ``outpoint`` when :func:`locate_covenant_funding` named it, otherwise every
+    output the history pays to the script — and classifies the input that spends it. Anything it
+    cannot establish is ``UNKNOWN`` with the reason — never a guess.
+
+    A REFUND reported mined below ``funding_height + t_rxd_blocks`` is ``UNKNOWN`` too: the
+    refund branch is a BIP68 relative lock and is invalid before that height, so a server
+    reporting one there is reporting something the chain cannot contain.
     """
     spk = bytes.fromhex(spk_hex)
     entries = [e for e in history if isinstance(e, dict) and isinstance(e.get("tx_hash"), str)]
@@ -1808,12 +2123,11 @@ async def read_covenant_spend(
             )
         height = e.get("height")
         txs[txid] = (tx, height if isinstance(height, int) and height > 0 else None)
-    funded = {
-        (txid, i)
-        for txid, (tx, _) in txs.items()
-        for i, out in enumerate(tx.outputs)
-        if out.locking_script is not None and out.locking_script.serialize() == spk
-    }
+    if outpoint is not None:
+        op = parse_outpoint(outpoint, what="the covenant outpoint")
+        funded = {(op.txid, op.vout)}
+    else:
+        funded = {(txid, i) for txid, (tx, _) in txs.items() for i, out in enumerate(tx.outputs) if _pays(out, spk)}
     kinds: set[str] = set()
     spender: tuple[str, int | None] | None = None
     for txid, (tx, height) in txs.items():
@@ -1842,6 +2156,22 @@ async def read_covenant_spend(
         return CovenantSpend("UNKNOWN", "the covenant was spent through BOTH branches (more than one funding)")
     txid, height = spender
     when = f"at height {height}" if height is not None else "UNCONFIRMED"
+    if (
+        kinds == {"refund"}
+        and height is not None
+        and funding_height is not None
+        and t_rxd_blocks is not None
+        and height < funding_height + t_rxd_blocks
+    ):
+        return CovenantSpend(
+            "UNKNOWN",
+            f"the server reports a REFUND of the covenant in {txid} at height {height}, but the covenant was "
+            f"funded at {funding_height} and its CSV refund branch cannot be mined before height "
+            f"{funding_height + t_rxd_blocks}. The report is impossible on a valid chain; read the covenant "
+            "on a second, independent ElectrumX server",
+            spend_txid=txid,
+            height=height,
+        )
     if kinds == {"claim"}:
         return CovenantSpend(
             "TAKER_CLAIM",
@@ -1910,6 +2240,11 @@ class CovenantChainState:
     #: Set only by :func:`read_covenant_chain_state` when a re-read could not reconcile
     #: a funding height above the tip. Never a value an operator should pass by hand.
     depth_unresolved: bool = False
+    #: Other live outputs at the covenant script, which were NOT taken for the covenant
+    #: (:attr:`CovenantFunding.ignored_outputs`). Reported, never spent.
+    ignored_outputs: int = 0
+    #: How the covenant output was chosen: ``pinned`` or ``earliest-confirmed``.
+    identified_by: str = "earliest-confirmed"
 
     def __post_init__(self) -> None:
         if self.tip_height < 0:
@@ -1959,13 +2294,21 @@ class CovenantChainState:
 
 
 async def read_covenant_chain_state(
-    client: Any, spk_hex: str, *, tip_reread_attempts: int = _TIP_REREAD_ATTEMPTS
+    client: Any,
+    spk_hex: str,
+    *,
+    tip_reread_attempts: int = _TIP_REREAD_ATTEMPTS,
+    pin_outpoint: str | None = None,
+    expected_value: int | None = None,
 ) -> CovenantChainState:
     """Locate the live covenant UTXO for ``spk_hex`` and measure its depth.
 
-    Refuses ambiguity rather than guessing: a covenant SPK that holds more than one
-    UTXO cannot be resolved to "the" covenant outpoint, and picking one silently could
-    build a spend of the wrong output.
+    The covenant output is identified by :func:`locate_covenant_funding` — ``pin_outpoint``
+    when the operator or the recovery file names it, otherwise the earliest-confirmed payment
+    to the script (of ``expected_value``, when known). More than one output at the script is
+    resolved by that rule, never refused: the script is a pure function of public terms. Other
+    outputs are counted (:attr:`CovenantChainState.ignored_outputs`) and left alone, and a
+    covenant that is already spent is refused as spent, whatever else is live at the script.
 
     **Two round trips, one moving chain.** ``listunspent`` and ``get_tip_height`` are
     separate calls, and :class:`~pyrxd.network.failover.FailoverElectrumXClient` picks
@@ -1979,26 +2322,35 @@ async def read_covenant_chain_state(
     still disagree is ``depth_unresolved`` set, which every consumer treats
     conservatively; see :class:`CovenantChainState`.
     """
-    sh = electrumx_script_hash(spk_hex)
-    utxos = list(await client.get_utxos(sh))
-    tip = int(await client.get_tip_height())
-    if not utxos:
-        history = await client.get_history(sh)
-        raise ValidationError(
-            "the covenant SPK holds no unspent output — "
-            + (
-                "it has chain history, so the swap already settled (claimed or refunded)."
-                if history
-                else "it was never funded, or you are pointed at the wrong network."
+    loc = await locate_covenant_funding(client, spk_hex, pin_outpoint=pin_outpoint, expected_value=expected_value)
+    tip = loc.tip_height
+    if loc.state == "absent":
+        if loc.outpoint is not None:
+            raise ValidationError(
+                f"the covenant outpoint {loc.outpoint} is neither live at the covenant script nor in its "
+                "history — check the outpoint, and that you are pointed at the right network."
             )
-        )
-    if len(utxos) > 1:
         raise ValidationError(
-            f"the covenant SPK holds {len(utxos)} unspent outputs; cannot resolve a single covenant "
-            "outpoint. Inspect them by hand before building a spend."
+            "the covenant SPK holds no unspent output — it was never funded, or you are pointed at the wrong network."
         )
-    u = utxos[0]
-    height = int(u.height) if int(u.height) > 0 else None
+    if loc.state == "spent":
+        which = f"the covenant output {loc.outpoint}" if loc.outpoint else "the covenant output"
+        if not loc.ignored_outputs:
+            others = ""
+        elif loc.identified_by == "pinned":
+            others = f" {loc.ignored_outputs} other output(s) are live at the covenant script; none is the outpoint you pinned."
+        else:
+            # Unpinned and spent with live outputs left: only reachable when none carries the recorded
+            # amount (a live candidate of that amount is refused as ambiguous by the locator).
+            others = (
+                f" {loc.ignored_outputs} other output(s) are live at the covenant script but do not carry the "
+                "recorded covenant amount, so none was taken as the covenant."
+            )
+        raise ValidationError(f"{which} is already spent, so the swap already settled (claimed or refunded).{others}")
+    if loc.outpoint is None or loc.value is None:  # pragma: no cover - a live covenant always has both
+        raise CovenantUnidentified("the live covenant output has no outpoint or value")
+    outpoint, carrier_value = loc.outpoint, loc.value
+    height = loc.height
     if height is not None and height > tip:
         for _ in range(max(0, tip_reread_attempts)):
             tip = max(tip, int(await client.get_tip_height()))
@@ -2011,26 +2363,29 @@ async def read_covenant_chain_state(
             "confirmation depth is UNKNOWN — not zero. Treating it as unresolved: this run will assume "
             "the deadline is imminent rather than assume time it has not measured. Re-run against a "
             "single, caught-up endpoint to get a real depth.",
-            u.tx_hash,
-            u.tx_pos,
+            *outpoint.split(":"),
             height,
             max(0, tip_reread_attempts),
             tip,
         )
         return CovenantChainState(
-            outpoint=f"{u.tx_hash}:{u.tx_pos}",
-            carrier_value=int(u.value),
+            outpoint=outpoint,
+            carrier_value=carrier_value,
             funding_height=height,
             tip_height=tip,
             confirmations=0,
             depth_unresolved=True,
+            ignored_outputs=loc.ignored_outputs,
+            identified_by=loc.identified_by,
         )
     return CovenantChainState(
-        outpoint=f"{u.tx_hash}:{u.tx_pos}",
-        carrier_value=int(u.value),
+        outpoint=outpoint,
+        carrier_value=carrier_value,
         funding_height=height,
         tip_height=tip,
         confirmations=(tip - height + 1) if height is not None else 0,
+        ignored_outputs=loc.ignored_outputs,
+        identified_by=loc.identified_by,
     )
 
 
