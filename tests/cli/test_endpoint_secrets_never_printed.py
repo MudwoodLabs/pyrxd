@@ -494,14 +494,15 @@ def test_recover_preimage_against_a_non_json_200_is_a_clean_network_error(tmp_pa
 
 # --------------------------------------------------------------------------- name-at-mark source labels
 
-#: The two commands whose output carries endpoint SOURCE LABELS (``binding_source``,
+#: The commands whose output carries endpoint SOURCE LABELS (``binding_source``,
 #: ``anchor_source``, ``chain.discovery_source`` / ``tip_source``, ``heights.by_source``, the
-#: anchor's ``source``, the reasons that quote them). The source-identity rules compare the raw
+#: anchor's ``source`` and ``verified_by``, the reasons that quote them). Plain ``verify`` is
+#: here too: with no ``--wave-name`` it looks the anchor up itself, under the raw label. The source-identity rules compare the raw
 #: URLs, so these labels are raw internally and must be redacted where they become output. A black
 #: hole never reaches them (the transaction fetch fails first), so these run in-process against a
 #: fake chain that ANSWERS — only the client class is replaced; the config loader, the real
 #: ``_endpoint_pair``, the judge and the command are real.
-NAME_AT_MARK_COMMANDS = ("verify", "glyph inspect --wave-name")
+NAME_AT_MARK_COMMANDS = ("verify --wave-name", "verify", "glyph inspect --wave-name")
 
 
 @pytest.mark.parametrize("command", NAME_AT_MARK_COMMANDS)
@@ -528,18 +529,20 @@ def test_name_at_mark_source_labels_never_print_the_endpoint_secrets(
     monkeypatch.setattr(failover, "FailoverElectrumXClient", factory)
     _fake_walk(monkeypatch, _address(key))
     url = _keyed("wss://only.example.invalid:50022").split("#", 1)[0]  # a WebSocket URI has no fragment
-    if command == "verify":
+    if command.startswith("verify"):
         args = ["verify", txid, "--digest", hashlib.sha256(content).hexdigest()]
     else:
         args = ["glyph", "inspect", "--fetch", txid]
+    if command.endswith("--wave-name"):
+        args += ["--wave-name", NAME]
     caplog.set_level("DEBUG")
-    r = _invoke(tmp_path, [*json_flag, "--electrumx", url, *args, "--wave-name", NAME, "--min-confirmations", "6"])
+    r = _invoke(tmp_path, [*json_flag, "--electrumx", url, *args, "--min-confirmations", "6"])
     text = r.output + caplog.text
     # Non-vacuity: the keyed endpoint was really used, and the name lookup really resolved — so the
     # source labels really were rendered (as the endpoint's host, which must still be shown).
     assert built and set(built) == {url}, built
     assert "only.example.invalid" in r.output, r.output
-    if json_flag:
+    if json_flag and command.endswith("--wave-name"):
         doc = json.loads(r.stdout)
         records = doc.get("records") or [o["hashmark"] for o in doc.get("outputs", []) if o.get("hashmark")]
         nam = records[0]["name_at_mark"]
