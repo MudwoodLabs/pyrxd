@@ -30,7 +30,7 @@ decimals live. Production's token registry is unchanged.
 
 Run it::
 
-    XCHAIN_ERC20_E2E=1 PYRXD_ETH_FORK_RPC=https://ethereum-rpc.publicnode.com \\
+    XCHAIN_ERC20_E2E=1 PYRXD_ETH_FORK_RPC=https://eth.drpc.org \\
         .venv/bin/pytest tests/test_xchain_erc20_usdc_lifecycle_e2e.py -m integration -s
 
 Or against Base, which is the corridor a Base mainnet run would actually take — and the only one
@@ -41,14 +41,30 @@ freeze and L1 USDT can::
         PYRXD_ETH_FORK_RPC=https://mainnet.base.org \\
         .venv/bin/pytest tests/test_xchain_erc20_usdc_lifecycle_e2e.py -m integration -s
 
-The Base endpoint must serve ARCHIVE reads; anvil fetches state behind the tip and a pruned node
-fails mid-swap with a Fork Error rather than at startup. Measured 2026-08-25:
-`mainnet.base.org`, `base.meowrpc.com`, `1rpc.io/base` and `base-mainnet.public.blastapi.io` serve
-them; `base-rpc.publicnode.com` answers ordinary calls but refuses archive ones ("Archive requests
-require a personal token"), so it looks healthy right up until the deploy receipt.
+THE ENDPOINT MUST SERVE HISTORICAL STATE — archive reads, on Base in practice. anvil forks at the tip
+and keeps reading state AT THE FORK BLOCK for the whole run, so the block it reads falls further
+behind the tip as the run goes on: one run (about 10 minutes) is ~50 blocks on Ethereum (12 s blocks)
+and ~300 on Base (2 s blocks). A pruned node fails mid-swap with a Fork Error rather than at startup, so it looks
+healthy right up until the deploy receipt. Measured 2026-10-01 with ``eth_getCode`` of the pinned USDC:
+``eth.drpc.org``, ``eth-mainnet.public.blastapi.io``, ``mainnet.base.org`` and
+``base-mainnet.public.blastapi.io`` served state 1024 blocks back (``base.meowrpc.com`` did too, between
+rate-limit refusals); ``ethereum-rpc.publicnode.com`` and ``base-rpc.publicnode.com`` refused reads 128
+blocks back ("Archive requests require a personal token"). publicnode's Ethereum endpoint passed an
+earlier, ~5 minute form of this suite inside that window; it is not on the nightly list, and on Base it
+cannot work at all. The nightly lane probes for exactly this before it runs
+(``.github/workflows/integration.yml``).
 
-No RPC key is needed — see `test_erc20_leg_fork_integration.py`'s header for the working endpoints
-and for why probing them from Python makes it look like one is.
+No RPC key is needed — see `test_erc20_leg_fork_integration.py`'s header for why probing endpoints
+from Python's ``urllib`` makes it look like one is (they block its user-agent; ``curl`` and anvil pass).
+
+THE POLICY IS THE RUNNER'S REAL-VALUE ONE. Every scenario takes its ``MarginPolicy``, ``t_rxd`` and
+``t_btc`` from ``scripts/eth_swap_run.py``'s own ``_args``/``_policy`` on its real token stage: MEASURED,
+a 36 s fast tail, a 3600 s ETH stall budget (``_runner_policy``). The happy path and both crash
+scenarios use the runner's 24 h default deadline (t_rxd about 2,680 blocks); the refund scenario uses
+a 4 h one (about 680) because it must mine t_rxd on regtest to mature the covenant. Regtest Radiant
+skips the value-bearing construction checks, so
+``test_runners_build_the_coordinator_first.test_the_erc20_lifecycle_e2e_terms_pass_the_mainnet_construction_checks``
+runs them, offline, on exactly these inputs.
 
 NOTE: the regtest fixture `docker rm -f`s a FIXED container name, so this cannot run beside another
 regtest suite — serialise them.
@@ -59,11 +75,13 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import pathlib
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -78,22 +96,32 @@ from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.eth_wallet.tokens import token_for
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
-from pyrxd.gravity.funding_spv import LOCAL_DEVNET_CHAIN_IDS
+from pyrxd.gravity.funding_spv import LOCAL_DEVNET_CHAIN_IDS, MEDIAN_TIME_SPAN
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
-from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
+from pyrxd.gravity.swap_coordinator import CoordinatorConfig, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import NetworkError
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
+
+# The runner inputs every scenario negotiates under (amounts, the measured 36 s fast tail, the 3600 s
+# stall floor, the maker-stall window) and the two deadlines: ONE copy, shared with the offline test
+# that runs the MAINNET construction checks on exactly these terms (regtest skips them).
+from tests.test_runners_build_the_coordinator_first import (
+    ERC20_LIFECYCLE_E2E_DEADLINES_S,
+    ERC20_LIFECYCLE_E2E_INPUTS,
+)
 from tests.test_swap_coordinator import FakeIndexer
 from tests.test_xchain_swap_regtest_e2e import (
     _FeeSource,
     _RadiantCliClient,
     _rxd_pay,
+    # The ONE canonical counter-leg derivation (scripts/_dust_swap_shared.py), re-exported by the BTC
+    # e2e, which puts scripts/ on the path — the same function scripts/eth_swap_run.py calls.
+    derive_counter_timelock,
 )
 
 pytestmark = pytest.mark.integration
@@ -315,6 +343,19 @@ def env(request, tmp_path_factory):
         node.stop()
 
 
+def _swap_dir(root: pathlib.Path, scenario: str) -> pathlib.Path:
+    """One record directory PER SWAP, as the runner keeps one ``--keys-out`` per run.
+
+    The scenarios share one module-scoped fixture, and they all wrote ``<tmp>/swap.swaprec.json``.
+    ``JsonFileRecordSink`` refuses to overwrite a record that belongs to a different swap (#504 item
+    3): it may be the only durable trace of a contract that still holds value. So the second
+    scenario was refused at its first persist — correctly. Each swap gets its own path instead.
+    """
+    d = root / scenario
+    d.mkdir()
+    return d
+
+
 class _RecordingEthLeg:
     """Captures the maker's claim tx hash on the way past.
 
@@ -356,52 +397,119 @@ class _InMemSeen:
         self._seen.add(bytes(h))
 
 
-def _policy():
-    """A dust-shaped policy: the economics gates are opt-out here, not because they do not matter
-    but because this run proves COMPOSITION, and a measured policy would gate on numbers no test
-    can measure."""
-    return MarginPolicy(
-        margin=bt.Timelock(6, bt.TimeUnit.BLOCKS),
-        block_interval_s=600.0,
-        is_measured=False,
-        # Regtest mines on demand, so a real interval is meaningless — but these two numbers
-        # DIVIDE into a block reserve (768/600 = 2 blocks), and a tiny interval would demand a
-        # ~768-block t_rxd for no reason. Kept mainnet-shaped so the arithmetic is the real one.
-        rxd_block_interval_s=600.0,
-        btc_claim_reorg_depth=bt.Timelock(2, bt.TimeUnit.BLOCKS),
-        rxd_claim_burial=bt.Timelock(2, bt.TimeUnit.BLOCKS),
-        eth_finalization_window_s=768,  # 2 post-Merge epochs; the policy enforces this floor
-        cross_clock_margin=CrossClockMargin(
-            eth_reorg_finality_s=768,
-            rxd_claim_burial_s=1800,
-            rxd_confirm_slack_s=600,
-            rounding_slack_s=300,
-        ),
-        max_covenant_confirm_wait_s=600,
-        accept_flat_burial=True,
+def _runner_policy(token, *, deadline: str = "default", t_rxd_blocks: int = 0, remaining_s: int | None = None):
+    """``(args, policy)`` from ``scripts/eth_swap_run.py`` ITSELF, on its real-value token stage.
+
+    The runner's own argument parser and its own ``_policy``: a real token counter leg on a
+    value-bearing chain (``--counter-asset usdc|usdt --eth-chain-id 1|8453``) builds a MEASURED,
+    ``require_measured`` policy, refuses without the measured fast tail and a stall budget of at
+    least 3600 s, and DERIVES ``t_rxd`` from its 24 h default deadline at that fast tail plus the taker
+    gate's modelled reserve. That is the policy and the ``t_rxd`` a real RXD<->USDC swap gets on
+    current main — about 2,680 blocks, where dividing by the nominal 300 s gives about an eighth of
+    it. Everything production-shaped is the runner's; the inputs are ``ERC20_LIFECYCLE_E2E_INPUTS``
+    (a measured fast tail, the runner-mandated stall floor, this suite's amounts) and a deadline
+    from ``ERC20_LIFECYCLE_E2E_DEADLINES_S``.
+
+    ``t_rxd_blocks`` and ``remaining_s`` are the runner's RESUME path: a resume reuses the recorded
+    ``t_rxd`` and judges the bounds against what is left of the deadline (``run_sepolia_dust``).
+    """
+    from tests.test_value_bearing_runners_pass_the_fast_tail import _load
+
+    mod = _load("eth_swap_run")
+    argv = [
+        "eth_swap_run.py",
+        "--stage",
+        "dry-run",
+        "--counter-asset",
+        token.symbol.lower(),
+        "--eth-chain-id",
+        str(_FORK_CHAIN_ID),
+        *ERC20_LIFECYCLE_E2E_INPUTS,
+        "--eth-timeout-s",
+        str(ERC20_LIFECYCLE_E2E_DEADLINES_S[deadline]),
+        "--t-rxd-blocks",
+        str(t_rxd_blocks),
+        "--keys-out",
+        "unused-by-the-parser.json",
+    ]
+    saved = sys.argv
+    try:
+        sys.argv = argv  # `_args()` parses sys.argv; restored before anything else runs
+        args = mod._args()
+    finally:
+        sys.argv = saved
+    assert mod._token_leg_is_real(args), "this must be the runner's REAL-VALUE token stage"
+    policy = mod._policy(args, remaining_s=remaining_s)
+    assert policy.is_measured and policy.require_measured, "the real-value stage builds a MEASURED policy"
+    # The shared inputs must be what this suite's assertions assume, or the offline construction test
+    # vouches for terms this suite does not run.
+    assert (args.token_amount, args.rxd_photons) == (_AMOUNT, _RXD_CARRIER)
+    return args, policy
+
+
+def _derive_terms_timelocks(url, token, deadline: str) -> tuple[bt.Timelock, bt.Timelock, int]:
+    """``(t_btc, t_rxd, eth_timeout_unix_s)`` for a fresh swap, the way ``run_sepolia_dust`` gets them.
+
+    The deadline is the runner's ``resolve_eth_timeout`` over its own default duration, on anvil's
+    clock (the clock both chains here share). ``t_rxd`` is the one ``_policy`` derived, and ``t_btc``
+    is ``derive_counter_timelock`` over the runner's inputs with the gate reserve it computed, as
+    ``_build_terms_and_covenant`` does.
+
+    The pre-#482 fixture typed ``t_rxd`` (8 or 60 blocks) and ``t_btc = t_rxd + 40``: the ordering
+    ``NegotiatedTerms`` refuses, and a Radiant refund opening hours before its deadline.
+    """
+    from tests.test_value_bearing_runners_pass_the_fast_tail import _load
+
+    args, _policy = _runner_policy(token, deadline=deadline)
+    eth_timeout = _load("eth_swap_run").resolve_eth_timeout(
+        None, now_unix_s=_now(url), eth_timeout_s=args.eth_timeout_s
     )
+    t_rxd = bt.Timelock(int(args.t_rxd_blocks), bt.TimeUnit.BLOCKS)
+    t_btc = bt.Timelock(
+        derive_counter_timelock(
+            t_rxd_blocks=t_rxd.value,
+            margin_blocks=args.margin_blocks,
+            rxd_block_interval_s=args.rxd_block_interval_s,
+            btc_block_interval_s=args.btc_block_interval_s,
+            elapsed_reserve_blocks=int(args.gate_reserve_blocks),
+        ),
+        bt.TimeUnit.BLOCKS,
+    )
+    return t_btc, t_rxd, eth_timeout
 
 
-def _build(node, url, workdir, token=None, *, t_rxd_blocks=60, seen=None, reuse=None):
+def _build(node, url, workdir, token=None, *, deadline="default", seen=None, reuse=None):
     """Covenant + BOTH real legs + the production coordinator, wired for RXD↔USDC.
 
-    ``reuse`` carries a previous build's key material and deadline so a RESTARTED process rebuilds
-    byte-identical terms. Generating fresh keys would produce a different covenant script, and the
-    resume would then verify against a covenant nobody funded — a test artefact that looks exactly
-    like the failure it is meant to detect.
+    The policy and timelocks are the runner's real-value ones (``_runner_policy``), never typed.
+
+    ``reuse`` carries a previous build's key material, timelocks and deadline so a RESTARTED process
+    rebuilds byte-identical terms. Generating fresh keys — or re-deriving ``t_rxd`` at a later
+    ``now`` — would produce a different covenant script, and the resume would then verify against a
+    covenant nobody funded: a test artefact that looks exactly like the failure it is meant to
+    detect. The runner does the same on ``--resume``: ``t_rxd`` and the deadline come from the
+    recovery file, never from the clock, and the policy is rebuilt against what is left.
     """
+    token = token or _USDC
     if reuse is None:
+        # A chain that has been producing blocks up to now. The refund scenario warps anvil's clock
+        # hours ahead; without fresh blocks the node's last 11 headers — the window the taker gate
+        # takes its median time past over — would read as a chain stalled for that long, and the
+        # gate counts that as elapsed time, as it must. A live chain does not stall between swaps.
+        node.rxd_mine(MEDIAN_TIME_SPAN)
         p_secret = SecretBytes(os.urandom(32))
         taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
-        eth_timeout = _now(url) + 50_000
+        t_btc, t_rxd, eth_timeout = _derive_terms_timelocks(url, token, deadline)
+        args, policy = _runner_policy(token, deadline=deadline)
+        assert int(args.t_rxd_blocks) == t_rxd.value
     else:
-        p_secret, taker_rxd, maker_rxd, eth_timeout = reuse
+        p_secret, taker_rxd, maker_rxd, t_btc, t_rxd, eth_timeout = reuse
+        args, policy = _runner_policy(token, t_rxd_blocks=t_rxd.value, remaining_s=eth_timeout - _now(url))
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
-    t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
     cov = build_htlc_covenant_rxd(
-        amount=_RXD_CARRIER, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd_blocks
+        amount=_RXD_CARRIER, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
     )
 
     terms = NegotiatedTerms(
@@ -411,7 +519,7 @@ def _build(node, url, workdir, token=None, *, t_rxd_blocks=60, seen=None, reuse=
         # different convention.
         btc_sats=100_000,
         radiant_amount=_RXD_CARRIER,
-        t_btc=bt.Timelock(t_rxd_blocks + 40, bt.TimeUnit.BLOCKS),
+        t_btc=t_btc,
         t_rxd=t_rxd,
         asset_variant="rxd",
         genesis_ref=b"",
@@ -424,13 +532,13 @@ def _build(node, url, workdir, token=None, *, t_rxd_blocks=60, seen=None, reuse=
         # THE token fields. `value_amount` is 6-decimal USDC base units, NOT wei — the whole reason
         # the record is chain-tagged, and the distinction a mock token cannot exercise.
         value_amount=_AMOUNT,
-        token_address=(token or _USDC).address,
+        token_address=token.address,
     )
 
     rpc = EthRpc(url, expected_chain_id=_DEVNET_CHAIN_ID)
     artifact = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
     contract_leg = Erc20HtlcLeg(
-        token=token or _USDC,
+        token=token,
         rpc=rpc,
         signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)),
         chain_id=_DEVNET_CHAIN_ID,
@@ -462,9 +570,12 @@ def _build(node, url, workdir, token=None, *, t_rxd_blocks=60, seen=None, reuse=
         indexer=FakeIndexer(),
         seen_store=seen if seen is not None else _InMemSeen(),
         persist=JsonFileRecordSink(keys + ".swaprec.json"),
+        # The runner's real-token wiring: its maker-stall window, and NO accept_estimated_eth_margins
+        # (the runner passes it only for a throwaway token; with a measured policy it would re-disable
+        # the two defences the policy switches on).
         config=CoordinatorConfig(
-            margin_policy=_policy(),
-            accept_estimated_eth_margins=True,
+            maker_stall_safety_window_blocks=args.maker_stall_safety_window_blocks,
+            margin_policy=policy,
             accept_nondurable_seen=True,  # single-process, fresh-H-per-run
             fund_lock=FileFundLock(keys),
         ),
@@ -486,15 +597,17 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
     amount surviving the record round trip, the chain-tagged locator reaching the claim path, the
     covenant and the token HTLC agreeing about the same preimage.
     """
-    node, url, workdir, token = env
+    node, url, root, token = env
+    workdir = _swap_dir(root, "happy")
     coord, cov, p_secret, eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir, token)
 
     maker_before = _usdc_balance(url, _ADDR_MAKER, token)
 
     # 1. MAKER locks the Radiant asset first, and it is mined. The taker will not fund until it has
     #    read this off the chain — HZ-1, enforced by pre_btc_lock_check step 5.
-    _rxd_pay(node, cov.funded_spk, _RXD_CARRIER)
-    node.rxd_mine(3)
+    _rxd_pay(node, cov.funded_spk, _RXD_CARRIER)  # mines the block that confirms the covenant
+    asset_locked_at = _rxd_height(node)
+    _bury_the_covenant(node, coord)
 
     # 2. TAKER funds the USDC counter leg. Two transactions: deploy, then a plain transfer.
     rec = await coord.taker_funds_btc(coord.record.terms, now_unix_s=_now(url))
@@ -522,7 +635,10 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
     assert loc.amount_wei == _AMOUNT, "the 6-decimal amount did not survive into the locator"
     assert _usdc_balance(url, loc.contract_address, token) == _AMOUNT, "the HTLC does not hold the USDC"
 
-    # 3. MAKER revalidates and the swap is BOTH_LOCKED.
+    # 3. MAKER revalidates and the swap is BOTH_LOCKED — once the deploy is FINAL. A measured policy
+    #    pins the verify->lock read to the `finalized` checkpoint (a reorg could otherwise re-deploy a
+    #    different contract at the same CREATE address), so a real maker waits for finality first.
+    _finalize_the_counter_leg(url)
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_now(url))
     assert rec.state is SwapState.BOTH_LOCKED
     # Positive control for the check at the end: the same helper, same outpoint, must report
@@ -543,7 +659,7 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
     assert claim_tx, "the maker's claim tx hash was not captured — the taker cannot scrape p"
     node.rxd_mine(2)
     rec = await coord.taker_scrape_and_claim_asset(
-        claim_tx, now_rxd_height=_rxd_height(node), asset_locked_at_height=_rxd_height(node) - 5
+        claim_tx, now_rxd_height=_rxd_height(node), asset_locked_at_height=asset_locked_at
     )
     assert rec.state is SwapState.COMPLETED, f"the swap did not complete: {rec.state}"
 
@@ -556,6 +672,25 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
         "the swap reports COMPLETED but the Radiant covenant is still unspent — the taker was "
         "never paid, while the maker already has the USDC and p is public"
     )
+
+
+def _finalize_the_counter_leg(url: str) -> None:
+    """Mine until the counter-leg deploy and transfer are under anvil's `finalized` checkpoint.
+
+    The fixture runs anvil with ``--slots-in-an-epoch 1``, so `finalized` is latest-2: three blocks
+    put both funding transactions behind it. On a real chain this is the ~13 min the maker waits.
+    """
+    _mine(url, 3)
+
+
+def _bury_the_covenant(node, coord) -> None:
+    """Mine the maker's covenant (already 1 deep from ``_rxd_pay``) to the burial the policy requires.
+
+    A MEASURED policy refuses to fund the counter leg until the covenant is ``rxd_claim_burial`` deep
+    (``pre_btc_lock_check`` step 5: "Wait for it to bury, then retry"), and a real taker waits exactly
+    so. The pre-#482 fixture mined a fixed 3 under an estimated policy, which does not enforce it.
+    """
+    node.rxd_mine(coord.config.margin_policy.rxd_claim_burial.value - 1)
 
 
 def _covenant_is_spent(node, outpoint: str) -> bool:
@@ -585,9 +720,14 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     actually needs when a counterparty goes quiet. It also exercises `mutual_refund`'s repair from
     this session: the two refunds are independent, so a failure in one must not skip the other.
     """
-    node, url, workdir, token = env
-    coord, cov, _p_secret, _eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir, token, t_rxd_blocks=8)
+    node, url, root, token = env
+    workdir = _swap_dir(root, "refund")
+    # The 4 h deadline, not the 24 h default: this scenario MINES t_rxd to mature the covenant, about
+    # 680 blocks here against about 2,680 (see ERC20_LIFECYCLE_E2E_DEADLINES_S for the measured cost).
+    # Same runner policy, fast tail and stall budget.
+    coord, cov, _p_secret, _eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir, token, deadline="refund")
     terms = coord.record.terms
+    policy = coord.config.margin_policy
 
     taker_before = _usdc_balance(url, _ADDR_TAKER, token)
     maker_before = _usdc_balance(url, _ADDR_MAKER, token)
@@ -595,19 +735,43 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     # Both legs funded, exactly as the happy path — a stalling maker still has to LOCK; "never locks
     # at all" is refused before any taker value moves.
     _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
-    node.rxd_mine(3)
+    _bury_the_covenant(node, coord)
     rec = await coord.taker_funds_btc(terms, now_unix_s=_now(url))
     assert rec.state is SwapState.BTC_LOCKED
     htlc = rec.counterchain_locator.contract_address
     assert _usdc_balance(url, htlc, token) == _AMOUNT
+    _finalize_the_counter_leg(url)  # the measured policy's `finalized` pin, as in the happy path
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_now(url))
     assert rec.state is SwapState.BOTH_LOCKED
 
-    # Nobody claims. Mature the Radiant CSV, and warp past the ETH deadline.
-    node.rxd_mine(terms.t_rxd.value + 1)
+    # Nobody claims. In the order the #482 ordering produces, on ONE wall clock:
+    # 1. The ETH deadline passes, and Radiant mines the blocks that same span holds at the MEASURED
+    #    FAST TAIL (rounded UP): the chain running as fast as the policy sizes t_rxd for, which is the
+    #    pace at which the covenant refund comes soonest. Mined at the nominal 300 s this was 48 blocks
+    #    for a 4 h span, eight times fewer, and the assertion below sat far from the boundary. The
+    #    taker's USDC refund is open; the maker's covenant refund is still CLOSED, and the production
+    #    leg's own maturity check refuses it before it takes a fee input or broadcasts anything.
+    fast = policy.rxd_block_interval_fast_s
+    elapsed_s = terms.eth_timeout_unix_s + 1 - _now(url)
     _rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
     _mine(url, 1)
+    node.rxd_mine(math.ceil(elapsed_s / fast))
+    cov_txid = coord.record.radiant_covenant_outpoint.split(":")[0]
+    cov_confs = int(node.rxd("getrawtransaction", cov_txid, "true")["confirmations"])
+    assert cov_confs < terms.t_rxd.value, "the covenant refund must open LAST"
+    # And by the margin the policy sizes for: even at the fast tail, what is left of t_rxd at the ETH
+    # deadline still covers the whole cross-clock margin (finality, stall, burial, slack), so the
+    # taker has that long to claim after p becomes public before the maker can refund.
+    left_s = (terms.t_rxd.value - cov_confs) * fast
+    assert left_s >= policy.cross_clock_margin.total_s(), (
+        f"at the fast tail only {left_s:.0f} s of t_rxd remain at the ETH deadline, under the "
+        f"{policy.cross_clock_margin.total_s()} s cross-clock margin the policy sizes it for"
+    )
+    with pytest.raises(NetworkError, match="not yet mature"):
+        await coord.radiant_leg.refund_asset(coord.record)
 
+    # 2. t_rxd matures last; now mutual_refund unwinds BOTH legs.
+    node.rxd_mine(terms.t_rxd.value - cov_confs)
     rec = await coord.mutual_refund()
     assert rec.state is SwapState.MUTUAL_REFUND, f"mutual refund did not complete: {rec.state}"
 
@@ -635,16 +799,15 @@ async def test_a_crash_between_deploy_and_transfer_RESUMES_without_double_fundin
     and the resume entry point. The property that matters is stated as arithmetic — ONE contract,
     holding EXACTLY the negotiated amount, never two and never double.
     """
-    node, url, workdir, token = env
+    node, url, root, token = env
+    workdir = _swap_dir(root, "crash_before_push")
     seen = _InMemSeen()
-    coord, cov, p_secret, _eth_leg, _rxd, taker_rxd, maker_rxd = _build(
-        node, url, workdir, token, t_rxd_blocks=60, seen=seen
-    )
+    coord, cov, p_secret, _eth_leg, _rxd, taker_rxd, maker_rxd = _build(node, url, workdir, token, seen=seen)
     terms = coord.record.terms
-    reuse = (p_secret, taker_rxd, maker_rxd, terms.eth_timeout_unix_s)
+    reuse = (p_secret, taker_rxd, maker_rxd, terms.t_btc, terms.t_rxd, terms.eth_timeout_unix_s)
 
     _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
-    node.rxd_mine(3)
+    _bury_the_covenant(node, coord)
     taker_before = _usdc_balance(url, _ADDR_TAKER, token)
 
     # CRASH: let the deploy land and be persisted, then die before the token push completes.
@@ -679,9 +842,7 @@ async def test_a_crash_between_deploy_and_transfer_RESUMES_without_double_fundin
 
     # RESUME in a fresh coordinator, as a restarted process would — loading the record from disk.
     sink = JsonFileRecordSink(str(workdir / "swap") + ".swaprec.json")
-    coord2, cov2, _p2, _leg2, _rxd2, _tk2, _mk2 = _build(
-        node, url, workdir, token, t_rxd_blocks=60, seen=seen, reuse=reuse
-    )
+    coord2, cov2, _p2, _leg2, _rxd2, _tk2, _mk2 = _build(node, url, workdir, token, seen=seen, reuse=reuse)
     assert cov2.funded_spk == cov.funded_spk, "the rebuilt covenant is not the funded one"
     rec = await coord2.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
 
@@ -712,16 +873,15 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
     Reproduced by turning anvil's automine off for the push, so the transfer sits pending exactly
     as it would behind a congested basefee.
     """
-    node, url, workdir, token = env
+    node, url, root, token = env
+    workdir = _swap_dir(root, "crash_after_push")
     seen = _InMemSeen()
-    coord, cov, p_secret, _eth, _rxd, taker_rxd, maker_rxd = _build(
-        node, url, workdir, token, t_rxd_blocks=60, seen=seen
-    )
+    coord, cov, p_secret, _eth, _rxd, taker_rxd, maker_rxd = _build(node, url, workdir, token, seen=seen)
     terms = coord.record.terms
-    reuse = (p_secret, taker_rxd, maker_rxd, terms.eth_timeout_unix_s)
+    reuse = (p_secret, taker_rxd, maker_rxd, terms.t_btc, terms.t_rxd, terms.eth_timeout_unix_s)
 
     _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
-    node.rxd_mine(3)
+    _bury_the_covenant(node, coord)
     taker_before = _usdc_balance(url, _ADDR_TAKER, token)
 
     leg = coord._token_leg
@@ -749,7 +909,7 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
     pinned = on_disk.get("pending_push_nonce")
     assert pinned is not None, "no durable nonce pin: the resume cannot replace its own pending push"
 
-    coord2, _c2, _p2, _l2, _r2, _t2, _m2 = _build(node, url, workdir, token, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    coord2, _c2, _p2, _l2, _r2, _t2, _m2 = _build(node, url, workdir, token, seen=seen, reuse=reuse)
     sink = JsonFileRecordSink(str(workdir / "swap") + ".swaprec.json")
 
     # WHILE THE PUSH IS PENDING the resume REFUSES, and does not reach the pinned re-send at all.
@@ -777,5 +937,5 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
 
 async def coord3_resume(node, url, workdir, token, seen, reuse, terms, sink):
     """A third process, resuming after the pending push settled."""
-    coord3, _c, _p, _l, _r, _t, _m = _build(node, url, workdir, token, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    coord3, _c, _p, _l, _r, _t, _m = _build(node, url, workdir, token, seen=seen, reuse=reuse)
     return await coord3.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
