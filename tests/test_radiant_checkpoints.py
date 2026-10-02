@@ -64,13 +64,13 @@ def test_every_entry_was_deep_when_pinned() -> None:
 
 
 def test_the_table_was_confirmed_by_the_maintainers_node() -> None:
-    """Regenerated 2026-09-30 with ``--node-cli``: the maintainer's Radiant Core node was a third
-    source, and ``reconcile`` refuses the write unless every source answers every height alike.
-    A later ``--write`` WITHOUT the node flips both of these back, and this test fails."""
+    """Regenerated with ``--node-cli`` (most recently on ``GENERATED_UTC``): the maintainer's
+    Radiant Core node was a further source, and ``reconcile`` refuses the write unless every source
+    answers every height alike. A later ``--write`` WITHOUT the node flips both of these back, and this test fails."""
     assert cp.NODE_CONFIRMED == {"mainnet": True}
     doc = " ".join((cp.__doc__ or "").split())
     ordinal = {2: "third", 3: "fourth"}[len(cp.SOURCES["mainnet"])]
-    assert f"maintainer was a {ordinal}, REQUIRED source: on 2026-09-30" in doc
+    assert f"maintainer was a {ordinal}, REQUIRED source: on {cp.GENERATED_UTC}" in doc
     assert "``radiant-cli getblockhash <height>`` for every entry" in doc
     assert "NO node" not in doc
     assert cp.SOURCES["mainnet"], "SOURCES lists the ElectrumX servers that agreed"

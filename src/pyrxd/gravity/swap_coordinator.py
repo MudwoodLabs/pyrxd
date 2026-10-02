@@ -1584,7 +1584,7 @@ class CoordinatorConfig:
     role: SwapRole | None = None
     # The taker gate's elapsed-depth bound policy (surge factor, confidence, the negotiation-time
     # check's slack and work margin): :class:`pyrxd.gravity.funding_spv.ElapsedBoundPolicy`. The
-    # defaults are the ones listed for maintainer sign-off.
+    # maintainer signed off on its defaults on 2026-09-30, except ``early_work_margin``.
     funding_bound: ElapsedBoundPolicy = DEFAULT_ELAPSED_BOUND_POLICY
 
     def __post_init__(self) -> None:
