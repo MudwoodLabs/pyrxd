@@ -62,9 +62,9 @@ entry named in brackets has the detail.
 - `MultiSourceEthRpc`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
   `MultiSourceRxdChainSource` refuse a client object that carries no `source_key`
   (`pyrxd.network.source_identity.source_key_of`); custom clients must set one [Changed (breaking)].
-- The swap taker gate refuses a Radiant leg tagged with a test network other than regtest (for
-  example `tb` or `signet`): pyrxd has no Radiant chain parameters to prove funding there. Use a
-  regtest (`bcrt`) or mainnet leg [Changed].
+- The swap taker gate refuses a Radiant leg tagged `tb`, `signet`, `rltc` or `tltc`: pyrxd has no
+  Radiant chain parameters to prove funding there. Use a regtest (`bcrt`) or mainnet leg. Any
+  other non-empty tag is treated as mainnet [Changed].
 - An injected ETH/ERC-20 HTLC artifact must carry `immutableReferences` and `immutable_names`, or
   the leg is refused at construction [Changed (breaking)].
 - The mainnet swap runner scripts take `--rxd-ssh-host` and `--rxd-container` with no default,
