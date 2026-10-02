@@ -416,24 +416,56 @@ jobs:
       # only end-to-end run of the ERC-20 counter leg. It was opt-in and nothing ran it, so it sat
       # red from v0.22.0 (#482's ordering) to the PR that added this step, unnoticed.
       #
-      # Keyless public RPCs, so an endpoint can be down. The policy:
-      #   * PASS needs a full run, every test passing and NONE skipped, against SOME endpoint. A
-      #     defect in the code fails on every endpoint, so retrying cannot turn it green; it can
-      #     only route around an endpoint that is down, and each fallback is a visible ::warning::.
-      #   * A SKIP IS A FAILURE. The suite skips when its environment is missing (the opt-in, the
-      #     RPC variable, docker, anvil, the node image), and a skip reports green. This step reads
-      #     pytest's junit counts and refuses `skipped > 0`, and refuses zero tests, so a nightly that
-      #     ran nothing cannot pass for one that ran everything.
-      #   * No endpoint passing is a FAILURE, never a skip.
-      # Endpoints measured working for forking without a key (see the suite's docstring and
-      # tests/test_erc20_leg_fork_integration.py's): anvil forks at the tip, so these need recent
-      # state, not deep archive reads.
+      # anvil forks at the tip and reads state AT THE FORK BLOCK for the whole run, so the endpoint
+      # must serve historical state as the chain moves on: one ~10 min run is ~50 blocks on Ethereum
+      # (12 s) but ~300 on Base (2 s), past what a non-archive public node serves (publicnode's
+      # free tier refused reads 128 blocks back on both chains, measured 2026-10-01). So the list is
+      # endpoints that served state 1024 blocks back, measured the same day, and the probe asks for
+      # exactly that.
+      #
+      # The policy:
+      #   * PREFLIGHT, per chain: each endpoint in order gets `eth_blockNumber` and then `eth_getCode`
+      #     of the chain's pinned USDC, 1024 blocks behind the tip (15 s timeout each). The first that
+      #     answers with code is used. An endpoint that fails the probe gets a ::warning:: naming why.
+      #   * The suite runs ONCE, against that endpoint. A red run is red: no retry, so an intermittent
+      #     defect cannot go green on whichever endpoint happens to pass.
+      #   * A SKIP IS A FAILURE. The suite skips when its environment is missing, and a skip reports
+      #     green, so pytest's junit counts must show skipped == 0 and at least one test.
+      #   * No endpoint passing the probe is a FAILURE, never a skip, and the ::error:: names each
+      #     endpoint's probe failure.
       - name: RXD↔USDC/USDT lifecycle on forked Ethereum and Base
         shell: bash
         env:
           XCHAIN_ERC20_E2E: "1"
+          PROBE_DEPTH_BLOCKS: "1024"
         run: |
           set -euo pipefail
+          rpc() {  # rpc <url> <method> <params json>: prints the string result, or why there is none
+            local body
+            body=$(curl -sS --max-time 15 -X POST -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" "$1" 2>&1) \
+              || { echo "${body:0:200}"; return 1; }
+            python - "$body" <<'PY'
+          import json
+          import sys
+
+          try:
+              result = json.loads(sys.argv[1])["result"]
+          except (ValueError, KeyError, TypeError):
+              result = None
+          if not isinstance(result, str):
+              print(sys.argv[1][:200].replace("\n", " "))
+              sys.exit(1)
+          print(result)
+          PY
+          }
+          probe() {  # probe <url> <token address>: prints why the endpoint cannot serve this fork
+            local tip code
+            tip=$(rpc "$1" eth_blockNumber '[]') || { echo "eth_blockNumber: ${tip}"; return 1; }
+            code=$(rpc "$1" eth_getCode "[\"$2\", \"$(printf '0x%x' $(( tip - PROBE_DEPTH_BLOCKS )))\"]") \
+              || { echo "eth_getCode ${PROBE_DEPTH_BLOCKS} blocks back: ${code}"; return 1; }
+            [ "${#code}" -gt 2 ] || { echo "no code for $2 ${PROBE_DEPTH_BLOCKS} blocks back"; return 1; }
+          }
           no_skips() {
             python - "$1" <<'PY'
           import sys
@@ -446,25 +478,34 @@ jobs:
           sys.exit(0 if tests > 0 and skipped == 0 and failures == 0 and errors == 0 else 1)
           PY
           }
-          run_fork() {
+          run_fork() {  # run_fork <chain id> <endpoint>...
             local chain="$1"; shift
-            local rpc xml="erc20-lifecycle-${chain}.xml"
+            local token rpc why chosen="" failures="" xml="erc20-lifecycle-${chain}.xml"
+            token=$(poetry run python -c "from pyrxd.eth_wallet.tokens import token_for; print(token_for('USDC', ${chain}).address)") \
+              || { echo "::error::chain ${chain}: could not resolve the pinned USDC address"; return 1; }
             for rpc in "$@"; do
-              rm -f "$xml"
-              if PYRXD_ETH_FORK_CHAIN_ID="$chain" PYRXD_ETH_FORK_RPC="$rpc" \
-                  poetry run pytest -o "addopts=" -m integration -q -rs --junitxml="$xml" \
-                  tests/test_xchain_erc20_usdc_lifecycle_e2e.py && no_skips "$xml"; then
-                echo "chain ${chain}: passed against ${rpc}"
-                return 0
+              if why=$(probe "$rpc" "$token"); then
+                chosen="$rpc"
+                break
               fi
-              echo "::warning::ERC-20 lifecycle e2e on chain ${chain} did not pass against ${rpc}; trying the next endpoint"
+              echo "::warning::chain ${chain}: ${rpc} failed the preflight probe: ${why}"
+              failures="${failures} [${rpc}: ${why}]"
             done
-            echo "::error::ERC-20 lifecycle e2e on chain ${chain} did not pass against any endpoint: $*"
-            return 1
+            if [ -z "$chosen" ]; then
+              echo "::error::chain ${chain}: no fork endpoint passed the preflight probe:${failures}"
+              return 1
+            fi
+            echo "chain ${chain}: running the suite ONCE against ${chosen}"
+            rm -f "$xml"
+            PYRXD_ETH_FORK_CHAIN_ID="$chain" PYRXD_ETH_FORK_RPC="$chosen" \
+              poetry run pytest -o "addopts=" -m integration -q -rs --junitxml="$xml" \
+              tests/test_xchain_erc20_usdc_lifecycle_e2e.py \
+              || { echo "::error::chain ${chain}: the suite failed against ${chosen} (not retried)"; return 1; }
+            no_skips "$xml" || { echo "::error::chain ${chain}: the suite skipped or ran nothing"; return 1; }
           }
           rc=0
-          run_fork 1 https://ethereum-rpc.publicnode.com https://eth.drpc.org || rc=1
-          run_fork 8453 https://mainnet.base.org https://base.meowrpc.com https://base-mainnet.public.blastapi.io || rc=1
+          run_fork 1 https://eth.drpc.org https://eth-mainnet.public.blastapi.io || rc=1
+          run_fork 8453 https://mainnet.base.org https://base-mainnet.public.blastapi.io https://base.meowrpc.com || rc=1
           exit "$rc"
 
   # ---------------------------------------------------------------- vendor pin

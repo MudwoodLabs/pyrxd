@@ -884,3 +884,57 @@ async def test_the_sepolia_dust_default_deadline_is_the_shortest_that_holds_with
         lo, hi = (lo, mid) if await constructs(mid) else (mid, hi)
     two_confirmations = funding_spv.erlang_upper_quantile_s(2, spacing_s=300, epsilon=1e-3)
     assert hi + two_confirmations <= 14_400, (hi, two_confirmations)
+
+
+#: The ``eth_swap_run.py`` inputs ``tests/test_xchain_erc20_usdc_lifecycle_e2e.py`` negotiates its swaps
+#: under — ONE copy, imported by that suite. It parses them through the runner's own ``_args`` and
+#: ``_policy`` (the real-value token stage: a MEASURED policy at a 36 s fast tail and a 3600 s stall
+#: budget), but on a regtest Radiant chain, where the coordinator runs none of the value-bearing
+#: construction checks. The test below runs those checks on exactly these inputs, on mainnet Radiant.
+ERC20_LIFECYCLE_E2E_INPUTS = (
+    "--token-amount",
+    "12345678",
+    "--rxd-photons",
+    "100000",
+    "--rxd-block-interval-fast-s",
+    "36",
+    "--eth-finality-stall-tolerance-s",
+    "3600",
+    "--maker-stall-safety-window-blocks",
+    "30",
+)
+#: Its ETH deadlines: the runner's real-token default (the happy path and both crash scenarios), and a
+#: 4 h one for the refund scenario only, which must MINE ``t_rxd`` on regtest to mature the covenant:
+#: about 680 blocks at 4 h instead of about 2,680 at 24 h. Measured 2026-10-01: with 24 h in every
+#: scenario one fork's run had not finished after 25 minutes (stopped after 7 of 8 tests); with 4 h for
+#: the refund each fork ran 8 tests in about 10 minutes. Same policy, same fast tail, same stall
+#: budget; only the deadline differs.
+ERC20_LIFECYCLE_E2E_DEADLINES_S = {"default": 86_400, "refund": 14_400}
+
+
+@pytest.mark.parametrize("deadline", sorted(ERC20_LIFECYCLE_E2E_DEADLINES_S))
+@pytest.mark.parametrize("symbol", ["usdc", "usdt"])
+@pytest.mark.parametrize("chain_id", [1, 8453])
+async def test_the_erc20_lifecycle_e2e_terms_pass_the_mainnet_construction_checks(
+    chain_id, symbol, deadline, tmp_path, monkeypatch
+):
+    """The RXD<->USDC/USDT lifecycle e2e runs on regtest Radiant beside a devnet chain id, so the
+    coordinator skips the value-bearing construction checks there (``_funding_proof_room_failure``
+    returns before them on a test network). Its terms are only production terms if they PASS those
+    checks. So: the same runner inputs, with a mainnet Radiant leg and the real chain id, driven
+    through ``run_sepolia_dust`` to its first broadcast — construction (value at stake, the
+    two-operator rule, the checkpoint horizon, steps 3/6/7 on the modelled elapsed bound, the
+    deadline's liveness floor) must accept, and steps 3/6/7 at the gate's modelled maximum must too."""
+    mod = _load("eth_swap_run")
+    events: list[str] = []
+    _instrument(mod, events, monkeypatch)
+    argv = _real_token_argv(tmp_path)
+    argv[argv.index("--counter-asset") + 1] = symbol
+    argv[argv.index("--eth-chain-id") + 1] = str(chain_id)
+    argv += [*ERC20_LIFECYCLE_E2E_INPUTS, "--eth-timeout-s", str(ERC20_LIFECYCLE_E2E_DEADLINES_S[deadline])]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = mod._args()
+    assert mod._token_leg_is_real(args), "the real-value token stage, or this proves nothing about it"
+    outcome = await _run(mod.run_sepolia_dust(args))
+    assert outcome == "stopped at wait_for_covenant_funding", (outcome, events)
+    assert "judged:ok" in events, events
