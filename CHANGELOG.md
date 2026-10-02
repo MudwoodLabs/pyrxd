@@ -6,6 +6,93 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-10-02
+
+This summary points into the entries below it, which are kept as they were written, PR by PR.
+
+**Security.** Upgrade before running an ETH or ERC-20 swap.
+
+- **HIGH: the ETH/ERC-20 HTLC counterparty runtime check could be passed by a modified contract
+  (#798; advisory GHSA-44pc-4fv5-39hv). Affects 0.6.0 through 0.25.1.** A maker verifying a
+  taker-deployed ETH or ERC-20 HTLC compared its runtime with a value-masked compare, so a taker
+  could deploy a contract whose getters named the maker while `claim()` paid another address, and
+  take both legs. The check now places every negotiated immutable at every offset it occupies and
+  requires exact byte equality. A per-PR test now runs the real `verify_funded` against forged
+  copies (#821).
+- **Status, recovery and redaction fixes (#815, #820, #821, #823).** `swap status` and
+  `swap recover-preimage` no longer report a BTC refund in the mempool, one RPC's report of an ETH
+  refund, or an empty ETH log read as a finished or still-locked leg, and no longer tell a taker to
+  keep waiting while the ETH preimage is already in the contract's logs. `status`, `build-claim`
+  and `build-refund` identify the RXD covenant by its funding outpoint. `verify_funded` refuses an
+  ETH contract that is already settled, and an ETH leg refuses to sign for a chain other than the
+  one its rpc is pinned to. Keyed endpoint URLs no longer reach error text, `--debug` tracebacks,
+  watchtower pages or logs, with two exceptions noted in the entries below: web3's own DEBUG-level
+  request log, and a key carried as a short letters-only path segment that a server echoes back.
+
+**Swaps: the taker proves the maker's Radiant funding before locking (#809, #817, #822).**
+`SwapCoordinator` no longer takes one server's word that the maker's covenant exists. It checks
+the funding transaction's merkle branch and links its header to a checkpoint pyrxd ships, at a
+depth sized from the value at stake. On mainnet, above 1,000 RXD by default, it needs two operators
+to report the funding's depth. It also refuses at construction, before anyone locks, a swap whose
+terms its gate would refuse on an honest chain; the checks at lock time still decide. The mainnet runner scripts construct at their defaults and build the
+coordinator before anything is minted or broadcast.
+
+**HashMarks: verification proves the mark's block (#802, #804, #807).** `pyrxd verify` and the
+`/verify/` and `/inspect/` pages check the transaction's merkle branch against the header served
+for its height, and link that header hash by hash to a shipped checkpoint. Past the newest
+checkpoint (467,712 in this release) they link at most 4,032 headers. `pyrxd verify` reports a
+mark beyond that as `CONFIRMED`, with the reason, and the pages show it as the server's word.
+Newer checkpoints come with newer pyrxd releases; the pages, which deploy from `main`, pick them
+up when the table there is refreshed.
+
+**Testing: the RXD↔USDC/USDT lifecycle end-to-end suite passes again and runs nightly (#824).**
+
+**Behaviour changes.** Each of these can change what a script, config or integration sees. The
+entry named in brackets has the detail.
+
+- `pyrxd-watchtower` refuses to start with fewer RXD sources of distinct operators than
+  `--rxd-quorum`, and exits 1. `--accept-single-source` starts it anyway, but no longer arms the
+  autonomous refund on single-source reads; that needs the new `--auto-refund-on-single-source`
+  [Changed].
+- Sources are counted by registered domain, or by an operator pyrxd knows, not by host (an
+  operator declared in config also counts for HashMark form 2). Every loopback spelling is one
+  source. Quorums refuse two sources of one operator with
+  `ValidationError`, and input that names no host is refused. `endpoint_host` and
+  `count_distinct_hosts` are removed [Changed (breaking)].
+- `MultiSourceEthRpc`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
+  `MultiSourceRxdChainSource` refuse a client object that carries no `source_key`
+  (`pyrxd.network.source_identity.source_key_of`); custom clients must set one [Changed (breaking)].
+- The swap taker gate refuses a Radiant leg tagged `tb`, `signet`, `rltc` or `tltc`: pyrxd has no
+  Radiant chain parameters to prove funding there. Use a regtest (`bcrt`) or mainnet leg. Any
+  other non-empty tag is treated as mainnet [Changed].
+- An injected ETH/ERC-20 HTLC artifact must carry `immutableReferences` and `immutable_names`, or
+  the leg is refused at construction [Changed (breaking)].
+- The mainnet swap runner scripts take `--rxd-ssh-host` and `--rxd-container` with no default,
+  and need `--rxd-block-interval-fast-s`; an NFT or FT swap needs `--value-at-risk-photons`
+  [Changed; Fixed, "The mainnet swap runners"].
+- `SwapCoordinator` refuses to construct a negotiated value-bearing swap without
+  `MarginPolicy.rxd_block_interval_fast_s`; in any role but `MAKER`, without a value at stake; and
+  for an ETH or ERC-20 counter leg, without `now_unix_s`. A Radiant leg must serve
+  `maker_funding_evidence`. The third value `taker_verify_asset_funding` returns is now the
+  elapsed-depth upper bound [Changed; Fixed, "The mainnet swap runners"].
+- `swap status` has new situations `COVENANT_UNIDENTIFIED`, `COUNTER_LEG_REFUND_UNCONFIRMED`,
+  `BOTH_SPENT_OUTCOME_UNKNOWN`, `MAKER_REFUNDED_AND_CLAIMED` and `TAKER_CLAIMED_AND_REFUNDED`. The
+  ETH counter leg has no `LOCKED` or `SPENT_NO_PREIMAGE` state; it reports `UNKNOWN` and
+  `REFUND_REPORTED_UNCONFIRMED` instead. `--json` gains `chain.covenant_spend`, and
+  `chain.blocks_to_refund` is now `t_rxd - depth` [Fixed].
+- `swap recover-preimage` exits 2 for an inconclusive read: an empty ETH log set, or one RPC's
+  report of a refund. It, `build-claim` and `build-refund` exit 2, not 4, for an aiohttp error, a
+  timeout or a reply that is not JSON [Security; Fixed].
+- `pyrxd verify` reports `checks.block.state` as `VERIFIED`, not `CONFIRMED`, when the mark's block
+  verifies, and exits 2 when the server's own proof contradicts the height it reported.
+  `mark_anchor` gains `blockhash`, `verified_confirmations` and `block_verification` [Changed].
+- Endpoint labels in `--json` output are `scheme://host:port`: `verify --wave-name`'s source
+  fields and `setup --json`'s `electrumx_url` [Security].
+- An empty entry in an `electrumx_servers` list is a config error, and a refused configuration
+  exits 1 as `error: invalid configuration`, not 4 [Changed; Fixed].
+- Constructing `GravityTrade` emits a `DeprecationWarning` [Deprecated].
+- `scripts/swap_run_verify.py` exits 3 with `INVALID: <reason>` on a malformed manifest [Changed].
+
 ### Security
 
 - **ETH/ERC-20 HTLC: the counterparty runtime check is now slot-exact, closing a fund-theft path
@@ -501,7 +588,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   interval from every source (the servers, and the node with `--node-cli`), refuses unless they are
   byte-identical and link between the two checkpoints, and records the numbers; `--check`
   re-verifies them. Regenerated 2026-09-30 with the maintainer's node: 465,696..467,712, the hardest
-  header at 465,703 (3.02 times the newest checkpoint's work).
+  header at 465,703 (3.02 times the newest checkpoint's work). Re-confirmed for this release on
+  2026-10-02 (`--check`, then `--write`, at tip 469,235) by the same three servers and the node:
+  every checkpoint and both work figures are unchanged, and only the provenance (date, tip and
+  `--min-depth`) was rewritten.
 - **`pyrxd verify` now verifies the mark's block, on by default.** It fetches the transaction's
   merkle branch, the block's coinbase branch and the header ranges `verify_mark_block` asks for,
   from one configured endpoint, and checks them with the raw transaction it already fetched.
@@ -680,7 +770,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   maker's asset until `t_rxd`. The construction-time check now projects where a funding agreed now
   reaches the depth the gate requires, from the newest checkpoint's timestamp and the clock (the
   system clock when the coordinator is built without one), with blocks counted 1.1 times faster
-  than the nominal 300 s (`CHECKPOINT_HORIZON_RATE_FACTOR`, a policy value the maintainer signed off on; the fastest
+  than the nominal 300 s (`CHECKPOINT_HORIZON_RATE_FACTOR`, a policy value the maintainer signed off on 2026-10-01; the fastest
   20,160-block stretch since height 300,000 ran 1.032 times nominal),
   and refuses past the horizon with "Upgrade pyrxd (newer checkpoints)". The checkpoint table now
   ships the newest checkpoint's raw header (`NEWEST_CHECKPOINT_HEADER`; a test re-hashes it to the
@@ -938,6 +1028,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   builder, the watchtower README, `docs/concepts/architecture.md`,
   `docs/how-to/build-a-cross-chain-swap.md` and `docs/red-team-checklist.md` said a value-bearing
   network needed an opt-in to construct. None does. The gate stays a no-op.
+- **The RXD↔USDC/USDT lifecycle end-to-end suite passes again, and a nightly job runs it (#824).**
+  `tests/test_xchain_erc20_usdc_lifecycle_e2e.py`, the only end-to-end run of the ERC-20 counter
+  leg, is opt-in (`XCHAIN_ERC20_E2E`) and no CI job ran it. Its fixture still set
+  `t_btc = t_rxd + 40`, the timelock order from before #482/#559, so `NegotiatedTerms` refused
+  it; #824 measured it failing at v0.22.0, at v0.25.1 and on `main` before the fix. Each scenario now takes its
+  policy, `t_rxd`, `t_btc` and deadline from `scripts/eth_swap_run.py`'s own real-value token
+  stage, and has its own record path. The `nightly-cross-chain` job in
+  `.github/workflows/integration.yml` runs it on anvil forks of Ethereum and Base, once per
+  chain with no retry, against the first endpoint that `scripts/fork_rpc_probe.py` finds serving
+  historical state. A skipped or empty run fails the job. Nothing in `src/` changed. A regtest
+  Radiant chain skips the value-bearing parts of the taker gate, so the new offline test
+  `test_the_erc20_lifecycle_e2e_terms_pass_the_mainnet_construction_checks` runs the suite's
+  inputs through the mainnet construction checks.
 
 ## [0.25.1] — 2026-09-29
 
