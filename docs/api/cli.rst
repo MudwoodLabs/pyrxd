@@ -124,7 +124,9 @@ human sizing the fee is the only remaining control.
   output's value for every variant), in
   the ordering the automated leg uses. Unlike the automated leg, which sees only live outputs, it
   looks through the script's history, so a covenant that was already spent is found even when a
-  later payment of another value is still live. ``chain.covenant_outpoint`` and
+  later payment of another value is still live — when the file records the amount
+  (``rxd_covenant_amount``, or for ft ``asset_ft_amount``); with no amount recorded, that case
+  reads ``COVENANT_UNIDENTIFIED`` (below). ``chain.covenant_outpoint`` and
   ``chain.covenant_identified_by`` say which output was taken and how. The situations:
 
   - ``NOT_FUNDED`` — the covenant is not on chain (one ElectrumX server's answer), or a pinned
