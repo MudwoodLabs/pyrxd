@@ -745,17 +745,28 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     assert rec.state is SwapState.BOTH_LOCKED
 
     # Nobody claims. In the order the #482 ordering produces, on ONE wall clock:
-    # 1. The ETH deadline passes, and Radiant mines the blocks that same span holds at the policy's
-    #    nominal interval (rounded UP, so the assertion below is only made harder to pass). The
+    # 1. The ETH deadline passes, and Radiant mines the blocks that same span holds at the MEASURED
+    #    FAST TAIL (rounded UP): the chain running as fast as the policy sizes t_rxd for, which is the
+    #    pace at which the covenant refund comes soonest. Mined at the nominal 300 s this was 48 blocks
+    #    for a 4 h span, eight times fewer, and the assertion below sat far from the boundary. The
     #    taker's USDC refund is open; the maker's covenant refund is still CLOSED, and the production
     #    leg's own maturity check refuses it before it takes a fee input or broadcasts anything.
+    fast = policy.rxd_block_interval_fast_s
     elapsed_s = terms.eth_timeout_unix_s + 1 - _now(url)
     _rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
     _mine(url, 1)
-    node.rxd_mine(math.ceil(elapsed_s / policy.rxd_block_interval_s))
+    node.rxd_mine(math.ceil(elapsed_s / fast))
     cov_txid = coord.record.radiant_covenant_outpoint.split(":")[0]
     cov_confs = int(node.rxd("getrawtransaction", cov_txid, "true")["confirmations"])
     assert cov_confs < terms.t_rxd.value, "the covenant refund must open LAST"
+    # And by the margin the policy sizes for: even at the fast tail, what is left of t_rxd at the ETH
+    # deadline still covers the whole cross-clock margin (finality, stall, burial, slack), so the
+    # taker has that long to claim after p becomes public before the maker can refund.
+    left_s = (terms.t_rxd.value - cov_confs) * fast
+    assert left_s >= policy.cross_clock_margin.total_s(), (
+        f"at the fast tail only {left_s:.0f} s of t_rxd remain at the ETH deadline, under the "
+        f"{policy.cross_clock_margin.total_s()} s cross-clock margin the policy sizes it for"
+    )
     with pytest.raises(NetworkError, match="not yet mature"):
         await coord.radiant_leg.refund_asset(coord.record)
 
