@@ -228,14 +228,12 @@ def test_the_scan_finds_the_opt_in_swap_suites() -> None:
 #: as ``t_btc`` (the ETH suites against the cross-clock gate), and the adversarial
 #: ``TestMakerStallAssetOnlyRefundIsTakerLoss`` needed its geometry re-derived, not flipped: under
 #: #482 the taker's BTC refund has already opened by the time the asset-only refund can fire.
-_KNOWN_BROKEN = {
-    "test_xchain_erc20_usdc_lifecycle_e2e.py": (
-        "t_btc = t_rxd + 40 passed as a constructor keyword; ALSO its t_rxd (8/60 blocks at 600 s) cannot "
-        "clear the cross-clock gate against its 50,000 s ETH deadline, and its flows mine 3 extra covenant "
-        "confirmations before funding, so a sizer anchored at now would still be refused. Needs a mainnet "
-        "fork RPC to run, so it has not been re-derived blind"
-    ),
-}
+#:
+#: The RXD<->USDC lifecycle suite (``test_xchain_erc20_usdc_lifecycle_e2e.py``) left this list the
+#: same way: it derives its timelocks with the ETH suite's derivation, and its strict xfail XPASSed.
+#: It had a second, unrelated breakage the ordering hid: its scenarios shared one record path, which
+#: ``JsonFileRecordSink`` has refused to clobber since #659.
+_KNOWN_BROKEN: dict[str, str] = {}
 
 
 def _blindness_reason(path: Path) -> str | None:

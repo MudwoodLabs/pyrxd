@@ -411,6 +411,61 @@ jobs:
             tests/test_xchain_eth_adversarial_e2e.py \
             tests/test_xchain_eth_active_adversary_e2e.py \
             tests/test_xchain_eth_tierb_isolated_e2e.py
+      # RXD↔USDC/USDT against the REAL token contracts, on an anvil fork of Ethereum and of Base
+      # (Base USDT is the only has_blacklist=False token, a different pre-reveal gate branch). The
+      # only end-to-end run of the ERC-20 counter leg. It was opt-in and nothing ran it, so it sat
+      # red from v0.22.0 (#482's ordering) to the PR that added this step, unnoticed.
+      #
+      # Keyless public RPCs, so an endpoint can be down. The policy:
+      #   * PASS needs a full run, every test passing and NONE skipped, against SOME endpoint. A
+      #     defect in the code fails on every endpoint, so retrying cannot turn it green; it can
+      #     only route around an endpoint that is down, and each fallback is a visible ::warning::.
+      #   * A SKIP IS A FAILURE. The suite skips when its environment is missing (the opt-in, the
+      #     RPC variable, docker, anvil, the node image), and a skip reports green. This step reads
+      #     pytest's junit counts and refuses `skipped > 0`, and refuses zero tests, so a nightly that
+      #     ran nothing cannot pass for one that ran everything.
+      #   * No endpoint passing is a FAILURE, never a skip.
+      # Endpoints measured working for forking without a key (see the suite's docstring and
+      # tests/test_erc20_leg_fork_integration.py's): anvil forks at the tip, so these need recent
+      # state, not deep archive reads.
+      - name: RXD↔USDC/USDT lifecycle on forked Ethereum and Base
+        shell: bash
+        env:
+          XCHAIN_ERC20_E2E: "1"
+        run: |
+          set -euo pipefail
+          no_skips() {
+            python - "$1" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          tests, skipped, failures, errors = (int(suite.get(k, 0)) for k in ("tests", "skipped", "failures", "errors"))
+          print(f"junit: tests={tests} skipped={skipped} failures={failures} errors={errors}")
+          sys.exit(0 if tests > 0 and skipped == 0 and failures == 0 and errors == 0 else 1)
+          PY
+          }
+          run_fork() {
+            local chain="$1"; shift
+            local rpc xml="erc20-lifecycle-${chain}.xml"
+            for rpc in "$@"; do
+              rm -f "$xml"
+              if PYRXD_ETH_FORK_CHAIN_ID="$chain" PYRXD_ETH_FORK_RPC="$rpc" \
+                  poetry run pytest -o "addopts=" -m integration -q -rs --junitxml="$xml" \
+                  tests/test_xchain_erc20_usdc_lifecycle_e2e.py && no_skips "$xml"; then
+                echo "chain ${chain}: passed against ${rpc}"
+                return 0
+              fi
+              echo "::warning::ERC-20 lifecycle e2e on chain ${chain} did not pass against ${rpc}; trying the next endpoint"
+            done
+            echo "::error::ERC-20 lifecycle e2e on chain ${chain} did not pass against any endpoint: $*"
+            return 1
+          }
+          rc=0
+          run_fork 1 https://ethereum-rpc.publicnode.com https://eth.drpc.org || rc=1
+          run_fork 8453 https://mainnet.base.org https://base.meowrpc.com https://base-mainnet.public.blastapi.io || rc=1
+          exit "$rc"
 
   # ---------------------------------------------------------------- vendor pin
   vendor-freshness:
