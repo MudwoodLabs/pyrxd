@@ -13,6 +13,7 @@ This is the I/O layer; the security-critical preimage parsing is the pure
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from pyrxd.network.redaction import redact_endpoint_secrets, redact_endpoints_in
@@ -116,20 +117,103 @@ class _RedactingLogger:
         return getattr(self._logger, name)
 
 
+_DIGITS = re.compile(r"[0-9]+")
+
+
+def _honest_jsonrpc(value: Any) -> bool:
+    """The only ``jsonrpc`` an honest server sends."""
+    return value == "2.0" and isinstance(value, str)
+
+
+def _honest_id(value: Any) -> bool:
+    """An id web3 could have sent: an int, or its digits as a string (a proxy that stringifies)."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) or (isinstance(value, str) and _DIGITS.fullmatch(value) is not None)
+
+
+def _honest_code(value: Any) -> bool:
+    """A JSON-RPC error code is an integer."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _scrub_values(value: Any, url: str) -> Any:
+    """*value* with *url*'s credential parts removed from every string VALUE in it.
+
+    Dict KEYS are never rewritten, and neither is anything that is not a string. The redactor
+    treats each query value of *url* as a whole-token secret, so a URL ending ``?x=message`` would
+    otherwise rename an ``error``'s ``message`` key, and ``?v=2`` would turn ``"2.0"`` into
+    ``"<redacted>.0"`` — both of which made web3 reject honest responses.
+    """
+    if isinstance(value, str):
+        return str(redact_endpoints_in(value, url))
+    if isinstance(value, dict):
+        return {k: _scrub_values(v, url) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_values(v, url) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_values(v, url) for v in value)
+    return value
+
+
+def _scrub_error(error: Any, url: str) -> Any:
+    """An ``error`` member: string values scrubbed, keys kept, ``code`` kept when it is an int."""
+    if isinstance(error, dict):
+        return {k: (v if k == "code" and _honest_code(v) else _scrub_values(v, url)) for k, v in error.items()}
+    return _scrub_values(error, url)
+
+
 def _scrub_response(response: Any, url: str) -> Any:
-    """*response* with the endpoint's credential parts removed from every string in it, EXCEPT
-    the ``result`` of a response object — which is returned exactly as the server sent it.
+    """*response* with the endpoint's credential parts removed from the text a server wrote.
 
     A JSON-RPC error, or a malformed response, arrives as a SUCCESSFUL HTTP response, so it never
     reaches the ``except`` in ``make_request``; web3 raises from it later (``Web3RPCError``,
     ``BadResponseFormat``) and quotes what the server wrote — which can echo the request path, key
-    included. Which field the server puts that text in is the server's choice (``error`` as an
-    object, a string, a list; a stray top-level field; a bare list), so nothing but ``result`` is
-    trusted to be free of it. ``result`` is the data the caller asked for and is never rewritten.
+    included, in any member it likes.
+
+    The rule is: an HONEST response is returned byte-identical, and anything else is scrubbed.
+
+    * A well-formed single response — a dict carrying exactly one of ``result`` and ``error``, a
+      ``jsonrpc`` of ``"2.0"`` and an ``id`` that is an int or a digit string — keeps its
+      ``result``, ``jsonrpc`` and ``id`` as sent, and its ``error.code`` too when that is an int.
+      A response whose ``jsonrpc`` or ``id`` has any other shape is NOT well-formed: web3 rejects it
+      and quotes the whole response, ``result`` included. Every other string VALUE is scrubbed; no
+      key is ever rewritten. The redactor treats each URL query value as a whole-token secret, so
+      rewriting a protocol member or a key unconditionally broke honest responses for ordinary
+      URLs (``?v=2`` turned ``"2.0"`` into ``"<redacted>.0"``).
+    * Anything else — a dict with both ``result`` and ``error`` or with neither, a misshapen
+      ``jsonrpc`` or ``id``, a bare list or string where a single response was due — is scrubbed IN
+      FULL, ``result`` included. web3
+      rejects those shapes and quotes them, so nothing honest is lost. (A batch response is a list
+      by design; ``make_batch_request`` applies this function to each element instead.)
     """
-    if isinstance(response, dict):
-        return {k: (v if k == "result" else redact_endpoints_in(v, url)) for k, v in response.items()}
-    return redact_endpoints_in(response, url)
+    if (
+        not isinstance(response, dict)
+        or (("result" in response) == ("error" in response))
+        or not _honest_jsonrpc(response.get("jsonrpc"))
+        or not _honest_id(response.get("id"))
+    ):
+        return _scrub_values(response, url)
+    out: dict[Any, Any] = {}
+    for k, v in response.items():
+        if _kept_as_sent(k, v):
+            out[k] = v
+        elif k == "error":
+            out[k] = _scrub_error(v, url)
+        else:
+            out[k] = _scrub_values(v, url)
+    return out
+
+
+def _kept_as_sent(member: Any, value: Any) -> bool:
+    """Whether a well-formed response's *member* is returned untouched (see :func:`_scrub_response`)."""
+    if member == "result":
+        return True
+    if member == "jsonrpc":
+        return _honest_jsonrpc(value)
+    if member == "id":
+        return _honest_id(value)
+    return False
 
 
 _PROVIDER_CLASS: Any = None
@@ -138,8 +222,8 @@ _PROVIDER_CLASS: Any = None
 def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
     """``AsyncHTTPProvider`` for *rpc_url* whose transport failures never quote the URL's secrets.
 
-    It also removes them from every part of a response except its ``result`` before web3 raises
-    from it (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
+    It also removes them from what a server wrote into a response before web3 raises from it,
+    leaving an honest response byte-identical (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
     the legs make through ``rpc.w3`` / :func:`~pyrxd.eth_wallet.multi_rpc.read_contract`, which
     never pass through an :class:`EthRpc` method and so are not covered by :meth:`EthRpc._failed`.
     A failure whose chain quotes nothing secret is re-raised UNCHANGED (same type, so web3's own
