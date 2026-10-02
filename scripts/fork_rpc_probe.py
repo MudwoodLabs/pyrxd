@@ -106,7 +106,10 @@ def _fetch(req: urllib.request.Request, method: str, *, timeout: float) -> bytes
             box["refused"] = f"{method}: HTTP {exc.code}" + (
                 " (redirects are not followed)" if 300 <= exc.code < 400 else ""
             )
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except Exception as exc:  # ANY failure means this endpoint cannot serve the fork
+            # Not only URLError/OSError: a malformed status line or an over-long header raises
+            # http.client.HTTPException, which is neither. Escaping here would end the probe with a
+            # traceback instead of falling through to the next endpoint.
             box["refused"] = f"{method}: {type(exc).__name__}: {_excerpt(exc)}"
 
     worker = threading.Thread(target=run, daemon=True)
@@ -116,7 +119,10 @@ def _fetch(req: urllib.request.Request, method: str, *, timeout: float) -> bytes
         raise ProbeRefused(f"{method}: no complete reply within {timeout:g} s")
     if "refused" in box:
         raise ProbeRefused(str(box["refused"]))
-    return box["raw"]  # type: ignore[return-value]
+    raw = box.get("raw")
+    if not isinstance(raw, bytes):
+        raise ProbeRefused(f"{method}: no reply was read")
+    return raw
 
 
 def _refuse_constant(name: str) -> object:

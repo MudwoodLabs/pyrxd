@@ -100,6 +100,11 @@ def server(tmp_path):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            if name == "bad_status":
+                # Not HTTP at all: http.client raises BadStatusLine (an HTTPException, not an OSError).
+                self.wfile.write(b"GARBAGE\r\n\r\n")
+                self.close_connection = True
+                return
             if name == "drip":
                 # A VALID reply, one byte at a time: each read is short, the call never ends.
                 out = json.dumps({"jsonrpc": "2.0", "id": 1, "result": _GOOD_TIP}).encode()
@@ -325,3 +330,16 @@ def test_a_chosen_endpoint_not_on_the_list_is_refused(server, tmp_path):
     assert proc.returncode != 0, out
     assert calls == [], f"the suite ran against an off-list endpoint: {calls}\n{out}"
     assert "the probe chose an endpoint that is not on the list" in out, out
+
+
+def test_a_malformed_http_response_falls_through_to_the_next_endpoint(server, tmp_path):
+    """A garbage status line raises http.client.HTTPException, which is neither URLError nor OSError.
+    It must count as a refused endpoint, so the probe moves on, not a traceback that ends the step."""
+    base, _pwned = server
+    with pytest.raises(fork_rpc_probe.ProbeRefused, match="BadStatusLine"):
+        fork_rpc_probe.probe(f"{base}/bad_status", "0x" + "11" * 20, depth=1024, timeout=10)
+    proc, calls = _run_step(tmp_path, eth=[f"{base}/bad_status", f"{base}/healthy"], base=[f"{base}/healthy"])
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "Traceback" not in out, out
+    assert calls == [f"1 {base}/healthy", f"8453 {base}/healthy"], (calls, out)
