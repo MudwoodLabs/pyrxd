@@ -173,19 +173,26 @@ def _scrub_response(response: Any, url: str) -> Any:
 
     The rule is: an HONEST response is returned byte-identical, and anything else is scrubbed.
 
-    * A well-formed single response — a dict carrying exactly one of ``result`` and ``error`` —
-      keeps its ``result`` as sent, and its ``jsonrpc``, ``id`` and ``error.code`` too WHEN they have
-      the shape an honest server sends (``"2.0"``; an int or a digit string; an int). A protocol
-      member in any other shape is scrubbed like text. Every other string VALUE is scrubbed; no
+    * A well-formed single response — a dict carrying exactly one of ``result`` and ``error``, a
+      ``jsonrpc`` of ``"2.0"`` and an ``id`` that is an int or a digit string — keeps its
+      ``result``, ``jsonrpc`` and ``id`` as sent, and its ``error.code`` too when that is an int.
+      A response whose ``jsonrpc`` or ``id`` has any other shape is NOT well-formed: web3 rejects it
+      and quotes the whole response, ``result`` included. Every other string VALUE is scrubbed; no
       key is ever rewritten. The redactor treats each URL query value as a whole-token secret, so
       rewriting a protocol member or a key unconditionally broke honest responses for ordinary
       URLs (``?v=2`` turned ``"2.0"`` into ``"<redacted>.0"``).
-    * Anything else — a dict with both ``result`` and ``error`` or with neither, a bare list or
-      string where a single response was due — is scrubbed IN FULL, ``result`` included. web3
+    * Anything else — a dict with both ``result`` and ``error`` or with neither, a misshapen
+      ``jsonrpc`` or ``id``, a bare list or string where a single response was due — is scrubbed IN
+      FULL, ``result`` included. web3
       rejects those shapes and quotes them, so nothing honest is lost. (A batch response is a list
       by design; ``make_batch_request`` applies this function to each element instead.)
     """
-    if not isinstance(response, dict) or (("result" in response) == ("error" in response)):
+    if (
+        not isinstance(response, dict)
+        or (("result" in response) == ("error" in response))
+        or not _honest_jsonrpc(response.get("jsonrpc"))
+        or not _honest_id(response.get("id"))
+    ):
         return _scrub_values(response, url)
     out: dict[Any, Any] = {}
     for k, v in response.items():

@@ -563,6 +563,11 @@ _PROTOCOL_LEAKS = {
     "jsonrpc-echo": lambda rid, echo: {"jsonrpc": echo, "id": rid, "result": "0x1"},
     "string-error-code": lambda rid, echo: {"jsonrpc": "2.0", "id": rid, "error": {"code": echo, "message": "x"}},
     "top-level-list-with-result": lambda rid, echo: [{"jsonrpc": "2.0", "id": rid, "result": echo}],
+    # A protocol member web3 rejects makes it quote the WHOLE response, so ``result`` too.
+    "old-jsonrpc-result-echo": lambda rid, echo: {"jsonrpc": "1.0", "id": rid, "result": echo},
+    "null-id-result-echo": lambda rid, echo: {"jsonrpc": "2.0", "id": None, "result": echo},
+    "float-id-result-echo": lambda rid, echo: {"jsonrpc": "2.0", "id": 1.5, "result": echo},
+    "no-jsonrpc-result-echo": lambda rid, echo: {"id": rid, "result": echo},
     "error-and-result": lambda rid, echo: {
         "jsonrpc": "2.0",
         "id": rid,
