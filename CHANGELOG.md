@@ -26,14 +26,15 @@ This summary points into the entries below it, which are kept as they were writt
   and `build-refund` identify the RXD covenant by its funding outpoint. `verify_funded` refuses an
   ETH contract that is already settled, and an ETH leg refuses to sign for a chain other than the
   one its rpc is pinned to. Keyed endpoint URLs no longer reach error text, `--debug` tracebacks,
-  watchtower pages or logs.
+  watchtower pages or logs, with two exceptions noted in the entries below: web3's own DEBUG-level
+  request log, and a key carried as a short letters-only path segment that a server echoes back.
 
 **Swaps: the taker proves the maker's Radiant funding before locking (#809, #817, #822).**
 `SwapCoordinator` no longer takes one server's word that the maker's covenant exists. It checks
 the funding transaction's merkle branch and links its header to a checkpoint pyrxd ships, at a
-depth sized from the value at stake. By default, above 1,000 RXD it needs two operators to
-report the funding's depth. It also refuses at construction, before anyone locks, a swap that its own gate
-would refuse later. The mainnet runner scripts construct at their defaults and build the
+depth sized from the value at stake. On mainnet, above 1,000 RXD by default, it needs two operators
+to report the funding's depth. It also refuses at construction, before anyone locks, a swap whose
+terms its gate would refuse on an honest chain; the checks at lock time still decide. The mainnet runner scripts construct at their defaults and build the
 coordinator before anything is minted or broadcast.
 
 **HashMarks: verification proves the mark's block (#802, #804, #807).** `pyrxd verify` and the
@@ -41,7 +42,8 @@ coordinator before anything is minted or broadcast.
 for its height, and link that header hash by hash to a shipped checkpoint. Past the newest
 checkpoint (467,712 in this release) they link at most 4,032 headers. `pyrxd verify` reports a
 mark beyond that as `CONFIRMED`, with the reason, and the pages show it as the server's word.
-Newer checkpoints come with newer releases.
+Newer checkpoints come with newer pyrxd releases; the pages, which deploy from `main`, pick them
+up when the table there is refreshed.
 
 **Testing: the RXD↔USDC/USDT lifecycle end-to-end suite passes again and runs nightly (#824).**
 
@@ -52,10 +54,17 @@ entry named in brackets has the detail.
   `--rxd-quorum`, and exits 1. `--accept-single-source` starts it anyway, but no longer arms the
   autonomous refund on single-source reads; that needs the new `--auto-refund-on-single-source`
   [Changed].
-- Sources are counted by operator, as declared, or by registered domain, not by host. Every
-  loopback spelling is one source. Quorums refuse two sources of one operator with
+- Sources are counted by registered domain, or by an operator pyrxd knows, not by host (an
+  operator declared in config also counts for HashMark form 2). Every loopback spelling is one
+  source. Quorums refuse two sources of one operator with
   `ValidationError`, and input that names no host is refused. `endpoint_host` and
   `count_distinct_hosts` are removed [Changed (breaking)].
+- `MultiSourceEthRpc`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and
+  `MultiSourceRxdChainSource` refuse a client object that carries no `source_key`
+  (`pyrxd.network.source_identity.source_key_of`); custom clients must set one [Changed (breaking)].
+- The swap taker gate refuses a Radiant leg tagged with a test network other than regtest (for
+  example `tb` or `signet`): pyrxd has no Radiant chain parameters to prove funding there. Use a
+  regtest (`bcrt`) or mainnet leg [Changed].
 - An injected ETH/ERC-20 HTLC artifact must carry `immutableReferences` and `immutable_names`, or
   the leg is refused at construction [Changed (breaking)].
 - The mainnet swap runner scripts take `--rxd-ssh-host` and `--rxd-container` with no default,

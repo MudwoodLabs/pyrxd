@@ -9,11 +9,11 @@ pip install --upgrade pyrxd          # or 'pyrxd[eth]' for the ETH/ERC-20 legs
 - **ETH/ERC-20 HTLC counterparty check (HIGH, #798, advisory GHSA-44pc-4fv5-39hv). Affects 0.6.0 through 0.25.1.** `verify_funded` compared the counterparty's deployed runtime with the expected one using a compare that skipped every byte that was zero in the artifact. Solidity stores each `immutable` at several offsets, and a getter reads a different copy from the one `claim()` reads. A taker who deploys the ETH side could make the getters name the maker while `claim()` paid another address. The maker's check passed, the maker revealed the preimage, and the taker could take both legs. The check now places every negotiated immutable at every offset and requires exact byte equality. A per-PR test now runs the real `verify_funded` against forged copies (#821).
 - **A settled ETH contract is refused (#821).** `verify_funded` refuses a contract whose `settled` flag is already set, since it cannot pay out. An ETH leg also refuses to sign for a chain other than the one its RPC is pinned to.
 - **Status and recovery report what they know (#815, #820).** `swap status` no longer calls a BTC refund still in the mempool, one RPC's report of an ETH refund, or an empty ETH log read a finished or still-locked leg. It no longer tells a taker to keep waiting while the ETH preimage is already in the contract's logs. `status`, `build-claim` and `build-refund` identify the RXD covenant by its funding outpoint, not by any output at the covenant script.
-- **Credentials stay out of output (#815, #821, #823).** A keyed RPC or ElectrumX URL no longer reaches error text, `--debug` tracebacks, `--json` output, watchtower pages or logs. pyrxd names an endpoint as `scheme://host:port`.
+- **Credentials stay out of output (#815, #821, #823).** A keyed RPC or ElectrumX URL no longer reaches error text, `--debug` tracebacks, `--json` output, watchtower pages or logs, with two exceptions listed in the CHANGELOG: web3's own DEBUG-level request log, and a key carried as a short letters-only path segment that a server echoes back. pyrxd names an endpoint as `scheme://host:port`.
 
 ## The swap taker proves the maker's funding (#809, #817, #822)
 
-The taker no longer takes one ElectrumX server's word that the maker's covenant exists before locking BTC or ETH. `SwapCoordinator` checks the funding transaction's merkle branch, links its block header to a checkpoint pyrxd ships, and requires a depth sized from the value at stake. By default, above 1,000 RXD, two operators must report the funding's depth. A swap the gate would refuse later is refused when the coordinator is built, before anyone locks. What stays the server's word, such as whether the covenant output is still unspent, is listed in the CHANGELOG.
+The taker no longer takes one ElectrumX server's word that the maker's covenant exists before locking BTC or ETH. `SwapCoordinator` checks the funding transaction's merkle branch, links its block header to a checkpoint pyrxd ships, and requires a depth sized from the value at stake. On mainnet, above 1,000 RXD by default, two operators must report the funding's depth. A swap whose terms the gate would refuse on an honest chain is refused when the coordinator is built, before anyone locks; the checks at lock time still decide. What stays the server's word, such as whether the covenant output is still unspent, is listed in the CHANGELOG.
 
 ## Verification proves the mark's block (#802, #804, #807)
 
@@ -22,13 +22,15 @@ The taker no longer takes one ElectrumX server's word that the maker's covenant 
 ## Also in this release
 
 - The RXD↔USDC/USDT end-to-end suite, the only end-to-end run of the ERC-20 leg, passes again and runs nightly on forks of Ethereum and Base (#824).
-- Sources are counted by operator, so two servers of one operator no longer corroborate each other (#801, #803).
+- Sources are counted by registered domain, or by an operator pyrxd knows, so two servers on one domain or of one known operator no longer corroborate each other (#801, #803).
 - `GravityTrade`, the SPV-oracle swap, warns that it is ungated and deprecated. Use `SwapCoordinator` instead (#805).
 
 ## Behaviour changes
 
 - **`pyrxd-watchtower`** exits 1 when it has fewer RXD sources of distinct operators than `--rxd-quorum`. `--accept-single-source` starts it anyway, but no longer arms autonomous refunds on single-source reads. That now needs `--auto-refund-on-single-source`.
-- **Source counting:** endpoints that share an operator or a registered domain count once, and every loopback spelling is one source. A quorum given two of them raises `ValidationError`. `endpoint_host` and `count_distinct_hosts` are removed.
+- **Source counting:** endpoints that share a registered domain or a known operator count once, and every loopback spelling is one source. A quorum given two of them raises `ValidationError`. `endpoint_host` and `count_distinct_hosts` are removed.
+- **Quorum clients:** `MultiSourceEthRpc`, `MultiSourceBtcDataSource`, `MultiSourceBtcFundingReader` and `MultiSourceRxdChainSource` refuse a client object that carries no `source_key`. A custom client must set one from `pyrxd.network.source_identity.source_key(<its URL>)`.
+- **Radiant test networks:** the swap taker gate refuses a Radiant leg tagged with a test network other than regtest, such as `tb` or `signet`, because pyrxd has no Radiant chain parameters to prove funding there. Use a regtest (`bcrt`) or mainnet leg.
 - **ETH/ERC-20 artifacts** must carry `immutableReferences` and `immutable_names`, or the leg is refused at construction.
 - **Swap runner scripts** take `--rxd-ssh-host` and `--rxd-container` with no default, and need `--rxd-block-interval-fast-s`. NFT and FT swaps need `--value-at-risk-photons`.
 - **`SwapCoordinator`** refuses a negotiated value-bearing swap without `MarginPolicy.rxd_block_interval_fast_s`. It also refuses one without a value at stake in any role but maker, and an ETH or ERC-20 swap without `now_unix_s`. A Radiant leg must serve `maker_funding_evidence`.
