@@ -61,27 +61,28 @@ def is_debug() -> bool:
 
 _URL_IN_ARG = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 
-#: URLs that came from somewhere other than argv and the environment — the config file — added by
-#: ``main.cli()`` through :func:`register_endpoint_urls` as soon as the config is loaded.
-_REGISTERED_URLS: list[str] = []
+#: URLs that came from somewhere other than argv and the environment — the config file. SET (not
+#: appended to) by ``main.cli()`` through :func:`set_config_endpoint_urls` on every invocation, so
+#: one in-process invocation (a test runner's, say) never redacts with another's URLs.
+_CONFIG_URLS: tuple[str, ...] = ()
 
 
-def register_endpoint_urls(urls: Iterable[str]) -> None:
-    """Make *urls* known to :func:`endpoint_urls_in_invocation` for the rest of this process."""
-    for url in urls:
-        if isinstance(url, str) and url and url not in _REGISTERED_URLS:
-            _REGISTERED_URLS.append(url)
+def set_config_endpoint_urls(urls: Iterable[str]) -> None:
+    """Make *urls* — and only *urls* — the config-file URLs :func:`endpoint_urls_in_invocation`
+    reports, replacing whatever an earlier invocation in this process set."""
+    global _CONFIG_URLS
+    _CONFIG_URLS = tuple(dict.fromkeys(u for u in urls if isinstance(u, str) and u))
 
 
 def endpoint_urls_in_invocation() -> list[str]:
     """Every endpoint URL this invocation may use: the command line, ``PYRXD_*`` variables and
-    the loaded config file (:func:`register_endpoint_urls`).
+    the loaded config file (:func:`set_config_endpoint_urls`).
 
     The URLs whose credential parts must not appear in text the CLI prints but did not write — a
     library exception's message, or its ``--debug`` traceback.
     """
     sources = [*sys.argv[1:], *(v for k, v in os.environ.items() if k.startswith("PYRXD_"))]
-    return [*(m for text in sources for m in _URL_IN_ARG.findall(text)), *_REGISTERED_URLS]
+    return [*(m for text in sources for m in _URL_IN_ARG.findall(text)), *_CONFIG_URLS]
 
 
 class CliError(click.ClickException):

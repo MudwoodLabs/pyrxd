@@ -157,6 +157,9 @@ def cli(
     # We set it as early as possible so any error during config load
     # also benefits from the traceback.
     _errors.set_debug(debug)
+    # This invocation's config URLs, not a previous one's: cleared before the load (which can
+    # fail), then set from what was loaded.
+    _errors.set_config_endpoint_urls(())
 
     try:
         cfg = _config.load(config_path)
@@ -164,7 +167,7 @@ def cli(
         raise _config_error(exc, config_path) from None
     # Before anything can fail on one of them: a keyed URL that lives only in the config file must
     # be as redactable in an error or a --debug traceback as one passed on the command line.
-    _errors.register_endpoint_urls(cfg.every_endpoint_url())
+    _errors.set_config_endpoint_urls(cfg.every_endpoint_url())
 
     # Resolve final network: flag > env (already in cfg) > built-in default.
     #

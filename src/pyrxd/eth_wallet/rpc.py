@@ -116,20 +116,62 @@ class _RedactingLogger:
         return getattr(self._logger, name)
 
 
+#: Response members that are PROTOCOL, not text: web3 validates them by exact value, so they are
+#: never rewritten. ``result`` is the data the caller asked for and is likewise returned as sent.
+_UNTOUCHED_MEMBERS = frozenset({"jsonrpc", "id", "result"})
+
+
+def _scrub_values(value: Any, url: str) -> Any:
+    """*value* with *url*'s credential parts removed from every string VALUE in it.
+
+    Dict KEYS are never rewritten, and neither is anything that is not a string. The redactor
+    treats each query value of *url* as a whole-token secret, so a URL ending ``?x=message`` would
+    otherwise rename an ``error``'s ``message`` key, and ``?v=2`` would turn ``"2.0"`` into
+    ``"<redacted>.0"`` — both of which made web3 reject honest responses.
+    """
+    if isinstance(value, str):
+        return str(redact_endpoints_in(value, url))
+    if isinstance(value, dict):
+        return {k: _scrub_values(v, url) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_values(v, url) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_values(v, url) for v in value)
+    return value
+
+
+def _scrub_error(error: Any, url: str) -> Any:
+    """An ``error`` member: string values scrubbed, ``code`` and every key left exactly as sent."""
+    if isinstance(error, dict):
+        return {k: (v if k == "code" else _scrub_values(v, url)) for k, v in error.items()}
+    return _scrub_values(error, url)
+
+
 def _scrub_response(response: Any, url: str) -> Any:
-    """*response* with the endpoint's credential parts removed from every string in it, EXCEPT
-    the ``result`` of a response object — which is returned exactly as the server sent it.
+    """*response* with the endpoint's credential parts removed from the text a server wrote.
 
     A JSON-RPC error, or a malformed response, arrives as a SUCCESSFUL HTTP response, so it never
     reaches the ``except`` in ``make_request``; web3 raises from it later (``Web3RPCError``,
     ``BadResponseFormat``) and quotes what the server wrote — which can echo the request path, key
-    included. Which field the server puts that text in is the server's choice (``error`` as an
-    object, a string, a list; a stray top-level field; a bare list), so nothing but ``result`` is
-    trusted to be free of it. ``result`` is the data the caller asked for and is never rewritten.
+    included, in ``error`` (an object, a string, a list), in a stray member, or in a bare list.
+
+    What is scrubbed is string VALUES only. Never touched: ``jsonrpc``, ``id`` and ``result`` (web3
+    checks the first two by exact value, and ``result`` is the caller's data), any dict key, and an
+    error's ``code``. A list at the top level is scrubbed element by element by the same rule.
     """
     if isinstance(response, dict):
-        return {k: (v if k == "result" else redact_endpoints_in(v, url)) for k, v in response.items()}
-    return redact_endpoints_in(response, url)
+        out: dict[Any, Any] = {}
+        for k, v in response.items():
+            if k in _UNTOUCHED_MEMBERS:
+                out[k] = v
+            elif k == "error":
+                out[k] = _scrub_error(v, url)
+            else:
+                out[k] = _scrub_values(v, url)
+        return out
+    if isinstance(response, list):
+        return [_scrub_response(r, url) for r in response]
+    return _scrub_values(response, url)
 
 
 _PROVIDER_CLASS: Any = None
@@ -138,8 +180,9 @@ _PROVIDER_CLASS: Any = None
 def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
     """``AsyncHTTPProvider`` for *rpc_url* whose transport failures never quote the URL's secrets.
 
-    It also removes them from every part of a response except its ``result`` before web3 raises
-    from it (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
+    It also removes them from the string values a server wrote into a response — never ``result``,
+    ``jsonrpc``, ``id``, an error ``code`` or any key — before web3 raises from it
+    (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
     the legs make through ``rpc.w3`` / :func:`~pyrxd.eth_wallet.multi_rpc.read_contract`, which
     never pass through an :class:`EthRpc` method and so are not covered by :meth:`EthRpc._failed`.
     A failure whose chain quotes nothing secret is re-raised UNCHANGED (same type, so web3's own

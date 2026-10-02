@@ -51,10 +51,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `EthRpc` now uses a provider that redacts transport failures. An exception whose chain quotes
     a secret is replaced by a redacted `NetworkError` with the chain cut; other exceptions are
     re-raised unchanged.
-  - The same provider redacts every string in a response except its `result` before web3 sees
+  - The same provider redacts the string VALUES a server wrote into a response before web3 sees
     it, so an endpoint that echoes the request path in an error body, or in a malformed response,
-    does not put the key into `Web3RPCError` or `BadResponseFormat`. `result` is returned exactly
-    as sent.
+    does not put the key into `Web3RPCError` or `BadResponseFormat`. Never rewritten: `result`,
+    `jsonrpc`, `id`, an error's `code`, and any key. (An earlier cut on this branch also rewrote
+    those, and an ordinary query such as `?v=2` or `?x=message` then broke every honest response;
+    a test now holds each such URL shape to a plain provider's results.) Known limitation: the
+    redactor treats each query value as a secret token, so with a short one (`?v=2`) a matching
+    token in an error's free text is also replaced. That is cosmetic, and fails safe.
   - Both apply to every request the provider sends, including contract reads that go through
     `rpc.w3` directly.
   - Every `EthRpc` error is built through one redacting helper.
@@ -67,7 +71,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `pyrxd --debug swap recover-preimage --eth-rpc-url <keyed>` printed the key on a 401 whose
   response repeats the path, or after a redirect. Every command's `--debug` traceback now goes
   through the whole-token redactor, with the URLs on the command line, in `PYRXD_*` variables and
-  in the loaded config file.
+  in the config file loaded by that invocation (replaced, not accumulated, on each `cli()` call).
 - **An ETH leg refuses to sign for a chain other than the one its rpc is pinned to.**
   `assert_chain` checks the endpoint against the rpc's own `expected_chain_id`, but nothing checked
   the leg's `chain_id` against that id, so a leg and an rpc built with different ids could sign for

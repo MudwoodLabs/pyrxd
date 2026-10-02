@@ -656,3 +656,116 @@ async def test_a_leg_signing_for_another_chain_never_reaches_the_node(anvil_url)
         assert sent == []
     finally:
         await rpc.close()
+
+
+# ---------------------------------------------------------------------------
+# The response scrub must not change an honest response, whatever the URL's query looks like.
+# Offline twin: test_eth_rpc_scrub_keeps_honest_responses.py.
+# ---------------------------------------------------------------------------
+
+
+def _reverting_runtime(revert_data: bytes) -> str:
+    """Runtime that reverts with *revert_data*: CODECOPY it to memory 0, then REVERT."""
+    n = len(revert_data)
+    assert n < 256
+    return "0x" + f"60{n:02x}600c600039" + f"60{n:02x}6000fd" + revert_data.hex()
+
+
+@pytest.fixture(params=[False, True], ids=["int-ids", "string-ids"])
+def anvil_proxy(anvil_url, request):
+    """Anvil behind a pass-through HTTP proxy that ignores the path and query, so any URL shape can
+    reach a real node. With ``string-ids`` the proxy sends each request id as a string."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    string_ids = request.param
+
+    class _H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            if string_ids:
+                for r in req if isinstance(req, list) else [req]:
+                    r["id"] = str(r["id"])
+            up = urllib.request.Request(
+                anvil_url, data=json.dumps(req).encode(), headers={"content-type": "application/json"}
+            )
+            body = urllib.request.urlopen(up, timeout=10).read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_port}", anvil_url, string_ids
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize("suffix", ["/?v=2", "/?debug=0", "/?x=message", "/?x=code", "/?id=1"])
+def test_honest_anvil_responses_are_identical_through_the_scrubbing_provider(anvil_proxy, suffix):
+    import asyncio
+
+    import web3
+    from eth_abi import encode
+
+    base, direct, string_ids = anvil_proxy
+    reason_to = web3.Web3.to_checksum_address("0x" + "ae" * 20)
+    custom_to = web3.Web3.to_checksum_address("0x" + "ce" * 20)
+
+    async def setup():
+        w3 = web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(direct))
+        try:
+            reason = bytes.fromhex("08c379a0") + encode(["string"], ["nope"])
+            await w3.provider.make_request("anvil_setCode", [reason_to, _reverting_runtime(reason)])
+            await w3.provider.make_request("anvil_setCode", [custom_to, _reverting_runtime(bytes.fromhex("560ff900"))])
+            h = await w3.eth.send_transaction({"from": _ADDR_TAKER, "to": _ADDR_MAKER, "value": 1})
+            await w3.eth.wait_for_transaction_receipt(h)
+            return h
+        finally:
+            await w3.provider.disconnect()
+
+    tx = asyncio.run(setup())
+
+    async def batch(w3):
+        async with w3.batch_requests() as b:
+            b.add(w3.eth.get_block(1))
+            b.add(w3.eth.get_transaction_receipt(tx))
+            return await b.async_execute()
+
+    calls = {
+        "chain_id": lambda w3: w3.eth.chain_id,
+        "block": lambda w3: w3.eth.get_block(1),
+        "receipt": lambda w3: w3.eth.get_transaction_receipt(tx),
+        "revert-reason": lambda w3: w3.eth.call({"to": reason_to, "data": "0x"}),
+        "custom-error": lambda w3: w3.eth.call({"to": custom_to, "data": "0x"}),
+        "batch": batch,
+    }
+
+    def outcome(make_w3, call):
+        async def go():
+            w3 = make_w3()
+            try:
+                return await call(w3)
+            finally:
+                await w3.provider.disconnect()
+
+        try:
+            return ("ok", repr(asyncio.run(go())))
+        except Exception as exc:  # the exception IS the outcome being compared
+            return (type(exc).__name__, str(exc))
+
+    url = base + suffix
+    for name, call in calls.items():
+        plain = outcome(lambda: web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(url)), call)
+        ours = outcome(lambda: EthRpc(url, expected_chain_id=_CHAIN_ID).w3, call)
+        assert ours == plain, (name, suffix)
+        if not string_ids:
+            expected = {"revert-reason": "ContractLogicError", "custom-error": "ContractCustomError"}.get(name, "ok")
+            assert plain[0] == expected, (name, plain)
