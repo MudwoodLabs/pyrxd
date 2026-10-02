@@ -27,6 +27,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,6 +48,18 @@ class ProbeRefused(Exception):
     """The endpoint cannot serve this fork; the message says why."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect. A listed endpoint answers JSON-RPC itself; following a 3xx would let an
+    endpoint (or anything on its path) point the probe at an internal address or another scheme, and
+    the refused reply's excerpt would then print that address's body into a public log."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # urllib then raises HTTPError for the 3xx, which _fetch refuses
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _excerpt(raw: object, limit: int = 160) -> str:
     """A refused reply, made safe to put inside a workflow command."""
     text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
@@ -62,13 +75,7 @@ def _call(url: str, method: str, params: list, *, timeout: float) -> str:
     req = urllib.request.Request(  # noqa: S310 - scheme checked above
         url, data=body, headers={"Content-Type": "application/json", "User-Agent": _USER_AGENT}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - scheme checked above
-            raw = resp.read(_MAX_REPLY_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        raise ProbeRefused(f"{method}: HTTP {exc.code}") from None
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise ProbeRefused(f"{method}: {type(exc).__name__}: {_excerpt(exc)}") from None
+    raw = _fetch(req, method, timeout=timeout)
     if len(raw) > _MAX_REPLY_BYTES:
         raise ProbeRefused(f"{method}: reply larger than {_MAX_REPLY_BYTES} bytes")
     try:
@@ -81,6 +88,35 @@ def _call(url: str, method: str, params: list, *, timeout: float) -> str:
     if not isinstance(result, str):
         raise ProbeRefused(f"{method}: result is not a string: {_excerpt(raw)}")
     return result
+
+
+def _fetch(req: urllib.request.Request, method: str, *, timeout: float) -> bytes:
+    """The reply body, read within *timeout* seconds IN TOTAL.
+
+    The socket timeout alone bounds each read, not the call: an endpoint that drips one byte at a time
+    keeps every read short and the call alive indefinitely. So the fetch runs in a daemon thread and the
+    call is abandoned at the deadline (the thread dies with the process; nothing it read is used)."""
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            with _OPENER.open(req, timeout=timeout) as resp:  # scheme checked by _call
+                box["raw"] = resp.read(_MAX_REPLY_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            box["refused"] = f"{method}: HTTP {exc.code}" + (
+                " (redirects are not followed)" if 300 <= exc.code < 400 else ""
+            )
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            box["refused"] = f"{method}: {type(exc).__name__}: {_excerpt(exc)}"
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise ProbeRefused(f"{method}: no complete reply within {timeout:g} s")
+    if "refused" in box:
+        raise ProbeRefused(str(box["refused"]))
+    return box["raw"]  # type: ignore[return-value]
 
 
 def _refuse_constant(name: str) -> object:
@@ -121,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--chain-id", type=int, required=True)
     ap.add_argument("--depth", type=int, default=1024, help="blocks behind the tip to read state at")
-    ap.add_argument("--timeout", type=float, default=15.0, help="seconds per call")
+    ap.add_argument("--timeout", type=float, default=15.0, help="seconds per call, in total")
     ap.add_argument("--chosen-file", required=True, help="where the chosen URL is written")
     ap.add_argument("urls", nargs="+")
     args = ap.parse_args(argv)

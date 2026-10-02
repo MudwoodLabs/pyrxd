@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -33,6 +34,8 @@ _WORKFLOW = _ROOT / ".github" / "workflows" / "integration.yml"
 _STEP_NAME = "RXD↔USDC/USDT lifecycle on forked Ethereum and Base"
 _GOOD_TIP = "0x4000"
 _GOOD_CODE = "0x6080604052"
+#: Requests that reached the server's "internal" path (reset per server fixture).
+_INTERNAL_HITS: list[str] = []
 
 sys.path.insert(0, str(_ROOT / "scripts"))
 import fork_rpc_probe
@@ -69,12 +72,48 @@ def _hostile(name: str, pwned: Path) -> tuple[object, object]:
 def server(tmp_path):
     """A local JSON-RPC server: ``http://127.0.0.1:PORT/<name>`` answers as the named endpoint."""
     pwned = tmp_path / "PWNED"
+    internal_hits = _INTERNAL_HITS
+    internal_hits.clear()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_a):
             pass
 
+        def _internal(self):
+            internal_hits.append(self.command)
+            out = b"INTERNAL-SECRET-0123456789"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        do_GET = _internal
+
         def do_POST(self):
+            name = self.path.split("?")[0].strip("/")
+            if name == "internal":
+                return self._internal()
+            if name == "redirect":
+                # An endpoint pointing the probe at an address only the runner can reach.
+                self.send_response(302)
+                self.send_header("Location", "/internal")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if name == "drip":
+                # A VALID reply, one byte at a time: each read is short, the call never ends.
+                out = json.dumps({"jsonrpc": "2.0", "id": 1, "result": _GOOD_TIP}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                try:
+                    for b in out:
+                        self.wfile.write(bytes([b]))
+                        self.wfile.flush()
+                        time.sleep(0.5)
+                except OSError:
+                    pass
+                return
             req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             tip, code = _hostile(self.path.split("?")[0].strip("/"), pwned)
             if req["method"] == "eth_getCode":
@@ -106,7 +145,7 @@ def _step_script() -> tuple[str, dict]:
 
 
 def _run_step(
-    tmp_path: Path, eth: list[str], base: list[str], *, suite: str = "pass"
+    tmp_path: Path, eth: list[str], base: list[str], *, suite: str = "pass", probe_python: str | None = None
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run the workflow step with its endpoint lists replaced, ``poetry``/``python`` shimmed."""
     script, env_block = _step_script()
@@ -150,7 +189,7 @@ def _run_step(
         "PYTHONPATH": str(_ROOT / "src"),
         "RUNNER_TEMP": str(tmp_path),
         "SHIM_LOG": str(log),
-        "SHIM_PYTHON": sys.executable,
+        "SHIM_PYTHON": probe_python or sys.executable,
         "SHIM_SUITE": suite,
     }
     proc = subprocess.run(
@@ -247,3 +286,42 @@ def test_a_tip_below_the_probe_depth_is_refused(server):
     base, _pwned = server
     with pytest.raises(fork_rpc_probe.ProbeRefused, match="below the probe depth"):
         fork_rpc_probe.probe(f"{base}/healthy", "0x" + "11" * 20, depth=int(_GOOD_TIP, 16) + 1, timeout=10)
+
+
+def test_a_redirect_is_refused_and_never_followed(server):
+    """A 3xx would let an endpoint point the probe at an address only the runner can reach, and the
+    refused reply's excerpt would print that address's body into a public log. Nothing honest needs one."""
+    base, _pwned = server
+    with pytest.raises(fork_rpc_probe.ProbeRefused, match="redirects are not followed") as exc:
+        fork_rpc_probe.probe(f"{base}/redirect", "0x" + "11" * 20, depth=1024, timeout=10)
+    assert _INTERNAL_HITS == [], "the probe followed the redirect"
+    assert "INTERNAL-SECRET" not in str(exc.value)
+
+
+def test_a_dripping_endpoint_is_cut_off_at_the_total_deadline(server):
+    """The socket timeout bounds each read; a reply sent a byte at a time keeps every read short. The
+    deadline is per CALL, so a dripping endpoint is refused near --timeout and the next one is tried."""
+    base, _pwned = server
+    started = time.monotonic()
+    with pytest.raises(fork_rpc_probe.ProbeRefused, match="no complete reply within 2 s"):
+        fork_rpc_probe.probe(f"{base}/drip", "0x" + "11" * 20, depth=1024, timeout=2)
+    assert time.monotonic() - started < 6, "the call outlived its deadline"
+
+
+def test_a_chosen_endpoint_not_on_the_list_is_refused(server, tmp_path):
+    """The step trusts only the URLs it passed in: a probe that writes anything else is refused before
+    the suite runs. Exercised with a stand-in probe that writes an off-list URL."""
+    base, _pwned = server
+    rogue = tmp_path / "rogue-python"
+    rogue.write_text(
+        "#!/bin/sh\n"
+        'while [ $# -gt 0 ]; do [ "$1" = --chosen-file ] && { printf %s http://elsewhere.invalid/ > "$2"; exit 0; }; shift; done\n'
+        "exit 1\n"
+    )
+    rogue.chmod(0o755)
+    healthy = [f"{base}/healthy"]
+    proc, calls = _run_step(tmp_path, eth=healthy, base=healthy, probe_python=str(rogue))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert calls == [], f"the suite ran against an off-list endpoint: {calls}\n{out}"
+    assert "the probe chose an endpoint that is not on the list" in out, out
