@@ -551,3 +551,53 @@ def test_an_honest_RESULT_is_returned_byte_identical_even_when_it_contains_the_k
     assert ours == plain
     assert ours["result"] == weird
     assert json.dumps(ours["result"]) == json.dumps(weird)
+
+
+# ── a protocol member, or a misshapen response, that echoes the key ─────────────────────────────
+
+#: Each keeps the honest-looking parts and puts the echo where the scrub must not trust it. These
+#: are the shapes a values-only scrub that never looked at ``id`` / ``jsonrpc`` / ``code`` /
+#: ``result`` let through (web3 quotes them in ``BadResponseFormat``).
+_PROTOCOL_LEAKS = {
+    "id-echo": lambda rid, echo: {"jsonrpc": "2.0", "id": echo, "result": "0x1"},
+    "jsonrpc-echo": lambda rid, echo: {"jsonrpc": echo, "id": rid, "result": "0x1"},
+    "string-error-code": lambda rid, echo: {"jsonrpc": "2.0", "id": rid, "error": {"code": echo, "message": "x"}},
+    "top-level-list-with-result": lambda rid, echo: [{"jsonrpc": "2.0", "id": rid, "result": echo}],
+    "error-and-result": lambda rid, echo: {
+        "jsonrpc": "2.0",
+        "id": rid,
+        "error": {"code": -1, "message": "x"},
+        "result": echo,
+    },
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_PROTOCOL_LEAKS))
+def test_no_misshapen_protocol_member_carries_the_key_into_a_raw_w3_read(shape):
+    import web3
+
+    srv, hits = _serve(_PROTOCOL_LEAKS[shape])
+    url = f"http://127.0.0.1:{srv.server_port}/v3/{_KEY}"
+
+    def raised(make_w3):
+        async def go():
+            w3 = make_w3()
+            try:
+                return await w3.eth.get_balance("0x" + "11" * 20)
+            finally:
+                await w3.provider.disconnect()
+
+        with pytest.raises(Exception) as caught:
+            asyncio.run(go())
+        return _full_text(caught.value)
+
+    try:
+        # Control, per shape: through a plain provider the key DOES reach the exception.
+        assert _KEY in raised(lambda: web3.AsyncWeb3(web3.AsyncWeb3.AsyncHTTPProvider(url)))
+        before = hits["n"]
+        text = raised(lambda: EthRpc(url, expected_chain_id=1).w3)
+        assert hits["n"] > before
+        assert _KEY not in text, text
+    finally:
+        srv.shutdown()
+        srv.server_close()

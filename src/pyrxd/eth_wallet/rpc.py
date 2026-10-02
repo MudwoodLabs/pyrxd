@@ -13,6 +13,7 @@ This is the I/O layer; the security-critical preimage parsing is the pure
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from pyrxd.network.redaction import redact_endpoint_secrets, redact_endpoints_in
@@ -116,9 +117,24 @@ class _RedactingLogger:
         return getattr(self._logger, name)
 
 
-#: Response members that are PROTOCOL, not text: web3 validates them by exact value, so they are
-#: never rewritten. ``result`` is the data the caller asked for and is likewise returned as sent.
-_UNTOUCHED_MEMBERS = frozenset({"jsonrpc", "id", "result"})
+_DIGITS = re.compile(r"[0-9]+")
+
+
+def _honest_jsonrpc(value: Any) -> bool:
+    """The only ``jsonrpc`` an honest server sends."""
+    return value == "2.0" and isinstance(value, str)
+
+
+def _honest_id(value: Any) -> bool:
+    """An id web3 could have sent: an int, or its digits as a string (a proxy that stringifies)."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) or (isinstance(value, str) and _DIGITS.fullmatch(value) is not None)
+
+
+def _honest_code(value: Any) -> bool:
+    """A JSON-RPC error code is an integer."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _scrub_values(value: Any, url: str) -> Any:
@@ -141,9 +157,9 @@ def _scrub_values(value: Any, url: str) -> Any:
 
 
 def _scrub_error(error: Any, url: str) -> Any:
-    """An ``error`` member: string values scrubbed, ``code`` and every key left exactly as sent."""
+    """An ``error`` member: string values scrubbed, keys kept, ``code`` kept when it is an int."""
     if isinstance(error, dict):
-        return {k: (v if k == "code" else _scrub_values(v, url)) for k, v in error.items()}
+        return {k: (v if k == "code" and _honest_code(v) else _scrub_values(v, url)) for k, v in error.items()}
     return _scrub_values(error, url)
 
 
@@ -153,25 +169,44 @@ def _scrub_response(response: Any, url: str) -> Any:
     A JSON-RPC error, or a malformed response, arrives as a SUCCESSFUL HTTP response, so it never
     reaches the ``except`` in ``make_request``; web3 raises from it later (``Web3RPCError``,
     ``BadResponseFormat``) and quotes what the server wrote — which can echo the request path, key
-    included, in ``error`` (an object, a string, a list), in a stray member, or in a bare list.
+    included, in any member it likes.
 
-    What is scrubbed is string VALUES only. Never touched: ``jsonrpc``, ``id`` and ``result`` (web3
-    checks the first two by exact value, and ``result`` is the caller's data), any dict key, and an
-    error's ``code``. A list at the top level is scrubbed element by element by the same rule.
+    The rule is: an HONEST response is returned byte-identical, and anything else is scrubbed.
+
+    * A well-formed single response — a dict carrying exactly one of ``result`` and ``error`` —
+      keeps its ``result`` as sent, and its ``jsonrpc``, ``id`` and ``error.code`` too WHEN they have
+      the shape an honest server sends (``"2.0"``; an int or a digit string; an int). A protocol
+      member in any other shape is scrubbed like text. Every other string VALUE is scrubbed; no
+      key is ever rewritten. The redactor treats each URL query value as a whole-token secret, so
+      rewriting a protocol member or a key unconditionally broke honest responses for ordinary
+      URLs (``?v=2`` turned ``"2.0"`` into ``"<redacted>.0"``).
+    * Anything else — a dict with both ``result`` and ``error`` or with neither, a bare list or
+      string where a single response was due — is scrubbed IN FULL, ``result`` included. web3
+      rejects those shapes and quotes them, so nothing honest is lost. (A batch response is a list
+      by design; ``make_batch_request`` applies this function to each element instead.)
     """
-    if isinstance(response, dict):
-        out: dict[Any, Any] = {}
-        for k, v in response.items():
-            if k in _UNTOUCHED_MEMBERS:
-                out[k] = v
-            elif k == "error":
-                out[k] = _scrub_error(v, url)
-            else:
-                out[k] = _scrub_values(v, url)
-        return out
-    if isinstance(response, list):
-        return [_scrub_response(r, url) for r in response]
-    return _scrub_values(response, url)
+    if not isinstance(response, dict) or (("result" in response) == ("error" in response)):
+        return _scrub_values(response, url)
+    out: dict[Any, Any] = {}
+    for k, v in response.items():
+        if _kept_as_sent(k, v):
+            out[k] = v
+        elif k == "error":
+            out[k] = _scrub_error(v, url)
+        else:
+            out[k] = _scrub_values(v, url)
+    return out
+
+
+def _kept_as_sent(member: Any, value: Any) -> bool:
+    """Whether a well-formed response's *member* is returned untouched (see :func:`_scrub_response`)."""
+    if member == "result":
+        return True
+    if member == "jsonrpc":
+        return _honest_jsonrpc(value)
+    if member == "id":
+        return _honest_id(value)
+    return False
 
 
 _PROVIDER_CLASS: Any = None
@@ -180,9 +215,8 @@ _PROVIDER_CLASS: Any = None
 def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
     """``AsyncHTTPProvider`` for *rpc_url* whose transport failures never quote the URL's secrets.
 
-    It also removes them from the string values a server wrote into a response — never ``result``,
-    ``jsonrpc``, ``id``, an error ``code`` or any key — before web3 raises from it
-    (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
+    It also removes them from what a server wrote into a response before web3 raises from it,
+    leaving an honest response byte-identical (:func:`_scrub_response`). This is the layer every request crosses — :class:`EthRpc`'s own methods AND the contract reads
     the legs make through ``rpc.w3`` / :func:`~pyrxd.eth_wallet.multi_rpc.read_contract`, which
     never pass through an :class:`EthRpc` method and so are not covered by :meth:`EthRpc._failed`.
     A failure whose chain quotes nothing secret is re-raised UNCHANGED (same type, so web3's own
