@@ -261,7 +261,7 @@ this commit, not against a plan:
    They have since been reordered so the maker's covenant is mined before the taker funds (for
    example `test_xchain_swap_regtest_e2e.py:697-711`); see HZ-1 in
    [`htlc-handshake-wire-format.md`](htlc-handshake-wire-format.md). They remain opt-in
-   (env-gated) and deselected from `task ci` (`pyproject.toml:661`, `-m 'not integration'`).
+   (env-gated) and deselected from `task ci` (`pyproject.toml:667`, `-m 'not integration'`).
 2. **A CONTAINER output with a child ref was mintable, unroutable, and worse — CLOSED after
    0.14.0.** `prepare_container_reveal(child_ref=...)` built a 100-byte script no classifier
    matched. Investigated against a regtest node rather than routed: the output was
@@ -434,7 +434,7 @@ The pre-existing numbering has collisions the auditor will otherwise trip on:
 - **Local CI:** `task ci` (ruff lint + bandit, format check, full pytest, 100% security-pkg +
   85% overall coverage, mypy on `pyrxd.security`, private-link check — `pyproject.toml`
   `[tool.taskipy.tasks]`). The default pytest run deselects `-m integration`
-  (`pyproject.toml:661`).
+  (`pyproject.toml:667`).
 - **Swap consensus on a real node** (opt-in, skips without docker/image):
   `RADIANT_REGTEST=1 pytest tests/test_htlc_regtest_e2e.py -m integration` (Radiant HTLC: claim,
   wrong-preimage, premature/matured CSV refund, the `R1` fake-singleton acceptance);
