@@ -284,7 +284,11 @@ ignore = [
 lint = "ruff check src tests examples scripts && bandit -r src/ -c pyproject.toml --quiet"
 format = "ruff format src tests examples"
 format-check = "ruff format --check src tests examples"
-test = "pytest"
+# `-n auto` (pytest-xdist): one worker per CPU. The offline suite is CPU-bound and its
+# collection is deterministic (xdist refuses to run if two workers collect different test
+# ids, so a parametrize id built from random bytes fails loudly here and in CI). 3.7x on a
+# 4-core machine, same outcomes test for test; see #825.
+test = "pytest -n auto"
 # `task typecheck` runs mypy --strict over the UNIT-CRITICAL surface: every module where a
 # number's UNIT decides whether funds move. Two confirmed defects came from unit conflation
 # (block height vs confirmation count; seconds vs blocks), and `pyrxd.security.units` turns each
@@ -358,7 +362,7 @@ typecheck = """mypy \
   scripts/radiant_mainnet_chainio.py \
   scripts/_dust_swap_shared.py"""
 coverage-security = 'pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100'
-coverage-overall = 'pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85'
+coverage-overall = 'pytest tests/ -o "addopts=" -n auto --cov=pyrxd --cov-fail-under=85'
 # `task check-private-links` ensures tracked docs (and staged additions) don't
 # link to gitignored paths. Catches leaks where a public doc references a
 # private design doc — broken links + leaked filenames in commit history.
@@ -469,6 +473,8 @@ test = [
     "pytest-github-actions-annotate-failures",
     "pytest-mock<3.15.2",
     "pytest-runner",
+    # `-n auto` for the offline suite in CI (`ci.yml`) and `task test` / `task coverage-overall`.
+    "pytest-xdist==3.8.0",
     "shellcheck-py==0.11.0.1",
     # ETH counter-chain integration suites (tests/test_xchain_eth_*.py) drive a live anvil node
     # through web3. Previously undeclared: the suites were importable only if a developer happened

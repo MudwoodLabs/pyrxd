@@ -16,15 +16,17 @@ cd pyrxd
 python3 -m venv .venv
 source .venv/bin/activate
 poetry install --sync     # installs all groups (dev + test) — matches CI exactly
-poetry run task test      # full pytest suite, ~2m40s (9,195 tests, with coverage)
+poetry run task test      # full offline suite in parallel (pytest -n auto), with coverage
 ```
 
 If you don't have Poetry installed, `pip install -e ".[dev]"` works for
 basic development but won't pull in the full `test` group (pytest-cov,
 hypothesis, pytest-mock). Use Poetry to match the exact CI environment.
 
-The full suite is ~9,200 tests in ~2m40s with coverage on a developer
-machine. If it gets materially slower, that is worth chasing rather than
+The offline suite is ~19,500 tests. `task test` runs it with `pytest -n auto`
+(pytest-xdist, one worker per CPU): measured in #825 on a 4-core machine with
+coverage, ~6m15s to 6m45s in parallel against ~23m55s serially, with the same
+outcome for every test. If it gets materially slower, that is worth chasing rather than
 absorbing — run `pytest --durations=25` and look at the top of the list.
 A single stdlib call in a per-node loop once made the Python 3.10 and 3.11
 CI jobs take 39 and 34 minutes against 3.12's 8, on identical tests; see
@@ -117,6 +119,22 @@ This is the canonical "is my PR likely to pass CI" check. Mirrors
 `.github/workflows/{lint,ci}.yml` exactly. If `task ci` passes locally,
 PR CI will almost always pass too.
 
+**The default loop: run the tests for the area you changed locally, push, and
+let CI run the full matrix.** Merging already requires the checks to pass on
+the exact head being merged, on all three Python versions, so a full local run
+before every push mostly duplicates CI. Run the whole suite locally only when
+you need the answer before a review round. For a targeted run:
+
+```bash
+poetry run pytest tests/test_the_area_you_changed.py -n auto
+```
+
+`-n auto` needs the suite's test ids to be the same in every worker. A
+`parametrize` value built from random bytes (`os.urandom`, a fresh
+`PrivateKey()`) gets a different id in each worker, and xdist then refuses to
+run ("Different tests were collected between gw0 and gw1"). Give such a
+`parametrize` explicit `ids=`.
+
 For faster iteration during a work session, run the individual tasks:
 
 ```bash
@@ -139,6 +157,32 @@ chain. Those suites need a real node and they run in their own workflow,
 | --- | --- |
 | every PR (into any base branch) and every push to `main`/`dev` that touches code | `regtest-core`: the Tier-1 quickstart plus the fast Radiant covenant/builder suites |
 | nightly (and `workflow_dispatch`) | RSWP, dMint's proof-of-work suites, the SPV covenant differential matrix, bitcoind + litecoind, the BTC↔RXD and ETH↔RXD legs, and the vendored-source freshness check |
+
+#### Running the nightly lanes on a branch (cross-chain included)
+
+A PR that touches the swap legs gets no BTC↔RXD / ETH↔RXD / ERC-20 lifecycle
+run from the per-push lane. Anyone with write access can run the nightly jobs
+against a branch in this repository, in CI, with no local Docker:
+
+```bash
+gh workflow run integration.yml --ref <branch>
+gh run list --workflow=integration.yml --branch <branch> --limit 1   # find the run
+gh run watch <run-id>
+```
+
+(or **Actions → Integration (node-backed) → Run workflow**, picking the
+branch). A `workflow_dispatch` run executes **every** job in the workflow on
+that branch's code: `regtest-core`, all `nightly-*` jobs (including
+`nightly-cross-chain`, capped at 90 minutes) and `vendor-freshness`. They run
+in parallel; the dMint and SPV-differential jobs can run for hours (300-minute
+caps), so read `nightly-cross-chain`'s result as soon as it finishes rather
+than waiting for the whole run. No job references a repository secret, the
+workflow's token is `contents: read`, and `nightly-cross-chain` checks out with
+`persist-credentials: false`.
+
+`--ref` must name a branch in this repository. A PR from a fork has to be
+pushed to a branch here first, and that runs the PR's code on our runners, so
+read the diff before doing it.
 
 Run the per-push set locally with:
 

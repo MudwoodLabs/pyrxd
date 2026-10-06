@@ -247,6 +247,7 @@ class TestSelfReplicatingTier:
             ),
             ("mut", build_mutable_nft_script(_REF, os.urandom(32))),
         ],
+        ids=["dmint-v2", "dmint-v1", "mut"],
     )
     def test_self_replicating_token_shapes_keep_their_own_label(self, label, script):
         """dMint contracts and mutable NFTs bind a singleton AND self-replicate,
@@ -459,6 +460,7 @@ class TestWallClockCltvIsReachable:
             ("a cltv script one byte short", build_p2pkh_with_cltv_script(_PKH, 144)[:-1]),
             ("no value push at all", bytes([_OP_CLTV, _OP_DROP]) + b"\x76\xa9\x14" + _PKH + b"\x88\xac"),
         ],
+        ids=["empty", "missing-push-data", "all-0xff", "plain-p2pkh", "cltv-one-byte-short", "no-value-push"],
     )
     def test_parser_returns_none_on_junk(self, label, script):
         assert parse_p2pkh_timelock_script(script) is None, label
@@ -518,6 +520,7 @@ class TestP2sh:
             b"\xa8\x14" + _PKH + b"\x87",  # OP_SHA256, not OP_HASH160
             b"\xa9\x14" + _PKH + b"\x87\x51",  # trailing byte
         ],
+        ids=["equalverify", "19-byte-hash", "sha256", "trailing-byte"],
     )
     def test_near_miss_is_not_p2sh(self, script):
         assert _classify(script)["type"] != "p2sh"
@@ -639,6 +642,7 @@ class TestExistingShapesUnchanged:
             ("mut", build_mutable_nft_script(_REF, os.urandom(32))),
             ("p2pkh", b"\x76\xa9\x14" + _PKH + b"\x88\xac"),
         ],
+        ids=["nft", "ft", "mut", "p2pkh"],
     )
     def test_shape_still_classifies(self, expected, script):
         assert _classify(script)["type"] == expected
