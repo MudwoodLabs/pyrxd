@@ -2,10 +2,13 @@
 
 ``tests/fixtures/EthHtlc.json`` and ``tests/fixtures/Erc20Htlc.json`` are what a maker checks a
 taker-deployed contract against, byte for byte (``EthHtlcContractLeg.verify_funded`` and the
-slot-exact runtime compare, which reads ``immutableReferences`` and ``immutable_names``). They are
-compiled in a DIFFERENT repo, ``MudwoodLabs/pyrxd-eth-htlc``, so nothing here would otherwise notice
-one being swapped for a different build. Any change to these bytes changes the canonical contract,
-and makers and takers on released versions would then disagree about which contract is genuine.
+slot-exact runtime compare, which reads ``immutableReferences`` and ``immutable_names``), in this
+repo's swap runners (``scripts/eth_swap_run.py``, ``scripts/swap_run_verify.py``,
+``scripts/eth_swap_grief_run.py``) and tests. The wheel ships no ETH artifact: an application using
+the leg injects its own (``htlc_leg.py``). They are compiled in a DIFFERENT repo,
+``MudwoodLabs/pyrxd-eth-htlc``, so nothing here would otherwise notice one being swapped for a
+different build. A change to these bytes changes the contract those runners accept, so two runs
+on different builds would disagree about which contract is genuine.
 
 The digests are CONSTANTS IN THIS FILE, never stored in the artifact: a digest that travels inside
 the file it describes moves with any substitution and so proves nothing.
@@ -15,8 +18,9 @@ CBOR metadata hash was NOT excluded: both artifacts match exactly, metadata incl
 
 * ``EthHtlc.json``: built from ``pyrxd-eth-htlc@726446c4070d:contracts/EthHtlc.sol`` (git blob
   ``2f8fea4a``; the identical blob is ``contracts/src/EthHtlc.sol`` at ``41a70d75``). Running
-  ``forge build --contracts . --use 0.8.24`` in ``contracts/`` with no ``foundry.toml`` (optimizer
-  off, evmVersion cancun, source unit ``EthHtlc.sol``) reproduces runtime, creation code, ABI and
+  ``forge build --root . --contracts . --use 0.8.24`` in ``contracts/`` with no ``foundry.toml``
+  (optimizer off, evmVersion cancun, source unit ``EthHtlc.sol``; ``--root .`` matters in a git
+  checkout, where forge otherwise takes the git root as the project root and the bytes differ) reproduces runtime, creation code, ABI and
   ``immutableReferences`` exactly. So does plain ``solc 0.8.24`` standard JSON with those settings.
   It is NOT the ``EthHtlc.artifact.json`` committed at 726446c, which is an optimized build (1256
   runtime bytes against 2087 here).
