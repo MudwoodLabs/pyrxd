@@ -89,7 +89,9 @@ class Contract:
     origin_blob: str  # the git blob id of the source at that origin
     note: str
     #: What changed since the copy, in words. Recorded in ``_source``; REQUIRED when the blob no
-    #: longer matches ``origin_blob`` and refused when it does, so the description cannot go stale.
+    #: longer matches ``origin_blob`` and refused when it does. Nothing checks the words against the
+    #: source: a further edit only changes the blob id in ``_source``, and the provenance test's pin
+    #: on that id is what forces someone to re-read this text.
     changes: str = ""
 
 
