@@ -124,11 +124,21 @@ async def sync_headers(
     reset: bool = False,
 ) -> dict[str, Any]:
     """Extend the header cache for *network* from *sources*: the status report, never an exception
-    for anything a server does. ``report["state"]`` is ``"synced"``, ``"up to date"`` or
-    ``"refused"`` (with ``report["reason"]``; nothing was written).
+    for anything a server does. ``report["state"]`` is one of:
+
+    * ``"synced"``: headers were added and written;
+    * ``"up to date"``: nothing new was deep enough, or a reset was not needed (``reason`` says which);
+    * ``"stopped"``: a header below the floor ended the sync; the agreed headers under it were written
+      when there were any, ``stopped`` says why, and ``advice`` (``"rerun"``, ``"reset"`` or
+      ``"upgrade"``) is what the cache on disk admits next; ``exit_code`` 6;
+    * ``"refused"``: nothing was written; ``reason`` and ``fix`` say why; ``exit_code`` 2 for the
+      servers' answers, 1 for a store that could not be written (``advice`` is then ``None``).
 
     *reset* rebuilds the cache from the newest shipped checkpoint instead of extending it, under the
-    same rules; the old store is replaced only when the rebuild succeeds."""
+    same rules. It is written when it finishes without a stop and either disagrees with the store at
+    a height both hold or reaches at least the store's top; a STOPPED reset is written only when the
+    ordinary append rule accepts it (it agrees with the store and reaches past its top). Otherwise
+    the store is kept unchanged."""
     table, shipped_header = _shipped(network)
     loaded = header_store.load(network, table, path=path)
     report: dict[str, Any] = {
@@ -231,51 +241,60 @@ async def sync_headers(
         except Exception as exc:
             return refuse(f"the sync could not complete: {_err(exc, scrub)}")
 
+    old = loaded.chain
     report["added"] = chain.top - old_top
     report["cached_from"], report["cached_to"] = chain.base_height, chain.top
-    kept = (
-        f" The existing cache (blocks {loaded.chain.base_height}..{loaded.chain.top}) was kept unchanged."
-        if loaded.chain is not None
-        else ""
-    )
+    advice_text = ""
     if report["stopped"]:
         report["exit_code"] = EXIT_SYNC_STOPPED
         report["stopped"] += f" (this sync's floor was {floor}, fixed when it began)."
-        if reset:
-            # A STOPPED RESET IS NOT SAVED. Its floor was the checkpoint's alone (nothing else was
-            # cached), so no re-run of the reset gets further: only a newer release can.
+    if reset and report["stopped"]:
+        # A STOPPED RESET is saved only when the ORDINARY save rule would accept it: it agrees with
+        # the existing cache at every height both hold and reaches past its top (a plain extension),
+        # or there is no existing cache. Otherwise it is never saved, and the existing cache stays.
+        agrees = old is None or all(
+            old.header_at(x) == chain.header_at(x) for x in range(old.base_height, min(old.top, chain.top) + 1)
+        )
+        if old is not None and not (agrees and chain.top > old.top):
             report["advice"] = "upgrade"
             report["stopped"] += (
-                f" A reset holds headers to 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped checkpoint's work, which this header does "
-                f"not meet, so only a newer pyrxd release can get past it.{kept}"
+                f" A reset holds headers to 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped checkpoint's work, which this "
+                f"header does not meet, so only a newer pyrxd release can get past it. The existing cache (blocks "
+                f"{old.base_height}..{old.top}) was kept unchanged."
             )
             report["state"], report["added"] = "stopped", 0
-            report["cached_from"] = loaded.chain.base_height if loaded.chain else None
-            report["cached_to"] = loaded.chain.top if loaded.chain else None
+            report["cached_from"], report["cached_to"] = old.base_height, old.top
             return report
-        # COMPUTED, not assumed: what the cache this sync leaves admits next time.
+        reset = False  # saved as the plain extension it is, under the ordinary append-only rule
+        report["added"] = chain.top - (old.top if old is not None else old_top)
+    if report["stopped"]:
+        # COMPUTED, not assumed: what the cache this sync leaves admits next time. Stated only once
+        # that cache is on disk (below); a save that fails withdraws it.
         advice, next_floor = floor_stop_advice(chain, report["stopped_work"])
         report["advice"], report["next_floor_work"] = advice, next_floor
+        d = _hc.FLOOR_WORK_DIVISOR
         if advice == ADVICE_RERUN:
-            report["stopped"] += (
+            advice_text = (
                 f" Re-run `pyrxd headers sync`: the headers this sync added move the floor to {next_floor}, "
                 f"which the header at {report['stopped_at']} meets."
             )
         elif advice == ADVICE_RESET:
-            report["stopped"] += (
+            advice_text = (
                 f" A plain re-run would stop here again (its floor would be {next_floor}). "
-                f"`{CACHE_RESET_COMMAND}` gets past it: a rebuild holds its first sync to 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped "
+                f"`{CACHE_RESET_COMMAND}` gets past it: a rebuild holds its first sync to 1/{d} of the shipped "
                 f"checkpoint's work ({chain.floor_work}), which the header at {report['stopped_at']} meets."
             )
         else:
-            report["stopped"] += (
-                f" Only a newer pyrxd release can get past this header: its work is below 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped "
+            advice_text = (
+                f" Only a newer pyrxd release can get past this header: its work is below 1/{d} of the shipped "
                 f"checkpoint's ({chain.floor_work}), so neither a re-run (floor {next_floor}) nor "
                 f"`{CACHE_RESET_COMMAND}` would cache it."
             )
     if report["added"] == 0 and not reset:
         report["state"] = "stopped" if report["stopped"] else "up to date"
-        if not report["stopped"]:
+        if report["stopped"]:
+            report["stopped"] += advice_text  # nothing to write: the cache on disk is the one advised on
+        else:
             report["reason"] = (
                 f"no new header is at least {min_depth} blocks below the lowest tip reported ({lowest})"
                 if stop <= old_top
@@ -284,7 +303,7 @@ async def sync_headers(
         return report
     record = {
         "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "from": old_top + 1,
+        "from": (old.top if old is not None and not reset else old_top) + 1,
         "to": chain.top,
         "lowest_tip": lowest,
         "min_depth": min_depth,
@@ -294,8 +313,10 @@ async def sync_headers(
 
     def unchanged() -> None:
         report["added"] = 0
-        report["cached_from"] = loaded.chain.base_height if loaded.chain else None
-        report["cached_to"] = loaded.chain.top if loaded.chain else None
+        report["cached_from"] = old.base_height if old else None
+        report["cached_to"] = old.top if old else None
+        # Advice about a cache that was not written would be advice about nothing.
+        report["advice"] = report["next_floor_work"] = None
 
     try:
         header_store.save(chain, table=table, record=record, path=loaded.path, reset=reset)
@@ -319,6 +340,8 @@ async def sync_headers(
             "the cache (if any) is unchanged",
             exit_code=UserError.exit_code,
         )
+    if report["stopped"]:
+        report["stopped"] += advice_text
     report["state"] = "stopped" if report["stopped"] else "synced"
     return report
 
@@ -351,7 +374,8 @@ def headers_group() -> None:
     is_flag=True,
     help="Rebuild the cache from the newest shipped checkpoint instead of extending it (for a cache "
     "left on a branch Radiant has abandoned). The old cache is replaced only when the rebuild finishes "
-    "without a stop and either disagrees with it or reaches past its top; otherwise it is kept.",
+    "without a stop and either disagrees with it or reaches at least its top, or when a stopped rebuild "
+    "agrees with it and reaches past its top; otherwise it is kept.",
 )
 @click.pass_obj
 def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:

@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,7 @@ def test_the_fixture_is_what_these_tests_lean_on() -> None:
     assert max(work, key=work.get) == 460566
     assert work[460575] < work[460576] < work[460566]
     assert mark_block.FLOOR_WORK_DIVISOR is header_cache.FLOOR_WORK_DIVISOR == 16
+    assert type(mark_block.FLOOR_WORK_DIVISOR) is int, "an int: a float floor is inexact (see _floor_of)"
 
 
 # ── the pure core ───────────────────────────────────────────────────────────────────────────
@@ -851,10 +853,10 @@ def test_the_sync_floor_rises_with_the_cached_median(monkeypatch, tmp_path) -> N
 
 def test_advice_rerun_when_the_added_headers_move_the_floor(monkeypatch, tmp_path) -> None:
     """The re-run branch. The headers a stopped sync adds move the median, so a plain re-run can pass
-    the header the first sync stopped at. Real headers 460,564..460,569 with a divisor of 1.0065 (a
+    the header the first sync stopped at. Real headers 460,564..460,569 with a divisor of 1.0065, exact (a
     test-scale ratio; see the module docstring): the cache holds 460,564..460,566; a sync adds
     460,567 and stops at 460,568; the next floor (computed exactly, not as a power of two) admits it."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1.0065)
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
     _patch_table(monkeypatch, START)
     ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
     r, out = _sync(monkeypatch, tmp_path, ops(START + 2))
@@ -920,7 +922,8 @@ def test_a_reset_that_agrees_and_ends_lower_keeps_the_existing_cache(monkeypatch
     r, out = _reset(monkeypatch, tmp_path, 460570 + CACHE_MIN_DEPTH)
     assert r.exit_code == 0 and out["state"] == "up to date" and "the existing cache was kept" in out["reason"]
     assert out["cached_to"] == TOP and _cached(START).top == TOP  # type: ignore[union-attr]
-    # Honest pair: a reset that reaches past the top replaces it (here, with the same headers).
+    # Honest pair: a reset that reaches AT LEAST the top (here it ends exactly AT it, with the same
+    # headers) replaces it.
     r, out = _reset(monkeypatch, tmp_path, DEEP)
     assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == TOP
 
@@ -1120,3 +1123,115 @@ def test_a_server_cannot_switch_the_cache_off_to_get_a_lower_floor(monkeypatch, 
         "block_verification"
     ]
     assert bv["state"] == "VERIFIED" and bv["cache_disagreement"] and bv["cached_anchor_height"] is None
+
+
+def test_a_float_divisor_is_refused() -> None:
+    """``int(W // 16.0)`` is inexact on real work; the floor refuses a float divisor outright."""
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(header_cache, "FLOOR_WORK_DIVISOR", 16.0)
+        with pytest.raises(ValidationError, match="positive int"):
+            header_cache.sync_floor(_chain(START, START))
+    finally:
+        mp.undo()
+    w = radiant_header_work(HEADERS[START])
+    assert header_cache._floor_of(w) == w // 16
+
+
+def test_following_the_advice_never_loops(monkeypatch, tmp_path) -> None:
+    """The review's advice loop: checkpoint 460,564, divisor 1.004 (exact), cache to 460,566. A sync
+    stops at 460,567 and advises `--reset`; the reset passes 460,567 and stops at 460,568, and is
+    SAVED, because it agrees with the cache and extends it; its advice is then computed from that
+    saved cache. Following every piece of advice ends, and no step repeats."""
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(1004, 1000))
+    _patch_table(monkeypatch, START)
+    ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
+    _, out = _sync(monkeypatch, tmp_path, ops(START + 2))
+    assert out["cached_to"] == START + 2
+    _, out = _sync(monkeypatch, tmp_path, ops(TOP))
+    assert (out["stopped_at"], out["advice"]) == (460567, "reset"), out
+    seen, steps = set(), []
+    for _ in range(6):
+        if out["advice"] == "reset":
+            _, out = _reset(monkeypatch, tmp_path, DEEP)
+        elif out["advice"] == "rerun":
+            _, out = _sync(monkeypatch, tmp_path, ops(TOP))
+        else:
+            break
+        step = (out["state"], out["stopped_at"], out["advice"], out["cached_to"])
+        assert step not in seen, f"the advice loops: {[*steps, step]}"
+        seen.add(step)
+        steps.append(step)
+    assert steps[0] == ("stopped", 460568, "upgrade", 460567), steps
+    assert _cached(START).top == 460567, "the stopped reset was saved: it extends the cache"  # type: ignore[union-attr]
+    # And the upgrade advice holds: a plain sync stops at 460,568 again.
+    _, out = _sync(monkeypatch, tmp_path, ops(TOP))
+    assert (out["stopped_at"], out["advice"]) == (460568, "upgrade"), out
+
+
+def test_a_failed_save_withdraws_the_advice(monkeypatch, tmp_path) -> None:
+    """A stopped sync that added headers but could not write them gives no advice: its premise
+    (the cache it would have left) is not on disk."""
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
+    _patch_table(monkeypatch, START)
+    ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
+    _sync(monkeypatch, tmp_path, ops(START + 2))
+
+    def full(*a, **kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(header_store, "save", full)
+    r, out = _sync(monkeypatch, tmp_path, ops(TOP))
+    assert r.exit_code == 1 and out["state"] == "refused"
+    assert out["advice"] is None and out["next_floor_work"] is None
+    assert "Re-run" not in (out["stopped"] or "") and out["cached_to"] == START + 2
+
+
+# ── the fork clause of the reset rule ───────────────────────────────────────────────────────
+#
+# A store on another branch from 460,568 up: real 460,564..460,567, then three headers that link to
+# each other but not to the real chain (460,568 re-nonced; 460,569 and 460,570 re-pointed at the one
+# below). Only the CACHE's proof-of-work check is told to accept those three, as for FORK above.
+
+
+def _fork_branch() -> list[bytes]:
+    f1 = _renonced(HEADERS[460568])
+    f2 = bytearray(HEADERS[460569])
+    f2[4:36] = bytes.fromhex(radiant_block_hash(f1))[::-1]
+    f3 = bytearray(HEADERS[460570])
+    f3[4:36] = bytes.fromhex(radiant_block_hash(bytes(f2)))[::-1]
+    return [f1, bytes(f2), bytes(f3)]
+
+
+def _store_long_fork(monkeypatch) -> None:
+    branch = _fork_branch()
+    real = header_cache.verify_radiant_header_pow
+    monkeypatch.setattr(
+        header_cache,
+        "verify_radiant_header_pow",
+        lambda h, **kw: radiant_block_hash(h) if h in branch else real(h, **kw),
+    )
+    chain, stopped = extend_verified_headers(_chain(START, 460567), branch)
+    assert stopped is None and chain.top == 460570
+    header_store.save(chain, table=_table(START))
+
+
+def test_a_completed_reset_that_disagrees_replaces_a_longer_store(monkeypatch, tmp_path) -> None:
+    """The fork clause: the rebuild ends at 460,569, BELOW the store's top (460,570), but disagrees
+    with it at 460,568, so it replaces it."""
+    _patch_table(monkeypatch, START)
+    _store_long_fork(monkeypatch)
+    r, out = _reset(monkeypatch, tmp_path, 460569 + CACHE_MIN_DEPTH)
+    assert r.exit_code == 0 and out["state"] == "synced", out
+    assert _cached(START).headers == tuple(HEADERS[h] for h in range(START, 460570))  # type: ignore[union-attr]
+
+
+def test_a_completed_reset_that_agrees_and_is_shorter_does_not_replace(monkeypatch, tmp_path) -> None:
+    """The inverse: the same shape of rebuild (ending below the store's top) that AGREES with it
+    keeps it; only disagreement licenses replacing a longer store."""
+    _patch_table(monkeypatch, START)
+    _store(START, 460570)
+    before = header_store.store_path("mainnet").read_bytes()
+    r, out = _reset(monkeypatch, tmp_path, 460569 + CACHE_MIN_DEPTH)
+    assert r.exit_code == 0 and out["state"] == "up to date" and "kept" in out["reason"]
+    assert header_store.store_path("mainnet").read_bytes() == before

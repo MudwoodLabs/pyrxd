@@ -24,8 +24,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     sync leaves: a plain re-run, `pyrxd headers sync --reset`, or only a newer pyrxd release. A
     local cache that cannot be written exits 1. `--json` prints the status.
   - `--reset` rebuilds the cache from the shipped checkpoint. It replaces the old cache only when
-    the rebuild finishes without a stop and either disagrees with the old cache or reaches past its
-    top; otherwise the old cache is kept unchanged.
+    the rebuild finishes without a stop and either disagrees with the old cache or reaches at least
+    its top. A rebuild that stops is written only when it agrees with the old cache and reaches past
+    its top, as an ordinary sync's extension would be. Otherwise the old cache is kept unchanged.
   - `pyrxd verify` links from the newest cached header at or below the range it needs, with the
     same 4,032 cap. So does `pyrxd verify --wave-name`, through the same lookup. Its claim names
     the anchor it used: a shipped checkpoint, or a cached header and the shipped checkpoint the

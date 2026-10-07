@@ -46,13 +46,17 @@ HOW CLOSE HONEST HEADERS COME (``scripts/measure_header_floor_margins.py``, whic
 run 2026-10-07, read-only from a default public server, over the 370,601 linked mainnet headers
 from block 100,000 to 470,600). Each figure is the worst, over the range, of ``W / (the least work
 of a header the rule would have to pass)``, taking the worst case over whatever the script does not
-model, so each is an upper bound; 16 or more would mean an honest header was held back.
+model; 16 or more would mean an honest header was held back. Every floor is ``max(W_C, X) // 16``.
+The fallback row computes exactly that; the sync and verify rows measure the ``X`` part alone, and
+the checkpoint rows the ``W_C`` part, so a full rule's worst is at most the larger of its row and the
+checkpoint row over the release's life.
 
-* sync, one floor for a span starting at every height (median of the 2,016 cached headers before
-  it): 3.64 over spans of 4,032 blocks, 3.48 over spans of 8,640 that fit in the range;
-* verify, every height as the anchor, over the 4,032 headers above it: 3.91;
-* the fallback after a disagreement, the worst cached anchor within 4,032 headers of the checkpoint
-  against every header in that walk: 3.84 for every checkpoint height, 4.57 for every height;
+* sync, ``X`` = the median of the 2,016 cached headers before a span starting at every height:
+  3.64 over spans of 4,032 blocks, 3.48 over spans of 8,640 that fit in the range;
+* verify, ``X`` = the anchor's work, every height as the anchor, over the 4,032 headers above it: 3.91;
+* the fallback after a disagreement, ``max(W_C, the worst cached anchor within 4,032 headers of the
+  checkpoint)`` against every header in that walk: 3.84 for every checkpoint height, 4.57 for every
+  height;
 * the shipped checkpoint's work against the headers after it, for every checkpoint height: 3.48
   over 8,640 blocks, and 7.94 over 25,920 blocks (about three months).
 
@@ -73,6 +77,7 @@ import json
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any
 
 from pyrxd.hash import radiant_block_hash
@@ -196,6 +201,16 @@ def _require_table(table: Sequence[tuple[int, str]]) -> tuple[tuple[int, str], .
     return out
 
 
+def _floor_of(work: int) -> int:
+    """``work // FLOOR_WORK_DIVISOR``, EXACTLY. The divisor ships as the int 16; a test may set an
+    exact :class:`~fractions.Fraction` to emulate a work ratio real headers cannot show. A float is
+    refused: ``int(W // 16.0)`` rounds real work (about 2**56) and can come out one too high."""
+    d = FLOOR_WORK_DIVISOR
+    if isinstance(d, bool) or not isinstance(d, (int, Fraction)) or d <= 0:
+        raise ValidationError(f"FLOOR_WORK_DIVISOR must be a positive int (or an exact Fraction), not {d!r}")
+    return int(work // d)
+
+
 def _walk(
     below_hash: str,
     start: int,
@@ -286,7 +301,7 @@ def verify_header_chain(
         if h in by_height and below != by_height[h]:
             return None, f"the stored header at {h} is not the checkpoint this pyrxd ships for that height"
     base = bytes(headers[cp_h - base_height])
-    floor = int(radiant_header_work(base, pow_limit=pow_limit) // FLOOR_WORK_DIVISOR)
+    floor = _floor_of(radiant_header_work(base, pow_limit=pow_limit))
     above = headers[cp_h - base_height + 1 :]
     hashes, kind, reason = _walk(cp_hash, cp_h + 1, above, floor, pow_limit=pow_limit)
     if kind == "lie":
@@ -314,7 +329,7 @@ def sync_floor(chain: VerifiedHeaders) -> int:
     sync adds anything, and pass it to every :func:`extend_verified_headers` call of that sync.
     """
     recent = statistics.median_low(radiant_header_work(h) for h in chain.headers[-RECENT_WINDOW:])
-    return int(max(radiant_header_work(chain.checkpoint_header), recent) // FLOOR_WORK_DIVISOR)
+    return _floor_of(max(radiant_header_work(chain.checkpoint_header), recent))
 
 
 #: What gets a stopped sync past the header it stopped at, as :func:`floor_stop_advice` computes it.

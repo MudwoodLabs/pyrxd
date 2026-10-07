@@ -12,8 +12,9 @@ them. Three rules:
 * **Append-only.** A write never changes a header the current store holds: it may only add headers
   above its top, or rebase onto a newer shipped checkpoint (dropping headers below it, which the
   shipped table then covers). :func:`save` refuses anything else, except a ``--reset`` rebuild that
-  finished without a stop and either disagrees with the store or reaches past its top: a reset never
-  only shortens a good cache, and a stopped or refused reset never reaches :func:`save` at all.
+  finished without a stop and either disagrees with the store or reaches at least its top: a reset
+  never only shortens a good cache. A stopped reset reaches :func:`save` only as an ordinary
+  extension (it agrees with the store and reaches past its top), and a refused one never does.
   The check and the replace run under one advisory lock (POSIX).
 """
 
