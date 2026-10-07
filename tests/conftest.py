@@ -102,6 +102,24 @@ except ImportError:
 # bare substring of an identifier.
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    """Put every test already marked ``integration`` in one xdist group.
+
+    This marks nothing new (see the note above). Under ``--dist loadgroup`` a group runs on a
+    single worker, so the regtest tests run one at a time, as they did before xdist. They need
+    that: modules share fixed container names (22 import ``node`` from
+    ``test_htlc_regtest_e2e``, which removes and restarts ``gravity-regtest-pytest``), so two
+    workers would remove each other's live node. Ungrouped tests are spread as under ``load``.
+    Without xdist nothing is marked (the marker would be unknown). ``tryfirst``: xdist registers its own hook later, so
+    without it xdist reads the groups before this adds them, and nothing is grouped."""
+    if not config.pluginmanager.hasplugin("xdist"):
+        return
+    for item in items:
+        if item.get_closest_marker("integration") is not None:
+            item.add_marker(pytest.mark.xdist_group("regtest"))
+
+
 @pytest.fixture
 def unit_test_mocks(monkeypatch: None):
     """Include Mocks here to execute all commands offline and fast."""
