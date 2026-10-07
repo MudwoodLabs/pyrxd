@@ -52,6 +52,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `pyrxd verify`'s human report wraps a VERIFIED claim to at most 20 lines (was 14), never breaking
   inside "proof-of-work", so the longer claim from a cached anchor is printed whole.
+- **The ETH counter-leg contracts are now built in this repo, and the canonical build is
+  optimized.** The Solidity source of `EthHtlc` and `Erc20Htlc` moved into `contracts/`, copied
+  unchanged from the private repo where it was written. `scripts/build_counter_leg_artifacts.py`
+  builds `tests/fixtures/EthHtlc.json` and `tests/fixtures/Erc20Htlc.json` from it with solc
+  0.8.24 (the official static binary, pinned by sha256): optimizer on with 200 runs, evmVersion
+  cancun, and no metadata hash, so the bytes reproduce on any linux-amd64 machine. A new
+  `counter-leg-artifacts` workflow rebuilds both on every pull request and push to main and fails
+  on any difference. `EthHtlc` was previously built with the optimizer off, which looks
+  accidental: its runtime is now 1,215 bytes (was 2,087). `Erc20Htlc` was already optimized; only
+  its trailing metadata changed. **Contracts deployed from the previous artifacts are refused by
+  this repo's swap runners and tests**, which verify a deployed contract byte for byte against
+  these artifacts. The wheel ships no ETH artifact, so an application that injects its own is
+  unaffected.
 
 ## [0.26.1] — 2026-10-07
 

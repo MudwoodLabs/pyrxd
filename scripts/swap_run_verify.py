@@ -573,12 +573,13 @@ _ETH_REFUNDED_TOPIC = "0xa4891be4c05fc4b104f07fbbd9f643c3a98d0f9d3c4e616281bdba9
 # sha256 of the canonical EthHtlc CREATION bytecode (init code), from tests/fixtures/EthHtlc.json "bytecode".
 # A deploy tx input is <init code> || <128B ABI ctor args>, and the init code is CONSTANT across deploys
 # (constructor args live in the trailing calldata, immutables are baked into the *runtime* not the init
-# code). Pinning it proves the deployed contract IS the audited EthHtlc — so its decoded ctor args are
+# code). Pinning it proves the deployed contract IS the canonical EthHtlc (contracts/EthHtlc.sol, built by
+# scripts/build_counter_leg_artifacts.py) — so its decoded ctor args are
 # authentic and a Claimed(p) provably pays the ctor-named claimant. WITHOUT this, the taker (who deploys the
 # ETH leg) can ship a look-alike that decodes honest (H, maker) ctor bytes yet pays the taker and emits a
 # forged Claimed(p) — a false PASS on a one-sided maker loss (audit HIGH). tests/test_swap_run_verify.py
 # re-derives this from the fixture so a fixture change without a pin update fails CI.
-_ETH_HTLC_CREATION_SHA256 = bytes.fromhex("81270a8375c83f51f1bd1812f36a31ef7b9b14e2bca8aea3287561d34d64b5ff")
+_ETH_HTLC_CREATION_SHA256 = bytes.fromhex("14929d5c58980ad93d446c22b55c48d8c71d040500b807ed84c83601142c10ec")
 
 
 def _hb(x: object) -> bytes:
@@ -669,7 +670,7 @@ def verify_counter_leg_eth(
                 [*notes, "eth deploy tx input too short for constructor args (forged funding tx)"],
             )
         # CODE PIN (audit HIGH): the ctor-arg decode below is meaningless unless the deployed contract is
-        # actually the audited EthHtlc — the taker controls the whole deploy payload and could ship a
+        # actually the canonical EthHtlc — the taker controls the whole deploy payload and could ship a
         # look-alike that decodes honest (H, maker) bytes yet pays the taker. Pin the init code
         # (deploy_input minus the trailing 128B ABI args) to the canonical creation bytecode. No extra RPC,
         # and unlike eth_getCode it does not depend on the contract surviving post-claim.
