@@ -12,4 +12,4 @@ cryptography>=50.0.1
 #   <21.7.12  does not integrity-check the downloaded seed wheels (pip/setuptools)
 #             before use.
 # CI installs this pin, so it must not resolve to a flagged version.
-virtualenv>=21.7.12
+virtualenv>=21.14.5
