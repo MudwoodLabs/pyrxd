@@ -125,8 +125,11 @@ transport (a timeout, an error from the server), is reported in the
 page's own words. A block that does not verify stays on screen as the
 server's word, with the reason. A proof that contradicts the height the
 server reported shows no block number, as `pyrxd verify` reports none.
-The pages link at most 4,032 headers past the newest checkpoint, as the
-CLI does. They require one confirmation (the block itself) and try to
+The pages link at most 4,032 headers past the newest checkpoint. The CLI
+uses the same cap, but after `pyrxd headers sync` it counts the 4,032 from
+the newest header in its local cache of verified headers, which keeps an
+installed release verifying new marks between releases; the pages have no
+such cache yet (#826). They require one confirmation (the block itself) and try to
 prove up to six, or as many as the server reports if that is fewer, so a
 server whose tip is short still verifies to the depth it can prove; a
 block at or below a checkpoint is proved as deep as the newest

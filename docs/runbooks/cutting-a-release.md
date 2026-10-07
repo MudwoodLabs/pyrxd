@@ -28,7 +28,16 @@ steps looked like beforehand.
   on the day it ships. The scheduled `Checkpoint freshness` workflow fails when
   fewer than 864 blocks (three days) remain before the 4,032 horizon; a refresh
   always turns it green. The pages pick up the
-  table on their next deploy from `main`.
+  table on their next deploy from `main` (`docs.yml` deploys on every push to
+  `main`).
+
+  An installed release can also outlive its own horizon: `pyrxd headers sync`
+  caches headers past the newest shipped checkpoint (each served alike by at
+  least two operators, at least 288 blocks below their lowest tip, linked to
+  that checkpoint and checked for proof-of-work and the floor), and `pyrxd
+  verify` then counts its 4,032 headers from the newest cached one. That does
+  not replace refreshing the table for a release: users who never run the sync,
+  and the pages, still depend on it.
 
 ## 1. Merge the release PR
 

@@ -77,6 +77,22 @@ required depth, what a header does decides by CAUSE:
 require 1 and aim for more, so a server whose tip is short still VERIFIES to the depth it can
 prove.
 
+A CACHED ANCHOR (``header_cache``, #826). ``pyrxd verify`` may pass the headers this machine has
+already linked to the newest checkpoint (:class:`pyrxd.glyph.header_cache.VerifiedHeaders`, from
+``pyrxd headers sync``). When the required depth reaches above the newest checkpoint and the cache
+does too, the walk anchors at the cached header ``A = min(newest cached, H + min_confirmations -
+1)`` as if it were one more checkpoint: a block at or below ``A`` is linked hash by hash up to it,
+each header above ``A`` meets its own proof-of-work and the floor, and the cap is measured from
+``A``. The floor is then ``max(newest checkpoint's work, A's work) // FLOOR_WORK_DIVISOR``: never
+below the checkpoint's (the reasoning, and the limit an honest difficulty drop meets, are in
+:mod:`pyrxd.glyph.header_cache`). ``checkpoint_height`` still names a SHIPPED
+checkpoint; ``cached_anchor_height`` names ``A``, and the claim says which anchor was used. A
+served header at ``A`` that is not the cached one is NOT VERIFIED, never CONTRADICTED: it
+disagrees with the local cache (which may be on a branch Radiant abandoned), not with anything
+shipped or with the mark's proof; ``cache_disagreement`` says so, and :func:`verify_with_fetched`
+then falls back to the shipped checkpoint when the block is within its reach. With no cache,
+nothing here changes.
+
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
 nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
 is not vendored here, so only each header's own target and the floor are checked); that the
@@ -102,7 +118,7 @@ from __future__ import annotations
 import bisect
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from pyrxd.hash import radiant_block_hash
@@ -208,6 +224,11 @@ class BlockVerification:
     checkpoint_hash: str | None = None
     #: Distinct headers whose hash linkage was checked.
     linked_headers: int = 0
+    #: When the walk anchored at a header from pyrxd's verified-header cache: its height and hash.
+    #: ``checkpoint_height`` is then the shipped checkpoint that cache is linked to. ``None`` when
+    #: no cached header was used (always, without a ``header_cache``).
+    cached_anchor_height: int | None = None
+    cached_anchor_hash: str | None = None
     #: For ``work``: floor(log2) of the minimum work each header above the checkpoint had to carry.
     floor_work_log2: int | None = None
     #: Blocks from the mark's block up to the highest one linked to it — the mark's block counts
@@ -224,6 +245,10 @@ class BlockVerification:
     #: not linking to the header below it across two separate requests. ``None`` when nothing past
     #: the required depth ended the run — always, with no target (``pyrxd verify``).
     short_of_target: str | None = None
+    #: Set when the server's header at the cached anchor is not the cached one: why, and how to
+    #: rebuild the cache. Never a contradiction (see :func:`verify_with_fetched`, which then falls
+    #: back to the shipped checkpoint). ``None`` otherwise.
+    cache_disagreement: str | None = None
 
 
 _STEPS = ("tree_depth", "merkle", "blockhash", "linkage", "proof_of_work", "floor", "burial")
@@ -304,12 +329,64 @@ def _top(
     return max(required, min(height + target - 1, newest_h + cap))
 
 
+def _require_cache(cache: Any, table: tuple[tuple[int, str], ...]) -> Any:
+    """*cache* checked to be a :class:`~pyrxd.glyph.header_cache.VerifiedHeaders` built against
+    THIS table's newest checkpoint (a programming error raises), or ``None``."""
+    if cache is None:
+        return None
+    from .header_cache import VerifiedHeaders  # lazy: header_cache imports this module
+
+    if not isinstance(cache, VerifiedHeaders):
+        raise ValidationError("header_cache must be a pyrxd.glyph.header_cache.VerifiedHeaders or None")
+    if not table or (cache.checkpoint_height, cache.checkpoint_hash) != table[-1]:
+        raise ValidationError("header_cache was verified against a different newest checkpoint than this table's")
+    return cache
+
+
+def _effective_table(
+    table: tuple[tuple[int, str], ...], cache: Any, height: Any, min_confirmations: int
+) -> tuple[tuple[tuple[int, str], ...], int | None]:
+    """``(table to walk, cached anchor height or None)``.
+
+    The cached header ``A = min(newest cached, required top)`` is appended to *table* as one more
+    anchor when the required top is above the newest checkpoint and the cache reaches above it
+    too. The cache links ``A`` to the newest checkpoint, so the extended table is still one chain.
+    """
+    if cache is None or not table or not _is_height(height):
+        return table, None
+    newest_h = table[-1][0]
+    required_top = height + min_confirmations - 1
+    if required_top <= newest_h or cache.top <= newest_h:
+        return table, None
+    a = min(cache.top, required_top)
+    return (*table, (a, cache.hash_at(a))), a
+
+
+#: The command that discards the header cache and rebuilds it from the shipped checkpoint.
+CACHE_RESET_COMMAND = "pyrxd headers sync --reset"
+
+#: How a claim names a cached anchor, and what the cache is.
+_CACHED_HEADER = "a header in pyrxd's verified-header cache on this machine"
+
+
+def _cache_sentence(shipped_h: Any) -> str:
+    from .header_cache import CACHE_MIN_DEPTH, MIN_OPERATORS  # lazy: header_cache imports this module
+
+    return (
+        f"That cached header is linked hash by hash to block {shipped_h}, a checkpoint shipped with pyrxd; "
+        f"`pyrxd headers sync` caches a header only when at least {MIN_OPERATORS} operators served it byte for "
+        f"byte alike, at least {CACHE_MIN_DEPTH} blocks below the lowest tip they reported, and every cached "
+        f"header's link, proof-of-work and floor are checked again whenever the cache is read."
+    )
+
+
 def _plan(
     height: Any,
     min_confirmations: int,
     table: tuple[tuple[int, str], ...],
     target: int | None = None,
     cap: int = MAX_HEADERS_FROM_CHECKPOINT,
+    cached: int | None = None,
 ) -> BlockFetchPlan:
     if not _is_height(height):
         return BlockFetchPlan(None, (), None, f"no usable block height to verify (got {type(height).__name__})")
@@ -328,6 +405,14 @@ def _plan(
         ranges += _chunks(height, above_h)
     else:
         level = "work"
+    if top - newest_h > cap and cached is not None:
+        return BlockFetchPlan(
+            height,
+            (),
+            None,
+            f"block {top} is {top - newest_h} blocks past the newest header in pyrxd's verified-header "
+            f"cache ({newest_h}); it links at most {cap} — run `pyrxd headers sync`, or upgrade pyrxd",
+        )
     if top - newest_h > cap:
         return BlockFetchPlan(
             height,
@@ -350,6 +435,7 @@ def plan_block_verification(
     network: str = "mainnet",
     checkpoints: Sequence[tuple[int, str]] | None = None,
     max_headers_from_checkpoint: int = MAX_HEADERS_FROM_CHECKPOINT,
+    header_cache: Any = None,
 ) -> BlockFetchPlan:
     """Which headers to fetch to verify the block at *height* — decided here, not by the caller.
 
@@ -357,14 +443,18 @@ def plan_block_verification(
     for *network*; tests pass their own. ``target_confirmations``: how deep to try beyond the
     REQUIRED ``min_confirmations`` (see the module docstring); ``None`` asks for the required depth
     only. ``max_headers_from_checkpoint`` bounds the walk (see :data:`MAX_HEADERS_FROM_CHECKPOINT`,
-    its default).
+    its default). ``header_cache``: a cached anchor (module docstring), or ``None``.
     """
+    table = _table(network, checkpoints)
+    min_conf = _require_min_confirmations(min_confirmations)
+    eff, cached = _effective_table(table, _require_cache(header_cache, table), height, min_conf)
     return _plan(
         height,
-        _require_min_confirmations(min_confirmations),
-        _table(network, checkpoints),
+        min_conf,
+        eff,
         _require_target(target_confirmations),
         _require_cap(max_headers_from_checkpoint),
+        cached,
     )
 
 
@@ -413,6 +503,8 @@ def verify_mark_block(
     target_confirmations: int | None = None,
     max_headers_from_checkpoint: int = MAX_HEADERS_FROM_CHECKPOINT,
     pow_limit: int | None = None,
+    header_cache: Any = None,
+    cached_floor: tuple[int, int] | None = None,
 ) -> BlockVerification:
     """Verify that *txid* is in the block at *height*, anchored to a shipped checkpoint.
 
@@ -438,12 +530,20 @@ def verify_mark_block(
     :func:`~pyrxd.spv.radiant.radiant_header_target`). Both exist for the swap taker gate; their
     defaults leave this function exactly as the pages and ``pyrxd verify`` have always run it.
 
+    ``header_cache`` (:class:`~pyrxd.glyph.header_cache.VerifiedHeaders`, or ``None``) lets the walk
+    anchor at a cached header instead (module docstring); ``None`` changes nothing.
+    ``cached_floor`` (``(height, work)`` of a cached header) keeps the floor at least that header's
+    work // :data:`FLOOR_WORK_DIVISOR` on a walk that does NOT anchor at it: the fallback
+    :func:`verify_with_fetched` takes when a server disagrees with the cache, so that disagreeing
+    cannot lower the floor the cache had set.
+
     Never raises on server data — see the module docstring for the states and what each claims.
     """
     table = _table(network, checkpoints)
     min_conf = _require_min_confirmations(min_confirmations)
     target = _require_target(target_confirmations)
     cap = _require_cap(max_headers_from_checkpoint)
+    cache = _require_cache(header_cache, table)
     if pow_limit is not None and (
         not isinstance(pow_limit, int) or isinstance(pow_limit, bool) or not 0 < pow_limit < (1 << 256)
     ):
@@ -472,6 +572,8 @@ def verify_mark_block(
             facts=facts,
             cap=cap,
             pow_limit=pow_limit,
+            cache=cache,
+            cached_floor=cached_floor,
         )
     except _Stop as stop:
         reason = stop.reason
@@ -499,9 +601,13 @@ def _verify(
     facts: dict[str, Any],
     cap: int = MAX_HEADERS_FROM_CHECKPOINT,
     pow_limit: int | None = None,
+    cache: Any = None,
+    cached_floor: tuple[int, int] | None = None,
 ) -> str:
     """Run every check; return the VERIFIED claim, or raise :class:`_Stop` with the outcome."""
-    plan = _plan(height, min_conf, table, target, cap)
+    shipped_h, shipped_hash = table[-1] if table else (None, None)
+    table, cached_h = _effective_table(table, cache, height, min_conf)
+    plan = _plan(height, min_conf, table, target, cap, cached_h)
     if plan.reason is not None:
         raise _Stop(NOT_VERIFIED, plan.reason)
     facts["level"] = plan.level
@@ -598,18 +704,38 @@ def _verify(
     def anchor(h: int, want: str) -> None:
         if radiant_block_hash(_header(headers, h)) != want:
             steps["linkage"] = "failed"
+            if h == cached_h:
+                # NOT a contradiction: the server's chain disagrees with OUR cache, not with anything
+                # shipped or with the mark's own proof. The cache may be on a branch Radiant has since
+                # abandoned (a reorganisation deeper than its margin), so this proves nothing either
+                # way. verify_with_fetched falls back to the shipped checkpoint when it can.
+                facts["cache_disagreement"] = (
+                    f"the header served at {h} is not the one pyrxd's verified-header cache holds for that "
+                    f"height; the cache may be on a branch Radiant has abandoned — run "
+                    f"`{CACHE_RESET_COMMAND}` to rebuild it"
+                )
+                raise _Stop(NOT_VERIFIED, facts["cache_disagreement"])
             raise _Stop(CONTRADICTED, f"the header served at {h} is not pyrxd's checkpoint for that height")
 
+    if cached_h is not None:
+        facts.update(cached_anchor_height=cached_h, cached_anchor_hash=newest_hash)
+    # Whether the mark's block is linked to the CACHED header (at or below it) rather than to a
+    # shipped checkpoint. `checkpoint_height` names a shipped checkpoint either way.
+    cp_is_cached = False
     if plan.level == "checkpoint":
         cp_h, cp_hash = table[bisect.bisect_left(heights, height)]
-        facts.update(checkpoint_height=cp_h, checkpoint_hash=cp_hash)
+        cp_is_cached = cp_h == cached_h
+        if cp_is_cached:
+            facts.update(checkpoint_height=shipped_h, checkpoint_hash=shipped_hash)
+        else:
+            facts.update(checkpoint_height=cp_h, checkpoint_hash=cp_hash)
         link(height, cp_h)
         anchor(cp_h, cp_hash)
         steps["linkage"] = "passed"
         facts["linked_headers"] = len(linked)
         facts["verified_depth"] = newest_h - height + 1
     else:
-        facts.update(checkpoint_height=newest_h, checkpoint_hash=newest_hash)
+        facts.update(checkpoint_height=shipped_h, checkpoint_hash=shipped_hash)
 
     # 4. above the newest checkpoint: linkage from it, each header's own PoW, and the floor. Past
     # the REQUIRED depth, a header decides by cause (module docstring): a failed proof-of-work, or
@@ -620,7 +746,20 @@ def _verify(
     required_above = required_top > newest_h
     if top > newest_h and (required_above or _hashes_to(headers.get(newest_h), newest_hash)):
         anchor(newest_h, newest_hash)
-        floor = radiant_header_work(_header(headers, newest_h), pow_limit=pow_limit) // FLOOR_WORK_DIVISOR
+        base_work = radiant_header_work(_header(headers, newest_h), pow_limit=pow_limit)
+        if cached_h is not None:
+            # NEVER LOWERED BY THE CACHE: the newest shipped checkpoint's work is the least the bar
+            # can rest on, and the cached anchor can only raise it (see pyrxd.glyph.header_cache).
+            base_work = max(base_work, radiant_header_work(cache.checkpoint_header, pow_limit=pow_limit))
+            floor_of = f"the greater of checkpoint {shipped_h}'s and cached header {cached_h}'s"
+        else:
+            floor_of = f"checkpoint {newest_h}'s"
+        if cached_floor is not None and cached_floor[1] > base_work:
+            # The fallback from a cache the server disagreed with: the floor the cached header set
+            # stays (its proof-of-work is real on whichever branch it sits).
+            base_work = cached_floor[1]
+            floor_of = f"cached header {cached_floor[0]}'s, which this walk did not anchor at"
+        floor = base_work // FLOOR_WORK_DIVISOR
         if required_above:
             # Known before any header is checked, so reported on a failing proof too (as in #804).
             facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
@@ -658,16 +797,15 @@ def _verify(
                 if past:
                     # Not in the proved run, so no step records it: the run ends below it.
                     facts["short_of_target"] = (
-                        f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of "
-                        f"checkpoint {newest_h}'s)"
+                        f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of {floor_of})"
                     )
                     break
                 steps["proof_of_work"] = "passed"  # every header up to this one, this one included
                 steps["floor"] = "failed"
                 raise _Stop(
                     NOT_VERIFIED,
-                    f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of "
-                    f"checkpoint {newest_h}'s); its difficulty may be honest, but it does not verify here",
+                    f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of {floor_of}); "
+                    f"its difficulty may be honest, but it does not verify here",
                 )
             steps["proof_of_work"] = "passed"  # so far: every header up to this one
             linked.add(h)
@@ -692,11 +830,33 @@ def _verify(
         )
     steps["burial"] = "passed"
 
-    if plan.level == "checkpoint":
+    if cp_is_cached:
+        claim = (
+            f"The transaction is in block {height}: its merkle branch leads to that block's header, and "
+            f"that header is linked hash by hash to block {cached_h}, {_CACHED_HEADER}. "
+            f"{_cache_sentence(shipped_h)} The height rests on that cache and that checkpoint, not on any server."
+        )
+    elif plan.level == "checkpoint":
         claim = (
             f"The transaction is in block {height}: its merkle branch leads to that block's header, and "
             f"that header is linked hash by hash to block {facts['checkpoint_height']}, a checkpoint "
             f"shipped with pyrxd. The height rests on that checkpoint, not on any server."
+        )
+        if cached_h is not None:
+            claim += (
+                f" Its depth is counted through pyrxd's verified-header cache on this machine, which links "
+                f"checkpoint {shipped_h} to block {cached_h}."
+            )
+    elif cached_h is not None:
+        claim = (
+            f"The transaction is in block {height}: its merkle branch leads to that block's header, and "
+            f"that header is linked hash by hash to block {cached_h}, {_CACHED_HEADER}, through "
+            f"{height - newest_h} header(s), each meeting its own proof-of-work target and carrying at least "
+            f"2^{facts['floor_work_log2']} expected hash evaluations. {_cache_sentence(shipped_h)} A server "
+            f"lying about this height could reuse the real headers below it; it would have had to mine the "
+            f"{facts['verified_depth']} header(s) from block {height} up, at that work or more. pyrxd does "
+            f"not check that they are Radiant's most-work chain, or that each difficulty is the one "
+            f"Radiant's rules require."
         )
     else:
         claim = (
@@ -801,6 +961,7 @@ def verify_with_fetched(
     network: str = "mainnet",
     checkpoints: Sequence[tuple[int, str]] | None = None,
     target_confirmations: int | None = None,
+    header_cache: Any = None,
 ) -> BlockVerification | BlockFetch:
     """The next :class:`BlockFetch` still needed, or the outcome once nothing is.
 
@@ -818,9 +979,17 @@ def verify_with_fetched(
 
     *min_confirmations* is required and *target_confirmations* only aimed for, as in
     :func:`verify_mark_block`; ``pyrxd verify`` passes no target, the pages pass one.
+    ``header_cache`` is :func:`verify_mark_block`'s: ``pyrxd verify`` passes the one
+    ``pyrxd headers sync`` built, when there is one; the pages pass none.
     """
 
-    def outcome(merkle: Any = None, coinbase: Any = None, headers: Any = None) -> BlockVerification:
+    def outcome(
+        merkle: Any = None,
+        coinbase: Any = None,
+        headers: Any = None,
+        cache: Any = None,
+        cached_floor: tuple[int, int] | None = None,
+    ) -> BlockVerification:
         return verify_mark_block(
             txid=txid,
             raw_tx=raw_tx,
@@ -833,34 +1002,72 @@ def verify_with_fetched(
             network=network,
             checkpoints=checkpoints,
             target_confirmations=target_confirmations,
+            header_cache=cache,
+            cached_floor=cached_floor,
         )
 
-    plan = plan_block_verification(
-        height=height,
-        min_confirmations=min_confirmations,
-        target_confirmations=target_confirmations,
-        network=network,
-        checkpoints=checkpoints,
-    )
+    def plan_for(cache: Any) -> BlockFetchPlan:
+        return plan_block_verification(
+            height=height,
+            min_confirmations=min_confirmations,
+            target_confirmations=target_confirmations,
+            network=network,
+            checkpoints=checkpoints,
+            header_cache=cache,
+        )
+
+    def collect(plan: BlockFetchPlan) -> tuple[Any, Any, dict[int, bytes]] | BlockFetch | BlockVerification:
+        merkle = coinbase = None
+        headers: dict[int, bytes] = {}
+        for step in block_fetches(plan, str(txid)):
+            if step.key in failed:
+                return could_not_fetch(step.what, source=source, detail=failed[step.key], height=height)
+            if step.key not in fetched:
+                return step
+            got = fetched[step.key]
+            if step.key == "merkle":
+                merkle = got
+            elif step.key == "coinbase":
+                coinbase = got
+            else:
+                start = step.params[0]
+                for i, header in enumerate(got or ()):
+                    headers.setdefault(start + i, header)
+        return merkle, coinbase, headers
+
+    plan = plan_for(header_cache)
     if plan.reason is not None or not txid:
-        return outcome()
-    merkle = coinbase = None
-    headers: dict[int, bytes] = {}
-    for step in block_fetches(plan, str(txid)):
-        if step.key in failed:
-            return could_not_fetch(step.what, source=source, detail=failed[step.key], height=height)
-        if step.key not in fetched:
-            return step
-        got = fetched[step.key]
-        if step.key == "merkle":
-            merkle = got
-        elif step.key == "coinbase":
-            coinbase = got
-        else:
-            start = step.params[0]
-            for i, header in enumerate(got or ()):
-                headers.setdefault(start + i, header)
-    return outcome(merkle, coinbase, headers)
+        return outcome(cache=header_cache)
+    got = collect(plan)
+    if not isinstance(got, tuple):
+        return got
+    first = outcome(*got, cache=header_cache)
+    if first.cache_disagreement is None:
+        return first
+    # THE CACHE DISAGREED WITH THE SERVER: fall back to the shipped checkpoint, as if there were no
+    # cache, when the mark is within its reach. The outcome then says the cache was not used, and
+    # why. Out of reach, or if the fallback's own fetches fail, the answer stays NOT VERIFIED with
+    # the cache's reason.
+    fallback_plan = plan_for(None)
+    if fallback_plan.reason is not None:
+        return first
+    got = collect(fallback_plan)
+    if isinstance(got, BlockFetch):
+        return got
+    if not isinstance(got, tuple):
+        return first
+    # The fallback keeps the floor the cached anchor set: a server that disagrees with the cache must
+    # not get a lower bar than one that agrees.
+    a = first.cached_anchor_height
+    second = outcome(*got, cache=None, cached_floor=(a, radiant_header_work(header_cache.header_at(a))))
+    note = (
+        f"pyrxd's verified-header cache disagreed with the server at block {first.cached_anchor_height}, so it "
+        f"was not used and the block was linked from the shipped checkpoint instead; run "
+        f"`{CACHE_RESET_COMMAND}` to rebuild the cache"
+    )
+    if second.state == VERIFIED:
+        return replace(second, claim=f"{second.claim} {note}.", cache_disagreement=first.cache_disagreement)
+    return replace(second, reason=f"{second.reason}; {note}", cache_disagreement=first.cache_disagreement)
 
 
 #: Said beside every CONTRADICTED outcome, on every surface: an honest mark served by a confused or
