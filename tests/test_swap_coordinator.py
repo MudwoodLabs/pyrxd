@@ -126,7 +126,11 @@ class FakeBtcLeg:
         return spk
 
     # Async: the real leg broadcasts/reads chain here.
-    async def fund(self, terms: NegotiatedTerms) -> t.BtcHtlcLocator:
+    async def fund(self, terms: NegotiatedTerms, *, on_built=None, resume_tx_hex=None) -> t.BtcHtlcLocator:
+        # This fake builds no transaction, so it has no bytes to hand `on_built` and never takes
+        # the resume path. Recording the funding tx before the broadcast, and resuming from it,
+        # is exercised against the REAL BitcoinTaprootLeg in test_btc_fund_interrupted_resume.py.
+        del on_built, resume_tx_hex
         self.calls.append("fund")
         amount = terms.btc_sats + self.fund_amount_delta
         loc = self._htlc(terms).with_funding(t.BtcOutpoint("ab" * 32, 0), amount)

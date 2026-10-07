@@ -55,6 +55,7 @@ from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
     CoordinatorConfig,
@@ -187,6 +188,11 @@ def _build_coordinator(
             seen_store_path if seen_store_path is not None else str(Path(args.keys_out).expanduser()) + ".seen.sqlite"
         ),
         config=config,
+        # The BTC funding transaction is recorded here BEFORE it is broadcast. Its amount is read
+        # back AFTER, and if that read fails the record is the only durable pointer to the BTC it
+        # sent: dust_swap_resume.py reads the txid from this file. The coordinator refuses a
+        # value-bearing BTC fund without it.
+        persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
     )
 
 

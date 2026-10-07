@@ -2013,7 +2013,7 @@ class SwapCoordinator:
             # deploy for WHATEVER hashlock was passed, so one record left pending disabled the
             # reuse probe for every unrelated H indefinitely — the evidence is "this swap already
             # reserved THIS H", and it says nothing about another one.
-            resuming_this_h = bool(self.record.pending_counter_contract) and (
+            resuming_this_h = bool(self.record.pending_counter_contract or self.record.pending_btc_funding_tx) and (
                 bytes(terms.hashlock) == bytes(self.record.terms.hashlock)
             )
             if not resuming_this_h and self.seen_store.has_seen(terms.hashlock):
@@ -2811,14 +2811,32 @@ class SwapCoordinator:
         persist an INTENT record (terms + derived funding SPK, enough to recover the
         address) BEFORE the awaited fund, and ``asyncio.shield()`` the post-broadcast
         persist of the funded record. ``fund`` itself must be idempotent (treat
-        "already in mempool" as success) so a retry after an intent-only crash does
-        not lock twice. Persistence is a no-op when no ``persist`` hook is injected.
+        "already in mempool" as success). Persistence is a no-op when no ``persist`` hook is
+        injected — which is refused for a value-bearing BTC fund (below).
+
+        A BTC fund records its signed funding transaction (``pending_btc_funding_tx``) BEFORE the
+        broadcast. ``fund`` broadcasts and then reads the amount back, and that read can fail after
+        the broadcast succeeded; without the bytes the record stayed NEGOTIATED with no locator and
+        H reserved, so a retry was refused as "H reused" and nothing in-band could reach the BTC.
+        A call on a record carrying them is a RESUME: if the recorded output is already confirmed it
+        is recorded as the lock with no gate (the funds already moved — refusing would only hide
+        them); otherwise the full gate runs as for a fresh fund and, if it passes, the SAME bytes are
+        re-sent (they spend one specific UTXO, so they cannot fund twice).
         """
         # When the caller's clock was read (as near as this method can know): the lock-time re-run
         # below judges `now_unix_s` advanced by everything since, reads included.
         now_sampled_monotonic = _monotonic()
         if self.record.state is not SwapState.NEGOTIATED:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
+        btc_resume_tx = self._btc_resume_tx(terms)
+        if btc_resume_tx is not None:
+            self._check_resume_reservation(terms)
+            landed = await self.counter_leg.read_confirmed_funding(terms, btc_resume_tx)
+            if landed is not None:
+                # The interrupted fund already landed: record the truth. No gate runs — the funds
+                # moved under the gate that ran before the broadcast, and refusing now would only
+                # leave them untracked.
+                return await self._record_counter_lock(terms, landed)
         gate = await self.pre_btc_lock_check(terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic)
         if not gate.ok:
             refused = DefinitiveFundRefusal if gate.definitive else ValidationError
@@ -2881,8 +2899,24 @@ class SwapCoordinator:
                 "nothing references. Pass persist= (see gravity.record_sink.JsonFileRecordSink)."
             )
 
+        # Beside the ETH rule above, after the gate (whose refusals are more specific) and before
+        # the reservation and the broadcast — the point every BTC fund, fresh or resumed, crosses.
+        if (
+            terms.counter_chain == "btc"
+            and self._persist is None
+            and (_leg_is_value_bearing(self.counter_leg) or _leg_is_value_bearing(self.radiant_leg))
+        ):
+            raise ValidationError(
+                "a value-bearing BTC counter-leg fund requires a durable persist hook: the funding "
+                "transaction is recorded BEFORE it is broadcast, and the amount is read back AFTER, so "
+                "a readback that fails or a process that dies in between leaves real BTC locked that "
+                "only the record can lead you back to. Pass persist= (see "
+                "gravity.record_sink.JsonFileRecordSink)."
+            )
         resume_from = None
-        if self.record.pending_counter_contract:
+        if btc_resume_tx is not None:
+            pass  # the reservation was checked above (`_check_resume_reservation`); this H is ours
+        elif self.record.pending_counter_contract:
             # CHECK the assumption instead of trusting it. "A pending deploy proves this swap won
             # the reservation" holds only while the seen-store and the record-store agree. They can
             # diverge — a restored backup, a rotated or deleted store, or a non-durable SeenStore
@@ -2958,7 +2992,69 @@ class SwapCoordinator:
                     on_push_nonce=_remember_push_nonce,
                 )
         else:
-            locator = await self.counter_leg.fund(terms)
+
+            async def _remember_btc_funding(raw_tx_hex: str) -> None:
+                # Durable BEFORE the broadcast: the only moment the bytes are certain to be ours
+                # and not yet on chain. Shielded so a cancellation cannot drop the one write that
+                # makes the broadcast after it recoverable.
+                self.record = dataclasses.replace(self.record, pending_btc_funding_tx=raw_tx_hex)
+                await self._persist_record(self.record, shield=True)
+
+            try:
+                locator = await self.counter_leg.fund(
+                    terms, on_built=_remember_btc_funding, resume_tx_hex=btc_resume_tx
+                )
+            except Exception as exc:
+                txid = self.record.pending_btc_funding_txid
+                if txid is None:
+                    raise  # failed before the bytes existed: nothing was sent
+                try:
+                    where = self.counter_leg.htlc_address(terms)
+                except Exception:  # the message must never mask the failure it reports
+                    where = None
+                msg = (
+                    f"BTC fund interrupted after funding transaction {txid} was recorded "
+                    f"(and may have been broadcast){f' to the HTLC at {where}' if where else ''}: {exc}. "
+                    "The record still carries the transaction and the reservation: call taker_funds_btc "
+                    "(or resume_interrupted_fund) again to record it once it confirms, or re-send it if "
+                    f"it never left. If it confirms and the swap does not proceed, it refunds after t_btc."
+                )
+                if isinstance(exc, NetworkError):
+                    raise NetworkError(msg) from exc
+                raise ValidationError(msg) from exc
+        return await self._record_counter_lock(terms, locator)
+
+    def _btc_resume_tx(self, terms: NegotiatedTerms) -> str | None:
+        """The recorded BTC funding bytes when THIS call resumes an interrupted fund of THIS swap."""
+        raw = self.record.pending_btc_funding_tx
+        if raw is None or terms.counter_chain != "btc":
+            return None
+        if bytes(terms.hashlock) != bytes(self.record.terms.hashlock):
+            raise ValidationError(
+                "the record carries an interrupted BTC fund for a different hashlock: resuming would "
+                "act on one swap's funding with another swap's terms"
+            )
+        return raw
+
+    def _check_resume_reservation(self, terms: NegotiatedTerms) -> None:
+        """A resume skips the seen-store reserve on the evidence that THIS record won it. Check that
+        evidence instead of trusting it: a restored backup or a rotated store can leave a pending
+        record whose H is no longer reserved, and then another swap could be using it."""
+        try:
+            still_reserved = self.seen_store.has_seen(terms.hashlock)
+        except Exception as exc:
+            raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
+        if not still_reserved:
+            raise ValidationError(
+                "record carries an interrupted BTC fund but its hashlock is NOT reserved in the "
+                "seen-store: the two stores have diverged, so this record cannot prove it won the "
+                "reservation. Refusing to resume; resolve the divergence first (the recorded "
+                "transaction, if it confirmed, refunds after t_btc)."
+            )
+
+    async def _record_counter_lock(self, terms: NegotiatedTerms, locator: Any) -> SwapRecord:
+        """Bind a funded counter-leg locator to the negotiated price, attach it, advance, persist —
+        the one place a fund (fresh, resumed, or found already confirmed) becomes BTC_LOCKED."""
         if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):
             raise ValidationError("counter_leg.fund must return a Btc/Eth HtlcLocator (full durable retained state)")
         # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits to
@@ -3542,7 +3638,7 @@ class SwapCoordinator:
                 "no swap record found: there is nothing to resume. If the fund never started, run "
                 "the forward path instead — resuming into a fresh fund would deploy a second HTLC."
             )
-        if not rec.pending_counter_contract:
+        if not rec.pending_counter_contract and not rec.pending_btc_funding_tx:
             state = rec.state.value if isinstance(rec.state, SwapState) else rec.state
             raise ValidationError(
                 f"the swap record carries no pending counter-leg deploy (state {state}), so there "
@@ -3558,6 +3654,14 @@ class SwapCoordinator:
         try:
             return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:
+            if self.record.state is SwapState.NEGOTIATED and self.record.pending_btc_funding_tx:
+                txid = self.record.pending_btc_funding_txid
+                raise ValidationError(
+                    f"BTC resume refused: {exc}. Nothing new was sent and the record is unchanged "
+                    f"(negotiated, recorded funding transaction {txid}). If that transaction was already "
+                    "broadcast it may still confirm: resume again and it is recorded as the lock with no "
+                    "gate. If it never left, it is not re-sent until the gate passes."
+                ) from exc
             if self.record.state is not SwapState.NEGOTIATED or not self.record.pending_counter_contract:
                 raise
             if isinstance(exc, DefinitiveFundRefusal):

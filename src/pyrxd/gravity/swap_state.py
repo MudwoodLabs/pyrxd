@@ -31,6 +31,7 @@ from pyrxd.btc_wallet.taproot import (
     BtcHtlcLocator,
     Timelock,
     TimeUnit,
+    btc_txid_from_raw,
 )
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, check_hex_addr, check_tx_hash
 from pyrxd.security.errors import ValidationError
@@ -597,6 +598,16 @@ class SwapRecord:
     #: watchtower tracks its refund (and a maker's claim with ``p``) instead of reading a NEGOTIATED
     #: record as "nothing locked". Serialised only when set.
     fund_refusal: str | None = None
+    #: The taker's BTC funding transaction (raw signed hex), recorded BEFORE it is broadcast and
+    #: cleared once the funded locator is attached. The HTLC *address* is derivable from the terms,
+    #: but the funding *transaction* is not, and `BitcoinTaprootLeg.fund` broadcasts first and reads
+    #: the amount back second: a readback that times out or fails left real BTC on chain under a
+    #: NEGOTIATED record with no locator and H already reserved, and every in-band path (`retry`,
+    #: `taker_refund_btc`, `mutual_refund`) refused. With the bytes on the record a resume can find
+    #: the output on chain, or re-broadcast the SAME bytes — which cannot fund twice, because the
+    #: transaction spends one specific UTXO. The txid is derived from these bytes, never stored
+    #: beside them, so the two cannot disagree. Serialised only when set.
+    pending_btc_funding_tx: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -666,6 +677,22 @@ class SwapRecord:
                 "whose slot is unknown, so a resume could neither replace it nor rule out sending a "
                 "second push at a different nonce. Record both or neither."
             )
+        if self.pending_btc_funding_tx is not None:
+            if self.terms.counter_chain != "btc":
+                raise ValidationError(
+                    "pending_btc_funding_tx is a BTC-side handle; it is meaningless on "
+                    f"counter_chain {self.terms.counter_chain!r}"
+                )
+            if not isinstance(self.pending_btc_funding_tx, str):
+                raise ValidationError("pending_btc_funding_tx must be a hex str")
+            try:
+                raw = bytes.fromhex(self.pending_btc_funding_tx)
+            except ValueError:
+                raise ValidationError("pending_btc_funding_tx must be hex") from None
+            # Structure is checked here, not at resume time: a record that round-trips bytes no
+            # parser accepts reads as a recoverable fund and recovers nothing.
+            btc_txid_from_raw(raw)
+            object.__setattr__(self, "pending_btc_funding_tx", raw.hex())
         if self.single_operator_override is not None and not isinstance(self.single_operator_override, str):
             raise ValidationError("single_operator_override must be a str or None")
         if self.fund_refusal is not None and not isinstance(self.fund_refusal, str):
@@ -679,6 +706,13 @@ class SwapRecord:
                 bytes.fromhex(self.radiant_covenant_spk_hex)
             except ValueError:
                 raise ValidationError("radiant_covenant_spk_hex must be hex") from None
+
+    @property
+    def pending_btc_funding_txid(self) -> str | None:
+        """The txid of :attr:`pending_btc_funding_tx`, derived from its bytes (or ``None``)."""
+        if self.pending_btc_funding_tx is None:
+            return None
+        return btc_txid_from_raw(bytes.fromhex(self.pending_btc_funding_tx))
 
     @property
     def btc_locator(self) -> BtcHtlcLocator | None:
@@ -715,6 +749,7 @@ class SwapRecord:
             pending_counter_deploy_tx=None,
             pending_push_nonce=None,
             pending_push_tx_hash=None,
+            pending_btc_funding_tx=None,
         )
 
     def with_btc_lock(self, locator: BtcHtlcLocator) -> SwapRecord:
@@ -763,6 +798,8 @@ class SwapRecord:
             d["single_operator_override"] = self.single_operator_override
         if self.fund_refusal is not None:
             d["fund_refusal"] = self.fund_refusal
+        if self.pending_btc_funding_tx is not None:
+            d["pending_btc_funding_tx"] = self.pending_btc_funding_tx
         return d
 
     @classmethod
@@ -797,6 +834,7 @@ class SwapRecord:
             pending_push_tx_hash=d.get("pending_push_tx_hash"),
             single_operator_override=d.get("single_operator_override"),
             fund_refusal=d.get("fund_refusal"),
+            pending_btc_funding_tx=d.get("pending_btc_funding_tx"),
         )
 
 

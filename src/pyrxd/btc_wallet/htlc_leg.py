@@ -389,6 +389,10 @@ class BitcoinTaprootLeg:
         )
 
     # -- pure HTLC derivation (sync) ----------------------------------------
+    def htlc_address(self, terms) -> str:
+        """The HTLC's P2TR address for *terms* — derivable before any funding exists."""
+        return self._htlc(terms).address
+
     def _htlc(self, terms) -> t.BtcHtlc:
         """Re-derive the HTLC funding artifact from the negotiated terms.
 
@@ -551,29 +555,45 @@ class BitcoinTaprootLeg:
         return confs
 
     # -- chain-touching (async) ---------------------------------------------
-    async def fund(self, terms) -> t.BtcHtlcLocator:
+    async def fund(self, terms, *, on_built=None, resume_tx_hex: str | None = None) -> t.BtcHtlcLocator:
         """Fund the HTLC P2TR address from the taker's UTXO; return the locator.
 
-        Build → idempotent-broadcast → read the funded amount back from the chain
+        Build → record → idempotent-broadcast → read the funded amount back from the chain
         (D4: the amount is the ON-CHAIN value, never a self-report). The funding tx
         pays output 0 to the HTLC address; change (if any) returns to the taker.
+
+        ``on_built(raw_tx_hex)`` is awaited with the signed bytes BEFORE they are broadcast. The
+        readback that follows can fail after the broadcast succeeded (a confirmation slower than
+        ``fund_confirm_timeout_s``, a transport error), and the caller must then still know which
+        transaction it sent: the HTLC address is derivable from the terms, the funding transaction
+        is not. ``resume_tx_hex`` re-sends those SAME recorded bytes instead of building new ones;
+        it cannot fund twice, because the transaction spends one specific UTXO, and the broadcaster
+        treats a transaction the node already has (mempool or chain) as success.
         """
         htlc = self._htlc(terms)
-        # build_payment_tx pays a hash + type; for P2TR the "hash" is the 32-byte
-        # output key (taproot output) — exactly htlc.output_key.
-        payment = build_payment_tx(
-            self.taker_keypair,
-            self.funding_utxo,
-            to_hash=htlc.output_key,
-            to_type="p2tr",
-            amount_sats=terms.btc_sats,
-            fee_sats=self.fee_sats,
-            input_type=self.funding_input_type,
-        )
-        broadcast_txid = await self.broadcaster.broadcast(bytes.fromhex(payment.tx_hex))
-        # The broadcaster's idempotent path returns the SAME txid build_payment_tx
-        # computed; bind to the builder's txid (authoritative for the outpoint).
-        funding_txid = Txid(payment.txid)
+        if resume_tx_hex is not None:
+            raw = self._recorded_funding_tx(terms, htlc, resume_tx_hex)
+        else:
+            # build_payment_tx pays a hash + type; for P2TR the "hash" is the 32-byte
+            # output key (taproot output) — exactly htlc.output_key.
+            payment = build_payment_tx(
+                self.taker_keypair,
+                self.funding_utxo,
+                to_hash=htlc.output_key,
+                to_type="p2tr",
+                amount_sats=terms.btc_sats,
+                fee_sats=self.fee_sats,
+                input_type=self.funding_input_type,
+            )
+            raw = bytes.fromhex(payment.tx_hex)
+            if t.btc_txid_from_raw(raw) != str(Txid(payment.txid)):
+                raise ValidationError("build_payment_tx reported a txid that is not the txid of its own bytes")
+        # The txid of THESE bytes is authoritative for the outpoint (serialize, don't trust).
+        funding_txid = Txid(t.btc_txid_from_raw(raw))
+        if on_built is not None:
+            await on_built(raw.hex())
+        broadcast_txid = await self.broadcaster.broadcast(raw)
+        # The broadcaster's idempotent path returns the SAME txid; bind to the bytes' txid.
         if broadcast_txid != str(funding_txid):
             raise NetworkError(
                 f"broadcast txid {broadcast_txid} != built funding txid {funding_txid}; refusing to proceed"
@@ -587,6 +607,44 @@ class BitcoinTaprootLeg:
         if not isinstance(on_chain_amount, int) or isinstance(on_chain_amount, bool) or on_chain_amount <= 0:
             raise NetworkError("funding reader returned a non-positive on-chain amount; fail-closed")
         return htlc.with_funding(outpoint, on_chain_amount)
+
+    async def read_confirmed_funding(self, terms, tx_hex: str) -> t.BtcHtlcLocator | None:
+        """The locator for a RECORDED funding transaction if its output is confirmed, else ``None``.
+
+        One read, no broadcast, no polling: this is how a resume learns that an interrupted fund
+        already landed, so it can record the truth without re-running a gate the funds have
+        already passed through. ``None`` means "not PROVEN confirmed" — not yet mined, never sent,
+        or a reader that could not answer (readers disagree on how they report an unknown tx:
+        some say 0 confirmations, the multi-source reader raises ``NetworkError``). A recorded
+        transaction that does not pay this swap's HTLC raises; that is a corrupt record, not a
+        transient.
+        """
+        htlc = self._htlc(terms)
+        raw = self._recorded_funding_tx(terms, htlc, tx_hex)
+        txid = t.btc_txid_from_raw(raw)
+        try:
+            amount = await self.funding_reader.read_output_amount_sats(
+                txid, 0, min_confirmations=self.min_confirmations
+            )
+        except NetworkError:
+            return None
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+            raise NetworkError("funding reader returned a non-positive on-chain amount; fail-closed")
+        return htlc.with_funding(t.BtcOutpoint(txid=txid, vout=0), amount)
+
+    def _recorded_funding_tx(self, terms, htlc, tx_hex: str) -> bytes:
+        """The recorded funding bytes, refused unless output 0 pays THIS swap's HTLC its amount."""
+        try:
+            raw = bytes.fromhex(tx_hex)
+        except (TypeError, ValueError):
+            raise ValidationError("recorded funding transaction is not hex") from None
+        outputs = t.btc_spend_fields_from_raw(raw).outputs
+        if not outputs or outputs[0] != (terms.btc_sats, htlc.scriptpubkey):
+            raise ValidationError(
+                "recorded funding transaction does not pay this swap's HTLC output 0 the negotiated "
+                "amount; refusing to broadcast or adopt it (the record is corrupt or belongs to another swap)"
+            )
+        return raw
 
     async def _read_funded_amount_sats(self, funding_txid: str, vout: int) -> int:
         """Read the on-chain funded amount, polling for min_confirmations if configured.
