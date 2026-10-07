@@ -24,7 +24,8 @@ basic development but won't pull in the full `test` group (pytest-cov,
 hypothesis, pytest-mock). Use Poetry to match the exact CI environment.
 
 The offline suite is ~19,500 tests. `task test` runs it with `pytest -n auto`
-(pytest-xdist, one worker per CPU): measured in #825 on a 4-core machine with
+(pytest-xdist; with psutil installed, `auto` starts one worker per
+physical core, which is 2 on a GitHub-hosted runner): measured in #825 on a 4-core machine with
 coverage, ~6m15s to 6m45s in parallel against ~23m55s serially, with the same
 outcome for every test. If it gets materially slower, that is worth chasing rather than
 absorbing — run `pytest --durations=25` and look at the top of the list.
@@ -120,9 +121,11 @@ This is the canonical "is my PR likely to pass CI" check. Mirrors
 PR CI will almost always pass too.
 
 **The default loop: run the tests for the area you changed locally, push, and
-let CI run the full matrix.** Merging already requires the checks to pass on
-the exact head being merged, on all three Python versions, so a full local run
-before every push mostly duplicates CI. Run the whole suite locally only when
+let CI run the full matrix.** Merging already requires the required checks to
+pass on the exact head being merged, so a full local run before every push
+mostly duplicates CI. Of the test jobs, only `test (3.12)` is a required check:
+`test (3.10)` and `test (3.11)` run on every PR but do not block a merge, so look
+at them before merging. Run the whole suite locally only when
 you need the answer before a review round. For a targeted run:
 
 ```bash
