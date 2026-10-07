@@ -568,10 +568,18 @@ class EthHtlcContractLeg:
                 "NOT YET FINALIZED — compare against 'latest' and retry once it buries. Empty code "
                 "at a checkpoint is not evidence of a wrong or attacker contract."
             )
-        if bytes(code) != self._expected_runtime(locator):
+        code, expected = bytes(code), self._expected_runtime(locator)
+        if code != expected:
+            # Say HOW it differs: a length mismatch is a different contract altogether, while a
+            # same-length difference at an immutable offset is the #798 forged-copy shape.
+            if len(code) != len(expected):
+                how = f"{len(code)} bytes present, {len(expected)} expected"
+            else:
+                first = next(i for i, (a, b) in enumerate(zip(code, expected)) if a != b)
+                how = f"same length ({len(code)} bytes), first difference at byte {first}"
             raise ValidationError(
                 f"on-chain runtime at {locator.contract_address} does not EXACTLY equal the runtime "
-                f"expected for the negotiated terms ({len(code)} bytes present, but different) — "
+                f"expected for the negotiated terms ({how}) — "
                 "wrong/attacker contract, or an immutable copy the getters cannot see was forged"
             )
         # Code is exact; storage is not code. Same pinned block as every other read here.

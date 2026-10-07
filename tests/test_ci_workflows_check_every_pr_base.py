@@ -87,9 +87,13 @@ _REQUIRED_CHECKS = (
 _PENDING_REQUIRED_CHECKS: dict[str, str] = {}
 
 #: Checks guarded exactly like the required ones (every PR base, no path filter) that branch
-#: protection does NOT require yet. REVIEWED, like `_REQUIRED_CHECKS`. Empty today; a check that
-#: must run on every PR before it is made required belongs here, then moves up.
-_GUARDED_NOT_YET_REQUIRED: tuple[str, ...] = ()
+#: protection does NOT require yet. REVIEWED, like `_REQUIRED_CHECKS`. A check that must run on
+#: every PR before it is made required belongs here, then moves up.
+_GUARDED_NOT_YET_REQUIRED: tuple[str, ...] = (
+    # counter-leg-artifacts.yml: rebuilds tests/fixtures/{EthHtlc,Erc20Htlc}.json from contracts/
+    # and fails on any difference (#846). Whether to require it is the maintainer's call.
+    "counter-leg artifacts rebuild",
+)
 
 #: A condition that reads the PR's base branch can reintroduce the filter one level down.
 _BASE_REF_IN_CONDITION = re.compile(r"\bbase_ref\b|pull_request\.base\.ref\b")

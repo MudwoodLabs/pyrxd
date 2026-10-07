@@ -1,5 +1,5 @@
 {
-  "_source": "contracts/EthHtlc.sol (git blob 2f8fea4a53857965dc652a24d96349865070e835), copied unchanged from MudwoodLabs/pyrxd-eth-htlc@726446c4070d2e88e52598fe346f5445f63e116f:contracts/EthHtlc.sol",
+  "_source": "contracts/EthHtlc.sol (git blob 8cb90847a044aa49c2a022f97125faa37b64d146), modified since it was copied from MudwoodLabs/pyrxd-eth-htlc@726446c4070d2e88e52598fe346f5445f63e116f:contracts/EthHtlc.sol (git blob 2f8fea4a53857965dc652a24d96349865070e835); changed: one comment only: the plan it cites is named by the repo it lives in, not by a path absent here",
   "_compiler": "solc 0.8.24+commit.e11b9ed9 (official static linux-amd64 build, sha256 fb03a29a517452b9f12bcf459ef37d0a543765bb3bbc911e70a87d6a37c30d5f), standard JSON, settings {\"evmVersion\": \"cancun\", \"metadata\": {\"bytecodeHash\": \"none\"}, \"optimizer\": {\"enabled\": true, \"runs\": 200}}, source unit contracts/EthHtlc.sol. Built by scripts/build_counter_leg_artifacts.py; `--check` rebuilds and compares.",
   "_note": "Per-swap deploy model: claim(bytes32 preimage) + immutable hashlock/claimant/refundee/timeout; Claimed(bytes32 preimage) non-indexed. Test fixture for the Anvil integration proof of the pyrxd EthLeg.",
   "abi": [

@@ -13,7 +13,7 @@ pragma solidity 0.8.24;
 ///     receiving the ETH. Revealing the preimage is the cross-chain message.
 ///   - If the maker never claims, the TAKER calls refund() after `timeout` to reclaim the ETH.
 ///
-/// Security properties (see docs/plans/2026-05-24-feat-eth-rxd-htlc-atomic-swap-plan.md):
+/// Security properties (design notes: the ETH-RXD HTLC plan in the MudwoodLabs/pyrxd-eth-htlc prototype repo):
 ///   - sha256 hashlock (digest-compatible with Bitcoin/Radiant OP_SHA256 over a 32-byte secret).
 ///   - Checks-Effects-Interactions + single `settled` flag => reentrancy-safe; the value send
 ///     is the last action and cannot re-enter a still-open swap.

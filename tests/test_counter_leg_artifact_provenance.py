@@ -19,8 +19,10 @@ pinned by sha256, through standard JSON with the optimizer on (200 runs), evmVer
 push to main; it rebuilds both artifacts and fails on any difference, so the source, the artifacts
 and these pins cannot drift apart unnoticed.
 
-* ``contracts/EthHtlc.sol`` is git blob ``2f8fea4a``, copied unchanged from
-  ``MudwoodLabs/pyrxd-eth-htlc@726446c4070d:contracts/EthHtlc.sol``.
+* ``contracts/EthHtlc.sol`` is git blob ``8cb90847``: blob ``2f8fea4a`` from
+  ``MudwoodLabs/pyrxd-eth-htlc@726446c4070d:contracts/EthHtlc.sol`` with one comment changed (it
+  cited a ``docs/plans/`` path that exists only in that repo). With no metadata hash, the bytecode
+  is identical to the unmodified file's.
 * ``contracts/Erc20Htlc.sol`` is git blob ``a0c9010f``, copied unchanged from
   ``MudwoodLabs/pyrxd-eth-htlc@7b7d005e9148:contracts/src/Erc20Htlc.sol``.
 
@@ -68,8 +70,10 @@ class _Pin:
 _PINS: dict[str, _Pin] = {
     "EthHtlc.json": _Pin(
         source=(
-            "contracts/EthHtlc.sol (git blob 2f8fea4a53857965dc652a24d96349865070e835), copied unchanged from "
-            "MudwoodLabs/pyrxd-eth-htlc@726446c4070d2e88e52598fe346f5445f63e116f:contracts/EthHtlc.sol"
+            "contracts/EthHtlc.sol (git blob 8cb90847a044aa49c2a022f97125faa37b64d146), modified since it was "
+            "copied from MudwoodLabs/pyrxd-eth-htlc@726446c4070d2e88e52598fe346f5445f63e116f:contracts/EthHtlc.sol "
+            "(git blob 2f8fea4a53857965dc652a24d96349865070e835); changed: one comment only: the plan it cites is "
+            "named by the repo it lives in, not by a path absent here"
         ),
         runtime_sha256="491310059e93d547d1be46d0770b10e8c0e037280c728e67eca6963d180ae61e",
         creation_sha256="14929d5c58980ad93d446c22b55c48d8c71d040500b807ed84c83601142c10ec",

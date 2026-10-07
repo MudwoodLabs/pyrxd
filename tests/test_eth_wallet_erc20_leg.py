@@ -552,7 +552,7 @@ async def test_a_resume_that_must_send_refuses_when_the_window_cannot_be_read():
 
 async def test_the_deploy_and_the_push_are_signed_with_their_gas_limits():
     # The limits are fields of the signed transactions, so changing either changes what is
-    # broadcast. (The source records the deploy at 412,786 gas on a mainnet fork.)
+    # broadcast. (The source records the deploy at 450,657 gas, measured on Anvil 2026-10-07.)
     rpc = _PushRpc(held=0)
     coro, sent = _push(rpc, resuming=False)
     await coro

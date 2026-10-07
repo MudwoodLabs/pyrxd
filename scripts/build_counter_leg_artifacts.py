@@ -88,6 +88,9 @@ class Contract:
     origin: str  # where the source was copied from when it moved into this repo
     origin_blob: str  # the git blob id of the source at that origin
     note: str
+    #: What changed since the copy, in words. Recorded in ``_source``; REQUIRED when the blob no
+    #: longer matches ``origin_blob`` and refused when it does, so the description cannot go stale.
+    changes: str = ""
 
 
 CONTRACTS: tuple[Contract, ...] = (
@@ -97,6 +100,7 @@ CONTRACTS: tuple[Contract, ...] = (
         artifact="tests/fixtures/EthHtlc.json",
         origin="MudwoodLabs/pyrxd-eth-htlc@726446c4070d2e88e52598fe346f5445f63e116f:contracts/EthHtlc.sol",
         origin_blob="2f8fea4a53857965dc652a24d96349865070e835",
+        changes="one comment only: the plan it cites is named by the repo it lives in, not by a path absent here",
         note=(
             "Per-swap deploy model: claim(bytes32 preimage) + immutable hashlock/claimant/refundee/timeout; "
             "Claimed(bytes32 preimage) non-indexed. Test fixture for the Anvil integration proof of the pyrxd EthLeg."
@@ -200,8 +204,15 @@ def _immutable_names(ast: dict) -> dict[str, str]:
 
 def _source_claim(c: Contract, blob: str) -> str:
     if blob == c.origin_blob:
+        if c.changes:
+            raise BuildError(f"{c.source} is the origin blob again, but CONTRACTS still describes changes to it")
         return f"{c.source} (git blob {blob}), copied unchanged from {c.origin}"
-    return f"{c.source} (git blob {blob}), modified since it was copied from {c.origin} (git blob {c.origin_blob})"
+    if not c.changes:
+        raise BuildError(f"{c.source} differs from what was copied from {c.origin}; say what changed in CONTRACTS")
+    return (
+        f"{c.source} (git blob {blob}), modified since it was copied from {c.origin} "
+        f"(git blob {c.origin_blob}); changed: {c.changes}"
+    )
 
 
 def build(c: Contract, solc: Path) -> dict:

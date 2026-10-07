@@ -239,7 +239,8 @@ def test_the_honest_runtime_is_ACCEPTED(kind):
 
 @pytest.mark.parametrize("kind,name,offset", _COPIES, ids=[f"{k}-{n}@{o}" for k, n, o in _COPIES])
 def test_forging_ANY_single_immutable_copy_is_refused_by_verify_funded(kind, name, offset):
-    """#798, every instance of the class rather than the one demonstrated (``claimant`` at 1224).
+    """#798, every instance of the class rather than the one demonstrated (``claimant``'s claim() copy,
+    at 1224 in the old unoptimized build).
 
     One copy of one immutable is replaced with an attacker word; every getter still answers the
     negotiated value. The old value-masked compare passed exactly this and the ETH was drained on
@@ -248,8 +249,13 @@ def test_forging_ANY_single_immutable_copy_is_refused_by_verify_funded(kind, nam
     forged = bytearray(_honest_runtime(_KINDS[kind][0]))
     assert forged[offset : offset + 32] != _word(_ATTACKER)  # the forgery really changes the copy
     forged[offset : offset + 32] = _word(_ATTACKER)
-    with pytest.raises(ValidationError, match="does not EXACTLY equal"):
+    assert len(forged) == len(_honest_runtime(_KINDS[kind][0]))  # a forged copy, not a length change
+    with pytest.raises(
+        ValidationError, match=r"does not EXACTLY equal .*same length .*first difference at byte (\d+)"
+    ) as e:
         _verify(kind, _Rpc(bytes(forged)))
+    first = int(str(e.value).split("first difference at byte ")[1].split(")")[0])
+    assert offset <= first < offset + 32, (offset, first)
 
 
 @pytest.mark.parametrize("kind", list(_KINDS))
@@ -263,7 +269,7 @@ def test_a_flipped_LOGIC_byte_the_old_mask_ignored_is_refused(kind):
     pos = next(i for i, b in enumerate(honest) if b == 0 and i not in windows)
     tampered = bytearray(honest)
     tampered[pos] = 0x42
-    with pytest.raises(ValidationError, match="does not EXACTLY equal"):
+    with pytest.raises(ValidationError, match=f"same length .*first difference at byte {pos}\\)"):
         _verify(kind, _Rpc(bytes(tampered)))
 
 
