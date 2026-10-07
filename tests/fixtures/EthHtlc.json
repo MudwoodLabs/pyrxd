@@ -1,6 +1,6 @@
 {
-  "_source": "EthHtlc.sol (pyrxd spike branch eth-htlc-from-pyrxd-spike:contracts/EthHtlc.sol)",
-  "_compiler": "forge/solc 0.8.24",
+  "_source": "MudwoodLabs/pyrxd-eth-htlc@726446c4070d2e88e52598fe346f5445f63e116f:contracts/EthHtlc.sol",
+  "_compiler": "forge (solc 0.8.24+commit.e11b9ed9), optimizer DISABLED, evmVersion cancun, no remappings, source unit EthHtlc.sol: `forge build --contracts . --use 0.8.24` run in contracts/ with no foundry.toml. NOT the optimized EthHtlc.artifact.json committed at that same commit.",
   "_note": "Per-swap deploy model: claim(bytes32 preimage) + immutable hashlock/claimant/refundee/timeout; Claimed(bytes32 preimage) non-indexed. Test fixture for the Anvil integration proof of the pyrxd EthLeg.",
   "abi": [
     {
