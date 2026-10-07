@@ -178,6 +178,11 @@ include = [
     # auditable source for a source release.
     { path = "scripts", format = ["sdist"] },
 
+    # Solidity source of the ETH counter-leg contracts. tests/fixtures/EthHtlc.json and
+    # Erc20Htlc.json are built from it by scripts/build_counter_leg_artifacts.py, so a source
+    # release can rebuild and check them. Never in the wheel: it ships no ETH artifact.
+    { path = "contracts", format = ["sdist"] },
+
     # Published Sphinx documentation source (built at
     # https://mudwoodlabs.github.io/pyrxd/: api/, concepts/, reference/, how-to/,
     # tutorials/, showcase.md, index.rst, conf.py, the pyodide-hosted inspect
