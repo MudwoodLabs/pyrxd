@@ -123,9 +123,10 @@ PR CI will almost always pass too.
 **The default loop: run the tests for the area you changed locally, push, and
 let CI run the full matrix.** Merging already requires the required checks to
 pass on the exact head being merged, so a full local run before every push
-mostly duplicates CI. Of the test jobs, only `test (3.12)` is a required check:
-`test (3.10)` and `test (3.11)` run on every PR but do not block a merge, so look
-at them before merging. Run the whole suite locally only when
+mostly duplicates CI. The required checks include `test (3.10)`, `test (3.11)`
+and `test (3.12)`, so a failure on any supported Python blocks the merge. The
+node-backed `regtest (core, per-push)` job is not required, so look at it before
+merging. Run the whole suite locally only when
 you need the answer before a review round. For a targeted run:
 
 ```bash
