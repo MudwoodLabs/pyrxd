@@ -26,21 +26,34 @@ anchor, must carry at least ``W // FLOOR_WORK_DIVISOR`` expected hash evaluation
 * while verifying from a cached anchor, ``W`` is the GREATER of that checkpoint's work and the
   anchor's own.
 
-So the floor is never lowered by headers the cache supplied: cached headers can only raise the bar
-later headers are held to, never move it below the one the shipped checkpoint sets.
+So no floor is ever below 1/16 of the newest shipped checkpoint's work. Cached headers can hold
+it above that, and as they change from one sync to the next the sync floor moves up or down with
+them, but never below that bound.
 
 THE HONEST-PATH LIMIT, plainly. ``pyrxd headers sync`` stops at the first header whose work is below
-1/16 of the greater of the newest shipped checkpoint's work and the median of the newest 2,016
-cached headers (it caches the agreed headers under it and says why); marks past that point do not
-verify with this release until difficulty recovers, or a newer pyrxd ships a newer checkpoint.
-Within one verification walk (at most 4,032 headers above a cached anchor) the same 1/16 applies
-relative to the anchor's work when that is higher, as it applies to a checkpoint today.
+the sync floor; it caches the agreed headers under it, reports ``stopped`` and says why. A later
+sync starts at that same header with a floor from the same cached headers, so it stops there
+again whatever difficulty does afterwards: the way past is a newer pyrxd (a newer checkpoint), or
+``pyrxd headers sync --reset``, which rebuilds the cache and holds its first sync to the
+checkpoint's work alone. Marks above the stopped header verify only from the shipped checkpoint,
+within its 4,032 headers. Within one verification walk (at most 4,032 headers above a cached
+anchor) the floor rests on the anchor's work when that is higher, as it rests on a checkpoint's.
 
-WHY 16 IS ENOUGH MARGIN (measured, 2026-10-07, read-only from a default public server): over the
-370,378 linked mainnet headers from block 100,000 to 470,377, the largest ratio of the median work
-of the 2,016 headers before a block to that block's own work was 3.23 (at block 467,103), and the
-largest max/min ratio of work inside one 2,016-block interval was 3.53. 16 is about five times the
-worst observed drop against the median.
+HOW CLOSE HONEST HEADERS COME (``scripts/measure_header_floor_margins.py``, which states its method;
+run 2026-10-07, read-only from a default public server, over the 370,601 linked mainnet headers
+from block 100,000 to 470,600). Each figure is the worst, over the range, of ``W / (the least work
+of a header the rule would have to pass)``; 16 or more would mean an honest header was held back.
+
+* sync, one floor for a span starting at every height (median of the 2,016 cached headers before
+  it): 3.64 over spans of 4,032 blocks, 3.48 over spans of 8,640 that fit in the range;
+* verify, every height as the anchor, over the 4,032 headers above it: 3.91;
+* the shipped checkpoint's work against the headers after it, for every checkpoint height: 3.48
+  over 8,640 blocks, and 7.94 over 25,920 blocks (about three months).
+
+The first three worst cases all fall at block 467,103. So the per-sync and per-anchor rules kept
+at least four times their margin over this range, while the checkpoint bound, which every floor
+keeps, used half of it within three months: a release whose checkpoint is months old can come
+within reach of its limit if difficulty keeps falling, and then needs a newer pyrxd.
 
 PURE. Nothing here touches a file or the network: the CLI's store
 (:mod:`pyrxd.cli.header_store`) reads and writes the bytes :func:`encode_store` produces, and the
@@ -97,7 +110,15 @@ _VERSION = 1
 #: them to decide anything.
 _MAX_SYNC_RECORDS = 64
 
-_SEAL = object()
+#: Seals issued by the verifying functions and not yet used. Each seal admits exactly ONE
+#: construction: ``dataclasses.replace`` (which re-runs ``__init__`` with the same seal) is refused.
+_UNUSED_SEALS: set[object] = set()
+
+
+def _issue_seal() -> object:
+    seal = object()
+    _UNUSED_SEALS.add(seal)
+    return seal
 
 
 class HeaderCacheRefusal(Exception):
@@ -115,8 +136,10 @@ class VerifiedHeaders:
 
     ``headers[0]`` is the checkpoint's own header (``base_height == checkpoint_height``); every
     later header names the one before it, meets its own proof-of-work target and carries at least
-    :attr:`floor_work`. Built ONLY by :func:`verify_header_chain` and :func:`extend_verified_headers`:
-    constructing one directly raises, so a :class:`VerifiedHeaders` is always a checked one.
+    :attr:`floor_work`. Built ONLY by :func:`verify_header_chain`, :func:`extend_verified_headers`
+    and :func:`start_verified_headers`: constructing one directly, or deriving one with
+    ``dataclasses.replace``, raises (each seal admits one construction), so a :class:`VerifiedHeaders`
+    is always a checked one.
     """
 
     network: str
@@ -129,8 +152,12 @@ class VerifiedHeaders:
     _seal: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self._seal is not _SEAL:
-            raise ValidationError("VerifiedHeaders is built only by verify_header_chain() or extend_verified_headers()")
+        try:
+            _UNUSED_SEALS.remove(self._seal)
+        except KeyError:
+            raise ValidationError(
+                "VerifiedHeaders is built only by verify_header_chain() or extend_verified_headers()"
+            ) from None
 
     @property
     def base_height(self) -> int:
@@ -266,7 +293,7 @@ def verify_header_chain(
             headers=kept,
             hashes=(cp_hash, *hashes),
             floor_work=floor,
-            _seal=_SEAL,
+            _seal=_issue_seal(),
         ),
         reason,
     )
@@ -312,7 +339,7 @@ def extend_verified_headers(
             headers=chain.headers + added,
             hashes=chain.hashes + tuple(hashes),
             floor_work=chain.floor_work,
-            _seal=_SEAL,
+            _seal=_issue_seal(),
         ),
         reason,
     )

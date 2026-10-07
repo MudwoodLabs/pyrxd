@@ -18,7 +18,7 @@
 #   scripts/mutation_test.sh verdicts       # the verification modules — authority, burn and relationship verdicts
 #   scripts/mutation_test.sh mutchain       # the mutable-chain walk and its discovery from the chain
 #   scripts/mutation_test.sh waveverdicts   # WAVE identity and HashMark anchor verdicts
-#   scripts/mutation_test.sh markblock      # verifying a mark's block — Radiant header PoW, checkpoints, the verifier
+#   scripts/mutation_test.sh markblock      # verifying a mark's block — Radiant header PoW, checkpoints, the verifier, the header cache and `pyrxd headers sync`
 #   scripts/mutation_test.sh btcleg        # the BTC HTLC leg — taproot refund/claim leafs, payment parse, key handling
 #   scripts/mutation_test.sh covenants     # consensus-enforced covenant bytes — the Gravity covenant, soulbound
 #   scripts/mutation_test.sh htlccovenant  # gravity/htlc_covenant.py — the HTLC covenant bytes (sharded in CI)
@@ -164,7 +164,7 @@ group_files() {
     verdicts)    echo "glyph/authority glyph/burn glyph/relationships" ;;
     mutchain)    echo "glyph/mutable_chain glyph/mutable_chain_discovery" ;;
     waveverdicts) echo "glyph/wave_identity glyph/mark_anchor" ;;
-    markblock)   echo "spv/radiant spv/radiant_checkpoints glyph/mark_block glyph/header_cache" ;;
+    markblock)   echo "spv/radiant spv/radiant_checkpoints glyph/mark_block glyph/header_cache cli/headers_cmds" ;;
     btcleg)      echo "btc_wallet/taproot btc_wallet/htlc_leg btc_wallet/payment btc_wallet/keys btc_wallet/chains btc_wallet/validate" ;;
     # `covenants`, `gravitycore` and `cryptoprim` were each ONE group until 2026-09-29, when
     # scheduled run 36558376548 cancelled all three at the 330-minute job timeout, having scored 2

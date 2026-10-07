@@ -137,10 +137,11 @@ async def sync_headers(
         "stopped": None,
         "reset": reset,
         "floor_work_log2": None,
+        "fix": None,
     }
 
-    def refuse(reason: str) -> dict[str, Any]:
-        report["state"], report["reason"] = "refused", reason
+    def refuse(reason: str, fix: str | None = None) -> dict[str, Any]:
+        report["state"], report["reason"], report["fix"] = "refused", reason, fix
         return report
 
     if not table:
@@ -211,8 +212,17 @@ async def sync_headers(
 
     report["added"] = chain.top - old_top
     report["cached_from"], report["cached_to"] = chain.base_height, chain.top
+    if report["stopped"]:
+        # STUCK, not up to date: the next sync starts at the same header with a floor from the same
+        # cached headers, so it stops there again. Say so, and say what does get past it.
+        report["stopped"] += (
+            f" (the floor was 2^{report['floor_work_log2']} expected hash evaluations, set when this sync "
+            f"began). Every later sync starts at that header with the same floor and stops there again. "
+            f"To go past it, install a newer pyrxd (a newer checkpoint), or run `{CACHE_RESET_COMMAND}`, "
+            f"which rebuilds the cache and holds its first sync to 1/16 of the shipped checkpoint's work alone"
+        )
     if report["added"] == 0 and not reset:
-        report["state"] = "up to date"
+        report["state"] = "stopped" if report["stopped"] else "up to date"
         if not report["stopped"]:
             report["reason"] = (
                 f"no new header is at least {min_depth} blocks below the lowest tip reported ({lowest})"
@@ -235,8 +245,12 @@ async def sync_headers(
         report["added"] = 0
         report["cached_from"] = loaded.chain.base_height if loaded.chain else None
         report["cached_to"] = loaded.chain.top if loaded.chain else None
-        return refuse(f"the header cache could not be written: {_err(exc, scrub)}")
-    report["state"] = "synced"
+        return refuse(
+            f"the header cache could not be written: {_err(exc, scrub)}",
+            fix=f"check that {loaded.path.parent} is writable and has free space, then re-run; "
+            "the cache (if any) is unchanged",
+        )
+    report["state"] = "stopped" if report["stopped"] else "synced"
     return report
 
 
@@ -277,8 +291,10 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     two servers of one operator count once) served it byte for byte alike, it is at least 288
     blocks below the lowest tip they reported, it links hash by hash to the header below it back
     to the newest checkpoint pyrxd ships, and it meets its own proof-of-work and the floor (never
-    lowered by headers the cache supplied). Otherwise nothing is written, and the reason is said.
-    Exit 2 when the sync is refused.
+    below 1/16 of that checkpoint's work). A refusal (too few operators, a disagreement, a broken
+    link, a failed proof-of-work) writes nothing. A header below the floor STOPS the sync: the
+    headers below it are written, and the reason says what gets past it. Exit 2 when the sync is
+    refused or stopped.
     """
     from .swap_recovery import electrumx_urls
 
@@ -290,17 +306,20 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     report["verify_reach"] = _reach(report["cached_to"], report["checkpoint_height"])
     if _json_mode(ctx, json_flag):
         click.echo(json.dumps(report, ensure_ascii=True, indent=2))
-        if report["state"] == "refused":
+        if report["state"] in ("refused", "stopped"):
             sys.exit(NetworkBoundaryError.exit_code)
         return
     if report["state"] == "refused":
         raise NetworkBoundaryError(
             "header cache not updated",
             cause=report["reason"],
-            fix="nothing was written; the cache (if any) is unchanged. Check the configured endpoints "
+            fix=report.get("fix")
+            or "nothing was written; the cache (if any) is unchanged. Check the configured endpoints "
             "span at least two operators (`pyrxd headers status`) and re-run",
         )
     click.echo(emit(report, mode=ctx.output_mode, quiet_field="cached_to", human_lines=_sync_lines(report)))
+    if report["state"] == "stopped":
+        sys.exit(NetworkBoundaryError.exit_code)
 
 
 def _sync_lines(r: dict[str, Any]) -> list[str]:
@@ -335,11 +354,15 @@ def headers_status_cmd(ctx: CliContext, json_flag: bool) -> None:
     loaded = header_store.load(ctx.network, table)
     chain = loaded.chain
     cp = table[-1][0] if table else None
+    if chain is not None and chain.top > chain.base_height:
+        state = "ready"
+    elif loaded.stale:
+        state = "stale"
+    else:
+        state = "untrusted" if loaded.untrusted else "empty"
     report = {
         "network": ctx.network,
-        "state": "ready"
-        if chain is not None and chain.top > chain.base_height
-        else ("untrusted" if loaded.untrusted else "empty"),
+        "state": state,
         "store": str(loaded.path),
         "note": loaded.note,
         "checkpoint_height": cp,
@@ -359,9 +382,15 @@ def headers_status_cmd(ctx: CliContext, json_flag: bool) -> None:
     if report["verify_reach"] is not None:
         lines.append(f"  verify reach: block {report['verify_reach']} (mark block + confirmations - 1)")
     if report["last_sync"]:
+        # The store's own records: text from a file, so sanitised before it reaches a terminal.
+        from ..glyph._inspect_core import _sanitize_display_string as clean
+
         s = report["last_sync"]
+        ops = s.get("operators")
+        ops_text = ", ".join(clean(str(o)) for o in ops) if isinstance(ops, list) else clean(str(ops))
         lines.append(
-            f"  last sync:    {s.get('utc')}, blocks {s.get('from')}..{s.get('to')}, by {', '.join(s.get('operators') or [])}"
+            f"  last sync:    {clean(str(s.get('utc')))}, blocks {clean(str(s.get('from')))}.."
+            f"{clean(str(s.get('to')))}, by {ops_text}"
         )
     lines.append(f"  store:        {report['store']}")
     click.echo(emit(report, mode=ctx.output_mode, quiet_field="cached_to", human_lines=lines))

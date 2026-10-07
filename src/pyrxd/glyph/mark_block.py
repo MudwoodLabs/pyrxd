@@ -83,9 +83,9 @@ already linked to the newest checkpoint (:class:`pyrxd.glyph.header_cache.Verifi
 does too, the walk anchors at the cached header ``A = min(newest cached, H + min_confirmations -
 1)`` as if it were one more checkpoint: a block at or below ``A`` is linked hash by hash up to it,
 each header above ``A`` meets its own proof-of-work and the floor, and the cap is measured from
-``A``. The floor is then ``max(newest checkpoint's work, A's work) // FLOOR_WORK_DIVISOR``: it is
-never lowered by headers the cache supplied (the reasoning, and the limit an honest difficulty
-drop meets, are in :mod:`pyrxd.glyph.header_cache`). ``checkpoint_height`` still names a SHIPPED
+``A``. The floor is then ``max(newest checkpoint's work, A's work) // FLOOR_WORK_DIVISOR``: never
+below the checkpoint's (the reasoning, and the limit an honest difficulty drop meets, are in
+:mod:`pyrxd.glyph.header_cache`). ``checkpoint_height`` still names a SHIPPED
 checkpoint; ``cached_anchor_height`` names ``A``, and the claim says which anchor was used. A
 served header at ``A`` that is not the cached one is NOT VERIFIED, never CONTRADICTED: it
 disagrees with the local cache (which may be on a branch Radiant abandoned), not with anything
@@ -504,6 +504,7 @@ def verify_mark_block(
     max_headers_from_checkpoint: int = MAX_HEADERS_FROM_CHECKPOINT,
     pow_limit: int | None = None,
     header_cache: Any = None,
+    cached_floor: tuple[int, int] | None = None,
 ) -> BlockVerification:
     """Verify that *txid* is in the block at *height*, anchored to a shipped checkpoint.
 
@@ -531,6 +532,10 @@ def verify_mark_block(
 
     ``header_cache`` (:class:`~pyrxd.glyph.header_cache.VerifiedHeaders`, or ``None``) lets the walk
     anchor at a cached header instead (module docstring); ``None`` changes nothing.
+    ``cached_floor`` (``(height, work)`` of a cached header) keeps the floor at least that header's
+    work // :data:`FLOOR_WORK_DIVISOR` on a walk that does NOT anchor at it: the fallback
+    :func:`verify_with_fetched` takes when a server disagrees with the cache, so that disagreeing
+    cannot lower the floor the cache had set.
 
     Never raises on server data — see the module docstring for the states and what each claims.
     """
@@ -568,6 +573,7 @@ def verify_mark_block(
             cap=cap,
             pow_limit=pow_limit,
             cache=cache,
+            cached_floor=cached_floor,
         )
     except _Stop as stop:
         reason = stop.reason
@@ -596,6 +602,7 @@ def _verify(
     cap: int = MAX_HEADERS_FROM_CHECKPOINT,
     pow_limit: int | None = None,
     cache: Any = None,
+    cached_floor: tuple[int, int] | None = None,
 ) -> str:
     """Run every check; return the VERIFIED claim, or raise :class:`_Stop` with the outcome."""
     shipped_h, shipped_hash = table[-1] if table else (None, None)
@@ -747,6 +754,11 @@ def _verify(
             floor_of = f"the greater of checkpoint {shipped_h}'s and cached header {cached_h}'s"
         else:
             floor_of = f"checkpoint {newest_h}'s"
+        if cached_floor is not None and cached_floor[1] > base_work:
+            # The fallback from a cache the server disagreed with: the floor the cached header set
+            # stays (its proof-of-work is real on whichever branch it sits).
+            base_work = cached_floor[1]
+            floor_of = f"cached header {cached_floor[0]}'s, which this walk did not anchor at"
         floor = base_work // FLOOR_WORK_DIVISOR
         if required_above:
             # Known before any header is checked, so reported on a failing proof too (as in #804).
@@ -971,7 +983,13 @@ def verify_with_fetched(
     ``pyrxd headers sync`` built, when there is one; the pages pass none.
     """
 
-    def outcome(merkle: Any = None, coinbase: Any = None, headers: Any = None, cache: Any = None) -> BlockVerification:
+    def outcome(
+        merkle: Any = None,
+        coinbase: Any = None,
+        headers: Any = None,
+        cache: Any = None,
+        cached_floor: tuple[int, int] | None = None,
+    ) -> BlockVerification:
         return verify_mark_block(
             txid=txid,
             raw_tx=raw_tx,
@@ -985,6 +1003,7 @@ def verify_with_fetched(
             checkpoints=checkpoints,
             target_confirmations=target_confirmations,
             header_cache=cache,
+            cached_floor=cached_floor,
         )
 
     def plan_for(cache: Any) -> BlockFetchPlan:
@@ -1037,16 +1056,17 @@ def verify_with_fetched(
         return got
     if not isinstance(got, tuple):
         return first
-    second = outcome(*got, cache=None)
+    # The fallback keeps the floor the cached anchor set: a server that disagrees with the cache must
+    # not get a lower bar than one that agrees.
+    a = first.cached_anchor_height
+    second = outcome(*got, cache=None, cached_floor=(a, radiant_header_work(header_cache.header_at(a))))
     note = (
         f"pyrxd's verified-header cache disagreed with the server at block {first.cached_anchor_height}, so it "
         f"was not used and the block was linked from the shipped checkpoint instead; run "
         f"`{CACHE_RESET_COMMAND}` to rebuild the cache"
     )
     if second.state == VERIFIED:
-        return replace(
-            second, claim=f"{second.claim} {note[0].upper()}{note[1:]}.", cache_disagreement=first.cache_disagreement
-        )
+        return replace(second, claim=f"{second.claim} {note}.", cache_disagreement=first.cache_disagreement)
     return replace(second, reason=f"{second.reason}; {note}", cache_disagreement=first.cache_disagreement)
 
 

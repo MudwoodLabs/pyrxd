@@ -13,25 +13,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   links a mark's block at most 4,032 headers past its anchor, and until now that anchor was the
   newest checkpoint the release ships, so a release stopped verifying new marks about two weeks
   after it. `pyrxd headers sync` caches headers from that checkpoint toward the tip in
-  `~/.pyrxd/headers/<network>.bin`. A header is cached only when every operator that answered,
-  and at least two different operators, served it byte for byte alike (two servers of one
-  operator count once), when it is at least 288 blocks below the lowest tip they reported, and
-  when it links hash by hash back to the shipped checkpoint and meets its own proof-of-work and
-  the floor. Otherwise nothing is written and the reason is printed (exit 2); `--json` prints the
-  status. `pyrxd verify` then links from the newest cached header at or below the range it needs,
-  with the same 4,032 cap, and its claim names the anchor it used: a shipped checkpoint, or a
-  cached header and the shipped checkpoint the cache is linked to (`cached_anchor_height` in the
-  JSON). The floor is never lowered by headers the cache supplied. While verifying, it is the
-  newest shipped checkpoint's work divided by 16, or the cached anchor's when that is higher.
-  While syncing, it is the greater of the checkpoint's work and the median work of the newest
-  2,016 headers already cached, divided by 16, fixed for the whole sync; a sync stops at the
-  first header below it (the largest drop below that median measured over blocks 100,000 to
-  470,377 was 3.2x). A server whose header differs from the cached one is reported NOT VERIFIED,
-  never CONTRADICTED (the cache may be on a branch Radiant abandoned), and `pyrxd verify` then
-  falls back to the shipped checkpoint when the block is within its reach;
-  `pyrxd headers sync --reset` rebuilds the cache. The store is re-verified on every read; a
-  missing, damaged or non-verifying store is treated as empty, and with no usable cache
-  `pyrxd verify` behaves exactly as before. The browser pages do not use a cache yet.
+  `~/.pyrxd/headers/<network>.bin`.
+  - A header is cached only when every operator that answered, and at least two different
+    operators, served it byte for byte alike (two servers of one operator count once). It must
+    also be at least 288 blocks below the lowest tip they reported, link hash by hash back to the
+    shipped checkpoint, and meet its own proof-of-work and the floor.
+  - A refusal (too few operators, a disagreement, a broken link, a failed proof-of-work) writes
+    nothing. A header below the floor STOPS the sync: the headers below it are written, and the
+    reason names the remedies, a newer pyrxd or `pyrxd headers sync --reset`. Both exit 2.
+    `--json` prints the status.
+  - `--reset` rebuilds the cache from the shipped checkpoint. The old cache is replaced only if the
+    rebuild succeeds.
+  - `pyrxd verify` links from the newest cached header at or below the range it needs, with the
+    same 4,032 cap. So does `pyrxd verify --wave-name`, through the same lookup. Its claim names
+    the anchor it used: a shipped checkpoint, or a cached header and the shipped checkpoint the
+    cache is linked to. Three new JSON fields: `cached_anchor_height`, `cached_anchor_hash` and
+    `cache_disagreement`.
+  - No floor is ever below 1/16 of the newest shipped checkpoint's work. While verifying, the
+    floor is the greater of that checkpoint's work and the cached anchor's, divided by 16. While
+    syncing, it is the greater of the checkpoint's work and the median work of the newest 2,016
+    headers already cached, divided by 16, fixed for the whole sync.
+  - A measurement script, `scripts/measure_header_floor_margins.py`, reports how close honest
+    headers came to each rule.
+  - A server whose header differs from the cached one is reported NOT VERIFIED, never CONTRADICTED,
+    because the cache may be on a branch Radiant abandoned. `pyrxd verify` then falls back to the
+    shipped checkpoint when the block is within its reach, keeping the floor the cached header set.
+  - The store is re-verified on every read, written atomically under an advisory lock, and
+    append-only. A missing, damaged or non-verifying store is treated as empty, and one left
+    behind by an upgrade is reported as stale. With no usable cache, `pyrxd verify` behaves
+    exactly as before.
+  - The browser pages do not use a cache yet.
 
 ### Changed
 

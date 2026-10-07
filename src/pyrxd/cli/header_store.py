@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import os
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,7 @@ from ..glyph.header_cache import (
     verify_header_chain,
 )
 
-__all__ = ["LoadedStore", "cache_dir", "load", "save", "store_path"]
+__all__ = ["LoadedStore", "cache_dir", "load", "lock_path", "save", "store_path"]
 
 
 def cache_dir() -> Path:
@@ -59,6 +60,9 @@ class LoadedStore:
     syncs: tuple[Mapping[str, Any], ...] = field(default=())
     #: True when the file existed but could not be trusted at all.
     untrusted: bool = False
+    #: True when the store is intact but ends below this pyrxd's newest checkpoint (an upgrade moved
+    #: the checkpoint past it): not trusted for anything, not damaged either; the next sync rebuilds it.
+    stale: bool = False
 
 
 def load(network: str, table: Sequence[tuple[int, str]], *, path: Path | None = None) -> LoadedStore:
@@ -78,11 +82,24 @@ def load(network: str, table: Sequence[tuple[int, str]], *, path: Path | None = 
         return LoadedStore(where, None, f"the header cache is damaged ({exc}); treated as empty", untrusted=True)
     syncs = tuple(s for s in meta["syncs"] if isinstance(s, dict))
     if meta["network"] != network:
+        from ..glyph._inspect_core import _sanitize_display_string  # the name is text from a file
+
+        theirs = _sanitize_display_string(str(meta["network"]))
         return LoadedStore(
-            where, None, f"the header cache is for {meta['network']}, not {network}; treated as empty", syncs, True
+            where, None, f"the header cache is for {theirs}, not {network}; treated as empty", syncs, True
         )
     if not table:
         return LoadedStore(where, None, f"this pyrxd ships no checkpoints for {network}", syncs)
+    top, newest = meta["base_height"] + len(headers) - 1, table[-1][0]
+    if headers and top < newest:
+        return LoadedStore(
+            where,
+            None,
+            f"the header cache ends at block {top}, behind this pyrxd's newest checkpoint ({newest}): it is "
+            f"stale, not damaged, and the next `pyrxd headers sync` rebuilds it",
+            syncs,
+            stale=True,
+        )
     try:
         chain, why = verify_header_chain(network, meta["base_height"], headers, table=table)
     except Exception as exc:  # total over file contents: anything unexpected is "untrusted"
@@ -92,6 +109,32 @@ def load(network: str, table: Sequence[tuple[int, str]], *, path: Path | None = 
     if chain is None:
         return LoadedStore(where, None, f"the header cache does not verify ({why}); treated as empty", syncs, True)
     return LoadedStore(where, chain, why, syncs)
+
+
+def lock_path(where: Path) -> Path:
+    """The advisory lock file beside a store."""
+    return where.with_name(f"{where.name}.lock")
+
+
+@contextmanager
+def _locked(where: Path) -> Iterator[None]:
+    """An exclusive advisory lock (``fcntl.flock``) on the store's lock file, held for the block.
+
+    POSIX only. On Windows ``fcntl`` does not exist and no lock is taken: two syncs run at the same
+    moment there can still race, and the later one may shorten the store (the store stays a
+    verified chain either way; the next sync extends it again)."""
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        yield
+        return
+    fd = os.open(lock_path(where), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def save(
@@ -106,28 +149,31 @@ def save(
     above *table*'s newest checkpoint. A current store that does not verify is treated as empty.
     *reset* (``pyrxd headers sync --reset``, and only that) replaces the store whatever it holds."""
     where = path or store_path(chain.network)
-    old = None if reset else load(chain.network, table, path=where).chain
-    if old is not None:
-        # Append-only: every height both hold must hold the same header.
-        lo = max(old.base_height, chain.base_height)
-        hi = min(old.top, chain.top)
-        for h in range(lo, hi + 1):
-            if old.header_at(h) != chain.header_at(h):
-                raise ValueError(f"refusing to rewrite the cached header at {h}: the header cache is append-only")
-        if chain.top < old.top:
-            raise ValueError("refusing to shorten the header cache: it is append-only")
     data = encode_store(chain, syncs=syncs)
     where.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = where.with_name(f".{where.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    try:
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, where)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+    # Read, check and replace under ONE lock, so two concurrent syncs cannot both pass the
+    # append-only check against the same old store and the second shorten what the first wrote.
+    with _locked(where):
+        old = None if reset else load(chain.network, table, path=where).chain
+        if old is not None:
+            # Append-only: every height both hold must hold the same header.
+            lo = max(old.base_height, chain.base_height)
+            hi = min(old.top, chain.top)
+            for h in range(lo, hi + 1):
+                if old.header_at(h) != chain.header_at(h):
+                    raise ValueError(f"refusing to rewrite the cached header at {h}: the header cache is append-only")
+            if chain.top < old.top:
+                raise ValueError("refusing to shorten the header cache: it is append-only")
+        tmp = where.with_name(f".{where.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, where)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
     try:
         dir_fd = os.open(where.parent, os.O_RDONLY)
     except OSError:
