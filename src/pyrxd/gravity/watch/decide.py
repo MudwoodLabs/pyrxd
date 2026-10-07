@@ -64,11 +64,12 @@ class Intent(Enum):
     * ``PAGE_SQUEEZED`` — a decision is required (gate SQUEEZED / ASSET_VULNERABLE,
       or finality un-assessable): winner-take-all claim vs accept loss. Never
       auto-resolved in v1.
-    * ``PAGE_RESUME_FUND`` — the taker's BTC fund was interrupted after its funding transaction was
-      recorded (``record.pending_btc_funding_tx``): the BTC may already be on chain under a NEGOTIATED
-      record. The operator must run the taker's fund step again (``resume_interrupted_fund``) so the
-      lock is recorded; until then nothing downstream tracks it, and a maker who claims it with ``p``
-      starts the claim race unobserved.
+    * ``PAGE_RESUME_FUND`` — the record carries a BTC funding transaction that is not yet the lock
+      (``record.pending_btc_funding_tx``). The record cannot say whether a fund is still RUNNING
+      (it is recorded before the broadcast and cleared when the lock lands, which can take as long as
+      ``fund_confirm_timeout_s``) or was interrupted, so this is a WARN, not CRITICAL. If no fund
+      process is running, the BTC may be on chain untracked: run the taker's fund step again
+      (``resume_interrupted_fund``).
     * ``RETIRE`` — the swap reached a terminal state; stop watching it.
     * ``NOOP`` — an unsupported counter_chain (BTC and ETH are both handled).
     """
@@ -592,9 +593,10 @@ def decide(
         return Decision(
             Intent.PAGE_RESUME_FUND,
             reason=(
-                f"interrupted BTC fund: funding transaction {record.pending_btc_funding_txid} was recorded "
-                "but never confirmed as the lock — it may already be on chain. Run the taker's fund step "
-                "again to record it (or re-send it if the gate still passes)."
+                f"BTC fund in progress or interrupted: funding transaction {record.pending_btc_funding_txid} "
+                "is recorded but not yet the lock, and may already be on chain. If NO fund process is running "
+                "for this swap, run the taker's fund step again (it records the lock once confirmed, or "
+                "re-sends the same bytes if the gate passes)."
             ),
             recommended_action="resume_interrupted_fund",
             low_corroboration=corr,

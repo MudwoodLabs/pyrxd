@@ -2835,7 +2835,13 @@ class SwapCoordinator:
                 # The interrupted fund already landed: record the truth. No gate and no reservation
                 # check run — recording an output already on chain sends nothing, and refusing would
                 # only leave the funds untracked (the stranding this path exists to end).
-                return await self._record_counter_lock(terms, landed)
+                rec = await self._record_counter_lock(terms, landed)
+                # Best effort: a seen-store that lost H (restored backup, rotated store) would accept a
+                # later swap under it. The lock is already recorded; a failing store must not undo that.
+                with contextlib.suppress(Exception):
+                    if not self.seen_store.has_seen(terms.hashlock):
+                        self.seen_store.reserve(terms.hashlock)
+                return rec
             # Not proven on chain: what follows may RE-SEND the bytes, so the reservation this record
             # claims must still hold.
             self._check_resume_reservation(terms)
@@ -3000,8 +3006,9 @@ class SwapCoordinator:
                 # and not yet on chain. Shielded so a cancellation cannot drop the one write that
                 # makes the broadcast after it recoverable.
                 staged = dataclasses.replace(self.record, pending_btc_funding_tx=raw_tx_hex)
-                # Adopted only once durable: if the write fails, the leg never broadcasts, and the
-                # record must not claim a transaction that was recorded nowhere.
+                # Adopted only once the write returns: if it raises, the leg never broadcasts, and the
+                # in-memory record must not claim the transaction. (A hook that writes and THEN raises
+                # leaves it on disk only; a resume from disk recovers that — nothing was sent.)
                 await self._persist_record(staged, shield=True)
                 self.record = staged
 
@@ -3634,9 +3641,10 @@ class SwapCoordinator:
           fresh fund is `taker_funds_btc`'s job; silently falling through to it would deploy again.
         * A record with no pending handle → refuse. Either the fund completed (the locator is on
           the record) or it never started; neither is a resume.
-        * Terms that disagree with the record's → refuse. `taker_funds_btc` takes `terms` as an
-          argument and never checks them against the record it is about to act on, so a drifted
-          argument would fund one thing while the record describes another.
+        * Terms for a different swap (another hashlock) → refuse. For the same swap the RECORD's
+          terms are used, not the supplied ones: `taker_funds_btc` acts on the `terms` it is given and
+          a runner rebuilds them from its arguments each run, so a drifted argument must neither fund
+          one thing while the record describes another nor refuse a legitimate resume.
         """
         rec = sink.load_record()
         if rec is None:
@@ -3656,23 +3664,30 @@ class SwapCoordinator:
                 "the supplied terms do not match the persisted record (different hashlock): "
                 "resuming would fund the contract from one swap using the parameters of another."
             )
-        if rec.terms.to_dict() != terms.to_dict():
-            raise ValidationError(
-                "the supplied terms do not match the persisted record (same hashlock, different "
-                "parameters): resuming would complete one fund while the record describes another."
-            )
+        # The RECORD's terms are authoritative from here on: they describe the contract that was
+        # deployed or the transaction that was signed. A runner rebuilds its terms from its arguments
+        # on every run (eth_swap_run re-derives t_btc from a re-measured block interval), so demanding
+        # the supplied terms match field-for-field refused legitimate resumes; acting on the supplied
+        # ones instead would complete one fund under parameters the record does not describe.
+        terms = rec.terms
         self.record = rec
         try:
             return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:
             if self.record.state is SwapState.NEGOTIATED and self.record.pending_btc_funding_tx:
                 txid = self.record.pending_btc_funding_txid
-                kind = DefinitiveFundRefusal if isinstance(exc, DefinitiveFundRefusal) else ValidationError
-                raise kind(
+                if isinstance(exc, DefinitiveFundRefusal):
+                    raise DefinitiveFundRefusal(
+                        f"BTC resume refused definitively: {exc}. The recorded funding transaction {txid} is "
+                        "NOT re-sent, and a resume will refuse again for the same reason. If it was already "
+                        "broadcast it may still confirm — a resume then records it as the lock with no gate; "
+                        "if it never left, the taker's UTXO is unspent and this swap cannot be funded."
+                    ) from exc
+                raise ValidationError(
                     f"BTC resume did not complete: {exc}. The record still carries funding transaction {txid} "
                     "(negotiated). Only those same bytes are ever sent, so it cannot fund twice; it may "
-                    "already be on chain. Resume again: once it confirms it is recorded as the lock with no "
-                    "gate, and it is re-sent only when the gate passes."
+                    "already be on chain. Resume again once the cause clears: if it has confirmed it is "
+                    "recorded as the lock with no gate, and it is re-sent only when the gate passes."
                 ) from exc
             if self.record.state is not SwapState.NEGOTIATED or not self.record.pending_counter_contract:
                 raise

@@ -53,8 +53,9 @@ class Severity(Enum):
 _SEVERITY: dict[Intent, Severity] = {
     Intent.PAGE_CLAIM: Severity.CRITICAL,
     Intent.PAGE_SQUEEZED: Severity.CRITICAL,
-    # CRITICAL: the BTC may be on chain untracked, and a maker claim with p would go unobserved.
-    Intent.PAGE_RESUME_FUND: Severity.CRITICAL,
+    # WARN, not CRITICAL: the same record shape is a fund still in progress (it can take as long as the
+    # leg's fund_confirm_timeout_s) or one that was interrupted, and decide() cannot tell them apart.
+    Intent.PAGE_RESUME_FUND: Severity.WARN,
     Intent.PAGE_REFUND: Severity.WARN,
     Intent.RETIRE: Severity.INFO,
 }

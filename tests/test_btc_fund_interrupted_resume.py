@@ -207,6 +207,7 @@ def test_a_confirmed_fund_is_recorded_even_when_the_seen_store_lost_its_hashlock
     rec = asyncio.run(coord.taker_funds_btc(terms))
     assert rec.state is SwapState.BTC_LOCKED
     assert len(btc.broadcasts) == 1
+    assert coord.seen_store.has_seen(terms.hashlock)  # re-reserved, so a later swap cannot reuse H
 
 
 def test_an_unconfirmed_fund_is_not_re_sent_when_the_seen_store_lost_its_hashlock():
@@ -236,7 +237,10 @@ def test_a_failed_pre_broadcast_write_sends_nothing_and_claims_nothing():
     assert coord.record.pending_btc_funding_tx is None
 
 
-def test_a_resume_with_different_terms_under_the_same_hashlock_is_refused(tmp_path):
+def test_a_resume_uses_the_records_terms_not_the_supplied_ones(tmp_path):
+    """A runner rebuilds its terms from its arguments each run (eth_swap_run re-derives t_btc from a
+    re-measured block interval), so the supplied terms can drift under the same hashlock. The resume
+    completes the fund the RECORD describes, and neither refuses it nor acts on the drifted terms."""
     import dataclasses
 
     sink = JsonFileRecordSink(tmp_path / "swap.swaprec.json")
@@ -244,10 +248,33 @@ def test_a_resume_with_different_terms_under_the_same_hashlock_is_refused(tmp_pa
     btc.read = "network"
     with pytest.raises(NetworkError):
         asyncio.run(coord.taker_funds_btc(terms))
-    drifted = dataclasses.replace(terms, radiant_amount=terms.radiant_amount + 1)
-    with pytest.raises(ValidationError, match="different parameters"):
-        asyncio.run(coord.resume_interrupted_fund(drifted, sink=sink, now_unix_s=None))
+    # t_btc is what drifts in practice, and it is part of the HTLC script: acting on the drifted value
+    # would derive a different HTLC and refuse the recorded transaction as "not this swap's".
+    drifted = dataclasses.replace(terms, t_btc=t.Timelock(terms.t_btc.value - 1, terms.t_btc.unit))
+    btc.read = "ok"
+    rec = asyncio.run(coord.resume_interrupted_fund(drifted, sink=sink, now_unix_s=None))
+    assert rec.state is SwapState.BTC_LOCKED
+    assert rec.terms.t_btc == terms.t_btc  # the record's, not the drifted argument
     assert len(btc.broadcasts) == 1
+
+
+def test_a_definitive_refusal_on_resume_keeps_its_type_and_sends_nothing(tmp_path):
+    from pyrxd.gravity.swap_coordinator import DefinitiveFundRefusal, PreBtcLockGate
+
+    sink = JsonFileRecordSink(tmp_path / "swap.swaprec.json")
+    coord, btc, terms, _ = _coord(persist=sink)
+    btc.read = "unconfirmed"
+    with pytest.raises(NetworkError):
+        asyncio.run(coord.taker_funds_btc(terms))
+
+    async def _refuse(*a, **k):
+        return PreBtcLockGate(ok=False, reason="timelock ordering no longer holds", definitive=True)
+
+    coord.pre_btc_lock_check = _refuse
+    with pytest.raises(DefinitiveFundRefusal, match="refused definitively"):
+        asyncio.run(coord.resume_interrupted_fund(terms, sink=sink, now_unix_s=None))
+    assert len(btc.broadcasts) == 1  # not re-sent
+    assert coord.record.state is SwapState.NEGOTIATED and coord.record.pending_btc_funding_tx
 
 
 # --------------------------------------------------------------------------- the record field

@@ -856,3 +856,12 @@ def test_every_page_intent_is_routed_and_has_a_severity():
     assert {Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.PAGE_RESUME_FUND} <= pages
     assert pages <= reconciler._ROUTED_INTENTS
     assert pages <= set(alerts._SEVERITY)
+
+
+def test_the_resume_page_is_a_warning_because_it_cannot_tell_running_from_interrupted():
+    """The pending field is on disk for the whole of a HEALTHY fund too (recorded before the broadcast,
+    cleared when the lock lands — up to the leg's fund_confirm_timeout_s). A CRITICAL page would fire on
+    every normal fund."""
+    from pyrxd.gravity.watch import alerts
+
+    assert alerts._SEVERITY[Intent.PAGE_RESUME_FUND] is alerts.Severity.WARN
