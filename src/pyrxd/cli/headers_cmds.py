@@ -42,8 +42,9 @@ from ..glyph.header_cache import (
     agreed_headers,
     extend_verified_headers,
     start_verified_headers,
+    sync_floor,
 )
-from ..glyph.mark_block import MAX_HEADERS_FROM_CHECKPOINT, MAX_HEADERS_PER_REQUEST
+from ..glyph.mark_block import CACHE_RESET_COMMAND, MAX_HEADERS_FROM_CHECKPOINT, MAX_HEADERS_PER_REQUEST
 from ..hash import radiant_block_hash
 from ..network.redaction import redact_endpoint_secrets
 from . import header_store
@@ -109,10 +110,14 @@ async def sync_headers(
     path: Path | None = None,
     scrub: Sequence[str] = (),
     min_depth: int = CACHE_MIN_DEPTH,
+    reset: bool = False,
 ) -> dict[str, Any]:
     """Extend the header cache for *network* from *sources*: the status report, never an exception
     for anything a server does. ``report["state"]`` is ``"synced"``, ``"up to date"`` or
-    ``"refused"`` (with ``report["reason"]``; nothing was written)."""
+    ``"refused"`` (with ``report["reason"]``; nothing was written).
+
+    *reset* rebuilds the cache from the newest shipped checkpoint instead of extending it, under the
+    same rules; the old store is replaced only when the rebuild succeeds."""
     table, shipped_header = _shipped(network)
     loaded = header_store.load(network, table, path=path)
     report: dict[str, Any] = {
@@ -130,6 +135,8 @@ async def sync_headers(
         "operators": [],
         "unreachable": {},
         "stopped": None,
+        "reset": reset,
+        "floor_work_log2": None,
     }
 
     def refuse(reason: str) -> dict[str, Any]:
@@ -160,7 +167,7 @@ async def sync_headers(
         report["lowest_tip"] = lowest
         stop = lowest - min_depth
 
-        chain = loaded.chain
+        chain = None if reset else loaded.chain
         try:
             if chain is None:
                 cp_h, cp_hash = table[-1]
@@ -172,6 +179,9 @@ async def sync_headers(
                     header = agreed_headers(dict(zip(reached, ([g] for g in got))), cp_h, 1)[0]
                 chain = start_verified_headers(network, header, table=table)
             old_top = chain.top
+            # THE SYNC'S FLOOR, fixed before anything is added (see header_cache.sync_floor).
+            floor = sync_floor(chain)
+            report["floor_work_log2"] = max(floor.bit_length() - 1, 0)
             h = chain.top + 1
             while h <= stop:
                 n = min(MAX_HEADERS_PER_REQUEST, stop - h + 1)
@@ -181,19 +191,27 @@ async def sync_headers(
                         replies[key] = await client.get_block_headers(h, n)
                     except Exception as exc:
                         return refuse(f"{key} did not serve the headers {h}-{h + n - 1}: {_err(exc, scrub)}")
-                chain, stopped = extend_verified_headers(chain, agreed_headers(replies, h, n))
+                chain, stopped = extend_verified_headers(chain, agreed_headers(replies, h, n), floor=floor)
                 if stopped:
                     report["stopped"] = stopped
                     break
                 h += n
         except HeaderCacheRefusal as exc:
-            return refuse(str(exc))
+            why = str(exc)
+            fork_at = loaded.chain.top + 1 if loaded.chain is not None else None
+            if fork_at is not None and not reset and why.startswith(f"the header at {fork_at} does not"):
+                why += (
+                    f"; the operators' chain does not continue from the newest cached header (block "
+                    f"{fork_at - 1}), which happens if Radiant reorganised past the cache — run "
+                    f"`{CACHE_RESET_COMMAND}` to rebuild it"
+                )
+            return refuse(why)
         except Exception as exc:
             return refuse(f"the sync could not complete: {_err(exc, scrub)}")
 
     report["added"] = chain.top - old_top
     report["cached_from"], report["cached_to"] = chain.base_height, chain.top
-    if report["added"] == 0:
+    if report["added"] == 0 and not reset:
         report["state"] = "up to date"
         if not report["stopped"]:
             report["reason"] = (
@@ -209,9 +227,10 @@ async def sync_headers(
         "lowest_tip": lowest,
         "min_depth": min_depth,
         "operators": sorted(reached),
+        **({"reset": True} if reset else {}),
     }
     try:
-        header_store.save(chain, table=table, syncs=[*loaded.syncs, record], path=loaded.path)
+        header_store.save(chain, table=table, syncs=[*loaded.syncs, record], path=loaded.path, reset=reset)
     except (OSError, ValueError) as exc:
         report["added"] = 0
         report["cached_from"] = loaded.chain.base_height if loaded.chain else None
@@ -244,8 +263,14 @@ def headers_group() -> None:
 
 @headers_group.command(name="sync")
 @click.option("--json", "json_flag", is_flag=True, help="Print the status as JSON.")
+@click.option(
+    "--reset",
+    is_flag=True,
+    help="Rebuild the cache from the newest shipped checkpoint instead of extending it (for a cache "
+    "left on a branch Radiant has abandoned). The old cache is replaced only if the rebuild succeeds.",
+)
 @click.pass_obj
-def headers_sync_cmd(ctx: CliContext, json_flag: bool) -> None:
+def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     """Extend the header cache toward the tip. Read-only against every server.
 
     A header is cached only when every operator that answered (at least two different operators;
@@ -261,7 +286,7 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool) -> None:
         sources = operator_sources(ctx)
     except Exception as exc:
         raise UserError("no ElectrumX endpoints to sync from", cause=str(exc)) from None
-    report = asyncio.run(sync_headers(sources, network=ctx.network, scrub=electrumx_urls(ctx)))
+    report = asyncio.run(sync_headers(sources, network=ctx.network, scrub=electrumx_urls(ctx), reset=reset))
     report["verify_reach"] = _reach(report["cached_to"], report["checkpoint_height"])
     if _json_mode(ctx, json_flag):
         click.echo(json.dumps(report, ensure_ascii=True, indent=2))

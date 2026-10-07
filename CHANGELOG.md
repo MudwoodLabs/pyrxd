@@ -21,12 +21,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   status. `pyrxd verify` then links from the newest cached header at or below the range it needs,
   with the same 4,032 cap, and its claim names the anchor it used: a shipped checkpoint, or a
   cached header and the shipped checkpoint the cache is linked to (`cached_anchor_height` in the
-  JSON). The floor is never lowered by headers the cache supplied: it is the newest shipped
-  checkpoint's work divided by 16, or the cached anchor's when that is higher. If Radiant's
-  difficulty falls below 1/16 of the newest shipped checkpoint's, the sync stops there and a newer
-  pyrxd is needed, as before. The store is re-verified on every read; a missing, damaged or
-  non-verifying store is treated as empty, and with no usable cache `pyrxd verify` behaves exactly
-  as before. The browser pages do not use a cache yet.
+  JSON). The floor is never lowered by headers the cache supplied. While verifying, it is the
+  newest shipped checkpoint's work divided by 16, or the cached anchor's when that is higher.
+  While syncing, it is the greater of the checkpoint's work and the median work of the newest
+  2,016 headers already cached, divided by 16, fixed for the whole sync; a sync stops at the
+  first header below it (the largest drop below that median measured over blocks 100,000 to
+  470,377 was 3.2x). A server whose header differs from the cached one is reported NOT VERIFIED,
+  never CONTRADICTED (the cache may be on a branch Radiant abandoned), and `pyrxd verify` then
+  falls back to the shipped checkpoint when the block is within its reach;
+  `pyrxd headers sync --reset` rebuilds the cache. The store is re-verified on every read; a
+  missing, damaged or non-verifying store is treated as empty, and with no usable cache
+  `pyrxd verify` behaves exactly as before. The browser pages do not use a cache yet.
 
 ### Changed
 

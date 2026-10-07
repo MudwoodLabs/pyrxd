@@ -86,8 +86,12 @@ each header above ``A`` meets its own proof-of-work and the floor, and the cap i
 ``A``. The floor is then ``max(newest checkpoint's work, A's work) // FLOOR_WORK_DIVISOR``: it is
 never lowered by headers the cache supplied (the reasoning, and the limit an honest difficulty
 drop meets, are in :mod:`pyrxd.glyph.header_cache`). ``checkpoint_height`` still names a SHIPPED
-checkpoint; ``cached_anchor_height`` names ``A``, and the claim says which anchor was used. With
-no cache, nothing here changes.
+checkpoint; ``cached_anchor_height`` names ``A``, and the claim says which anchor was used. A
+served header at ``A`` that is not the cached one is NOT VERIFIED, never CONTRADICTED: it
+disagrees with the local cache (which may be on a branch Radiant abandoned), not with anything
+shipped or with the mark's proof; ``cache_disagreement`` says so, and :func:`verify_with_fetched`
+then falls back to the shipped checkpoint when the block is within its reach. With no cache,
+nothing here changes.
 
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
 nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
@@ -114,7 +118,7 @@ from __future__ import annotations
 import bisect
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from pyrxd.hash import radiant_block_hash
@@ -241,6 +245,10 @@ class BlockVerification:
     #: not linking to the header below it across two separate requests. ``None`` when nothing past
     #: the required depth ended the run — always, with no target (``pyrxd verify``).
     short_of_target: str | None = None
+    #: Set when the server's header at the cached anchor is not the cached one: why, and how to
+    #: rebuild the cache. Never a contradiction (see :func:`verify_with_fetched`, which then falls
+    #: back to the shipped checkpoint). ``None`` otherwise.
+    cache_disagreement: str | None = None
 
 
 _STEPS = ("tree_depth", "merkle", "blockhash", "linkage", "proof_of_work", "floor", "burial")
@@ -353,6 +361,9 @@ def _effective_table(
     a = min(cache.top, required_top)
     return (*table, (a, cache.hash_at(a))), a
 
+
+#: The command that discards the header cache and rebuilds it from the shipped checkpoint.
+CACHE_RESET_COMMAND = "pyrxd headers sync --reset"
 
 #: How a claim names a cached anchor, and what the cache is.
 _CACHED_HEADER = "a header in pyrxd's verified-header cache on this machine"
@@ -687,10 +698,16 @@ def _verify(
         if radiant_block_hash(_header(headers, h)) != want:
             steps["linkage"] = "failed"
             if h == cached_h:
-                raise _Stop(
-                    CONTRADICTED,
-                    f"the header served at {h} is not the one pyrxd's verified-header cache holds for that height",
+                # NOT a contradiction: the server's chain disagrees with OUR cache, not with anything
+                # shipped or with the mark's own proof. The cache may be on a branch Radiant has since
+                # abandoned (a reorganisation deeper than its margin), so this proves nothing either
+                # way. verify_with_fetched falls back to the shipped checkpoint when it can.
+                facts["cache_disagreement"] = (
+                    f"the header served at {h} is not the one pyrxd's verified-header cache holds for that "
+                    f"height; the cache may be on a branch Radiant has abandoned — run "
+                    f"`{CACHE_RESET_COMMAND}` to rebuild it"
                 )
+                raise _Stop(NOT_VERIFIED, facts["cache_disagreement"])
             raise _Stop(CONTRADICTED, f"the header served at {h} is not pyrxd's checkpoint for that height")
 
     if cached_h is not None:
@@ -954,7 +971,7 @@ def verify_with_fetched(
     ``pyrxd headers sync`` built, when there is one; the pages pass none.
     """
 
-    def outcome(merkle: Any = None, coinbase: Any = None, headers: Any = None) -> BlockVerification:
+    def outcome(merkle: Any = None, coinbase: Any = None, headers: Any = None, cache: Any = None) -> BlockVerification:
         return verify_mark_block(
             txid=txid,
             raw_tx=raw_tx,
@@ -967,36 +984,70 @@ def verify_with_fetched(
             network=network,
             checkpoints=checkpoints,
             target_confirmations=target_confirmations,
-            header_cache=header_cache,
+            header_cache=cache,
         )
 
-    plan = plan_block_verification(
-        height=height,
-        min_confirmations=min_confirmations,
-        target_confirmations=target_confirmations,
-        network=network,
-        checkpoints=checkpoints,
-        header_cache=header_cache,
-    )
+    def plan_for(cache: Any) -> BlockFetchPlan:
+        return plan_block_verification(
+            height=height,
+            min_confirmations=min_confirmations,
+            target_confirmations=target_confirmations,
+            network=network,
+            checkpoints=checkpoints,
+            header_cache=cache,
+        )
+
+    def collect(plan: BlockFetchPlan) -> tuple[Any, Any, dict[int, bytes]] | BlockFetch | BlockVerification:
+        merkle = coinbase = None
+        headers: dict[int, bytes] = {}
+        for step in block_fetches(plan, str(txid)):
+            if step.key in failed:
+                return could_not_fetch(step.what, source=source, detail=failed[step.key], height=height)
+            if step.key not in fetched:
+                return step
+            got = fetched[step.key]
+            if step.key == "merkle":
+                merkle = got
+            elif step.key == "coinbase":
+                coinbase = got
+            else:
+                start = step.params[0]
+                for i, header in enumerate(got or ()):
+                    headers.setdefault(start + i, header)
+        return merkle, coinbase, headers
+
+    plan = plan_for(header_cache)
     if plan.reason is not None or not txid:
-        return outcome()
-    merkle = coinbase = None
-    headers: dict[int, bytes] = {}
-    for step in block_fetches(plan, str(txid)):
-        if step.key in failed:
-            return could_not_fetch(step.what, source=source, detail=failed[step.key], height=height)
-        if step.key not in fetched:
-            return step
-        got = fetched[step.key]
-        if step.key == "merkle":
-            merkle = got
-        elif step.key == "coinbase":
-            coinbase = got
-        else:
-            start = step.params[0]
-            for i, header in enumerate(got or ()):
-                headers.setdefault(start + i, header)
-    return outcome(merkle, coinbase, headers)
+        return outcome(cache=header_cache)
+    got = collect(plan)
+    if not isinstance(got, tuple):
+        return got
+    first = outcome(*got, cache=header_cache)
+    if first.cache_disagreement is None:
+        return first
+    # THE CACHE DISAGREED WITH THE SERVER: fall back to the shipped checkpoint, as if there were no
+    # cache, when the mark is within its reach. The outcome then says the cache was not used, and
+    # why. Out of reach, or if the fallback's own fetches fail, the answer stays NOT VERIFIED with
+    # the cache's reason.
+    fallback_plan = plan_for(None)
+    if fallback_plan.reason is not None:
+        return first
+    got = collect(fallback_plan)
+    if isinstance(got, BlockFetch):
+        return got
+    if not isinstance(got, tuple):
+        return first
+    second = outcome(*got, cache=None)
+    note = (
+        f"pyrxd's verified-header cache disagreed with the server at block {first.cached_anchor_height}, so it "
+        f"was not used and the block was linked from the shipped checkpoint instead; run "
+        f"`{CACHE_RESET_COMMAND}` to rebuild the cache"
+    )
+    if second.state == VERIFIED:
+        return replace(
+            second, claim=f"{second.claim} {note[0].upper()}{note[1:]}.", cache_disagreement=first.cache_disagreement
+        )
+    return replace(second, reason=f"{second.reason}; {note}", cache_disagreement=first.cache_disagreement)
 
 
 #: Said beside every CONTRADICTED outcome, on every surface: an honest mark served by a confused or

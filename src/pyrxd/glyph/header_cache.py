@@ -16,22 +16,31 @@ least :data:`CACHE_MIN_DEPTH` blocks below the lowest tip any of them reported.
 THE FLOOR. Each cached header, and each header :mod:`~pyrxd.glyph.mark_block` links above a cached
 anchor, must carry at least ``W // FLOOR_WORK_DIVISOR`` expected hash evaluations, where:
 
-* while caching (and when the cache is read back), ``W`` is the work of the NEWEST SHIPPED
-  checkpoint's header, fixed for the whole cache;
+* while syncing (:func:`sync_floor`), ``W`` is the GREATER of the newest shipped checkpoint's work
+  and the median work of the newest :data:`RECENT_WINDOW` headers ALREADY in the cache when the
+  sync starts. It is computed once per sync, so the headers being added in that sync neither raise
+  nor lower their own bar, and a median rather than a maximum, so one high-work header cannot
+  strand an honest sync;
+* when the cache is read back, ``W`` is the newest shipped checkpoint's work: the invariant every
+  cached header must keep, whatever bar it was admitted under;
 * while verifying from a cached anchor, ``W`` is the GREATER of that checkpoint's work and the
   anchor's own.
 
-So the floor is never lowered by headers the cache supplied: a cached header can only raise the bar
-later headers are held to, never move it below the one the shipped checkpoint sets. The floor
-does not drift with the cache's own contents, however many headers it holds.
+So the floor is never lowered by headers the cache supplied: cached headers can only raise the bar
+later headers are held to, never move it below the one the shipped checkpoint sets.
 
-THE HONEST-PATH LIMIT, plainly. If Radiant's difficulty falls below 1/16 of the newest shipped
-checkpoint's, ``pyrxd headers sync`` stops caching at the first header below that (it caches the
-agreed headers under it and says why), and marks past that point do not verify with this release:
-the answer is NOT VERIFIED and a newer pyrxd, with a newer checkpoint, is needed. Within one
-verification walk (at most 4,032 headers above a cached anchor) the same limit applies relative
-to the anchor's difficulty when that is higher, exactly as it applies to a checkpoint today. The
-cache removes the TIME limit on a release; it does not remove this one.
+THE HONEST-PATH LIMIT, plainly. ``pyrxd headers sync`` stops at the first header whose work is below
+1/16 of the greater of the newest shipped checkpoint's work and the median of the newest 2,016
+cached headers (it caches the agreed headers under it and says why); marks past that point do not
+verify with this release until difficulty recovers, or a newer pyrxd ships a newer checkpoint.
+Within one verification walk (at most 4,032 headers above a cached anchor) the same 1/16 applies
+relative to the anchor's work when that is higher, as it applies to a checkpoint today.
+
+WHY 16 IS ENOUGH MARGIN (measured, 2026-10-07, read-only from a default public server): over the
+370,378 linked mainnet headers from block 100,000 to 470,377, the largest ratio of the median work
+of the 2,016 headers before a block to that block's own work was 3.23 (at block 467,103), and the
+largest max/min ratio of work inside one 2,016-block interval was 3.53. 16 is about five times the
+worst observed drop against the median.
 
 PURE. Nothing here touches a file or the network: the CLI's store
 (:mod:`pyrxd.cli.header_store`) reads and writes the bytes :func:`encode_store` produces, and the
@@ -42,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -56,6 +66,7 @@ from .mark_block import FLOOR_WORK_DIVISOR
 __all__ = [
     "CACHE_MIN_DEPTH",
     "MIN_OPERATORS",
+    "RECENT_WINDOW",
     "HeaderCacheRefusal",
     "HeaderStoreCorrupt",
     "VerifiedHeaders",
@@ -64,6 +75,7 @@ __all__ = [
     "encode_store",
     "extend_verified_headers",
     "start_verified_headers",
+    "sync_floor",
     "verify_header_chain",
 ]
 
@@ -71,6 +83,9 @@ __all__ = [
 #: checkpoint refresh's own minimum depth (``scripts/refresh_radiant_checkpoints.py``), the same
 #: number, so a cached header is held to the depth a shipped checkpoint is.
 CACHE_MIN_DEPTH = MIN_DEPTH_BELOW_TIP
+
+#: How many of the newest cached headers :func:`sync_floor` takes the median work of.
+RECENT_WINDOW = 2016
 
 #: Distinct OPERATORS (:func:`pyrxd.network.source_identity.source_key`; two hosts of one operator
 #: are one) that must serve a header byte for byte alike before it is cached.
@@ -148,7 +163,13 @@ def _require_table(table: Sequence[tuple[int, str]]) -> tuple[tuple[int, str], .
 
 
 def _walk(
-    below_hash: str, start: int, headers: Sequence[Any], floor: int, *, pow_limit: int | None
+    below_hash: str,
+    start: int,
+    headers: Sequence[Any],
+    floor: int,
+    *,
+    pow_limit: int | None,
+    floor_of: str = "the newest shipped checkpoint's",
 ) -> tuple[list[str], str | None, str | None]:
     """Check *headers* (heights ``start``, ``start+1``, ...) above a header hashing to *below_hash*.
 
@@ -174,8 +195,8 @@ def _walk(
             return (
                 hashes,
                 "floor",
-                f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of the newest "
-                f"shipped checkpoint's); its difficulty may be honest, but a newer pyrxd is needed to cache past it",
+                f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of {floor_of}); "
+                f"its difficulty may be honest, but it is not cached",
             )
         hashes.append(got)
         below = got
@@ -251,17 +272,35 @@ def verify_header_chain(
     )
 
 
+def sync_floor(chain: VerifiedHeaders) -> int:
+    """The floor a sync from *chain* holds every new header to: never below the shipped checkpoint's.
+
+    ``max(checkpoint work, median work of the newest RECENT_WINDOW cached headers) //
+    FLOOR_WORK_DIVISOR``, from headers ALREADY verified into the cache. Compute it once, before the
+    sync adds anything, and pass it to every :func:`extend_verified_headers` call of that sync.
+    """
+    recent = statistics.median_low(radiant_header_work(h) for h in chain.headers[-RECENT_WINDOW:])
+    return max(radiant_header_work(chain.checkpoint_header), recent) // FLOOR_WORK_DIVISOR
+
+
 def extend_verified_headers(
-    chain: VerifiedHeaders, new: Sequence[Any], *, pow_limit: int | None = None
+    chain: VerifiedHeaders, new: Sequence[Any], *, floor: int | None = None, pow_limit: int | None = None
 ) -> tuple[VerifiedHeaders, str | None]:
     """*chain* with *new* (heights ``chain.top + 1`` up) appended: ``(extended, why it stopped)``.
 
     Every new header must link to the one below it and meet its own proof-of-work, or this raises
-    :class:`HeaderCacheRefusal` and nothing is added. One below the floor (:attr:`~VerifiedHeaders.floor_work`,
-    fixed by the shipped checkpoint, never by a cached header) ends the extension there: the headers
-    under it are added and the reason is returned.
+    :class:`HeaderCacheRefusal` and nothing is added. One below the floor ends the extension there:
+    the headers under it are added and the reason is returned. *floor* is the sync's
+    (:func:`sync_floor`, computed before the sync added anything); it may never be below
+    :attr:`~VerifiedHeaders.floor_work`, the shipped checkpoint's, which is the default.
     """
-    hashes, kind, reason = _walk(chain.hashes[-1], chain.top + 1, new, chain.floor_work, pow_limit=pow_limit)
+    if floor is None:
+        floor, floor_of = chain.floor_work, "the newest shipped checkpoint's"
+    elif floor < chain.floor_work:
+        raise ValidationError("a sync floor may never be below the shipped checkpoint's (VerifiedHeaders.floor_work)")
+    else:
+        floor_of = "the greater of the newest shipped checkpoint's and the recent cached median"
+    hashes, kind, reason = _walk(chain.hashes[-1], chain.top + 1, new, floor, pow_limit=pow_limit, floor_of=floor_of)
     if kind == "lie":
         raise HeaderCacheRefusal(str(reason))
     added = tuple(bytes(x) for x in new[: len(hashes)])

@@ -100,11 +100,13 @@ def save(
     table: Sequence[tuple[int, str]],
     syncs: Sequence[Mapping[str, Any]],
     path: Path | None = None,
+    reset: bool = False,
 ) -> Path:
     """Write *chain* atomically, refusing to change or drop any header the current store holds
-    above *table*'s newest checkpoint. A current store that does not verify is treated as empty."""
+    above *table*'s newest checkpoint. A current store that does not verify is treated as empty.
+    *reset* (``pyrxd headers sync --reset``, and only that) replaces the store whatever it holds."""
     where = path or store_path(chain.network)
-    old = load(chain.network, table, path=where).chain
+    old = None if reset else load(chain.network, table, path=where).chain
     if old is not None:
         # Append-only: every height both hold must hold the same header.
         lo = max(old.base_height, chain.base_height)
