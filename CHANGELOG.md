@@ -6,6 +6,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`pyrxd headers sync` and `pyrxd headers status`: a local cache of verified block headers, so
+  `pyrxd verify` keeps verifying new marks between releases (#826, phase 1).** `pyrxd verify`
+  links a mark's block at most 4,032 headers past its anchor, and until now that anchor was the
+  newest checkpoint the release ships, so a release stopped verifying new marks about two weeks
+  after it. `pyrxd headers sync` caches headers from that checkpoint toward the tip in
+  `~/.pyrxd/headers/<network>.bin`. A header is cached only when every operator that answered,
+  and at least two different operators, served it byte for byte alike (two servers of one
+  operator count once), when it is at least 288 blocks below the lowest tip they reported, and
+  when it links hash by hash back to the shipped checkpoint and meets its own proof-of-work and
+  the floor. Otherwise nothing is written and the reason is printed (exit 2); `--json` prints the
+  status. `pyrxd verify` then links from the newest cached header at or below the range it needs,
+  with the same 4,032 cap, and its claim names the anchor it used: a shipped checkpoint, or a
+  cached header and the shipped checkpoint the cache is linked to (`cached_anchor_height` in the
+  JSON). The floor is never lowered by headers the cache supplied: it is the newest shipped
+  checkpoint's work divided by 16, or the cached anchor's when that is higher. If Radiant's
+  difficulty falls below 1/16 of the newest shipped checkpoint's, the sync stops there and a newer
+  pyrxd is needed, as before. The store is re-verified on every read; a missing, damaged or
+  non-verifying store is treated as empty, and with no usable cache `pyrxd verify` behaves exactly
+  as before. The browser pages do not use a cache yet.
+
+### Changed
+
+- `pyrxd verify`'s human report wraps a VERIFIED claim to at most 20 lines (was 14), never breaking
+  inside "proof-of-work", so the longer claim from a cached anchor is printed whole.
+
 ## [0.26.1] — 2026-10-07
 
 A checkpoint-only release. Upgrade to keep verifying new HashMarks.

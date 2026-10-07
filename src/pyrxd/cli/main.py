@@ -260,6 +260,7 @@ from . import (  # noqa: E402
     agent_cmds,
     glyph_cmds,
     hashmark_cmds,
+    headers_cmds,
     query_cmds,
     regtest_cmds,
     setup_cmd,
@@ -278,6 +279,7 @@ cli.add_command(hashmark_cmds.mark_cmd)
 # point onto the verdict `glyph inspect` already computes, plus the file-matching half inspect
 # never had — not a second implementation of it.
 cli.add_command(hashmark_cmds.verify_cmd)
+cli.add_command(headers_cmds.headers_group)
 cli.add_command(query_cmds.address_cmd)
 cli.add_command(query_cmds.balance_cmd)
 cli.add_command(query_cmds.utxos_cmd)

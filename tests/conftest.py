@@ -157,6 +157,18 @@ def _pin_the_checkpoint_horizon_clock(request: pytest.FixtureRequest, monkeypatc
     monkeypatch.setattr(swap_coordinator, "checkpoint_horizon_failure", pinned)
 
 
+@pytest.fixture(autouse=True)
+def _header_cache_in_tmp(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Point the verified-header cache (``pyrxd headers sync``, read by every ``pyrxd verify``)
+    at an empty per-test directory, so a cache a developer synced in their own ``~/.pyrxd`` can
+    never change what a verify test sees. Tests that exercise the cache write into this one."""
+    from pyrxd.cli import header_store
+
+    where = tmp_path_factory.mktemp("header-cache")
+    monkeypatch.setattr(header_store, "cache_dir", lambda: where)
+    return where
+
+
 # ---------------------------------------------------------------------------------
 # Unexpected-skip guard
 #

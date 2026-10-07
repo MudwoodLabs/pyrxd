@@ -844,9 +844,16 @@ async def verify_anchor_block(
     from contextlib import AsyncExitStack
 
     from ..glyph.mark_block import BlockFetch, BlockVerification, verify_with_fetched
+    from ..spv.radiant_checkpoints import CHECKPOINTS
+    from .header_store import load as load_header_cache
 
     fetched: dict[str, object] = {}
     failed: dict[str, str] = {}
+    # THE HEADER CACHE (`pyrxd headers sync`, #826): re-verified against the shipped table on
+    # every read, and empty when missing, damaged or not verifying, so with no usable cache this
+    # runs exactly as it did before the cache existed. The verifier decides whether a cached
+    # header is used as the anchor, and says so in its outcome.
+    header_cache = load_header_cache(network, CHECKPOINTS.get(network, ())).chain
 
     def step(label: str | None) -> BlockVerification | BlockFetch:
         # The SAME sequence and decision the browser pages run (`glue.verify_mark_block`): the
@@ -861,6 +868,7 @@ async def verify_anchor_block(
             fetched=fetched,
             failed=failed,
             network=network,
+            header_cache=header_cache,
         )
 
     first = step(None)
@@ -961,9 +969,10 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
     caveat = _sanitize_display_string(str(a.get("caveat") or ""))
     if verified:
         caveat = f"VERIFIED: {caveat}"
-    # The longest claim (the proof-of-work level, with the sentence saying the endpoint had named a
-    # different block) wraps to 11 lines at this width; 14 leaves room. A cut claim reads as whole.
-    for chunk in textwrap.wrap(caveat, width=92)[:14]:
+    # The longest claim (the proof-of-work level from a CACHED header, with the sentence saying the
+    # endpoint had named a different block) wraps to 16 lines at this width; 20 leaves room. A cut
+    # claim reads as whole. Not broken at hyphens, so "proof-of-work" is never split across lines.
+    for chunk in textwrap.wrap(caveat, width=92, break_on_hyphens=False)[:20]:
         lines.append(f"{indent}              {chunk}")
     if bv is not None and not verified and bv.get("reason"):
         why = _sanitize_display_string(f"not verified: {bv.get('reason')}")
