@@ -53,6 +53,8 @@ class Severity(Enum):
 _SEVERITY: dict[Intent, Severity] = {
     Intent.PAGE_CLAIM: Severity.CRITICAL,
     Intent.PAGE_SQUEEZED: Severity.CRITICAL,
+    # CRITICAL: the BTC may be on chain untracked, and a maker claim with p would go unobserved.
+    Intent.PAGE_RESUME_FUND: Severity.CRITICAL,
     Intent.PAGE_REFUND: Severity.WARN,
     Intent.RETIRE: Severity.INFO,
 }

@@ -2830,13 +2830,15 @@ class SwapCoordinator:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
         btc_resume_tx = self._btc_resume_tx(terms)
         if btc_resume_tx is not None:
-            self._check_resume_reservation(terms)
             landed = await self.counter_leg.read_confirmed_funding(terms, btc_resume_tx)
             if landed is not None:
-                # The interrupted fund already landed: record the truth. No gate runs — the funds
-                # moved under the gate that ran before the broadcast, and refusing now would only
-                # leave them untracked.
+                # The interrupted fund already landed: record the truth. No gate and no reservation
+                # check run — recording an output already on chain sends nothing, and refusing would
+                # only leave the funds untracked (the stranding this path exists to end).
                 return await self._record_counter_lock(terms, landed)
+            # Not proven on chain: what follows may RE-SEND the bytes, so the reservation this record
+            # claims must still hold.
+            self._check_resume_reservation(terms)
         gate = await self.pre_btc_lock_check(terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic)
         if not gate.ok:
             refused = DefinitiveFundRefusal if gate.definitive else ValidationError
@@ -2997,8 +2999,11 @@ class SwapCoordinator:
                 # Durable BEFORE the broadcast: the only moment the bytes are certain to be ours
                 # and not yet on chain. Shielded so a cancellation cannot drop the one write that
                 # makes the broadcast after it recoverable.
-                self.record = dataclasses.replace(self.record, pending_btc_funding_tx=raw_tx_hex)
-                await self._persist_record(self.record, shield=True)
+                staged = dataclasses.replace(self.record, pending_btc_funding_tx=raw_tx_hex)
+                # Adopted only once durable: if the write fails, the leg never broadcasts, and the
+                # record must not claim a transaction that was recorded nowhere.
+                await self._persist_record(staged, shield=True)
+                self.record = staged
 
             try:
                 locator = await self.counter_leg.fund(
@@ -3048,8 +3053,9 @@ class SwapCoordinator:
             raise ValidationError(
                 "record carries an interrupted BTC fund but its hashlock is NOT reserved in the "
                 "seen-store: the two stores have diverged, so this record cannot prove it won the "
-                "reservation. Refusing to resume; resolve the divergence first (the recorded "
-                "transaction, if it confirmed, refunds after t_btc)."
+                "reservation, and the recorded transaction is not proven on chain. Refusing to re-send it. "
+                "If it does confirm, resuming again records it (that path needs no reservation); if it "
+                "never left, resolve the divergence before funding."
             )
 
     async def _record_counter_lock(self, terms: NegotiatedTerms, locator: Any) -> SwapRecord:
@@ -3650,17 +3656,23 @@ class SwapCoordinator:
                 "the supplied terms do not match the persisted record (different hashlock): "
                 "resuming would fund the contract from one swap using the parameters of another."
             )
+        if rec.terms.to_dict() != terms.to_dict():
+            raise ValidationError(
+                "the supplied terms do not match the persisted record (same hashlock, different "
+                "parameters): resuming would complete one fund while the record describes another."
+            )
         self.record = rec
         try:
             return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:
             if self.record.state is SwapState.NEGOTIATED and self.record.pending_btc_funding_tx:
                 txid = self.record.pending_btc_funding_txid
-                raise ValidationError(
-                    f"BTC resume refused: {exc}. Nothing new was sent and the record is unchanged "
-                    f"(negotiated, recorded funding transaction {txid}). If that transaction was already "
-                    "broadcast it may still confirm: resume again and it is recorded as the lock with no "
-                    "gate. If it never left, it is not re-sent until the gate passes."
+                kind = DefinitiveFundRefusal if isinstance(exc, DefinitiveFundRefusal) else ValidationError
+                raise kind(
+                    f"BTC resume did not complete: {exc}. The record still carries funding transaction {txid} "
+                    "(negotiated). Only those same bytes are ever sent, so it cannot fund twice; it may "
+                    "already be on chain. Resume again: once it confirms it is recorded as the lock with no "
+                    "gate, and it is re-sent only when the gate passes."
                 ) from exc
             if self.record.state is not SwapState.NEGOTIATED or not self.record.pending_counter_contract:
                 raise

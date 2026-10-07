@@ -4,8 +4,9 @@
 readback can fail after the broadcast succeeded — a confirmation slower than
 ``fund_confirm_timeout_s``, a transport error — and before this fix that left real BTC on chain under
 a NEGOTIATED record with no locator and H reserved: a retry was refused as "hashlock H reused",
-``taker_refund_btc`` and ``mutual_refund`` refused from NEGOTIATED, and the watchtower and
-``swap status`` had nothing to read. Found by the 2026-10-07 calibration review (finding F-3) and
+``taker_refund_btc`` and ``mutual_refund`` refused from NEGOTIATED, the watchtower read the record
+as "no action due", and the operator had no durable copy of the funding outpoint that ``swap status``
+asks for. Found by the 2026-10-07 calibration review (finding F-3) and
 reproduced on unplanted main.
 
 Every test here drives the REAL :class:`BitcoinTaprootLeg` through the coordinator's production entry
@@ -194,15 +195,58 @@ def test_a_recorded_tx_that_does_not_pay_this_htlc_is_refused_not_broadcast():
     assert len(btc.broadcasts) == 1
 
 
-def test_a_resume_whose_hashlock_is_no_longer_reserved_is_refused():
+def test_a_confirmed_fund_is_recorded_even_when_the_seen_store_lost_its_hashlock():
+    """Recording an output already on chain sends nothing, so it needs no reservation — refusing here
+    re-created the original stranding (adversarial review M2)."""
     coord, btc, terms, _ = _coord()
     btc.read = "network"
     with pytest.raises(NetworkError):
         asyncio.run(coord.taker_funds_btc(terms))
     coord.seen_store._seen.clear()  # a restored backup / rotated store: the stores have diverged
-    btc.read = "ok"
+    btc.read = "ok"  # ...and the fund confirmed
+    rec = asyncio.run(coord.taker_funds_btc(terms))
+    assert rec.state is SwapState.BTC_LOCKED
+    assert len(btc.broadcasts) == 1
+
+
+def test_an_unconfirmed_fund_is_not_re_sent_when_the_seen_store_lost_its_hashlock():
+    coord, btc, terms, _ = _coord()
+    btc.read = "network"
+    with pytest.raises(NetworkError):
+        asyncio.run(coord.taker_funds_btc(terms))
+    coord.seen_store._seen.clear()
+    btc.read = "unconfirmed"
     with pytest.raises(ValidationError, match="NOT reserved"):
         asyncio.run(coord.taker_funds_btc(terms))
+    assert len(btc.broadcasts) == 1  # not re-sent
+
+
+def test_a_failed_pre_broadcast_write_sends_nothing_and_claims_nothing():
+    """If the durable write of the bytes fails, the leg never broadcasts — and the record and the error
+    must not claim a transaction was recorded (adversarial review LOW-4)."""
+
+    async def _sink(record):
+        if record.pending_btc_funding_tx:
+            raise OSError("disk full")
+
+    coord, btc, terms, _ = _coord(persist=_sink)
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(coord.taker_funds_btc(terms))
+    assert btc.broadcasts == []
+    assert coord.record.pending_btc_funding_tx is None
+
+
+def test_a_resume_with_different_terms_under_the_same_hashlock_is_refused(tmp_path):
+    import dataclasses
+
+    sink = JsonFileRecordSink(tmp_path / "swap.swaprec.json")
+    coord, btc, terms, _ = _coord(persist=sink)
+    btc.read = "network"
+    with pytest.raises(NetworkError):
+        asyncio.run(coord.taker_funds_btc(terms))
+    drifted = dataclasses.replace(terms, radiant_amount=terms.radiant_amount + 1)
+    with pytest.raises(ValidationError, match="different parameters"):
+        asyncio.run(coord.resume_interrupted_fund(drifted, sink=sink, now_unix_s=None))
     assert len(btc.broadcasts) == 1
 
 

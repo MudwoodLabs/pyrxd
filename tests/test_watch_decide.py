@@ -812,3 +812,47 @@ class TestTheDepthVerdictAndTheGateUseONEConversion:
             assert int(_required_btc_depth_blocks(policy)) >= int(
                 _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
             ), seconds
+
+
+# ---------------------------------------------------------------------------
+# An interrupted BTC fund (record.pending_btc_funding_tx) is paged, not ignored
+# ---------------------------------------------------------------------------
+
+
+def _signed_tx_hex(terms: NegotiatedTerms) -> str:
+    from pyrxd.btc_wallet.keys import generate_keypair
+    from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
+
+    return build_payment_tx(
+        generate_keypair("bcrt"),
+        BtcUtxo(txid="cd" * 32, vout=0, value=terms.btc_sats * 3),
+        to_hash=b"\x11" * 32,
+        to_type="p2tr",
+        amount_sats=terms.btc_sats,
+        fee_sats=1_000,
+    ).tx_hex
+
+
+def test_an_interrupted_btc_fund_pages_the_operator_to_resume():
+    terms = _btc_terms()
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=_signed_tx_hex(terms))
+    d = _decide(rec, Observations(maker_has_claimed_btc=False, now_rxd_height=150))
+    assert d.intent is Intent.PAGE_RESUME_FUND
+    assert rec.pending_btc_funding_txid in d.reason
+    assert d.recommended_action == "resume_interrupted_fund"
+
+
+def test_a_healthy_negotiated_swap_is_still_not_paged():
+    d = _decide(_record(SwapState.NEGOTIATED), Observations(maker_has_claimed_btc=False, now_rxd_height=150))
+    assert d.intent is Intent.WATCH
+
+
+def test_every_page_intent_is_routed_and_has_a_severity():
+    """A PAGE_* intent the reconciler does not route is only logged at debug, and one with no severity
+    is never escalated: either way the page is silently dropped. The set is DERIVED from the enum."""
+    from pyrxd.gravity.watch import alerts, reconciler
+
+    pages = {i for i in Intent if i.name.startswith("PAGE_")}
+    assert {Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.PAGE_RESUME_FUND} <= pages
+    assert pages <= reconciler._ROUTED_INTENTS
+    assert pages <= set(alerts._SEVERITY)

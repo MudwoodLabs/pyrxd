@@ -64,6 +64,11 @@ class Intent(Enum):
     * ``PAGE_SQUEEZED`` — a decision is required (gate SQUEEZED / ASSET_VULNERABLE,
       or finality un-assessable): winner-take-all claim vs accept loss. Never
       auto-resolved in v1.
+    * ``PAGE_RESUME_FUND`` — the taker's BTC fund was interrupted after its funding transaction was
+      recorded (``record.pending_btc_funding_tx``): the BTC may already be on chain under a NEGOTIATED
+      record. The operator must run the taker's fund step again (``resume_interrupted_fund``) so the
+      lock is recorded; until then nothing downstream tracks it, and a maker who claims it with ``p``
+      starts the claim race unobserved.
     * ``RETIRE`` — the swap reached a terminal state; stop watching it.
     * ``NOOP`` — an unsupported counter_chain (BTC and ETH are both handled).
     """
@@ -72,6 +77,7 @@ class Intent(Enum):
     PAGE_CLAIM = "page_claim"
     PAGE_REFUND = "page_refund"
     PAGE_SQUEEZED = "page_squeezed"
+    PAGE_RESUME_FUND = "page_resume_fund"
     RETIRE = "retire"
     NOOP = "noop"
 
@@ -580,7 +586,21 @@ def decide(
             low_corroboration=corr,
         )
 
-    # 3e. Other pre-lock states (NEGOTIATED): nothing time-critical.
+    # 3e. An INTERRUPTED fund: the funding transaction was recorded before its broadcast and the fund
+    #     never completed, so BTC may be on chain under this NEGOTIATED record with nothing tracking it.
+    if state is SwapState.NEGOTIATED and record.pending_btc_funding_tx:
+        return Decision(
+            Intent.PAGE_RESUME_FUND,
+            reason=(
+                f"interrupted BTC fund: funding transaction {record.pending_btc_funding_txid} was recorded "
+                "but never confirmed as the lock — it may already be on chain. Run the taker's fund step "
+                "again to record it (or re-send it if the gate still passes)."
+            ),
+            recommended_action="resume_interrupted_fund",
+            low_corroboration=corr,
+        )
+
+    # 3f. Other pre-lock states (NEGOTIATED): nothing time-critical.
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
 
 

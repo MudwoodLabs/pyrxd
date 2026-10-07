@@ -567,8 +567,10 @@ class BitcoinTaprootLeg:
         ``fund_confirm_timeout_s``, a transport error), and the caller must then still know which
         transaction it sent: the HTLC address is derivable from the terms, the funding transaction
         is not. ``resume_tx_hex`` re-sends those SAME recorded bytes instead of building new ones;
-        it cannot fund twice, because the transaction spends one specific UTXO, and the broadcaster
-        treats a transaction the node already has (mempool or chain) as success.
+        it cannot fund twice, because the transaction spends one specific UTXO. A node that already
+        has it answers with one of the ``_ALREADY_KNOWN_MARKERS`` phrases, which the broadcaster maps to
+        success; a node that answers otherwise (wording varies by version for a CONFIRMED tx) makes
+        the resume fail retryably, never fund a second time.
         """
         htlc = self._htlc(terms)
         if resume_tx_hex is not None:
