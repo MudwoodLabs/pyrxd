@@ -239,10 +239,17 @@ def _real_leg(view, *, network: str, min_confirmations: int = 1, depth_sources=N
     )
 
 
-def _btc_coord(terms, radiant_leg, *, policy=None, btc_view=None, **config):
+def _btc_coord(terms, radiant_leg, *, policy=None, btc_view=None, persist="memory", **config):
+    """``persist="memory"`` keeps every written record in ``coord.persisted`` — a value-bearing BTC fund
+    refuses to run without a durable persist hook, and this is the in-memory stand-in for one."""
     maker_kp, taker_kp = generate_keypair("bcrt"), generate_keypair("bcrt")
     del maker_kp
     btc_view = btc_view or A._BtcChainView()
+    persisted: list = []
+
+    async def _memory_sink(record):
+        persisted.append(record)
+
     coord = SwapCoordinator(
         record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=A._taker_btc_leg(terms=terms, taker_kp=taker_kp, btc_view=btc_view),
@@ -250,7 +257,9 @@ def _btc_coord(terms, radiant_leg, *, policy=None, btc_view=None, **config):
         indexer=FakeIndexer(),
         seen_store=FakeSeenStore(),
         config=CoordinatorConfig(margin_policy=policy or MarginPolicy.estimated(), **config),
+        persist=_memory_sink if persist == "memory" else persist,
     )
+    coord.persisted = persisted
     return coord, btc_view
 
 

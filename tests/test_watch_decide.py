@@ -812,3 +812,15 @@ class TestTheDepthVerdictAndTheGateUseONEConversion:
             assert int(_required_btc_depth_blocks(policy)) >= int(
                 _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
             ), seconds
+
+
+def test_every_page_intent_is_routed_and_has_a_severity():
+    """A PAGE_* intent the reconciler does not route is only logged at debug, and one with no severity
+    is never escalated: either way the page is silently dropped. The set is DERIVED from the enum, so a
+    new page intent cannot be added without being wired in both places."""
+    from pyrxd.gravity.watch import alerts, reconciler
+
+    pages = {i for i in Intent if i.name.startswith("PAGE_")}
+    assert {Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED} <= pages  # non-vacuity
+    assert pages <= reconciler._ROUTED_INTENTS
+    assert pages <= set(alerts._SEVERITY)

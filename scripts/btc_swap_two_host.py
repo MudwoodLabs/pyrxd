@@ -102,6 +102,7 @@ from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
     ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS,
@@ -468,7 +469,16 @@ def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
         indexer=None,  # plain RXD has no genesis ref → no ref-authenticity indexer needed
         seen_store=DurableSeenStore(str(Path(keys_out).expanduser()) + ".seen.sqlite"),
         config=CoordinatorConfig(margin_policy=_margin_policy(args), role=role),
+        # The taker's BTC funding transaction is recorded here BEFORE it is broadcast, so a fund
+        # whose post-broadcast readback fails is resumed from this file by re-running the taker's
+        # fund step (see `_record_sink`). The coordinator refuses a value-bearing BTC fund without it.
+        persist=_record_sink(keys_out),
     )
+
+
+def _record_sink(keys_out) -> JsonFileRecordSink:
+    """The swap record file beside the run's keys and seen-store."""
+    return JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json")
 
 
 async def _maker_verify_btc_funding(coord: SwapCoordinator, locator) -> int:
@@ -627,7 +637,16 @@ async def taker_phase_fund(args) -> None:
             "taker_funds_btc: fund the BTC HTLC (taker's UTXO; claim pays the maker, refund pays the taker)",
             auto_yes=args.yes,
         )
-        rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
+        sink = _record_sink(args.local_out)
+        prior = sink.load_record()
+        if prior is not None and prior.pending_btc_funding_tx and prior.terms.hashlock == terms.hashlock:
+            # An earlier run recorded its funding transaction and then failed to read the amount back:
+            # the BTC may already be on chain. Complete THAT fund (recorded if it confirmed, the same
+            # bytes re-sent only if the gate still passes) instead of building a new one.
+            print(f"  -> resuming the interrupted BTC fund {prior.pending_btc_funding_txid}")
+            rec = await coord.resume_interrupted_fund(terms, sink=sink, now_unix_s=int(time.time()))
+        else:
+            rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
         if rec.state is not SwapState.BTC_LOCKED:
             raise SystemExit(f"taker_funds_btc landed in {rec.state.value}, expected btc_locked")
         loc = rec.counterchain_locator

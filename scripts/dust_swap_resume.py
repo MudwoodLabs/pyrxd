@@ -50,6 +50,8 @@ from pyrxd.security.secrets import SecretBytes
 from pyrxd.security.types import Hex20, Txid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
 from _dust_swap_shared import (
     CapturingBroadcaster,
     SshTrFeeSource,
@@ -67,6 +69,21 @@ from _dust_swap_shared import (
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 _MAINNET_BTC_API = "https://mempool.space/api"
+
+
+def _funding_txid_from_record(keys_out: str) -> str:
+    """The BTC HTLC funding txid the forward run recorded in its swap record (pending or funded)."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    path = str(Path(keys_out).expanduser()) + ".swaprec.json"
+    rec = JsonFileRecordSink(path).load_record()
+    if rec is None:
+        raise SystemExit(f"no --btc-htlc-funding-txid given and no swap record at {path}")
+    if rec.counterchain_locator is not None:
+        return rec.counterchain_locator.funding_outpoint.txid
+    if rec.pending_btc_funding_txid is not None:
+        return rec.pending_btc_funding_txid
+    raise SystemExit(f"{path} records no BTC funding transaction; pass --btc-htlc-funding-txid")
 
 
 async def resume(args) -> None:
@@ -170,7 +187,7 @@ async def resume(args) -> None:
             f"rebuilt HTLC address {htlc.address} != persisted {keys['btc_htlc_address']}; "
             "t_btc/keys drift — refusing to operate on the wrong taproot key"
         )
-    funding_txid = args.btc_htlc_funding_txid
+    funding_txid = args.btc_htlc_funding_txid or _funding_txid_from_record(args.keys_out)
     on_chain_amount = await btc_reader.read_output_amount_sats(funding_txid, 0, min_confirmations=1)
     if on_chain_amount != terms.btc_sats:
         raise SystemExit(f"on-chain HTLC amount {on_chain_amount} != terms {terms.btc_sats}")
@@ -358,7 +375,12 @@ async def resume(args) -> None:
 def _parse_args(argv):
     ap = argparse.ArgumentParser(description="Resume a dust BTC<->RXD HTLC swap from persisted keys.")
     ap.add_argument("--keys-out", required=True, help="the run-keys file (must contain preimage_p_hex)")
-    ap.add_argument("--btc-htlc-funding-txid", required=True, help="the confirmed HTLC funding txid")
+    ap.add_argument(
+        "--btc-htlc-funding-txid",
+        default=None,
+        help="the confirmed HTLC funding txid (default: read from <keys-out>.swaprec.json, where "
+        "dust_swap_run.py records the funding transaction before broadcasting it)",
+    )
     ap.add_argument(
         "--i-accept-dust-loss",
         action="store_true",
