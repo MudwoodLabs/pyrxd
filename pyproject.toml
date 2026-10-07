@@ -362,11 +362,9 @@ typecheck = """mypy \
   scripts/radiant_mainnet_chainio.py \
   scripts/_dust_swap_shared.py"""
 coverage-security = 'pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100'
-# `--dist loadscope` keeps each module on one worker. This run clears addopts, so it collects
-# the regtest modules, and most start a module-scoped container under one fixed name after a
-# `docker rm -f` of that name. Split across workers with RADIANT_REGTEST=1 set, one worker
-# would remove another's live node. CI leaves those env vars unset, so its step keeps `load`.
-coverage-overall = 'pytest tests/ -o "addopts=" -n auto --dist loadscope --cov=pyrxd --cov-fail-under=85'
+# `--dist loadgroup`: tests/conftest.py puts every `integration` test in one group, so the
+# regtest tests run on one worker, one at a time. They share fixed container names across modules.
+coverage-overall = 'pytest tests/ -o "addopts=" -n auto --dist loadgroup --cov=pyrxd --cov-fail-under=85'
 # `task check-private-links` ensures tracked docs (and staged additions) don't
 # link to gitignored paths. Catches leaks where a public doc references a
 # private design doc — broken links + leaked filenames in commit history.

@@ -60,12 +60,14 @@ jobs:
       # re-ran the slowest tests a second time, so it was dropped.
       - name: Security module coverage (must be 100%)
         run: poetry run pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100
-      # `-n auto` (pytest-xdist) runs one worker per physical core (psutil is installed, so 2
-      # on a hosted runner: the log shows `created: 2/2 workers`); pytest-cov combines the
+      # `-n auto` (pytest-xdist) counts physical cores when psutil is importable (it arrives
+      # through taskipy, undeclared here) and logical CPUs otherwise; the hosted runner's log
+      # shows `created: 2/2 workers`. `--dist loadgroup` keeps the `integration` group on one
+      # worker (tests/conftest.py); they skip here anyway. pytest-cov combines the
       # workers' data, so the 85% gate reads the same total. Before it, this step was ~93%
       # of the job (14m58s of 16m04s on 3.12, main @ 9b8459c). See #825.
       - name: Tests + overall coverage (must be 85%)
-        run: poetry run pytest tests/ -o "addopts=" -n auto --cov=pyrxd --cov-fail-under=85 --tb=short
+        run: poetry run pytest tests/ -o "addopts=" -n auto --dist loadgroup --cov=pyrxd --cov-fail-under=85 --tb=short
       - name: Bandit security scan
         run: poetry run bandit -r src/ -c pyproject.toml
       - name: Type check
