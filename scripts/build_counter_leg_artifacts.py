@@ -173,7 +173,7 @@ def obtain_solc(explicit: str | None, cache: Path) -> Path:
             except OSError as exc:  # URLError and HTTPError are OSErrors
                 raise BuildError(f"could not download {SOLC_URL}: {exc}") from exc
             _verified_solc(Path(tmp))
-            os.chmod(tmp, 0o755)  # noqa: S103 - an executable the build runs; its digest was just checked
+            os.chmod(tmp, 0o700)  # owner-only executable; its digest was just checked
             os.replace(tmp, target)
         finally:
             if os.path.exists(tmp):
