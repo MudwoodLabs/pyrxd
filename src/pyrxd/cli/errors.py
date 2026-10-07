@@ -7,14 +7,19 @@ codes uniformly across direct ``cli()`` invocations and the test runner.
 
 Exit codes (per docs/wallet-cli-plan.md §"Exit codes"):
   0   success
-  1   user-error
-  2   network error
+  1   user-error (in `pyrxd headers sync`, also: the local header cache could
+      not be written)
+  2   network error (in `pyrxd headers sync`, also: the servers' answers refused
+      the sync — too few operators, a disagreement, a header that fails a check)
   3   wallet decryption failed
   4   unexpected error (bug)
   5   a verdict that does not hold (`pyrxd verify`) — the report is still
       printed in full; only the exit status says no. Distinct from 1 on
       purpose: a gate whose "no" is spelled the same as "you typed it
       wrong" cannot be scripted. See `hashmark_cmds.EXIT_VERDICT_DOES_NOT_HOLD`.
+  6   `pyrxd headers sync` stopped at a header below its floor — the status is
+      still printed; its reason says what gets past that header. See
+      `headers_cmds.EXIT_SYNC_STOPPED`.
 
 Debug traceback handling
 ------------------------

@@ -905,11 +905,24 @@ def _block_check(anchor: dict | None) -> tuple[str, str]:
         # characters, and this is the part a reader must not lose.
         if dict(bv.get("steps") or ()).get("blockhash") == "differs":
             where += f"; the endpoint had named a different block, the block proved is {anchor.get('blockhash')}"
+        # WHICH ANCHOR: a shipped checkpoint, or a header from the local cache (`pyrxd headers
+        # sync`), itself linked to a shipped checkpoint. Named either way, so the summary never
+        # credits a shipped checkpoint with a link the cache made.
+        cached = bv.get("cached_anchor_height")
+        cp = bv.get("checkpoint_height")
+        to_cache = cached is not None and (bv.get("level") != "checkpoint" or anchor["height"] > cp)
+        target = (
+            f"cached header {cached} (pyrxd's verified-header cache, first linked to pyrxd checkpoint {cp})"
+            if to_cache
+            else f"pyrxd checkpoint {cp}"
+        )
         if bv.get("level") == "checkpoint":
-            how = f"linked hash by hash to pyrxd checkpoint {bv.get('checkpoint_height')}"
+            how = f"linked hash by hash to {target}"
+            if cached is not None and not to_cache:
+                how += f", depth counted on through the cached headers from block {cached}"
         else:
             how = (
-                f"linked to pyrxd checkpoint {bv.get('checkpoint_height')} through headers each carrying "
+                f"linked to {target} through headers each carrying "
                 f"proof-of-work of at least 2^{bv.get('floor_work_log2')}"
             )
         return "VERIFIED", f"{where}; merkle inclusion proved, {how}"
