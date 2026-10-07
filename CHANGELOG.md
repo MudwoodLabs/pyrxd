@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.26.1] — 2026-10-07
+
+A checkpoint-only release. Upgrade to keep verifying new HashMarks.
+
+### Changed
+
+- **Radiant checkpoints refreshed to block 469,728.** `pyrxd verify` and the verification pages
+  link at most 4,032 headers past the newest shipped checkpoint, so 0.26.0 could prove a mark's
+  block only up to block 471,744. 0.26.1 reaches block 473,760. The swap taker gate's reach moves
+  from block 487,872 to 489,888. All three default ElectrumX servers and the maintainer's Radiant
+  Core node agreed on all 234 entries at tip 470,597, and on every header of the last interval.
+
+### Fixed
+
+- A verify test assumed the shipped table ended below its fixture block, so the refresh broke it.
+  It now checks that none of its 17 headers is a shipped checkpoint, which holds whatever the
+  table ships.
+
+### Correction
+
+- 0.26.0's notes said the RXD↔USDC/USDT end-to-end suite "passes again and runs nightly" (#824).
+  It runs nightly, but the scheduled run has failed every night since 0.26.0: the fork's token
+  balance seed leaves 0, before any swap runs (#835). The suite passed locally for #824. It has
+  not yet passed in scheduled CI.
+
 ## [0.26.0] — 2026-10-02
 
 This summary points into the entries below it, which are kept as they were written, PR by PR.

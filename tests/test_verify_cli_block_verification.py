@@ -359,12 +359,13 @@ def test_regtest_ships_no_checkpoints_so_its_block_stays_confirmed(monkeypatch, 
     assert not {m for m, _ in server.calls} & _BLOCK_RPCS
 
 
-def test_a_mark_past_the_shipped_tables_reach_is_confirmed_with_the_reason(monkeypatch, tmp_path) -> None:
-    """The SHIPPED table, unpatched. Block 468,521 is ~2,800 past its newest checkpoint (465,696),
-    and these 17 headers do not reach back to it — so the server's short header range is what
-    stops verification, honestly, and the verdict stands."""
+def test_a_mark_whose_headers_reach_no_shipped_checkpoint_is_confirmed_with_the_reason(monkeypatch, tmp_path) -> None:
+    """The SHIPPED table, unpatched. None of these 17 headers is a shipped checkpoint, so they
+    cannot link the mark to one, whichever side of the newest checkpoint the mark falls on. The
+    server's short header range is what stops verification, honestly, and the verdict stands."""
     chain = Chain(PYRXD)
-    assert radiant_checkpoints.CHECKPOINTS["mainnet"][-1][0] < chain.start
+    shipped = {h for h, _ in radiant_checkpoints.CHECKPOINTS["mainnet"]}
+    assert shipped and not shipped & set(chain.headers)
     r, _ = _verify(monkeypatch, tmp_path, chain)
     assert r.exit_code == 0, r.output
     out = json.loads(r.output)
