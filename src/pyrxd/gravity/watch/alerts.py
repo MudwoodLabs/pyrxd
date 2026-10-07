@@ -53,10 +53,6 @@ class Severity(Enum):
 _SEVERITY: dict[Intent, Severity] = {
     Intent.PAGE_CLAIM: Severity.CRITICAL,
     Intent.PAGE_SQUEEZED: Severity.CRITICAL,
-    # CRITICAL (re-pages until ACK'd, counted by the heartbeat): decide() raises it only once the pending
-    # funding tx is ON CHAIN under a NEGOTIATED record (or unreadable) — real BTC that nothing tracks. A
-    # WARN pages once, and that one page landed during a healthy fund (review round 2).
-    Intent.PAGE_RESUME_FUND: Severity.CRITICAL,
     Intent.PAGE_REFUND: Severity.WARN,
     Intent.RETIRE: Severity.INFO,
 }

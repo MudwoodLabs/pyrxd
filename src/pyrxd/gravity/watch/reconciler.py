@@ -40,9 +40,7 @@ _STORE = "<records-store>"
 
 # Intents that the alerter is told about: the actionable pages + the terminal RETIRE
 # (so it can emit an INFO "done" and clear its dedup state). WATCH/NOOP are silent.
-_ROUTED_INTENTS = frozenset(
-    {Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.PAGE_RESUME_FUND, Intent.RETIRE}
-)
+_ROUTED_INTENTS = frozenset({Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.RETIRE})
 
 
 @runtime_checkable

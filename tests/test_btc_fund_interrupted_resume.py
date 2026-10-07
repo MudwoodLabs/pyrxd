@@ -4,9 +4,9 @@
 readback can fail after the broadcast succeeded — a confirmation slower than
 ``fund_confirm_timeout_s``, a transport error — and before this fix that left real BTC on chain under
 a NEGOTIATED record with no locator and H reserved: a retry was refused as "hashlock H reused",
-``taker_refund_btc`` and ``mutual_refund`` refused from NEGOTIATED, the watchtower read the record
-as "no action due", and the operator had no durable copy of the funding outpoint that ``swap status``
-asks for. Found by the 2026-10-07 calibration review (finding F-3) and
+``taker_refund_btc`` and ``mutual_refund`` refused from NEGOTIATED, and the operator had no durable
+copy of the funding outpoint that ``swap status`` asks for. (The watchtower still reads such a record
+as "no action due"; paging it without false or lost alerts is #842.) Found by the 2026-10-07 calibration review (finding F-3) and
 reproduced on unplanted main.
 
 Every test here drives the REAL :class:`BitcoinTaprootLeg` through the coordinator's production entry

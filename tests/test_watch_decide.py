@@ -814,72 +814,13 @@ class TestTheDepthVerdictAndTheGateUseONEConversion:
             ), seconds
 
 
-# ---------------------------------------------------------------------------
-# An interrupted BTC fund (record.pending_btc_funding_tx) is paged, not ignored
-# ---------------------------------------------------------------------------
-
-
-def _signed_tx_hex(terms: NegotiatedTerms) -> str:
-    from pyrxd.btc_wallet.keys import generate_keypair
-    from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
-
-    return build_payment_tx(
-        generate_keypair("bcrt"),
-        BtcUtxo(txid="cd" * 32, vout=0, value=terms.btc_sats * 3),
-        to_hash=b"\x11" * 32,
-        to_type="p2tr",
-        amount_sats=terms.btc_sats,
-        fee_sats=1_000,
-    ).tx_hex
-
-
-def _pending(terms=None):
-    terms = terms or _btc_terms()
-    return SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=_signed_tx_hex(terms))
-
-
-@pytest.mark.parametrize("confs", [1, 6])
-def test_a_pending_fund_confirmed_on_chain_pages_the_operator_to_resume(confs):
-    rec = _pending()
-    obs = Observations(maker_has_claimed_btc=False, now_rxd_height=150, pending_btc_funding_confirmations=confs)
-    d = _decide(rec, obs)
-    assert d.intent is Intent.PAGE_RESUME_FUND
-    assert rec.pending_btc_funding_txid in d.reason and "ON CHAIN" in d.reason
-    assert d.recommended_action == "resume_interrupted_fund"
-
-
-def test_a_pending_fund_not_yet_on_chain_only_watches():
-    """A healthy fund keeps the pending tx on its record until the lock lands: no page while nothing
-    confirmed is at risk (review round 2: the earlier page fired on every healthy fund)."""
-    obs = Observations(maker_has_claimed_btc=False, now_rxd_height=150, pending_btc_funding_confirmations=0)
-    assert _decide(_pending(), obs).intent is Intent.WATCH
-
-
-def test_a_pending_fund_of_unread_depth_pages_because_it_cannot_be_shown_safe():
-    d = _decide(_pending(), Observations(maker_has_claimed_btc=False, now_rxd_height=150))
-    assert d.intent is Intent.PAGE_RESUME_FUND and "UNREAD" in d.reason
-
-
-def test_a_healthy_negotiated_swap_is_still_not_paged():
-    d = _decide(_record(SwapState.NEGOTIATED), Observations(maker_has_claimed_btc=False, now_rxd_height=150))
-    assert d.intent is Intent.WATCH
-
-
 def test_every_page_intent_is_routed_and_has_a_severity():
     """A PAGE_* intent the reconciler does not route is only logged at debug, and one with no severity
-    is never escalated: either way the page is silently dropped. The set is DERIVED from the enum."""
+    is never escalated: either way the page is silently dropped. The set is DERIVED from the enum, so a
+    new page intent cannot be added without being wired in both places."""
     from pyrxd.gravity.watch import alerts, reconciler
 
     pages = {i for i in Intent if i.name.startswith("PAGE_")}
-    assert {Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.PAGE_RESUME_FUND} <= pages
+    assert {Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED} <= pages  # non-vacuity
     assert pages <= reconciler._ROUTED_INTENTS
     assert pages <= set(alerts._SEVERITY)
-
-
-def test_the_resume_page_is_critical_so_it_re_pages_until_acknowledged():
-    """It fires only once the pending funding tx is ON CHAIN under a NEGOTIATED record (or unreadable):
-    real BTC nothing tracks. A WARN pages once and never again (review round 2 measured 1 page in 50
-    ticks), and that one page could land before the fund was ever interrupted."""
-    from pyrxd.gravity.watch import alerts
-
-    assert alerts._SEVERITY[Intent.PAGE_RESUME_FUND] is alerts.Severity.CRITICAL
