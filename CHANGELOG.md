@@ -15,7 +15,7 @@ A checkpoint-only release. Upgrade to keep verifying new HashMarks.
 - **Radiant checkpoints refreshed to block 469,728.** `pyrxd verify` and the verification pages
   link at most 4,032 headers past the newest shipped checkpoint, so 0.26.0 could prove a mark's
   block only up to block 471,744. 0.26.1 reaches block 473,760 (for the CLI, the mark's block
-  plus its `--min-confirmations` must fit under it). The swap taker gate's reach moves
+  plus `--min-confirmations` minus 1 must be at most that). The swap taker gate's reach moves
   from block 487,872 to 489,888. All three default ElectrumX servers and the maintainer's Radiant
   Core node agreed on all 234 entries at tip 470,597, and on every header of the last interval.
 
