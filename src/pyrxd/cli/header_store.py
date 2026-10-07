@@ -11,7 +11,10 @@ them. Three rules:
   new one, never a mixture.
 * **Append-only.** A write never changes a header the current store holds: it may only add headers
   above its top, or rebase onto a newer shipped checkpoint (dropping headers below it, which the
-  shipped table then covers). :func:`save` refuses anything else.
+  shipped table then covers). :func:`save` refuses anything else, except a ``--reset`` rebuild that
+  finished without a stop and either disagrees with the store or reaches past its top: a reset never
+  only shortens a good cache, and a stopped or refused reset never reaches :func:`save` at all.
+  The check and the replace run under one advisory lock (POSIX).
 """
 
 from __future__ import annotations
@@ -32,7 +35,16 @@ from ..glyph.header_cache import (
     verify_header_chain,
 )
 
-__all__ = ["LoadedStore", "cache_dir", "load", "lock_path", "save", "store_path"]
+__all__ = [
+    "AppendOnlyRefusal",
+    "LoadedStore",
+    "ResetKeptExisting",
+    "cache_dir",
+    "load",
+    "lock_path",
+    "save",
+    "store_path",
+]
 
 
 def cache_dir() -> Path:
@@ -95,8 +107,8 @@ def load(network: str, table: Sequence[tuple[int, str]], *, path: Path | None = 
         return LoadedStore(
             where,
             None,
-            f"the header cache ends at block {top}, behind this pyrxd's newest checkpoint ({newest}): it is "
-            f"stale, not damaged, and the next `pyrxd headers sync` rebuilds it",
+            f"the header cache ends at block {top}, behind this pyrxd's newest checkpoint ({newest}), so it is "
+            f"stale and was not checked further; the next `pyrxd headers sync` rebuilds it from that checkpoint",
             syncs,
             stale=True,
         )
@@ -137,33 +149,59 @@ def _locked(where: Path) -> Iterator[None]:
         os.close(fd)
 
 
+class AppendOnlyRefusal(ValueError):
+    """A write that would change or drop headers the current store holds. The store is unchanged."""
+
+
+class ResetKeptExisting(Exception):
+    """A ``--reset`` rebuild that agrees with the current store and does not reach past its top:
+    replacing would only shorten a good cache, so the store is kept unchanged."""
+
+
 def save(
     chain: VerifiedHeaders,
     *,
     table: Sequence[tuple[int, str]],
-    syncs: Sequence[Mapping[str, Any]],
+    record: Mapping[str, Any] | None = None,
     path: Path | None = None,
     reset: bool = False,
 ) -> Path:
-    """Write *chain* atomically, refusing to change or drop any header the current store holds
-    above *table*'s newest checkpoint. A current store that does not verify is treated as empty.
-    *reset* (``pyrxd headers sync --reset``, and only that) replaces the store whatever it holds."""
+    """Write *chain* atomically under the store's lock; *record* is appended to the sync records
+    read from the file under that same lock, so a concurrent sync's record is never lost.
+
+    Without *reset*: :class:`AppendOnlyRefusal` if *chain* would change or drop a header the current
+    store holds above *table*'s newest checkpoint (a store that does not verify counts as empty).
+
+    With *reset* (``pyrxd headers sync --reset``, and only that, after a rebuild that finished
+    without a stop): the store is replaced, unless *chain* agrees with it at every height both hold
+    and ends below its top, which raises :class:`ResetKeptExisting` and keeps it.
+    """
     where = path or store_path(chain.network)
-    data = encode_store(chain, syncs=syncs)
     where.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Read, check and replace under ONE lock, so two concurrent syncs cannot both pass the
     # append-only check against the same old store and the second shorten what the first wrote.
     with _locked(where):
-        old = None if reset else load(chain.network, table, path=where).chain
+        current = load(chain.network, table, path=where)
+        old = current.chain
         if old is not None:
-            # Append-only: every height both hold must hold the same header.
-            lo = max(old.base_height, chain.base_height)
-            hi = min(old.top, chain.top)
-            for h in range(lo, hi + 1):
-                if old.header_at(h) != chain.header_at(h):
-                    raise ValueError(f"refusing to rewrite the cached header at {h}: the header cache is append-only")
-            if chain.top < old.top:
-                raise ValueError("refusing to shorten the header cache: it is append-only")
+            lo, hi = max(old.base_height, chain.base_height), min(old.top, chain.top)
+            differs = next((h for h in range(lo, hi + 1) if old.header_at(h) != chain.header_at(h)), None)
+            if reset:
+                if differs is None and chain.top < old.top:
+                    raise ResetKeptExisting(
+                        f"the rebuild agrees with the existing cache and ends at block {chain.top}, below its top "
+                        f"({old.top}); the existing cache was kept"
+                    )
+            elif differs is not None:
+                raise AppendOnlyRefusal(
+                    f"the cache on disk holds a different header at block {differs} than this sync built on"
+                )
+            elif chain.top < old.top:
+                raise AppendOnlyRefusal(
+                    f"the cache on disk already reaches block {old.top}, past this sync's {chain.top}"
+                )
+        syncs = [*current.syncs, *([record] if record is not None else [])]
+        data = encode_store(chain, syncs=syncs)
         tmp = where.with_name(f".{where.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         try:
             with open(tmp, "wb") as fh:

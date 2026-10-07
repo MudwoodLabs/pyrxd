@@ -14,7 +14,10 @@ header in that range would have been held back by that rule.
     PYTHONPATH=src python scripts/measure_header_floor_margins.py --from 100000 --to 470000 --save h.bin
     PYTHONPATH=src python scripts/measure_header_floor_margins.py --from 100000 --load h.bin
 
-What is measured, matching what the code does:
+What is measured, for each rule. Each figure is the worst over the range; where the code's rule
+depends on something the script does not model (which anchor a mark gets, where a fallback walk
+ends), the script takes the worst case over it, so the figure is an UPPER BOUND on what that rule
+did to honest headers in the range, never an underestimate:
 
 * **sync** (:func:`pyrxd.glyph.header_cache.sync_floor`): a sync fixes ONE floor from the median
   work of the newest 2,016 headers already cached, and holds every header it adds to it. For every
@@ -24,6 +27,11 @@ What is measured, matching what the code does:
 * **verify** (:mod:`pyrxd.glyph.mark_block` from a cached anchor): the floor comes from one anchor
   for up to 4,032 headers above it. For every height ``a`` as the anchor, the ratio is
   ``work[a] / min(work[a+1 : a+4033])``.
+* **fallback** (:func:`pyrxd.glyph.mark_block.verify_with_fetched` after a server disagrees with the
+  cache): the walk runs from the shipped checkpoint ``C`` and holds EVERY header above it, those
+  below the cached anchor ``A`` included, to ``work[A] // 16``, with ``A`` anywhere in the 4,032
+  headers above ``C``. The ratio is ``max(work[C+1 : C+4033]) / min(work[C+1 : C+4033])`` (the worst
+  ``A`` against the worst header), for every checkpoint height ``C`` and, separately, for every height.
 * **checkpoint**: the shipped checkpoint's work is the least any floor can be. For every checkpoint
   height (a multiple of 2,016), the ratio is ``work[cp] / min(work[cp+1 : cp+1+L])`` for ``L`` =
   8,640 and 25,920 blocks (about one and three months of a release's life).
@@ -45,6 +53,7 @@ from pathlib import Path
 WINDOW = 2016
 SYNC_SPANS = (4032, 8640)
 VERIFY_SPAN = 4032
+FALLBACK_SPAN = 4032
 CHECKPOINT_SPANS = (8640, 25920)
 INTERVAL = 2016
 
@@ -109,6 +118,12 @@ def trailing_median_low(values: Sequence[int], window: int) -> list[int]:
     return out
 
 
+def sliding_max(values: Sequence[int], span: int) -> list[tuple[int, int]]:
+    """``out[i] = (max(values[i : i+span]), its index)`` for every full window."""
+    neg = [-v for v in values]
+    return [(-m, at) for m, at in sliding_min(neg, span)]
+
+
 def measure(work: Sequence[int], lo: int) -> dict:
     n = len(work)
     result: dict = {"from": lo, "to": lo + n - 1, "headers": n}
@@ -130,6 +145,22 @@ def measure(work: Sequence[int], lo: int) -> dict:
         if r > best[0]:
             best = (r, lo + a, lo + at)
     result[f"verify_span_{VERIFY_SPAN}"] = {"worst_ratio": round(best[0], 3), "anchor": best[1], "at": best[2]}
+    mins = sliding_min(work, FALLBACK_SPAN)
+    maxs = sliding_max(work, FALLBACK_SPAN)
+    for label, step in (("every_checkpoint", INTERVAL), ("every_height", 1)):
+        best = (0.0, None, None, None)
+        first = (-lo) % INTERVAL if step == INTERVAL else 0
+        for c in range(first, n - FALLBACK_SPAN - 1, step):
+            (m, at), (mx, a) = mins[c + 1], maxs[c + 1]
+            r = mx / m
+            if r > best[0]:
+                best = (r, lo + c, lo + a, lo + at)
+        result[f"fallback_span_{FALLBACK_SPAN}_{label}"] = {
+            "worst_ratio": round(best[0], 3),
+            "checkpoint": best[1],
+            "anchor": best[2],
+            "at": best[3],
+        }
     for span in CHECKPOINT_SPANS:
         mins = sliding_min(work, span)
         best = (0.0, None, None)

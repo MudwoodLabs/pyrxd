@@ -31,29 +31,35 @@ it above that, and as they change from one sync to the next the sync floor moves
 them, but never below that bound.
 
 THE HONEST-PATH LIMIT, plainly. ``pyrxd headers sync`` stops at the first header whose work is below
-the sync floor; it caches the agreed headers under it, reports ``stopped`` and says why. A later
-sync starts at that same header with a floor from the same cached headers, so it stops there
-again whatever difficulty does afterwards: the way past is a newer pyrxd (a newer checkpoint), or
-``pyrxd headers sync --reset``, which rebuilds the cache and holds its first sync to the
-checkpoint's work alone. Marks above the stopped header verify only from the shipped checkpoint,
-within its 4,032 headers. Within one verification walk (at most 4,032 headers above a cached
-anchor) the floor rests on the anchor's work when that is higher, as it rests on a checkpoint's.
+the sync floor; it caches the agreed headers under it, reports ``stopped``, and says what gets past
+that header, as :func:`floor_stop_advice` COMPUTES it from the cache it left: a plain re-run, when
+the headers it added moved the floor to or below that header's work; ``pyrxd headers sync
+--reset``, when the shipped checkpoint's floor admits the header; otherwise only a newer pyrxd
+release. Until then, marks above that header verify only from the shipped checkpoint, within its
+4,032 headers. Within one verification walk (at most 4,032 headers above a cached anchor) the floor
+rests on the anchor's work when that is higher, as it rests on a checkpoint's; and when a server
+disagrees with the cache, the fallback walk from the checkpoint keeps that floor for EVERY header
+above the checkpoint, including those below the cached anchor, which neither the agreeing walk nor
+a walk with no cache holds to it.
 
 HOW CLOSE HONEST HEADERS COME (``scripts/measure_header_floor_margins.py``, which states its method;
 run 2026-10-07, read-only from a default public server, over the 370,601 linked mainnet headers
 from block 100,000 to 470,600). Each figure is the worst, over the range, of ``W / (the least work
-of a header the rule would have to pass)``; 16 or more would mean an honest header was held back.
+of a header the rule would have to pass)``, taking the worst case over whatever the script does not
+model, so each is an upper bound; 16 or more would mean an honest header was held back.
 
 * sync, one floor for a span starting at every height (median of the 2,016 cached headers before
   it): 3.64 over spans of 4,032 blocks, 3.48 over spans of 8,640 that fit in the range;
 * verify, every height as the anchor, over the 4,032 headers above it: 3.91;
+* the fallback after a disagreement, the worst cached anchor within 4,032 headers of the checkpoint
+  against every header in that walk: 3.84 for every checkpoint height, 4.57 for every height;
 * the shipped checkpoint's work against the headers after it, for every checkpoint height: 3.48
   over 8,640 blocks, and 7.94 over 25,920 blocks (about three months).
 
-The first three worst cases all fall at block 467,103. So the per-sync and per-anchor rules kept
-at least four times their margin over this range, while the checkpoint bound, which every floor
-keeps, used half of it within three months: a release whose checkpoint is months old can come
-within reach of its limit if difficulty keeps falling, and then needs a newer pyrxd.
+So the per-sync, per-anchor and fallback rules kept more than three times their margin over this
+range, while the checkpoint bound, which every floor keeps, used half of it within three months: a
+release whose checkpoint is months old can come within reach of its limit if difficulty keeps
+falling, and then needs a newer pyrxd.
 
 PURE. Nothing here touches a file or the network: the CLI's store
 (:mod:`pyrxd.cli.header_store`) reads and writes the bytes :func:`encode_store` produces, and the
@@ -87,6 +93,7 @@ __all__ = [
     "decode_store",
     "encode_store",
     "extend_verified_headers",
+    "floor_stop_advice",
     "start_verified_headers",
     "sync_floor",
     "verify_header_chain",
@@ -279,7 +286,7 @@ def verify_header_chain(
         if h in by_height and below != by_height[h]:
             return None, f"the stored header at {h} is not the checkpoint this pyrxd ships for that height"
     base = bytes(headers[cp_h - base_height])
-    floor = radiant_header_work(base, pow_limit=pow_limit) // FLOOR_WORK_DIVISOR
+    floor = int(radiant_header_work(base, pow_limit=pow_limit) // FLOOR_WORK_DIVISOR)
     above = headers[cp_h - base_height + 1 :]
     hashes, kind, reason = _walk(cp_hash, cp_h + 1, above, floor, pow_limit=pow_limit)
     if kind == "lie":
@@ -307,7 +314,30 @@ def sync_floor(chain: VerifiedHeaders) -> int:
     sync adds anything, and pass it to every :func:`extend_verified_headers` call of that sync.
     """
     recent = statistics.median_low(radiant_header_work(h) for h in chain.headers[-RECENT_WINDOW:])
-    return max(radiant_header_work(chain.checkpoint_header), recent) // FLOOR_WORK_DIVISOR
+    return int(max(radiant_header_work(chain.checkpoint_header), recent) // FLOOR_WORK_DIVISOR)
+
+
+#: What gets a stopped sync past the header it stopped at, as :func:`floor_stop_advice` computes it.
+ADVICE_RERUN, ADVICE_RESET, ADVICE_UPGRADE = "rerun", "reset", "upgrade"
+
+
+def floor_stop_advice(chain: VerifiedHeaders, stopped_work: int) -> tuple[str, int]:
+    """``(advice, next sync floor)`` for a sync that stopped at a header carrying *stopped_work*,
+    *chain* being the cache as that sync left it. Computed, never assumed:
+
+    * ``"rerun"`` when the floor a plain re-run would use (:func:`sync_floor` of *chain*: the headers
+      the stopped sync added move the median) is at or below *stopped_work*;
+    * else ``"reset"`` when a rebuild's first-sync floor, the shipped checkpoint's
+      (:attr:`VerifiedHeaders.floor_work`), is at or below it. Every cached header above the
+      checkpoint already meets that floor (the store invariant), so a rebuild reaches the header;
+    * else ``"upgrade"``: no floor this release can use admits the header.
+    """
+    next_floor = sync_floor(chain)
+    if stopped_work >= next_floor:
+        return ADVICE_RERUN, next_floor
+    if stopped_work >= chain.floor_work:
+        return ADVICE_RESET, next_floor
+    return ADVICE_UPGRADE, next_floor
 
 
 def extend_verified_headers(

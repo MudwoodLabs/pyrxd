@@ -35,24 +35,35 @@ from typing import Any
 
 import click
 
+from ..glyph import header_cache as _hc
 from ..glyph.header_cache import (
+    ADVICE_RERUN,
+    ADVICE_RESET,
     CACHE_MIN_DEPTH,
     MIN_OPERATORS,
     HeaderCacheRefusal,
     agreed_headers,
     extend_verified_headers,
+    floor_stop_advice,
     start_verified_headers,
     sync_floor,
 )
 from ..glyph.mark_block import CACHE_RESET_COMMAND, MAX_HEADERS_FROM_CHECKPOINT, MAX_HEADERS_PER_REQUEST
 from ..hash import radiant_block_hash
 from ..network.redaction import redact_endpoint_secrets
+from ..spv.radiant import radiant_header_work
 from . import header_store
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
 
-__all__ = ["OperatorSource", "headers_group", "operator_sources", "sync_headers"]
+__all__ = ["EXIT_SYNC_STOPPED", "OperatorSource", "headers_group", "operator_sources", "sync_headers"]
+
+#: Exit status of `pyrxd headers sync` when a header below the floor stopped it: the cache could not
+#: be brought up to date, and retrying unchanged may not help (the reason says what will). Distinct
+#: from 2 (the servers' answers were unusable) and 1 (the local store could not be written), so a
+#: script can tell them apart. Listed with the other codes in pyrxd.cli.errors.
+EXIT_SYNC_STOPPED = 6
 
 
 @dataclass(frozen=True)
@@ -138,10 +149,16 @@ async def sync_headers(
         "reset": reset,
         "floor_work_log2": None,
         "fix": None,
+        "exit_code": 0,
+        "floor_work": None,
+        "next_floor_work": None,
+        "stopped_at": None,
+        "stopped_work": None,
+        "advice": None,
     }
 
-    def refuse(reason: str, fix: str | None = None) -> dict[str, Any]:
-        report["state"], report["reason"], report["fix"] = "refused", reason, fix
+    def refuse(reason: str, fix: str | None = None, exit_code: int = NetworkBoundaryError.exit_code) -> dict[str, Any]:
+        report["state"], report["reason"], report["fix"], report["exit_code"] = "refused", reason, fix, exit_code
         return report
 
     if not table:
@@ -183,6 +200,7 @@ async def sync_headers(
             # THE SYNC'S FLOOR, fixed before anything is added (see header_cache.sync_floor).
             floor = sync_floor(chain)
             report["floor_work_log2"] = max(floor.bit_length() - 1, 0)
+            report["floor_work"] = floor
             h = chain.top + 1
             while h <= stop:
                 n = min(MAX_HEADERS_PER_REQUEST, stop - h + 1)
@@ -192,9 +210,12 @@ async def sync_headers(
                         replies[key] = await client.get_block_headers(h, n)
                     except Exception as exc:
                         return refuse(f"{key} did not serve the headers {h}-{h + n - 1}: {_err(exc, scrub)}")
-                chain, stopped = extend_verified_headers(chain, agreed_headers(replies, h, n), floor=floor)
+                agreed = agreed_headers(replies, h, n)
+                chain, stopped = extend_verified_headers(chain, agreed, floor=floor)
                 if stopped:
                     report["stopped"] = stopped
+                    report["stopped_at"] = chain.top + 1
+                    report["stopped_work"] = radiant_header_work(agreed[chain.top + 1 - h])
                     break
                 h += n
         except HeaderCacheRefusal as exc:
@@ -212,15 +233,46 @@ async def sync_headers(
 
     report["added"] = chain.top - old_top
     report["cached_from"], report["cached_to"] = chain.base_height, chain.top
+    kept = (
+        f" The existing cache (blocks {loaded.chain.base_height}..{loaded.chain.top}) was kept unchanged."
+        if loaded.chain is not None
+        else ""
+    )
     if report["stopped"]:
-        # STUCK, not up to date: the next sync starts at the same header with a floor from the same
-        # cached headers, so it stops there again. Say so, and say what does get past it.
-        report["stopped"] += (
-            f" (the floor was 2^{report['floor_work_log2']} expected hash evaluations, set when this sync "
-            f"began). Every later sync starts at that header with the same floor and stops there again. "
-            f"To go past it, install a newer pyrxd (a newer checkpoint), or run `{CACHE_RESET_COMMAND}`, "
-            f"which rebuilds the cache and holds its first sync to 1/16 of the shipped checkpoint's work alone"
-        )
+        report["exit_code"] = EXIT_SYNC_STOPPED
+        report["stopped"] += f" (this sync's floor was {floor}, fixed when it began)."
+        if reset:
+            # A STOPPED RESET IS NOT SAVED. Its floor was the checkpoint's alone (nothing else was
+            # cached), so no re-run of the reset gets further: only a newer release can.
+            report["advice"] = "upgrade"
+            report["stopped"] += (
+                f" A reset holds headers to 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped checkpoint's work, which this header does "
+                f"not meet, so only a newer pyrxd release can get past it.{kept}"
+            )
+            report["state"], report["added"] = "stopped", 0
+            report["cached_from"] = loaded.chain.base_height if loaded.chain else None
+            report["cached_to"] = loaded.chain.top if loaded.chain else None
+            return report
+        # COMPUTED, not assumed: what the cache this sync leaves admits next time.
+        advice, next_floor = floor_stop_advice(chain, report["stopped_work"])
+        report["advice"], report["next_floor_work"] = advice, next_floor
+        if advice == ADVICE_RERUN:
+            report["stopped"] += (
+                f" Re-run `pyrxd headers sync`: the headers this sync added move the floor to {next_floor}, "
+                f"which the header at {report['stopped_at']} meets."
+            )
+        elif advice == ADVICE_RESET:
+            report["stopped"] += (
+                f" A plain re-run would stop here again (its floor would be {next_floor}). "
+                f"`{CACHE_RESET_COMMAND}` gets past it: a rebuild holds its first sync to 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped "
+                f"checkpoint's work ({chain.floor_work}), which the header at {report['stopped_at']} meets."
+            )
+        else:
+            report["stopped"] += (
+                f" Only a newer pyrxd release can get past this header: its work is below 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped "
+                f"checkpoint's ({chain.floor_work}), so neither a re-run (floor {next_floor}) nor "
+                f"`{CACHE_RESET_COMMAND}` would cache it."
+            )
     if report["added"] == 0 and not reset:
         report["state"] = "stopped" if report["stopped"] else "up to date"
         if not report["stopped"]:
@@ -239,16 +291,33 @@ async def sync_headers(
         "operators": sorted(reached),
         **({"reset": True} if reset else {}),
     }
-    try:
-        header_store.save(chain, table=table, syncs=[*loaded.syncs, record], path=loaded.path, reset=reset)
-    except (OSError, ValueError) as exc:
+
+    def unchanged() -> None:
         report["added"] = 0
         report["cached_from"] = loaded.chain.base_height if loaded.chain else None
         report["cached_to"] = loaded.chain.top if loaded.chain else None
+
+    try:
+        header_store.save(chain, table=table, record=record, path=loaded.path, reset=reset)
+    except header_store.ResetKeptExisting as exc:
+        unchanged()
+        report["state"], report["reason"] = "up to date", str(exc)
+        return report
+    except header_store.AppendOnlyRefusal as exc:
+        unchanged()
+        return refuse(
+            f"the header cache was not written: {exc}",
+            fix="another `pyrxd headers sync` wrote the cache while this one ran; re-run "
+            f"(if it repeats, `{CACHE_RESET_COMMAND}`). The cache on disk is unchanged",
+            exit_code=UserError.exit_code,
+        )
+    except OSError as exc:
+        unchanged()
         return refuse(
             f"the header cache could not be written: {_err(exc, scrub)}",
             fix=f"check that {loaded.path.parent} is writable and has free space, then re-run; "
             "the cache (if any) is unchanged",
+            exit_code=UserError.exit_code,
         )
     report["state"] = "stopped" if report["stopped"] else "synced"
     return report
@@ -281,7 +350,8 @@ def headers_group() -> None:
     "--reset",
     is_flag=True,
     help="Rebuild the cache from the newest shipped checkpoint instead of extending it (for a cache "
-    "left on a branch Radiant has abandoned). The old cache is replaced only if the rebuild succeeds.",
+    "left on a branch Radiant has abandoned). The old cache is replaced only when the rebuild finishes "
+    "without a stop and either disagrees with it or reaches past its top; otherwise it is kept.",
 )
 @click.pass_obj
 def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
@@ -293,8 +363,9 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     to the newest checkpoint pyrxd ships, and it meets its own proof-of-work and the floor (never
     below 1/16 of that checkpoint's work). A refusal (too few operators, a disagreement, a broken
     link, a failed proof-of-work) writes nothing. A header below the floor STOPS the sync: the
-    headers below it are written, and the reason says what gets past it. Exit 2 when the sync is
-    refused or stopped.
+    headers below it are written, and the reason says what gets past it, computed from the cache
+    the sync leaves. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot
+    be written, 6 when a header below the floor stopped it.
     """
     from .swap_recovery import electrumx_urls
 
@@ -306,11 +377,12 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     report["verify_reach"] = _reach(report["cached_to"], report["checkpoint_height"])
     if _json_mode(ctx, json_flag):
         click.echo(json.dumps(report, ensure_ascii=True, indent=2))
-        if report["state"] in ("refused", "stopped"):
-            sys.exit(NetworkBoundaryError.exit_code)
+        if report["exit_code"]:
+            sys.exit(report["exit_code"])
         return
     if report["state"] == "refused":
-        raise NetworkBoundaryError(
+        cls = UserError if report["exit_code"] == UserError.exit_code else NetworkBoundaryError
+        raise cls(
             "header cache not updated",
             cause=report["reason"],
             fix=report.get("fix")
@@ -318,8 +390,8 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
             "span at least two operators (`pyrxd headers status`) and re-run",
         )
     click.echo(emit(report, mode=ctx.output_mode, quiet_field="cached_to", human_lines=_sync_lines(report)))
-    if report["state"] == "stopped":
-        sys.exit(NetworkBoundaryError.exit_code)
+    if report["exit_code"]:
+        sys.exit(report["exit_code"])
 
 
 def _sync_lines(r: dict[str, Any]) -> list[str]:

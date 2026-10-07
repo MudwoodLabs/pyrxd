@@ -174,7 +174,7 @@ def test_extending_refuses_a_lie_and_stops_at_the_floor() -> None:
 def test_a_saved_store_reads_back_verified(tmp_path) -> None:
     chain = _chain(START, TOP)
     path = tmp_path / "mainnet.bin"
-    header_store.save(chain, table=_table(START), syncs=[{"from": START + 1, "to": TOP}], path=path)
+    header_store.save(chain, table=_table(START), record={"from": START + 1, "to": TOP}, path=path)
     got = header_store.load("mainnet", _table(START), path=path)
     assert got.chain is not None and got.chain.headers == chain.headers and got.note is None
     assert got.syncs == ({"from": START + 1, "to": TOP},)
@@ -220,7 +220,7 @@ def test_a_damaged_store_is_empty_never_trusted(tmp_path, case: str) -> None:
 
 def test_a_store_for_another_network_or_another_checkpoint_is_not_used(tmp_path) -> None:
     path = tmp_path / "mainnet.bin"
-    header_store.save(_chain(START, TOP), table=_table(START), syncs=[], path=path)
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)
     assert header_store.load("testnet", _table(START), path=path).chain is None
     assert header_store.load("mainnet", _table(460570), path=path).chain is None, "not at a shipped checkpoint"
     # Honest pair: a newer shipped checkpoint the store reaches is honoured (the store is rebased on it).
@@ -231,15 +231,18 @@ def test_a_store_for_another_network_or_another_checkpoint_is_not_used(tmp_path)
 
 def test_a_store_that_ends_below_the_newest_checkpoint_is_stale(tmp_path) -> None:
     path = tmp_path / "mainnet.bin"
-    header_store.save(_chain(START, 460570), table=_table(START), syncs=[], path=path)
+    header_store.save(_chain(START, 460570), table=_table(START), path=path)
     got = header_store.load("mainnet", ((START, _hash(START)), (460575, _hash(460575))), path=path)
     assert got.chain is None and got.stale and not got.untrusted
-    assert "behind this pyrxd's newest checkpoint (460575)" in (got.note or "") and "not damaged" in got.note
+    assert (
+        "behind this pyrxd's newest checkpoint (460575)" in (got.note or "")
+        and "stale and was not checked further" in got.note
+    )
 
 
 def test_a_write_that_fails_leaves_the_old_store_whole(tmp_path, monkeypatch) -> None:
     path = tmp_path / "mainnet.bin"
-    header_store.save(_chain(START, 460570), table=_table(START), syncs=[], path=path)
+    header_store.save(_chain(START, 460570), table=_table(START), path=path)
     before = path.read_bytes()
 
     def boom(src, dst):  # the rename never happens: the crash a temp file + os.replace guards against
@@ -247,7 +250,7 @@ def test_a_write_that_fails_leaves_the_old_store_whole(tmp_path, monkeypatch) ->
 
     monkeypatch.setattr(header_store.os, "replace", boom)
     with pytest.raises(OSError):
-        header_store.save(_chain(START, TOP), table=_table(START), syncs=[], path=path)
+        header_store.save(_chain(START, TOP), table=_table(START), path=path)
     assert path.read_bytes() == before
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir()), "the temporary file is removed"
 
@@ -262,12 +265,12 @@ def test_two_saves_at_once_cannot_shorten_the_store(tmp_path) -> None:
     import threading
 
     path = tmp_path / "mainnet.bin"
-    header_store.save(_chain(START, 460570), table=_table(START), syncs=[], path=path)
+    header_store.save(_chain(START, 460570), table=_table(START), path=path)
     errors: list[BaseException] = []
 
     def shorter() -> None:
         try:
-            header_store.save(_chain(START, 460575), table=_table(START), syncs=[], path=path)
+            header_store.save(_chain(START, 460575), table=_table(START), path=path)
         except BaseException as exc:
             errors.append(exc)
 
@@ -284,17 +287,18 @@ def test_two_saves_at_once_cannot_shorten_the_store(tmp_path) -> None:
         os.close(fd)
     t.join(10)
     assert not t.is_alive()
-    assert errors and "shorten" in str(errors[0])
+    assert errors and isinstance(errors[0], header_store.AppendOnlyRefusal)
+    assert "already reaches block 460580" in str(errors[0])
     assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
 
 
 def test_the_store_is_append_only(tmp_path) -> None:
     path = tmp_path / "mainnet.bin"
-    header_store.save(_chain(START, 460575), table=_table(START), syncs=[], path=path)
-    with pytest.raises(ValueError, match="append-only"):
-        header_store.save(_chain(START, 460570), table=_table(START), syncs=[], path=path)
+    header_store.save(_chain(START, 460575), table=_table(START), path=path)
+    with pytest.raises(header_store.AppendOnlyRefusal, match="already reaches block 460575"):
+        header_store.save(_chain(START, 460570), table=_table(START), path=path)
     assert header_store.load("mainnet", _table(START), path=path).chain.top == 460575  # type: ignore[union-attr]
-    header_store.save(_chain(START, TOP), table=_table(START), syncs=[], path=path)  # honest: extending
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)  # honest: extending
     assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
 
 
@@ -442,7 +446,7 @@ def test_a_header_below_the_floor_ends_the_sync_and_keeps_what_is_under_it(monke
     monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, 460575)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
-    assert r.exit_code == 2, r.output
+    assert r.exit_code == 6, r.output
     assert out["state"] == "stopped" and out["cached_to"] == 460577 and out["added"] == 2
     assert "the header at 460578 carries less work than the floor" in out["stopped"]
     assert _cached(460575).top == 460577, "the headers below the stop are written"  # type: ignore[union-attr]
@@ -469,7 +473,7 @@ def test_a_floor_stop_in_the_second_request_keeps_the_first(monkeypatch, tmp_pat
     monkeypatch.setattr(headers_cmds, "MAX_HEADERS_PER_REQUEST", 2)
     _patch_table(monkeypatch, 460575)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
-    assert r.exit_code == 2 and out["state"] == "stopped" and out["cached_to"] == 460577
+    assert r.exit_code == 6 and out["state"] == "stopped" and out["cached_to"] == 460577
     assert _cached(460575).top == 460577  # type: ignore[union-attr]
 
 
@@ -496,7 +500,7 @@ def test_status_calls_a_store_behind_the_checkpoint_stale_not_untrusted(monkeypa
     monkeypatch.setitem(radiant_checkpoints.CHECKPOINTS, "mainnet", ((START, _hash(START)), (460575, _hash(460575))))
     head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
     out = json.loads(CliRunner().invoke(cli, [*head, "--json", "headers", "status"]).output)
-    assert out["state"] == "stale" and "not damaged" in out["note"]
+    assert out["state"] == "stale" and "stale" in out["note"]
     human = CliRunner().invoke(cli, [*head, "headers", "status"]).output
     assert "STALE" in human and "UNTRUSTED" not in human and "does not verify" not in human
     # And the next sync rebuilds it from the newer checkpoint.
@@ -511,7 +515,7 @@ def test_status_sanitises_what_the_store_says(monkeypatch, tmp_path) -> None:
     header_store.save(
         _chain(START, TOP),
         table=_table(START),
-        syncs=[{"utc": evil, "from": evil, "to": 1, "operators": [evil, "operator:b"]}],
+        record={"utc": evil, "from": evil, "to": 1, "operators": [evil, "operator:b"]},
     )
     head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
     human = CliRunner().invoke(cli, [*head, "headers", "status"]).output
@@ -590,7 +594,7 @@ def _verify(monkeypatch, tmp_path, server=None, *, conf: int = 6, json_out: bool
 
 
 def _store(cp: int, top: int) -> None:
-    header_store.save(_chain(cp, top), table=_table(cp), syncs=[])
+    header_store.save(_chain(cp, top), table=_table(cp))
 
 
 def _flat(text: str) -> str:
@@ -716,7 +720,7 @@ def _store_fork(monkeypatch) -> None:
     chain = _chain(START, FORK_H - 1)
     chain, stopped = extend_verified_headers(chain, [FORK])
     assert stopped is None and chain.hash_at(FORK_H) != _hash(FORK_H)
-    header_store.save(chain, table=_table(START), syncs=[])
+    header_store.save(chain, table=_table(START))
     assert _cached(START).top == FORK_H  # type: ignore[union-attr]
 
 
@@ -756,7 +760,7 @@ def test_verify_falls_back_to_the_shipped_checkpoint_when_the_cache_disagrees(mo
     assert "linked from the shipped checkpoint instead" in bv["claim"] and "--reset" in bv["claim"]
     assert bv["cache_disagreement"] and out["checks"]["block"]["state"] == "VERIFIED"
     # Honest pair: the same mark with the real chain cached verifies FROM the cache, no note.
-    header_store.save(_chain(START, FORK_H), table=_table(START), syncs=[], reset=True)
+    header_store.save(_chain(START, FORK_H), table=_table(START), reset=True)
     bv = json.loads(_verify(monkeypatch, tmp_path).output)["mark_anchor"]["block_verification"]
     assert bv["state"] == "VERIFIED" and bv["cached_anchor_height"] == FORK_H and bv["cache_disagreement"] is None
 
@@ -821,16 +825,21 @@ def test_the_sync_floor_rises_with_the_cached_median(monkeypatch, tmp_path) -> N
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 2)
     assert r.exit_code == 0 and out["cached_to"] == CP2 + 2
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 5)
-    assert r.exit_code == 2, r.output
+    assert r.exit_code == 6, r.output
     assert out["state"] == "stopped" and out["added"] == 0 and out["cached_to"] == CP2 + 2
     assert f"the header at {CP2 + 3} carries less work than the floor" in out["stopped"]
     assert "recent cached median" in out["stopped"]
-    assert f"the floor was 2^{out['floor_work_log2']}" in out["stopped"]
-    assert "a newer pyrxd" in out["stopped"] and "`pyrxd headers sync --reset`" in out["stopped"]
-    # STUCK, and said so: the next sync stops at the same header, with the same floor.
+    assert f"this sync's floor was {out['floor_work']}" in out["stopped"]
+    # THE ADVICE IS COMPUTED: nothing was added, so a re-run's floor is the same (exact integers),
+    # and the checkpoint's floor admits 468,527, so `--reset` is what gets past it.
+    assert out["advice"] == "reset" and out["next_floor_work"] == out["floor_work"]
+    assert out["stopped_at"] == CP2 + 3 and out["stopped_work"] == radiant_header_work(HEADERS2[CP2 + 3])
+    assert "A plain re-run would stop here again" in out["stopped"]
+    assert "`pyrxd headers sync --reset` gets past it" in out["stopped"]
+    # And it is true: a re-run stops at the same header with the same exact floor...
     r, again = _sync2(monkeypatch, tmp_path, CP2 + 5)
-    assert r.exit_code == 2 and again["state"] == "stopped" and again["cached_to"] == CP2 + 2
-    assert again["floor_work_log2"] == out["floor_work_log2"]
+    assert r.exit_code == 6 and again["state"] == "stopped" and again["cached_to"] == CP2 + 2
+    assert again["floor_work"] == out["floor_work"]
     # What the reason offers does get past it: a reset holds its first sync to the checkpoint's work.
     tip = CP2 + 5 + CACHE_MIN_DEPTH
     two = [headers_cmds.OperatorSource(k, _operator(tip, HEADERS2)) for k in ("operator:a", "operator:b")]
@@ -838,6 +847,125 @@ def test_the_sync_floor_rises_with_the_cached_median(monkeypatch, tmp_path) -> N
     head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml"), "--json"]
     r = CliRunner().invoke(cli, [*head, "headers", "sync", "--reset"])
     assert r.exit_code == 0 and json.loads(r.output)["cached_to"] == CP2 + 5
+
+
+def test_advice_rerun_when_the_added_headers_move_the_floor(monkeypatch, tmp_path) -> None:
+    """The re-run branch. The headers a stopped sync adds move the median, so a plain re-run can pass
+    the header the first sync stopped at. Real headers 460,564..460,569 with a divisor of 1.0065 (a
+    test-scale ratio; see the module docstring): the cache holds 460,564..460,566; a sync adds
+    460,567 and stops at 460,568; the next floor (computed exactly, not as a power of two) admits it."""
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1.0065)
+    _patch_table(monkeypatch, START)
+    ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
+    r, out = _sync(monkeypatch, tmp_path, ops(START + 2))
+    assert r.exit_code == 0 and out["cached_to"] == START + 2
+    r, out = _sync(monkeypatch, tmp_path, ops(TOP))
+    assert r.exit_code == 6 and out["state"] == "stopped" and out["stopped_at"] == 460568, out
+    assert out["added"] == 1 and out["advice"] == "rerun"
+    assert out["next_floor_work"] < out["floor_work"] and out["stopped_work"] >= out["next_floor_work"]
+    assert "Re-run `pyrxd headers sync`" in out["stopped"] and "--reset" not in out["stopped"]
+    # And it is true: the plain re-run gets past 460,568.
+    r, again = _sync(monkeypatch, tmp_path, ops(TOP))
+    assert again["cached_to"] >= 460569, again
+
+
+def test_advice_upgrade_when_nothing_this_release_can_use_admits_the_header(monkeypatch, tmp_path) -> None:
+    """The upgrade branch. Divisor 1, checkpoint 460,566 (the most work of the stretch): 460,567 is
+    below the checkpoint's own floor, so neither a re-run nor a reset can cache it."""
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    _patch_table(monkeypatch, 460566)
+    r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
+    assert r.exit_code == 6 and out["state"] == "stopped" and out["advice"] == "upgrade"
+    assert out["stopped_at"] == 460567 and out["stopped_work"] < out["floor_work"]
+    assert "Only a newer pyrxd release can get past this header" in out["stopped"]
+    assert "gets past it" not in out["stopped"] and "Re-run" not in out["stopped"]
+    # And it is true: a reset stops at the same header.
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml"), "--json"]
+    two = [headers_cmds.OperatorSource(k, _operator(DEEP)) for k in ("operator:a", "operator:b")]
+    monkeypatch.setattr(headers_cmds, "operator_sources", lambda ctx: two)
+    reset = json.loads(CliRunner().invoke(cli, [*head, "headers", "sync", "--reset"]).output)
+    assert reset["state"] == "stopped" and reset["stopped_at"] == 460567 and reset["advice"] == "upgrade"
+
+
+# ── a reset never destroys a longer good cache ──────────────────────────────────────────────
+
+
+def _reset(monkeypatch, tmp_path, tip: int, headers: dict[int, bytes] | None = None):
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml"), "--json"]
+    two = [headers_cmds.OperatorSource(k, _operator(tip, headers)) for k in ("operator:a", "operator:b")]
+    monkeypatch.setattr(headers_cmds, "operator_sources", lambda ctx: two)
+    r = CliRunner().invoke(cli, [*head, "headers", "sync", "--reset"])
+    return r, json.loads(r.output)
+
+
+def test_a_stopped_reset_keeps_the_existing_cache(monkeypatch, tmp_path) -> None:
+    """The review's case: a store reaching 460,580, and a reset whose floor stops it at 460,567. The
+    reset is not saved: the file on disk is byte for byte what it was. (With divisor 1 the store's
+    own re-read sees only 460,566 of it, which is what the message reports; the file is untouched.)"""
+    _patch_table(monkeypatch, 460566)
+    _store(460566, TOP)
+    before = header_store.store_path("mainnet").read_bytes()
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    r, out = _reset(monkeypatch, tmp_path, DEEP)
+    assert r.exit_code == 6 and out["state"] == "stopped" and out["added"] == 0
+    assert "was kept unchanged" in out["stopped"]
+    assert header_store.store_path("mainnet").read_bytes() == before
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 16)
+    assert _cached(460566).top == TOP  # type: ignore[union-attr]
+
+
+def test_a_reset_that_agrees_and_ends_lower_keeps_the_existing_cache(monkeypatch, tmp_path) -> None:
+    _patch_table(monkeypatch, START)
+    _store(START, TOP)
+    r, out = _reset(monkeypatch, tmp_path, 460570 + CACHE_MIN_DEPTH)
+    assert r.exit_code == 0 and out["state"] == "up to date" and "the existing cache was kept" in out["reason"]
+    assert out["cached_to"] == TOP and _cached(START).top == TOP  # type: ignore[union-attr]
+    # Honest pair: a reset that reaches past the top replaces it (here, with the same headers).
+    r, out = _reset(monkeypatch, tmp_path, DEEP)
+    assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == TOP
+
+
+def test_a_reset_refused_by_the_operators_keeps_the_existing_cache(monkeypatch, tmp_path) -> None:
+    """Operators that serve a lie (here, a failed proof-of-work) refuse the reset; nothing is written."""
+    _patch_table(monkeypatch, START)
+    _store(START, TOP)
+    r, out = _reset(monkeypatch, tmp_path, DEEP, _lie(460570, _renonced(HEADERS[460570])))
+    assert r.exit_code == 2 and out["state"] == "refused"
+    assert _cached(START).headers == tuple(HEADERS[h] for h in range(START, TOP + 1))  # type: ignore[union-attr]
+
+
+def test_a_write_refusal_and_a_write_failure_say_different_things(monkeypatch, tmp_path) -> None:
+    _patch_table(monkeypatch, START)
+    ops = {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)}
+
+    def raced(*a, **kw):
+        raise header_store.AppendOnlyRefusal("the cache on disk already reaches block 460590, past this sync's 460580")
+
+    monkeypatch.setattr(header_store, "save", raced)
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
+    sources = [headers_cmds.OperatorSource(k, c) for k, c in ops.items()]
+    monkeypatch.setattr(headers_cmds, "operator_sources", lambda ctx: sources)
+    r = CliRunner().invoke(cli, [*head, "headers", "sync"])
+    assert r.exit_code == 1 and "another `pyrxd headers sync` wrote the cache" in _flat(r.output)
+    assert "writable" not in r.output
+
+    def full(*a, **kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(header_store, "save", full)
+    sources = [headers_cmds.OperatorSource(k, _operator(DEEP)) for k in ops]
+    monkeypatch.setattr(headers_cmds, "operator_sources", lambda ctx: sources)
+    r = CliRunner().invoke(cli, [*head, "headers", "sync"])
+    assert r.exit_code == 1 and "is writable and has free space" in _flat(r.output)
+    assert "another `pyrxd headers sync`" not in r.output
+
+
+def test_sync_records_accumulate_on_disk(tmp_path) -> None:
+    """Each save appends its record to the records read from the file under the lock."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460570), table=_table(START), record={"to": 460570}, path=path)
+    header_store.save(_chain(START, TOP), table=_table(START), record={"to": TOP}, path=path)
+    assert header_store.load("mainnet", _table(START), path=path).syncs == ({"to": 460570}, {"to": TOP})
 
 
 def test_a_sync_does_not_raise_its_own_bar_one_header_per_request(monkeypatch, tmp_path) -> None:

@@ -19,11 +19,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     also be at least 288 blocks below the lowest tip they reported, link hash by hash back to the
     shipped checkpoint, and meet its own proof-of-work and the floor.
   - A refusal (too few operators, a disagreement, a broken link, a failed proof-of-work) writes
-    nothing. A header below the floor STOPS the sync: the headers below it are written, and the
-    reason names the remedies, a newer pyrxd or `pyrxd headers sync --reset`. Both exit 2.
-    `--json` prints the status.
-  - `--reset` rebuilds the cache from the shipped checkpoint. The old cache is replaced only if the
-    rebuild succeeds.
+    nothing and exits 2. A header below the floor STOPS the sync (exit 6, a new code): the headers
+    below it are written. The reason says what gets past that header, computed from the cache the
+    sync leaves: a plain re-run, `pyrxd headers sync --reset`, or only a newer pyrxd release. A
+    local cache that cannot be written exits 1. `--json` prints the status.
+  - `--reset` rebuilds the cache from the shipped checkpoint. It replaces the old cache only when
+    the rebuild finishes without a stop and either disagrees with the old cache or reaches past its
+    top; otherwise the old cache is kept unchanged.
   - `pyrxd verify` links from the newest cached header at or below the range it needs, with the
     same 4,032 cap. So does `pyrxd verify --wave-name`, through the same lookup. Its claim names
     the anchor it used: a shipped checkpoint, or a cached header and the shipped checkpoint the

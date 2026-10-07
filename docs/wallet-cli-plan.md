@@ -235,9 +235,12 @@ Skip with `--yes`. With `--json` (machine-readable mode), `--yes` is **required*
 
 ```
 0   success
-1   user-error (bad input, file not found, insufficient funds, missing --yes in JSON mode)
+1   user-error (bad input, file not found, insufficient funds, missing --yes in JSON mode;
+    in `pyrxd headers sync`, also a local header cache that could not be written)
 2   network error (couldn't reach ElectrumX, broadcast rejected; in `pyrxd verify`, also a
-    server whose own block proof contradicts the height it reported for the mark)
+    server whose own block proof contradicts the height it reported for the mark; in
+    `pyrxd headers sync`, also servers whose answers refused the sync: too few operators,
+    a disagreement, a header that fails a check)
 3   wallet decryption failed
 4   unexpected error (bug — should not happen)
 5   a verdict that does not hold (`pyrxd verify`): no single HashMark record in the
@@ -247,6 +250,8 @@ Skip with `--yes`. With `--json` (machine-readable mode), `--yes` is **required*
     question that was asked and could not be answered (`--wave-name` NOT ESTABLISHED, or a
     `--file`/`--digest` with CANNOT COMPARE because the record is one this build cannot read).
     The full report is still printed on stdout; only the status says no.
+6   `pyrxd headers sync` stopped at a header below its floor. The status is still printed;
+    its reason says what gets past that header (a re-run, `--reset`, or only a newer release).
 ```
 
 ## Configuration
