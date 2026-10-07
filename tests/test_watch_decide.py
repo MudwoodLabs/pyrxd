@@ -833,13 +833,31 @@ def _signed_tx_hex(terms: NegotiatedTerms) -> str:
     ).tx_hex
 
 
-def test_an_interrupted_btc_fund_pages_the_operator_to_resume():
-    terms = _btc_terms()
-    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=_signed_tx_hex(terms))
-    d = _decide(rec, Observations(maker_has_claimed_btc=False, now_rxd_height=150))
+def _pending(terms=None):
+    terms = terms or _btc_terms()
+    return SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=_signed_tx_hex(terms))
+
+
+@pytest.mark.parametrize("confs", [1, 6])
+def test_a_pending_fund_confirmed_on_chain_pages_the_operator_to_resume(confs):
+    rec = _pending()
+    obs = Observations(maker_has_claimed_btc=False, now_rxd_height=150, pending_btc_funding_confirmations=confs)
+    d = _decide(rec, obs)
     assert d.intent is Intent.PAGE_RESUME_FUND
-    assert rec.pending_btc_funding_txid in d.reason
+    assert rec.pending_btc_funding_txid in d.reason and "ON CHAIN" in d.reason
     assert d.recommended_action == "resume_interrupted_fund"
+
+
+def test_a_pending_fund_not_yet_on_chain_only_watches():
+    """A healthy fund keeps the pending tx on its record until the lock lands: no page while nothing
+    confirmed is at risk (review round 2: the earlier page fired on every healthy fund)."""
+    obs = Observations(maker_has_claimed_btc=False, now_rxd_height=150, pending_btc_funding_confirmations=0)
+    assert _decide(_pending(), obs).intent is Intent.WATCH
+
+
+def test_a_pending_fund_of_unread_depth_pages_because_it_cannot_be_shown_safe():
+    d = _decide(_pending(), Observations(maker_has_claimed_btc=False, now_rxd_height=150))
+    assert d.intent is Intent.PAGE_RESUME_FUND and "UNREAD" in d.reason
 
 
 def test_a_healthy_negotiated_swap_is_still_not_paged():
@@ -858,10 +876,10 @@ def test_every_page_intent_is_routed_and_has_a_severity():
     assert pages <= set(alerts._SEVERITY)
 
 
-def test_the_resume_page_is_a_warning_because_it_cannot_tell_running_from_interrupted():
-    """The pending field is on disk for the whole of a HEALTHY fund too (recorded before the broadcast,
-    cleared when the lock lands — up to the leg's fund_confirm_timeout_s). A CRITICAL page would fire on
-    every normal fund."""
+def test_the_resume_page_is_critical_so_it_re_pages_until_acknowledged():
+    """It fires only once the pending funding tx is ON CHAIN under a NEGOTIATED record (or unreadable):
+    real BTC nothing tracks. A WARN pages once and never again (review round 2 measured 1 page in 50
+    ticks), and that one page could land before the fund was ever interrupted."""
     from pyrxd.gravity.watch import alerts
 
-    assert alerts._SEVERITY[Intent.PAGE_RESUME_FUND] is alerts.Severity.WARN
+    assert alerts._SEVERITY[Intent.PAGE_RESUME_FUND] is alerts.Severity.CRITICAL

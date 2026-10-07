@@ -507,3 +507,41 @@ async def test_eth_observation_to_decide_pages_the_overdue_counter_leg_refund():
 def test_chain_observer_rejects_a_non_callable_clock():
     with pytest.raises(ValidationError):
         ChainObserver(eth=FakeEth(EthClaimStatus(claimed=False, claim_tx_hash=None), None), rxd=FakeRxd(tip=1), clock=5)
+
+
+# --- an interrupted BTC fund: the observer reads the PENDING funding tx's depth ------------------
+
+
+class _FakeBtcWithFunding(FakeBtc):
+    def __init__(self, funding_confs):
+        super().__init__(BtcClaimStatus(claimed=False))
+        self._funding = funding_confs
+        self.funding_calls: list[str] = []
+
+    async def funding_confirmations(self, funding_txid):
+        self.funding_calls.append(funding_txid)
+        return self._funding
+
+
+def _pending_record():
+    import dataclasses
+
+    from tests.test_watch_decide import _signed_tx_hex
+
+    rec = _record(state=SwapState.NEGOTIATED, with_locator=False, with_covenant=False)
+    return dataclasses.replace(rec, pending_btc_funding_tx=_signed_tx_hex(rec.terms))
+
+
+async def test_the_observer_reads_the_depth_of_a_pending_funding_tx():
+    rec = _pending_record()
+    btc = _FakeBtcWithFunding(funding_confs=3)
+    obs = await ChainObserver(btc=btc, rxd=FakeRxd(tip=200)).observe("s", rec)
+    assert btc.funding_calls == [rec.pending_btc_funding_txid]
+    assert obs.pending_btc_funding_confirmations == 3
+
+
+async def test_a_negotiated_record_without_a_pending_fund_reads_nothing_extra():
+    btc = _FakeBtcWithFunding(funding_confs=3)
+    rec = _record(state=SwapState.NEGOTIATED, with_locator=False, with_covenant=False)
+    obs = await ChainObserver(btc=btc, rxd=FakeRxd(tip=200)).observe("s", rec)
+    assert btc.funding_calls == [] and obs.pending_btc_funding_confirmations is None

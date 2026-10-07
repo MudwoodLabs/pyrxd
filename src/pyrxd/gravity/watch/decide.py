@@ -64,11 +64,11 @@ class Intent(Enum):
     * ``PAGE_SQUEEZED`` — a decision is required (gate SQUEEZED / ASSET_VULNERABLE,
       or finality un-assessable): winner-take-all claim vs accept loss. Never
       auto-resolved in v1.
-    * ``PAGE_RESUME_FUND`` — the record carries a BTC funding transaction that is not yet the lock
-      (``record.pending_btc_funding_tx``). The record cannot say whether a fund is still RUNNING
-      (it is recorded before the broadcast and cleared when the lock lands, which can take as long as
-      ``fund_confirm_timeout_s``) or was interrupted, so this is a WARN, not CRITICAL. If no fund
-      process is running, the BTC may be on chain untracked: run the taker's fund step again
+    * ``PAGE_RESUME_FUND`` — the record's PENDING BTC funding transaction (``record.pending_btc_funding_tx``)
+      is confirmed on chain (or its depth could not be read) while the record is still NEGOTIATED: the
+      BTC is locked and nothing tracks it. A pending transaction NOT yet on chain is a fund still running
+      (or one that never left) and only WATCHes — the record alone cannot tell running from interrupted,
+      but the chain can tell whether anything is at risk. Run the taker's fund step again
       (``resume_interrupted_fund``).
     * ``RETIRE`` — the swap reached a terminal state; stop watching it.
     * ``NOOP`` — an unsupported counter_chain (BTC and ETH are both handled).
@@ -126,6 +126,12 @@ class Observations:
     # pre-existing caller) keeps that branch fail-closed to WATCH — exactly as the BTC branch
     # watches on an unread funding depth — so an absent clock can never manufacture a page.
     now_unix_s: Seconds | None = None
+    # Depth of the record's PENDING BTC funding transaction (``record.pending_btc_funding_tx``): read
+    # only for a NEGOTIATED record that carries one. 0 = recorded but not on chain (a fund still
+    # running, or one that never left) — nothing confirmed is at risk; >= 1 = the BTC is on chain under
+    # a NEGOTIATED record, i.e. untracked unless a running fund records it within moments; ``None`` =
+    # unread, which cannot be shown safe.
+    pending_btc_funding_confirmations: Confirmations | None = None
     low_corroboration: bool = False
 
     def __post_init__(self) -> None:
@@ -138,6 +144,7 @@ class Observations:
             ("btc_claim_confirmations", self.btc_claim_confirmations),
             ("btc_funding_confirmations", self.btc_funding_confirmations),
             ("now_unix_s", self.now_unix_s),
+            ("pending_btc_funding_confirmations", self.pending_btc_funding_confirmations),
         ):
             if val is not None and (not isinstance(val, int) or isinstance(val, bool) or val < 0):
                 raise ValidationError(f"Observations.{label} must be a non-negative int or None")
@@ -589,14 +596,28 @@ def decide(
 
     # 3e. An INTERRUPTED fund: the funding transaction was recorded before its broadcast and the fund
     #     never completed, so BTC may be on chain under this NEGOTIATED record with nothing tracking it.
+    if state is SwapState.NEGOTIATED and record.pending_btc_funding_tx and obs.pending_btc_funding_confirmations == 0:
+        return Decision(
+            Intent.WATCH,
+            reason=(
+                f"BTC funding transaction {record.pending_btc_funding_txid} recorded, not yet on chain "
+                "(a fund in progress, or one that never left) — nothing confirmed is at risk"
+            ),
+            low_corroboration=corr,
+        )
     if state is SwapState.NEGOTIATED and record.pending_btc_funding_tx:
         return Decision(
             Intent.PAGE_RESUME_FUND,
             reason=(
-                f"BTC fund in progress or interrupted: funding transaction {record.pending_btc_funding_txid} "
-                "is recorded but not yet the lock, and may already be on chain. If NO fund process is running "
-                "for this swap, run the taker's fund step again (it records the lock once confirmed, or "
-                "re-sends the same bytes if the gate passes)."
+                f"BTC funding transaction {record.pending_btc_funding_txid} is "
+                + (
+                    f"ON CHAIN ({obs.pending_btc_funding_confirmations} conf)"
+                    if obs.pending_btc_funding_confirmations is not None
+                    else "of UNREAD depth"
+                )
+                + " but the record is still NEGOTIATED, so nothing tracks it and a maker claim with p would go "
+                "unobserved. Run the taker's fund step again to record the lock (a fund process still running "
+                "records it within moments of the first confirmation)."
             ),
             recommended_action="resume_interrupted_fund",
             low_corroboration=corr,

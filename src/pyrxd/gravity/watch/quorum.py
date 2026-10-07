@@ -268,12 +268,19 @@ class ChainObserver(Observer):
             # autonomous refund on funding >= t_btc; a None here keeps decide() fail-closed.
             if record.state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
                 funding_confs = await self._btc.funding_confirmations(locator.funding_outpoint.txid)
+        # An interrupted fund leaves its funding tx on a NEGOTIATED record with no locator; its depth is
+        # what tells decide() whether real BTC is on chain untracked (>= 1) or nothing is at risk (0).
+        pending_confs: Confirmations | None = None
+        pending_txid = record.pending_btc_funding_txid
+        if pending_txid is not None and record.state is SwapState.NEGOTIATED:
+            pending_confs = await self._btc.funding_confirmations(pending_txid)
         return Observations(
             maker_has_claimed_btc=maker_claimed,
             now_rxd_height=tip,
             asset_locked_at_height=asset_locked,
             btc_claim_confirmations=btc_confs,
             btc_funding_confirmations=funding_confs,
+            pending_btc_funding_confirmations=pending_confs,
             low_corroboration=low_corr,
         )
 

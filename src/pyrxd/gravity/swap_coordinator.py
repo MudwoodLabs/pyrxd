@@ -2838,9 +2838,15 @@ class SwapCoordinator:
                 rec = await self._record_counter_lock(terms, landed)
                 # Best effort: a seen-store that lost H (restored backup, rotated store) would accept a
                 # later swap under it. The lock is already recorded; a failing store must not undo that.
-                with contextlib.suppress(Exception):
+                try:
                     if not self.seen_store.has_seen(terms.hashlock):
                         self.seen_store.reserve(terms.hashlock)
+                except Exception as exc:  # the lock is recorded; say so rather than undo it
+                    logger.warning(
+                        "recorded the BTC lock but could not re-reserve its hashlock in the seen-store (%s); "
+                        "a later swap under the same H would not be refused until it is reserved",
+                        exc,
+                    )
                 return rec
             # Not proven on chain: what follows may RE-SEND the bytes, so the reservation this record
             # claims must still hold.
@@ -3679,9 +3685,9 @@ class SwapCoordinator:
                 if isinstance(exc, DefinitiveFundRefusal):
                     raise DefinitiveFundRefusal(
                         f"BTC resume refused definitively: {exc}. The recorded funding transaction {txid} is "
-                        "NOT re-sent, and a resume will refuse again for the same reason. If it was already "
-                        "broadcast it may still confirm — a resume then records it as the lock with no gate; "
-                        "if it never left, the taker's UTXO is unspent and this swap cannot be funded."
+                        "NOT re-sent. If it was already broadcast it may still confirm — a resume then records "
+                        "it as the lock with no gate. If it never left, the taker's UTXO is unspent, and the "
+                        "gate will keep refusing the re-send unless what it refused on changes."
                     ) from exc
                 raise ValidationError(
                     f"BTC resume did not complete: {exc}. The record still carries funding transaction {txid} "
