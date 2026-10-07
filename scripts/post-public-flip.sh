@@ -76,6 +76,8 @@ gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
     "strict": true,
     "checks": [
       {"context": "test (3.12)", "app_id": 15368},
+      {"context": "test (3.11)", "app_id": 15368},
+      {"context": "test (3.10)", "app_id": 15368},
       {"context": "lint", "app_id": 15368},
       {"context": "Scan for leaked secrets", "app_id": 15368},
       {"context": "Analyze (Python)", "app_id": 15368},
