@@ -1,6 +1,6 @@
 """A pull request into ANY base branch must get the checks a pull request into main gets.
 
-Branch protection requires six status checks on `main` (`_REQUIRED_CHECKS` below; the
+Branch protection requires eight status checks on `main` (`_REQUIRED_CHECKS` below; the
 count is checked against it). It requires nothing on any other branch. Until this file
 existed, seven workflows (ci, lint, codeql, docs, osv-scanner, trufflehog, integration) also
 filtered their `pull_request` trigger with `branches: [main]` or `branches: [main, dev]`. So a
@@ -67,10 +67,13 @@ _BASE_FILTER_EXEMPTIONS: dict[str, str] = {}
 #: read branch protection. Read 2026-09-22, and again 2026-09-23 after `leak-scan` was added, with
 #: `gh api repos/MudwoodLabs/pyrxd/branches/main/protection --jq .required_status_checks.contexts`,
 #: and again 2026-09-25: the same six, each now bound to the GitHub Actions app (app_id 15368).
+#: 2026-10-07: `test (3.11)` and `test (3.10)` added (app_id 15368); eight in all.
 #: The workflow that produces each one is NOT written here; it is derived from the workflows' job
 #: names, so a renamed job fails this file rather than silently leaving a check unguarded.
 _REQUIRED_CHECKS = (
     "test (3.12)",
+    "test (3.11)",  # added to branch protection 2026-10-07
+    "test (3.10)",  # added to branch protection 2026-10-07
     "lint",
     "Scan for leaked secrets",
     "Analyze (Python)",
@@ -274,7 +277,8 @@ _GITHUB_ACTIONS_APP_ID = 15368
 #: The WHOLE branch-protection document the script PUTs, as it must be to reproduce the live
 #: rules exactly. REVIEWED, not derived (CI cannot read branch protection): compared field by
 #: field with `gh api repos/MudwoodLabs/pyrxd/branches/main/protection`, read 2026-09-25 after
-#: required signatures were switched off. The check list is built from `_REQUIRED_CHECKS`, so the
+#: required signatures were switched off, and again 2026-10-07 after the two test checks were added
+#: (every other field unchanged). The check list is built from `_REQUIRED_CHECKS`, so the
 #: two reviewed copies in this file cannot disagree with each other.
 _LIVE_PROTECTION: dict[str, Any] = {
     "required_status_checks": {

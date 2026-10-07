@@ -394,11 +394,15 @@ jobs:
         run: pip install -r ci/poetry-pin.txt --require-hashes
       - name: Install dependencies
         run: poetry install --sync --no-interaction
-      # anvil for the ETH leg. Foundry's own installer action, hash-pinned.
+      # anvil for the ETH leg. Foundry's own installer action, hash-pinned. The action pins only
+      # the installer: `version` picks the anvil binary, and `stable` let it float (1.7.x to 1.8.4
+      # changed when a sent tx's state becomes readable, and the ERC-20 lifecycle step failed every
+      # night until #840). Bump it in its own PR, and dispatch this workflow on that branch before
+      # merging: the lifecycle step runs only nightly or on dispatch.
       - name: Install Foundry (anvil)
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
-          version: stable
+          version: v1.8.5
       - name: BTC↔RXD HTLC, both chains, one coordinator
         env:
           XCHAIN_REGTEST: "1"
