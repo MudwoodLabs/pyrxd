@@ -10,11 +10,11 @@
 #
 # NO `paths:` filter and NO `branches:` filter on pull_request, deliberately: a filter is a way for
 # a change to reach main without this check having run on it (a docs-only PR that also touches a
-# fixture, a stacked PR into a non-main base). tests/test_ci_workflows_check_every_pr_base.py
-# enforces both: its base-branch rule covers every workflow, and this job's check name is listed in
-# that file's _GUARDED_NOT_YET_REQUIRED, so `test_every_required_check_runs_on_every_pull_request`
-# also fails on a `paths:`/`paths-ignore:` filter here or on a renamed job. Branch protection does
-# not require the check (yet).
+# fixture, a stacked PR into a non-main base). `counter-leg artifacts rebuild` is a REQUIRED check
+# on main (branch protection, since 2026-10-07), and tests/test_ci_workflows_check_every_pr_base.py
+# lists it in _REQUIRED_CHECKS: `test_every_required_check_runs_on_every_pull_request` fails on a
+# `branches:`, `paths:` or `paths-ignore:` filter here or on a renamed job, and the protection
+# payload in scripts/post-public-flip.sh is pinned to the same list.
 # It is cheap: one checkout, one ~15 MB download, two compiles. Stdlib Python only, so no install.
 
 name: counter-leg-artifacts
