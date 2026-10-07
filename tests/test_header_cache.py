@@ -1235,3 +1235,29 @@ def test_a_completed_reset_that_agrees_and_is_shorter_does_not_replace(monkeypat
     r, out = _reset(monkeypatch, tmp_path, 460569 + CACHE_MIN_DEPTH)
     assert r.exit_code == 0 and out["state"] == "up to date" and "kept" in out["reason"]
     assert header_store.store_path("mainnet").read_bytes() == before
+
+
+def test_a_stopped_reset_that_disagrees_and_reaches_past_the_top_replaces_the_store(monkeypatch, tmp_path) -> None:
+    """A store on an abandoned branch (real 460,564..460,567, then two branch headers to 460,569),
+    and a reset that stops at 460,571, past the store's top: it is written, though it disagrees,
+    so the user is not left on the abandoned branch. Divisor 1.015 (exact), so the reset's floor
+    (the checkpoint's alone) admits 460,570 and not 460,571."""
+    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(1015, 1000))
+    _patch_table(monkeypatch, START)
+    branch = _fork_branch()[:2]
+    real = header_cache.verify_radiant_header_pow
+    monkeypatch.setattr(
+        header_cache,
+        "verify_radiant_header_pow",
+        lambda h, **kw: radiant_block_hash(h) if h in branch else real(h, **kw),
+    )
+    chain, stopped = extend_verified_headers(_chain(START, 460567), branch)
+    assert stopped is None and chain.top == 460569
+    header_store.save(chain, table=_table(START))
+    r, out = _reset(monkeypatch, tmp_path, DEEP)
+    assert r.exit_code == 6 and out["state"] == "stopped" and out["stopped_at"] == 460571, out
+    assert out["cached_to"] == 460570 and "kept unchanged" not in out["stopped"]
+    assert out["advice"] in ("rerun", "reset", "upgrade") and out["next_floor_work"] is not None
+    saved = header_store.load("mainnet", _table(START))
+    assert saved.chain.headers == tuple(HEADERS[h] for h in range(START, 460571))  # type: ignore[union-attr]
+    assert saved.syncs[-1].get("reset") is True, "the record of a written stopped reset keeps the flag"

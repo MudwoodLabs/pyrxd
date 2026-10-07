@@ -19,14 +19,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     also be at least 288 blocks below the lowest tip they reported, link hash by hash back to the
     shipped checkpoint, and meet its own proof-of-work and the floor.
   - A refusal (too few operators, a disagreement, a broken link, a failed proof-of-work) writes
-    nothing and exits 2. A header below the floor STOPS the sync (exit 6, a new code): the headers
-    below it are written. The reason says what gets past that header, computed from the cache the
+    nothing and exits 2. A header below the floor STOPS the sync (exit 6, a new code): a plain sync
+    writes the headers below it. The reason says what gets past that header, computed from the cache the
     sync leaves: a plain re-run, `pyrxd headers sync --reset`, or only a newer pyrxd release. A
     local cache that cannot be written exits 1. `--json` prints the status.
   - `--reset` rebuilds the cache from the shipped checkpoint. It replaces the old cache only when
     the rebuild finishes without a stop and either disagrees with the old cache or reaches at least
-    its top. A rebuild that stops is written only when it agrees with the old cache and reaches past
-    its top, as an ordinary sync's extension would be. Otherwise the old cache is kept unchanged.
+    its top. A rebuild that stops is written only when it reaches past the old cache's top, whether
+    it agrees with it or not. Otherwise the old cache is kept unchanged. A rebuild holds every header
+    to the shipped checkpoint's floor alone, as a first sync with no cache does.
   - `pyrxd verify` links from the newest cached header at or below the range it needs, with the
     same 4,032 cap. So does `pyrxd verify --wave-name`, through the same lookup. Its claim names
     the anchor it used: a shipped checkpoint, or a cached header and the shipped checkpoint the

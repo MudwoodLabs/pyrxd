@@ -17,8 +17,9 @@ to ``lowest tip - 288``, where the lowest tip is the lowest any operator reporte
   the floor (:mod:`pyrxd.glyph.header_cache`).
 
 Fewer than two operators, any disagreement, a broken link or a failed proof-of-work refuses the
-sync and writes nothing. A header below the floor ends the sync there; the agreed headers below
-it are cached and the reason is reported.
+sync and writes nothing. A header below the floor ends the sync there; a plain sync caches the
+agreed headers below it, a ``--reset`` only when they reach past the existing cache's top, and the
+reason is reported.
 """
 
 from __future__ import annotations
@@ -128,17 +129,19 @@ async def sync_headers(
 
     * ``"synced"``: headers were added and written;
     * ``"up to date"``: nothing new was deep enough, or a reset was not needed (``reason`` says which);
-    * ``"stopped"``: a header below the floor ended the sync; the agreed headers under it were written
-      when there were any, ``stopped`` says why, and ``advice`` (``"rerun"``, ``"reset"`` or
-      ``"upgrade"``) is what the cache on disk admits next; ``exit_code`` 6;
+    * ``"stopped"``: a header below the floor ended the sync. A plain sync writes the agreed headers
+      under it, when there are any; a reset writes them only when they reach past the existing
+      cache's top (see below). ``stopped`` says why and what was kept, and ``advice`` (``"rerun"``,
+      ``"reset"`` or ``"upgrade"``) is what the cache on disk admits next; ``exit_code`` 6;
     * ``"refused"``: nothing was written; ``reason`` and ``fix`` say why; ``exit_code`` 2 for the
       servers' answers, 1 for a store that could not be written (``advice`` is then ``None``).
 
     *reset* rebuilds the cache from the newest shipped checkpoint instead of extending it, under the
-    same rules. It is written when it finishes without a stop and either disagrees with the store at
-    a height both hold or reaches at least the store's top; a STOPPED reset is written only when the
-    ordinary append rule accepts it (it agrees with the store and reaches past its top). Otherwise
-    the store is kept unchanged."""
+    same rules, holding every header to the shipped checkpoint's floor alone (as a first sync with no
+    cache does). It is written when it finishes without a stop and either disagrees with the store
+    at a height both hold or reaches at least the store's top; a STOPPED reset is written only when
+    it reaches past the store's top, whether it agrees with it or not. Otherwise the store is kept
+    unchanged."""
     table, shipped_header = _shipped(network)
     loaded = header_store.load(network, table, path=path)
     report: dict[str, Any] = {
@@ -242,6 +245,7 @@ async def sync_headers(
             return refuse(f"the sync could not complete: {_err(exc, scrub)}")
 
     old = loaded.chain
+    stopped_reset_saved = False
     report["added"] = chain.top - old_top
     report["cached_from"], report["cached_to"] = chain.base_height, chain.top
     advice_text = ""
@@ -249,13 +253,10 @@ async def sync_headers(
         report["exit_code"] = EXIT_SYNC_STOPPED
         report["stopped"] += f" (this sync's floor was {floor}, fixed when it began)."
     if reset and report["stopped"]:
-        # A STOPPED RESET is saved only when the ORDINARY save rule would accept it: it agrees with
-        # the existing cache at every height both hold and reaches past its top (a plain extension),
-        # or there is no existing cache. Otherwise it is never saved, and the existing cache stays.
-        agrees = old is None or all(
-            old.header_at(x) == chain.header_at(x) for x in range(old.base_height, min(old.top, chain.top) + 1)
-        )
-        if old is not None and not (agrees and chain.top > old.top):
+        # A STOPPED RESET is saved iff it reaches PAST the existing cache's top (or there is none),
+        # whether it agrees with it (an extension) or not (a replacement: the existing cache may be on
+        # an abandoned branch). A stopped reset that is not longer is never saved.
+        if old is not None and chain.top <= old.top:
             report["advice"] = "upgrade"
             report["stopped"] += (
                 f" A reset holds headers to 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped checkpoint's work, which this "
@@ -265,7 +266,7 @@ async def sync_headers(
             report["state"], report["added"] = "stopped", 0
             report["cached_from"], report["cached_to"] = old.base_height, old.top
             return report
-        reset = False  # saved as the plain extension it is, under the ordinary append-only rule
+        stopped_reset_saved = True
         report["added"] = chain.top - (old.top if old is not None else old_top)
     if report["stopped"]:
         # COMPUTED, not assumed: what the cache this sync leaves admits next time. Stated only once
@@ -319,7 +320,9 @@ async def sync_headers(
         report["advice"] = report["next_floor_work"] = None
 
     try:
-        header_store.save(chain, table=table, record=record, path=loaded.path, reset=reset)
+        header_store.save(
+            chain, table=table, record=record, path=loaded.path, reset=reset, past_top_only=stopped_reset_saved
+        )
     except header_store.ResetKeptExisting as exc:
         unchanged()
         report["state"], report["reason"] = "up to date", str(exc)
@@ -375,7 +378,8 @@ def headers_group() -> None:
     help="Rebuild the cache from the newest shipped checkpoint instead of extending it (for a cache "
     "left on a branch Radiant has abandoned). The old cache is replaced only when the rebuild finishes "
     "without a stop and either disagrees with it or reaches at least its top, or when a stopped rebuild "
-    "agrees with it and reaches past its top; otherwise it is kept.",
+    "reaches past its top; otherwise it is kept. A rebuild holds headers to the shipped checkpoint's "
+    "floor alone, as a first sync with no cache does.",
 )
 @click.pass_obj
 def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
@@ -386,9 +390,10 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     blocks below the lowest tip they reported, it links hash by hash to the header below it back
     to the newest checkpoint pyrxd ships, and it meets its own proof-of-work and the floor (never
     below 1/16 of that checkpoint's work). A refusal (too few operators, a disagreement, a broken
-    link, a failed proof-of-work) writes nothing. A header below the floor STOPS the sync: the
-    headers below it are written, and the reason says what gets past it, computed from the cache
-    the sync leaves. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot
+    link, a failed proof-of-work) writes nothing. A header below the floor STOPS the sync: a plain
+    sync writes the headers below it, a --reset only when they reach past the existing cache's top,
+    and the reason says what was kept and what gets past that header, computed from the cache on
+    disk afterwards. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot
     be written, 6 when a header below the floor stopped it.
     """
     from .swap_recovery import electrumx_urls

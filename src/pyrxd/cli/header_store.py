@@ -13,8 +13,8 @@ them. Three rules:
   above its top, or rebase onto a newer shipped checkpoint (dropping headers below it, which the
   shipped table then covers). :func:`save` refuses anything else, except a ``--reset`` rebuild that
   finished without a stop and either disagrees with the store or reaches at least its top: a reset
-  never only shortens a good cache. A stopped reset reaches :func:`save` only as an ordinary
-  extension (it agrees with the store and reaches past its top), and a refused one never does.
+  never only shortens a good cache. A stopped reset is written only when it reaches past the
+  store's top (agreeing or not), and a refused one never reaches :func:`save`.
   The check and the replace run under one advisory lock (POSIX).
 """
 
@@ -166,6 +166,7 @@ def save(
     record: Mapping[str, Any] | None = None,
     path: Path | None = None,
     reset: bool = False,
+    past_top_only: bool = False,
 ) -> Path:
     """Write *chain* atomically under the store's lock; *record* is appended to the sync records
     read from the file under that same lock, so a concurrent sync's record is never lost.
@@ -175,7 +176,8 @@ def save(
 
     With *reset* (``pyrxd headers sync --reset``, and only that, after a rebuild that finished
     without a stop): the store is replaced, unless *chain* agrees with it at every height both hold
-    and ends below its top, which raises :class:`ResetKeptExisting` and keeps it.
+    and ends below its top, which raises :class:`ResetKeptExisting` and keeps it. *past_top_only*
+    (a reset that STOPPED) also keeps it unless *chain* reaches past its top, checked under the lock.
     """
     where = path or store_path(chain.network)
     where.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -188,6 +190,11 @@ def save(
             lo, hi = max(old.base_height, chain.base_height), min(old.top, chain.top)
             differs = next((h for h in range(lo, hi + 1) if old.header_at(h) != chain.header_at(h)), None)
             if reset:
+                if past_top_only and chain.top <= old.top:
+                    raise ResetKeptExisting(
+                        f"the stopped rebuild ends at block {chain.top}, not past the existing cache's top "
+                        f"({old.top}); the existing cache was kept"
+                    )
                 if differs is None and chain.top < old.top:
                     raise ResetKeptExisting(
                         f"the rebuild agrees with the existing cache and ends at block {chain.top}, below its top "
