@@ -1,6 +1,6 @@
 {
-  "_source": "Erc20Htlc.sol (MudwoodLabs/pyrxd-eth-htlc branch spike/erc20-htlc:contracts/src/Erc20Htlc.sol)",
-  "_compiler": "forge/solc 0.8.24",
+  "_source": "MudwoodLabs/pyrxd-eth-htlc@7b7d005e9148a8ffd88b1a2e36b0e36450e0e40a:contracts/src/Erc20Htlc.sol",
+  "_compiler": "forge (solc 0.8.24+commit.e11b9ed9), optimizer enabled runs=200, evmVersion cancun, remappings [forge-std/=lib/forge-std/src/], source unit src/Erc20Htlc.sol: `forge build` run in contracts/ under that commit's foundry.toml.",
   "_note": "Per-swap ERC-20 HTLC. Funded by a plain token transfer to the CREATE address (no allowance is ever created); claim/refund sweep balanceOf. claim() requires balanceOf >= amount before revealing the preimage. The Claimed(bytes32) event keeps the preimage NON-INDEXED because pyrxd scrapes the secret from the log data.",
   "abi": [
     {
