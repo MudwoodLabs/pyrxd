@@ -116,7 +116,19 @@ def fork_url():
         _rpc_call(url, "anvil_impersonateAccount", [_WHALE])
         _rpc_call(url, "anvil_setBalance", [_WHALE, hex(10**18)])
         transfer = "0xa9059cbb" + _ADDR_TAKER[2:].rjust(64, "0") + hex(_AMOUNT * 10)[2:].rjust(64, "0")
-        _rpc_call(url, "eth_sendTransaction", [{"from": _WHALE, "to": _USDC.address, "data": transfer}])
+        tx_hash = _rpc_call(url, "eth_sendTransaction", [{"from": _WHALE, "to": _USDC.address, "data": transfer}])[
+            "result"
+        ]
+        # A returned hash means accepted, not mined: anvil 1.8.x returns it before the state is
+        # visible (#835). Wait for the receipt, and refuse a revert, which anvil reports only there.
+        for _ in range(600):
+            receipt = _rpc_call(url, "eth_getTransactionReceipt", [tx_hash]).get("result")
+            if receipt is not None:
+                break
+            time.sleep(0.05)
+        else:  # pragma: no cover
+            pytest.fail(f"seeding transfer {tx_hash} was not mined within 30s on the fork")
+        assert int(receipt["status"], 16) == 1, f"seeding transfer {tx_hash} reverted on the fork"
         yield url
     finally:
         proc.terminate()

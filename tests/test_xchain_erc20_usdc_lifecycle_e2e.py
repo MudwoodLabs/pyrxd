@@ -193,7 +193,7 @@ def _rpc(url: str, method: str, params=None):
     # MEASURED 2026-08-25, and it is precisely the limit of this check: anvil does NOT report a
     # reverted `eth_sendTransaction` as an error. It mines the transaction and returns a hash; the
     # revert appears only in the receipt. A failed seeding send is therefore invisible HERE, which
-    # is why `_seed_token` reads the balance back rather than trusting the send.
+    # is why `_send_as` waits for the receipt and `_seed_token` reads the balance back.
     if "error" in body:
         raise RuntimeError(f"{method} failed: {body['error']}")
     return body
@@ -213,13 +213,39 @@ def _word(value) -> str:
     return hex(int(value, 16) if isinstance(value, str) else int(value))[2:].rjust(64, "0")
 
 
+def _wait_receipt(url: str, tx_hash: str, timeout_s: float = 30.0) -> dict:
+    """The mined receipt for `tx_hash`, polling until it exists.
+
+    `eth_sendTransaction` returning a hash means the transaction was ACCEPTED, not that it was mined.
+    anvil 1.7.1 happened to have the transaction's state visible by the time the hash came back, so
+    reading a balance straight after the send worked. anvil 1.8.x does not (#835). MEASURED 2026-10-06
+    on an Ethereum fork, reading the balance immediately after the seeding sends: 0 on anvil 1.8.5 in
+    3 of 3 runs, the seeded amount on 1.7.1 in 3 of 3; with a receipt wait first, both versions seed
+    correctly. CI installs foundry `stable`, which moved to 1.8.x, so every nightly read 0.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        receipt = _rpc(url, "eth_getTransactionReceipt", [tx_hash])["result"]
+        if receipt is not None:
+            return receipt
+        if time.monotonic() > deadline:
+            raise AssertionError(f"transaction {tx_hash} was not mined within {timeout_s:.0f}s on the fork")
+        time.sleep(0.05)
+
+
 def _send_as(url: str, sender: str, to: str, data: str) -> None:
-    """Send `data` to `to` as `sender`, impersonating it and funding its gas first."""
+    """Send `data` to `to` as `sender`, impersonating it and funding its gas first, and WAIT for it
+    to be mined successfully."""
     _rpc(url, "anvil_impersonateAccount", [sender])
     _rpc(url, "anvil_setBalance", [sender, hex(10**18)])
     # No return value is inspected: Tether's `transfer` returns nothing at all, so there is nothing
-    # to inspect. A revert arrives as a JSON-RPC error instead, and `_rpc` raises on those.
-    _rpc(url, "eth_sendTransaction", [{"from": sender, "to": to, "data": data}])
+    # to inspect. A revert does NOT arrive as a JSON-RPC error (see `_rpc`); it shows only as the
+    # receipt's status, so that is what is checked.
+    tx_hash = _rpc(url, "eth_sendTransaction", [{"from": sender, "to": to, "data": data}])["result"]
+    receipt = _wait_receipt(url, tx_hash)
+    assert int(receipt["status"], 16) == 1, (
+        f"seeding send {data[:10]} from {sender} to {to} reverted on the fork (tx {tx_hash})"
+    )
 
 
 def _getter_address(url: str, contract: str, selector: str) -> str | None:
@@ -242,12 +268,16 @@ def _seed_token(url: str, token, holder: str, amount: int) -> None:
     answers that same caller `FiatToken: caller is not a minter`. A chain-keyed seeder is therefore
     wrong for one of the two tokens this fixture parametrises over — and wrong silently.
 
-    The closing balance read is the load-bearing line, and nothing else does its job: anvil mines a
-    reverting send and returns a hash for it (see `_rpc`), so the wrong seeder reports success and
-    moves nothing. Verified by planting exactly that — an L2-bridge mint against native USDC, the
-    shape the previous revision of this fixture used — and watching the send pass while the balance
-    stayed 0. Seeding runs before any assertion, so without this line the shortfall would resurface
+    anvil mines a reverting send and returns a hash for it (see `_rpc`), so the wrong seeder looks
+    like success at the send. Two checks stand behind it: `_send_as` refuses a receipt whose status
+    is not 1, and the closing balance read refuses a send that succeeded but credited `holder` less
+    than `amount`. The balance read was verified by planting an L2-bridge mint against native USDC,
+    the shape an earlier revision of this fixture used, and watching the send pass while the balance
+    stayed 0. Seeding runs before any assertion, so without these the shortfall would resurface
     inside the swap as a transfer that moved less than it should have.
+
+    The balance is read only after every send is MINED (`_wait_receipt`). Read straight after the
+    send, it was 0 on anvil 1.8.x for every token on both forks — the whole of #835.
     """
     bridge = _getter_address(url, token.address, _SEL_L2_BRIDGE)
     master_minter = _getter_address(url, token.address, _SEL_MASTER_MINTER)
