@@ -1151,7 +1151,7 @@ def recover_preimage_from_eth_artifacts(
     It never raises :class:`PreimageNotRevealed`: on ETH, "spent without revealing p" is never
     reached from one RPC's answer.
     """
-    from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+    from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 
     bound = _bound_logs(logs, contract_address)
     if not bound and claim_tx is None:

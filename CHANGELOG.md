@@ -70,6 +70,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   these artifacts. The wheel ships no ETH artifact, so an application that injects its own is
   unaffected.
 
+### Fixed
+
+- **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
+  `Claimed(bytes32)` and `Refunded()` topic0 values were `hashlib.sha3_256` of the event
+  signatures (NIST SHA3-256) rather than Ethereum Keccak-256, so they matched no log the
+  contracts can emit. An honest claim and an honest refund both scored ANOMALOUS ("our contract
+  emitted neither Claimed nor Refunded"), the `eth_getLogs` discovery of an uncited spend never
+  found one (the leg stayed PENDING), and a receipt carrying the bogus topic was scored as a
+  claim. The values had been wrong since the script was added (#273); its `--self-check` built
+  its receipts from the same constants, so it passed regardless. The topics are now computed
+  from the signatures in a new web3-free `pyrxd.eth_wallet.events`, which the watchtower
+  (`eth_adapters`), `swap_recovery` and the script all import, and new tests check them against
+  the ABI and the `PUSH32` operands of both shipped runtimes. The self-check's calldata selectors
+  had the same mistake and now use `claim(bytes32)`/`refund()`'s real selectors. The script is
+  not part of the wheel. Found by an independent defensive review (Claude Mythos).
+
 ## [0.26.1] — 2026-10-07
 
 A checkpoint-only release. Upgrade to keep verifying new HashMarks.

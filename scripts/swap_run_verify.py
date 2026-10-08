@@ -65,6 +65,7 @@ from pyrxd.btc_wallet.taproot import (
     build_htlc,
     scrape_secret,
 )
+from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0, function_selector, keccak256
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.network.source_identity import source_key
 from pyrxd.security.errors import ValidationError
@@ -567,9 +568,13 @@ def verify_counter_leg_btc(
     return CounterLeg.TAKER_REFUNDED, None, [*notes, "no p revealed -> CSV refund leaf -> taker refunded"]
 
 
-# EthHtlc event topic0 (keccak of the event signature) — from tests/fixtures/EthHtlc.json.
-_ETH_CLAIMED_TOPIC = "0xb651fac6b68e9074a2da0835d9a5cb12e8cc45ff91d6e79e31a9627866507cc7"
-_ETH_REFUNDED_TOPIC = "0xa4891be4c05fc4b104f07fbbd9f643c3a98d0f9d3c4e616281bdba972991a558"
+# EthHtlc event topic0s: keccak256("Claimed(bytes32)") / keccak256("Refunded()"), DERIVED in
+# pyrxd.eth_wallet.events (the same source the watchtower uses). These were once typed in by hand as
+# hashlib.sha3_256 digests — NIST SHA3, not Ethereum Keccak — which matched no log the contract can
+# emit, so every honest claim and refund scored ANOMALOUS. tests/test_eth_event_topics.py pins them
+# to the PUSH32 operands of both shipped runtimes.
+_ETH_CLAIMED_TOPIC = CLAIMED_TOPIC0
+_ETH_REFUNDED_TOPIC = REFUNDED_TOPIC0
 # sha256 of the canonical EthHtlc CREATION bytecode (init code), from tests/fixtures/EthHtlc.json "bytecode".
 # A deploy tx input is <init code> || <128B ABI ctor args>, and the init code is CONSTANT across deploys
 # (constructor args live in the trailing calldata, immutables are baked into the *runtime* not the init
@@ -1567,6 +1572,24 @@ def _self_check() -> int:
     check("secret guard REJECTS a nested privkey", _rejects({"x": {"maker_privkey_hex": "de" * 32}}))
 
     # 6) ETH counter-leg disposition against synthetic tx/receipt dicts.
+    # The receipts below are built from the topic constants under test, so on their own they would pass
+    # with ANY value (they once did, with sha3_256 digests in place of keccak). Pin the constants first to
+    # values obtained independently of this module: the PUSH32 operands that the canonical EthHtlc and
+    # Erc20Htlc runtimes (tests/fixtures/*.json) push before LOG1 — not computed here, read from the
+    # compiled bytecode. And pin the primitive with the standard empty-input vector, which is
+    # keccak256(b"") = c5d24601... while sha3_256(b"") = a7ffc6f8..., so the two cannot be confused.
+    check(
+        "keccak256 is Ethereum Keccak-256 (empty-input vector), not NIST SHA3-256",
+        keccak256(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+    )
+    check(
+        "Claimed topic0 == the PUSH32 operand in the shipped EthHtlc/Erc20Htlc runtimes",
+        _ETH_CLAIMED_TOPIC == "0xeddf608ef698454af2fb41c1df7b7e5154ff0d46969f895e0f39c7dfe7e6380a",
+    )
+    check(
+        "Refunded topic0 == the PUSH32 operand in the shipped EthHtlc/Erc20Htlc runtimes",
+        _ETH_REFUNDED_TOPIC == "0x8616bbbbad963e4e65b1366f1d75dfb63f9e9704bbbf91fb01bec70849906cf7",
+    )
     p_eth = b"\xcd" * 32
     h_eth = _sha256(p_eth)
     contract = "0x" + "ab" * 20
@@ -1584,7 +1607,7 @@ def _self_check() -> int:
         eth_contract=contract,
         eth_chain_id=11155111,
     )
-    claim_tx = {"input": "0xae1fc8c1" + p_eth.hex(), "to": contract}
+    claim_tx = {"input": "0x" + function_selector("claim(bytes32)").hex() + p_eth.hex(), "to": contract}
     claim_rcpt = {
         "status": 1,
         "logs": [{"address": contract, "topics": [_ETH_CLAIMED_TOPIC], "data": "0x" + p_eth.hex()}],
@@ -1601,7 +1624,7 @@ def _self_check() -> int:
         "ETH claim -> MAKER_CLAIMED (digest == H, raw p not returned)",
         e1 is CounterLeg.MAKER_CLAIMED and e1_digest == _sha256(p_eth),
     )
-    e2, _, _ = verify_counter_leg_eth(m_eth, {"input": "0x962e097e"}, refund_rcpt)
+    e2, _, _ = verify_counter_leg_eth(m_eth, {"input": "0x" + function_selector("refund()").hex()}, refund_rcpt)
     check("ETH refund -> TAKER_REFUNDED", e2 is CounterLeg.TAKER_REFUNDED)
     e3, _, _ = verify_counter_leg_eth(m_eth, claim_tx, reverted_rcpt)
     check("ETH reverted claim -> ANOMALOUS", e3 is CounterLeg.ANOMALOUS)
