@@ -233,9 +233,11 @@ def test_a_receipt_with_the_old_sha3_topic_is_not_accepted(old_topic: str) -> No
     """The contract cannot emit the old value, so a receipt carrying it is not ours to score as a spend."""
     tx, _ = _claim()
     forged = {"status": 1, "logs": [{"address": _CONTRACT, "topics": [old_topic], "data": "0x" + _P.hex()}]}
-    leg, digest, _ = v.verify_counter_leg_eth(_manifest(), tx, forged, funding=_funding())
+    leg, digest, notes = v.verify_counter_leg_eth(_manifest(), tx, forged, funding=_funding())
     assert leg is v.CounterLeg.ANOMALOUS
     assert digest is None
+    # Refused because the topic is not one the contract emits, not by the init-code pin or another check.
+    assert any("emitted neither Claimed nor Refunded" in n for n in notes), notes
 
 
 async def test_spend_discovery_filters_on_the_real_topics() -> None:

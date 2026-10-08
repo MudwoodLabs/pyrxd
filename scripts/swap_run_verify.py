@@ -1574,9 +1574,10 @@ def _self_check() -> int:
     # 6) ETH counter-leg disposition against synthetic tx/receipt dicts.
     # The receipts below are built from the topic constants under test, so on their own they would pass
     # with ANY value (they once did, with sha3_256 digests in place of keccak). Pin the constants first to
-    # values obtained independently of this module: the PUSH32 operands that the canonical EthHtlc and
-    # Erc20Htlc runtimes (tests/fixtures/*.json) push before LOG1 — not computed here, read from the
-    # compiled bytecode. And pin the primitive with the standard empty-input vector, which is
+    # values obtained independently of this module: typed-in copies of the PUSH32 operands that the
+    # canonical EthHtlc and Erc20Htlc runtimes (tests/fixtures/*.json) push before LOG1. This check
+    # compares against those copies; tests/test_eth_event_topics.py checks them against the bytecode
+    # itself. And pin the primitive with the standard empty-input vector, which is
     # keccak256(b"") = c5d24601... while sha3_256(b"") = a7ffc6f8..., so the two cannot be confused.
     check(
         "keccak256 is Ethereum Keccak-256 (empty-input vector), not NIST SHA3-256",
