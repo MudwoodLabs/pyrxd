@@ -3980,21 +3980,83 @@ async def test_mutual_refund_retried_after_the_radiant_leg_refunded_gives_the_SA
 
     coord.counter_leg.refund = _nothing_to_refund()
     coord.radiant_leg.refund_asset = _radiant_refund_once
+    writes: list[SwapRecord] = []
+
+    async def _persist(record):
+        writes.append(record)
+
+    def _restarted():
+        # Each retry is a FRESH coordinator over the persisted record, as after a restart.
+        fresh = _coordinator(terms=coord.record.terms, btc_leg=coord.counter_leg, radiant_leg=coord.radiant_leg)
+        fresh.record = SwapRecord.from_dict(json.loads(json.dumps(writes[-1].to_dict())))
+        fresh._persist = _persist
+        return fresh
+
+    coord._persist = _persist
+    current = coord
     for _ in range(2):
         with pytest.raises(NothingToRefund) as e:
-            await coord.mutual_refund()
+            await current.mutual_refund()
         assert not isinstance(e.value, NetworkError)
-        assert coord.record.state is SwapState.BOTH_LOCKED
+        assert current.record.state is SwapState.BOTH_LOCKED
+        current = _restarted()
     assert radiant_sends == [1], "the Radiant refund must not be re-sent"
-    assert coord.record.asset_refund_txid == "rxd-refund-txid"
-    assert SwapRecord.from_dict(json.loads(json.dumps(coord.record.to_dict()))).asset_refund_txid == "rxd-refund-txid"
+    assert current.record.asset_refund_txid == "rxd-refund-txid"
 
     async def _counter_refund(*_a, **_k):
         return "0xcounter-refund"
 
     coord.counter_leg.refund = _counter_refund  # the tokens arrived
-    rec = await coord.mutual_refund()
+    rec = await current.mutual_refund()
     assert rec.state is SwapState.MUTUAL_REFUND and radiant_sends == [1]
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_KILLED_after_the_first_leg_does_not_resend_it_from_the_persisted_record():
+    """Review finding (MEDIUM): the first leg's handle was persisted only after the second leg's
+    attempt. A kill there (CancelledError from refund_asset) wrote nothing, so a restarted
+    coordinator re-sent the counter refund, which reverts against the settled contract on every
+    retry. The handle is now persisted, shielded, the moment the leg succeeds: a FRESH coordinator
+    built from the persisted record skips that leg and completes."""
+    import asyncio
+
+    coord = await _both_locked_coordinator()
+    writes: list[SwapRecord] = []
+
+    async def _persist(record):
+        writes.append(record)
+
+    coord._persist = _persist
+    counter_sends: list[int] = []
+
+    async def _counter_refund(*_a, **_k):
+        counter_sends.append(1)
+        if len(counter_sends) > 1:
+            raise ValidationError("tx would revert (preflight eth_call): AlreadySettled")
+        return "0xcounter-refund"
+
+    async def _killed(*_a, **_k):
+        raise asyncio.CancelledError()
+
+    coord.counter_leg.refund = _counter_refund
+    coord.radiant_leg.refund_asset = _killed
+    with pytest.raises(asyncio.CancelledError):
+        await coord.mutual_refund()
+    assert writes, "nothing was persisted before the kill"
+    on_disk = SwapRecord.from_dict(json.loads(json.dumps(writes[-1].to_dict())))
+    assert on_disk.state is SwapState.BOTH_LOCKED and on_disk.counter_refund_tx == "0xcounter-refund"
+
+    fresh = _coordinator(terms=on_disk.terms, btc_leg=coord.counter_leg, radiant_leg=coord.radiant_leg)
+    fresh.record = on_disk
+    fresh._persist = _persist
+
+    async def _radiant_ok(*_a, **_k):
+        return "rxd-refund-txid"
+
+    fresh.radiant_leg.refund_asset = _radiant_ok
+    rec = await fresh.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND
+    assert counter_sends == [1], "the counter refund was re-sent after the restart"
 
 
 @pytest.mark.asyncio

@@ -590,14 +590,20 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         * not yet mature: the parent's transient :class:`NetworkError`, unchanged.
         * matured, unsettled, zero balance: :class:`NothingToRefund`, before anything is signed.
 
-        The balance is read with MAX across endpoints. Only an all-zero answer refuses; one endpoint
-        that sees tokens lets the refund go ahead to the preflight, so a lagging endpoint cannot talk
-        the taker out of its own exit.
+        The balance is read from EVERY configured endpoint and the MAX is taken. "Empty" needs every
+        endpoint to answer 0: one that sees tokens lets the refund go ahead to the preflight, and one
+        that does not answer makes the balance unknown, which raises a retryable
+        :class:`NetworkError`. So neither a lagging nor an unreachable endpoint can make a funded
+        contract read as empty.
         """
         await self._rpc.assert_chain()
         now_ts = await self._rpc.latest_block_timestamp_min()
         if now_ts >= int(locator.timeout) and not any(await self._settled_word(locator, None)):
-            held = await balance_of(self._rpc, self._token, locator.contract_address, combine=max)
+            answers = await self._read_every_endpoint(
+                lambda r: balance_of(r, self._token, locator.contract_address),
+                label=f"{self._token.symbol}.balanceOf({locator.contract_address})",
+            )
+            held = max(answers)
             if held == 0:
                 raise NothingToRefund(
                     f"nothing to refund: the HTLC at {locator.contract_address} holds 0 "
@@ -608,6 +614,43 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                     contract_address=locator.contract_address,
                 )
         return await super().refund(locator)
+
+    async def _read_every_endpoint(self, read: Callable[[Any], Awaitable[Any]], *, label: str) -> list[Any]:
+        """``read`` against every configured endpoint; all must answer, or this raises.
+
+        For a conclusion that a NEGATIVE reading supports ("holds nothing", "cannot land"): an
+        endpoint that does not answer may be the one that would have said otherwise, so a missing
+        answer is "unknown", never a vote. A single-source rpc is its own only endpoint.
+        """
+        import asyncio
+
+        sources = getattr(self._rpc, "sources", None)
+        endpoints = list(sources) if sources else [self._rpc]
+        results = await asyncio.gather(*(read(r) for r in endpoints), return_exceptions=True)
+        failed = [r for r in results if isinstance(r, BaseException)]
+        if failed:
+            raise NetworkError(
+                f"{label}: {len(failed)} of {len(endpoints)} endpoints did not answer ({failed[0]}). "
+                "An endpoint that does not answer may hold the reading that matters, so the result is "
+                "unknown and nothing was concluded or sent. Retry once every endpoint answers."
+            )
+        return list(results)
+
+    async def push_nonce_closed(self, nonce: int) -> tuple[bool, int]:
+        """Whether a token push sent at ``nonce`` can no longer land: ``(closed, finalized_nonce)``.
+
+        Closed means this leg's account has a FINALIZED transaction count above ``nonce`` at every
+        configured endpoint (the MIN is returned), so a transaction at that nonce is finalized —
+        the push itself or something that replaced it — and no other can ever be mined. A
+        not-yet-finalized count could still be reorged back to an open slot, so it does not count.
+        """
+        account = self._account_address()
+        counts = await self._read_every_endpoint(
+            lambda r: r.get_transaction_count(account, "finalized"),
+            label=f"finalized nonce of {account}",
+        )
+        finalized = min(int(c) for c in counts)
+        return finalized > int(nonce), finalized
 
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
         """Check the freeze gate, then claim exactly as the native leg does.

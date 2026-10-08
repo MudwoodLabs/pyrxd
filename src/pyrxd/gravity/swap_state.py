@@ -814,10 +814,13 @@ class SwapRecord:
         if self.pending_counter_contract:
             d["pending_counter_contract"] = self.pending_counter_contract
             d["pending_counter_deploy_tx"] = self.pending_counter_deploy_tx
-            if self.pending_push_nonce is not None:
-                d["pending_push_nonce"] = self.pending_push_nonce
-            if self.pending_push_tx_hash is not None:
-                d["pending_push_tx_hash"] = self.pending_push_tx_hash
+        # Outside the block above: a refused resume keeps the push nonce on a record that already
+        # carries the locator (no pending contract), because ending that swap needs to know whether
+        # the push at that nonce can still land.
+        if self.pending_push_nonce is not None:
+            d["pending_push_nonce"] = self.pending_push_nonce
+        if self.pending_push_tx_hash is not None:
+            d["pending_push_tx_hash"] = self.pending_push_tx_hash
         if self.single_operator_override is not None:
             d["single_operator_override"] = self.single_operator_override
         if self.fund_refusal is not None:

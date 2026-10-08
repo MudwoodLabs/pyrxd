@@ -318,6 +318,12 @@ class EthLeg:
         # Timelock the coordinator passes (BTC-shaped) is intentionally ignored.
         return await self._leg.refund(locator)
 
+    async def push_nonce_closed(self, nonce: int) -> tuple[bool, int]:
+        """The token leg's :meth:`~pyrxd.eth_wallet.erc20_leg.Erc20HtlcLeg.push_nonce_closed`.
+        A native leg has no token push, so it has none and this raises AttributeError, which the
+        coordinator reads as "cannot prove"."""
+        return await self._leg.push_nonce_closed(nonce)
+
     # -- secret recovery + finality ------------------------------------------------------
 
     def scrape_secret(self, claim_artifacts: list[bytes], hashlock: bytes) -> bytes:

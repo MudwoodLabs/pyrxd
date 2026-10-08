@@ -994,7 +994,7 @@ async def test_an_EMPTY_Erc20Htlc_refund_reverts_WITHOUT_settling_and_a_late_pus
     try:
         token = await _moving_token(rpc, mint_to=_ADDR_TAKER, amount=10 * _ERC20_AMOUNT)
         taker = _erc20_leg(rpc, token, _KEY_TAKER)
-        _p, h = _secret()
+        p, h = _secret()
         loc = await _deploy_unfunded_erc20_htlc(
             rpc, token, hashlock=h, timeout=await _now_plus(rpc, 100), amount=_ERC20_AMOUNT
         )
@@ -1019,6 +1019,9 @@ async def test_an_EMPTY_Erc20Htlc_refund_reverts_WITHOUT_settling_and_a_late_pus
         # The late push, then the honest refund through the same leg.
         before = await _token_balance(rpc, token, _ADDR_TAKER)
         await _token_transfer(rpc, token, sender=_ADDR_TAKER, to=loc.contract_address, amount=_ERC20_AMOUNT)
+        # A push landing past the deadline can only be refunded: the right preimage cannot claim it.
+        claim_call = {"from": _ADDR_MAKER, "to": loc.contract_address, "data": _sel("claim(bytes32)") + p.hex()}
+        assert await _revert_selector(rpc, claim_call) == _sel("Expired()")
         receipt = await rpc.wait_receipt(await taker.refund(loc))
         assert int(receipt["status"]) == 1
         assert await _token_balance(rpc, token, loc.contract_address) == 0
@@ -1164,5 +1167,25 @@ async def test_both_contracts_give_claim_errors_in_ONE_order(anvil_url, which):
             assert await _revert_selector(rpc, claim_call(empty_late.contract_address, p)) == expired
             # Still in time AND underfunded: unchanged by the advance.
             assert await _revert_selector(rpc, claim_call(empty.contract_address, p)) == _sel("Underfunded()")
+    finally:
+        await rpc.close()
+
+
+async def test_push_nonce_closed_reads_the_FINALIZED_nonce_on_a_real_node(anvil_url_fast_finality):
+    """``Erc20HtlcLeg.push_nonce_closed`` against a real node, so the "finalized" tag reaches it:
+    a nonce the account has used is closed once that transaction is finalized, and the next unused
+    nonce is never closed."""
+    rpc = EthRpc(anvil_url_fast_finality, expected_chain_id=_CHAIN_ID)
+    try:
+        taker = _erc20_leg(rpc, await _stub_token(rpc), _KEY_TAKER)
+        used = await rpc.w3.eth.get_transaction_count(_ADDR_TAKER)
+        h = await rpc.w3.eth.send_transaction({"from": _ADDR_TAKER, "to": _ADDR_MAKER, "value": 1})
+        await rpc.w3.eth.wait_for_transaction_receipt(h)
+        closed, finalized = await taker.push_nonce_closed(used)
+        assert closed is (finalized > used)  # whatever finality says right now, the answer follows it
+        for _ in range(8):  # drive the finalized checkpoint past that transaction
+            await rpc.w3.provider.make_request("evm_mine", [])
+        assert await taker.push_nonce_closed(used) == (True, used + 1)
+        assert (await taker.push_nonce_closed(used + 1))[0] is False, "an unused nonce is never closed"
     finally:
         await rpc.close()

@@ -1948,39 +1948,107 @@ async def _refused_token_resume_past_its_deadline():
     return coord, eth, page
 
 
-async def test_a_refused_token_resume_whose_push_NEVER_LANDED_ends_aborted_and_stops_paging():
-    """Review finding (MEDIUM). The refused resume tracks the token contract at BTC_LOCKED because
-    the push nonce was recorded, but that nonce is recorded BEFORE the push is broadcast, so the
-    contract may be empty. At the deadline the watchtower paged taker_refund_btc; the leg refused it
-    (NothingToRefund), the swap stayed BTC_LOCKED, and the page repeated on every tick, forever.
+def _fresh_eth_coord(record, eth):
+    """A NEW coordinator over *record* reloaded through its JSON form: what a restart sees."""
+    reloaded = SwapRecord.from_dict(json.loads(json.dumps(record.to_dict())))
+    coord = _eth_coord_full(terms=reloaded.terms, eth_leg=eth, radiant_leg=FakeRadiantLeg(asset_funded=True))
+    coord.record = reloaded
+    return coord
 
-    The whole path: refused resume -> deadline -> page -> taker_refund_btc on an empty contract ->
-    ABORTED with an honest abort_reason, persisted, surviving a JSON round trip -> no further page.
-    The leg's own refusal is faked here; that the real Erc20HtlcLeg raises it on an empty contract
-    is proven on Anvil (test_an_EMPTY_Erc20Htlc_refund_reverts_WITHOUT_settling_...)."""
+
+def _empty_refund(address):
+    from pyrxd.security.errors import NothingToRefund
+
+    async def _refund(*_a, **_k):
+        raise NothingToRefund("nothing to refund: the HTLC holds 0", contract_address=address)
+
+    return _refund
+
+
+def _push_slot(closed: bool, finalized: int):
+    async def _check(nonce):
+        return closed, finalized
+
+    return _check
+
+
+async def test_a_refused_token_resume_whose_push_NEVER_LANDED_ends_aborted_only_once_the_push_cannot_land():
+    """Review findings (MEDIUM, two rounds). The refused resume tracks the token contract at
+    BTC_LOCKED because the push nonce was recorded, but that nonce is recorded BEFORE the push is
+    broadcast, so the contract may be empty. Round 2 made taker_refund_btc abort an empty contract;
+    round 3 found the abort could not know whether the push could still land (the nonce was cleared)
+    and nothing would point at tokens arriving afterwards.
+
+    Now: the nonce survives the refused resume and a JSON reload; while the funding account's
+    FINALIZED nonce is not past it, taker_refund_btc refuses with what to do (cancel the nonce or
+    wait) and the swap stays BTC_LOCKED; once it is past, a FRESH coordinator reloaded from the
+    persisted record aborts with an honest reason, and later ticks page nothing. The leg's refusal
+    is faked; the real Erc20HtlcLeg raising it on an empty contract is the Anvil test
+    test_an_EMPTY_Erc20Htlc_refund_reverts_WITHOUT_settling_..."""
     from pyrxd.security.errors import NothingToRefund
 
     coord, eth, page = await _refused_token_resume_past_its_deadline()
+    assert coord.record.pending_push_nonce == 7, "the push nonce must survive the refused resume"
     assert page.intent.name == "PAGE_REFUND" and page.recommended_action == "taker_refund_btc", page
-    assert "may never have landed" in page.reason and "records the swap aborted" in page.reason, page.reason
+    assert "finalized nonce is past 7" in page.reason and "cancel nonce 7" in page.reason, page.reason
 
     address = coord.record.counterchain_locator.contract_address
+    eth.refund = _empty_refund(address)
+    eth.push_nonce_closed = _push_slot(False, 7)
+    first = _fresh_eth_coord(coord.persisted[-1], eth)
+    assert first.record.pending_push_nonce == 7
+    with pytest.raises(NothingToRefund, match="may still land") as e:
+        await first.taker_refund_btc()
+    assert "0-value transaction from the funding account to itself with nonce 7" in str(e.value)
+    assert first.record.state is SwapState.BTC_LOCKED and first.persisted == []
 
-    async def _empty(*_a, **_k):
-        raise NothingToRefund("nothing to refund: the HTLC holds 0", contract_address=address)
-
-    eth.refund = _empty
-    rec = await coord.taker_refund_btc()
+    eth.push_nonce_closed = _push_slot(True, 8)  # nonce 7 is now final: the push cannot land
+    second = _fresh_eth_coord(coord.persisted[-1], eth)
+    rec = await second.taker_refund_btc()
     assert rec.state is SwapState.ABORTED
     assert "nothing to refund" in rec.abort_reason and address in rec.abort_reason
-    assert "past its timeout, so no claim can take it" in rec.abort_reason
-    assert coord.persisted[-1] == rec
-    reloaded = SwapRecord.from_dict(json.loads(json.dumps(rec.to_dict())))
+    assert "finalized nonce is 8" in rec.abort_reason and "can no longer land" in rec.abort_reason
+    reloaded = SwapRecord.from_dict(json.loads(json.dumps(second.persisted[-1].to_dict())))
     assert reloaded.state is SwapState.ABORTED and reloaded.abort_reason == rec.abort_reason
-    # The alert does not repeat: every later tick on the terminal record pages nothing.
     for later in (60, 3600, 86_400):
         tick = _eth_decide(reloaded, now_unix_s=rec.terms.eth_timeout_unix_s + later)
         assert not tick.intent.name.startswith("PAGE"), tick
+
+
+async def test_a_push_that_LANDS_after_the_refusal_is_refunded_by_the_ordinary_path():
+    """The case the abort must not pre-empt: refused while the push could still land, then the push
+    lands (past the deadline, so it can only be refunded). A fresh coordinator's taker_refund_btc
+    refunds it and the swap ends by the ordinary maker-never-locked edge, with no abort_reason."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord, eth, _page = await _refused_token_resume_past_its_deadline()
+    address = coord.record.counterchain_locator.contract_address
+    eth.refund = _empty_refund(address)
+    eth.push_nonce_closed = _push_slot(False, 7)
+    with pytest.raises(NothingToRefund, match="may still land"):
+        await _fresh_eth_coord(coord.persisted[-1], eth).taker_refund_btc()
+
+    async def _refunds(*_a, **_k):  # the push landed: the contract now holds the tokens
+        eth.refunded = True
+        return "0xethrefund"
+
+    eth.refund = _refunds
+    rec = await _fresh_eth_coord(coord.persisted[-1], eth).taker_refund_btc()
+    assert rec.state is SwapState.ABORTED and eth.refunded and rec.abort_reason is None
+
+
+async def test_a_record_WITHOUT_the_push_nonce_refuses_rather_than_guessing():
+    """A record written before the nonce was kept cannot show the push is closed: refuse, say so."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord, eth, _page = await _refused_token_resume_past_its_deadline()
+    eth.refund = _empty_refund(coord.record.counterchain_locator.contract_address)
+    eth.push_nonce_closed = _push_slot(True, 99)
+    stale = dataclasses.replace(coord.persisted[-1], pending_push_nonce=None)
+    fresh = _fresh_eth_coord(stale, eth)
+    with pytest.raises(NothingToRefund, match="carries no push nonce"):
+        await fresh.taker_refund_btc()
+    assert fresh.record.state is SwapState.BTC_LOCKED
 
 
 async def test_HONEST_a_refused_token_resume_whose_push_LANDED_is_refunded_normally():

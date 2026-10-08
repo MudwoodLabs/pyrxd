@@ -59,7 +59,7 @@ def _locator() -> Erc20HtlcLocator:
 def rig(monkeypatch):
     """A leg whose clock, settled flag and token balance are set per test, and whose parent
     ``refund`` (the maturity check and the broadcast) only records that it was reached."""
-    state = {"now": _TIMEOUT, "settled": False, "balance": 0, "parent_calls": 0, "combine": None}
+    state = {"now": _TIMEOUT, "settled": False, "balance": 0, "parent_calls": 0, "reads": 0}
 
     leg = Erc20HtlcLeg(
         token=_TOKEN,
@@ -73,8 +73,11 @@ def rig(monkeypatch):
         return (b"\x00" * 31) + (b"\x01" if state["settled"] else b"\x00")
 
     async def _balance_of(rpc, token, owner, block_identifier=None, *, combine=min):
-        state["combine"] = combine
-        return state["balance"]
+        state["reads"] += 1
+        answer = getattr(rpc, "balance", state["balance"])  # a fake endpoint carries its own answer
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     async def _parent_refund(self, locator):
         state["parent_calls"] += 1
@@ -83,6 +86,8 @@ def rig(monkeypatch):
     monkeypatch.setattr(Erc20HtlcLeg, "_settled_word", _settled_word)
     monkeypatch.setattr(erc20_leg_mod, "balance_of", _balance_of)
     monkeypatch.setattr(EthHtlcContractLeg, "refund", _parent_refund)
+
+    state["leg"] = leg
 
     def run(*, now: int, settled: bool = False, balance: int = 0):
         state.update(now=now, settled=settled, balance=balance)
@@ -109,11 +114,47 @@ async def test_HONEST_path_a_matured_funded_htlc_reaches_the_parent_refund(rig) 
     assert state["parent_calls"] == 1
 
 
-async def test_the_balance_is_read_with_MAX_so_one_endpoint_seeing_tokens_lets_the_refund_proceed(rig) -> None:
-    """An under-reported balance would refuse the taker's own exit; only an all-zero answer may."""
-    run, state = rig
-    await run(now=_TIMEOUT, balance=5)
-    assert state["combine"] is max
+class _Endpoint:
+    def __init__(self, balance):
+        self.balance = balance
+
+
+class _MultiRpc(_Rpc):
+    """A multi-source rpc as the leg sees it: ``sources`` lists every configured endpoint."""
+
+    def __init__(self, now: int, balances) -> None:
+        super().__init__(now)
+        self.sources = [_Endpoint(b) for b in balances]
+
+
+@pytest.mark.parametrize(
+    ("balances", "outcome"),
+    [
+        ((0, 5, 0), "refund"),  # one endpoint sees tokens: go ahead (the preflight decides)
+        ((0, 0, 0), "empty"),  # every endpoint answered 0: NothingToRefund
+        ((0, NetworkError("timeout"), 0), "unknown"),  # one did not answer: unknown, retryable
+        ((NetworkError("down"), 0, 0), "unknown"),
+    ],
+)
+async def test_EVERY_endpoint_must_answer_before_the_balance_is_called_empty(rig, balances, outcome) -> None:
+    """Review finding (LOW): with MAX over only the endpoints that answered, an unreachable endpoint
+    holding the real balance and two lagging ones answering 0 made a funded contract read as empty.
+    "Empty" now needs every configured endpoint to answer 0; a missing answer is unknown, never a vote."""
+    _run, state = rig
+    run_leg = state["leg"]
+    run_leg._rpc = _MultiRpc(_TIMEOUT, balances)
+    if outcome == "refund":
+        assert await run_leg.refund(_locator()) == "0x" + "ee" * 32
+        assert state["parent_calls"] == 1
+    elif outcome == "empty":
+        with pytest.raises(NothingToRefund):
+            await run_leg.refund(_locator())
+        assert state["parent_calls"] == 0
+    else:
+        with pytest.raises(NetworkError, match="did not answer") as e:
+            await run_leg.refund(_locator())
+        assert not isinstance(e.value, NothingToRefund) and state["parent_calls"] == 0
+    assert state["reads"] == 3, "every configured endpoint must be read"
 
 
 async def test_a_NOT_YET_MATURE_empty_htlc_gets_the_parents_answer_not_NothingToRefund(rig) -> None:
@@ -122,7 +163,7 @@ async def test_a_NOT_YET_MATURE_empty_htlc_gets_the_parents_answer_not_NothingTo
     run, state = rig
     await run(now=_TIMEOUT - 1, balance=0)
     assert state["parent_calls"] == 1
-    assert state["combine"] is None, "the balance must not be read before the timeout"
+    assert state["reads"] == 0, "the balance must not be read before the timeout"
 
 
 async def test_a_SETTLED_htlc_is_left_to_the_parent_not_reported_as_empty(rig) -> None:
@@ -131,7 +172,7 @@ async def test_a_SETTLED_htlc_is_left_to_the_parent_not_reported_as_empty(rig) -
     run, state = rig
     await run(now=_TIMEOUT, settled=True, balance=0)
     assert state["parent_calls"] == 1
-    assert state["combine"] is None
+    assert state["reads"] == 0
 
 
 async def test_the_real_parent_reports_not_yet_mature_as_a_NetworkError(monkeypatch) -> None:
@@ -145,3 +186,37 @@ async def test_the_real_parent_reports_not_yet_mature_as_a_NetworkError(monkeypa
     )
     with pytest.raises(NetworkError, match="not yet mature"):
         await leg.refund(_locator())
+
+
+class _NonceEndpoint:
+    def __init__(self, finalized):
+        self.finalized = finalized
+        self.asked: list[str] = []
+
+    async def get_transaction_count(self, address, block="pending"):
+        self.asked.append(block)
+        if isinstance(self.finalized, Exception):
+            raise self.finalized
+        return self.finalized
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ((8, 9, 8), (True, 8)),  # every endpoint's finalized nonce is past 7
+        ((8, 7, 9), (False, 7)),  # one endpoint has not finalized nonce 7: it may still land
+        ((8, NetworkError("down"), 9), "unknown"),  # one did not answer: unknown, never "closed"
+    ],
+)
+async def test_push_nonce_closed_needs_EVERY_endpoints_FINALIZED_count_past_the_nonce(counts, expected) -> None:
+    rpc = _Rpc(_TIMEOUT)
+    rpc.sources = [_NonceEndpoint(c) for c in counts]
+    leg = Erc20HtlcLeg(
+        token=_TOKEN, rpc=rpc, signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=31337, artifact=_ARTIFACT
+    )
+    if expected == "unknown":
+        with pytest.raises(NetworkError, match="did not answer"):
+            await leg.push_nonce_closed(7)
+    else:
+        assert await leg.push_nonce_closed(7) == expected
+    assert all(e.asked == ["finalized"] for e in rpc.sources), "only the FINALIZED count may close a nonce"

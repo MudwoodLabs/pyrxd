@@ -769,9 +769,18 @@ def _decide_eth(
             # recorded before the push is broadcast: the contract may be EMPTY. Say so, and say what
             # the step does then — it records the swap aborted rather than sending a refund the
             # contract would revert — so the page is true either way and running it ends it.
+            nonce = record.pending_push_nonce
             empty_note = (
-                " The token push may never have landed: taker_refund_btc refunds what the contract holds, "
-                "and if it holds nothing it records the swap aborted (nothing to refund), which ends this page."
+                " The token push may never have landed: taker_refund_btc refunds what the contract holds. If "
+                "it holds nothing, taker_refund_btc records the swap aborted (nothing to refund), which ends "
+                f"this page, but only once the funding account's finalized nonce is past {nonce}, the nonce the "
+                f"push was recorded at. Until then the push may still land and it refuses: cancel nonce {nonce} "
+                "with a 0-value transaction from the funding account to itself, or wait for the push, then run "
+                "it again."
+                if refused is not None and terms.token_address and nonce is not None
+                else " The token push may never have landed, and this record does not carry its nonce: "
+                "taker_refund_btc refunds what the contract holds, but if it holds nothing it cannot prove the "
+                "push will not land and refuses. Check the funding account for a pending transfer first."
                 if refused is not None and terms.token_address
                 else ""
             )

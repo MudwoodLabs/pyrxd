@@ -84,22 +84,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     refuses a balance below the negotiated amount, which is never zero.
   - **`Erc20HtlcLeg.refund` raises the new `NothingToRefund` error** (a `ValidationError`, in
     `pyrxd.security.errors`) before signing anything when the contract has timed out, is not
-    settled and holds no tokens. A not-yet-mature refund and a refund of a settled contract behave
-    as before.
-  - **`SwapCoordinator.taker_refund_btc` ends an ERC-20 swap at `BTC_LOCKED` as `ABORTED` when its
-    contract is past its timeout, unsettled and empty**, recording why in the new
-    `SwapRecord.abort_reason` (new event `COUNTER_LEG_EXPIRED_EMPTY`, the existing
-    `BTC_LOCKED → ABORTED` edge). That state is reached after a refused resume, which tracks a
-    deployed token contract whose push may never have landed. Before, the refund was refused, the
-    swap stayed `BTC_LOCKED` with no way out, and the watchtower's page for `taker_refund_btc`
-    repeated forever. The watchtower's page now says the contract may be empty and what the step
-    does then. Elsewhere `NothingToRefund` propagates and the swap does not advance.
+    settled and holds no tokens. "Holds no tokens" needs every configured RPC endpoint to answer 0:
+    one that does not answer makes the balance unknown and raises a retryable `NetworkError`. A
+    not-yet-mature refund and a refund of a settled contract behave as before.
+  - **`SwapCoordinator.taker_refund_btc` can end an ERC-20 swap at `BTC_LOCKED` as `ABORTED`** when
+    its contract is past its timeout, unsettled and empty, and the token push can no longer land.
+    It records why in the new `SwapRecord.abort_reason` (new event `COUNTER_LEG_EXPIRED_EMPTY`, on
+    the existing `BTC_LOCKED → ABORTED` edge). That state is reached after a refused resume, which
+    tracks a deployed token contract whose push may never have landed. The resume now keeps the
+    push nonce on the record. The abort happens only once the funding account's finalized nonce is
+    past that nonce at every endpoint (new `Erc20HtlcLeg.push_nonce_closed`). Until then the call
+    refuses with `NothingToRefund`, says the push may still land, and says how to cancel it: send a
+    0-value transaction from the funding account to itself at that nonce. Before, the refund was
+    refused, the swap stayed `BTC_LOCKED` with no way out, and the watchtower's page for
+    `taker_refund_btc` repeated forever. The page now says the same as the call. Elsewhere,
+    `NothingToRefund` propagates and the swap does not advance.
   - **`SwapCoordinator.mutual_refund` records each leg's refund as it succeeds**
-    (`SwapRecord.counter_refund_tx`, `SwapRecord.asset_refund_txid`) and does not re-send it on a
-    retry. Re-sending a refund of a settled contract or a spent covenant fails, which made every
-    retry after a partial refund fail too. When the only failure is an empty ERC-20 contract it
-    raises `NothingToRefund` rather than a retryable `NetworkError`, on the first call and on every
-    retry, and does not record the swap as refunded.
+    (`SwapRecord.counter_refund_tx`, `SwapRecord.asset_refund_txid`) and persists it at once,
+    shielded from cancellation, before trying the other leg. A retry from that record does not
+    re-send it. Re-sending a refund of a settled contract or a spent covenant fails, which made
+    every retry after a partial refund (or a crash between the two legs) fail too. When the only
+    failure is an empty ERC-20 contract it raises `NothingToRefund` rather than a retryable
+    `NetworkError`, on the first call and on every retry from the record, and does not record the
+    swap as refunded. A caller that builds a fresh record for each attempt (the two-host runner
+    scripts do) does not get this protection.
   - **`EthHtlc`'s constructor reverts `ZeroAddress` on a zero claimant or refundee**, the error and
     check `Erc20Htlc` already had.
   - **Both contracts check claim errors in one order: `AlreadySettled`, then `Expired`, then

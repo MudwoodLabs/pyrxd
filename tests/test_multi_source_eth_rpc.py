@@ -614,19 +614,42 @@ class TestOneValueTwoDirections:
         revert as empty. There the conservative direction is the opposite of a floor's: an
         under-reported balance would talk the taker out of its own exit, while an over-reported one
         only sends the refund on to the eth_call preflight, where the contract decides. So the read
-        must be MAX, and its result may be used for exactly one thing: ``== 0`` raising
-        NothingToRefund. If either stops being true, this fails and the exemption has to be
+        goes to EVERY endpoint (``_read_every_endpoint``, which refuses when one does not answer) and
+        is combined with MAX, and its result may be used for exactly one thing: ``== 0`` raising
+        NothingToRefund. If any of that stops being true, this fails and the exemption has to be
         re-argued rather than inherited."""
         import ast
 
         tree = ast.parse(pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text())
-        lines = self._refund_lines(tree)
-        reads = [r for r in self._balance_reads(tree) if r[1] in lines]
-        assert len(reads) == 1, reads
-        name, _lineno, combine = reads[0]
-        assert isinstance(combine, ast.Name) and combine.id == "max"
-
         fn = next(f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef) and f.name == "refund")
+        balance_calls = [
+            n for n in ast.walk(fn) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "balance_of"
+        ]
+        assert len(balance_calls) == 1, "refund must read the balance exactly once"
+        # ... inside a lambda handed to `self._read_every_endpoint`, whose result is assigned:
+        fan_out = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Await)
+            and isinstance(n.value.value, ast.Call)
+            and getattr(n.value.value.func, "attr", None) == "_read_every_endpoint"
+            and any(isinstance(a, ast.Lambda) and a.body is balance_calls[0] for a in n.value.value.args)
+        ]
+        assert len(fan_out) == 1, "the balance read must go through _read_every_endpoint"
+        answers = fan_out[0].targets[0].id
+        # ... and combined with MAX into the one name the zero test reads.
+        combined = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Call)
+            and getattr(n.value.func, "id", None) == "max"
+            and [getattr(a, "id", None) for a in n.value.args] == [answers]
+        ]
+        assert len(combined) == 1, "the endpoints' answers must be combined with max"
+        name = combined[0].targets[0].id
+
         uses = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)]
         assert len(uses) == 1, f"`{name}` is read {len(uses)} times in refund; only the zero test may use it"
         compares = [
