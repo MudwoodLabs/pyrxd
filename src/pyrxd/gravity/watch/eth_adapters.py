@@ -44,6 +44,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.watch.quorum import EthClaimStatus
@@ -51,13 +52,12 @@ from pyrxd.security.errors import NetworkError
 
 __all__ = ["CLAIMED_TOPIC0", "REFUNDED_TOPIC0", "RpcEthChainSource"]
 
-# Pinned EthHtlc.sol event selectors (verified against web3 keccak by test_event_selectors_match_keccak):
-#   keccak256("Claimed(bytes32)")  — the canonical claim event; p is in the (non-indexed) log data.
-#   keccak256("Refunded()")        — the refund event; emitted when the maker did NOT reveal p.
+# EthHtlc.sol / Erc20Htlc.sol event topic0s, DERIVED in pyrxd.eth_wallet.events as keccak256 of the
+# signature (one source, shared with scripts/swap_run_verify.py) and re-exported here:
+#   CLAIMED_TOPIC0  = keccak256("Claimed(bytes32)")  — the claim event; p is in the (non-indexed) log data.
+#   REFUNDED_TOPIC0 = keccak256("Refunded()")        — the refund event; emitted when the maker did NOT reveal p.
 # Detection is selector-AGNOSTIC (see the module docstring) — these only refine which logs are a claim
 # vs a refund so a refund does not over-page, while an unrecognised event still fails toward paging.
-CLAIMED_TOPIC0 = "0xeddf608ef698454af2fb41c1df7b7e5154ff0d46969f895e0f39c7dfe7e6380a"
-REFUNDED_TOPIC0 = "0x8616bbbbad963e4e65b1366f1d75dfb63f9e9704bbbf91fb01bec70849906cf7"
 
 
 def _to_0x_hash(value: object) -> str:
