@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.20;
+pragma solidity 0.8.24;
 
 /// @title Erc20Htlc — per-swap HTLC holding an ERC-20 (USDC) for RXD ↔ token swaps.
 /// @notice The token counterpart of the per-swap-deploy `EthHtlc.sol` that pyrxd's
@@ -55,6 +55,7 @@ contract Erc20Htlc {
     error Expired();
     error NotYetExpired();
     error Underfunded();
+    error NothingToRefund();
     error TransferFailed();
     error ZeroValue();
     error ZeroAddress();
@@ -85,6 +86,10 @@ contract Erc20Htlc {
     ///      would let a claimant reveal the secret in exchange for a partial balance — paying for
     ///      the other leg in full and being paid a fraction. Refuse instead, and the preimage stays
     ///      secret until the contract actually holds what was promised.
+    ///      Error order, shared with EthHtlc: AlreadySettled, then Expired, then BadPreimage (then
+    ///      Underfunded, which EthHtlc has no counterpart for). The state and the clock come before
+    ///      the caller's input. `amount` is non-zero by construction, so this can never settle a
+    ///      contract that holds nothing.
     function claim(bytes32 preimage) external {
         if (settled) revert AlreadySettled();
         if (block.timestamp >= timeout) revert Expired();
@@ -103,13 +108,21 @@ contract Erc20Htlc {
     /// @notice After the timeout, return everything to the refundee.
     /// @dev No `Underfunded` check here — refunding a partial balance is strictly better than
     ///      stranding it, and no secret is revealed by refunding.
+    ///
+    ///      But an EMPTY balance is refused, and refused WITHOUT settling. Funding is a push that
+    ///      follows the deploy, so a contract can pass its timeout holding nothing (the push failed,
+    ///      or was never sent). Settling it then would refund nothing and leave `settled` set for
+    ///      good, so tokens pushed afterwards could be moved by neither `claim` nor `refund`. The
+    ///      balance is read (a staticcall) before the state write; the transfer still comes after it.
     function refund() external {
         if (settled) revert AlreadySettled();
         if (block.timestamp < timeout) revert NotYetExpired();
+        uint256 balance = _balance();
+        if (balance == 0) revert NothingToRefund();
 
         settled = true;
         emit Refunded();
-        _sweep(refundee, _balance());
+        _sweep(refundee, balance);
     }
 
     function _balance() internal view returns (uint256) {
@@ -125,6 +138,8 @@ contract Erc20Htlc {
     ///      return. Treat "did not revert, returned nothing" as success. USDC itself returns a
     ///      bool, so this is insurance rather than a requirement — cheap, and it removes a whole
     ///      failure class if the pinned token set ever widens.
+    ///      Neither caller passes 0 (claim requires at least `amount`, which is non-zero; refund
+    ///      refuses an empty balance), so the early return below is a guard, not a path.
     function _sweep(address to, uint256 value) internal {
         if (value == 0) return;
         (bool ok, bytes memory data) = token.call(

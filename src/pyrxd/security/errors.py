@@ -41,6 +41,7 @@ __all__ = [
     "KeyMaterialError",
     "MaxAttemptsError",
     "NetworkError",
+    "NothingToRefund",
     "PolicyRejection",
     "PoolTooSmallError",
     "PreRevealAbort",
@@ -338,6 +339,28 @@ class InsufficientFundsError(ValidationError):
         if self.available is None or self.required is None:
             return None
         return self.required - self.available
+
+
+class NothingToRefund(ValidationError):
+    """A refund was refused BEFORE broadcast because the HTLC holds nothing to refund.
+
+    Raised by the ERC-20 counter leg when its contract has passed its timeout, is not settled, and
+    holds a zero token balance — typically a deploy whose token push failed or was never sent. The
+    contract itself refuses the same call (``Erc20Htlc.refund`` reverts ``NothingToRefund``) and,
+    since that revert, does NOT settle, so tokens that arrive later can still be refunded.
+
+    Its own type, not a borrowed one, because the cause is specific and the right response differs
+    from both neighbours: it is not "not yet mature" (:class:`NetworkError`, wait and retry) and not
+    "already claimed or refunded". Nothing was sent, nothing moved, and the swap must NOT be recorded
+    as refunded. A :class:`ValidationError`, so a driver stops rather than retrying: the balance only
+    changes if someone pushes tokens into the contract, after which a refund works.
+
+    ``contract_address`` is carried so the operator knows which contract to check.
+    """
+
+    def __init__(self, message: str, *, contract_address: str | None = None) -> None:
+        super().__init__(message)
+        self.contract_address = contract_address
 
 
 class SpvVerificationError(RxdSdkError):

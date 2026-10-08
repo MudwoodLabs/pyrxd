@@ -1,11 +1,15 @@
 """ERC-20 (USDC) counter-chain leg — the token sibling of :class:`EthHtlcContractLeg`.
 
 **A subclass, not a fork, and not an edit.** The native leg has moved real value on mainnet, so
-this adds behaviour without changing a line of it. ``refund``, ``fetch_claim_artifacts``,
+this adds behaviour without changing a line of it. ``fetch_claim_artifacts``,
 ``assert_claim_provenance``, ``is_final`` and ``claim_finality_verdict`` are inherited
 **unchanged**, which works because ``Erc20Htlc.sol`` was deliberately given the same
 ``claim(bytes32)`` / ``refund()`` signatures and the same ``Claimed(bytes32)`` event with the
 preimage un-indexed. Secret recovery therefore needs no token-specific code at all.
+
+``refund`` adds one pre-broadcast read and then delegates: a matured, unsettled contract holding
+no tokens raises :class:`~pyrxd.security.errors.NothingToRefund` instead of sending a refund the
+contract would revert. The broadcast itself is the parent's.
 
 ``fund``, ``verify_funded`` AND ``claim`` are overridden. An earlier version of this paragraph said
 ``claim`` was inherited unchanged; it is not, and the difference matters to anyone reading this to
@@ -27,7 +31,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ..security.errors import NetworkError, PreRevealAbort, ValidationError
+from ..security.errors import NetworkError, NothingToRefund, PreRevealAbort, ValidationError
 from ..security.reveal import watching_for_reveal
 from .erc20 import (
     assert_not_frozen_before_funding,
@@ -299,7 +303,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             checksum(self._token.address),
             int(amount_wei),
         )
-        # Deploy measured at 450,657 on Anvil (2026-10-07, mock token); the inherited 800k limit covers it.
+        # Deploy measured at 458,657 on Anvil (2026-10-08, mock token); the inherited 800k limit covers it.
         deploy_tx = await self._base_tx(gas=800_000)
         built = await ctor.build_transaction(deploy_tx)
         deploy_hash = await self._sign_and_send(built, preflight=False)
@@ -568,6 +572,42 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             amount_wei=int(amount_wei),
             token_address=self._token.address,
         )
+
+    async def refund(self, locator: EthHtlcLocator) -> str:
+        """Refund after the timeout, refusing up front when the contract holds nothing to refund.
+
+        ``Erc20Htlc.refund`` reverts ``NothingToRefund`` on a zero balance, and that revert leaves
+        the contract unsettled, so tokens that arrive later stay refundable. Funding is a push that
+        follows the deploy, so a matured, unsettled, empty contract is a real state: a deploy whose
+        push failed or was never sent. The parent would send that refund into the eth_call preflight
+        and surface a generic "tx would revert"; this names the cause instead, with its own type.
+
+        The checks run in the contract's own order — settled, then the timeout, then the balance —
+        so each refusal is the one the contract would give:
+
+        * settled: no early answer here; the parent's preflight reports the revert as before (a
+          retry after a refund that already succeeded lands there, not in "nothing to refund").
+        * not yet mature: the parent's transient :class:`NetworkError`, unchanged.
+        * matured, unsettled, zero balance: :class:`NothingToRefund`, before anything is signed.
+
+        The balance is read with MAX across endpoints. Only an all-zero answer refuses; one endpoint
+        that sees tokens lets the refund go ahead to the preflight, so a lagging endpoint cannot talk
+        the taker out of its own exit.
+        """
+        await self._rpc.assert_chain()
+        now_ts = await self._rpc.latest_block_timestamp_min()
+        if now_ts >= int(locator.timeout) and not any(await self._settled_word(locator, None)):
+            held = await balance_of(self._rpc, self._token, locator.contract_address, combine=max)
+            if held == 0:
+                raise NothingToRefund(
+                    f"nothing to refund: the HTLC at {locator.contract_address} holds 0 "
+                    f"{self._token.symbol} and is not settled, so refund() would revert "
+                    "NothingToRefund. Nothing was sent, and the contract stays unsettled: if tokens "
+                    "reach it later (a token push still pending, say), a refund then will return them. "
+                    "Do not record this swap as refunded.",
+                    contract_address=locator.contract_address,
+                )
+        return await super().refund(locator)
 
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
         """Check the freeze gate, then claim exactly as the native leg does.

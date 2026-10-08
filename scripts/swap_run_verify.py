@@ -584,7 +584,7 @@ _ETH_REFUNDED_TOPIC = REFUNDED_TOPIC0
 # ETH leg) can ship a look-alike that decodes honest (H, maker) ctor bytes yet pays the taker and emits a
 # forged Claimed(p) — a false PASS on a one-sided maker loss (audit HIGH). tests/test_swap_run_verify.py
 # re-derives this from the fixture so a fixture change without a pin update fails CI.
-_ETH_HTLC_CREATION_SHA256 = bytes.fromhex("14929d5c58980ad93d446c22b55c48d8c71d040500b807ed84c83601142c10ec")
+_ETH_HTLC_CREATION_SHA256 = bytes.fromhex("16021fe7842f83350cdcf25742347449708e620d9cab25efd9b0c720695de415")
 
 
 def _hb(x: object) -> bytes:

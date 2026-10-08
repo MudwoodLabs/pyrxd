@@ -58,7 +58,7 @@ from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
-from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
+from pyrxd.security.errors import NetworkError, NothingToRefund, PreRevealAbort, ValidationError
 from pyrxd.security.reveal import reveal_boundary
 from pyrxd.security.secrets import SecretBytes
 
@@ -4266,6 +4266,18 @@ class SwapCoordinator:
             # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts both. A
             # leg that already refunded fails harmlessly the second time; a leg that did not gets
             # its chance.
+            if all(isinstance(exc, NothingToRefund) for _, exc in failures):
+                # NOT retryable, so not a NetworkError. The only failure is a counter-leg HTLC that
+                # holds nothing to refund — a fact about the chain, refused before anything was
+                # signed — and repeating the call cannot change it. Every other leg was attempted
+                # and succeeded. Still not recorded as MUTUAL_REFUND: that leg refunded nothing.
+                leg, exc = failures[0]
+                raise NothingToRefund(
+                    f"mutual refund incomplete — {leg}: {exc}. The other leg was attempted and did "
+                    "not fail. The swap stays BOTH_LOCKED and is NOT recorded as refunded; retrying "
+                    "will refuse the same way until tokens reach that contract.",
+                    contract_address=getattr(exc, "contract_address", None),
+                )
             raise NetworkError(
                 "mutual refund incomplete — "
                 + "; ".join(f"{leg}: {exc}" for leg, exc in failures)

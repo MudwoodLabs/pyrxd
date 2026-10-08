@@ -844,9 +844,9 @@ class EthHtlcContractLeg:
             int(timeout),
         )
         # Deploy gas: the contract's runtime CODE DEPOSIT alone is 200 gas/byte, plus constructor
-        # and base tx. The optimized EthHtlc (1,215-byte runtime) deployed for 318,414 gas on Anvil
-        # (2026-10-07); the earlier unoptimized build (2,087 bytes) took 510,245, and 400k
-        # out-of-gas-reverted it (Phase-4 finding). 800k is a fixed limit, so it also covers an
+        # and base tx. The optimized EthHtlc (1,215-byte runtime) deployed for 319,422 gas on Anvil
+        # (2026-10-08, with the zero-address guard); the earlier unoptimized build (2,087 bytes)
+        # took 510,245, and 400k out-of-gas-reverted it (Phase-4 finding). 800k is a fixed limit, so it also covers an
         # injected artifact up to roughly that older size (you pay gasUsed, not the limit). A
         # per-artifact eth_estimateGas is the robust follow-up.
         tx = await self._base_tx(gas=800_000)

@@ -587,13 +587,63 @@ class TestOneValueTwoDirections:
             for n in ast.walk(fn)
             if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Sub)
         }
-        floors = [r for r in self._balance_reads(tree) if not any(abs(r[1] - ln) < 40 for ln in subtracting_lines)]
+        refund_lines = self._refund_lines(tree)
+        floors = [
+            r
+            for r in self._balance_reads(tree)
+            if not any(abs(r[1] - ln) < 40 for ln in subtracting_lines) and r[1] not in refund_lines
+        ]
         assert floors, "expected floor reads to still exist"
         for name, lineno, combine in floors:
             assert not (isinstance(combine, ast.Name) and combine.id == "max"), (
                 f"{name} at line {lineno} was swept to `max`; it is compared against a floor, "
                 "where believing the highest answer passes an under-funded HTLC"
             )
+
+    @staticmethod
+    def _refund_lines(tree) -> set[int]:
+        import ast
+
+        fns = [fn for fn in ast.walk(tree) if isinstance(fn, ast.AsyncFunctionDef) and fn.name == "refund"]
+        assert len(fns) == 1, "expected exactly one `refund` in the ERC-20 leg"
+        return set(range(fns[0].lineno, fns[0].end_lineno + 1))
+
+    def test_the_EMPTY_refund_read_is_MAX_and_only_ever_refuses_on_zero(self) -> None:
+        """The one balance read the floor rule above does NOT govern, and why — derived, not
+        asserted in prose. ``refund`` reads the balance only to refuse a refund the contract would
+        revert as empty. There the conservative direction is the opposite of a floor's: an
+        under-reported balance would talk the taker out of its own exit, while an over-reported one
+        only sends the refund on to the eth_call preflight, where the contract decides. So the read
+        must be MAX, and its result may be used for exactly one thing: ``== 0`` raising
+        NothingToRefund. If either stops being true, this fails and the exemption has to be
+        re-argued rather than inherited."""
+        import ast
+
+        tree = ast.parse(pathlib.Path("src/pyrxd/eth_wallet/erc20_leg.py").read_text())
+        lines = self._refund_lines(tree)
+        reads = [r for r in self._balance_reads(tree) if r[1] in lines]
+        assert len(reads) == 1, reads
+        name, _lineno, combine = reads[0]
+        assert isinstance(combine, ast.Name) and combine.id == "max"
+
+        fn = next(f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef) and f.name == "refund")
+        uses = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)]
+        assert len(uses) == 1, f"`{name}` is read {len(uses)} times in refund; only the zero test may use it"
+        compares = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Compare)
+            and isinstance(n.left, ast.Name)
+            and n.left.id == name
+            and [type(o) for o in n.ops] == [ast.Eq]
+            and isinstance(n.comparators[0], ast.Constant)
+            and n.comparators[0].value == 0
+        ]
+        assert len(compares) == 1, "the read must be consumed by `== 0`"
+        guarded = [n for n in ast.walk(fn) if isinstance(n, ast.If) and n.test is compares[0]]
+        assert len(guarded) == 1 and isinstance(guarded[0].body[0], ast.Raise)
+        raised = guarded[0].body[0].exc
+        assert isinstance(raised, ast.Call) and getattr(raised.func, "id", None) == "NothingToRefund"
 
     def test_the_FLOOR_call_site_asks_for_the_quorum_th(self) -> None:
         """Its neighbour must NOT have been swept along to `max`: it compares against a required

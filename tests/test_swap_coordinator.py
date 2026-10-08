@@ -3876,6 +3876,90 @@ async def test_mutual_refund_HONEST_path_still_completes():
     assert rec.state is not SwapState.BOTH_LOCKED, "an all-successful mutual refund must advance"
 
 
+async def _both_locked_coordinator():
+    terms = _terms()
+    btc, rxd = FakeBtcLeg(), FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    assert coord.record.state is SwapState.BOTH_LOCKED
+    return coord
+
+
+def _nothing_to_refund():
+    from pyrxd.security.errors import NothingToRefund
+
+    async def _refund(*_a, **_k):
+        raise NothingToRefund("nothing to refund: the HTLC holds 0", contract_address="0x" + "ab" * 20)
+
+    return _refund
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_with_an_EMPTY_counter_leg_is_permanent_and_not_recorded_as_refunded():
+    """An ERC-20 counter-leg HTLC that holds nothing now refuses its refund (the contract reverts
+    NothingToRefund, and the leg raises it before signing). mutual_refund must still refund the
+    Radiant leg, must NOT record MUTUAL_REFUND (that leg refunded nothing), and must say so with a
+    type a driver stops on: as a NetworkError a driver would retry a refusal that cannot change."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord = await _both_locked_coordinator()
+    refunded_radiant: list[bool] = []
+
+    async def _radiant_refund(*_a, **_k):
+        refunded_radiant.append(True)
+        return "rxd-refund-txid"
+
+    coord.counter_leg.refund = _nothing_to_refund()
+    coord.radiant_leg.refund_asset = _radiant_refund
+
+    with pytest.raises(NothingToRefund, match="nothing to refund") as e:
+        await coord.mutual_refund()
+    assert not isinstance(e.value, NetworkError), "a permanent refusal must not read as retryable"
+    assert e.value.contract_address == "0x" + "ab" * 20
+    assert "NOT recorded as refunded" in str(e.value)
+    assert refunded_radiant == [True], "the Radiant leg must still be refunded"
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_with_an_EMPTY_counter_leg_AND_a_transient_failure_stays_retryable():
+    """The permanent type is only for a refusal that retrying cannot change. When the other leg
+    failed transiently, a retry is still the right move, so the NetworkError stays."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord = await _both_locked_coordinator()
+
+    async def _boom(*_a, **_k):
+        raise NetworkError("radiant node unreachable")
+
+    coord.counter_leg.refund = _nothing_to_refund()
+    coord.radiant_leg.refund_asset = _boom
+    with pytest.raises(NetworkError, match="mutual refund incomplete") as e:
+        await coord.mutual_refund()
+    assert not isinstance(e.value, NothingToRefund)
+    assert "nothing to refund" in str(e.value) and "radiant node unreachable" in str(e.value)
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+
+@pytest.mark.asyncio
+async def test_taker_refund_with_an_EMPTY_counter_leg_raises_and_does_not_advance():
+    """taker_refund_btc refunds the counter leg alone. An empty HTLC must surface as
+    NothingToRefund and leave the swap where it was: recording ABORTED would claim a refund that
+    returned nothing. (The honest path, where the refund succeeds and the swap ends ABORTED, is
+    pinned by the PARAMS_MISMATCH test above.)"""
+    from pyrxd.security.errors import NothingToRefund
+
+    terms = _terms()
+    coord = _coordinator(terms=terms, btc_leg=FakeBtcLeg(), radiant_leg=FakeRadiantLeg())
+    await coord.taker_funds_btc(terms)
+    assert coord.record.state is SwapState.BTC_LOCKED
+    coord.counter_leg.refund = _nothing_to_refund()
+    with pytest.raises(NothingToRefund):
+        await coord.taker_refund_btc()
+    assert coord.record.state is SwapState.BTC_LOCKED
+
+
 class TestTheMakerCannotSpendTRxdBeforePresentingTheSwap:
     """Step 7 of the pre-fund gate: the cross-clock ordering check, re-run against the window that
     ACTUALLY REMAINS.

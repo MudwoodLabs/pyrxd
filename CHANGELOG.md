@@ -69,6 +69,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   this repo's swap runners and tests**, which verify a deployed contract byte for byte against
   these artifacts. The wheel ships no ETH artifact, so an application that injects its own is
   unaffected.
+- **The ETH counter-leg contracts were revised before the external audit, so the audited bytecode
+  is final.** Both artifacts change again (EthHtlc 1,215 runtime / 1,548 creation bytes; Erc20Htlc
+  1,856 / 2,298), and contracts deployed from the earlier artifacts are refused by this repo's swap
+  runners and tests, as above. The behaviour changes:
+  - **A refund of an `Erc20Htlc` that holds no tokens now reverts `NothingToRefund`, and leaves the
+    contract unsettled.** Before, `refund()` after the timeout on a deployed but never-funded
+    contract succeeded: it set `settled`, refunded nothing, and any tokens sent to the contract
+    afterwards could be moved by neither `claim` nor `refund`. Now tokens that arrive later can
+    still be refunded. `claim()` needs no change: it already refuses a balance below the
+    negotiated amount, which is never zero.
+  - **`Erc20HtlcLeg.refund` raises the new `NothingToRefund` error** (a `ValidationError`, in
+    `pyrxd.security.errors`) before signing anything when the contract has timed out, is not
+    settled and holds no tokens. A not-yet-mature refund and a refund of a settled contract behave
+    as before. `SwapCoordinator.taker_refund_btc` lets it propagate and does not advance the swap;
+    `SwapCoordinator.mutual_refund` still refunds the Radiant leg, does not record the swap as
+    refunded, and raises `NothingToRefund` rather than a retryable `NetworkError` when that is its
+    only failure.
+  - **`EthHtlc`'s constructor reverts `ZeroAddress` on a zero claimant or refundee**, the error and
+    check `Erc20Htlc` already had.
+  - **Both contracts check claim errors in one order: `AlreadySettled`, then `Expired`, then
+    `BadPreimage`** (then `Underfunded` in `Erc20Htlc`). `EthHtlc` used to check the preimage
+    first, so a claim after the timeout with a wrong preimage reverted `BadPreimage` there and
+    `Expired` in `Erc20Htlc`; it now reverts `Expired` in both. Nothing in pyrxd matched on these
+    names.
+  - `Erc20Htlc.sol` pins `pragma solidity 0.8.24` (was `^0.8.20`), the compiler the build uses.
+  - Measured on Anvil: deploy gas rises from 318,414 to 319,422 (`EthHtlc`) and from 450,657 to
+    458,657 (`Erc20Htlc`); an `Erc20Htlc` refund rises by 34 gas; claims are unchanged.
 
 ### Fixed
 

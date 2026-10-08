@@ -527,6 +527,7 @@ async def test_a_real_Erc20Htlc_deploy_verifies_and_every_forged_copy_is_refused
             for slot in slots:
                 forged = bytearray(honest)
                 forged[slot["start"] + 31] ^= 0x01
+                assert len(forged) == len(honest), "the forgery must not change the length"
                 faddr = to_checksum_address("0x" + "cc" * 18 + f"{forged_count + 1:04x}")
                 await rpc.w3.provider.make_request("anvil_setCode", [faddr, "0x" + bytes(forged).hex()])
                 with pytest.raises(ValidationError, match="does not EXACTLY equal"):
@@ -810,3 +811,352 @@ def test_honest_anvil_responses_are_identical_through_the_scrubbing_provider(anv
         if not string_ids:
             expected = {"revert-reason": "ContractLogicError", "custom-error": "ContractCustomError"}.get(name, "ok")
             assert plain[0] == expected, (name, plain)
+
+
+# ---------------------------------------------------------------------------
+# Contract hardening before the external audit: an empty Erc20Htlc refund reverts WITHOUT settling,
+# EthHtlc refuses zero addresses, and both contracts give claim errors in ONE order. Every refusal
+# below is paired with the honest call it must not refuse.
+# ---------------------------------------------------------------------------
+
+
+def _sel(signature: str) -> str:
+    from eth_utils import keccak
+
+    return "0x" + keccak(text=signature)[:4].hex()
+
+
+def _checksum(address: str) -> str:
+    """``Erc20Token`` stores its address lowercased; web3 accepts only the checksummed form."""
+    from eth_utils import to_checksum_address
+
+    return to_checksum_address(address)
+
+
+def _asm(program: list) -> bytes:
+    """A two-pass assembler for the token below: opcode names, ``("push", n, value)``, ``("label",
+    name)`` and ``("ref", name)`` (a PUSH2 of that label's offset). Written out so a reader can check
+    the token against its mnemonics rather than trust a hex blob."""
+    ops = {
+        "ADD": 0x01, "SUB": 0x03, "LT": 0x10, "EQ": 0x14, "SHR": 0x1C, "CALLER": 0x33,
+        "CALLDATALOAD": 0x35, "MSTORE": 0x52, "SLOAD": 0x54, "SSTORE": 0x55, "JUMPI": 0x57,
+        "JUMPDEST": 0x5B, "PUSH0": 0x5F, "DUP1": 0x80, "DUP2": 0x81, "RETURN": 0xF3, "REVERT": 0xFD,
+    }  # fmt: skip
+
+    def size(item) -> int:
+        if isinstance(item, str) or item[0] == "label":
+            return 1
+        return 1 + item[1] if item[0] == "push" else 3
+
+    labels, pc = {}, 0
+    for item in program:
+        if not isinstance(item, str) and item[0] == "label":
+            labels[item[1]] = pc
+        pc += size(item)
+    out = bytearray()
+    for item in program:
+        if isinstance(item, str):
+            out.append(ops[item])
+        elif item[0] == "push":
+            out += bytes([0x5F + item[1]]) + int(item[2]).to_bytes(item[1], "big")
+        elif item[0] == "label":
+            out.append(ops["JUMPDEST"])
+        else:
+            out += bytes([0x61]) + labels[item[1]].to_bytes(2, "big")
+    return bytes(out)
+
+
+#: A token whose balances MOVE, unlike ``_STUB_TOKEN_RUNTIME`` above: an empty-refund test needs a
+#: balance that is really 0 and then really is not. Storage slot = the holder's address.
+#:   decimals()              -> 6
+#:   balanceOf(a)            -> sload(a)
+#:   transfer(to, v) -> true    reverts when sload(caller) < v; else moves v from caller to `to`
+#: Anything else reverts. No events, no allowances, no freeze list: the HTLC needs none of them.
+_MOVING_TOKEN_RUNTIME = _asm(
+    [
+        "PUSH0", "CALLDATALOAD", ("push", 1, 0xE0), "SHR",
+        "DUP1", ("push", 4, 0x313CE567), "EQ", ("ref", "decimals"), "JUMPI",
+        "DUP1", ("push", 4, 0x70A08231), "EQ", ("ref", "balance"), "JUMPI",
+        "DUP1", ("push", 4, 0xA9059CBB), "EQ", ("ref", "transfer"), "JUMPI",
+        "PUSH0", "PUSH0", "REVERT",
+        ("label", "decimals"), ("push", 1, 6), "PUSH0", "MSTORE", ("push", 1, 32), "PUSH0", "RETURN",
+        ("label", "balance"), ("push", 1, 4), "CALLDATALOAD", "SLOAD", "PUSH0", "MSTORE",
+        ("push", 1, 32), "PUSH0", "RETURN",
+        ("label", "transfer"),
+        ("push", 1, 0x24), "CALLDATALOAD", "CALLER", "SLOAD",  # [v, bal]
+        "DUP2", "DUP2", "LT", ("ref", "fail"), "JUMPI",  # bal < v -> fail
+        "SUB", "CALLER", "SSTORE",  # balance[caller] = bal - v
+        ("push", 1, 0x24), "CALLDATALOAD", ("push", 1, 4), "CALLDATALOAD", "SLOAD", "ADD",
+        ("push", 1, 4), "CALLDATALOAD", "SSTORE",  # balance[to] += v
+        ("push", 1, 1), "PUSH0", "MSTORE", ("push", 1, 32), "PUSH0", "RETURN",
+        ("label", "fail"), "PUSH0", "PUSH0", "REVERT",
+    ]
+)  # fmt: skip
+_MOVING_TOKEN_ADDR = "0x" + "70ce" * 9 + "0002"
+
+
+async def _moving_token(rpc, *, mint_to: str, amount: int):
+    from eth_utils import to_checksum_address
+
+    from pyrxd.eth_wallet.tokens import Erc20Token
+
+    addr = to_checksum_address(_MOVING_TOKEN_ADDR)
+    await rpc.w3.provider.make_request("anvil_setCode", [addr, "0x" + _MOVING_TOKEN_RUNTIME.hex()])
+    slot = "0x" + int(mint_to, 16).to_bytes(32, "big").hex()
+    await rpc.w3.provider.make_request("anvil_setStorageAt", [addr, slot, "0x" + amount.to_bytes(32, "big").hex()])
+    return Erc20Token("MOV", addr, 6, _CHAIN_ID, has_blacklist=False)
+
+
+async def _token_balance(rpc, token, owner: str) -> int:
+    data = _sel("balanceOf(address)") + int(owner, 16).to_bytes(32, "big").hex()
+    return int.from_bytes(bytes(await rpc.w3.eth.call({"to": _checksum(token.address), "data": data})), "big")
+
+
+async def _token_transfer(rpc, token, *, sender: str, to: str, amount: int) -> None:
+    data = _sel("transfer(address,uint256)") + int(to, 16).to_bytes(32, "big").hex() + amount.to_bytes(32, "big").hex()
+    h = await rpc.w3.eth.send_transaction(
+        {"from": sender, "to": _checksum(token.address), "data": data, "gas": 100_000}
+    )
+    assert (await rpc.w3.eth.wait_for_transaction_receipt(h))["status"] == 1
+
+
+async def _revert_selector(rpc, tx: dict) -> str | None:
+    """The 4-byte revert selector an ``eth_call`` of *tx* returns, or None if it does not revert."""
+    resp = await rpc.w3.provider.make_request("eth_call", [tx, "latest"])
+    err = resp.get("error")
+    if err is None:
+        return None
+    data = err.get("data")
+    if isinstance(data, dict):
+        data = data.get("data")
+    assert isinstance(data, str) and data.startswith("0x"), err
+    return data[:10].lower()
+
+
+def _erc20_leg(rpc, token, key: str):
+    from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+
+    return Erc20HtlcLeg(
+        token=token,
+        rpc=rpc,
+        signing_key=PrivateKeyMaterial(bytes.fromhex(key)),
+        chain_id=_CHAIN_ID,
+        artifact=_ERC20_ARTIFACT,
+    )
+
+
+async def _deploy_unfunded_erc20_htlc(rpc, token, *, hashlock: bytes, timeout: int, amount: int):
+    """Deploy an Erc20Htlc and push NOTHING into it: the state a failed or unsent push leaves."""
+    from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+    c = rpc.w3.eth.contract(abi=_ERC20_ARTIFACT["abi"], bytecode=_ERC20_ARTIFACT["bytecode"])
+    h = await c.constructor(hashlock, _ADDR_MAKER, _ADDR_TAKER, timeout, _checksum(token.address), amount).transact(
+        {"from": _ADDR_TAKER}
+    )
+    receipt = await rpc.w3.eth.wait_for_transaction_receipt(h)
+    assert receipt["status"] == 1
+    return Erc20HtlcLocator(
+        chain_id=_CHAIN_ID,
+        contract_address=receipt["contractAddress"],
+        deploy_tx_hash="0x" + bytes(h).hex().removeprefix("0x"),
+        hashlock="0x" + hashlock.hex(),
+        claimant=_ADDR_MAKER,
+        refundee=_ADDR_TAKER,
+        timeout=timeout,
+        amount_wei=amount,
+        token_address=token.address,
+    )
+
+
+async def _settled(rpc, address: str) -> bool:
+    return bool(await rpc.w3.eth.contract(address=address, abi=_ERC20_ARTIFACT["abi"]).functions.settled().call())
+
+
+async def test_an_EMPTY_Erc20Htlc_refund_reverts_WITHOUT_settling_and_a_late_push_still_refunds(anvil_url):
+    """F2. Before this revision ``refund()`` on a matured contract holding no tokens SUCCEEDED: it set
+    ``settled`` and refunded nothing, so tokens pushed afterwards could be moved by neither claim
+    nor refund. Now:
+
+    * the call reverts ``NothingToRefund``, and a refund MINED anyway (sent with a fixed gas limit,
+      past every off-chain check) reverts on chain and leaves ``settled`` false;
+    * the taker's leg refuses it before signing, with ``NothingToRefund``, and spends no nonce;
+    * HONEST PATH: tokens pushed late are refunded in full by the same leg, the contract then
+      settles, and a second refund is ``AlreadySettled``, which the leg does not call "empty"."""
+    from pyrxd.security.errors import NothingToRefund
+
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    try:
+        token = await _moving_token(rpc, mint_to=_ADDR_TAKER, amount=10 * _ERC20_AMOUNT)
+        taker = _erc20_leg(rpc, token, _KEY_TAKER)
+        _p, h = _secret()
+        loc = await _deploy_unfunded_erc20_htlc(
+            rpc, token, hashlock=h, timeout=await _now_plus(rpc, 100), amount=_ERC20_AMOUNT
+        )
+        await _advance_time(rpc, 200)
+        assert await _token_balance(rpc, token, loc.contract_address) == 0
+
+        refund_call = {"from": _ADDR_TAKER, "to": loc.contract_address, "data": _sel("refund()")}
+        assert await _revert_selector(rpc, refund_call) == _sel("NothingToRefund()")
+
+        mined = await rpc.w3.eth.wait_for_transaction_receipt(
+            await rpc.w3.eth.send_transaction({**refund_call, "gas": 200_000})
+        )
+        assert mined["status"] == 0, "an empty refund must revert on chain, not merely in eth_call"
+        assert await _settled(rpc, loc.contract_address) is False, "the revert must leave the contract open"
+
+        nonce_before = await rpc.w3.eth.get_transaction_count(_ADDR_TAKER)
+        with pytest.raises(NothingToRefund, match="nothing to refund") as e:
+            await taker.refund(loc)
+        assert e.value.contract_address == loc.contract_address
+        assert await rpc.w3.eth.get_transaction_count(_ADDR_TAKER) == nonce_before, "nothing may be sent"
+
+        # The late push, then the honest refund through the same leg.
+        before = await _token_balance(rpc, token, _ADDR_TAKER)
+        await _token_transfer(rpc, token, sender=_ADDR_TAKER, to=loc.contract_address, amount=_ERC20_AMOUNT)
+        receipt = await rpc.wait_receipt(await taker.refund(loc))
+        assert int(receipt["status"]) == 1
+        assert await _token_balance(rpc, token, loc.contract_address) == 0
+        assert await _token_balance(rpc, token, _ADDR_TAKER) == before
+        assert await _settled(rpc, loc.contract_address) is True
+
+        assert await _revert_selector(rpc, refund_call) == _sel("AlreadySettled()")
+        with pytest.raises(ValidationError, match="would revert") as again:
+            await taker.refund(loc)
+        assert not isinstance(again.value, NothingToRefund), "a settled contract is not an empty one"
+    finally:
+        await rpc.close()
+
+
+async def test_HONEST_Erc20Htlc_claim_and_refund_through_the_leg_with_a_token_that_moves(anvil_url):
+    """The honest paths the refusals above must not have touched, end to end with real balances:
+    the taker's ``fund`` pushes the tokens, the maker verifies and claims them; a second swap times
+    out and the taker refunds it in full."""
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    try:
+        token = await _moving_token(rpc, mint_to=_ADDR_TAKER, amount=10 * _ERC20_AMOUNT)
+        taker, maker = _erc20_leg(rpc, token, _KEY_TAKER), _erc20_leg(rpc, token, _KEY_MAKER)
+        p, h = _secret()
+        claim_loc = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 3600),
+            amount_wei=_ERC20_AMOUNT,
+        )
+        await maker.verify_funded(claim_loc, expected_amount_wei=_ERC20_AMOUNT)
+        await maker.claim(claim_loc, p)
+        assert await _token_balance(rpc, token, _ADDR_MAKER) == _ERC20_AMOUNT
+
+        _p2, h2 = _secret()
+        refund_loc = await taker.fund(
+            hashlock=h2,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 100),
+            amount_wei=_ERC20_AMOUNT,
+        )
+        before = await _token_balance(rpc, token, _ADDR_TAKER)
+        await _advance_time(rpc, 200)
+        assert int((await rpc.wait_receipt(await taker.refund(refund_loc)))["status"]) == 1
+        assert await _token_balance(rpc, token, _ADDR_TAKER) == before + _ERC20_AMOUNT
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.parametrize("which", ["EthHtlc", "Erc20Htlc"])
+@pytest.mark.parametrize("zero", ["claimant", "refundee", None])
+async def test_both_constructors_refuse_a_zero_claimant_or_refundee(anvil_url, which, zero):
+    """F5. EthHtlc had no zero-address guard; it now reverts ``ZeroAddress``, the error Erc20Htlc
+    already used. ``None`` is the honest pairing: the same creation call with both addresses set
+    succeeds and returns the runtime."""
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    try:
+        art = _ARTIFACT if which == "EthHtlc" else _ERC20_ARTIFACT
+        claimant = "0x" + "00" * 20 if zero == "claimant" else _ADDR_MAKER
+        refundee = "0x" + "00" * 20 if zero == "refundee" else _ADDR_TAKER
+        c = rpc.w3.eth.contract(abi=art["abi"], bytecode=art["bytecode"])
+        timeout = await _now_plus(rpc, 3600)
+        if which == "EthHtlc":
+            data = c.constructor(b"\x11" * 32, claimant, refundee, timeout).data_in_transaction
+            tx = {"from": _ADDR_TAKER, "data": data, "value": hex(_AMOUNT_WEI)}
+        else:
+            token = await _stub_token(rpc)
+            ctor = c.constructor(b"\x11" * 32, claimant, refundee, timeout, _checksum(token.address), _ERC20_AMOUNT)
+            tx = {"from": _ADDR_TAKER, "data": ctor.data_in_transaction}
+        got = await _revert_selector(rpc, tx)
+        assert got == (None if zero is None else _sel("ZeroAddress()")), (which, zero, got)
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.parametrize("which", ["EthHtlc", "Erc20Htlc"])
+async def test_both_contracts_give_claim_errors_in_ONE_order(anvil_url, which):
+    """F5. The agreed order is AlreadySettled, then Expired, then BadPreimage (then, for the token
+    contract, Underfunded). EthHtlc used to check the preimage before the clock, so a late claim
+    with a wrong preimage said BadPreimage there and Expired in Erc20Htlc. The same expectations are
+    checked against BOTH contracts, honest calls included."""
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    try:
+        if which == "EthHtlc":
+            taker = EthHtlcContractLeg(
+                rpc=rpc,
+                signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)),
+                chain_id=_CHAIN_ID,
+                artifact=_ARTIFACT,
+            )
+            amount, token = _AMOUNT_WEI, None
+        else:
+            token = await _moving_token(rpc, mint_to=_ADDR_TAKER, amount=10 * _ERC20_AMOUNT)
+            taker = _erc20_leg(rpc, token, _KEY_TAKER)
+            amount = _ERC20_AMOUNT
+        p, h = _secret()
+        wrong = bytes(b ^ 0xFF for b in p)
+
+        def claim_call(address: str, preimage: bytes) -> dict:
+            return {"from": _ADDR_MAKER, "to": address, "data": _sel("claim(bytes32)") + preimage.hex()}
+
+        async def fund(seconds: int):
+            return await taker.fund(
+                hashlock=h,
+                claimant=_ADDR_MAKER,
+                refundee=_ADDR_TAKER,
+                timeout=await _now_plus(rpc, seconds),
+                amount_wei=amount,
+            )
+
+        live = await fund(3600)  # stays open, then gets claimed
+        late = await fund(100)  # expires
+        bad, expired, settled = _sel("BadPreimage()"), _sel("Expired()"), _sel("AlreadySettled()")
+
+        # Open and in time: only the preimage decides. The honest claim is accepted.
+        assert await _revert_selector(rpc, claim_call(live.contract_address, wrong)) == bad
+        assert await _revert_selector(rpc, claim_call(live.contract_address, p)) is None
+        if token is not None:
+            # In time, right preimage, nothing pushed: the token contract's last check.
+            empty = await _deploy_unfunded_erc20_htlc(
+                rpc, token, hashlock=h, timeout=await _now_plus(rpc, 3600), amount=amount
+            )
+            assert await _revert_selector(rpc, claim_call(empty.contract_address, p)) == _sel("Underfunded()")
+            assert await _revert_selector(rpc, claim_call(empty.contract_address, wrong)) == bad
+            empty_late = await _deploy_unfunded_erc20_htlc(
+                rpc, token, hashlock=h, timeout=await _now_plus(rpc, 100), amount=amount
+            )
+
+        # Settle `live` with a real claim; afterwards AlreadySettled wins over everything.
+        sent = await rpc.w3.eth.send_transaction({**claim_call(live.contract_address, p), "gas": 200_000})
+        assert (await rpc.w3.eth.wait_for_transaction_receipt(sent))["status"] == 1
+        assert await _revert_selector(rpc, claim_call(live.contract_address, p)) == settled
+        assert await _revert_selector(rpc, claim_call(live.contract_address, wrong)) == settled
+
+        # Past the timeout: Expired, WHATEVER the preimage. This is the case the order decides.
+        await _advance_time(rpc, 200)
+        assert await _revert_selector(rpc, claim_call(late.contract_address, wrong)) == expired
+        assert await _revert_selector(rpc, claim_call(late.contract_address, p)) == expired
+        assert await _revert_selector(rpc, claim_call(live.contract_address, wrong)) == settled
+        if token is not None:
+            # Expired AND underfunded: the clock comes first.
+            assert await _revert_selector(rpc, claim_call(empty_late.contract_address, p)) == expired
+            # Still in time AND underfunded: unchanged by the advance.
+            assert await _revert_selector(rpc, claim_call(empty.contract_address, p)) == _sel("Underfunded()")
+    finally:
+        await rpc.close()
