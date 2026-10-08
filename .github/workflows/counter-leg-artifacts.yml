@@ -1,0 +1,44 @@
+# counter-leg-artifacts — rebuild tests/fixtures/{EthHtlc,Erc20Htlc}.json from contracts/*.sol
+# and fail on any byte of difference.
+#
+# Those two artifacts are what this repo's swap runners check a taker-deployed contract against,
+# byte for byte. scripts/build_counter_leg_artifacts.py compiles the committed source with a
+# sha256-pinned solc and pinned settings; `--check` compares the result with the committed files.
+# So a source edit without a rebuild, a hand-edited artifact, or a stray artifact the script does
+# not build fails here. The digest pins in tests/test_counter_leg_artifact_provenance.py then tie
+# the rebuilt bytes to reviewed constants.
+#
+# NO `paths:` filter and NO `branches:` filter on pull_request, deliberately: a filter is a way for
+# a change to reach main without this check having run on it (a docs-only PR that also touches a
+# fixture, a stacked PR into a non-main base). `counter-leg artifacts rebuild` is a REQUIRED check
+# on main (branch protection, since 2026-10-07), and tests/test_ci_workflows_check_every_pr_base.py
+# lists it in _REQUIRED_CHECKS: `test_every_required_check_runs_on_every_pull_request` fails on a
+# `branches:`, `paths:` or `paths-ignore:` filter here or on a renamed job, and the protection
+# payload in scripts/post-public-flip.sh is pinned to the same list.
+# It is cheap: one checkout, one ~15 MB download, two compiles. Stdlib Python only, so no install.
+
+name: counter-leg-artifacts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild-check:
+    name: counter-leg artifacts rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rebuild the counter-leg artifacts and compare byte for byte
+        run: python3 scripts/build_counter_leg_artifacts.py --check

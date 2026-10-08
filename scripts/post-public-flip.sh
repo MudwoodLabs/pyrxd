@@ -82,7 +82,8 @@ gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
       {"context": "Scan for leaked secrets", "app_id": 15368},
       {"context": "Analyze (Python)", "app_id": 15368},
       {"context": "scan-pr / osv-scan", "app_id": 15368},
-      {"context": "leak-scan", "app_id": 15368}
+      {"context": "leak-scan", "app_id": 15368},
+      {"context": "counter-leg artifacts rebuild", "app_id": 15368}
     ]
   },
   "enforce_admins": true,

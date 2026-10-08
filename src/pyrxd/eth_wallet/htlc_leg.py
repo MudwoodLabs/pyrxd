@@ -568,10 +568,18 @@ class EthHtlcContractLeg:
                 "NOT YET FINALIZED — compare against 'latest' and retry once it buries. Empty code "
                 "at a checkpoint is not evidence of a wrong or attacker contract."
             )
-        if bytes(code) != self._expected_runtime(locator):
+        code, expected = bytes(code), self._expected_runtime(locator)
+        if code != expected:
+            # Say HOW it differs: a length mismatch is a different contract altogether, while a
+            # same-length difference at an immutable offset is the #798 forged-copy shape.
+            if len(code) != len(expected):
+                how = f"{len(code)} bytes present, {len(expected)} expected"
+            else:
+                first = next(i for i, (a, b) in enumerate(zip(code, expected)) if a != b)
+                how = f"same length ({len(code)} bytes), first difference at byte {first}"
             raise ValidationError(
                 f"on-chain runtime at {locator.contract_address} does not EXACTLY equal the runtime "
-                f"expected for the negotiated terms ({len(code)} bytes present, but different) — "
+                f"expected for the negotiated terms ({how}) — "
                 "wrong/attacker contract, or an immutable copy the getters cannot see was forged"
             )
         # Code is exact; storage is not code. Same pinned block as every other read here.
@@ -835,10 +843,12 @@ class EthHtlcContractLeg:
             web3.Web3.to_checksum_address(refundee),
             int(timeout),
         )
-        # Deploy gas: the contract's runtime CODE DEPOSIT alone is 200 gas/byte (EthHtlc's
-        # ~2.1 KB runtime ≈ 418k) + constructor + base tx ≈ 510k measured on Anvil. 400k
-        # out-of-gas-reverted the deploy (Phase-4 finding); 800k gives comfortable margin (you
-        # pay gasUsed, not the limit). A per-artifact eth_estimateGas is the robust follow-up.
+        # Deploy gas: the contract's runtime CODE DEPOSIT alone is 200 gas/byte, plus constructor
+        # and base tx. The optimized EthHtlc (1,215-byte runtime) deployed for 318,414 gas on Anvil
+        # (2026-10-07); the earlier unoptimized build (2,087 bytes) took 510,245, and 400k
+        # out-of-gas-reverted it (Phase-4 finding). 800k is a fixed limit, so it also covers an
+        # injected artifact up to roughly that older size (you pay gasUsed, not the limit). A
+        # per-artifact eth_estimateGas is the robust follow-up.
         tx = await self._base_tx(gas=800_000)
         tx["value"] = int(amount_wei)
         built = await ctor.build_transaction(tx)

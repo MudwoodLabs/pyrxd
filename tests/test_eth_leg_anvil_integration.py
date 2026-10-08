@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import socket
 import subprocess
@@ -177,46 +178,86 @@ async def test_verify_funded_rejects_wrong_amount(anvil_url):
 
 
 async def test_forged_immutable_copy_is_rejected_by_verify_funded(anvil_url):
-    """FUND-SAFETY regression (proven exploit → fix). Solidity splices each immutable into 2–3
-    SEPARATE runtime offsets; ``claimant`` (ref id 6) has copies at 1224 and 1418. The getter — and
-    therefore verify_funded's claimant() bind — reads 1418, while ``claim()``'s value send reads
-    1224. The old value-masked compare wildcarded every committed-zero byte and never checked the
-    copies agreed, so a hostile TAKER could deploy a runtime with 1418=maker (getter honest) and
-    1224=attacker: verify_funded passed, then claim(p) drained the whole balance to the attacker
-    while revealing p (handing the taker the RXD leg too).
+    """FUND-SAFETY regression (proven exploit → fix, #798). Solidity splices each immutable into
+    SEPARATE runtime offsets; ``claimant`` has two. The getter (and so verify_funded's claimant()
+    bind) reads one, while ``claim()``'s value send reads the other. The old value-masked compare
+    never checked the copies agreed, so a hostile TAKER could deploy a runtime whose getter copy
+    says maker and whose claim() copy says attacker: verify_funded passed, then claim(p) paid the
+    whole balance to the attacker while revealing p (handing the taker the RXD leg too).
 
-    Here: deploy the honest contract, read its real spliced runtime, forge ONLY the 1224 copy, place
-    it at a fresh address via anvil_setCode + fund it, then run the MAKER's real verify_funded. The
-    slot-exact compare must REJECT it (before the fix, verify_funded passed and the maker was robbed)."""
+    No offset is hardcoded: a literal (1224, from the unoptimized build) outlived a rebuild that made
+    the runtime 1,215 bytes long, the slice APPENDED instead of forging, and the refusal this test
+    asserted was about length. So, for EACH copy of ``claimant`` from the artifact, this forges that
+    copy alone (same length, differing only inside that 32-byte window), places it at a fresh funded
+    address, and:
+
+    * EXECUTES the attack: claim(p) is sent to the forged contract and the attacker's balance is
+      read. Exactly one copy, the one the getter does not read, moves the funds to the attacker,
+      while ``claimant()`` on that contract still answers the maker. So the forgery is real.
+    * runs the MAKER's real verify_funded on every forged contract, which must refuse it with the
+      SAME-LENGTH message naming a first differing byte inside the forged window."""
     from eth_utils import to_checksum_address
+
+    from tests.test_eth_htlc_immutable_names import getter_reads
+
+    claimant_id = next(k for k, v in _ARTIFACT["immutable_names"].items() if v == "claimant")
+    copies = sorted(r["start"] for r in _ARTIFACT["immutableReferences"][claimant_id])
+    assert len(copies) >= 2, copies
 
     rpc, taker, maker = _legs(anvil_url)
     try:
-        _p, h = _secret()
+        p, h = _secret()
         timeout = await _now_plus(rpc, 3600)
         honest = await taker.fund(
             hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_AMOUNT_WEI
         )
-        runtime = bytearray(await rpc.get_code(honest.contract_address))
-        attacker = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"  # taker's own second address
-        runtime[1224 : 1224 + 32] = b"\x00" * 12 + bytes.fromhex(attacker[2:])  # forge the claim() copy only
-        faddr = to_checksum_address("0x" + "c0de" * 10)
-        await rpc.w3.provider.make_request("anvil_setCode", [faddr, "0x" + bytes(runtime).hex()])
-        await rpc.w3.provider.make_request("anvil_setBalance", [faddr, hex(_AMOUNT_WEI)])
-        forged_loc = EthHtlcLocator(
-            chain_id=_CHAIN_ID,
-            contract_address=faddr,
-            deploy_tx_hash="0x" + "00" * 32,
-            hashlock="0x" + h.hex(),
-            claimant=_ADDR_MAKER,
-            refundee=_ADDR_TAKER,
-            timeout=timeout,
-            amount_wei=_AMOUNT_WEI,
-        )
-        # The getter copy (1418) is still the honest maker, so every immutable-by-getter bind passes;
-        # only the exact runtime compare stands between the maker and revealing p to a robbing contract.
-        with pytest.raises(ValidationError, match="does not EXACTLY equal"):
-            await maker.verify_funded(forged_loc, expected_amount_wei=_AMOUNT_WEI)
+        honest_runtime = bytes(await rpc.get_code(honest.contract_address))
+        attacker = to_checksum_address("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")  # taker's 2nd address
+        drained_by: list[int] = []
+        for n, off in enumerate(copies):
+            runtime = bytearray(honest_runtime)
+            runtime[off : off + 32] = b"\x00" * 12 + bytes.fromhex(attacker[2:])
+            changed = [i for i in range(len(runtime)) if runtime[i] != honest_runtime[i]]
+            assert len(runtime) == len(honest_runtime), "the forgery must not change the length"
+            assert changed and all(off <= i < off + 32 for i in changed), (off, changed)
+
+            faddr = to_checksum_address("0x" + "c0de" * 9 + f"{n + 1:04x}")
+            await rpc.w3.provider.make_request("anvil_setCode", [faddr, "0x" + bytes(runtime).hex()])
+            await rpc.w3.provider.make_request("anvil_setBalance", [faddr, hex(_AMOUNT_WEI)])
+            forged_loc = EthHtlcLocator(
+                chain_id=_CHAIN_ID,
+                contract_address=faddr,
+                deploy_tx_hash="0x" + "00" * 32,
+                hashlock="0x" + h.hex(),
+                claimant=_ADDR_MAKER,
+                refundee=_ADDR_TAKER,
+                timeout=timeout,
+                amount_wei=_AMOUNT_WEI,
+            )
+            with pytest.raises(
+                ValidationError, match=r"same length \(\d+ bytes\), first difference at byte (\d+)"
+            ) as e:
+                await maker.verify_funded(forged_loc, expected_amount_wei=_AMOUNT_WEI)
+            first = int(re.search(r"first difference at byte (\d+)", str(e.value)).group(1))
+            assert off <= first < off + 32, (off, first)
+
+            # The attack, executed: what does claim(p) on this forged contract actually pay?
+            c = rpc.w3.eth.contract(address=faddr, abi=_ARTIFACT["abi"])
+            getter_says = await c.functions.claimant().call()
+            before = await rpc.w3.eth.get_balance(attacker)
+            receipt = await rpc.w3.eth.wait_for_transaction_receipt(
+                await c.functions.claim(p).transact({"from": _ADDR_MAKER})
+            )
+            assert receipt["status"] == 1
+            gained = await rpc.w3.eth.get_balance(attacker) - before
+            assert gained in (0, _AMOUNT_WEI), gained
+            if gained:
+                assert getter_says == _ADDR_MAKER  # the getter cannot see the copy that pays
+                drained_by.append(off)
+
+        # Exactly one copy redirects the funds, and it is the copy the claimant() getter does NOT read.
+        assert len(drained_by) == 1, drained_by
+        assert drained_by[0] not in getter_reads(_ARTIFACT)["claimant"]
     finally:
         await rpc.close()
 

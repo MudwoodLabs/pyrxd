@@ -59,15 +59,21 @@ def _is_push(op: int) -> bool:
     return 0x60 <= op <= 0x7F
 
 
-def derive_immutable_names(artifact: dict) -> dict[str, str]:
-    """``{reference-id: getter-name}`` derived from bytecode + ABI + ``immutableReferences`` only."""
+def getter_reads(artifact: dict) -> dict[str, set[int]]:
+    """``{getter-name: {offset, ...}}``: the ``immutableReferences`` OFFSETS each no-argument view
+    getter's code path loads, from bytecode + ABI + ``immutableReferences`` only.
+
+    Solidity splices each immutable into several offsets and a getter reads only one of them, so
+    this also tells a test which copy is NOT the getter's (the copy ``claim()`` pays from, for
+    ``claimant``) without hardcoding an offset that moves with every build.
+    """
     code = bytes.fromhex(artifact["runtime_bytecode"].removeprefix("0x"))
     ops = _decode(code)
     pcs = sorted(ops)
     index = {pc: i for i, pc in enumerate(pcs)}
-    id_at = {slot["start"]: str(rid) for rid, slots in artifact["immutableReferences"].items() for slot in slots}
+    referenced = {slot["start"] for slots in artifact["immutableReferences"].values() for slot in slots}
 
-    derived: dict[str, str] = {}
+    reads: dict[str, set[int]] = {}
     for fn in artifact["abi"]:
         if fn.get("type") != "function" or fn.get("inputs") or fn.get("stateMutability") not in ("view", "pure"):
             continue
@@ -86,7 +92,7 @@ def derive_immutable_names(artifact: dict) -> dict[str, str]:
         assert len(entries) == 1, f"{fn['name']}: expected one dispatcher entry, found {entries}"
         assert ops.get(entries[0], (None,))[0] == _JUMPDEST, f"{fn['name']}: dispatcher target is not a JUMPDEST"
 
-        loaded: set[str] = set()
+        offsets: set[int] = set()
         seen: set[int] = set()
         todo = list(entries)
         while todo:
@@ -95,20 +101,30 @@ def derive_immutable_names(artifact: dict) -> dict[str, str]:
                 continue
             seen.add(pc)
             op, _ = ops[pc]
-            if op == _PUSH32 and pc + 1 in id_at:
-                loaded.add(id_at[pc + 1])
+            if op == _PUSH32 and pc + 1 in referenced:
+                offsets.add(pc + 1)
             i = index[pc]
             prev_op, prev_imm = ops[pcs[i - 1]] if i else (None, b"")
             if op in (_JUMP, _JUMPI) and prev_op is not None and _is_push(prev_op):
                 todo.append(int.from_bytes(prev_imm, "big"))
             if op not in _HALTS and i + 1 < len(pcs):
                 todo.append(pcs[i + 1])
+        reads[fn["name"]] = offsets
+    return reads
+
+
+def derive_immutable_names(artifact: dict) -> dict[str, str]:
+    """``{reference-id: getter-name}`` derived from bytecode + ABI + ``immutableReferences`` only."""
+    id_at = {slot["start"]: str(rid) for rid, slots in artifact["immutableReferences"].items() for slot in slots}
+    derived: dict[str, str] = {}
+    for name, offsets in getter_reads(artifact).items():
+        loaded = {id_at[o] for o in offsets}
         if not loaded:
             continue  # a view getter over storage (Erc20Htlc's `settled`), not an immutable
-        assert len(loaded) == 1, f"getter {fn['name']} loads several immutables {sorted(loaded)}; cannot name one"
+        assert len(loaded) == 1, f"getter {name} loads several immutables {sorted(loaded)}; cannot name one"
         (rid,) = loaded
-        assert rid not in derived, f"ref id {rid} is loaded by both {derived[rid]!r} and {fn['name']!r}"
-        derived[rid] = fn["name"]
+        assert rid not in derived, f"ref id {rid} is loaded by both {derived[rid]!r} and {name!r}"
+        derived[rid] = name
     return derived
 
 

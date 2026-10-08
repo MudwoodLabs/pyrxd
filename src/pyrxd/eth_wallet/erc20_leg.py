@@ -245,7 +245,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             # THE FRESH-FUND BRANCH ONLY, and that scoping is the whole subtlety. This is the CHEAP
             # copy of the gate — it cannot name the contract, because on a fresh fund the contract
             # does not exist until the deploy below — and it is here so a doomed swap costs nothing
-            # rather than a 412k-gas deploy. The load-bearing copy runs in `_push_and_bind`, inside
+            # rather than a ~450k-gas deploy. The load-bearing copy runs in `_push_and_bind`, inside
             # the branch that actually moves tokens.
             #
             # A first version ran before this `if`, on RESUMES too, passing the known contract
@@ -299,7 +299,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             checksum(self._token.address),
             int(amount_wei),
         )
-        # Deploy measured at 412,786 on a mainnet fork; the inherited 800k limit covers it.
+        # Deploy measured at 450,657 on Anvil (2026-10-07, mock token); the inherited 800k limit covers it.
         deploy_tx = await self._base_tx(gas=800_000)
         built = await ctor.build_transaction(deploy_tx)
         deploy_hash = await self._sign_and_send(built, preflight=False)

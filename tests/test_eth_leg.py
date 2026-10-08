@@ -687,12 +687,22 @@ def test_expected_runtime_rejects_a_forged_immutable_copy_the_getters_cannot_see
     for refs in _REAL_ART["immutableReferences"].values():
         for r in refs:
             assert expected[r["start"] : r["start"] + 32] != b"\x00" * 32
-    # THE ATTACK: forge ONLY the claim()-copy of `claimant` (id 6 has copies at 1224 and 1418; the
-    # getter reads 1418, claim() reads 1224). The forged runtime keeps the getter copy honest, so
-    # every getter bind in verify_funded still passes — the exact compare is what rejects it.
+    # THE ATTACK: forge ONLY the claim()-copy of `claimant`, the copy its getter does not read. The
+    # offset is DERIVED: a literal (1224, from the unoptimized build) outlived a rebuild that made
+    # the runtime 1,215 bytes long, so the slice appended past the end instead of forging anything.
+    from tests.test_eth_htlc_immutable_names import getter_reads
+
+    claimant_id = next(k for k, v in _REAL_ART["immutable_names"].items() if v == "claimant")
+    copies = {r["start"] for r in _REAL_ART["immutableReferences"][claimant_id]}
+    getter_copy = getter_reads(_REAL_ART)["claimant"]
+    assert len(getter_copy) == 1 and getter_copy < copies, (getter_copy, copies)
+    (claim_copy,) = copies - getter_copy  # EthHtlc's claimant has exactly two copies
     attacker = bytes.fromhex("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
     forged = bytearray(expected)
-    forged[1224 : 1224 + 32] = b"\x00" * 12 + attacker
+    forged[claim_copy : claim_copy + 32] = b"\x00" * 12 + attacker
+    assert len(forged) == len(expected)  # a forged COPY, not a different-length contract
+    assert [i for i in range(len(expected)) if forged[i] != expected[i]], "the forgery changed nothing"
+    assert all(claim_copy <= i < claim_copy + 32 for i in range(len(expected)) if forged[i] != expected[i])
     assert bytes(forged) != expected  # the forgery is visible to an exact compare (which this does not run)
     # And a byte flipped anywhere in the LOGIC (a committed-zero position the old mask ignored) is
     # likewise rejected: find a non-immutable zero byte and flip it.
