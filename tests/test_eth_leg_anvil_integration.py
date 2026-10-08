@@ -527,13 +527,19 @@ async def test_a_real_Erc20Htlc_deploy_verifies_and_every_forged_copy_is_refused
             for slot in slots:
                 forged = bytearray(honest)
                 forged[slot["start"] + 31] ^= 0x01
-                assert len(forged) == len(honest), "the forgery must not change the length"
                 faddr = to_checksum_address("0x" + "cc" * 18 + f"{forged_count + 1:04x}")
                 await rpc.w3.provider.make_request("anvil_setCode", [faddr, "0x" + bytes(forged).hex()])
-                with pytest.raises(ValidationError, match="does not EXACTLY equal"):
+                # The verifier must see a SAME-LENGTH runtime differing exactly at the flipped byte,
+                # so the refusal is about the forged copy and not about a different contract.
+                with pytest.raises(
+                    ValidationError,
+                    match=r"does not EXACTLY equal.*same length \(\d+ bytes\), first difference at byte",
+                ) as e:
                     await maker.verify_funded(
                         dataclasses.replace(loc, contract_address=faddr), expected_amount_wei=_ERC20_AMOUNT
                     )
+                first = int(re.search(r"first difference at byte (\d+)", str(e.value)).group(1))
+                assert first == slot["start"] + 31, (slot, first)
                 forged_count += 1
         # Non-vacuity: every slot of every immutable was forged and refused.
         assert forged_count == sum(len(s) for s in _ERC20_ARTIFACT["immutableReferences"].values()) >= 12

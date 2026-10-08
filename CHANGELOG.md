@@ -77,15 +77,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     contract unsettled.** Before, `refund()` after the timeout on a deployed but never-funded
     contract succeeded: it set `settled`, refunded nothing, and any tokens sent to the contract
     afterwards could be moved by neither `claim` nor `refund`. Now tokens that arrive later can
-    still be refunded. `claim()` needs no change: it already refuses a balance below the
-    negotiated amount, which is never zero.
+    still be refunded, unless someone settles the contract first by calling `refund()` while it
+    holds a non-zero balance. `refund()` can be called by anyone, so a third party can still do
+    this for the cost of one token base unit plus gas, where before it cost only gas. Nothing can be
+    stolen this way: a refund always pays the refundee. `claim()` needs no change: it already
+    refuses a balance below the negotiated amount, which is never zero.
   - **`Erc20HtlcLeg.refund` raises the new `NothingToRefund` error** (a `ValidationError`, in
     `pyrxd.security.errors`) before signing anything when the contract has timed out, is not
     settled and holds no tokens. A not-yet-mature refund and a refund of a settled contract behave
-    as before. `SwapCoordinator.taker_refund_btc` lets it propagate and does not advance the swap;
-    `SwapCoordinator.mutual_refund` still refunds the Radiant leg, does not record the swap as
-    refunded, and raises `NothingToRefund` rather than a retryable `NetworkError` when that is its
-    only failure.
+    as before.
+  - **`SwapCoordinator.taker_refund_btc` ends an ERC-20 swap at `BTC_LOCKED` as `ABORTED` when its
+    contract is past its timeout, unsettled and empty**, recording why in the new
+    `SwapRecord.abort_reason` (new event `COUNTER_LEG_EXPIRED_EMPTY`, the existing
+    `BTC_LOCKED → ABORTED` edge). That state is reached after a refused resume, which tracks a
+    deployed token contract whose push may never have landed. Before, the refund was refused, the
+    swap stayed `BTC_LOCKED` with no way out, and the watchtower's page for `taker_refund_btc`
+    repeated forever. The watchtower's page now says the contract may be empty and what the step
+    does then. Elsewhere `NothingToRefund` propagates and the swap does not advance.
+  - **`SwapCoordinator.mutual_refund` records each leg's refund as it succeeds**
+    (`SwapRecord.counter_refund_tx`, `SwapRecord.asset_refund_txid`) and does not re-send it on a
+    retry. Re-sending a refund of a settled contract or a spent covenant fails, which made every
+    retry after a partial refund fail too. When the only failure is an empty ERC-20 contract it
+    raises `NothingToRefund` rather than a retryable `NetworkError`, on the first call and on every
+    retry, and does not record the swap as refunded.
   - **`EthHtlc`'s constructor reverts `ZeroAddress` on a zero claimant or refundee**, the error and
     check `Erc20Htlc` already had.
   - **Both contracts check claim errors in one order: `AlreadySettled`, then `Expired`, then

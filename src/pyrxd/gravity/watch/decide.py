@@ -765,11 +765,21 @@ def _decide_eth(
             )
         deadline_s = terms.eth_timeout_unix_s
         if obs.now_unix_s is not None and deadline_s is not None and obs.now_unix_s >= deadline_s:
+            # A refused TOKEN fund is tracked whenever its push nonce was recorded, and that nonce is
+            # recorded before the push is broadcast: the contract may be EMPTY. Say so, and say what
+            # the step does then — it records the swap aborted rather than sending a refund the
+            # contract would revert — so the page is true either way and running it ends it.
+            empty_note = (
+                " The token push may never have landed: taker_refund_btc refunds what the contract holds, "
+                "and if it holds nothing it records the swap aborted (nothing to refund), which ends this page."
+                if refused is not None and terms.token_address
+                else ""
+            )
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=(
                     f"the taker refused to complete the fund ({refused}); the ETH HTLC timeout {deadline_s} has "
-                    f"passed (now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"
+                    f"passed (now {obs.now_unix_s}) — refund the ETH counter-leg HTLC.{empty_note}"
                     if refused is not None
                     else f"maker never locked the asset; the ETH HTLC timeout {deadline_s} has passed "
                     f"(now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"

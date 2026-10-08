@@ -1937,6 +1937,77 @@ async def test_a_definitively_refused_token_resume_whose_push_may_have_been_sent
     assert "the token push may have been sent" in str(exc) and "fund" not in eth.calls
 
 
+async def _refused_token_resume_past_its_deadline():
+    """A token fund interrupted after the push nonce was recorded, resumed too late (refused
+    definitively): BTC_LOCKED with a token locator. Returns the coordinator, its leg and the
+    first watchtower decision once the deadline has passed."""
+    coord, eth, _exc, _ = await _resume(covenant_funded=True, now=_LATE, token="0x" + "77" * 20, push_nonce=7)
+    rec = coord.record
+    assert rec.state is SwapState.BTC_LOCKED and rec.fund_refusal
+    page = _eth_decide(rec, now_unix_s=rec.terms.eth_timeout_unix_s + 60)
+    return coord, eth, page
+
+
+async def test_a_refused_token_resume_whose_push_NEVER_LANDED_ends_aborted_and_stops_paging():
+    """Review finding (MEDIUM). The refused resume tracks the token contract at BTC_LOCKED because
+    the push nonce was recorded, but that nonce is recorded BEFORE the push is broadcast, so the
+    contract may be empty. At the deadline the watchtower paged taker_refund_btc; the leg refused it
+    (NothingToRefund), the swap stayed BTC_LOCKED, and the page repeated on every tick, forever.
+
+    The whole path: refused resume -> deadline -> page -> taker_refund_btc on an empty contract ->
+    ABORTED with an honest abort_reason, persisted, surviving a JSON round trip -> no further page.
+    The leg's own refusal is faked here; that the real Erc20HtlcLeg raises it on an empty contract
+    is proven on Anvil (test_an_EMPTY_Erc20Htlc_refund_reverts_WITHOUT_settling_...)."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord, eth, page = await _refused_token_resume_past_its_deadline()
+    assert page.intent.name == "PAGE_REFUND" and page.recommended_action == "taker_refund_btc", page
+    assert "may never have landed" in page.reason and "records the swap aborted" in page.reason, page.reason
+
+    address = coord.record.counterchain_locator.contract_address
+
+    async def _empty(*_a, **_k):
+        raise NothingToRefund("nothing to refund: the HTLC holds 0", contract_address=address)
+
+    eth.refund = _empty
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.ABORTED
+    assert "nothing to refund" in rec.abort_reason and address in rec.abort_reason
+    assert "past its timeout, so no claim can take it" in rec.abort_reason
+    assert coord.persisted[-1] == rec
+    reloaded = SwapRecord.from_dict(json.loads(json.dumps(rec.to_dict())))
+    assert reloaded.state is SwapState.ABORTED and reloaded.abort_reason == rec.abort_reason
+    # The alert does not repeat: every later tick on the terminal record pages nothing.
+    for later in (60, 3600, 86_400):
+        tick = _eth_decide(reloaded, now_unix_s=rec.terms.eth_timeout_unix_s + later)
+        assert not tick.intent.name.startswith("PAGE"), tick
+
+
+async def test_HONEST_a_refused_token_resume_whose_push_LANDED_is_refunded_normally():
+    """The pairing: the push did land, so the refund goes through and the swap ends ABORTED by the
+    ordinary maker-never-locked edge, with no abort_reason."""
+    coord, eth, page = await _refused_token_resume_past_its_deadline()
+    assert page.recommended_action == "taker_refund_btc"
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.ABORTED and eth.refunded and rec.abort_reason is None
+
+
+async def test_an_empty_counter_leg_after_PARAMS_MISMATCH_is_not_aborted_silently():
+    """The terminal edge is BTC_LOCKED only. From PARAMS_MISMATCH the refusal propagates."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord, eth, _page = await _refused_token_resume_past_its_deadline()
+    coord.record = coord.record.with_state(SwapState.PARAMS_MISMATCH)
+
+    async def _empty(*_a, **_k):
+        raise NothingToRefund("nothing to refund")
+
+    eth.refund = _empty
+    with pytest.raises(NothingToRefund):
+        await coord.taker_refund_btc()
+    assert coord.record.state is SwapState.PARAMS_MISMATCH
+
+
 async def test_a_leg_that_cannot_rebuild_the_locator_keeps_the_handle_and_says_so():
     class _NoExpected(FakeEthLeg):
         expected_locator = None

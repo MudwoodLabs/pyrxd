@@ -3943,10 +3943,10 @@ async def test_mutual_refund_with_an_EMPTY_counter_leg_AND_a_transient_failure_s
 
 
 @pytest.mark.asyncio
-async def test_taker_refund_with_an_EMPTY_counter_leg_raises_and_does_not_advance():
-    """taker_refund_btc refunds the counter leg alone. An empty HTLC must surface as
-    NothingToRefund and leave the swap where it was: recording ABORTED would claim a refund that
-    returned nothing. (The honest path, where the refund succeeds and the swap ends ABORTED, is
+async def test_taker_refund_with_an_EMPTY_counter_leg_on_a_NON_TOKEN_swap_raises_and_does_not_advance():
+    """The terminal transition for an empty counter leg is scoped to an ERC-20 swap at BTC_LOCKED
+    (see test_taker_funding_spv_gate.py). Anywhere else a NothingToRefund propagates and the swap
+    stays where it was. (The honest path, where the refund succeeds and the swap ends ABORTED, is
     pinned by the PARAMS_MISMATCH test above.)"""
     from pyrxd.security.errors import NothingToRefund
 
@@ -3958,6 +3958,73 @@ async def test_taker_refund_with_an_EMPTY_counter_leg_raises_and_does_not_advanc
     with pytest.raises(NothingToRefund):
         await coord.taker_refund_btc()
     assert coord.record.state is SwapState.BTC_LOCKED
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_retried_after_the_radiant_leg_refunded_gives_the_SAME_permanent_answer():
+    """Review finding (LOW): the first call refunded the Radiant leg and raised NothingToRefund for
+    the empty counter leg; the second re-sent the Radiant refund, which fails once the covenant is
+    spent, and so raised a retryable NetworkError. A driver retrying on NetworkError then looped.
+    The Radiant refund is now recorded when it succeeds and not re-sent, so two consecutive calls
+    give the same permanent answer, and once tokens reach the contract a third call completes."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord = await _both_locked_coordinator()
+    radiant_sends: list[int] = []
+
+    async def _radiant_refund_once(*_a, **_k):
+        radiant_sends.append(1)
+        if len(radiant_sends) > 1:
+            raise NetworkError("covenant already spent")
+        return "rxd-refund-txid"
+
+    coord.counter_leg.refund = _nothing_to_refund()
+    coord.radiant_leg.refund_asset = _radiant_refund_once
+    for _ in range(2):
+        with pytest.raises(NothingToRefund) as e:
+            await coord.mutual_refund()
+        assert not isinstance(e.value, NetworkError)
+        assert coord.record.state is SwapState.BOTH_LOCKED
+    assert radiant_sends == [1], "the Radiant refund must not be re-sent"
+    assert coord.record.asset_refund_txid == "rxd-refund-txid"
+    assert SwapRecord.from_dict(json.loads(json.dumps(coord.record.to_dict()))).asset_refund_txid == "rxd-refund-txid"
+
+    async def _counter_refund(*_a, **_k):
+        return "0xcounter-refund"
+
+    coord.counter_leg.refund = _counter_refund  # the tokens arrived
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and radiant_sends == [1]
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_retried_after_the_COUNTER_leg_refunded_does_not_resend_it():
+    """The same mechanism, the other leg (it had the same retry-forever shape: the settled
+    counter-leg contract reverts a second refund). HONEST path: the retry completes."""
+    coord = await _both_locked_coordinator()
+    counter_sends: list[int] = []
+    radiant_calls: list[int] = []
+
+    async def _counter_refund_once(*_a, **_k):
+        counter_sends.append(1)
+        if len(counter_sends) > 1:
+            raise ValidationError("tx would revert (preflight eth_call): AlreadySettled")
+        return "0xcounter-refund"
+
+    async def _radiant_flaky(*_a, **_k):
+        radiant_calls.append(1)
+        if len(radiant_calls) == 1:
+            raise NetworkError("radiant node unreachable")
+        return "rxd-refund-txid"
+
+    coord.counter_leg.refund = _counter_refund_once
+    coord.radiant_leg.refund_asset = _radiant_flaky
+    with pytest.raises(NetworkError, match="radiant node unreachable"):
+        await coord.mutual_refund()
+    assert coord.record.counter_refund_tx == "0xcounter-refund"
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND
+    assert counter_sends == [1] and radiant_calls == [1, 1]
 
 
 class TestTheMakerCannotSpendTRxdBeforePresentingTheSwap:
