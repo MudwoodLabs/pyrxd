@@ -4060,6 +4060,29 @@ async def test_mutual_refund_KILLED_after_the_first_leg_does_not_resend_it_from_
 
 
 @pytest.mark.asyncio
+async def test_mutual_refund_reports_a_FAILED_SAVE_as_a_save_not_as_a_failed_refund():
+    """Review finding: a persist that raised after a successful leg refund read as "counter leg:
+    disk full", as if the refund had failed. It now says the refund succeeded, names its tx, and
+    says the record could not be saved."""
+    coord = await _both_locked_coordinator()
+
+    async def _counter_refund(*_a, **_k):
+        return "0xcounter-refund"
+
+    async def _disk_full(record):
+        raise OSError("disk full")
+
+    coord.counter_leg.refund = _counter_refund
+    coord._persist = _disk_full
+    with pytest.raises(NetworkError) as e:
+        await coord.mutual_refund()
+    msg = str(e.value)
+    assert "counter leg refund SUCCEEDED (0xcounter-refund)" in msg and "could not be saved" in msg, msg
+    assert "disk full" in msg and "counter leg: disk full" not in msg
+    assert coord.record.counter_refund_tx == "0xcounter-refund" and coord.record.state is SwapState.BOTH_LOCKED
+
+
+@pytest.mark.asyncio
 async def test_mutual_refund_retried_after_the_COUNTER_leg_refunded_does_not_resend_it():
     """The same mechanism, the other leg (it had the same retry-forever shape: the settled
     counter-leg contract reverts a second refund). HONEST path: the retry completes."""

@@ -95,8 +95,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     push nonce on the record. The abort happens only once the funding account's finalized nonce is
     past that nonce at every endpoint (new `Erc20HtlcLeg.push_nonce_closed`). Until then the call
     refuses with `NothingToRefund`, says the push may still land, and says how to cancel it: send a
-    0-value transaction from the funding account to itself at that nonce. Before, the refund was
-    refused, the swap stayed `BTC_LOCKED` with no way out, and the watchtower's page for
+    0-value transaction from the funding account to itself at that nonce, priced at least about 10%
+    above the pending push on both fees (or, if that nonce is already mined, wait for finality).
+    Before, the refund was refused, the swap stayed `BTC_LOCKED` with no way out, and the watchtower's page for
     `taker_refund_btc` repeated forever. The page now says the same as the call. Elsewhere,
     `NothingToRefund` propagates and the swap does not advance.
   - **`SwapCoordinator.mutual_refund` records each leg's refund as it succeeds**

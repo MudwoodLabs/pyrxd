@@ -320,9 +320,13 @@ class EthLeg:
 
     async def push_nonce_closed(self, nonce: int) -> tuple[bool, int]:
         """The token leg's :meth:`~pyrxd.eth_wallet.erc20_leg.Erc20HtlcLeg.push_nonce_closed`.
-        A native leg has no token push, so it has none and this raises AttributeError, which the
-        coordinator reads as "cannot prove"."""
+        The coordinator calls it only for a token swap, after the token leg raised NothingToRefund.
+        A native leg has no such method, so on one this raises AttributeError, uncaught."""
         return await self._leg.push_nonce_closed(nonce)
+
+    def funding_address(self) -> str:
+        """The address this leg signs from: the account that deploys and pushes."""
+        return self._leg._account_address()
 
     # -- secret recovery + finality ------------------------------------------------------
 

@@ -1990,7 +1990,8 @@ async def test_a_refused_token_resume_whose_push_NEVER_LANDED_ends_aborted_only_
     coord, eth, page = await _refused_token_resume_past_its_deadline()
     assert coord.record.pending_push_nonce == 7, "the push nonce must survive the refused resume"
     assert page.intent.name == "PAGE_REFUND" and page.recommended_action == "taker_refund_btc", page
-    assert "finalized nonce is past 7" in page.reason and "cancel nonce 7" in page.reason, page.reason
+    assert "finalized nonce is past 7" in page.reason and "at nonce 7" in page.reason, page.reason
+    assert "10% above the pending push" in page.reason and "just wait for finality" in page.reason
 
     address = coord.record.counterchain_locator.contract_address
     eth.refund = _empty_refund(address)
@@ -1999,7 +2000,9 @@ async def test_a_refused_token_resume_whose_push_NEVER_LANDED_ends_aborted_only_
     assert first.record.pending_push_nonce == 7
     with pytest.raises(NothingToRefund, match="may still land") as e:
         await first.taker_refund_btc()
-    assert "0-value transaction from the funding account to itself with nonce 7" in str(e.value)
+    msg = str(e.value)
+    assert "to itself at nonce 7" in msg and "at least about 10% on both the max fee and the priority fee" in msg
+    assert "cast send <self> --value 0 --nonce 7" in msg and "already mined, just wait for it to finalize" in msg
     assert first.record.state is SwapState.BTC_LOCKED and first.persisted == []
 
     eth.push_nonce_closed = _push_slot(True, 8)  # nonce 7 is now final: the push cannot land
@@ -2046,8 +2049,9 @@ async def test_a_record_WITHOUT_the_push_nonce_refuses_rather_than_guessing():
     eth.push_nonce_closed = _push_slot(True, 99)
     stale = dataclasses.replace(coord.persisted[-1], pending_push_nonce=None)
     fresh = _fresh_eth_coord(stale, eth)
-    with pytest.raises(NothingToRefund, match="carries no push nonce"):
+    with pytest.raises(NothingToRefund, match="no transfer into it can be shown to be final") as e:
         await fresh.taker_refund_btc()
+    assert "carries no token-push nonce" in str(e.value) and "Check the funding account" in str(e.value)
     assert fresh.record.state is SwapState.BTC_LOCKED
 
 
@@ -4190,3 +4194,24 @@ def test_a_step_6_policy_that_cannot_be_computed_is_a_retryable_configuration_re
     monkeypatch.setattr(coord, "_safe_claim_terms", broken)
     gate = coord._remaining_window_failure(terms, cov_confs=1, now_unix_s=_NOW)
     assert gate is not None and "burial-vs-t_rxd check failed" in gate.reason and gate.definitive is False
+
+
+async def test_the_abort_rereads_the_balance_AFTER_the_finalized_nonce():
+    """The empty balance that triggered the branch was read BEFORE the finalized nonce. A push that
+    lands in between must not be aborted over: once the nonce reads closed the refund runs again,
+    and here it finds the tokens and refunds them by the ordinary path."""
+    from pyrxd.security.errors import NothingToRefund
+
+    coord, eth, _page = await _refused_token_resume_past_its_deadline()
+    calls: list[int] = []
+
+    async def _empty_then_funded(*_a, **_k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise NothingToRefund("nothing to refund: the HTLC holds 0")
+        return "0xethrefund"
+
+    eth.refund = _empty_then_funded
+    eth.push_nonce_closed = _push_slot(True, 8)
+    rec = await _fresh_eth_coord(coord.persisted[-1], eth).taker_refund_btc()
+    assert calls == [1, 1] and rec.state is SwapState.ABORTED and rec.abort_reason is None

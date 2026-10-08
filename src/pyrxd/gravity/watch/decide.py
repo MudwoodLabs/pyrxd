@@ -770,17 +770,21 @@ def _decide_eth(
             # the step does then — it records the swap aborted rather than sending a refund the
             # contract would revert — so the page is true either way and running it ends it.
             nonce = record.pending_push_nonce
+            push_tx = record.pending_push_tx_hash
             empty_note = (
                 " The token push may never have landed: taker_refund_btc refunds what the contract holds. If "
                 "it holds nothing, taker_refund_btc records the swap aborted (nothing to refund), which ends "
                 f"this page, but only once the funding account's finalized nonce is past {nonce}, the nonce the "
-                f"push was recorded at. Until then the push may still land and it refuses: cancel nonce {nonce} "
-                "with a 0-value transaction from the funding account to itself, or wait for the push, then run "
-                "it again."
+                f"push was recorded at{f' (tx {push_tx})' if push_tx else ''}. Until then it refuses. If nonce "
+                f"{nonce} is already mined, just wait for finality. Otherwise wait for the push, or cancel it: "
+                f"0 value from the funding account (the key that deployed the contract) to itself at nonce "
+                f"{nonce}, at least about 10% above the pending push on both the max fee and the priority fee "
+                f"(e.g. `cast send <self> --value 0 --nonce {nonce} ...`, or a wallet that sets a custom nonce)."
                 if refused is not None and terms.token_address and nonce is not None
                 else " The token push may never have landed, and this record does not carry its nonce: "
-                "taker_refund_btc refunds what the contract holds, but if it holds nothing it cannot prove the "
-                "push will not land and refuses. Check the funding account for a pending transfer first."
+                "taker_refund_btc refunds what the contract holds, but if it holds nothing it cannot show that "
+                "no transfer into it is still pending, and refuses. Check the funding account for a pending or "
+                "not-yet-finalized transaction, and the token's transfers into the contract."
                 if refused is not None and terms.token_address
                 else ""
             )

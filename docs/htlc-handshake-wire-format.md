@@ -231,7 +231,7 @@ MUST verify, before acting on it (`swap_coordinator.py:3971-3976`):
    by byte offset** (`counter_chain_leg.py:45-48`);
 2. **provenance** — BTC: the transaction spends *this swap's* funding outpoint
    (`swap_coordinator.py:3850-3872`); ETH: the transaction targets *this swap's* contract instance
-   and emits `Claimed(p)` from it (`eth_leg.py:340-346`). Without this, a claim transaction from a
+   and emits `Claimed(p)` from it (`eth_leg.py:344-350`). Without this, a claim transaction from a
    different swap that happens to share `H` would be accepted.
 
 ## The `terms` object

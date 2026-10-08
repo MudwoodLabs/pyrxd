@@ -4267,24 +4267,48 @@ class SwapCoordinator:
             nonce = self.record.pending_push_nonce
             closed_check = getattr(self.counter_leg, "push_nonce_closed", None)
             if nonce is None or closed_check is None:
+                missing = (
+                    "the record carries no token-push nonce (an older record, or one whose push was never recorded)"
+                    if nonce is None
+                    else "this counter leg cannot read the funding account's finalized nonce"
+                )
                 raise NothingToRefund(
-                    f"{exc}. The swap stays btc_locked: the record carries no push nonce (or this leg "
-                    "cannot read the account nonce), so nothing shows whether a token push for this "
-                    f"contract can still land. Check the funding account for a pending transfer to {address} "
-                    "before abandoning it; if one lands, run taker_refund_btc again to refund it.",
+                    f"{exc}. The swap stays btc_locked. The contract is past its timeout, unsettled and empty, "
+                    f"but no transfer into it can be shown to be final: {missing}. Check the funding account "
+                    f"for a pending or not-yet-finalized transaction, and the token's transfers into {address}; "
+                    "if tokens arrive, run taker_refund_btc again to refund them.",
                     contract_address=address,
                 ) from exc
+            # ORDER MATTERS: the finalized nonce first, the balance after it. The balance this branch
+            # caught was read before the nonce; deciding on it would let an endpoint pair an OLD empty
+            # balance with a NEW finalized nonce (a push that landed in between). So once the nonce
+            # reads closed, the balance is read again, through the same refund, after it.
             closed, finalized = await closed_check(nonce)
             if not closed:
+                funding_address = getattr(self.counter_leg, "funding_address", None)
+                funding = funding_address() if callable(funding_address) else "the funding account"
+                push_tx = self.record.pending_push_tx_hash
                 raise NothingToRefund(
-                    f"{exc}. The swap stays btc_locked: the token push was recorded at nonce {nonce} of the "
-                    f"funding account, whose finalized nonce is {finalized}, so that push may still land. "
-                    f"Either cancel it — send a 0-value transaction from the funding account to itself with "
-                    f"nonce {nonce} — or wait for the push; once nonce {nonce} is finalized, run "
-                    "taker_refund_btc again. If the push lands, that run refunds it; if not, it records the "
-                    "swap aborted with nothing to refund.",
+                    f"{exc}. The swap stays btc_locked: the token push was recorded at nonce {nonce} of "
+                    f"{funding}{f' (tx {push_tx})' if push_tx else ''}, whose finalized nonce is {finalized}, "
+                    f"so it may still land. If nonce {nonce} is already mined, just wait for it to finalize. "
+                    f"Otherwise wait for the push, or cancel it: send 0 value from {funding} to itself at "
+                    f"nonce {nonce}, outbidding the pending push by at least about 10% on both the max fee "
+                    f"and the priority fee (e.g. `cast send <self> --value 0 --nonce {nonce} --gas-price <max> "
+                    "--priority-gas-price <tip>`, or any wallet that sets a custom nonce). Once it is "
+                    "finalized, run taker_refund_btc again: it refunds a push that landed, or records the swap "
+                    "aborted.",
                     contract_address=address,
                 ) from exc
+            try:
+                await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
+            except NothingToRefund:
+                pass  # still empty, read after the finalized nonce: the abort below is decided
+            else:
+                # Tokens arrived between the two reads and the refund went out: the ordinary path.
+                self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
+                await self._persist_record(self.record, shield=True)
+                return self.record
             self.record = dataclasses.replace(
                 self.record,
                 abort_reason=(
@@ -4303,6 +4327,19 @@ class SwapCoordinator:
             self._advance(SwapEvent.TAKER_REFUNDS_BTC)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+    async def _record_leg_refund(self, leg: str, handle: str | None, failures: list) -> None:
+        """Persist a leg's successful refund; a save that fails is reported as a SAVE failure."""
+        try:
+            await self._persist_record(self.record, shield=True)
+        except Exception as exc:
+            failures.append(
+                (
+                    f"{leg} refund SUCCEEDED ({handle}) but the swap record could not be saved, so a retry "
+                    "from the saved record would send it again",
+                    exc,
+                )
+            )
 
     # -- safe failure: both timeouts elapse, both refund (MUTUAL_REFUND) -----
     @_serialized_step
@@ -4332,19 +4369,22 @@ class SwapCoordinator:
         if self.record.counter_refund_tx is None:
             try:
                 tx = await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-                self.record = dataclasses.replace(self.record, counter_refund_tx=_refund_handle(tx))
-                # Durable NOW, before the other leg is tried: a crash or cancellation there must not
-                # lose the handle, or the retry re-sends this refund and it reverts every time.
-                await self._persist_record(self.record, shield=True)
             except Exception as exc:
                 failures.append(("counter leg", exc))
+            else:
+                self.record = dataclasses.replace(self.record, counter_refund_tx=_refund_handle(tx))
+                # Durable NOW, before the other leg is tried: a crash or cancellation there must not
+                # lose the handle, or the retry re-sends this refund and it reverts every time. A
+                # save that fails is reported as that, not as the refund failing.
+                await self._record_leg_refund("counter leg", self.record.counter_refund_tx, failures)
         if self.record.asset_refund_txid is None:
             try:
                 txid = await self.radiant_leg.refund_asset(self.record)
-                self.record = dataclasses.replace(self.record, asset_refund_txid=_refund_handle(txid))
-                await self._persist_record(self.record, shield=True)
             except Exception as exc:
                 failures.append(("radiant leg", exc))
+            else:
+                self.record = dataclasses.replace(self.record, asset_refund_txid=_refund_handle(txid))
+                await self._record_leg_refund("radiant leg", self.record.asset_refund_txid, failures)
         if failures:
             # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts the legs
             # that failed. What succeeded was persisted the moment it succeeded, so the retry skips it.
