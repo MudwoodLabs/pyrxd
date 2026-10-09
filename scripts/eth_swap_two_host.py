@@ -65,7 +65,7 @@ coordinator entry point each one drives, and docs/how-to/run-a-two-host-swap-dry
   # abort: recover ONLY the leg THIS operator locked, as soon as its own timelock matures:
   python scripts/eth_swap_two_host.py --role taker --phase abort      --io ./swapdir ...
   python scripts/eth_swap_two_host.py --role maker --phase abort      --io ./swapdir ...
-  # refund: the MUTUAL unwind, once BOTH legs are locked and BOTH timeouts have elapsed:
+  # refund: each side refunds its OWN leg once BOTH are locked (the taker: the ETH HTLC only, #850):
   python scripts/eth_swap_two_host.py --role taker --phase refund     --io ./swapdir ...
   python scripts/eth_swap_two_host.py --role maker --phase refund     --io ./swapdir ...
 """
@@ -905,14 +905,12 @@ class _CapturingEthLeg:
 #
 #   --phase abort    recover ONLY the leg THIS operator locked, unilaterally, as soon as that
 #                    leg's own timelock matures. Nothing is expected of the counterparty.
-#   --phase refund   the MUTUAL unwind, once BOTH legs are locked and BOTH timeouts have elapsed:
-#                    every leg goes back to whoever locked it.
+#   --phase refund   each side's half of the mutual unwind, once BOTH legs are locked: each
+#                    operator refunds the leg it locked (#850 — neither sends the other's refund).
 #
-# `abort` is the one a stalled operator reaches for FIRST, and it is available EARLIER: the ETH
-# HTLC times out at `eth_timeout_unix_s` while the covenant's CSV matures at t_rxd, and t_rxd is
-# deliberately the LATER of the two (#482), so there is a long stretch in which the taker can
-# recover its own leg and the mutual unwind is not yet possible. `refund` REFUSES in that stretch,
-# naming the shortfall and pointing here, rather than broadcasting one leg and failing on the other.
+# `abort` is the one a stalled operator reaches for FIRST: it needs nothing from the other chain.
+# The ETH HTLC times out at `eth_timeout_unix_s` while the covenant's CSV matures at t_rxd, and
+# t_rxd is deliberately the LATER of the two (#482), so the taker's leg is recoverable first.
 #
 # WHICH COORDINATOR ENTRY POINT EACH DRIVES, and why that one:
 #
@@ -921,11 +919,15 @@ class _CapturingEthLeg:
 #                    refundee, which is the taker. The Radiant leg is built with _NoFeeSource, so
 #                    this phase cannot broadcast a covenant spend at all.
 #
-#   (taker, refund)  SwapCoordinator.mutual_refund()         BOTH_LOCKED -> MUTUAL_REFUND
-#                    Both legs. The taker can push the covenant half because that refund needs NO
-#                    maker key — build_htlc_refund_tx puts <OP_1> and nothing else in the covenant
-#                    scriptSig — only a fee UTXO, which is why --fee-* is required here and not in
-#                    --phase abort. It pays the MAKER; that is the unwind, not a loss.
+#   (taker, refund)  SwapCoordinator.mutual_refund()         BOTH_LOCKED -> BOTH_LOCKED
+#                    The taker's ETH leg ONLY (#850). The covenant refund needs no maker key —
+#                    build_htlc_refund_tx puts <OP_1> and nothing else in the covenant scriptSig —
+#                    so the taker COULD send it, and this phase used to. It must not: if the maker
+#                    claimed the ETH before its timeout, the taker can still claim the covenant
+#                    with the revealed p, and a covenant refund sent from here pays the maker
+#                    instead. A TAKER-role coordinator's mutual_refund refuses to send it on an ETH
+#                    counter leg, and the Radiant leg here is built with _NoFeeSource as well. The
+#                    record stays BOTH_LOCKED: the covenant is still locked, and still the maker's.
 #
 #   (maker, refund)  SwapCoordinator.maybe_refund_asset_on_maker_stall()
 #                                                    BOTH_LOCKED -> ASSET_REFUNDED_TAKER_ACTS
@@ -1024,17 +1026,19 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
 
 
 async def taker_phase_refund(args: argparse.Namespace) -> None:
-    """TAKER recovery — the MUTUAL unwind of BOTH legs (``--phase refund``).
+    """TAKER recovery — the taker's half of the mutual unwind (``--phase refund``).
 
-    Drives ``SwapCoordinator.mutual_refund()`` (BOTH_LOCKED -> MUTUAL_REFUND): the ETH HTLC refunds
-    to the TAKER and the RXD covenant CSV-refunds to the MAKER, so neither side takes a one-sided
-    loss. Requires ``--fee-*`` because the taker pays for the covenant half.
+    Drives ``SwapCoordinator.mutual_refund()`` on a TAKER-role coordinator, which on an ETH counter
+    leg refunds the ETH HTLC to the TAKER and nothing else (#850). The record stays BOTH_LOCKED. The
+    RXD covenant's CSV refund pays the MAKER and is the maker's to send (its ``--phase refund``);
+    this phase does not send it, because if the maker claimed the ETH HTLC before its timeout the
+    taker can still claim the covenant with the revealed p (``--phase claim``), and a covenant
+    refund sent from here would take that away. The Radiant leg is built with ``_NoFeeSource``, so
+    this phase cannot broadcast a covenant spend by any route, and no ``--fee-*`` is needed.
 
-    BOTH timeouts are checked BEFORE anything broadcasts. ``mutual_refund`` attempts the counter leg
-    first and only then the asset, so calling it while the covenant is still immature would refund
-    the ETH, fail on the covenant, and leave the record stuck at BOTH_LOCKED with a retry that can
-    never complete. If either leg is short this refuses with the shortfall and points at
-    ``--phase abort``, which recovers the taker's own leg alone and is available much earlier.
+    The covenant is read first so the record pins its outpoint; the ETH timeout is checked before
+    anything broadcasts. ``--phase abort`` does the same counter-leg refund without reading the
+    covenant, for when the maker never locked it or the Radiant node cannot answer.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
@@ -1044,7 +1048,6 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
     cov = _rederive_covenant(args, terms=terms, taker_pkh=taker_pkh, maker_pkh=maker_pkh)
-    fee_source = _require_fee_source(args, what="the taker's mutual refund (--phase refund)")
 
     rpc, eth_leg = _eth_leg(
         args,
@@ -1052,31 +1055,29 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
         refund_to=local["eth_taker_refund_addr"],
         eth_timeout=int(terms.eth_timeout_unix_s),
     )
-    rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
+    # DELIBERATELY NOT the operator's --fee-* source, as in --phase abort: a leg that cannot
+    # dispense a fee input cannot broadcast a covenant spend by any route (#850).
+    rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
 
     try:
         try:
             outpoint, value, confs = await _covenant_state(rxd_leg, cov=cov, expected_photons=terms.radiant_amount)
         except Exception as exc:
             raise SystemExit(
-                "REFUSING to drive a mutual unwind whose asset half cannot be verified: the covenant is "
+                "REFUSING to build a BOTH_LOCKED record for a covenant that cannot be verified: it is "
                 f"not readable at the agreed SPK/amount ({str(exc)[:160]}). Either the maker never funded "
                 "it, or this Radiant node cannot answer right now — this phase cannot tell those apart and "
                 "will not guess. Use --phase abort to recover YOUR OWN ETH leg; it needs no Radiant read."
             ) from None
-        print(f"  covenant: funded at {outpoint} ({value} photons), {confs} conf(s)")
-        if confs < terms.t_rxd.value:
-            raise SystemExit(
-                f"the covenant's CSV refund is NOT yet mature: {confs} of {terms.t_rxd.value} required "
-                f"confirmations ({terms.t_rxd.value - confs} block(s) to go). A mutual unwind now would "
-                "refund the ETH and then fail on the asset, leaving the swap half-unwound. Use --phase "
-                "abort to recover your own ETH leg now, or retry this at maturity."
-            )
+        print(
+            f"  maker's covenant: funded at {outpoint} ({value} photons), {confs} conf(s) — it CSV-refunds "
+            f"to the MAKER at {terms.t_rxd.value} confirmations. That is the maker's to send, not this phase's."
+        )
         now_ts = int(await rpc.latest_block_timestamp_min())
         if now_ts < int(loc.timeout):
             raise SystemExit(
                 f"the ETH HTLC has NOT timed out: it matures at unix {int(loc.timeout)}, the chain is at "
-                f"{now_ts} ({int(loc.timeout) - now_ts}s to go). Nothing is recoverable on either leg yet."
+                f"{now_ts} ({int(loc.timeout) - now_ts}s to go). Nothing is recoverable on the ETH leg yet."
             )
 
         # Pin the outpoint we just verified. The covenant SPK is a pure function of public terms, so
@@ -1091,13 +1092,20 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
             args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record
         )
         confirm(
-            "mutual_refund: refund BOTH legs (ETH -> the taker, the RXD covenant -> the MAKER)",
+            "mutual_refund: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
             auto_yes=args.yes,
         )
         rec = await coord.mutual_refund()
-        if rec.state is not SwapState.MUTUAL_REFUND:
-            raise SystemExit(f"mutual_refund landed in {rec.state.value}, expected mutual_refund")
-        print(f"  -> {rec.state.value}; ETH refunded to the taker, the covenant refunded to the maker.")
+        if rec.state is not SwapState.BOTH_LOCKED:
+            raise SystemExit(
+                f"mutual_refund landed in {rec.state.value}; a TAKER-role ETH refund leaves the record both_locked"
+            )
+        print(
+            "  -> ETH refund sent to the taker; the record stays both_locked because the covenant is "
+            "still the maker's to refund. Check the refund on-chain; the maker cannot claim the ETH "
+            "after its timeout. (Had the maker claimed it before, this refund would have failed — then "
+            "run --phase claim to claim the covenant with the revealed p.)"
+        )
     finally:
         await rpc.close()
 
@@ -1469,8 +1477,8 @@ def _args() -> argparse.Namespace:
             "taker: intro|fund|claim ; maker: envelope|lock-claim. RECOVERY, both roles: "
             "'abort' recovers ONLY the leg you locked, unilaterally, as soon as its own timelock "
             "matures (taker: SwapCoordinator.taker_refund_btc on the ETH HTLC; maker: the covenant "
-            "CSV refund). 'refund' is the MUTUAL unwind once BOTH legs are locked and BOTH timeouts "
-            "have elapsed (taker: SwapCoordinator.mutual_refund, both legs; maker: "
+            "CSV refund). 'refund' is each side's half of the mutual unwind once BOTH legs are locked "
+            "(taker: SwapCoordinator.mutual_refund, the ETH HTLC only, #850; maker: "
             "SwapCoordinator.maybe_refund_asset_on_maker_stall, the asset half). 'abort' is "
             "available EARLIER than 'refund' and is what a stalled operator reaches for first."
         ),

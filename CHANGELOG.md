@@ -125,6 +125,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the ABI and the `PUSH32` operands of both shipped runtimes. The self-check's calldata selectors
   had the same mistake and now use `claim(bytes32)`/`refund()`'s real selectors. The script is
   not part of the wheel. Found by an independent defensive review (Claude Mythos).
+- **A taker's `mutual_refund` on an ETH counter leg no longer sends the maker's covenant refund
+  (#850).** `SwapCoordinator.mutual_refund` refunded the counter leg and then always refunded the
+  RXD covenant, even when the counter refund failed. The covenant's CSV refund needs no key and
+  pays the maker, so a taker that ran `mutual_refund` after the maker had already claimed the ETH
+  HTLC (revealing `p`) sent the covenant back to the maker and could no longer claim it with `p`.
+  On a `SwapRole.TAKER` coordinator with an ETH or ERC-20 counter leg, `mutual_refund` now
+  refunds the counter leg only, leaves the covenant for the maker to refund, and leaves the
+  record at `BOTH_LOCKED`, from where `taker_observed_reveal` can still follow a maker claim.
+  Maker-role and role-less coordinators are unchanged. `scripts/eth_swap_two_host.py --role taker
+  --phase refund` now refunds only the ETH HTLC, cannot spend the covenant, and no longer needs
+  `--fee-*`; the watchtower's ETH refund page says that it repeats after the refund has run.
+  **The BTC counter leg is unchanged in this release and has the same race** (its claim leaf has
+  no timelock, so a maker can claim while the taker's refund is unconfirmed); fixing it first
+  needs the watchtower to tell the taker's own refund from a maker claim. Found in review of #850.
 
 ## [0.26.1] — 2026-10-07
 

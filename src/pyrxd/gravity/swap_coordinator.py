@@ -1038,8 +1038,8 @@ def taker_refund_window_open(
     theft one — and because a swap negotiated under the old relation is still out there. Treat the
     trigger as "stop waiting", never "keep waiting".
 
-    IMPORTANT — what the taker DOES when this fires is :meth:`mutual_refund` (both legs
-    unwind once both timeouts elapse), NOT an asset-only refund. The asset CSV refund
+    IMPORTANT — what the taker DOES when this fires is :meth:`mutual_refund` (on ETH a TAKER-role
+    coordinator refunds only its counter leg, #850), NOT an asset-only refund. The asset CSV refund
     pays the MAKER (the maker owns the covenant), so a taker that "refunds the asset
     proactively" strands itself — see :meth:`maybe_refund_asset_on_maker_stall` (a
     maker-only primitive) and ``gravity.watch.decide`` (FSM finding #2, 2026-06-09).
@@ -4143,7 +4143,7 @@ class SwapCoordinator:
         its own counter-leg stays locked, after which the maker — still holding p — claims the
         counter-leg and takes both (proven by tests/test_xchain_swap_regtest_e2e.py::
         TestMakerStallAssetOnlyRefundIsTakerLoss). The correct TAKER stall recovery on BOTH the BTC
-        and ETH runbooks is :meth:`mutual_refund` (refunds BOTH legs after both timeouts). The
+        and ETH runbooks is :meth:`mutual_refund` (TAKER role on ETH: counter leg only, #850). The
         watchtower (gravity.watch.decide) routes neither counter-chain's taker here.
         """
         # ROLE GUARD (P3): this primitive's CSV refund pays the MAKER in BOTH directions, so a TAKER
@@ -4151,7 +4151,7 @@ class SwapCoordinator:
         # while its own counter-leg stays locked — the maker, still holding p, then takes both legs
         # (proven by tests/test_xchain_swap_regtest_e2e.py::TestMakerStallAssetOnlyRefundIsTakerLoss).
         # The docstring has always said "MAKER-side only"; a TAKER-role coordinator now cannot call it
-        # at all. The taker's stall recovery is mutual_refund (both legs unwind, no one-sided loss).
+        # at all. The taker's stall recovery is mutual_refund (on ETH its own counter leg only, #850).
         if self.config.role is SwapRole.TAKER:
             raise ValidationError(
                 "maybe_refund_asset_on_maker_stall is a MAKER-side primitive and is forbidden for a "
@@ -4241,11 +4241,51 @@ class SwapCoordinator:
         Valid from BOTH_LOCKED. The taker refunds BTC, the maker refunds the asset;
         neither suffers one-sided loss. Requires the full locator be retained. Async
         because both refunds broadcast on their chains.
+
+        **ETH counter leg, TAKER role: the counter leg ONLY** (#850). The covenant's CSV refund
+        pays the MAKER and needs no key, so the taker's process can broadcast it — and "attempt
+        both, always" did, even when the counter refund failed because the maker had already
+        claimed the ETH HTLC (revealing ``p``). The taker's own tool then sent the covenant back
+        to the maker while the taker could still have claimed it with ``p``. So for
+        ``role=SwapRole.TAKER`` on an ETH counter leg this broadcasts the counter-leg refund
+        only, leaves the covenant for the maker to refund (:meth:`maybe_refund_asset_on_maker_stall`
+        in the maker's process), and leaves the record at BOTH_LOCKED: one of the two refunds has
+        happened, and the record must stay where :meth:`taker_observed_reveal` can follow a maker
+        claim. Recording MUTUAL_REFUND would say both legs were refunded and make that path
+        unreachable. A counter refund that fails (``AlreadySettled`` after a maker claim, or an
+        unexpired contract) raises unchanged and nothing else is broadcast. Once the refund has
+        landed the maker can no longer claim (``EthHtlc``/``Erc20Htlc`` refuse a claim at or after
+        the timeout), so a retry is expected to fail on the settled contract.
+
+        **BTC counter leg: unchanged in this release, for every role** (#850, interim). The BTC
+        claim leaf has no timelock, so a maker can still claim with ``p`` while the taker's
+        refund is unconfirmed, and the taker's covenant refund forecloses its claim in that
+        race — the same defect. It is not closed here because a non-terminal BTC record is
+        misread by the watchtower: ``OutspendBtcClaimSource`` reports ANY spend of the BTC HTLC
+        as the maker's claim, so the taker's own refund would page a claim race on every tick.
+        Fixing BTC needs that spender classification first (#850 plan, PR 9).
+
+        ``role=None`` (one operator driving both legs) and ``role=SwapRole.MAKER`` keep the
+        behaviour below on both counter chains: attempt both refunds, advance to MUTUAL_REFUND
+        only if both returned. A maker's process holds no BTC refund key, so on BTC its counter
+        refund fails and the record stays BOTH_LOCKED; the maker's own recovery is
+        :meth:`maybe_refund_asset_on_maker_stall`.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(f"mutual_refund only valid from BOTH_LOCKED, not {self.record.state.value}")
         if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; BTC would strand (state was lost)")
+        if self.config.role is SwapRole.TAKER and self.record.terms.counter_chain == "eth":
+            # The taker's own leg only. No FSM advance and nothing new to persist: the record
+            # already says BOTH_LOCKED, which is still true of the covenant. Errors propagate
+            # unchanged, as in taker_refund_btc.
+            await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
+            logger.info(
+                "mutual_refund (TAKER role, ETH): counter-leg refund sent; the covenant is left for the "
+                "maker to refund and the record stays BOTH_LOCKED. If the maker claimed the ETH HTLC "
+                "before its timeout, run taker_observed_reveal and then taker_scrape_and_claim_asset."
+            )
+            return self.record
         # ATTEMPT BOTH, ALWAYS. These two refunds are independent — neither is a precondition for
         # the other — so a failure in the first must not skip the second. Sequencing them with a
         # bare `await; await` made a crash between the broadcasts unrecoverable: the record stays

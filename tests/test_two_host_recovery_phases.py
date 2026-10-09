@@ -686,76 +686,93 @@ class TestTakerAbortRecoversOnlyTheTakersOwnLeg:
         assert "could not be read" in capsys.readouterr().out
 
 
-class TestTakerRefundIsTheMutualUnwindAndNeverHalfBroadcasts:
-    async def test_eth_refund_unwinds_both_legs(self, eth_mod, tmp_path, monkeypatch):
+class TestTakerRefundOnEthRefundsOnlyTheTakersLeg:
+    """#850, ETH: the taker's ``--phase refund`` refunds the ETH HTLC and never the covenant. The
+    covenant refund pays the MAKER; sent from the taker's side after the maker claimed the ETH with
+    p, it takes away the taker's claim on the covenant. The record stays BOTH_LOCKED."""
+
+    async def test_eth_refund_refunds_the_counter_leg_and_not_the_covenant(self, eth_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_eth(eth_mod, monkeypatch)
+        await eth_mod.taker_phase_refund(args)  # no --fee-*: it is not needed any more
+        assert len(built["counter"].refund_calls) == 1
+        assert built["rxd"].refund_calls == [], "the taker's refund phase spent the maker's covenant"
+        assert built["rpc"].closed
+
+    async def test_eth_refund_cannot_spend_the_covenant_even_with_a_fee_utxo(self, eth_mod, tmp_path, monkeypatch):
+        """Not "we did not call it" — the leg is structurally incapable, as in --phase abort."""
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
         built = _wire_eth(eth_mod, monkeypatch)
         await eth_mod.taker_phase_refund(_with_fee(args))
-        assert len(built["counter"].refund_calls) == 1
-        assert len(built["rxd"].refund_calls) == 1
+        assert isinstance(built["rxd"].fee_source, eth_mod._NoFeeSource)
+        assert built["rxd"].refund_calls == []
 
-    async def test_btc_refund_unwinds_both_legs(self, btc_mod, tmp_path, monkeypatch):
+    async def test_an_immature_covenant_no_longer_blocks_the_takers_own_eth_refund(
+        self, eth_mod, tmp_path, monkeypatch
+    ):
+        """The honest path for the gate this replaced: the covenant's CSV maturity was checked only
+        because the phase used to send the covenant refund too. Refusing the taker's own matured ETH
+        refund on the covenant's clock would be a guard refusing valid work."""
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_eth(eth_mod, monkeypatch, covenant_confs=1)  # t_rxd is 120
+        await eth_mod.taker_phase_refund(args)
+        assert len(built["counter"].refund_calls) == 1
+        assert built["rxd"].refund_calls == []
+
+    async def test_an_unverifiable_covenant_refuses_rather_than_guessing(self, eth_mod, tmp_path, monkeypatch):
+        """ "Not funded" and "the node cannot answer" are the SAME exception from find_covenant_utxo.
+        The phase pins the covenant outpoint in a BOTH_LOCKED record, so it must not guess."""
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_eth(eth_mod, monkeypatch, covenant_funded=False)
+        with pytest.raises(SystemExit, match="cannot tell those apart"):
+            await eth_mod.taker_phase_refund(args)
+        assert built["counter"].refund_calls == []
+
+
+class TestTakerRefundOnBtcIsStillTheMutualUnwind:
+    """#850 interim, BTC: unchanged in this release, so these pin the OLD behaviour on purpose. On
+    BTC the taker's run still sends the covenant refund — the same race is open there — until the
+    watchtower can tell the taker's own BTC refund from a maker claim. When that lands, the first
+    test here must fail and be rewritten to the ETH shape above."""
+
+    async def test_btc_refund_still_unwinds_both_legs(self, btc_mod, tmp_path, monkeypatch):
         args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
         built = _wire_btc(btc_mod, monkeypatch)
         await btc_mod.taker_phase_refund(_with_fee(args))
         assert len(built["counter"].refund_calls) == 1
         assert len(built["rxd"].refund_calls) == 1
 
-    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
-    async def test_an_immature_covenant_refuses_BEFORE_the_counter_leg_is_broadcast(self, name, tmp_path, monkeypatch):
+    async def test_an_immature_covenant_refuses_BEFORE_the_counter_leg_is_broadcast(
+        self, btc_mod, tmp_path, monkeypatch
+    ):
         """mutual_refund broadcasts the counter leg FIRST. Calling it while the covenant's CSV is
         immature refunds the counter leg, fails on the asset, and leaves the record stuck at
         BOTH_LOCKED — so the shortfall has to be caught before anything is broadcast at all."""
-        mod = _load(name)
-        if name == "eth_swap_two_host":
-            args, _terms, _io = _eth_scenario(mod, tmp_path, role="taker", with_funding=True)
-            built = _wire_eth(mod, monkeypatch, covenant_confs=119)  # t_rxd is 120
-        else:
-            args, _terms, _io = _btc_scenario(mod, tmp_path, role="taker", with_funding=True)
-            built = _wire_btc(mod, monkeypatch, covenant_confs=119)
+        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_btc(btc_mod, monkeypatch, covenant_confs=119)  # t_rxd is 120
         with pytest.raises(SystemExit, match="NOT yet mature"):
-            await mod.taker_phase_refund(_with_fee(args))
+            await btc_mod.taker_phase_refund(_with_fee(args))
         assert built["counter"].refund_calls == [], "nothing may broadcast before the shortfall check"
         assert built["rxd"].refund_calls == []
 
-    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
-    async def test_the_refusal_points_at_the_phase_that_still_works(self, name, tmp_path, monkeypatch):
-        mod = _load(name)
-        if name == "eth_swap_two_host":
-            args, _terms, _io = _eth_scenario(mod, tmp_path, role="taker", with_funding=True)
-            _wire_eth(mod, monkeypatch, covenant_confs=1)
-        else:
-            args, _terms, _io = _btc_scenario(mod, tmp_path, role="taker", with_funding=True)
-            _wire_btc(mod, monkeypatch, covenant_confs=1)
+    async def test_the_refusal_points_at_the_phase_that_still_works(self, btc_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        _wire_btc(btc_mod, monkeypatch, covenant_confs=1)
         with pytest.raises(SystemExit, match="--phase abort"):
-            await mod.taker_phase_refund(_with_fee(args))
+            await btc_mod.taker_phase_refund(_with_fee(args))
 
-    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
-    async def test_an_unverifiable_covenant_refuses_rather_than_guessing(self, name, tmp_path, monkeypatch):
-        """ "Not funded" and "the node cannot answer" are the SAME exception from find_covenant_utxo.
-        The phase must not report one as the other, and must not unwind on an unverified asset."""
-        mod = _load(name)
-        if name == "eth_swap_two_host":
-            args, _terms, _io = _eth_scenario(mod, tmp_path, role="taker", with_funding=True)
-            built = _wire_eth(mod, monkeypatch, covenant_funded=False)
-        else:
-            args, _terms, _io = _btc_scenario(mod, tmp_path, role="taker", with_funding=True)
-            built = _wire_btc(mod, monkeypatch, covenant_funded=False)
+    async def test_an_unverifiable_covenant_refuses_rather_than_guessing(self, btc_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_btc(btc_mod, monkeypatch, covenant_funded=False)
         with pytest.raises(SystemExit, match="cannot tell those apart"):
-            await mod.taker_phase_refund(_with_fee(args))
+            await btc_mod.taker_phase_refund(_with_fee(args))
         assert built["counter"].refund_calls == []
 
-    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
-    async def test_without_a_fee_utxo_it_refuses_up_front_naming_the_flags(self, name, tmp_path, monkeypatch):
-        mod = _load(name)
-        if name == "eth_swap_two_host":
-            args, _terms, _io = _eth_scenario(mod, tmp_path, role="taker", with_funding=True)
-            _wire_eth(mod, monkeypatch)
-        else:
-            args, _terms, _io = _btc_scenario(mod, tmp_path, role="taker", with_funding=True)
-            _wire_btc(mod, monkeypatch)
+    async def test_without_a_fee_utxo_it_refuses_up_front_naming_the_flags(self, btc_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        _wire_btc(btc_mod, monkeypatch)
         with pytest.raises(SystemExit, match="--fee-txid"):
-            await mod.taker_phase_refund(args)
+            await btc_mod.taker_phase_refund(args)
 
 
 class TestTheEthTimeoutIsCheckedTooNotOnlyTheCovenant:

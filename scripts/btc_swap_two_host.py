@@ -1053,6 +1053,12 @@ async def taker_phase_refund(args) -> None:
     to the TAKER and the RXD covenant CSV-refunds to the MAKER, so neither side takes a one-sided
     loss. Requires ``--fee-*`` because the taker pays for the covenant half.
 
+    KNOWN OPEN (#850, interim): the ETH sibling no longer sends the covenant refund from the
+    taker's side, because a maker that claims the counter leg with ``p`` must leave the taker able
+    to claim the covenant. On BTC the same race exists (the claim leaf has no timelock, so the maker
+    can claim while this BTC refund is unconfirmed), but this phase is unchanged until the
+    watchtower can tell the taker's own refund from a maker claim.
+
     BOTH timeouts are checked BEFORE anything broadcasts. ``mutual_refund`` attempts the counter leg
     first and only then the asset, so calling it while the covenant is still immature would refund
     the BTC, fail on the covenant, and leave the record stuck at BOTH_LOCKED with a retry that can
