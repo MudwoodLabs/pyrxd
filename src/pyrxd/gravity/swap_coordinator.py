@@ -4375,8 +4375,8 @@ class SwapCoordinator:
         if self.config.role is SwapRole.TAKER and self.record.terms.counter_chain == "eth":
             # The taker's own leg only. No FSM advance and nothing new to persist: the record
             # already says BOTH_LOCKED, which is still true of the covenant. A failed refund is
-            # explained from the chain when it can be (the maker claimed, or the contract was
-            # already refunded); otherwise the original error propagates.
+            # explained from the chain only when a claim VERIFIES; settled with no verified claim
+            # is reported as unverified (never as refunded); otherwise the error propagates.
             locator = self.record.counterchain_locator
             try:
                 await self.counter_leg.refund(locator, self.record.terms.t_btc)

@@ -1131,7 +1131,8 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
                 f"{exc}\n  NEXT: check the events of {exc.contract_address} on another RPC or an explorer. If "
                 f"there is a Claimed event, write its tx hash into {args.io}/maker_claim.json as "
                 '{"eth_claim_tx_hash": "0x…"} and run: python scripts/eth_swap_two_host.py --role taker '
-                f"--phase claim --io {args.io} ... (before t_rxd)."
+                f"--phase claim --io {args.io} --eth-rpc-url <the endpoint that showed the Claimed event> "
+                "... (before t_rxd). The claim phase verifies the receipt, so a lying endpoint makes it fail."
             ) from None
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(
