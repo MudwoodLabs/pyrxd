@@ -150,6 +150,114 @@ def preflight_coordinator(build: Any, *, before: str) -> Any:
         raise SystemExit(f"refused before {before}: the swap coordinator refuses these terms:\n  {exc}{hint}") from None
 
 
+# ---------------------------------------------------------------------------
+# The persisted swap record: load it, merge what a phase rebuilt, refuse a disagreement (#850 PR R)
+# ---------------------------------------------------------------------------
+
+#: The role a single-process runner passes to ``CoordinatorConfig``: ``None``, one operator driving
+#: BOTH legs (#850 D11). It equals the config's default, so the value changes nothing today; it is
+#: named so that every runner states its role, and a test requires a ``role=`` keyword on every
+#: ``CoordinatorConfig`` a script builds. The two-host runners pass ``SwapRole.MAKER``/``TAKER``.
+SINGLE_OPERATOR_ROLE = None
+
+#: The record fields that say WHICH swap and WHICH contracts it is about. When the persisted record
+#: and a phase's rebuild both hold one of these and they differ, the merge refuses instead of
+#: picking a side. Every other field is carried from the persisted record (see the merge below).
+BINDING_RECORD_FIELDS = ("terms", "counterchain_locator", "radiant_covenant_outpoint", "radiant_covenant_spk_hex")
+
+
+def _comparable(value: Any) -> Any:
+    """A value in a form ``==`` compares by content: a locator or terms object by type and wire form."""
+    if hasattr(value, "to_dict"):
+        return (type(value).__name__, value.to_dict())
+    if isinstance(value, str):
+        return value.lower()
+    return value
+
+
+def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str) -> Any:
+    """The record a phase drives: the persisted one where it exists, merged with the phase's rebuild.
+
+    Every recovery phase of the two-host runners used to build a FRESH record from the public
+    exchange files and hand it to a coordinator that persists it, overwriting whatever an earlier
+    phase had saved (#850 review B1). Fields the coordinator writes — the pending deploy and push
+    handles, the covenant outpoint, the fund refusal — were lost on every retry. The rule now:
+
+    * **No persisted record** (a first run): the rebuild, unchanged.
+    * **Binding fields** (:data:`BINDING_RECORD_FIELDS`): when both sides hold a value they must be
+      equal, or this REFUSES (``SystemExit``) and nothing is sent. A persisted pending counter
+      contract (ETH) or pending funding transaction (BTC) must also be the contract or funding the
+      rebuilt locator describes. A disagreement means the record and the exchange files describe
+      different swaps or contracts; this does not guess which is right.
+    * **Every other field**, derived from ``dataclasses.fields(SwapRecord)`` so a field added later
+      is carried without editing this list: the persisted value when it is set, else the rebuilt one.
+      The exchange files only fill what the record lacks.
+    * **state**: the rebuild's, as before this change. Each phase builds the state its coordinator
+      entry point requires; this merge does not change which state a phase drives.
+
+    *source* names what the rebuild came from, for the refusal message.
+    """
+    from pyrxd.gravity.swap_state import SwapRecord
+
+    path = getattr(sink, "path", "the swap record")
+    try:
+        persisted = sink.load_record()
+    except (ValidationError, NetworkError) as exc:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} could not be read ({exc}). Nothing was sent. Inspect the "
+            "file before running this phase: it may reference a contract that holds value."
+        ) from None
+    if persisted is None:
+        return rebuilt
+
+    def _refuse(field: str, kept: Any, rebuilt_value: Any) -> SystemExit:
+        return SystemExit(
+            f"REFUSING: the swap record at {path} and {source} disagree on {field}.\n"
+            f"  record: {kept}\n  {source}: {rebuilt_value}\n"
+            "Nothing was sent. The record is what this host wrote while the swap ran; the other value came "
+            "from the files above. Find out which one describes the swap you mean to recover before running "
+            "this phase again; this phase will not pick one."
+        )
+
+    if persisted.terms.hashlock != rebuilt.terms.hashlock:
+        raise _refuse(
+            "the hashlock (they are different swaps)", persisted.terms.hashlock.hex(), rebuilt.terms.hashlock.hex()
+        )
+    for name in BINDING_RECORD_FIELDS:
+        kept, new = getattr(persisted, name), getattr(rebuilt, name)
+        if kept is not None and new is not None and _comparable(kept) != _comparable(new):
+            shown_kept = kept.to_dict() if hasattr(kept, "to_dict") else kept
+            shown_new = new.to_dict() if hasattr(new, "to_dict") else new
+            raise _refuse(name, shown_kept, shown_new)
+    new_loc = rebuilt.counterchain_locator
+    if persisted.counterchain_locator is None and new_loc is not None:
+        pending = persisted.pending_counter_contract
+        address = getattr(new_loc, "contract_address", None)
+        if pending is not None and (address is None or address.lower() != pending.lower()):
+            raise _refuse("the counter-leg contract (pending in the record, funded in the rebuild)", pending, address)
+        pending_txid = persisted.pending_btc_funding_txid
+        outpoint = getattr(new_loc, "funding_outpoint", None)
+        if pending_txid is not None and (outpoint is None or outpoint.txid != pending_txid):
+            raise _refuse(
+                "the BTC funding transaction (pending in the record, funded in the rebuild)",
+                pending_txid,
+                getattr(outpoint, "txid", None),
+            )
+
+    carried = {}
+    for field in dataclasses.fields(SwapRecord):
+        if field.name == "state":
+            continue
+        kept = getattr(persisted, field.name)
+        carried[field.name] = kept if kept is not None else getattr(rebuilt, field.name)
+    try:
+        return dataclasses.replace(persisted, state=rebuilt.state, **carried)
+    except ValidationError as exc:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} cannot be combined with {source}: {exc}. Nothing was sent."
+        ) from None
+
+
 #: The flags naming the user's own mainnet Radiant node, reached as
 #: ``ssh <host> 'docker exec <container> radiant-cli ...'``. REQUIRED wherever a script reaches the
 #: node: there is no default, because these scripts are public and must not name any one operator's

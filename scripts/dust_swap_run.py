@@ -74,6 +74,7 @@ from pyrxd.security.types import Hex20, Txid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
+    SINGLE_OPERATOR_ROLE,
     CapturingBroadcaster,
     OfflineBtcTransport,
     OfflineRadiantClient,
@@ -225,7 +226,10 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     # A dry run builds the coordinator the broadcast stages build, so it needs what they need; a
     # missing fast tail is reported as its verdict.
     policy, provenance = await measured_margin_from_mainnet(args, dry_run=not do_broadcast)
-    config = CoordinatorConfig(margin_policy=policy, funding_bound=funding_bound_from_args(args))
+    # One process drives BOTH legs: the single-operator role, stated rather than defaulted (#850 D11).
+    config = CoordinatorConfig(
+        margin_policy=policy, funding_bound=funding_bound_from_args(args), role=SINGLE_OPERATOR_ROLE
+    )
     report = StepReport(args.stage, provenance)
     print(f"  measured margin: {json.dumps(provenance)}")
 

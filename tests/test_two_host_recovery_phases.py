@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -129,6 +130,14 @@ class _FakeCounterLeg:
     async def refund(self, locator, timeout=None) -> str:
         self.refund_calls.append(locator)
         return "0x" + "ef" * 32
+
+    # The reads the ETH taker's --phase refund pre-check makes (#850 PR R): an honest, unsettled
+    # contract with no claim in its logs. Subclasses below model the other answers.
+    async def is_settled(self, locator) -> bool:
+        return False
+
+    async def observed_claim_tx(self, locator):
+        return None
 
 
 class _FakeEthRpc:
@@ -749,12 +758,26 @@ class _ClaimedEthCounterLeg(_FakeCounterLeg):
     selector, not a name. The claim itself is readable from the contract's logs.
     """
 
-    def __init__(self, preimage: bytes | None, *, claim_tx: str | None = "0x" + "55" * 32, settled: bool = True):
+    def __init__(
+        self,
+        preimage: bytes | None,
+        *,
+        claim_tx: str | None = "0x" + "55" * 32,
+        settled: bool = True,
+        lands_after_precheck: bool = False,
+    ):
         super().__init__()
         self._p = preimage
         self._claim_tx = claim_tx
         self._settled = settled
+        # The race the runner's pre-check cannot close: the contract is unsettled with no claim when
+        # --phase refund reads it, and the maker's claim lands before the refund's own preflight. The
+        # reads answer "unsettled, no claim" until the refund is attempted, then the configured values.
+        self._lands_after_precheck = lands_after_precheck
         self.provenance_checked: list[str] = []
+
+    def _not_yet(self) -> bool:
+        return self._lands_after_precheck and not self.refund_calls
 
     async def refund(self, locator, timeout=None) -> str:
         self.refund_calls.append(locator)
@@ -762,10 +785,10 @@ class _ClaimedEthCounterLeg(_FakeCounterLeg):
         raise ValidationError(f"tx would revert (preflight eth_call): ('{sel}', '{sel}')")
 
     async def observed_claim_tx(self, locator):
-        return self._claim_tx
+        return None if self._not_yet() else self._claim_tx
 
     async def is_settled(self, locator) -> bool:
-        return self._settled
+        return False if self._not_yet() else self._settled
 
     async def fetch_claim_artifacts(self, tx_hash):
         return [b"\x00\x00\x00\x00" + self._p]
@@ -799,12 +822,17 @@ def _wire_eth_claimed(mod, monkeypatch, leg, *, now_ts=1_900_000_000):
 
 class TestTakerEthRefundSaysWhatHappenedWhenItFails:
     """#850 review: the real leg's failure for "the maker claimed" is a bare preflight revert, the
-    same text as "your refund already landed". The phase must tell the operator which."""
+    same text as "your refund already landed". The phase must tell the operator which.
+
+    Since #850 PR R the phase refuses BEFORE the refund when the contract already reads settled or
+    claimed (``TestTakerEthRefundPreCheck``). The coordinator's failure-time explanation still
+    matters for the race that pre-check cannot close: the claim lands between the pre-check and the
+    refund's preflight. These tests drive that race (``lands_after_precheck``)."""
 
     async def test_maker_already_claimed_names_the_claim_and_the_claim_phase(self, eth_mod, tmp_path, monkeypatch):
         p = os.urandom(32)
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True, preimage=p)
-        leg = _ClaimedEthCounterLeg(p)
+        leg = _ClaimedEthCounterLeg(p, lands_after_precheck=True)
         built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(SystemExit) as raised:
             await eth_mod.taker_phase_refund(args)
@@ -825,10 +853,11 @@ class TestTakerEthRefundSaysWhatHappenedWhenItFails:
         # The leg's log scan finds no claim (withheld; a forged Refunded() reads the same through the
         # real scan — that half is tested through the shipped EthLeg in
         # test_taker_mutual_refund_leaves_covenant.py) while storage says settled.
-        leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True)
+        leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True, lands_after_precheck=True)
         built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(SystemExit) as raised:
             await eth_mod.taker_phase_refund(args)
+        assert len(leg.refund_calls) == 1, "the race case: the pre-check passed and the refund was attempted"
         assert raised.value.code not in (None, 0), "the phase exited 0: the operator would stop here"
         msg = str(raised.value.code)
         assert "ALREADY SETTLED" in msg and "does not mean it was refunded" in msg, msg
@@ -1123,3 +1152,383 @@ class TestBothRolesReDeriveTheSameCovenant:
             maker_pkh=bytes.fromhex(env["maker_pkh_hex"]),
         )
         assert cov.funded_spk.hex() == env["covenant_spk_hex"]
+
+
+# ---------------------------------------------------------------------------
+# 6. The persisted record survives every phase, and a disagreement refuses (#850 PR R)
+# ---------------------------------------------------------------------------
+#
+# Before PR R every recovery phase built a FRESH record from the exchange files, and the coordinator
+# persisted it over `<local_out>.swaprec.json`, dropping whatever an earlier phase had saved (#850
+# review B1). These drive the RUNNER ENTRY POINTS: each run loads a fresh copy of the script module,
+# and the record is read back from disk through a new sink after every run.
+
+#: What the fake Radiant leg reports for the covenant (`_FakeRadiantLeg.find_covenant_utxo`).
+_FAKE_COVENANT_OUTPOINT = "cc" * 32 + ":0"
+
+_OVERRIDE_STATEMENT = "single-operator depth accepted up to 5 RXD by user override (default 1 RXD)"
+
+
+def _record_path(args) -> Path:
+    return Path(str(Path(args.local_out).expanduser()) + ".swaprec.json")
+
+
+def _read_back(args):
+    """The record as a NEW process would see it: a new sink, reading the file."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    return JsonFileRecordSink(_record_path(args)).load_record()
+
+
+def _exchange_locator(io_dir: Path, *, eth: bool):
+    doc = json.loads((io_dir / "taker_funding.json").read_text())
+    if eth:
+        from pyrxd.eth_wallet.locator import EthHtlcLocator
+
+        return EthHtlcLocator.from_dict(doc["eth_locator"])
+    return bt.BtcHtlcLocator.from_dict(doc["btc_locator"])
+
+
+async def _seed(args, record) -> None:
+    """Write a record the way the coordinator does: through the real sink."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    await JsonFileRecordSink(_record_path(args))(record)
+
+
+def _seeded_record(terms, io_dir: Path, *, eth: bool, state: SwapState):
+    """The record an earlier phase of this host left behind, holding every field scenario 19 names.
+
+    FIXTURE NOTE: on ETH this carries the funded locator AND the pending deploy/push handles of the
+    same contract. Today's coordinator clears the pending handles when it attaches the locator
+    (``SwapRecord.with_counter_lock``), and PR 3 of the #850 plan keeps the push handles beside the
+    locator, so this exact combination is not one a 0.26.x run writes. It is the superset: the merge
+    must carry whatever the record holds, and a field it drops fails here."""
+    from pyrxd.gravity.swap_state import SwapRecord
+
+    loc = _exchange_locator(io_dir, eth=eth)
+    env = json.loads((io_dir / "envelope.json").read_text())
+    rec = (
+        SwapRecord(state=state, terms=terms)
+        .with_counter_lock(loc)
+        .with_radiant_lock(_FAKE_COVENANT_OUTPOINT, env["covenant_spk_hex"])
+    )
+    extra: dict[str, object] = {"single_operator_override": _OVERRIDE_STATEMENT}
+    if eth:
+        extra.update(
+            pending_counter_contract=loc.contract_address,
+            pending_counter_deploy_tx=loc.deploy_tx_hash,
+            pending_push_nonce=7,
+            pending_push_tx_hash="0x" + "77" * 32,
+        )
+    return dataclasses.replace(rec, **extra)
+
+
+def _kept_fields(rec) -> dict:
+    """Every field but ``state``, in wire form: what must survive a phase."""
+    d = rec.to_dict()
+    d.pop("state")
+    return d
+
+
+#: (script, role, phase, the state the phase persists). Each persists through the coordinator.
+_PERSISTING_PHASES = [
+    ("eth_swap_two_host", "taker", "abort", SwapState.ABORTED),
+    ("eth_swap_two_host", "maker", "refund", SwapState.ASSET_REFUNDED_TAKER_ACTS),
+    ("btc_swap_two_host", "taker", "abort", SwapState.ABORTED),
+    ("btc_swap_two_host", "taker", "refund", SwapState.MUTUAL_REFUND),
+    ("btc_swap_two_host", "maker", "refund", SwapState.ASSET_REFUNDED_TAKER_ACTS),
+]
+
+
+async def _run_phase(name: str, args, monkeypatch, *, role: str, phase: str):
+    """Run one phase through the runner's own dispatch table, in a FRESH copy of the module."""
+    mod = _load(name)
+    built = _wire_eth(mod, monkeypatch) if name == "eth_swap_two_host" else _wire_btc(mod, monkeypatch)
+    _wire_rxd_height(mod, monkeypatch, tip=1_120, locked_at=1_000)  # t_rxd 120 => matured exactly
+    await mod._DISPATCH[(role, phase)](_with_fee(argparse.Namespace(**vars(args))))
+    return built
+
+
+class TestEveryPhaseKeepsThePersistedRecord:
+    """Scenario 19 (#850 PR R): each recovery phase, run twice, keeps every field the record holds."""
+
+    @pytest.mark.parametrize(("name", "role", "phase", "lands_in"), _PERSISTING_PHASES)
+    async def test_run_twice_and_every_field_survives(self, name, role, phase, lands_in, tmp_path, monkeypatch):
+        eth = name == "eth_swap_two_host"
+        scenario = _eth_scenario if eth else _btc_scenario
+        args, terms, io_dir = scenario(_load(name), tmp_path, role=role, with_funding=True)
+        start = SwapState.BTC_LOCKED if phase == "abort" else SwapState.BOTH_LOCKED
+        seeded = _seeded_record(terms, io_dir, eth=eth, state=start)
+        await _seed(args, seeded)
+        before = _kept_fields(_read_back(args))
+        assert before == _kept_fields(seeded), "the fixture did not round-trip through the sink"
+        assert before["radiant_covenant_outpoint"] == _FAKE_COVENANT_OUTPOINT
+        assert before["single_operator_override"] == _OVERRIDE_STATEMENT
+        if eth:
+            assert before["pending_push_nonce"] == 7 and before["pending_counter_contract"]
+
+        for run in (1, 2):
+            await _run_phase(name, args, monkeypatch, role=role, phase=phase)
+            after = _read_back(args)
+            assert after.state is lands_in, f"run {run}: the phase did not persist ({after.state.value})"
+            assert _kept_fields(after) == before, f"run {run}: the phase dropped persisted fields"
+
+    async def test_the_outpoint_one_phase_persisted_is_the_one_the_next_phase_spends(self, tmp_path, monkeypatch):
+        """The maker's lock-claim pins the covenant outpoint it verified; its later --phase refund must
+        spend THAT outpoint. The refund leg receives the coordinator's record, so this reads what the
+        next phase actually drove, not only what it wrote."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        name = "eth_swap_two_host"
+        args, terms, io_dir = _eth_scenario(_load(name), tmp_path, role="maker", with_funding=True)
+        spk = json.loads((io_dir / "envelope.json").read_text())["covenant_spk_hex"]
+        pinned = "dd" * 32 + ":1"
+        lock_claim_left = (
+            SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms)
+            .with_counter_lock(_exchange_locator(io_dir, eth=True))
+            .with_radiant_lock(pinned, spk)
+        )
+        await _seed(args, lock_claim_left)
+        built = await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
+        assert len(built["rxd"].refund_calls) == 1
+        assert built["rxd"].refund_calls[0].radiant_covenant_outpoint == pinned
+        assert _read_back(args).radiant_covenant_outpoint == pinned
+
+
+class TestADisagreementRefusesAndSendsNothing:
+    """A binding field (terms, hashlock, the counter-leg contract, the covenant) that differs between
+    the persisted record and what a phase rebuilt REFUSES: nothing is broadcast and the file is left
+    as it was. The survival tests above are the honest-path pair: same fields, equal values."""
+
+    async def test_eth_taker_abort_refuses_a_different_counter_contract(self, eth_mod, tmp_path, monkeypatch):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        other = dataclasses.replace(_exchange_locator(io_dir, eth=True), contract_address="0x" + "99" * 20)
+        await _seed(args, SwapRecord(state=SwapState.BTC_LOCKED, terms=terms).with_counter_lock(other))
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(eth_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="disagree on counterchain_locator") as raised:
+            await eth_mod.taker_phase_abort(args)
+        assert "Nothing was sent" in str(raised.value.code)
+        assert built["counter"].refund_calls == []
+        assert _record_path(args).read_bytes() == before
+
+    async def test_eth_taker_abort_refuses_a_pending_contract_that_is_not_the_funded_one(
+        self, eth_mod, tmp_path, monkeypatch
+    ):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        await _seed(
+            args,
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=terms,
+                pending_counter_contract="0x" + "98" * 20,
+                pending_counter_deploy_tx="0x" + "97" * 32,
+                fund_refusal="the taker gate refused",
+            ),
+        )
+        built = _wire_eth(eth_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="counter-leg contract"):
+            await eth_mod.taker_phase_abort(args)
+        assert built["counter"].refund_calls == []
+
+    async def test_btc_taker_refund_refuses_a_different_covenant_outpoint(self, btc_mod, tmp_path, monkeypatch):
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        seeded = _seeded_record(terms, io_dir, eth=False, state=SwapState.BOTH_LOCKED)
+        await _seed(args, dataclasses.replace(seeded, radiant_covenant_outpoint="ee" * 32 + ":3"))
+        built = _wire_btc(btc_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="disagree on radiant_covenant_outpoint"):
+            await btc_mod.taker_phase_refund(_with_fee(args))
+        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
+
+    async def test_eth_maker_lock_claim_refuses_different_terms_under_the_same_hashlock(
+        self, eth_mod, tmp_path, monkeypatch
+    ):
+        p = os.urandom(32)
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True, preimage=p)
+        local = json.loads(Path(args.local_out).read_text())
+        local["preimage_p_hex"] = p.hex()  # lock-claim checks the maker's local p against H first
+        Path(args.local_out).write_text(json.dumps(local))
+        seeded = _seeded_record(terms, io_dir, eth=True, state=SwapState.BOTH_LOCKED)
+        changed = dataclasses.replace(terms, radiant_amount=terms.radiant_amount + 1)
+        await _seed(args, dataclasses.replace(seeded, terms=changed))
+        built = _wire_eth(eth_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="disagree on terms"):
+            await eth_mod.maker_phase_lock_claim(_with_fee(args))
+        assert built["counter"].refund_calls == []
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_a_record_for_a_different_swap_refuses_the_maker_abort(self, name, tmp_path, monkeypatch):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        mod = _load(name)
+        scenario = _eth_scenario if name == "eth_swap_two_host" else _btc_scenario
+        args, terms, _io = scenario(mod, tmp_path, role="maker", with_funding=False)
+        other = dataclasses.replace(terms, hashlock=hashlib.sha256(b"another swap").digest())
+        await _seed(args, SwapRecord(state=SwapState.NEGOTIATED, terms=other))
+        built = _wire_eth(mod, monkeypatch) if name == "eth_swap_two_host" else _wire_btc(mod, monkeypatch)
+        with pytest.raises(SystemExit, match="different swaps"):
+            await mod.maker_phase_abort(_with_fee(args))
+        assert built["rxd"].refund_calls == []
+
+
+class TestTheMergeHelperOnItsOwn:
+    """``merge_with_persisted_record`` as ``dust_swap_resume.py`` uses it (no two-host phase around it)."""
+
+    def _merge(self, sink_path: Path, rebuilt):
+        sys.path.insert(0, str(_SCRIPTS))
+        from _dust_swap_shared import merge_with_persisted_record
+
+        from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+        return merge_with_persisted_record(JsonFileRecordSink(sink_path), rebuilt, source="the test's rebuild")
+
+    async def test_no_record_returns_the_rebuild_unchanged(self, btc_mod, tmp_path):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        _args, terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        rebuilt = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms)
+        assert self._merge(tmp_path / "none.swaprec.json", rebuilt) is rebuilt
+
+    async def test_a_btc_locator_rebuilt_from_the_chain_equals_the_persisted_one(self, btc_mod, tmp_path):
+        """The resume rebuilds the locator with ``build_htlc(...).with_funding(...)``; the forward run
+        persisted the one its leg returned. Equal content must merge, or every resume would refuse."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        persisted_loc = _exchange_locator(io_dir, eth=False)
+        await _seed(args, SwapRecord(state=SwapState.BTC_LOCKED, terms=terms).with_counter_lock(persisted_loc))
+        fresh = bt.build_htlc(
+            hashlock=terms.hashlock,
+            claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
+            refund_pubkey_xonly=terms.btc_refund_pubkey_xonly,
+            timeout=terms.t_btc,
+            network="bcrt",
+        ).with_funding(bt.BtcOutpoint("ab" * 32, 0), 100_000)
+        rebuilt = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms).with_counter_lock(fresh)
+        merged = self._merge(_record_path(args), rebuilt)
+        assert merged.counterchain_locator.to_dict() == persisted_loc.to_dict()
+
+    async def test_an_unreadable_record_refuses(self, btc_mod, tmp_path):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        _args, terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        torn = tmp_path / "torn.swaprec.json"
+        torn.write_text('{"state": "btc_lo')
+        with pytest.raises(SystemExit, match="could not be read"):
+            self._merge(torn, SwapRecord(state=SwapState.BTC_LOCKED, terms=terms))
+
+
+# ---------------------------------------------------------------------------
+# 7. The ETH taker's --phase refund pre-check (#850 PR R, Mythos M1)
+# ---------------------------------------------------------------------------
+
+
+class TestTakerEthRefundPreCheck:
+    """Refuses when the HTLC is settled or a claim is found in its logs; never concludes "refunded"."""
+
+    async def test_a_claim_in_the_logs_refuses_and_names_the_claim_phase(self, eth_mod, tmp_path, monkeypatch, capsys):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        leg = _ClaimedEthCounterLeg(os.urandom(32))
+        built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        with pytest.raises(SystemExit) as raised:
+            await eth_mod.taker_phase_refund(args)
+        msg = str(raised.value.code)
+        assert msg.startswith("REFUSING to refund") and "0x" + "55" * 32 in msg, msg
+        assert "not verified here" in msg and "--phase claim" in msg and "t_rxd = 120" in msg, msg
+        assert "Nothing was sent" in msg, msg
+        assert leg.refund_calls == [], "the refund was attempted against a claimed contract"
+        assert built["rxd"].refund_calls == []
+        assert "refunded" not in capsys.readouterr().out.lower()
+
+    async def test_settled_with_no_claim_found_refuses_and_never_says_refunded(self, eth_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True)
+        _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        with pytest.raises(SystemExit) as raised:
+            await eth_mod.taker_phase_refund(args)
+        msg = str(raised.value.code)
+        assert "already SETTLED" in msg and "does not mean it was refunded" in msg, msg
+        assert "maker_claim.json" in msg and "--phase claim" in msg and "0x" + "33" * 20 in msg, msg
+        assert leg.refund_calls == []
+
+    async def test_a_claim_on_an_unsettled_contract_still_refuses(self, eth_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        leg = _ClaimedEthCounterLeg(os.urandom(32), settled=False)
+        _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        with pytest.raises(SystemExit, match="NOT settled"):
+            await eth_mod.taker_phase_refund(args)
+        assert leg.refund_calls == []
+
+    async def test_it_runs_before_the_timeout_check(self, eth_mod, tmp_path, monkeypatch):
+        """A claim before the ETH timeout is when the covenant claim is most urgent; the "has NOT
+        timed out" refusal must not hide it."""
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        leg = _ClaimedEthCounterLeg(os.urandom(32))
+        _wire_eth_claimed(eth_mod, monkeypatch, leg, now_ts=1_700_000_000)  # before the 1_800_000_000 timeout
+        with pytest.raises(SystemExit, match="a claim of the ETH HTLC"):
+            await eth_mod.taker_phase_refund(args)
+
+    async def test_an_unreadable_settled_flag_refuses(self, eth_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+
+        class _Leg(_FakeCounterLeg):
+            async def is_settled(self, locator) -> bool:
+                raise NetworkError("eth_getStorageAt timed out")
+
+        leg = _Leg()
+        _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        with pytest.raises(SystemExit, match="could not read whether"):
+            await eth_mod.taker_phase_refund(args)
+        assert leg.refund_calls == []
+
+    async def test_unreadable_logs_on_an_unsettled_contract_do_not_block_the_refund(
+        self, eth_mod, tmp_path, monkeypatch
+    ):
+        """The honest path: many endpoints cap or prune old logs, and an unsettled contract has no
+        landed claim. A pre-check that refused here would block a valid refund."""
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+
+        class _Leg(_FakeCounterLeg):
+            async def observed_claim_tx(self, locator):
+                raise NetworkError("eth_getLogs: block range too large")
+
+        leg = _Leg()
+        _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        await eth_mod.taker_phase_refund(args)
+        assert len(leg.refund_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 8. Every runner states its role (#850 D11)
+# ---------------------------------------------------------------------------
+
+
+def test_every_coordinator_config_a_script_builds_names_its_role():
+    """Derived from the source: every ``CoordinatorConfig(...)`` call under scripts/ passes ``role=``.
+    The two-host runners pass MAKER/TAKER; the single-process runners pass SINGLE_OPERATOR_ROLE."""
+    calls: list[tuple[str, int, bool]] = []
+    for path in sorted(_SCRIPTS.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+            if name == "CoordinatorConfig":
+                calls.append((path.name, node.lineno, any(k.arg == "role" for k in node.keywords)))
+    found = {f for f, _line, _has in calls}
+    # Non-vacuity: the six runners this rule was written for are all found.
+    assert {
+        "eth_swap_two_host.py",
+        "btc_swap_two_host.py",
+        "eth_swap_run.py",
+        "eth_swap_grief_run.py",
+        "dust_swap_run.py",
+        "dust_swap_resume.py",
+    } <= found, found
+    missing = [f"{f}:{line}" for f, line, has_role in calls if not has_role]
+    assert missing == [], f"CoordinatorConfig built without an explicit role= at {missing}"

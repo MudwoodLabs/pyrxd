@@ -88,6 +88,7 @@ from _dust_swap_shared import (
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    merge_with_persisted_record,
     resolve_asset_locked_at_height,
     resolve_eth_key_file,
     wait_for_covenant_via_leg,
@@ -1042,6 +1043,57 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
         await rpc.close()
 
 
+async def _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc: EthHtlcLocator, terms) -> None:
+    """The taker's ``--phase refund`` pre-check (#850 PR R, Mythos M1). It refuses; it never concludes.
+
+    Refuses when the ETH HTLC is already settled (``EthLeg.is_settled``: claimed or refunded) or a
+    claim on it is found in its logs (``EthLeg.observed_claim_tx``). Both reads come from ONE
+    endpoint, the one ``--eth-rpc-url`` names, which is why this only ever refuses: it never reports
+    the contract as refunded, and a claim found here is verified by ``--phase claim``, not here.
+
+    An unreadable settled flag refuses too: nothing is known, and nothing is sent. An unreadable log
+    history on a contract that is NOT settled does not refuse: a claim that landed would have set the
+    flag, and many endpoints cap or prune old logs.
+    """
+    contract = loc.contract_address
+    claim_cmd = f"python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ..."
+    window = f"t_rxd = {terms.t_rxd.value} {terms.t_rxd.unit.value} after the covenant was mined"
+    try:
+        settled = await eth_leg.is_settled(loc)
+    except Exception as exc:
+        raise SystemExit(
+            f"REFUSING to refund: could not read whether the ETH HTLC {contract} is already settled "
+            f"({str(exc)[:160]}). Nothing was sent. Retry, or pass an --eth-rpc-url that can answer."
+        ) from None
+    try:
+        claim_tx = await eth_leg.observed_claim_tx(loc)
+    except Exception as exc:
+        if not settled:
+            print(f"  could not read the HTLC's logs ({str(exc)[:120]}); it is not settled, so no claim has landed.")
+            return
+        claim_tx = None
+    if claim_tx is not None:
+        state = "settled" if settled else "NOT settled"
+        raise SystemExit(
+            f"REFUSING to refund: a claim of the ETH HTLC {contract} was found in its logs, tx {claim_tx}. It was "
+            f"read from one endpoint and is not verified here; the contract is {state} at that endpoint's tip. "
+            "If the maker claimed, p is public and the RXD covenant is yours to claim before its CSV refund to "
+            f"the maker opens, {window}. Nothing was sent.\n"
+            f"  NEXT: {claim_cmd} (it verifies the claim on chain before using it; if maker_claim.json is "
+            f'absent, write {{"eth_claim_tx_hash": "{claim_tx}"}} into it or let the phase find the claim).'
+        )
+    if settled:
+        raise SystemExit(
+            f"REFUSING to refund: the ETH HTLC {contract} is already SETTLED (claimed or refunded) at this "
+            "endpoint's tip, and no claim was found in its logs here. That does not mean it was refunded: the "
+            "logs come from one endpoint, which may be incomplete or wrong. Nothing was sent.\n"
+            f"  NEXT: check the events of {contract} on another RPC or a block explorer. If there is a Claimed "
+            f'event, write its tx hash into {args.io}/maker_claim.json as {{"eth_claim_tx_hash": "0x…"}} and '
+            f"run: {claim_cmd} (before {window}). If it shows only a refund to your address, nothing more is "
+            "needed on the ETH side."
+        )
+
+
 async def taker_phase_refund(args: argparse.Namespace) -> None:
     """TAKER recovery — the taker's half of the mutual unwind (``--phase refund``).
 
@@ -1053,8 +1105,9 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     refund sent from here would take that away. The Radiant leg is built with ``_NoFeeSource``, so
     this phase cannot broadcast a covenant spend by any route, and no ``--fee-*`` is needed.
 
-    The covenant is read first so the record pins its outpoint; the ETH timeout is checked before
-    anything broadcasts. ``--phase abort`` does the same counter-leg refund without reading the
+    Before anything else it refuses when the ETH HTLC is already settled or a claim on it is found
+    (``_refuse_if_counter_leg_settled_or_claimed``). The covenant is read next so the record pins its
+    outpoint; the ETH timeout is checked before anything broadcasts. ``--phase abort`` does the same counter-leg refund without reading the
     covenant, for when the maker never locked it or the Radiant node cannot answer.
     """
     io_dir = _io_dir(args)
@@ -1077,6 +1130,10 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
 
     try:
+        # FIRST, before the covenant read and the timeout check: a settled or claimed contract
+        # changes what the taker should do next, and a claim must not wait behind a refusal that
+        # says "nothing is recoverable yet".
+        await _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc, terms)
         try:
             outpoint, value, confs = await _covenant_state(rxd_leg, cov=cov, expected_photons=terms.radiant_amount)
         except Exception as exc:
@@ -1266,7 +1323,9 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     fee_source = _require_fee_source(args, what="the maker's asset abort (--phase abort)")
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
 
-    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    # No coordinator here, but the leg reads the record: a covenant outpoint this host persisted
+    # earlier pins which UTXO the refund spends.
+    record = _merged_record(args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out)
     confirm(
         "refund_asset: CSV-refund the RXD covenant to the maker (the taker never funded a counter leg)",
         auto_yes=args.yes,
@@ -1291,12 +1350,20 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
     """Build the REAL SwapCoordinator — the SAME object graph as eth_swap_run.py / the e2e, only
     each process constructs its own side. Durable seen-store by default.
 
+    A phase that passes the ``record`` it rebuilt from the exchange files gets that record MERGED
+    with the one this host persisted (``merge_with_persisted_record``, #850 PR R): the persisted
+    fields are kept, the rebuild only fills what the record lacks, and a disagreement on the swap
+    or contract identity refuses. ``record=None`` (the taker's fund) starts a fresh NEGOTIATED
+    record, as before.
+
     The coordinator is ROLE-tagged (security review): this is a genuine two-party deployment, so the
     P3 role guard must be armed — without it a taker who mistakenly runs the maker-only
     ``maybe_refund_asset_on_maker_stall`` self-strands (its CSV refund pays the maker). The BTC sibling
     already threads this; the ETH one previously left ``role`` unset (guard disabled)."""
     if record is None:
         record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    else:
+        record = _merged_record(args, record, keys_out=keys_out)
     role = SwapRole.MAKER if args.role == "maker" else SwapRole.TAKER
     return SwapCoordinator(
         record=record,
@@ -1304,7 +1371,7 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
         radiant_leg=rxd_leg,
         indexer=None,  # plain RXD has no genesis ref → no ref-authenticity indexer needed
         seen_store=DurableSeenStore(str(Path(keys_out).expanduser()) + ".seen.sqlite"),
-        persist=JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json"),
+        persist=_record_sink(keys_out),
         config=CoordinatorConfig(
             margin_policy=_margin_policy(args),
             accept_estimated_eth_margins=True,
@@ -1321,6 +1388,20 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
         # The ETH deadline is absolute: on a value-bearing Radiant leg the coordinator judges its
         # ordering against t_rxd from the clock when it is built (inert on this regtest-pinned leg).
         now_unix_s=int(time.time()),
+    )
+
+
+def _record_sink(keys_out) -> JsonFileRecordSink:
+    """The swap record file beside the run's local state and seen-store."""
+    return JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json")
+
+
+def _merged_record(args, rebuilt: SwapRecord, *, keys_out) -> SwapRecord:
+    """The persisted record merged with what this phase rebuilt (see ``_coordinator``)."""
+    return merge_with_persisted_record(
+        _record_sink(keys_out),
+        rebuilt,
+        source=f"what this phase rebuilt from the exchange files in {args.io}",
     )
 
 

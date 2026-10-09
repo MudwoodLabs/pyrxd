@@ -244,6 +244,21 @@ refund event, and the logs come from one RPC, so check the contract's events els
 there is a claim, put its tx hash in `maker_claim.json` and run `--phase claim` before `t_rxd`.
 Any other failure is shown as it came.
 
+Before any of that, ETH taker `refund` reads the contract and **refuses up front**, sending
+nothing, when the HTLC is already settled or a claim is found in its logs. It never reads that
+as "refunded". A claim found there is not verified by this check; `--phase claim` verifies it.
+For a settled contract with no claim found, check the contract's events elsewhere, as above. An
+unreadable settled flag refuses too. An unreadable log history on a contract that is not settled
+does not refuse, because a claim that landed would have settled it.
+
+**The swap record carries across phases.** Each phase rebuilds its record from the exchange
+files, and then merges it with the record this host saved (`<--local-out>.swaprec.json`). Fields
+the record already holds are kept, such as the covenant outpoint pinned by an earlier phase and
+the pending deploy or push handles. The exchange files only fill fields the record lacks. If
+the record and the exchange files disagree on the terms, the hashlock, the counter-leg contract
+or the covenant outpoint, the phase refuses and sends nothing. Find out which one describes your
+swap before running it again. Each phase still drives the FSM state it always did.
+
 `scripts/btc_swap_two_host.py` has the same four phases, with the BTC HTLC's CSV (`t_btc`) in
 place of the ETH timeout — but its taker `refund` is **unchanged for now**: it still refunds
 both legs, so it still refuses until the covenant's CSV has matured. On BTC the same race is

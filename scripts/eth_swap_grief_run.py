@@ -40,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
+    SINGLE_OPERATOR_ROLE,
     InMemSeen,
     SshTrFeeSource,
     StepReport,
@@ -129,6 +130,9 @@ async def run(args) -> None:
         accept_estimated_eth_margins=True,
         fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
         funding_bound=funding_bound_from_args(args),
+        # One process plays both the stalling maker and the honest taker: the single-operator
+        # role, stated rather than defaulted (#850 D11).
+        role=SINGLE_OPERATOR_ROLE,
     )
     rxd_network = SshTrRadiantClient.NETWORK
     print(f"=== ETH↔RXD GRIEFING run (S1) — ETH=sepolia, RXD={rxd_network} mainnet ===")

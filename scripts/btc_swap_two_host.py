@@ -87,6 +87,7 @@ from _dust_swap_shared import (
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    merge_with_persisted_record,
     resolve_asset_locked_at_height,
     wait_for_covenant_via_leg,
 )
@@ -458,9 +459,17 @@ def _fee_source_from_args(args):
 
 def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
     """Build the REAL SwapCoordinator — the SAME object graph as dust_swap_run.py / the e2e, only each
-    process constructs its own side. Durable seen-store; role-tagged for the P3 recovery guards."""
+    process constructs its own side. Durable seen-store; role-tagged for the P3 recovery guards.
+
+    A phase that passes the ``record`` it rebuilt from the exchange files gets that record MERGED
+    with the one this host persisted (``merge_with_persisted_record``, #850 PR R): the persisted
+    fields are kept, the rebuild only fills what the record lacks, and a disagreement on the swap
+    or contract identity refuses. ``record=None`` (the taker's fund) starts a fresh NEGOTIATED
+    record, as before."""
     if record is None:
         record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    else:
+        record = _merged_record(args, record, keys_out=keys_out)
     role = SwapRole.MAKER if args.role == "maker" else SwapRole.TAKER
     return SwapCoordinator(
         record=record,
@@ -479,6 +488,15 @@ def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
 def _record_sink(keys_out) -> JsonFileRecordSink:
     """The swap record file beside the run's keys and seen-store."""
     return JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json")
+
+
+def _merged_record(args, rebuilt: SwapRecord, *, keys_out) -> SwapRecord:
+    """The persisted record merged with what this phase rebuilt (see ``_coordinator``)."""
+    return merge_with_persisted_record(
+        _record_sink(keys_out),
+        rebuilt,
+        source=f"what this phase rebuilt from the exchange files in {args.io}",
+    )
 
 
 async def _maker_verify_btc_funding(coord: SwapCoordinator, locator) -> int:
@@ -1259,7 +1277,9 @@ async def maker_phase_abort(args) -> None:
     fee_source = _require_fee_source(args, what="the maker's asset abort (--phase abort)")
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
 
-    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    # No coordinator here, but the leg reads the record: a covenant outpoint this host persisted
+    # earlier pins which UTXO the refund spends.
+    record = _merged_record(args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out)
     confirm(
         "refund_asset: CSV-refund the RXD covenant to the maker (the taker never funded a counter leg)",
         auto_yes=args.yes,
