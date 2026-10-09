@@ -50,7 +50,7 @@ it refuses to write a file whose keys look like a secret (`preimage`, `wif`, `se
 | 1 | `taker_intro.json` | taker → maker | the taker's RXD pubkey-hash + ETH addresses |
 | 2 | `envelope.json` | maker → taker | the `NegotiatedTerms` (hashlock **H** only), the maker's public ETH/RXD payout config, and the funded covenant SPK |
 | 3 | `taker_funding.json` | taker → maker | the funded ETH HTLC locator (`EthHtlcLocator` — carries H, never p) |
-| 4 | `maker_claim.json` | maker → taker | the maker's ETH claim **tx hash** (the taker scrapes `p` from that tx **on-chain**, never from this file) |
+| 4 | `maker_claim.json` | maker → taker | the maker's ETH claim **tx hash** (the taker scrapes `p` from that tx **on-chain**, never from this file). Optional: without it, `--phase claim` finds the claim in the HTLC contract's logs |
 
 ## The envelope (`envelope.json`)
 
@@ -227,35 +227,48 @@ Both roles have both phases, and the rule for choosing between them is one sente
 | Phase | Use it when | What it recovers |
 |---|---|---|
 | **`abort`** | the swap never reached *both legs locked* — or you simply want your own leg back | **only the leg you locked**, unilaterally, as soon as **its own** timelock matures |
-| **`refund`** | both legs are locked and the swap will not complete | the **mutual unwind**: every leg goes back to whoever locked it, once **both** timeouts have elapsed |
+| **`refund`** | both legs are locked and the swap will not complete | **your half of the mutual unwind**: on ETH each operator refunds the leg it locked (#850); on BTC the taker's run still refunds both legs, once **both** timeouts have elapsed |
 
 **`abort` is available earlier, and it is the one a stalled operator reaches for first.** The
 ETH HTLC times out at `eth_timeout_unix_s`; the RXD covenant's CSV matures at `t_rxd`, which
-is deliberately the *later* of the two. In the stretch between them the taker can already
-recover its own ETH while the mutual unwind is not yet possible — so `refund` **refuses**
-there, names the shortfall, and points at `abort`, rather than refunding one leg and failing
-on the other. (`mutual_refund` broadcasts the counter leg first; a half-completed unwind
-leaves the record stuck at `both_locked` with a retry that can never finish.)
+is deliberately the *later* of the two, so the taker's own leg is recoverable first.
 
-`scripts/btc_swap_two_host.py` has the identical four phases, with the BTC HTLC's CSV
-(`t_btc`) in place of the ETH timeout.
+On ETH, taker `refund` refunds the ETH HTLC **only** and leaves the record at `both_locked`
+(#850). The covenant's refund pays the maker and is the maker's to send: if the maker claimed
+the ETH before its timeout, the taker can still claim the covenant with the revealed `p`
+(`--phase claim`), and a covenant refund sent from the taker's side would take that away.
+When the ETH refund fails, the phase reads the contract to say why. For a verified maker claim,
+it names the claim tx and `--phase claim`. For a settled contract with no verified claim, it
+exits non-zero and does **not** conclude "refunded": an honest node always shows a claim or a
+refund event, and the logs come from one RPC, so check the contract's events elsewhere, and if
+there is a claim, put its tx hash in `maker_claim.json` and run `--phase claim` before `t_rxd`.
+Any other failure is shown as it came.
+
+`scripts/btc_swap_two_host.py` has the same four phases, with the BTC HTLC's CSV (`t_btc`) in
+place of the ETH timeout — but its taker `refund` is **unchanged for now**: it still refunds
+both legs, so it still refuses until the covenant's CSV has matured. On BTC the same race is
+open (the claim leaf has no timelock, so the maker can claim while the taker's refund is
+unconfirmed); closing it needs the watchtower to tell the taker's refund from a maker claim
+first, which is tracked in #850.
 
 ### What each phase actually drives
 
 | Role + phase | Coordinator entry point | FSM |
 |---|---|---|
 | taker `abort` | `SwapCoordinator.taker_refund_btc()` | `btc_locked → aborted` |
-| taker `refund` | `SwapCoordinator.mutual_refund()` | `both_locked → mutual_refund` |
+| taker `refund` (ETH) | `SwapCoordinator.mutual_refund()` on a taker-role coordinator | `both_locked` (no advance) |
+| taker `refund` (BTC) | `SwapCoordinator.mutual_refund()` | `both_locked → mutual_refund` |
 | maker `refund` | `SwapCoordinator.maybe_refund_asset_on_maker_stall()` | `both_locked → asset_refunded_taker_acts` |
 | maker `abort` | `RadiantCovenantLeg.refund_asset()` — **no coordinator entry point exists** | *(no advance)* |
 
 Three things about that table are worth knowing before you need it:
 
-- **The taker can push the maker's covenant refund, and that is not a loss.** The covenant's
-  CSV refund needs no maker key — its scriptSig is `<OP_1>` and nothing else — only a fee
-  UTXO. That is why `--fee-*` is required for taker `refund` and *not* for taker `abort`:
-  the abort path builds its Radiant leg with a fee source that **cannot dispense**, so it is
-  structurally incapable of broadcasting a covenant spend at all.
+- **The taker can push the maker's covenant refund, and on ETH it no longer does.** The
+  covenant's CSV refund needs no maker key — its scriptSig is `<OP_1>` and nothing else — only
+  a fee UTXO. On ETH, taker `abort` and taker `refund` both build their Radiant leg with a fee
+  source that **cannot dispense**, so they are structurally incapable of broadcasting a covenant
+  spend, and neither needs `--fee-*`. On BTC, taker `refund` still sends the covenant refund
+  and still requires `--fee-*` (#850).
 - **The asset-only refund is a taker-destroying trap, and is wired for the maker only.**
   `maybe_refund_asset_on_maker_stall` refunds the covenant, which pays the **maker** in both
   directions. A taker that ran it would gift the asset back *and* destroy its own only
@@ -271,8 +284,8 @@ Three things about that table are worth knowing before you need it:
 
 ### Running them
 
-Both maker phases and taker `refund` spend the RXD covenant, so they need that operator's own
-regtest fee UTXO (`--fee-txid/--fee-vout/--fee-value/--fee-spk-hex/--fee-wif`); they refuse up
+Both maker phases (and, on BTC, taker `refund`) spend the RXD covenant, so they need that
+operator's own regtest fee UTXO (`--fee-txid/--fee-vout/--fee-value/--fee-spk-hex/--fee-wif`); they refuse up
 front, naming the flags, if it is missing. Every broadcast still goes through the same
 `confirm` prompt as the happy path.
 
@@ -283,12 +296,11 @@ taker$ python scripts/eth_swap_two_host.py --role taker --phase abort \
     --eth-key-file ~/.swap-taker-eth-key --audit-cleared \
     --rxd-electrumx-url ws://<regtest-electrumx>
 
-# taker — the mutual unwind, once BOTH timeouts have elapsed:
+# taker — your half of the unwind once both legs are locked: the ETH HTLC only, after its timeout:
 taker$ python scripts/eth_swap_two_host.py --role taker --phase refund \
     --io ./swapdir --eth-rpc-url <sepolia-or-anvil> \
     --eth-key-file ~/.swap-taker-eth-key --audit-cleared \
-    --rxd-electrumx-url ws://<regtest-electrumx> \
-    --fee-txid <…> --fee-vout <…> --fee-value <…> --fee-spk-hex <…> --fee-wif <…>
+    --rxd-electrumx-url ws://<regtest-electrumx>
 
 # maker — the maker's half of the unwind, once t_rxd has matured:
 maker$ python scripts/eth_swap_two_host.py --role maker --phase refund \

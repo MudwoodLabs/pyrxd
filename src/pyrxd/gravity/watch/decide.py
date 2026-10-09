@@ -320,6 +320,38 @@ _STEP_TO_SECRET_REVEALED = "taker_observed_reveal"  # nosec B105
 _STEP_FROM_SECRET_REVEALED = "taker_scrape_and_claim_asset"  # nosec B105
 _STEP_FROM_VULNERABLE = "taker_claim_asset_from_vulnerable"
 
+# The BOTH_LOCKED maker-stall page, per counter chain (#850). The two differ because mutual_refund
+# does: on an ETH counter leg a TAKER-role coordinator refunds only the taker's ETH HTLC and leaves
+# the record BOTH_LOCKED (the covenant refund pays the maker and is the maker's to send). The tower
+# sees no claim in a refund and the situation does not change, so this stays the decision on every
+# tick; DedupAlerter delivers a WARN once per situation, from in-memory state, so the operator sees
+# it again only after a tower restart. On a BTC counter leg mutual_refund is unchanged in this
+# release: it also sends the covenant refund, which cannot be mined before t_rxd, and reaches the
+# terminal MUTUAL_REFUND.
+#
+# Both replace a sentence that said the counter leg "cannot mature until t_btc > t_rxd". The
+# relation was inverted in #482. The gates require t_rxd's refund to open no earlier than the
+# counter deadline plus the margin (``assert_timelock_margin`` on BTC, in wall clock; the
+# ``eth_rxd_timelock`` cross-clock gate on ETH, against ``eth_timeout_unix_s``).
+_BOTH_LOCKED_REFUND_COMMON = (
+    "maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund. The deadline "
+    "shown is t_rxd, when the maker's CSV refund of the covenant opens. "
+)
+_BOTH_LOCKED_REFUND_REASON_BTC = _BOTH_LOCKED_REFUND_COMMON + (
+    "The BTC refund opens first (the swap was gated so the covenant refund opens no earlier than the BTC refund plus the margin, in wall-clock time). On "
+    "a BTC counter leg mutual_refund also broadcasts the covenant refund, so run it once BOTH timeouts "
+    "have elapsed."
+)
+_BOTH_LOCKED_REFUND_REASON_ETH = _BOTH_LOCKED_REFUND_COMMON + (
+    "The ETH refund opens first (the swap was gated on the covenant refund opening no earlier than "
+    "eth_timeout_unix_s + margin). On an ETH counter leg a TAKER-role mutual_refund refunds only your "
+    "ETH HTLC and leaves the record BOTH_LOCKED (the covenant is the maker's to refund), so this "
+    "situation does not clear after you run it: check the refund on-chain rather than re-running it. "
+    "If the refund fails, mutual_refund names a maker claim only when it can verify one from the "
+    "contract's logs, which it reads from one endpoint; if it reports the contract settled with no "
+    "verified claim, check the contract's events on another source before the covenant's CSV refund opens."
+)
+
 #: Coordinator steps, IN ORDER, that carry a record at this state to a claimed asset. A state
 #: absent here has NO valid claim step and is paged "investigate" rather than a name that raises.
 #: Cross-checked against the coordinator's own ``record.state is not …`` / ``state not in (…)``
@@ -502,6 +534,8 @@ def decide(
     #     covenant) while the taker's BTC stays locked until t_btc, and the maker (still privately
     #     holding p) then claims the BTC via the maker-only claim leaf. mutual_refund unwinds BOTH legs
     #     once both timeouts elapse (proven by the regtest PoC TestMakerStallAssetOnlyRefundIsTakerLoss).
+    #     On BTC that is still true for a TAKER-role coordinator in this release (#850 interim; the ETH
+    #     arm differs, see _BOTH_LOCKED_REFUND_REASON_ETH).
     if state is SwapState.MAKER_STALLS:
         # Unreachable on the coordinator-driven path post-fix: the only entry to MAKER_STALLS is
         # maybe_refund_asset_on_maker_stall, which is no longer a taker watchtower action and advances
@@ -539,7 +573,7 @@ def decide(
         if refund_due:
             return Decision(
                 Intent.PAGE_REFUND,
-                reason="maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund. The deadline shown is t_rxd, when the maker's CSV refund opens (the danger), NOT a mutual_refund deadline: mutual_refund's counter leg cannot mature until t_btc > t_rxd, so broadcast it once BOTH timeouts have elapsed",
+                reason=_BOTH_LOCKED_REFUND_REASON_BTC,
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
@@ -602,7 +636,8 @@ def _decide_eth(
     * **Refund recovery is ``mutual_refund``, not ``maybe_refund_asset_on_maker_stall``.** The latter
       refunds ONLY the RXD covenant and is explicitly forbidden on the ETH stall path
       (``swap_coordinator.py`` — the taker's value sits in the ETH HTLC it does not touch); ``mutual_refund``
-      unwinds BOTH legs once their timeouts elapse.
+      refunds the taker's ETH HTLC and, on a TAKER-role coordinator, leaves the covenant to the maker
+      and the record BOTH_LOCKED (#850).
     * **The maker-claim trigger is ``eth_claim_detected``** (an ETH claim tx observed) instead of a
       spent BTC funding outpoint. ``taker_refund_window_open`` is chain-agnostic (it keys purely
       on RXD heights) and is reused unchanged.
@@ -727,7 +762,7 @@ def _decide_eth(
         if refund_due:
             return Decision(
                 Intent.PAGE_REFUND,
-                reason="maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund. The deadline shown is t_rxd, when the maker's CSV refund opens (the danger), NOT a mutual_refund deadline: mutual_refund's counter leg cannot mature until t_btc > t_rxd, so broadcast it once BOTH timeouts have elapsed",
+                reason=_BOTH_LOCKED_REFUND_REASON_ETH,
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,

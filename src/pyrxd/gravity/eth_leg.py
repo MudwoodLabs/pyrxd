@@ -318,6 +318,30 @@ class EthLeg:
         # Timelock the coordinator passes (BTC-shaped) is intentionally ignored.
         return await self._leg.refund(locator)
 
+    # -- what happened to the contract (#850: explaining a failed refund) --------------------
+
+    async def observed_claim_tx(self, locator: EthHtlcLocator) -> str | None:
+        """The tx hash of a claim on this swap's HTLC, found in the contract's logs, or ``None``.
+
+        The watchtower's scan (:meth:`RpcEthChainSource.claim_status`), reused rather than
+        re-implemented: every log from the per-swap contract between its deploy block and the
+        head, a ``Claimed`` log preferred, ``Refunded()``-only read as unclaimed. A HINT, not a
+        verdict — the caller verifies it like any reveal (``scrape_secret`` with ``sha256 == H``,
+        then :meth:`assert_claim_provenance`) before acting on it. Read-only; holds no key.
+        """
+        # Local import: pyrxd.gravity.watch imports the coordinator, which callers of this leg import.
+        from pyrxd.gravity.watch.eth_adapters import RpcEthChainSource
+
+        status = await RpcEthChainSource(self._leg._rpc).claim_status(locator.contract_address, locator.deploy_tx_hash)
+        return status.claim_tx_hash if status.claimed else None
+
+    async def is_settled(self, locator: EthHtlcLocator) -> bool:
+        """Whether the contract's ``settled`` storage flag is set at the tip (claimed or refunded).
+
+        The same storage read the leg's own claim and verify paths make
+        (:meth:`EthHtlcContractLeg._settled_word`)."""
+        return any(await self._leg._settled_word(locator, None))
+
     # -- secret recovery + finality ------------------------------------------------------
 
     def scrape_secret(self, claim_artifacts: list[bytes], hashlock: bytes) -> bytes:
