@@ -618,7 +618,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
     async def _read_every_endpoint(self, read: Callable[[Any], Awaitable[Any]], *, label: str) -> list[Any]:
         """``read`` against every configured endpoint; all must answer, or this raises.
 
-        For a conclusion that a NEGATIVE reading supports ("holds nothing", "cannot land"): an
+        For a conclusion that a NEGATIVE reading supports ("the contract holds nothing"): an
         endpoint that does not answer may be the one that would have said otherwise, so a missing
         answer is "unknown", never a vote. A single-source rpc is its own only endpoint.
         """
@@ -635,22 +635,6 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 "unknown and nothing was concluded or sent. Retry once every endpoint answers."
             )
         return list(results)
-
-    async def push_nonce_closed(self, nonce: int) -> tuple[bool, int]:
-        """Whether a token push sent at ``nonce`` can no longer land: ``(closed, finalized_nonce)``.
-
-        Closed means this leg's account has a FINALIZED transaction count above ``nonce`` at every
-        configured endpoint (the MIN is returned), so a transaction at that nonce is finalized —
-        the push itself or something that replaced it — and no other can ever be mined. A
-        not-yet-finalized count could still be reorged back to an open slot, so it does not count.
-        """
-        account = self._account_address()
-        counts = await self._read_every_endpoint(
-            lambda r: r.get_transaction_count(account, "finalized"),
-            label=f"finalized nonce of {account}",
-        )
-        finalized = min(int(c) for c in counts)
-        return finalized > int(nonce), finalized
 
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
         """Check the freeze gate, then claim exactly as the native leg does.

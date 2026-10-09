@@ -318,16 +318,6 @@ class EthLeg:
         # Timelock the coordinator passes (BTC-shaped) is intentionally ignored.
         return await self._leg.refund(locator)
 
-    async def push_nonce_closed(self, nonce: int) -> tuple[bool, int]:
-        """The token leg's :meth:`~pyrxd.eth_wallet.erc20_leg.Erc20HtlcLeg.push_nonce_closed`.
-        The coordinator calls it only for a token swap, after the token leg raised NothingToRefund.
-        A native leg has no such method, so on one this raises AttributeError, uncaught."""
-        return await self._leg.push_nonce_closed(nonce)
-
-    def funding_address(self) -> str:
-        """The address this leg signs from: the account that deploys and pushes."""
-        return self._leg._account_address()
-
     # -- secret recovery + finality ------------------------------------------------------
 
     def scrape_secret(self, claim_artifacts: list[bytes], hashlock: bytes) -> bytes:

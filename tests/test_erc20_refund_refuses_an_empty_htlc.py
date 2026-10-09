@@ -186,37 +186,3 @@ async def test_the_real_parent_reports_not_yet_mature_as_a_NetworkError(monkeypa
     )
     with pytest.raises(NetworkError, match="not yet mature"):
         await leg.refund(_locator())
-
-
-class _NonceEndpoint:
-    def __init__(self, finalized):
-        self.finalized = finalized
-        self.asked: list[str] = []
-
-    async def get_transaction_count(self, address, block="pending"):
-        self.asked.append(block)
-        if isinstance(self.finalized, Exception):
-            raise self.finalized
-        return self.finalized
-
-
-@pytest.mark.parametrize(
-    ("counts", "expected"),
-    [
-        ((8, 9, 8), (True, 8)),  # every endpoint's finalized nonce is past 7
-        ((8, 7, 9), (False, 7)),  # one endpoint has not finalized nonce 7: it may still land
-        ((8, NetworkError("down"), 9), "unknown"),  # one did not answer: unknown, never "closed"
-    ],
-)
-async def test_push_nonce_closed_needs_EVERY_endpoints_FINALIZED_count_past_the_nonce(counts, expected) -> None:
-    rpc = _Rpc(_TIMEOUT)
-    rpc.sources = [_NonceEndpoint(c) for c in counts]
-    leg = Erc20HtlcLeg(
-        token=_TOKEN, rpc=rpc, signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=31337, artifact=_ARTIFACT
-    )
-    if expected == "unknown":
-        with pytest.raises(NetworkError, match="did not answer"):
-            await leg.push_nonce_closed(7)
-    else:
-        assert await leg.push_nonce_closed(7) == expected
-    assert all(e.asked == ["finalized"] for e in rpc.sources), "only the FINALIZED count may close a nonce"

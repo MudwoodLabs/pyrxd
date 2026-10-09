@@ -141,7 +141,6 @@ class SwapEvent(Enum):
     TAKER_SCRAPES_P_CLAIMS_ASSET = "taker_scrapes_p_claims_asset"
     TAKER_OFFLINE_OR_PINNED = "taker_offline_or_pinned"
     MAKER_REFUNDS_ASSET_CSV = "maker_refunds_asset_csv"
-    COUNTER_LEG_EXPIRED_EMPTY = "counter_leg_expired_empty"
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +174,6 @@ _TRANSITION_TABLE: frozenset[tuple[SwapState, SwapEvent, SwapState]] = frozenset
         (SwapState.BTC_LOCKED, SwapEvent.MAKER_LOCKS_ASSET, SwapState.BOTH_LOCKED),
         # BTC_LOCKED --> ABORTED : maker never locks; t_BTC elapses; taker refunds BTC
         (SwapState.BTC_LOCKED, SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT, SwapState.ABORTED),
-        # BTC_LOCKED --> ABORTED : the taker's ERC-20 counter-leg contract is past its timeout,
-        # unsettled, and holds NOTHING, so there is nothing to refund. Reachable only through a
-        # refused resume, which tracks a deployed token contract whose push may never have landed.
-        # The same edge as the line above, under its own event so the record says what happened.
-        (SwapState.BTC_LOCKED, SwapEvent.COUNTER_LEG_EXPIRED_EMPTY, SwapState.ABORTED),
         # BTC_LOCKED --> PARAMS_MISMATCH : maker locks asset but covenant != terms/H
         (SwapState.BTC_LOCKED, SwapEvent.MAKER_LOCKS_WRONG_PARAMS, SwapState.PARAMS_MISMATCH),
         # PARAMS_MISMATCH --> ABORTED : taker refunds BTC via timelock leg (H4)
@@ -614,18 +608,6 @@ class SwapRecord:
     #: transaction spends one specific UTXO. The txid is derived from these bytes, never stored
     #: beside them, so the two cannot disagree. Serialised only when set.
     pending_btc_funding_tx: str | None = None
-    #: Why the swap was ABORTED without a refund, or ``None``. Set when ``taker_refund_btc`` finds
-    #: the ERC-20 counter-leg contract past its timeout, unsettled and empty (nothing to refund).
-    #: Serialised only when set.
-    abort_reason: str | None = None
-    #: The Radiant refund ``mutual_refund`` already broadcast while the other leg failed, or ``None``.
-    #: Recorded so a retry does not re-send a refund of a covenant it already spent (which fails, and
-    #: would turn every retry into a failure). Serialised only when set.
-    asset_refund_txid: str | None = None
-    #: The counter-leg refund ``mutual_refund`` already broadcast while the other leg failed, or
-    #: ``None``. Same reason: a retry must not re-send a refund of a contract it already settled.
-    #: Serialised only when set.
-    counter_refund_tx: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -715,12 +697,6 @@ class SwapRecord:
             raise ValidationError("single_operator_override must be a str or None")
         if self.fund_refusal is not None and not isinstance(self.fund_refusal, str):
             raise ValidationError("fund_refusal must be a str or None")
-        if self.abort_reason is not None and not isinstance(self.abort_reason, str):
-            raise ValidationError("abort_reason must be a str or None")
-        if self.asset_refund_txid is not None and not isinstance(self.asset_refund_txid, str):
-            raise ValidationError("asset_refund_txid must be a str or None")
-        if self.counter_refund_tx is not None and not isinstance(self.counter_refund_tx, str):
-            raise ValidationError("counter_refund_tx must be a str or None")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -814,25 +790,16 @@ class SwapRecord:
         if self.pending_counter_contract:
             d["pending_counter_contract"] = self.pending_counter_contract
             d["pending_counter_deploy_tx"] = self.pending_counter_deploy_tx
-        # Outside the block above: a refused resume keeps the push nonce on a record that already
-        # carries the locator (no pending contract), because ending that swap needs to know whether
-        # the push at that nonce can still land.
-        if self.pending_push_nonce is not None:
-            d["pending_push_nonce"] = self.pending_push_nonce
-        if self.pending_push_tx_hash is not None:
-            d["pending_push_tx_hash"] = self.pending_push_tx_hash
+            if self.pending_push_nonce is not None:
+                d["pending_push_nonce"] = self.pending_push_nonce
+            if self.pending_push_tx_hash is not None:
+                d["pending_push_tx_hash"] = self.pending_push_tx_hash
         if self.single_operator_override is not None:
             d["single_operator_override"] = self.single_operator_override
         if self.fund_refusal is not None:
             d["fund_refusal"] = self.fund_refusal
         if self.pending_btc_funding_tx is not None:
             d["pending_btc_funding_tx"] = self.pending_btc_funding_tx
-        if self.abort_reason is not None:
-            d["abort_reason"] = self.abort_reason
-        if self.asset_refund_txid is not None:
-            d["asset_refund_txid"] = self.asset_refund_txid
-        if self.counter_refund_tx is not None:
-            d["counter_refund_tx"] = self.counter_refund_tx
         return d
 
     @classmethod
@@ -868,9 +835,6 @@ class SwapRecord:
             single_operator_override=d.get("single_operator_override"),
             fund_refusal=d.get("fund_refusal"),
             pending_btc_funding_tx=d.get("pending_btc_funding_tx"),
-            abort_reason=d.get("abort_reason"),
-            asset_refund_txid=d.get("asset_refund_txid"),
-            counter_refund_tx=d.get("counter_refund_tx"),
         )
 
 

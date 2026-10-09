@@ -347,7 +347,8 @@ class NothingToRefund(ValidationError):
     Raised by the ERC-20 counter leg when its contract has passed its timeout, is not settled, and
     holds a zero token balance — typically a deploy whose token push failed or was never sent. The
     contract itself refuses the same call (``Erc20Htlc.refund`` reverts ``NothingToRefund``) and,
-    since that revert, does NOT settle, so tokens that arrive later can still be refunded.
+    since that revert, does NOT settle, so tokens that arrive later can still be refunded (unless
+    someone settles the contract first by calling ``refund()`` while it holds a non-zero balance).
 
     Its own type, not a borrowed one, because the cause is specific and the right response differs
     from both neighbours: it is not "not yet mature" (:class:`NetworkError`, wait and retry) and not

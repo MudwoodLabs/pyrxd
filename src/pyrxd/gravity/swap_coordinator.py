@@ -58,7 +58,7 @@ from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
-from pyrxd.security.errors import NetworkError, NothingToRefund, PreRevealAbort, ValidationError
+from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.reveal import reveal_boundary
 from pyrxd.security.secrets import SecretBytes
 
@@ -1632,12 +1632,6 @@ def _serialized_step(method):
             return await method(self, *args, **kwargs)
 
     return _wrapper
-
-
-def _refund_handle(tx: object) -> str:
-    """What ``mutual_refund`` records for a leg that refunded: its tx id, or a marker when the leg
-    returned none. Either way the field is set, which is what stops a retry re-sending it."""
-    return str(tx) if tx else "(refund broadcast; no tx id returned)"
 
 
 def _leg_is_value_bearing(leg: object) -> bool:
@@ -3739,14 +3733,8 @@ class SwapCoordinator:
         So where the contract MAY hold value the record moves to ``BTC_LOCKED`` with the locator of
         that contract — rebuilt from this swap's own terms and leg (``expected_locator``), the same
         immutables the deploy used — and ``fund_refusal`` says why. Nothing is broadcast; the
-        refusal still stands (no push is sent). From there the watchtower pages at the deadline for
-        ``taker_refund_btc``, or for a claim if the maker reveals ``p``. ``taker_refund_btc`` refunds
-        what the contract holds; a token contract may hold NOTHING here — the nonce is recorded
-        before the push is broadcast, so the push may never have landed. Then it records the swap
-        ABORTED with ``abort_reason``, but only once the funding account's FINALIZED nonce is past
-        the recorded push nonce, so the push can no longer land; until then it refuses and says how
-        to cancel that nonce. That is why the push nonce and hash are KEPT on the record here. The
-        balance is not read here because a zero now does not prove the push will not land later. A
+        refusal still stands (no push is sent). From there ``taker_refund_btc`` refunds it after the
+        deadline, and the watchtower pages for that, or for a claim if the maker reveals ``p``. A
         token contract whose push was never sent holds nothing: the record stays NEGOTIATED (still
         resumable) with the reason recorded.
 
@@ -3761,14 +3749,7 @@ class SwapCoordinator:
         build = getattr(self.counter_leg, "expected_locator", None)
         if may_hold_value and callable(build):
             locator = build(terms, contract_address=address, deploy_tx_hash=deploy_tx)
-            # KEEP the push nonce and hash, which `with_counter_lock` clears: they are how
-            # `taker_refund_btc` later tells "the push can no longer land" from "it still might".
-            self.record = dataclasses.replace(
-                rec.with_counter_lock(locator),
-                fund_refusal=why,
-                pending_push_nonce=rec.pending_push_nonce,
-                pending_push_tx_hash=rec.pending_push_tx_hash,
-            )
+            self.record = dataclasses.replace(rec.with_counter_lock(locator), fund_refusal=why)
             self._advance(SwapEvent.TAKER_FUNDS_BTC)
             if not await self._save_tracked(sink):
                 return (
@@ -3786,9 +3767,8 @@ class SwapCoordinator:
                     else "and the token push may have been sent"
                 )
                 + "; nothing more was sent. The record is now btc_locked with that contract's locator and this reason, "
-                "so the watchtower tracks it: after its deadline run taker_refund_btc (it refunds what the contract "
-                "holds, or, if it holds nothing and the push can no longer land, records the swap aborted), or claim "
-                "the covenant if the maker reveals p"
+                "so the watchtower tracks it: refund it after its deadline (taker_refund_btc), or claim the covenant "
+                "if the maker reveals p"
             )
         self.record = dataclasses.replace(rec, fund_refusal=why)
         saved = await self._save_tracked(sink)
@@ -4245,101 +4225,13 @@ class SwapCoordinator:
             raise ValidationError(f"taker_refund_btc not valid from {state.value}")
         if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot refund (state was lost)")
-        try:
-            await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-        except NothingToRefund as exc:
-            # The ERC-20 leg proved the contract is past its timeout, unsettled and EMPTY (every
-            # endpoint answered 0, before anything was signed). Reachable through a refused resume:
-            # it tracks a deployed token contract at BTC_LOCKED whenever the push nonce was recorded,
-            # and that nonce is recorded BEFORE the push is broadcast, so the push may never have
-            # landed. Refusing forever left the swap with no exit and the watchtower recommending
-            # this same call on every tick.
-            #
-            # Only from BTC_LOCKED, where nothing of the taker's is locked: an empty contract holds
-            # none of its tokens, and the maker's covenant is the maker's to refund by CSV. From
-            # PARAMS_MISMATCH the refusal propagates unchanged.
-            if state is not SwapState.BTC_LOCKED or not self.record.terms.token_address:
-                raise
-            # Empty NOW is not empty for good: a signed push at the recorded nonce can still be
-            # mined until that nonce is used. Ending the swap then would leave tokens arriving in a
-            # contract nothing tracks. So abort only once the account's FINALIZED nonce is past it.
-            address = self.record.counterchain_locator.contract_address
-            nonce = self.record.pending_push_nonce
-            closed_check = getattr(self.counter_leg, "push_nonce_closed", None)
-            if nonce is None or closed_check is None:
-                missing = (
-                    "the record carries no token-push nonce (an older record, or one whose push was never recorded)"
-                    if nonce is None
-                    else "this counter leg cannot read the funding account's finalized nonce"
-                )
-                raise NothingToRefund(
-                    f"{exc}. The swap stays btc_locked. The contract is past its timeout, unsettled and empty, "
-                    f"but no transfer into it can be shown to be final: {missing}. Check the funding account "
-                    f"for a pending or not-yet-finalized transaction, and the token's transfers into {address}; "
-                    "if tokens arrive, run taker_refund_btc again to refund them.",
-                    contract_address=address,
-                ) from exc
-            # ORDER MATTERS: the finalized nonce first, the balance after it. The balance this branch
-            # caught was read before the nonce; deciding on it would let an endpoint pair an OLD empty
-            # balance with a NEW finalized nonce (a push that landed in between). So once the nonce
-            # reads closed, the balance is read again, through the same refund, after it.
-            closed, finalized = await closed_check(nonce)
-            if not closed:
-                funding_address = getattr(self.counter_leg, "funding_address", None)
-                funding = funding_address() if callable(funding_address) else "the funding account"
-                push_tx = self.record.pending_push_tx_hash
-                raise NothingToRefund(
-                    f"{exc}. The swap stays btc_locked: the token push was recorded at nonce {nonce} of "
-                    f"{funding}{f' (tx {push_tx})' if push_tx else ''}, whose finalized nonce is {finalized}, "
-                    f"so it may still land. If nonce {nonce} is already mined, just wait for it to finalize. "
-                    f"Otherwise wait for the push, or cancel it: send 0 value from {funding} to itself at "
-                    f"nonce {nonce}, outbidding the pending push by at least about 10% on both the max fee "
-                    f"and the priority fee (e.g. `cast send <self> --value 0 --nonce {nonce} --gas-price <max> "
-                    "--priority-gas-price <tip>`, or any wallet that sets a custom nonce). Once it is "
-                    "finalized, run taker_refund_btc again: it refunds a push that landed, or records the swap "
-                    "aborted.",
-                    contract_address=address,
-                ) from exc
-            try:
-                await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-            except NothingToRefund:
-                pass  # still empty, read after the finalized nonce: the abort below is decided
-            else:
-                # Tokens arrived between the two reads and the refund went out: the ordinary path.
-                self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
-                await self._persist_record(self.record, shield=True)
-                return self.record
-            self.record = dataclasses.replace(
-                self.record,
-                abort_reason=(
-                    f"the ERC-20 counter-leg contract {address} passed its timeout unsettled and holding none "
-                    f"of the tokens, so there was nothing to refund ({exc}). The token push was recorded at "
-                    f"nonce {nonce} of the funding account, whose finalized nonce is {finalized}: a transaction "
-                    "at that nonce is final, so the push can no longer land."
-                ),
-            )
-            self._advance(SwapEvent.COUNTER_LEG_EXPIRED_EMPTY)
-            await self._persist_record(self.record, shield=True)
-            return self.record
+        await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
         if state is SwapState.BTC_LOCKED:
             self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
         else:
             self._advance(SwapEvent.TAKER_REFUNDS_BTC)
         await self._persist_record(self.record, shield=True)
         return self.record
-
-    async def _record_leg_refund(self, leg: str, handle: str | None, failures: list) -> None:
-        """Persist a leg's successful refund; a save that fails is reported as a SAVE failure."""
-        try:
-            await self._persist_record(self.record, shield=True)
-        except Exception as exc:
-            failures.append(
-                (
-                    f"{leg} refund SUCCEEDED ({handle}) but the swap record could not be saved, so a retry "
-                    "from the saved record would send it again",
-                    exc,
-                )
-            )
 
     # -- safe failure: both timeouts elapse, both refund (MUTUAL_REFUND) -----
     @_serialized_step
@@ -4361,55 +4253,25 @@ class SwapCoordinator:
         # preflight reverts against the settled contract and raises BEFORE the Radiant refund ever
         # runs. The leg that still holds value could then never be refunded in-band, which is the
         # opposite of what "the guaranteed-safe failure" promises.
-        #
-        # A leg that already refunded is NOT re-sent. Its refund is recorded the moment it succeeds
-        # (below), because re-sending it fails — the contract is settled, the covenant spent — and
-        # that failure made every retry fail too, so the swap could never leave BOTH_LOCKED.
         failures: list[tuple[str, Exception]] = []
-        if self.record.counter_refund_tx is None:
-            try:
-                tx = await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-            except Exception as exc:
-                failures.append(("counter leg", exc))
-            else:
-                self.record = dataclasses.replace(self.record, counter_refund_tx=_refund_handle(tx))
-                # Durable NOW, before the other leg is tried: a crash or cancellation there must not
-                # lose the handle, or the retry re-sends this refund and it reverts every time. A
-                # save that fails is reported as that, not as the refund failing.
-                await self._record_leg_refund("counter leg", self.record.counter_refund_tx, failures)
-        if self.record.asset_refund_txid is None:
-            try:
-                txid = await self.radiant_leg.refund_asset(self.record)
-            except Exception as exc:
-                failures.append(("radiant leg", exc))
-            else:
-                self.record = dataclasses.replace(self.record, asset_refund_txid=_refund_handle(txid))
-                await self._record_leg_refund("radiant leg", self.record.asset_refund_txid, failures)
+        try:
+            await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
+        except Exception as exc:
+            failures.append(("counter leg", exc))
+        try:
+            await self.radiant_leg.refund_asset(self.record)
+        except Exception as exc:
+            failures.append(("radiant leg", exc))
         if failures:
-            # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts the legs
-            # that failed. What succeeded was persisted the moment it succeeded, so the retry skips it.
-            if all(isinstance(exc, NothingToRefund) for _, exc in failures):
-                # NOT retryable, so not a NetworkError. The only failure is a counter-leg HTLC that
-                # holds nothing to refund — a fact about the chain, refused before anything was
-                # signed. Every other leg has refunded (now or on an earlier call, recorded above),
-                # so a retry reaches this same answer. Not recorded as MUTUAL_REFUND: that leg
-                # refunded nothing.
-                leg, exc = failures[0]
-                raise NothingToRefund(
-                    f"mutual refund incomplete — {leg}: {exc}. The other leg has refunded; that is "
-                    "on this swap record (persisted, when the coordinator has a persist hook), and a "
-                    "retry from that record does not re-send it. The swap stays BOTH_LOCKED and is NOT "
-                    "recorded as refunded; a retry from that record gives this same answer until tokens "
-                    "reach that contract, and then refunds them. A retry from a freshly built record "
-                    "knows none of this and will try the other leg's refund again.",
-                    contract_address=getattr(exc, "contract_address", None),
-                )
+            # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts both. A
+            # leg that already refunded fails harmlessly the second time; a leg that did not gets
+            # its chance.
             raise NetworkError(
                 "mutual refund incomplete — "
                 + "; ".join(f"{leg}: {exc}" for leg, exc in failures)
-                + ". The other leg was attempted regardless. A leg that refunded is on this swap record "
-                "(persisted, when the coordinator has a persist hook), and a retry from that record does "
-                "not re-send it. The swap stays BOTH_LOCKED so a retry re-attempts what failed."
+                + ". The other leg was attempted regardless. The swap stays BOTH_LOCKED so a "
+                "retry re-attempts both; refunds are independent and re-attempting a settled leg "
+                "is harmless."
             )
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)
