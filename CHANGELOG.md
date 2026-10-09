@@ -146,6 +146,50 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   **The BTC counter leg is unchanged in this release and has the same race** (its claim leaf has
   no timelock, so a maker can claim while the taker's refund is unconfirmed); fixing it first
   needs the watchtower to tell the taker's own refund from a maker claim. Found in review of #850.
+- **The swap runners no longer overwrite the persisted swap record on every recovery phase (#850,
+  PR R).** In `scripts/eth_swap_two_host.py` and `scripts/btc_swap_two_host.py`, every phase after
+  the taker's fund (claim, lock-claim, abort, refund) rebuilt a fresh record from the exchange
+  files, and the coordinator then persisted it over `<--local-out>.swaprec.json`. Fields an earlier
+  phase had saved were dropped. Examples are the covenant outpoint and SPK that the maker's
+  lock-claim pins, which its later `--phase refund` then did not use, and the taker gate's
+  `single_operator_override` statement. Any other field the coordinator writes, such as the pending
+  deploy and push handles, was exposed to the same overwrite. Those phases now load the persisted
+  record and merge the rebuild into it. So do the maker's `--phase abort`, which hands its record to
+  the Radiant leg, and `scripts/dust_swap_resume.py`. The taker's fund still starts a fresh record.
+  The merge rule:
+  - a field the record holds is kept, and the rebuild only fills fields the record lacks;
+  - the terms, the hashlock, the counter-leg locator and the covenant outpoint and SPK must agree
+    when both sides hold them. A pending counter contract or BTC funding transaction on the record
+    must be the one the rebuilt locator describes. A disagreement refuses, and nothing is sent;
+  - a locator filled into a record that held only the pending handles goes through
+    `SwapRecord.with_counter_lock`, which clears those handles and `fund_refusal` as the
+    coordinator does;
+  - the FSM state is still the one each phase builds for its coordinator step, so a retry can
+    rewind (a claim retry from `SECRET_REVEALED`, a lock-claim retry). The persisted state is
+    checked at the top of each phase, before any chain read, maturity or timeout check, against a
+    phase × state table that covers every runner phase and every
+    `SwapState`. On both two-host runners, taker `--phase abort` and `--phase refund` refuse on
+    `SECRET_REVEALED`, `ASSET_VULNERABLE` or `COMPLETED`, naming `--phase claim` and the `t_rxd`
+    deadline. Before this, a BTC taker `--phase refund` on such a record sent both refunds,
+    including the covenant refund that pays the maker. Maker `--phase refund` refuses on
+    `SECRET_REVEALED`. Terminal states are not refused yet: they are written at broadcast, so
+    re-sending a dropped transaction must stay possible.
+
+  With no record on disk (a first run) the rebuild is used as before. `scripts/eth_swap_run.py`
+  already loaded the record whole under `--resume`. The four single-process runners
+  (`eth_swap_run`, `eth_swap_grief_run`, `dust_swap_run`, `dust_swap_resume`) now pass their
+  coordinator role explicitly, as the single-operator role (`None`, unchanged in effect). A test
+  requires a `role=` on every `CoordinatorConfig` a script builds.
+- **`scripts/eth_swap_two_host.py --role taker --phase refund` and `--phase abort` refuse up front
+  when the ETH HTLC is already settled or a claim on it is found in its logs (#850, PR R).** Both
+  send the same counter-leg refund. A failed `--phase abort` refund is now explained the same way
+  as a failed `--phase refund`; before, it surfaced as a bare preflight error. The check sends nothing, says
+  which, and names the next step: `--phase claim` for a claim, or checking the contract's events
+  on another endpoint for a settled contract with no claim found. It never reports the contract as
+  refunded: both reads come from the one `--eth-rpc-url`. An unreadable settled flag refuses too.
+  Unreadable logs on a contract that is not settled do not, since a landed claim would have settled
+  it. The coordinator's failure-time explanation from #851 still covers a claim that lands between
+  this check and the refund.
 
 ## [0.26.1] — 2026-10-07
 

@@ -35,6 +35,7 @@ from pyrxd.gravity import funding_spv
 from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY, ElapsedBoundPolicy, MakerFundingNotVerified
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
 from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times, taker_gate_early_bound
+from pyrxd.gravity.swap_state import SwapState
 from pyrxd.network.bitcoin import MempoolSpaceSource
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight
@@ -148,6 +149,382 @@ def preflight_coordinator(build: Any, *, before: str) -> Any:
         elif "rxd_block_interval_fast_s" in str(exc):
             hint = "\n  pass --rxd-block-interval-fast-s (the MEASURED p10 Radiant inter-block interval, seconds)"
         raise SystemExit(f"refused before {before}: the swap coordinator refuses these terms:\n  {exc}{hint}") from None
+
+
+# ---------------------------------------------------------------------------
+# The persisted swap record: load it, merge what a phase rebuilt, refuse a disagreement (#850 PR R)
+# ---------------------------------------------------------------------------
+
+#: The role a single-process runner passes to ``CoordinatorConfig``: ``None``, one operator driving
+#: BOTH legs (#850 D11). It equals the config's default, so the value changes nothing today; it is
+#: named so that every runner states its role, and a test requires a ``role=`` keyword on every
+#: ``CoordinatorConfig`` a script builds. The two-host runners pass ``SwapRole.MAKER``/``TAKER``.
+SINGLE_OPERATOR_ROLE = None
+
+#: The record fields that say WHICH swap and WHICH contracts it is about. When the persisted record
+#: and a phase's rebuild both hold one of these and they differ, the merge refuses instead of
+#: picking a side. Every other field is carried from the persisted record (see the merge below).
+BINDING_RECORD_FIELDS = ("terms", "counterchain_locator", "radiant_covenant_outpoint", "radiant_covenant_spk_hex")
+
+
+#: Which persisted ``SwapState`` each runner phase may run on (#850 PR R, review F1). Keyed by
+#: ``(role, phase)``: the two-host runners' phases (both runners share them) and
+#: ``("none", "resume")`` for ``dust_swap_resume.py``. Every row lists EVERY ``SwapState``, and a
+#: test derives the expected keys from ``SwapState`` itself, so a new state without a verdict here
+#: fails the suite instead of being allowed by default. A verdict is ``("allow", why)``,
+#: ``("refuse", why)`` or ``("n/a", why)``; a refusal's text may use ``{state}`` and ``{t_rxd}``.
+#: ``n/a`` marks the phases that build no record from the exchange files (taker intro and fund,
+#: maker envelope): the rule is never applied there, and applying it raises.
+#:
+#: The rule is applied twice: at the top of each phase that reads the record
+#: (``refuse_by_persisted_state``, before any chain read, maturity or timeout check, so a refusal
+#: is not hidden behind "not yet mature"), and again inside the merge.
+#:
+#: Every rebuild still drives the state its coordinator step needs (a claim retry rewinds
+#: SECRET_REVEALED or ASSET_VULNERABLE to BOTH_LOCKED; a lock-claim retry rewinds to BTC_LOCKED).
+#: The refusals are the cases where the persisted state says the phase would act against the
+#: operator: a taker refunding after p is public, a maker refunding the asset after claiming the
+#: counter leg. TERMINAL states (ABORTED, MUTUAL_REFUND, COMPLETED, ASSET_REFUNDED_TAKER_ACTS) are
+#: NOT refused for being terminal: today they are written at BROADCAST, not confirmation, so
+#: re-sending a dropped transaction must stay possible. Terminal-state refusals come with PR 5b
+#: (ETH) and PR 9a (BTC), once terminal means confirmed.
+_NO_RECORD = ("n/a", "not applicable: this phase builds no record from the exchange files")
+_FUND = (
+    "n/a",
+    "not applicable: the fund starts a fresh NEGOTIATED record (the BTC fund's own resume reads only a "
+    "recorded funding transaction); the coordinator's hashlock-reuse check refuses a second fund",
+)
+_CLAIM = (
+    "allow",
+    "a claim (re)try: rebuilds BOTH_LOCKED and re-verifies the reveal on chain. A terminal state is "
+    "written at broadcast, so a claim may still be due",
+)
+_LOCK_CLAIM = (
+    "allow",
+    "a lock-claim (re)try: rebuilds BTC_LOCKED, and the coordinator re-verifies the counter leg and "
+    "the covenant before the reveal",
+)
+_TAKER_OWN_LEG = (
+    "allow",
+    "the taker's own counter leg; a terminal state is written at broadcast, so re-sending a dropped "
+    "refund stays possible",
+)
+_TAKER_P_PUBLIC = (
+    "refuse",
+    "the persisted record says {state}: the maker claimed the counter leg and p is public (or the "
+    "covenant claim was already sent). The covenant is yours to claim with p; a refund here does not "
+    "recover it. NEXT: --phase claim (re-run it if a claim was sent and has not confirmed), before the "
+    "covenant's CSV refund to the maker opens, t_rxd = {t_rxd} after the covenant was mined",
+)
+_MAKER_ABORT = (
+    "allow",
+    "the phase refuses on its own whenever taker_funding.json is present; with no funded counter leg "
+    "the covenant is the maker's to recover",
+)
+_MAKER_REFUND = (
+    "allow",
+    "the coordinator's stall trigger, its maturity check and the maker_claim.json read decide; a "
+    "terminal state is written at broadcast, so re-sending a dropped refund stays possible",
+)
+_MAKER_REVEALED = (
+    "refuse",
+    "the persisted record says {state}: this maker claimed the counter leg and revealed p. Refunding "
+    "the asset as well would take both legs. If that claim has not confirmed, re-run --phase "
+    "lock-claim to re-send it; the covenant is the taker's to claim with p",
+)
+_RESUME = (
+    "allow",
+    "single operator: rebuilds BTC_LOCKED and re-drives the claim path with p from the keys file",
+)
+
+
+def _row(**by_state: tuple[str, str]) -> dict[SwapState, tuple[str, str]]:
+    return {SwapState[name]: verdict for name, verdict in by_state.items()}
+
+
+_ALL_NO_RECORD = {
+    name: _NO_RECORD
+    for name in (
+        "NEGOTIATED",
+        "BTC_LOCKED",
+        "BOTH_LOCKED",
+        "SECRET_REVEALED",
+        "COMPLETED",
+        "MUTUAL_REFUND",
+        "PARAMS_MISMATCH",
+        "MAKER_STALLS",
+        "ASSET_VULNERABLE",
+        "ONE_SIDED_LOSS_TAKER",
+        "ABORTED",
+        "ASSET_REFUNDED_TAKER_ACTS",
+    )
+}
+
+PHASE_STATE_RULES: dict[tuple[str, str], dict[SwapState, tuple[str, str]]] = {
+    ("taker", "intro"): _row(**_ALL_NO_RECORD),
+    ("maker", "envelope"): _row(**_ALL_NO_RECORD),
+    ("taker", "fund"): _row(
+        NEGOTIATED=_FUND,
+        BTC_LOCKED=_FUND,
+        BOTH_LOCKED=_FUND,
+        SECRET_REVEALED=_FUND,
+        COMPLETED=_FUND,
+        MUTUAL_REFUND=_FUND,
+        PARAMS_MISMATCH=_FUND,
+        MAKER_STALLS=_FUND,
+        ASSET_VULNERABLE=_FUND,
+        ONE_SIDED_LOSS_TAKER=_FUND,
+        ABORTED=_FUND,
+        ASSET_REFUNDED_TAKER_ACTS=_FUND,
+    ),
+    ("taker", "claim"): _row(
+        NEGOTIATED=_CLAIM,
+        BTC_LOCKED=_CLAIM,
+        BOTH_LOCKED=_CLAIM,
+        SECRET_REVEALED=_CLAIM,
+        COMPLETED=_CLAIM,
+        MUTUAL_REFUND=_CLAIM,
+        PARAMS_MISMATCH=_CLAIM,
+        MAKER_STALLS=_CLAIM,
+        ASSET_VULNERABLE=_CLAIM,
+        ONE_SIDED_LOSS_TAKER=_CLAIM,
+        ABORTED=_CLAIM,
+        ASSET_REFUNDED_TAKER_ACTS=_CLAIM,
+    ),
+    ("taker", "abort"): _row(
+        NEGOTIATED=_TAKER_OWN_LEG,
+        BTC_LOCKED=_TAKER_OWN_LEG,
+        BOTH_LOCKED=_TAKER_OWN_LEG,
+        SECRET_REVEALED=_TAKER_P_PUBLIC,
+        COMPLETED=_TAKER_P_PUBLIC,
+        MUTUAL_REFUND=_TAKER_OWN_LEG,
+        PARAMS_MISMATCH=_TAKER_OWN_LEG,
+        MAKER_STALLS=_TAKER_OWN_LEG,
+        ASSET_VULNERABLE=_TAKER_P_PUBLIC,
+        ONE_SIDED_LOSS_TAKER=_TAKER_OWN_LEG,
+        ABORTED=_TAKER_OWN_LEG,
+        ASSET_REFUNDED_TAKER_ACTS=_TAKER_OWN_LEG,
+    ),
+    ("taker", "refund"): _row(
+        NEGOTIATED=_TAKER_OWN_LEG,
+        BTC_LOCKED=_TAKER_OWN_LEG,
+        BOTH_LOCKED=_TAKER_OWN_LEG,
+        SECRET_REVEALED=_TAKER_P_PUBLIC,
+        COMPLETED=_TAKER_P_PUBLIC,
+        MUTUAL_REFUND=_TAKER_OWN_LEG,
+        PARAMS_MISMATCH=_TAKER_OWN_LEG,
+        MAKER_STALLS=_TAKER_OWN_LEG,
+        ASSET_VULNERABLE=_TAKER_P_PUBLIC,
+        ONE_SIDED_LOSS_TAKER=_TAKER_OWN_LEG,
+        ABORTED=_TAKER_OWN_LEG,
+        ASSET_REFUNDED_TAKER_ACTS=_TAKER_OWN_LEG,
+    ),
+    ("maker", "lock-claim"): _row(
+        NEGOTIATED=_LOCK_CLAIM,
+        BTC_LOCKED=_LOCK_CLAIM,
+        BOTH_LOCKED=_LOCK_CLAIM,
+        SECRET_REVEALED=_LOCK_CLAIM,
+        COMPLETED=_LOCK_CLAIM,
+        MUTUAL_REFUND=_LOCK_CLAIM,
+        PARAMS_MISMATCH=_LOCK_CLAIM,
+        MAKER_STALLS=_LOCK_CLAIM,
+        ASSET_VULNERABLE=_LOCK_CLAIM,
+        ONE_SIDED_LOSS_TAKER=_LOCK_CLAIM,
+        ABORTED=_LOCK_CLAIM,
+        ASSET_REFUNDED_TAKER_ACTS=_LOCK_CLAIM,
+    ),
+    ("maker", "abort"): _row(
+        NEGOTIATED=_MAKER_ABORT,
+        BTC_LOCKED=_MAKER_ABORT,
+        BOTH_LOCKED=_MAKER_ABORT,
+        SECRET_REVEALED=_MAKER_ABORT,
+        COMPLETED=_MAKER_ABORT,
+        MUTUAL_REFUND=_MAKER_ABORT,
+        PARAMS_MISMATCH=_MAKER_ABORT,
+        MAKER_STALLS=_MAKER_ABORT,
+        ASSET_VULNERABLE=_MAKER_ABORT,
+        ONE_SIDED_LOSS_TAKER=_MAKER_ABORT,
+        ABORTED=_MAKER_ABORT,
+        ASSET_REFUNDED_TAKER_ACTS=_MAKER_ABORT,
+    ),
+    ("maker", "refund"): _row(
+        NEGOTIATED=_MAKER_REFUND,
+        BTC_LOCKED=_MAKER_REFUND,
+        BOTH_LOCKED=_MAKER_REFUND,
+        SECRET_REVEALED=_MAKER_REVEALED,
+        COMPLETED=_MAKER_REFUND,
+        MUTUAL_REFUND=_MAKER_REFUND,
+        PARAMS_MISMATCH=_MAKER_REFUND,
+        MAKER_STALLS=_MAKER_REFUND,
+        ASSET_VULNERABLE=_MAKER_REFUND,
+        ONE_SIDED_LOSS_TAKER=_MAKER_REFUND,
+        ABORTED=_MAKER_REFUND,
+        ASSET_REFUNDED_TAKER_ACTS=_MAKER_REFUND,
+    ),
+    ("none", "resume"): _row(
+        NEGOTIATED=_RESUME,
+        BTC_LOCKED=_RESUME,
+        BOTH_LOCKED=_RESUME,
+        SECRET_REVEALED=_RESUME,
+        COMPLETED=_RESUME,
+        MUTUAL_REFUND=_RESUME,
+        PARAMS_MISMATCH=_RESUME,
+        MAKER_STALLS=_RESUME,
+        ASSET_VULNERABLE=_RESUME,
+        ONE_SIDED_LOSS_TAKER=_RESUME,
+        ABORTED=_RESUME,
+        ASSET_REFUNDED_TAKER_ACTS=_RESUME,
+    ),
+}
+
+
+def persisted_state_refusal(role: str, phase: str, persisted: Any) -> str | None:
+    """The refusal text for running ``(role, phase)`` on ``persisted``, or ``None`` when it may run.
+
+    Raises ``KeyError`` for a phase or state the table does not list: a missing verdict is a bug in
+    the table, never an implicit allow."""
+    verdict, why = PHASE_STATE_RULES[(role, phase)][persisted.state]
+    if verdict == "n/a":
+        raise ValueError(f"the persisted-state rule does not apply to {role} --phase {phase}: {why}")
+    if verdict == "allow":
+        return None
+    t_rxd = persisted.terms.t_rxd
+    return why.format(state=persisted.state.value, t_rxd=f"{t_rxd.value} {t_rxd.unit.value}")
+
+
+def refuse_by_persisted_state(sink: Any, *, terms: Any, role: str, phase: str) -> None:
+    """Apply :data:`PHASE_STATE_RULES` at the TOP of a phase, before any chain read.
+
+    The merge applies the same rule, but a phase reaches its merge only after its covenant read,
+    maturity checks or timeout check. A taker record at SECRET_REVEALED before the covenant matures
+    then got "not yet mature, retry at maturity" instead of "claim the covenant before t_rxd", so the
+    claim instruction only appeared once it was too late. Reads the file only; refuses an unreadable
+    record or one for a different swap (the hashlock), and otherwise only what the table refuses.
+    """
+    path = getattr(sink, "path", "the swap record")
+    try:
+        persisted = sink.load_record()
+    except (ValidationError, NetworkError) as exc:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} could not be read ({exc}). Nothing was sent. Inspect the "
+            "file before running this phase: it may reference a contract that holds value."
+        ) from None
+    if persisted is None:
+        return
+    if persisted.terms.hashlock != terms.hashlock:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} and these terms disagree on the hashlock (they are "
+            f"different swaps): record {persisted.terms.hashlock.hex()[:16]}…, terms {terms.hashlock.hex()[:16]}…. "
+            "Nothing was sent. Find out which swap you mean to recover before running this phase again."
+        )
+    refusal = persisted_state_refusal(role, phase, persisted)
+    if refusal is not None:
+        raise SystemExit(f"REFUSING {role} --phase {phase}: {refusal}. Nothing was sent. (record: {path})")
+
+
+def _comparable(value: Any) -> Any:
+    """A value in a form ``==`` compares by content: a locator or terms object by type and wire form."""
+    if hasattr(value, "to_dict"):
+        return (type(value).__name__, value.to_dict())
+    if isinstance(value, str):
+        return value.lower()
+    return value
+
+
+def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: str, phase: str) -> Any:
+    """The record a phase drives: the persisted one where it exists, merged with the phase's rebuild.
+
+    Every recovery phase of the two-host runners used to build a FRESH record from the public
+    exchange files and hand it to a coordinator that persists it, overwriting whatever an earlier
+    phase had saved (#850 review B1). Fields the coordinator writes — the pending deploy and push
+    handles, the covenant outpoint, the fund refusal — were lost on every retry. The rule now:
+
+    * **No persisted record** (a first run): the rebuild, unchanged.
+    * **Binding fields** (:data:`BINDING_RECORD_FIELDS`): when both sides hold a value they must be
+      equal, or this REFUSES (``SystemExit``) and nothing is sent. A persisted pending counter
+      contract (ETH) or pending funding transaction (BTC) must also be the contract or funding the
+      rebuilt locator describes. A disagreement means the record and the exchange files describe
+      different swaps or contracts; this does not guess which is right.
+    * **Every other field**, derived from ``dataclasses.fields(SwapRecord)`` so a field added later
+      is carried without editing this list: the persisted value when it is set, else the rebuilt one.
+      The exchange files only fill what the record lacks.
+    * **Locator filled into a record without one**: through ``SwapRecord.with_counter_lock``, so the
+      pending handles and ``fund_refusal`` it supersedes are cleared exactly as the coordinator
+      clears them when it attaches a locator.
+    * **state**: the rebuild's. Each phase builds the state its coordinator entry point requires,
+      and a retry must be able to rewind (a claim retry from SECRET_REVEALED, a lock-claim retry).
+      The PERSISTED state is checked first against :data:`PHASE_STATE_RULES` for ``(role, phase)``,
+      and a refused combination exits before anything is merged or sent.
+
+    *source* names what the rebuild came from, for the refusal message.
+    """
+    from pyrxd.gravity.swap_state import SwapRecord
+
+    path = getattr(sink, "path", "the swap record")
+    try:
+        persisted = sink.load_record()
+    except (ValidationError, NetworkError) as exc:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} could not be read ({exc}). Nothing was sent. Inspect the "
+            "file before running this phase: it may reference a contract that holds value."
+        ) from None
+    if persisted is None:
+        return rebuilt
+
+    def _refuse(field: str, kept: Any, rebuilt_value: Any) -> SystemExit:
+        return SystemExit(
+            f"REFUSING: the swap record at {path} and {source} disagree on {field}.\n"
+            f"  record: {kept}\n  {source}: {rebuilt_value}\n"
+            "Nothing was sent. The record is what this host wrote while the swap ran; the other value came "
+            "from the files above. Find out which one describes the swap you mean to recover before running "
+            "this phase again; this phase will not pick one."
+        )
+
+    if persisted.terms.hashlock != rebuilt.terms.hashlock:
+        raise _refuse(
+            "the hashlock (they are different swaps)", persisted.terms.hashlock.hex(), rebuilt.terms.hashlock.hex()
+        )
+    refusal = persisted_state_refusal(role, phase, persisted)
+    if refusal is not None:
+        raise SystemExit(f"REFUSING {role} --phase {phase}: {refusal}. Nothing was sent. (record: {path})")
+    for name in BINDING_RECORD_FIELDS:
+        kept, new = getattr(persisted, name), getattr(rebuilt, name)
+        if kept is not None and new is not None and _comparable(kept) != _comparable(new):
+            shown_kept = kept.to_dict() if hasattr(kept, "to_dict") else kept
+            shown_new = new.to_dict() if hasattr(new, "to_dict") else new
+            raise _refuse(name, shown_kept, shown_new)
+    new_loc = rebuilt.counterchain_locator
+    if persisted.counterchain_locator is None and new_loc is not None:
+        pending = persisted.pending_counter_contract
+        address = getattr(new_loc, "contract_address", None)
+        if pending is not None and (address is None or address.lower() != pending.lower()):
+            raise _refuse("the counter-leg contract (pending in the record, funded in the rebuild)", pending, address)
+        pending_txid = persisted.pending_btc_funding_txid
+        outpoint = getattr(new_loc, "funding_outpoint", None)
+        if pending_txid is not None and (outpoint is None or outpoint.txid != pending_txid):
+            raise _refuse(
+                "the BTC funding transaction (pending in the record, funded in the rebuild)",
+                pending_txid,
+                getattr(outpoint, "txid", None),
+            )
+
+    carried = {}
+    for field in dataclasses.fields(SwapRecord):
+        if field.name == "state":
+            continue
+        kept = getattr(persisted, field.name)
+        carried[field.name] = kept if kept is not None else getattr(rebuilt, field.name)
+    try:
+        merged = dataclasses.replace(persisted, state=rebuilt.state, **carried)
+        if persisted.counterchain_locator is None and new_loc is not None:
+            # The locator supersedes the pending handles it was built from: the coordinator's own
+            # rule (`with_counter_lock`), reused rather than restated.
+            merged = merged.with_counter_lock(new_loc)
+        return merged
+    except ValidationError as exc:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} cannot be combined with {source}: {exc}. Nothing was sent."
+        ) from None
 
 
 #: The flags naming the user's own mainnet Radiant node, reached as

@@ -49,6 +49,7 @@ from pyrxd.gravity.seen_store import DurableSeenStore
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
+    SINGLE_OPERATOR_ROLE,
     SshTrFeeSource,
     StepReport,
     add_eth_key_arguments,
@@ -1345,6 +1346,9 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # The taker gate's single-operator threshold: the shipped default unless the user passed
         # --accept-single-operator-up-to.
         funding_bound=funding_bound_from_args(args),
+        # One process drives BOTH legs (it holds p and both sides' keys): the single-operator
+        # role, stated rather than defaulted (#850 D11).
+        role=SINGLE_OPERATOR_ROLE,
     )
     provenance = {
         "stage": "sepolia-dust",

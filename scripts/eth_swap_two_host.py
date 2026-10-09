@@ -88,6 +88,8 @@ from _dust_swap_shared import (
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    merge_with_persisted_record,
+    refuse_by_persisted_state,
     resolve_asset_locked_at_height,
     resolve_eth_key_file,
     wait_for_covenant_via_leg,
@@ -642,6 +644,7 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="claim")  # before any chain read
     claim_path = io_dir / "maker_claim.json"
     # The maker publishes its claim tx hash here. When it has not (a maker that claimed and went
     # quiet), the claim is found on the chain below, from this swap's own contract logs, and then
@@ -670,7 +673,9 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
     # first-class taker_observed_reveal, which VERIFIES the maker's on-chain reveal before advancing.
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
     record = SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms).with_counter_lock(loc)
-    coord = _coordinator(args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="claim"
+    )
 
     try:
         if eth_claim_tx is None:
@@ -817,6 +822,7 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="lock-claim")  # before any chain read
     funding = _read_public(io_dir, "taker_funding.json")
     eth_loc = EthHtlcLocator.from_dict(funding["eth_locator"])
 
@@ -849,7 +855,9 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
     record = (
         SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(eth_loc).with_state(SwapState.BTC_LOCKED)
     )
-    coord = _coordinator(args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="lock-claim"
+    )
 
     try:
         # 1. Verify the taker-deployed ETH HTLC binds to terms (claimant=maker, refundee=taker, H,
@@ -995,11 +1003,15 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
     It CANNOT touch the covenant — the Radiant leg is built with ``_NoFeeSource`` and every covenant
     spend dispenses a fee input first. The covenant's CSV refund pays the MAKER; leaving it alone is
     the unwind working as designed, not value the taker is giving up.
+
+    It sends the same counter-leg refund as ``--phase refund``, so it runs the same pre-check
+    (refuse when the HTLC is settled or a claim is found) and the same failure explanation.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="abort")  # before any chain read
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -1014,7 +1026,9 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
     # leg that cannot dispense a fee input cannot broadcast a covenant spend by any route.
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
     record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
-    coord = _coordinator(args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="abort"
+    )
 
     try:
         # A DISCLOSURE, never a gate: say what the maker's asset is doing so the operator is not
@@ -1030,16 +1044,121 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
         except Exception as exc:  # unfunded, spent, or an unreachable Radiant node — all non-fatal here
             print(f"  maker's covenant: could not be read ({str(exc)[:120]}) — not needed for this refund.")
 
+        # The same pre-check as --phase refund (#850 PR R, review F2): this phase sends the same
+        # counter-leg refund, so a settled or claimed HTLC must stop it here too.
+        await _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc, terms)
         confirm(
             "taker_refund_btc: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
             auto_yes=args.yes,
         )
-        rec = await coord.taker_refund_btc()
+        rec = await _taker_eth_refund_explained(args, coord, loc, coord.taker_refund_btc)
         if rec.state is not SwapState.ABORTED:
             raise SystemExit(f"taker_refund_btc landed in {rec.state.value}, expected aborted")
         print(f"  -> {rec.state.value}; the taker's ETH is refunded to the taker. Nothing else is owed to you.")
     finally:
         await rpc.close()
+
+
+async def _taker_eth_refund_explained(args, coord, loc: EthHtlcLocator, step):
+    """Run a taker step that sends the ETH counter-leg refund; turn a failure into what happened.
+
+    Both taker phases that send it go through here: ``--phase refund`` (``mutual_refund``, which
+    already explains its own failure) and ``--phase abort`` (``taker_refund_btc``, which does not).
+    For the second, a failure is passed to the coordinator's #851 read
+    (``_explain_failed_taker_eth_refund``), which raises ``CounterLegClaimedByCounterparty`` for a
+    VERIFIED maker claim and ``CounterLegSettledUnverified`` for a settled contract with no verified
+    claim, and otherwise returns so the original error propagates. Both become a non-zero exit
+    naming the next step; neither is ever reported as "refunded". PR 6 replaces that read.
+    """
+    from pyrxd.security.errors import CounterLegClaimedByCounterparty, CounterLegSettledUnverified
+
+    t_rxd = coord.record.terms.t_rxd
+    window = f"t_rxd = {t_rxd.value} {t_rxd.unit.value} after the covenant was mined"
+    claim_cmd = f"python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ..."
+    try:
+        try:
+            return await step()
+        except (CounterLegClaimedByCounterparty, CounterLegSettledUnverified):
+            raise
+        except Exception as exc:
+            await coord._explain_failed_taker_eth_refund(loc, exc)
+            raise
+    except CounterLegClaimedByCounterparty as exc:
+        # The maker claimed first, verified from the chain. The covenant is untouched and the
+        # taker's to claim with p: say exactly that, and name the phase that does it.
+        raise SystemExit(
+            f"the ETH refund failed because the MAKER CLAIMED the HTLC {exc.contract_address} in tx "
+            f"{exc.tx_hash}, revealing p (verified: sha256(p) == H, and the claim emits p from this swap's "
+            "contract). The refund can never succeed now. The RXD covenant was NOT touched and is yours to "
+            f"claim with p before its CSV refund to the maker opens, {window}.\n"
+            f"  NEXT: {claim_cmd} (it reads the claim tx from maker_claim.json, or finds {exc.tx_hash} on the "
+            "contract if that file is absent)."
+        ) from None
+    except CounterLegSettledUnverified as exc:
+        # NEVER "done": settled with no verified claim is also what a withheld or forged log
+        # looks like after a real maker claim. Exit non-zero with the check and the next steps.
+        raise SystemExit(
+            f"the ETH refund failed: the HTLC {exc.contract_address} is ALREADY SETTLED (claimed or refunded), "
+            "and this endpoint showed NO VERIFIED CLAIM. That does not mean it was refunded: the logs come "
+            "from one endpoint, which may be incomplete or wrong.\n"
+            f"  NEXT: check the events of {exc.contract_address} on another RPC or an explorer. If there is a "
+            f'Claimed event, write its tx hash into {args.io}/maker_claim.json as {{"eth_claim_tx_hash": "0x…"}} '
+            f"and run: {claim_cmd} --eth-rpc-url <the endpoint that showed the Claimed event> (before {window}). "
+            "The claim phase verifies the receipt, so a lying endpoint makes it fail. If it shows only a "
+            "refund to your address, nothing more is needed on the ETH side."
+        ) from None
+
+
+async def _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc: EthHtlcLocator, terms) -> None:
+    """The taker's ``--phase refund`` and ``--phase abort`` pre-check (#850 PR R, Mythos M1, review
+    F2). It refuses; it never concludes.
+
+    Refuses when the ETH HTLC is already settled (``EthLeg.is_settled``: claimed or refunded) or a
+    claim on it is found in its logs (``EthLeg.observed_claim_tx``). Both reads come from ONE
+    endpoint, the one ``--eth-rpc-url`` names, which is why this only ever refuses: it never reports
+    the contract as refunded, and a claim found here is verified by ``--phase claim``, not here.
+
+    An unreadable settled flag refuses too: nothing is known, and nothing is sent. An unreadable log
+    history on a contract that is NOT settled does not refuse: a claim that landed would have set the
+    flag, and many endpoints cap or prune old logs.
+    """
+    contract = loc.contract_address
+    claim_cmd = f"python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ..."
+    window = f"t_rxd = {terms.t_rxd.value} {terms.t_rxd.unit.value} after the covenant was mined"
+    try:
+        settled = await eth_leg.is_settled(loc)
+    except Exception as exc:
+        raise SystemExit(
+            f"REFUSING to refund: could not read whether the ETH HTLC {contract} is already settled "
+            f"({str(exc)[:160]}). Nothing was sent. Retry, or pass an --eth-rpc-url that can answer."
+        ) from None
+    try:
+        claim_tx = await eth_leg.observed_claim_tx(loc)
+    except Exception as exc:
+        if not settled:
+            print(f"  could not read the HTLC's logs ({str(exc)[:120]}); it is not settled, so no claim has landed.")
+            return
+        claim_tx = None
+    if claim_tx is not None:
+        state = "settled" if settled else "NOT settled"
+        raise SystemExit(
+            f"REFUSING to refund: a claim of the ETH HTLC {contract} was found in its logs, tx {claim_tx}. It was "
+            f"read from one endpoint and is not verified here; the contract is {state} at that endpoint's tip. "
+            "If the maker claimed, p is public and the RXD covenant is yours to claim before its CSV refund to "
+            f"the maker opens, {window}. Nothing was sent.\n"
+            f"  NEXT: {claim_cmd} (it verifies the claim on chain before using it; if maker_claim.json is "
+            f'absent, write {{"eth_claim_tx_hash": "{claim_tx}"}} into it or let the phase find the claim).'
+        )
+    if settled:
+        raise SystemExit(
+            f"REFUSING to refund: the ETH HTLC {contract} is already SETTLED (claimed or refunded) at this "
+            "endpoint's tip, and no claim was found in its logs here. That does not mean it was refunded: the "
+            "logs come from one endpoint, which may be incomplete or wrong. Nothing was sent.\n"
+            f"  NEXT: check the events of {contract} on another RPC or a block explorer. If there is a Claimed "
+            f'event, write its tx hash into {args.io}/maker_claim.json as {{"eth_claim_tx_hash": "0x…"}} and '
+            f"run: {claim_cmd} (before {window}). If it shows only a refund to your address, nothing more is "
+            "needed on the ETH side."
+        )
 
 
 async def taker_phase_refund(args: argparse.Namespace) -> None:
@@ -1053,14 +1172,16 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     refund sent from here would take that away. The Radiant leg is built with ``_NoFeeSource``, so
     this phase cannot broadcast a covenant spend by any route, and no ``--fee-*`` is needed.
 
-    The covenant is read first so the record pins its outpoint; the ETH timeout is checked before
-    anything broadcasts. ``--phase abort`` does the same counter-leg refund without reading the
+    Before anything else it refuses when the ETH HTLC is already settled or a claim on it is found
+    (``_refuse_if_counter_leg_settled_or_claimed``). The covenant is read next so the record pins its
+    outpoint; the ETH timeout is checked before anything broadcasts. ``--phase abort`` does the same counter-leg refund without reading the
     covenant, for when the maker never locked it or the Radiant node cannot answer.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -1077,6 +1198,10 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
 
     try:
+        # FIRST, before the covenant read and the timeout check: a settled or claimed contract
+        # changes what the taker should do next, and a claim must not wait behind a refusal that
+        # says "nothing is recoverable yet".
+        await _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc, terms)
         try:
             outpoint, value, confs = await _covenant_state(rxd_leg, cov=cov, expected_photons=terms.radiant_amount)
         except Exception as exc:
@@ -1106,34 +1231,13 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
             .with_state(SwapState.BOTH_LOCKED)
         )
         coord = _coordinator(
-            args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record
+            args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="refund"
         )
         confirm(
             "mutual_refund: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
             auto_yes=args.yes,
         )
-        from pyrxd.security.errors import CounterLegClaimedByCounterparty, CounterLegSettledUnverified
-
-        try:
-            rec = await coord.mutual_refund()
-        except CounterLegClaimedByCounterparty as exc:
-            # The maker claimed first, verified from the chain. The covenant is untouched and the
-            # taker's to claim with p: say exactly that, and name the phase that does it.
-            raise SystemExit(
-                f"{exc}\n  NEXT: python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ... "
-                f"(it reads the claim tx from maker_claim.json, or finds {exc.tx_hash} on the contract if that "
-                "file is absent)."
-            ) from None
-        except CounterLegSettledUnverified as exc:
-            # NEVER "done": settled with no verified claim is also what a withheld or forged log
-            # looks like after a real maker claim. Exit non-zero with the check and the next steps.
-            raise SystemExit(
-                f"{exc}\n  NEXT: check the events of {exc.contract_address} on another RPC or an explorer. If "
-                f"there is a Claimed event, write its tx hash into {args.io}/maker_claim.json as "
-                '{"eth_claim_tx_hash": "0x…"} and run: python scripts/eth_swap_two_host.py --role taker '
-                f"--phase claim --io {args.io} --eth-rpc-url <the endpoint that showed the Claimed event> "
-                "... (before t_rxd). The claim phase verifies the receipt, so a lying endpoint makes it fail."
-            ) from None
+        rec = await _taker_eth_refund_explained(args, coord, loc, coord.mutual_refund)
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(
                 f"mutual_refund landed in {rec.state.value}; a TAKER-role ETH refund leaves the record both_locked"
@@ -1164,6 +1268,7 @@ async def maker_phase_refund(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
     if not (io_dir / "taker_funding.json").exists():
         raise SystemExit(
             "no taker_funding.json in the exchange directory: the taker never published a funded ETH "
@@ -1200,7 +1305,7 @@ async def maker_phase_refund(args: argparse.Namespace) -> None:
             SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BOTH_LOCKED)
         )
         coord = _coordinator(
-            args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record
+            args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="refund"
         )
         if maker_has_claimed:
             print(
@@ -1249,6 +1354,7 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="abort")  # before any chain read
     if (io_dir / "taker_funding.json").exists():
         raise SystemExit(
             "taker_funding.json is present: the taker DID fund a counter leg, so this is the mutual "
@@ -1266,7 +1372,11 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     fee_source = _require_fee_source(args, what="the maker's asset abort (--phase abort)")
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
 
-    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    # No coordinator here, but the leg reads the record: a covenant outpoint this host persisted
+    # earlier pins which UTXO the refund spends.
+    record = _merged_record(
+        args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out, phase="abort"
+    )
     confirm(
         "refund_asset: CSV-refund the RXD covenant to the maker (the taker never funded a counter leg)",
         auto_yes=args.yes,
@@ -1287,9 +1397,15 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
+def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None, phase=None):
     """Build the REAL SwapCoordinator — the SAME object graph as eth_swap_run.py / the e2e, only
     each process constructs its own side. Durable seen-store by default.
+
+    A phase that passes the ``record`` it rebuilt from the exchange files gets that record MERGED
+    with the one this host persisted (``merge_with_persisted_record``, #850 PR R): the persisted
+    fields are kept, the rebuild only fills what the record lacks, and a disagreement on the swap
+    or contract identity refuses. ``record=None`` (the taker's fund) starts a fresh NEGOTIATED
+    record, as before.
 
     The coordinator is ROLE-tagged (security review): this is a genuine two-party deployment, so the
     P3 role guard must be armed — without it a taker who mistakenly runs the maker-only
@@ -1297,6 +1413,10 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
     already threads this; the ETH one previously left ``role`` unset (guard disabled)."""
     if record is None:
         record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    else:
+        if phase is None:
+            raise ValueError("_coordinator: a phase that passes a rebuilt record must name itself (phase=)")
+        record = _merged_record(args, record, keys_out=keys_out, phase=phase)
     role = SwapRole.MAKER if args.role == "maker" else SwapRole.TAKER
     return SwapCoordinator(
         record=record,
@@ -1304,7 +1424,7 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
         radiant_leg=rxd_leg,
         indexer=None,  # plain RXD has no genesis ref → no ref-authenticity indexer needed
         seen_store=DurableSeenStore(str(Path(keys_out).expanduser()) + ".seen.sqlite"),
-        persist=JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json"),
+        persist=_record_sink(keys_out),
         config=CoordinatorConfig(
             margin_policy=_margin_policy(args),
             accept_estimated_eth_margins=True,
@@ -1321,6 +1441,28 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
         # The ETH deadline is absolute: on a value-bearing Radiant leg the coordinator judges its
         # ordering against t_rxd from the clock when it is built (inert on this regtest-pinned leg).
         now_unix_s=int(time.time()),
+    )
+
+
+def _record_sink(keys_out) -> JsonFileRecordSink:
+    """The swap record file beside the run's local state and seen-store."""
+    return JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json")
+
+
+def _refuse_by_persisted_state(args, terms, *, phase: str) -> None:
+    """``PHASE_STATE_RULES`` at the top of a phase, before any chain read, maturity or timeout check."""
+    refuse_by_persisted_state(_record_sink(args.local_out), terms=terms, role=args.role, phase=phase)
+
+
+def _merged_record(args, rebuilt: SwapRecord, *, keys_out, phase: str) -> SwapRecord:
+    """The persisted record merged with what this phase rebuilt (see ``_coordinator``). ``phase``
+    selects the row of ``PHASE_STATE_RULES`` the persisted state is checked against."""
+    return merge_with_persisted_record(
+        _record_sink(keys_out),
+        rebuilt,
+        source=f"what this phase rebuilt from the exchange files in {args.io}",
+        role=args.role,
+        phase=phase,
     )
 
 

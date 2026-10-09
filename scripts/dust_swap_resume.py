@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 from _dust_swap_shared import (
+    SINGLE_OPERATOR_ROLE,
     CapturingBroadcaster,
     SshTrFeeSource,
     add_rxd_node_args,
@@ -62,6 +63,7 @@ from _dust_swap_shared import (
     funding_bound_from_args,
     measured_margin_from_mainnet,
     merge_into_mode_600,
+    merge_with_persisted_record,
     require_rxd_node_args,
     rxd_blockcount,
     validated_resume_deadline_s,
@@ -231,7 +233,20 @@ async def resume(args) -> None:
         min_confirmations=1,
         audit_cleared=audit_cleared,
     )
-    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_btc_lock(locator).with_state(SwapState.BTC_LOCKED)
+    rebuilt = (
+        SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_btc_lock(locator).with_state(SwapState.BTC_LOCKED)
+    )
+    # The forward run's persisted record, merged with this rebuild (#850 PR R): fields it holds are
+    # kept, the rebuild fills only what it lacks, and different terms or a different locator refuse.
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    record = merge_with_persisted_record(
+        JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+        rebuilt,
+        source="what this resume rebuilt from the keys file and the chain",
+        role="none",
+        phase="resume",
+    )
     coord = SwapCoordinator(
         record=record,
         btc_leg=btc_leg,
@@ -242,7 +257,11 @@ async def resume(args) -> None:
         # taker_funds_btc, so it neither reserves nor needs H — but the durable store keeps
         # the SEEN-1 guard satisfied without the accept_nondurable_seen opt-in.
         seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=policy, funding_bound=funding_bound_from_args(args)),
+        # One process drives BOTH legs (p is in the keys file): the single-operator role, stated
+        # rather than defaulted (#850 D11).
+        config=CoordinatorConfig(
+            margin_policy=policy, funding_bound=funding_bound_from_args(args), role=SINGLE_OPERATOR_ROLE
+        ),
     )
     print(f"  coordinator seeded at {coord.record.state.value}")
 

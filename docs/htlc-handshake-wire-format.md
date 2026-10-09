@@ -51,7 +51,7 @@ re-derive from it.
 | BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:396-422` (`BitcoinTaprootLeg._htlc`, `derive_funding_scriptpubkey` and `promised_funding_scriptpubkey`) |
 | ETH counter-leg binding | `src/pyrxd/gravity/eth_leg.py:121-197` (`EthLeg.fund`), `src/pyrxd/gravity/eth_leg.py:250-311` (`EthLeg.verify_counterparty_funded`), `src/pyrxd/eth_wallet/locator.py:117-220` (`EthHtlcLocator`) |
 | Counter-leg locators (durable, JSON) | `src/pyrxd/btc_wallet/taproot.py:616-691` (`BtcHtlcLocator`), `src/pyrxd/eth_wallet/locator.py:117-220` (`EthHtlcLocator`) |
-| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-50` (the exchanged files), `scripts/btc_swap_two_host.py:539-906` (the five phases, `taker_phase_intro` through `maker_phase_lock_claim`), `scripts/eth_swap_two_host.py:494-885` (the same five) |
+| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-50` (the exchanged files), `scripts/btc_swap_two_host.py:568-941` (the five phases, `taker_phase_intro` through `maker_phase_lock_claim`), `scripts/eth_swap_two_host.py:496-893` (the same five) |
 | Conformance vectors | `conformance/htlc-handshake-vectors.json`, guarded by `tests/test_htlc_handshake_conformance_vectors.py` |
 
 ## Roles, and the one invariant everything rests on
@@ -100,8 +100,8 @@ Every message is a JSON object carrying a `schema` string:
 
 | Value | Meaning |
 |---|---|
-| `btc_rxd_two_host_envelope_v1` | BTC counter leg (`scripts/btc_swap_two_host.py:817`) |
-| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:798`) |
+| `btc_rxd_two_host_envelope_v1` | BTC counter leg (`scripts/btc_swap_two_host.py:849`) |
+| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:803`) |
 
 **A conforming implementation MUST read `schema` and MUST refuse an unrecognised value**, exactly
 as `gravity/watch/escalation.py:210-214` does for the watchtower heartbeat's `schema_version`
@@ -123,8 +123,8 @@ The taker's public key material, so the maker can build the covenant and the tap
 | `taker_btc_refund_xonly_hex` | 64-hex | BTC only | Taker's x-only key for the BTC refund leaf. |
 | `eth_taker_refund_addr` | `0x`+40-hex | ETH only | Taker's address; becomes the contract's immutable `refundee`. |
 
-Source: `scripts/btc_swap_two_host.py:558-562`, `scripts/eth_swap_two_host.py:515-523`. The ETH harness
-also writes `eth_maker_claim_addr` (`scripts/eth_swap_two_host.py:521`) into `taker_intro`; the maker
+Source: `scripts/btc_swap_two_host.py:587-591`, `scripts/eth_swap_two_host.py:517-525`. The ETH harness
+also writes `eth_maker_claim_addr` (`scripts/eth_swap_two_host.py:523`) into `taker_intro`; the maker
 ignores it and puts its own `--eth-maker-addr` in the envelope.
 
 ### 2. `envelope` (maker → taker)
@@ -143,12 +143,12 @@ The core message. Carries `H` — never `p`.
 | `eth_chain_id` | int | ETH only | **not validated** | EIP-155 chain id. See **HZ-5**. |
 | `btc_network` / `rxd_network` | string | yes | **not validated** | Network tags. See **HZ-5**. |
 
-Source: `scripts/btc_swap_two_host.py:813-825`, `scripts/eth_swap_two_host.py:797-806`. The ETH envelope
+Source: `scripts/btc_swap_two_host.py:845-857`, `scripts/eth_swap_two_host.py:802-811`. The ETH envelope
 carries `rxd_network` and `eth_chain_id` but no `btc_network`.
 
 The maker MUST NOT place a private key, WIF, seed, or the preimage in this document. The harnesses
 enforce this with a recursive key-name and WIF-shape scan before every write
-(`scripts/btc_swap_two_host.py:136-178`: `_SECRET_FORBIDDEN_KEYS`, `_looks_like_wif`,
+(`scripts/btc_swap_two_host.py:138-180`: `_SECRET_FORBIDDEN_KEYS`, `_looks_like_wif`,
 `_assert_public_only`); a conforming implementation SHOULD do the same, because
 the failure mode is unrecoverable and silent.
 
@@ -221,7 +221,7 @@ The maker's counter-chain claim, which reveals `p` on chain.
 | `btc_claim_tx_hex` | hex | BTC — the raw claim transaction |
 | `eth_claim_tx_hash` | `0x`-hex | ETH — the claim transaction hash |
 
-Source: `scripts/btc_swap_two_host.py:903`, `scripts/eth_swap_two_host.py:882`.
+Source: `scripts/btc_swap_two_host.py:938`, `scripts/eth_swap_two_host.py:890`.
 
 This message is a **convenience pointer, not a channel**. `p` is public on chain the moment the
 claim confirms; the taker can and should find it by watching the counter chain. A conforming taker
@@ -401,7 +401,7 @@ the block-denominated form, re-derive against the wall-clock relation.**
 
 **Margin floor.** There is no protocol-mandated minimum. `margin` is **each party's own policy**,
 not a negotiated field — the taker checks the maker's `terms` against the *taker's* margin and
-refuses on failure (`scripts/btc_swap_two_host.py:577-580`). The shipped default is
+refuses on failure (`scripts/btc_swap_two_host.py:606-609`). The shipped default is
 `ESTIMATED_DEFAULT_MARGIN_BLOCKS = 36` (`swap_coordinator.py:177`), which is **labelled ESTIMATED
 and is test-only**: a policy constructed with `require_measured=True` refuses to use it
 (`:484-488`). A real-value swap MUST supply a margin measured from real block data
@@ -529,12 +529,12 @@ HZ-1 and reads the same way. Neither is the order value reaches the chains. The 
 **maker-locks-first**, and the code now says so where those names live: the comment on that edge
 (`swap_state.py:156-165`) and the invariant's own text (`swap_coordinator.py:138-141`, with the note
 on its name at `:151-153`). The shipped BTC runbook follows it: the maker funds the Radiant covenant
-right after publishing the envelope (`scripts/btc_swap_two_host.py:827`), and the taker verifies
+right after publishing the envelope (`scripts/btc_swap_two_host.py:859`), and the taker verifies
 that funding is on chain **and buried** before locking any BTC (`:617-634`). An earlier revision of
 both the comment and the invariant described the opposite order; that disagreement is what this
 hazard was first written about.
 
-The harness states its own reason (`scripts/btc_swap_two_host.py:617-621`): *"a hostile maker who never locks RXD can wait for
+The harness states its own reason (`scripts/btc_swap_two_host.py:646-650`): *"a hostile maker who never locks RXD can wait for
 our BTC HTLC and claim it with p → one-sided taker loss."* That is a correct reading of the scripts
 — the BTC claim leaf is `<H> … <makerClaimPk> OP_CHECKSIG` with no precondition that the asset was
 ever locked, and the maker holds both `p` and the claim key from the moment the envelope is
@@ -599,7 +599,7 @@ funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG ent
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**
-(`scripts/btc_swap_two_host.py:817, 1341`; `scripts/eth_swap_two_host.py:798, 1401` — the second of
+(`scripts/btc_swap_two_host.py:849, 1386`; `scripts/eth_swap_two_host.py:803, 1543` — the second of
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only
@@ -721,7 +721,7 @@ omit the checks that actually bind.
 ### HZ-5: Network identity is carried but never checked
 
 `envelope` carries `btc_network`, `rxd_network` and (ETH) `eth_chain_id`
-(`scripts/btc_swap_two_host.py:821-822`, `scripts/eth_swap_two_host.py:803-804`), but no reader
+(`scripts/btc_swap_two_host.py:853-854`, `scripts/eth_swap_two_host.py:808-809`), but no reader
 compares them to its own configuration — the taker phases read `maker_pkh_hex`,
 `covenant_spk_hex` and the payout fields and nothing else. `terms` carries no network at all, and
 `BtcHtlcLocator.network` defaults to `"bc"` (`taproot.py:630`).
@@ -766,7 +766,7 @@ say "I will require 6 confirmations", and no message with which to renegotiate.
 
 `RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:863`). The
 harness threads an operator flag into it and defaults that to 1 as well, with the flag's own help
-text warning that real value must set it deep (`scripts/btc_swap_two_host.py:1488-1495`). A
+text warning that real value must set it deep (`scripts/btc_swap_two_host.py:1533-1540`). A
 shallow or mempool-only covenant funding is replaceable/reorgable: a maker who double-spends it
 after the taker has locked strands the taker's counter leg.
 

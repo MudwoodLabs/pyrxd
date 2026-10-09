@@ -87,6 +87,8 @@ from _dust_swap_shared import (
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
+    merge_with_persisted_record,
+    refuse_by_persisted_state,
     resolve_asset_locked_at_height,
     wait_for_covenant_via_leg,
 )
@@ -456,11 +458,21 @@ def _fee_source_from_args(args):
     )
 
 
-def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
+def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None, phase=None):
     """Build the REAL SwapCoordinator — the SAME object graph as dust_swap_run.py / the e2e, only each
-    process constructs its own side. Durable seen-store; role-tagged for the P3 recovery guards."""
+    process constructs its own side. Durable seen-store; role-tagged for the P3 recovery guards.
+
+    A phase that passes the ``record`` it rebuilt from the exchange files gets that record MERGED
+    with the one this host persisted (``merge_with_persisted_record``, #850 PR R): the persisted
+    fields are kept, the rebuild only fills what the record lacks, and a disagreement on the swap
+    or contract identity refuses. ``record=None`` (the taker's fund) starts a fresh NEGOTIATED
+    record, as before."""
     if record is None:
         record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    else:
+        if phase is None:
+            raise ValueError("_coordinator: a phase that passes a rebuilt record must name itself (phase=)")
+        record = _merged_record(args, record, keys_out=keys_out, phase=phase)
     role = SwapRole.MAKER if args.role == "maker" else SwapRole.TAKER
     return SwapCoordinator(
         record=record,
@@ -479,6 +491,23 @@ def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
 def _record_sink(keys_out) -> JsonFileRecordSink:
     """The swap record file beside the run's keys and seen-store."""
     return JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json")
+
+
+def _refuse_by_persisted_state(args, terms, *, phase: str) -> None:
+    """``PHASE_STATE_RULES`` at the top of a phase, before any chain read, maturity or timeout check."""
+    refuse_by_persisted_state(_record_sink(args.local_out), terms=terms, role=args.role, phase=phase)
+
+
+def _merged_record(args, rebuilt: SwapRecord, *, keys_out, phase: str) -> SwapRecord:
+    """The persisted record merged with what this phase rebuilt (see ``_coordinator``). ``phase``
+    selects the row of ``PHASE_STATE_RULES`` the persisted state is checked against."""
+    return merge_with_persisted_record(
+        _record_sink(keys_out),
+        rebuilt,
+        source=f"what this phase rebuilt from the exchange files in {args.io}",
+        role=args.role,
+        phase=phase,
+    )
 
 
 async def _maker_verify_btc_funding(coord: SwapCoordinator, locator) -> int:
@@ -666,6 +695,7 @@ async def taker_phase_claim(args) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="claim")  # before any chain read
     claim_doc = _read_public(io_dir, "maker_claim.json")
     claim_raw = bytes.fromhex(claim_doc["btc_claim_tx_hex"])
     loc = bt.BtcHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["btc_locator"])
@@ -700,7 +730,9 @@ async def taker_phase_claim(args) -> None:
     # SECRET_REVEALED after verifying the maker's on-chain reveal (never fabricating that state).
     record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
     record = record.with_state(SwapState.BOTH_LOCKED)
-    coord = _coordinator(args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="claim"
+    )
 
     try:
         confirm("taker_observed_reveal: verify the maker's on-chain BTC claim reveals THIS swap's p", auto_yes=args.yes)
@@ -836,6 +868,7 @@ async def maker_phase_lock_claim(args) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="lock-claim")  # before any chain read
     loc = bt.BtcHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["btc_locator"])
 
     from pyrxd.security.secrets import SecretBytes
@@ -868,7 +901,9 @@ async def maker_phase_lock_claim(args) -> None:
     fee_source = _fee_source_from_args(args)
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source or _NoFeeSource())
     record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
-    coord = _coordinator(args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="lock-claim"
+    )
 
     try:
         # 1. Re-derive the expected HTLC SPK and REFUSE to lock RXD if the taker funded a different one.
@@ -1008,6 +1043,7 @@ async def taker_phase_abort(args) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="abort")  # before any chain read
     loc = bt.BtcHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["btc_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -1018,7 +1054,9 @@ async def taker_phase_abort(args) -> None:
     # leg that cannot dispense a fee input cannot broadcast a covenant spend by any route.
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
     record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
-    coord = _coordinator(args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="abort"
+    )
 
     try:
         # A DISCLOSURE, never a gate: say what the maker's asset is doing so the operator is not
@@ -1069,6 +1107,7 @@ async def taker_phase_refund(args) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
     loc = bt.BtcHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["btc_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -1115,7 +1154,7 @@ async def taker_phase_refund(args) -> None:
             .with_state(SwapState.BOTH_LOCKED)
         )
         coord = _coordinator(
-            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record
+            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="refund"
         )
         confirm(
             "mutual_refund: refund BOTH legs (BTC -> the taker, the RXD covenant -> the MAKER)",
@@ -1146,6 +1185,7 @@ async def maker_phase_refund(args) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
     if not (io_dir / "taker_funding.json").exists():
         raise SystemExit(
             "no taker_funding.json in the exchange directory: the taker never published a funded BTC "
@@ -1193,7 +1233,7 @@ async def maker_phase_refund(args) -> None:
             SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BOTH_LOCKED)
         )
         coord = _coordinator(
-            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record
+            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="refund"
         )
         if maker_has_claimed:
             print(
@@ -1242,6 +1282,7 @@ async def maker_phase_abort(args) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="abort")  # before any chain read
     if (io_dir / "taker_funding.json").exists():
         raise SystemExit(
             "taker_funding.json is present: the taker DID fund a counter leg, so this is the mutual "
@@ -1259,7 +1300,11 @@ async def maker_phase_abort(args) -> None:
     fee_source = _require_fee_source(args, what="the maker's asset abort (--phase abort)")
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
 
-    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    # No coordinator here, but the leg reads the record: a covenant outpoint this host persisted
+    # earlier pins which UTXO the refund spends.
+    record = _merged_record(
+        args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out, phase="abort"
+    )
     confirm(
         "refund_asset: CSV-refund the RXD covenant to the maker (the taker never funded a counter leg)",
         auto_yes=args.yes,
