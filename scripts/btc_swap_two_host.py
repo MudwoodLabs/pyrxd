@@ -457,7 +457,7 @@ def _fee_source_from_args(args):
     )
 
 
-def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
+def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None, phase=None):
     """Build the REAL SwapCoordinator — the SAME object graph as dust_swap_run.py / the e2e, only each
     process constructs its own side. Durable seen-store; role-tagged for the P3 recovery guards.
 
@@ -469,7 +469,9 @@ def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
     if record is None:
         record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
     else:
-        record = _merged_record(args, record, keys_out=keys_out)
+        if phase is None:
+            raise ValueError("_coordinator: a phase that passes a rebuilt record must name itself (phase=)")
+        record = _merged_record(args, record, keys_out=keys_out, phase=phase)
     role = SwapRole.MAKER if args.role == "maker" else SwapRole.TAKER
     return SwapCoordinator(
         record=record,
@@ -490,12 +492,15 @@ def _record_sink(keys_out) -> JsonFileRecordSink:
     return JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json")
 
 
-def _merged_record(args, rebuilt: SwapRecord, *, keys_out) -> SwapRecord:
-    """The persisted record merged with what this phase rebuilt (see ``_coordinator``)."""
+def _merged_record(args, rebuilt: SwapRecord, *, keys_out, phase: str) -> SwapRecord:
+    """The persisted record merged with what this phase rebuilt (see ``_coordinator``). ``phase``
+    selects the row of ``PHASE_STATE_RULES`` the persisted state is checked against."""
     return merge_with_persisted_record(
         _record_sink(keys_out),
         rebuilt,
         source=f"what this phase rebuilt from the exchange files in {args.io}",
+        role=args.role,
+        phase=phase,
     )
 
 
@@ -718,7 +723,9 @@ async def taker_phase_claim(args) -> None:
     # SECRET_REVEALED after verifying the maker's on-chain reveal (never fabricating that state).
     record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
     record = record.with_state(SwapState.BOTH_LOCKED)
-    coord = _coordinator(args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="claim"
+    )
 
     try:
         confirm("taker_observed_reveal: verify the maker's on-chain BTC claim reveals THIS swap's p", auto_yes=args.yes)
@@ -886,7 +893,9 @@ async def maker_phase_lock_claim(args) -> None:
     fee_source = _fee_source_from_args(args)
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source or _NoFeeSource())
     record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
-    coord = _coordinator(args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="lock-claim"
+    )
 
     try:
         # 1. Re-derive the expected HTLC SPK and REFUSE to lock RXD if the taker funded a different one.
@@ -1036,7 +1045,9 @@ async def taker_phase_abort(args) -> None:
     # leg that cannot dispense a fee input cannot broadcast a covenant spend by any route.
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
     record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
-    coord = _coordinator(args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
+    coord = _coordinator(
+        args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="abort"
+    )
 
     try:
         # A DISCLOSURE, never a gate: say what the maker's asset is doing so the operator is not
@@ -1133,7 +1144,7 @@ async def taker_phase_refund(args) -> None:
             .with_state(SwapState.BOTH_LOCKED)
         )
         coord = _coordinator(
-            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record
+            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="refund"
         )
         confirm(
             "mutual_refund: refund BOTH legs (BTC -> the taker, the RXD covenant -> the MAKER)",
@@ -1211,7 +1222,7 @@ async def maker_phase_refund(args) -> None:
             SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BOTH_LOCKED)
         )
         coord = _coordinator(
-            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record
+            args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="refund"
         )
         if maker_has_claimed:
             print(
@@ -1279,7 +1290,9 @@ async def maker_phase_abort(args) -> None:
 
     # No coordinator here, but the leg reads the record: a covenant outpoint this host persisted
     # earlier pins which UTXO the refund spends.
-    record = _merged_record(args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out)
+    record = _merged_record(
+        args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out, phase="abort"
+    )
     confirm(
         "refund_asset: CSV-refund the RXD covenant to the maker (the taker never funded a counter leg)",
         auto_yes=args.yes,

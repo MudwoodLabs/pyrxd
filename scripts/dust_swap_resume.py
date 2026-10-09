@@ -244,6 +244,8 @@ async def resume(args) -> None:
         JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
         rebuilt,
         source="what this resume rebuilt from the keys file and the chain",
+        role="none",
+        phase="resume",
     )
     coord = SwapCoordinator(
         record=record,

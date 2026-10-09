@@ -161,15 +161,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - the terms, the hashlock, the counter-leg locator and the covenant outpoint and SPK must agree
     when both sides hold them. A pending counter contract or BTC funding transaction on the record
     must be the one the rebuilt locator describes. A disagreement refuses, and nothing is sent;
-  - the FSM state is still the one each phase builds for its coordinator step, as before.
+  - a locator filled into a record that held only the pending handles goes through
+    `SwapRecord.with_counter_lock`, which clears those handles and `fund_refusal` as the
+    coordinator does;
+  - the FSM state is still the one each phase builds for its coordinator step, so a retry can
+    rewind (a claim retry from `SECRET_REVEALED`, a lock-claim retry). The persisted state is
+    checked first against a phase × state table that covers every runner phase and every
+    `SwapState`. On both two-host runners, taker `--phase abort` and `--phase refund` refuse on
+    `SECRET_REVEALED`, `ASSET_VULNERABLE` or `COMPLETED`, naming `--phase claim` and the `t_rxd`
+    deadline. Before this, a BTC taker `--phase refund` on such a record sent both refunds,
+    including the covenant refund that pays the maker. Maker `--phase refund` refuses on
+    `SECRET_REVEALED`. Terminal states are not refused yet: they are written at broadcast, so
+    re-sending a dropped transaction must stay possible.
 
   With no record on disk (a first run) the rebuild is used as before. `scripts/eth_swap_run.py`
   already loaded the record whole under `--resume`. The four single-process runners
   (`eth_swap_run`, `eth_swap_grief_run`, `dust_swap_run`, `dust_swap_resume`) now pass their
   coordinator role explicitly, as the single-operator role (`None`, unchanged in effect). A test
   requires a `role=` on every `CoordinatorConfig` a script builds.
-- **`scripts/eth_swap_two_host.py --role taker --phase refund` refuses up front when the ETH HTLC
-  is already settled or a claim on it is found in its logs (#850, PR R).** It sends nothing, says
+- **`scripts/eth_swap_two_host.py --role taker --phase refund` and `--phase abort` refuse up front
+  when the ETH HTLC is already settled or a claim on it is found in its logs (#850, PR R).** Both
+  send the same counter-leg refund. A failed `--phase abort` refund is now explained the same way
+  as a failed `--phase refund`; before, it surfaced as a bare preflight error. The check sends nothing, says
   which, and names the next step: `--phase claim` for a claim, or checking the contract's events
   on another endpoint for a settled contract with no claim found. It never reports the contract as
   refunded: both reads come from the one `--eth-rpc-url`. An unreadable settled flag refuses too.

@@ -244,8 +244,10 @@ refund event, and the logs come from one RPC, so check the contract's events els
 there is a claim, put its tx hash in `maker_claim.json` and run `--phase claim` before `t_rxd`.
 Any other failure is shown as it came.
 
-Before any of that, ETH taker `refund` reads the contract and **refuses up front**, sending
-nothing, when the HTLC is already settled or a claim is found in its logs. It never reads that
+Before any of that, ETH taker `refund` and ETH taker `abort` (which sends the same refund) read
+the contract and **refuse up front**, sending nothing, when the HTLC is already settled or a
+claim is found in its logs. A failed `abort` refund is explained the same way as a failed
+`refund`. It never reads that
 as "refunded". A claim found there is not verified by this check; `--phase claim` verifies it.
 For a settled contract with no claim found, check the contract's events elsewhere, as above. An
 unreadable settled flag refuses too. An unreadable log history on a contract that is not settled
@@ -257,7 +259,16 @@ the record already holds are kept, such as the covenant outpoint pinned by an ea
 the pending deploy or push handles. The exchange files only fill fields the record lacks. If
 the record and the exchange files disagree on the terms, the hashlock, the counter-leg contract
 or the covenant outpoint, the phase refuses and sends nothing. Find out which one describes your
-swap before running it again. Each phase still drives the FSM state it always did.
+swap before running it again. Each phase still drives the FSM state it always did, so a retry
+can rewind (a claim retry after the reveal was recorded, a lock-claim retry).
+
+The saved record's state is checked first, on both runners. Taker `abort` and taker `refund`
+refuse when it says `secret_revealed`, `asset_vulnerable` or `completed`: `p` is public and the
+covenant is yours to claim, so run `--phase claim` before `t_rxd`. Maker `refund` refuses when it
+says `secret_revealed`, because you claimed the counter leg and refunding the asset too would
+take both legs; re-run `--phase lock-claim` if that claim did not confirm. Terminal states are
+not refused, because today they are written when a transaction is broadcast, not when it
+confirms, so re-sending a dropped refund must stay possible.
 
 `scripts/btc_swap_two_host.py` has the same four phases, with the BTC HTLC's CSV (`t_btc`) in
 place of the ETH timeout — but its taker `refund` is **unchanged for now**: it still refunds
