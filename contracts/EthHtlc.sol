@@ -39,6 +39,7 @@ contract EthHtlc {
     error NotYetExpired();
     error SendFailed();
     error ZeroValue();
+    error ZeroAddress();
 
     constructor(
         bytes32 _hashlock,
@@ -47,6 +48,9 @@ contract EthHtlc {
         uint256 _timeout
     ) payable {
         if (msg.value == 0) revert ZeroValue();
+        // Same guard, same error, as Erc20Htlc: a zero recipient can never sign for, or spend, what
+        // it is paid, so a swap built with one could only ever burn its value.
+        if (_claimant == address(0) || _refundee == address(0)) revert ZeroAddress();
         hashlock = _hashlock;
         claimant = _claimant;
         refundee = _refundee;
@@ -57,12 +61,15 @@ contract EthHtlc {
     ///         only `claimant` — so a mempool front-runner gains nothing (revealing p is the point).
     /// @param preimage the 32-byte secret p such that sha256(p) == hashlock
     function claim(bytes32 preimage) external {
+        // Error order, shared with Erc20Htlc: AlreadySettled, then Expired, then BadPreimage. The
+        // state and the clock come before the caller's input, so a claim after the timeout reports
+        // Expired whatever preimage it carries: no preimage can succeed then.
         if (settled) revert AlreadySettled();
+        if (block.timestamp >= timeout) revert Expired();
         // sha256 precompile (0x02), NOT keccak256 — must match Radiant OP_SHA256.
         // For a bytes32, sha256(abi.encodePacked(preimage)) hashes exactly those 32 bytes
         // (no length prefix / padding), matching hashlib.sha256(p).digest() and OP_SHA256.
         if (sha256(abi.encodePacked(preimage)) != hashlock) revert BadPreimage();
-        if (block.timestamp >= timeout) revert Expired();
         settled = true; // EFFECTS before INTERACTION (reentrancy-safe)
         emit Claimed(preimage);
         (bool ok, ) = claimant.call{value: address(this).balance}("");

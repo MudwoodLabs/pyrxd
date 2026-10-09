@@ -102,7 +102,11 @@ CONTRACTS: tuple[Contract, ...] = (
         artifact="tests/fixtures/EthHtlc.json",
         origin="MudwoodLabs/pyrxd-eth-htlc@726446c4070d2e88e52598fe346f5445f63e116f:contracts/EthHtlc.sol",
         origin_blob="2f8fea4a53857965dc652a24d96349865070e835",
-        changes="one comment only: the plan it cites is named by the repo it lives in, not by a path absent here",
+        changes=(
+            "a comment: the plan it cites is named by the repo it lives in, not by a path absent here; "
+            "the constructor refuses a zero claimant or refundee (ZeroAddress, as Erc20Htlc does); claim() "
+            "checks Expired before BadPreimage, the order Erc20Htlc uses"
+        ),
         note=(
             "Per-swap deploy model: claim(bytes32 preimage) + immutable hashlock/claimant/refundee/timeout; "
             "Claimed(bytes32 preimage) non-indexed. Test fixture for the Anvil integration proof of the pyrxd EthLeg."
@@ -114,6 +118,10 @@ CONTRACTS: tuple[Contract, ...] = (
         artifact="tests/fixtures/Erc20Htlc.json",
         origin="MudwoodLabs/pyrxd-eth-htlc@7b7d005e9148a8ffd88b1a2e36b0e36450e0e40a:contracts/src/Erc20Htlc.sol",
         origin_blob="a0c9010f0125e5ba9baba4970108a6b20b8405e9",
+        changes=(
+            "refund() reverts NothingToRefund, without settling, when the balance is zero; pragma pinned to "
+            "0.8.24 (was ^0.8.20); comments on the claim-error order and the sweep guard"
+        ),
         note=(
             "Per-swap ERC-20 HTLC. Funded by a plain token transfer to the CREATE address (no allowance is "
             "ever created); claim/refund sweep balanceOf. claim() requires balanceOf >= amount before revealing "

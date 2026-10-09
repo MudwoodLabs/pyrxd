@@ -69,6 +69,46 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   this repo's swap runners and tests**, which verify a deployed contract byte for byte against
   these artifacts. The wheel ships no ETH artifact, so an application that injects its own is
   unaffected.
+- **The ETH counter-leg contracts were revised before the external audit, so the audited bytecode
+  is final.** Both artifacts change again (EthHtlc 1,215 runtime / 1,548 creation bytes; Erc20Htlc
+  1,856 / 2,298), and contracts deployed from the earlier artifacts are refused by this repo's swap
+  runners and tests, as above. The behaviour changes:
+  - **A refund of an `Erc20Htlc` that holds no tokens now reverts `NothingToRefund`, and leaves the
+    contract unsettled.** Before, `refund()` after the timeout on a deployed but never-funded
+    contract succeeded: it set `settled`, refunded nothing, and any tokens sent to the contract
+    afterwards could be moved by neither `claim` nor `refund`. Now tokens that arrive later can
+    still be refunded, unless someone settles the contract first by calling `refund()` while it
+    holds a non-zero balance. `refund()` can be called by anyone, so a third party can still do
+    this for the cost of one token base unit plus gas, where before it cost only gas. Nothing can be
+    stolen this way: a refund always pays the refundee. `claim()` needs no change: it already
+    refuses a balance below the negotiated amount, which is never zero.
+  - **`Erc20HtlcLeg.refund` raises the new `NothingToRefund` error** (a `ValidationError`, in
+    `pyrxd.security.errors`) before signing anything when the contract has timed out, is not
+    settled and holds no tokens. "Holds no tokens" needs every configured RPC endpoint to answer 0:
+    one that does not answer makes the balance unknown and raises a retryable `NetworkError`. A
+    not-yet-mature refund and a refund of a settled contract behave as before.
+  - **Interim behaviour of the swap coordinator, until #850.** The coordinator is unchanged, but it
+    now meets the refusal above. On an ERC-20 swap whose contract is past its timeout, unsettled and
+    empty, `SwapCoordinator.taker_refund_btc` raises `NothingToRefund` and leaves the swap where it
+    was. Before this release the same call succeeded and settled the empty contract.
+    `SwapCoordinator.mutual_refund` refunds the Radiant leg and raises `NetworkError("mutual refund
+    incomplete — counter leg: nothing to refund …")`, leaving the swap at `BOTH_LOCKED`; a retry
+    gives the same answer about the empty contract. Neither records a refund that did not happen,
+    and the watchtower keeps paging for the refund. Within pyrxd an empty contract at that point is
+    reachable after a resumed token fund was refused (its token push may never have landed), not
+    after a fund that completed: a completed fund reads the full balance back before it records the
+    contract. How the coordinator should end such a swap, and decide refund completion from the
+    chain rather than from its own broadcast, is #850.
+  - **`EthHtlc`'s constructor reverts `ZeroAddress` on a zero claimant or refundee**, the error and
+    check `Erc20Htlc` already had.
+  - **Both contracts check claim errors in one order: `AlreadySettled`, then `Expired`, then
+    `BadPreimage`** (then `Underfunded` in `Erc20Htlc`). `EthHtlc` used to check the preimage
+    first, so a claim after the timeout with a wrong preimage reverted `BadPreimage` there and
+    `Expired` in `Erc20Htlc`; it now reverts `Expired` in both. Nothing in pyrxd matched on these
+    names.
+  - `Erc20Htlc.sol` pins `pragma solidity 0.8.24` (was `^0.8.20`), the compiler the build uses.
+  - Measured on Anvil: deploy gas rises from 318,414 to 319,422 (`EthHtlc`) and from 450,657 to
+    458,657 (`Erc20Htlc`); an `Erc20Htlc` refund rises by 34 gas; claims are unchanged.
 
 ### Fixed
 
