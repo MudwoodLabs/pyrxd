@@ -89,6 +89,7 @@ from _dust_swap_shared import (
     derive_counter_timelock,
     elapsed_reserve_blocks,
     merge_with_persisted_record,
+    refuse_by_persisted_state,
     resolve_asset_locked_at_height,
     resolve_eth_key_file,
     wait_for_covenant_via_leg,
@@ -643,6 +644,7 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="claim")  # before any chain read
     claim_path = io_dir / "maker_claim.json"
     # The maker publishes its claim tx hash here. When it has not (a maker that claimed and went
     # quiet), the claim is found on the chain below, from this swap's own contract logs, and then
@@ -820,6 +822,7 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="lock-claim")  # before any chain read
     funding = _read_public(io_dir, "taker_funding.json")
     eth_loc = EthHtlcLocator.from_dict(funding["eth_locator"])
 
@@ -1008,6 +1011,7 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="abort")  # before any chain read
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -1177,6 +1181,7 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -1263,6 +1268,7 @@ async def maker_phase_refund(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
     if not (io_dir / "taker_funding.json").exists():
         raise SystemExit(
             "no taker_funding.json in the exchange directory: the taker never published a funded ETH "
@@ -1348,6 +1354,7 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="abort")  # before any chain read
     if (io_dir / "taker_funding.json").exists():
         raise SystemExit(
             "taker_funding.json is present: the taker DID fund a counter leg, so this is the mutual "
@@ -1440,6 +1447,11 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None, phase=
 def _record_sink(keys_out) -> JsonFileRecordSink:
     """The swap record file beside the run's local state and seen-store."""
     return JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json")
+
+
+def _refuse_by_persisted_state(args, terms, *, phase: str) -> None:
+    """``PHASE_STATE_RULES`` at the top of a phase, before any chain read, maturity or timeout check."""
+    refuse_by_persisted_state(_record_sink(args.local_out), terms=terms, role=args.role, phase=phase)
 
 
 def _merged_record(args, rebuilt: SwapRecord, *, keys_out, phase: str) -> SwapRecord:

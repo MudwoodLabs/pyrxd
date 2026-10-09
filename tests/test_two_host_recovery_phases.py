@@ -1467,7 +1467,7 @@ class TestADisagreementRefusesAndSendsNothing:
         built = _wire_eth(mod, monkeypatch) if name == "eth_swap_two_host" else _wire_btc(mod, monkeypatch)
         with pytest.raises(SystemExit, match="different swaps"):
             await mod.maker_phase_abort(_with_fee(args))
-        assert built["rxd"].refund_calls == []
+        assert "counter" not in built and "rxd" not in built, "refused after a leg was built"
 
 
 class TestTheMergeHelperOnItsOwn:
@@ -1653,7 +1653,7 @@ class TestThePhaseStateTable:
         assert set(rules) == set(eth_mod._DISPATCH) | set(btc_mod._DISPATCH) | {("none", "resume")}
         for key, row in rules.items():
             assert set(row) == set(SwapState), f"{key}: missing {set(SwapState) - set(row)}"
-            assert {verdict for verdict, _why in row.values()} <= {"allow", "refuse"}, key
+            assert {verdict for verdict, _why in row.values()} <= {"allow", "refuse", "n/a"}, key
             assert all(why for _verdict, why in row.values()), key
 
     def test_the_refusals_are_exactly_these(self):
@@ -1668,6 +1668,39 @@ class TestThePhaseStateTable:
         expected = {("taker", phase, state) for phase in ("abort", "refund") for state in _P_PUBLIC}
         expected.add(("maker", "refund", SwapState.SECRET_REVEALED))
         assert refused == expected
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    def test_n_a_marks_exactly_the_phases_that_never_apply_the_rule(self, name):
+        """Derived from each runner's source: a phase applies the rule iff its function calls
+        ``_refuse_by_persisted_state`` with its own phase name. Those rows hold a real verdict for
+        every state; the other rows are wholly ``n/a``. So a row cannot claim a check nobody runs,
+        and a phase cannot apply a rule its row does not define."""
+        mod = _load(name)
+        fns = _functions_of(_SCRIPTS / f"{name}.py")
+        rules = _shared().PHASE_STATE_RULES
+        applied = set()
+        for (role, phase), fn in mod._DISPATCH.items():
+            for node in ast.walk(fns[fn.__name__]):
+                if (
+                    isinstance(node, ast.Call)
+                    and getattr(node.func, "id", None) == "_refuse_by_persisted_state"
+                    and any(k.arg == "phase" and getattr(k.value, "value", None) == phase for k in node.keywords)
+                ):
+                    applied.add((role, phase))
+        assert applied, "the derivation found no phase applying the rule"
+        for key in mod._DISPATCH:
+            verdicts = {verdict for verdict, _why in rules[key].values()}
+            if key in applied:
+                assert "n/a" not in verdicts, key
+            else:
+                assert verdicts == {"n/a"}, key
+        assert set(mod._DISPATCH) - applied == {("taker", "intro"), ("taker", "fund"), ("maker", "envelope")}
+
+    def test_applying_an_n_a_row_raises(self):
+        # The row raises before it reads the record's terms, so a state-only stand-in suffices.
+        rec = argparse.Namespace(state=SwapState.BOTH_LOCKED, terms=None)
+        with pytest.raises(ValueError, match="does not apply"):
+            _shared().persisted_state_refusal("taker", "fund", rec)
 
 
 class TestThePersistedStateGuardThroughTheRunners:
@@ -1688,8 +1721,30 @@ class TestThePersistedStateGuardThroughTheRunners:
         msg = str(raised.value.code)
         assert f"says {state.value}" in msg and "--phase claim" in msg and "t_rxd = 120" in msg, msg
         assert "Nothing was sent" in msg, msg
-        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
+        assert "counter" not in built and "rxd" not in built, "refused after a leg was built"
         assert _record_path(args).read_bytes() == before
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    @pytest.mark.parametrize("phase", ["abort", "refund"])
+    async def test_before_maturity_the_claim_instruction_is_not_hidden(self, name, phase, tmp_path, monkeypatch):
+        """Re-review MEDIUM: the guard used to run at the merge, AFTER the maturity and timeout checks,
+        so a SECRET_REVEALED record with the covenant 5 of 120 deep got "not yet mature, retry at
+        maturity" (BTC) or "Nothing is recoverable on the ETH leg yet" (ETH): the claim-before-t_rxd
+        instruction only appeared once t_rxd had passed. It must come first, before any chain read."""
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir, _leg, _stop = _phase_scenario(name, tmp_path, role="taker", phase=phase)
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.SECRET_REVEALED, pending=False))
+        mod = _load(name)
+        if eth:
+            built = _wire_eth(mod, monkeypatch, covenant_confs=5, now_ts=1_700_000_000)  # before the timeout
+        else:
+            built = _wire_btc(mod, monkeypatch, covenant_confs=5, btc_confs=5)  # neither CSV is mature
+        with pytest.raises(SystemExit) as raised:
+            await mod._DISPATCH[("taker", phase)](_with_fee(args))
+        msg = str(raised.value.code)
+        assert "--phase claim" in msg and "t_rxd = 120" in msg, msg
+        assert "mature" not in msg and "Nothing is recoverable" not in msg, msg
+        assert "counter" not in built and "rxd" not in built, "a leg was built before the refusal"
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     async def test_maker_refund_refuses_after_the_maker_revealed_p(self, name, tmp_path, monkeypatch):
@@ -1704,7 +1759,7 @@ class TestThePersistedStateGuardThroughTheRunners:
         with pytest.raises(SystemExit, match="take both legs") as raised:
             await mod.maker_phase_refund(_with_fee(args))
         assert "--phase lock-claim" in str(raised.value.code)
-        assert built["rxd"].refund_calls == []
+        assert "counter" not in built and "rxd" not in built, "refused after a leg was built"
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     @pytest.mark.parametrize(

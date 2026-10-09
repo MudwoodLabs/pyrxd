@@ -166,7 +166,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     coordinator does;
   - the FSM state is still the one each phase builds for its coordinator step, so a retry can
     rewind (a claim retry from `SECRET_REVEALED`, a lock-claim retry). The persisted state is
-    checked first against a phase × state table that covers every runner phase and every
+    checked at the top of each phase, before any chain read, maturity or timeout check, against a
+    phase × state table that covers every runner phase and every
     `SwapState`. On both two-host runners, taker `--phase abort` and `--phase refund` refuse on
     `SECRET_REVEALED`, `ASSET_VULNERABLE` or `COMPLETED`, naming `--phase claim` and the `t_rxd`
     deadline. Before this, a BTC taker `--phase refund` on such a record sent both refunds,

@@ -171,8 +171,14 @@ BINDING_RECORD_FIELDS = ("terms", "counterchain_locator", "radiant_covenant_outp
 #: ``(role, phase)``: the two-host runners' phases (both runners share them) and
 #: ``("none", "resume")`` for ``dust_swap_resume.py``. Every row lists EVERY ``SwapState``, and a
 #: test derives the expected keys from ``SwapState`` itself, so a new state without a verdict here
-#: fails the suite instead of being allowed by default. A verdict is ``("allow", why)`` or
-#: ``("refuse", why)``; a refusal's text may use ``{state}`` and ``{t_rxd}``.
+#: fails the suite instead of being allowed by default. A verdict is ``("allow", why)``,
+#: ``("refuse", why)`` or ``("n/a", why)``; a refusal's text may use ``{state}`` and ``{t_rxd}``.
+#: ``n/a`` marks the phases that build no record from the exchange files (taker intro and fund,
+#: maker envelope): the rule is never applied there, and applying it raises.
+#:
+#: The rule is applied twice: at the top of each phase that reads the record
+#: (``refuse_by_persisted_state``, before any chain read, maturity or timeout check, so a refusal
+#: is not hidden behind "not yet mature"), and again inside the merge.
 #:
 #: Every rebuild still drives the state its coordinator step needs (a claim retry rewinds
 #: SECRET_REVEALED or ASSET_VULNERABLE to BOTH_LOCKED; a lock-claim retry rewinds to BTC_LOCKED).
@@ -182,11 +188,11 @@ BINDING_RECORD_FIELDS = ("terms", "counterchain_locator", "radiant_covenant_outp
 #: NOT refused for being terminal: today they are written at BROADCAST, not confirmation, so
 #: re-sending a dropped transaction must stay possible. Terminal-state refusals come with PR 5b
 #: (ETH) and PR 9a (BTC), once terminal means confirmed.
-_NO_RECORD = ("allow", "this phase does not read the persisted record")
+_NO_RECORD = ("n/a", "not applicable: this phase builds no record from the exchange files")
 _FUND = (
-    "allow",
-    "starts a fresh NEGOTIATED record (the BTC fund resumes a recorded funding transaction); the "
-    "coordinator's hashlock-reuse check refuses a second fund of this swap",
+    "n/a",
+    "not applicable: the fund starts a fresh NEGOTIATED record (the BTC fund's own resume reads only a "
+    "recorded funding transaction); the coordinator's hashlock-reuse check refuses a second fund",
 )
 _CLAIM = (
     "allow",
@@ -378,10 +384,42 @@ def persisted_state_refusal(role: str, phase: str, persisted: Any) -> str | None
     Raises ``KeyError`` for a phase or state the table does not list: a missing verdict is a bug in
     the table, never an implicit allow."""
     verdict, why = PHASE_STATE_RULES[(role, phase)][persisted.state]
+    if verdict == "n/a":
+        raise ValueError(f"the persisted-state rule does not apply to {role} --phase {phase}: {why}")
     if verdict == "allow":
         return None
     t_rxd = persisted.terms.t_rxd
     return why.format(state=persisted.state.value, t_rxd=f"{t_rxd.value} {t_rxd.unit.value}")
+
+
+def refuse_by_persisted_state(sink: Any, *, terms: Any, role: str, phase: str) -> None:
+    """Apply :data:`PHASE_STATE_RULES` at the TOP of a phase, before any chain read.
+
+    The merge applies the same rule, but a phase reaches its merge only after its covenant read,
+    maturity checks or timeout check. A taker record at SECRET_REVEALED before the covenant matures
+    then got "not yet mature, retry at maturity" instead of "claim the covenant before t_rxd", so the
+    claim instruction only appeared once it was too late. Reads the file only; refuses an unreadable
+    record or one for a different swap (the hashlock), and otherwise only what the table refuses.
+    """
+    path = getattr(sink, "path", "the swap record")
+    try:
+        persisted = sink.load_record()
+    except (ValidationError, NetworkError) as exc:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} could not be read ({exc}). Nothing was sent. Inspect the "
+            "file before running this phase: it may reference a contract that holds value."
+        ) from None
+    if persisted is None:
+        return
+    if persisted.terms.hashlock != terms.hashlock:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} and these terms disagree on the hashlock (they are "
+            f"different swaps): record {persisted.terms.hashlock.hex()[:16]}…, terms {terms.hashlock.hex()[:16]}…. "
+            "Nothing was sent. Find out which swap you mean to recover before running this phase again."
+        )
+    refusal = persisted_state_refusal(role, phase, persisted)
+    if refusal is not None:
+        raise SystemExit(f"REFUSING {role} --phase {phase}: {refusal}. Nothing was sent. (record: {path})")
 
 
 def _comparable(value: Any) -> Any:
