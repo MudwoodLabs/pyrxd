@@ -232,7 +232,7 @@ _RESUME = (
 )
 
 
-def _row(**by_state: tuple[str, str]) -> dict:
+def _row(**by_state: tuple[str, str]) -> dict[SwapState, tuple[str, str]]:
     return {SwapState[name]: verdict for name, verdict in by_state.items()}
 
 
@@ -254,7 +254,7 @@ _ALL_NO_RECORD = {
     )
 }
 
-PHASE_STATE_RULES: dict[tuple[str, str], dict] = {
+PHASE_STATE_RULES: dict[tuple[str, str], dict[SwapState, tuple[str, str]]] = {
     ("taker", "intro"): _row(**_ALL_NO_RECORD),
     ("maker", "envelope"): _row(**_ALL_NO_RECORD),
     ("taker", "fund"): _row(
