@@ -599,7 +599,7 @@ funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG ent
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**
-(`scripts/btc_swap_two_host.py:817, 1341`; `scripts/eth_swap_two_host.py:798, 1400` — the second of
+(`scripts/btc_swap_two_host.py:817, 1341`; `scripts/eth_swap_two_host.py:798, 1401` — the second of
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only
