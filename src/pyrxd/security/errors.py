@@ -32,6 +32,8 @@ __all__ = [
     "ClaimNotConfirmed",
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
+    "CounterLegAlreadySettled",
+    "CounterLegClaimedByCounterparty",
     "CovenantError",
     "DmintError",
     "FeePoolExhaustedError",
@@ -357,6 +359,41 @@ class NothingToRefund(ValidationError):
     changes if someone pushes tokens into the contract, after which a refund works.
 
     ``contract_address`` is carried so the operator knows which contract to check.
+    """
+
+    def __init__(self, message: str, *, contract_address: str | None = None) -> None:
+        super().__init__(message)
+        self.contract_address = contract_address
+
+
+class CounterLegClaimedByCounterparty(ValidationError):
+    """A taker's counter-leg refund failed because the counterparty CLAIMED that leg, revealing ``p``.
+
+    Raised by ``SwapCoordinator.mutual_refund`` on a TAKER-role ETH swap, only after the claim has
+    been verified from the chain: a claim tx found in the HTLC contract's logs, ``p`` scraped from
+    it with ``sha256(p) == H``, and the provenance gate passed (a successful tx emitting ``p`` from
+    this swap's contract). The refund can never succeed now, and the right next step is the
+    opposite of retrying it: claim the RXD covenant with ``p`` before its CSV refund opens.
+
+    Its own type because the generic failure it replaces (a preflight revert, usually a bare
+    revert code) reads the same as "your refund already landed", which calls for doing nothing.
+    ``tx_hash`` is the verified claim, the value to pass to ``taker_observed_reveal``.
+    """
+
+    def __init__(self, message: str, *, tx_hash: str | None = None, contract_address: str | None = None) -> None:
+        super().__init__(message)
+        self.tx_hash = tx_hash
+        self.contract_address = contract_address
+
+
+class CounterLegAlreadySettled(ValidationError):
+    """A taker's counter-leg refund failed because the HTLC is already settled and no claim was found.
+
+    The contract's ``settled`` flag is set and the contract's logs, as read through the configured
+    RPC, carry no claim, so it was refunded, by an earlier run or by anyone (``refund()`` pays the
+    immutable refundee whoever sends it). Nothing more is needed on that leg. Not proof against an
+    RPC that withholds logs: the message says to check a second source if the covenant is still
+    claimable and that matters. ``contract_address`` names the contract to check.
     """
 
     def __init__(self, message: str, *, contract_address: str | None = None) -> None:

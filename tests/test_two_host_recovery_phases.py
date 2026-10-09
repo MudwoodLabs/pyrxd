@@ -36,6 +36,7 @@ import pytest
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.keys import generate_keypair
+from pyrxd.eth_wallet.events import function_selector
 from pyrxd.gravity.swap_state import SwapRole, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import NetworkError, ValidationError
@@ -166,13 +167,23 @@ _FEE_WIF = PrivateKey(os.urandom(32)).wif()
 # ---------------------------------------------------------------------------
 
 
-def _eth_scenario(mod, tmp_path: Path, *, role: str, with_funding: bool, with_claim: bool = False, **over):
+def _eth_scenario(
+    mod,
+    tmp_path: Path,
+    *,
+    role: str,
+    with_funding: bool,
+    with_claim: bool = False,
+    preimage: bytes | None = None,
+    **over,
+):
     io_dir = tmp_path / "swapdir"
     io_dir.mkdir()
     taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
-    h = hashlib.sha256(os.urandom(32)).digest()
+    # `preimage` lets a test play the maker's reveal: the scenario's H is then sha256(preimage).
+    h = hashlib.sha256(preimage if preimage is not None else os.urandom(32)).digest()
     eth_timeout = 1_800_000_000
     terms, cov = mod._terms_from_public(
         hashlock=h,
@@ -727,6 +738,118 @@ class TestTakerRefundOnEthRefundsOnlyTheTakersLeg:
         with pytest.raises(SystemExit, match="cannot tell those apart"):
             await eth_mod.taker_phase_refund(args)
         assert built["counter"].refund_calls == []
+
+
+class _ClaimedEthCounterLeg(_FakeCounterLeg):
+    """The ETH HTLC after the maker claimed it, as the REAL leg reports it.
+
+    ``EthHtlcContractLeg.refund`` preflights with ``eth_call``; against a claimed contract that
+    reverts ``AlreadySettled()`` and ``EthRpc.preflight`` raises a ``ValidationError`` whose text is
+    "tx would revert (preflight eth_call): " plus web3's rendering of the custom error — the 4-byte
+    selector, not a name. The claim itself is readable from the contract's logs.
+    """
+
+    def __init__(self, preimage: bytes | None, *, claim_tx: str | None = "0x" + "55" * 32, settled: bool = True):
+        super().__init__()
+        self._p = preimage
+        self._claim_tx = claim_tx
+        self._settled = settled
+        self.provenance_checked: list[str] = []
+
+    async def refund(self, locator, timeout=None) -> str:
+        self.refund_calls.append(locator)
+        sel = "0x" + function_selector("AlreadySettled()").hex()
+        raise ValidationError(f"tx would revert (preflight eth_call): ('{sel}', '{sel}')")
+
+    async def observed_claim_tx(self, locator):
+        return self._claim_tx
+
+    async def is_settled(self, locator) -> bool:
+        return self._settled
+
+    async def fetch_claim_artifacts(self, tx_hash):
+        return [b"\x00\x00\x00\x00" + self._p]
+
+    def scrape_secret(self, artifacts, hashlock) -> bytes:
+        from pyrxd.eth_wallet.secret import recover_secret
+
+        return recover_secret(artifacts, hashlock)
+
+    async def assert_claim_provenance(self, tx_hash, *, contract_address, preimage) -> None:
+        self.provenance_checked.append(tx_hash)
+
+
+def _wire_eth_claimed(mod, monkeypatch, leg, *, now_ts=1_900_000_000):
+    built: dict[str, object] = {"counter": leg}
+
+    def _fake_radiant(args, *, taker_pkh, maker_pkh, fee_source):
+        rxd = _FakeRadiantLeg(fee_source=fee_source)
+        built["rxd"] = rxd
+        return rxd
+
+    def _fake_eth(args, *, claim_to, refund_to, eth_timeout):
+        rpc = _FakeEthRpc(now_ts)
+        built["rpc"] = rpc
+        return rpc, leg
+
+    monkeypatch.setattr(mod, "_radiant_leg", _fake_radiant)
+    monkeypatch.setattr(mod, "_eth_leg", _fake_eth)
+    return built
+
+
+class TestTakerEthRefundSaysWhatHappenedWhenItFails:
+    """#850 review: the real leg's failure for "the maker claimed" is a bare preflight revert, the
+    same text as "your refund already landed". The phase must tell the operator which."""
+
+    async def test_maker_already_claimed_names_the_claim_and_the_claim_phase(self, eth_mod, tmp_path, monkeypatch):
+        p = os.urandom(32)
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True, preimage=p)
+        leg = _ClaimedEthCounterLeg(p)
+        built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        with pytest.raises(SystemExit) as raised:
+            await eth_mod.taker_phase_refund(args)
+        msg = str(raised.value)
+        assert "MAKER CLAIMED" in msg and "0x" + "55" * 32 in msg, msg
+        assert "--phase claim" in msg and "t_rxd" in msg, msg
+        assert leg.provenance_checked == ["0x" + "55" * 32], "the claim was not verified before being reported"
+        assert built["rxd"].refund_calls == []
+
+    async def test_already_refunded_is_reported_as_done_not_as_a_failure(self, eth_mod, tmp_path, monkeypatch, capsys):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True)
+        built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        await eth_mod.taker_phase_refund(args)
+        assert "REFUNDED" in capsys.readouterr().out
+        assert built["rxd"].refund_calls == []
+
+    async def test_claim_phase_finds_the_claim_on_the_contract_without_maker_claim_json(
+        self, eth_mod, tmp_path, monkeypatch
+    ):
+        p = os.urandom(32)
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True, preimage=p)
+        assert not (Path(args.io) / "maker_claim.json").exists()
+
+        class _Stop(Exception):
+            pass
+
+        class _Leg(_ClaimedEthCounterLeg):
+            async def assert_claim_provenance(self, tx_hash, *, contract_address, preimage) -> None:
+                self.provenance_checked.append(tx_hash)
+                raise _Stop  # far enough: the discovered hash reached the verified reveal
+
+        leg = _Leg(p, claim_tx="0x" + "66" * 32)
+        _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        with pytest.raises(_Stop):
+            await eth_mod.taker_phase_claim(_with_fee(args))
+        assert leg.provenance_checked == ["0x" + "66" * 32]
+
+    async def test_claim_phase_without_maker_claim_json_or_a_claim_refuses_clearly(
+        self, eth_mod, tmp_path, monkeypatch
+    ):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        _wire_eth_claimed(eth_mod, monkeypatch, _ClaimedEthCounterLeg(None, claim_tx=None, settled=False))
+        with pytest.raises(SystemExit, match="no claim found in the logs"):
+            await eth_mod.taker_phase_claim(_with_fee(args))
 
 
 class TestTakerRefundOnBtcIsStillTheMutualUnwind:

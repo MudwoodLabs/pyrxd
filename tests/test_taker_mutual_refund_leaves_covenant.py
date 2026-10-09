@@ -35,12 +35,18 @@ import hashlib
 
 import pytest
 
+from pyrxd.eth_wallet.events import function_selector
 from pyrxd.gravity.finality import CounterClaimState
 from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import SwapRole, SwapState
 from pyrxd.gravity.watch import Intent, Observations, decide
-from pyrxd.security.errors import NetworkError
+from pyrxd.security.errors import (
+    CounterLegAlreadySettled,
+    CounterLegClaimedByCounterparty,
+    NetworkError,
+    ValidationError,
+)
 from pyrxd.security.units import ChainHeight
 from tests.test_swap_coordinator import (
     _NOW,
@@ -61,17 +67,51 @@ from tests.test_swap_coordinator import (
 _SAFETY = 6
 
 
-class _SettledEthLeg(FakeEthLeg):
-    """The ETH HTLC after the maker claimed it before its timeout: ``refund()`` reverts.
+_CLAIM_TX = "0xethclaim"
 
-    This is what the real contracts do — ``EthHtlc``/``Erc20Htlc`` set ``settled`` on a claim and
-    revert ``refund()`` with ``AlreadySettled`` — and a claim AFTER the timeout reverts with
-    ``Expired``, so on ETH the maker's claim necessarily comes before the taker's refund attempt.
+
+def _preflight_revert() -> ValidationError:
+    """What the REAL leg raises for a refund against a settled contract.
+
+    ``EthHtlcContractLeg.refund`` preflights with ``eth_call``; the contract reverts
+    ``AlreadySettled()`` and ``EthRpc.preflight`` raises ``ValidationError("tx would revert
+    (preflight eth_call): <web3's rendering>")``, which carries the 4-byte selector, not the name.
+    The same text comes back whether the maker claimed or the taker's own refund already landed.
     """
+    sel = "0x" + function_selector("AlreadySettled()").hex()
+    return ValidationError(f"tx would revert (preflight eth_call): ('{sel}', '{sel}')")
+
+
+class _ChainEthLeg(FakeEthLeg):
+    """``FakeEthLeg`` plus the two chain reads the shipped ``EthLeg`` exposes for explaining a
+    failed refund (``observed_claim_tx`` from the contract logs, ``is_settled`` from storage).
+
+    ``claimed=True`` models the maker having claimed before the timeout (``EthHtlc``/``Erc20Htlc``
+    reject a claim at or after it, so on ETH the claim necessarily precedes the refund attempt):
+    the contract is settled, the logs carry the claim, and ``refund()`` raises the preflight error.
+    """
+
+    def __init__(self, *, claimed: bool = False, settled: bool = False, refund_error=None, **kw) -> None:
+        super().__init__(**kw)
+        self.claim_tx = _CLAIM_TX if claimed else None
+        self.settled = settled or claimed
+        self.refund_error = (
+            refund_error if refund_error is not None else (_preflight_revert() if self.settled else None)
+        )
 
     async def refund(self, locator, timeout=None) -> str:
         self.calls.append("refund")
-        raise NetworkError("execution reverted: AlreadySettled()")
+        if self.refund_error is not None:
+            raise self.refund_error
+        return await super().refund(locator, timeout)
+
+    async def observed_claim_tx(self, locator):
+        self.calls.append("observed_claim_tx")
+        return self.claim_tx
+
+    async def is_settled(self, locator) -> bool:
+        self.calls.append("is_settled")
+        return self.settled
 
 
 async def _eth_both_locked_on_disk(tmp_path, *, secret, h):
@@ -129,22 +169,219 @@ async def test_the_race_maker_claims_first_and_the_taker_can_still_claim_the_cov
     secret, h = generate_secret()
     p_bytes = secret.unsafe_raw_bytes()
     sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
-    eth, rxd = _SettledEthLeg(preimage=p_bytes, verdict=_final()), FakeRadiantLeg()
+    eth, rxd = _ChainEthLeg(claimed=True, preimage=p_bytes, verdict=_final()), FakeRadiantLeg()
     coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
 
-    with pytest.raises(NetworkError, match="AlreadySettled"):
+    with pytest.raises(CounterLegClaimedByCounterparty) as raised:
         await coord.mutual_refund()
+    assert raised.value.tx_hash == _CLAIM_TX
     assert "refund_asset" not in rxd.calls, "the covenant went back to the maker; the taker's claim is gone"
     assert sink.load_record().state is SwapState.BOTH_LOCKED
 
-    # A fresh process again, then the existing claim path.
+    # A fresh process again, then the existing claim path, with the tx the error named.
     coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
-    rec = await coord.taker_observed_reveal("0xethclaim")
+    rec = await coord.taker_observed_reveal(raised.value.tx_hash)
     assert rec.state is SwapState.SECRET_REVEALED
     rec = await coord.taker_scrape_and_claim_asset("0xethclaim", now_rxd_height=1000, asset_locked_at_height=1000)
     assert rec.state is SwapState.COMPLETED
     assert rxd.claimed_with is not None and hashlib.sha256(rxd.claimed_with).digest() == h
     assert sink.load_record().state is SwapState.COMPLETED
+
+
+async def test_the_race_past_t_rxd_goes_through_asset_vulnerable_to_completed(tmp_path):
+    """The same race, with the taker noticing only after the covenant's CSV refund has opened (the
+    maker has not sent it yet). The gate squeezes to ASSET_VULNERABLE and the deliberate
+    winner-take-all claim still takes the covenant — reachable only because the record was left
+    BOTH_LOCKED and the covenant untouched."""
+    secret, h = generate_secret()
+    p_bytes = secret.unsafe_raw_bytes()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    eth, rxd = _ChainEthLeg(claimed=True, preimage=p_bytes, verdict=_final()), FakeRadiantLeg()
+    coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
+    with pytest.raises(CounterLegClaimedByCounterparty):
+        await coord.mutual_refund()
+
+    coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
+    await coord.taker_observed_reveal(_CLAIM_TX)
+    locked = 1_000
+    past_t_rxd = locked + coord.record.terms.t_rxd.value
+    rec = await coord.taker_scrape_and_claim_asset(_CLAIM_TX, now_rxd_height=past_t_rxd, asset_locked_at_height=locked)
+    assert rec.state is SwapState.ASSET_VULNERABLE, rec.state
+    rec = await coord.taker_claim_asset_from_vulnerable(_CLAIM_TX)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with is not None and hashlib.sha256(rxd.claimed_with).digest() == h
+    assert "refund_asset" not in rxd.calls
+    assert sink.load_record().state is SwapState.COMPLETED
+
+
+async def test_a_failed_refund_on_an_already_refunded_contract_says_so(tmp_path):
+    """(b): settled, and no claim in the logs — it was refunded (by an earlier run, or anyone).
+    Nothing more is needed on ETH; the error says that rather than a bare revert."""
+    secret, h = generate_secret()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    eth, rxd = _ChainEthLeg(settled=True, preimage=secret, verdict=_final()), FakeRadiantLeg()
+    coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
+    with pytest.raises(CounterLegAlreadySettled, match="REFUNDED") as raised:
+        await coord.mutual_refund()
+    assert isinstance(raised.value.__cause__, ValidationError)  # the original preflight error is chained
+    assert "refund_asset" not in rxd.calls
+    assert sink.load_record().state is SwapState.BOTH_LOCKED
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["not_yet_expired", "claim_does_not_verify", "log_read_fails"],
+)
+async def test_any_other_failure_propagates_the_original_error(tmp_path, case):
+    """(c): nothing on chain explains it, or the explanation cannot be verified — the original
+    error, unchanged. A claim that fails provenance must never be reported as the maker's claim."""
+    secret, h = generate_secret()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    if case == "not_yet_expired":
+        original = NetworkError("ETH HTLC refund is not yet mature: matures at unix 1, now 0")
+        eth = _ChainEthLeg(refund_error=original, preimage=secret, verdict=_final())
+    elif case == "claim_does_not_verify":
+        original = _preflight_revert()
+        eth = _ChainEthLeg(claimed=True, refund_error=original, preimage=secret, verdict=_final(), provenance_ok=False)
+    else:
+        original = _preflight_revert()
+        eth = _ChainEthLeg(claimed=True, refund_error=original, preimage=secret, verdict=_final())
+
+        async def _boom(locator):
+            raise NetworkError("eth_getLogs: range too large")
+
+        eth.observed_claim_tx = _boom
+    rxd = FakeRadiantLeg()
+    coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
+    with pytest.raises(type(original)) as raised:
+        await coord.mutual_refund()
+    assert raised.value is original
+    assert not isinstance(raised.value, (CounterLegClaimedByCounterparty, CounterLegAlreadySettled))
+    assert "refund_asset" not in rxd.calls
+    assert sink.load_record().state is SwapState.BOTH_LOCKED
+
+
+# ---------------------------------------------------------------------------
+# The same, through the SHIPPED EthLeg over EthHtlcContractLeg (only the RPC is faked)
+# ---------------------------------------------------------------------------
+
+_ART = {
+    "abi": [],
+    "bytecode": "0x00",
+    "runtime_bytecode": "0x" + "00" * 32,
+    "immutableReferences": {"1": [{"start": 0, "length": 32}]},
+    "immutable_names": {"1": "hashlock"},
+}
+
+
+class _ChainRpc:
+    """An Ethereum RPC as the real leg reads it: deploy tx, contract logs, receipts, and storage.
+
+    ``claim_p`` set → the contract was claimed with it (a ``Claimed(p)`` log, a claim tx whose
+    calldata carries p, settled). ``claim_p`` None and ``refunded`` → only ``Refunded()``, settled.
+    """
+
+    def __init__(self, *, contract: str, deploy_tx: str, claim_p: bytes | None, refunded: bool = False):
+        from types import SimpleNamespace
+
+        from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+
+        self._contract, self._deploy_tx = contract, deploy_tx
+        self._claim_p = claim_p
+        if claim_p is not None:
+            self._logs = [
+                {
+                    "address": contract,
+                    "topics": [CLAIMED_TOPIC0],
+                    "data": "0x" + claim_p.hex(),
+                    "transactionHash": _REAL_CLAIM_TX,
+                }
+            ]
+        elif refunded:
+            self._logs = [
+                {"address": contract, "topics": [REFUNDED_TOPIC0], "data": "0x", "transactionHash": "0x" + "77" * 32}
+            ]
+        else:
+            self._logs = []
+        settled = claim_p is not None or refunded
+
+        async def _get_storage_at(addr, slot, block_identifier=None):
+            return (b"\x00" * 31 + b"\x01") if settled else b"\x00" * 32
+
+        self.w3 = SimpleNamespace(eth=SimpleNamespace(get_storage_at=_get_storage_at))
+
+    async def get_transaction(self, tx_hash):
+        if tx_hash == self._deploy_tx:
+            return {"blockNumber": 5}
+        sel = function_selector("claim(bytes32)").hex()
+        return {"to": self._contract, "input": "0x" + sel + (self._claim_p or b"").hex(), "blockNumber": 9}
+
+    async def get_logs(self, *, address, topics=None, from_block="earliest", to_block="latest"):
+        assert address == self._contract
+        return list(self._logs)
+
+    async def wait_receipt(self, tx_hash):
+        return {"status": 1, "blockNumber": 9, "logs": [lg for lg in self._logs if lg["transactionHash"] == tx_hash]}
+
+
+_REAL_CLAIM_TX = "0x" + "88" * 32
+
+
+def _real_eth_leg(rpc):
+    from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+    from pyrxd.gravity.eth_leg import EthLeg
+    from pyrxd.security.secrets import PrivateKeyMaterial
+
+    contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=31337, artifact=_ART)
+
+    async def _refund_reverts(locator):
+        # Everything before the preflight needs a live node; the preflight's failure is what matters.
+        raise _preflight_revert()
+
+    contract_leg.refund = _refund_reverts
+    return EthLeg(
+        contract_leg=contract_leg,
+        network="regtest",  # an audit-cleared tag: not value-bearing, so no durable seen-store needed
+        claim_to="0x" + "11" * 20,
+        refund_to="0x" + "22" * 20,
+        eth_timeout_unix_s=_NOW + 40000,
+    )
+
+
+async def test_the_shipped_eth_leg_turns_a_maker_claim_into_the_claim_error(tmp_path):
+    secret, h = generate_secret()
+    p_bytes = secret.unsafe_raw_bytes()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    loc = sink.load_record().counterchain_locator
+    rpc = _ChainRpc(contract=loc.contract_address, deploy_tx=loc.deploy_tx_hash, claim_p=p_bytes)
+    rxd = FakeRadiantLeg()
+    coord = _eth_reloaded(sink, eth_leg=_real_eth_leg(rpc), radiant_leg=rxd, role=SwapRole.TAKER)
+    with pytest.raises(CounterLegClaimedByCounterparty) as raised:
+        await coord.mutual_refund()
+    assert raised.value.tx_hash == _REAL_CLAIM_TX
+    assert "taker_observed_reveal" in str(raised.value) and "t_rxd" in str(raised.value)
+    assert "refund_asset" not in rxd.calls
+
+
+async def test_the_shipped_eth_leg_turns_an_earlier_refund_into_the_settled_error(tmp_path):
+    secret, h = generate_secret()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    loc = sink.load_record().counterchain_locator
+    rpc = _ChainRpc(contract=loc.contract_address, deploy_tx=loc.deploy_tx_hash, claim_p=None, refunded=True)
+    coord = _eth_reloaded(sink, eth_leg=_real_eth_leg(rpc), radiant_leg=FakeRadiantLeg(), role=SwapRole.TAKER)
+    with pytest.raises(CounterLegAlreadySettled):
+        await coord.mutual_refund()
+
+
+async def test_the_shipped_eth_leg_leaves_an_unexplained_failure_alone(tmp_path):
+    secret, h = generate_secret()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    loc = sink.load_record().counterchain_locator
+    rpc = _ChainRpc(contract=loc.contract_address, deploy_tx=loc.deploy_tx_hash, claim_p=None)
+    coord = _eth_reloaded(sink, eth_leg=_real_eth_leg(rpc), radiant_leg=FakeRadiantLeg(), role=SwapRole.TAKER)
+    with pytest.raises(ValidationError, match="tx would revert") as raised:
+        await coord.mutual_refund()
+    assert not isinstance(raised.value, (CounterLegClaimedByCounterparty, CounterLegAlreadySettled))
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +454,9 @@ async def test_btc_taker_mutual_refund_is_unchanged_in_this_release(tmp_path):
 
 async def test_eth_tower_after_a_taker_only_refund_pages_refund_with_text_that_says_it_repeats(tmp_path):
     """The record stays BOTH_LOCKED and the ETH tower sees no Claimed event for a refund, so past
-    the stall window it keeps paging the refund. That page must not send the operator round in a
-    loop: it says the page repeats after mutual_refund and to check the refund on-chain."""
+    the stall window the decision stays PAGE_REFUND. (DedupAlerter delivers that WARN once per
+    situation; it repeats only after a tower restart.) The text must not send the operator round in
+    a loop: it says the situation does not clear after mutual_refund and to check the refund."""
     secret, h = generate_secret()
     sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
     coord = _eth_reloaded(
@@ -239,7 +477,8 @@ async def test_eth_tower_after_a_taker_only_refund_pages_refund_with_text_that_s
     )
     assert d.intent is Intent.PAGE_REFUND
     assert d.recommended_action == "mutual_refund"
-    assert "repeats after you have run it" in d.reason
+    assert "does not clear after you run it" in d.reason
+    assert "repeats" not in d.reason  # it does not: a WARN is paged once per situation
     assert "BOTH_LOCKED" in d.reason
 
     # And a maker claim on that same record still pages the claim race through the claim path.

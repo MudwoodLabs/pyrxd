@@ -101,7 +101,7 @@ Every message is a JSON object carrying a `schema` string:
 | Value | Meaning |
 |---|---|
 | `btc_rxd_two_host_envelope_v1` | BTC counter leg (`scripts/btc_swap_two_host.py:817`) |
-| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:781`) |
+| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:794`) |
 
 **A conforming implementation MUST read `schema` and MUST refuse an unrecognised value**, exactly
 as `gravity/watch/escalation.py:210-214` does for the watchtower heartbeat's `schema_version`
@@ -231,7 +231,7 @@ MUST verify, before acting on it (`swap_coordinator.py:3951-3956`):
    by byte offset** (`counter_chain_leg.py:45-48`);
 2. **provenance** — BTC: the transaction spends *this swap's* funding outpoint
    (`swap_coordinator.py:3830-3852`); ETH: the transaction targets *this swap's* contract instance
-   and emits `Claimed(p)` from it (`eth_leg.py:334-340`). Without this, a claim transaction from a
+   and emits `Claimed(p)` from it (`eth_leg.py:358-364`). Without this, a claim transaction from a
    different swap that happens to share `H` would be accepted.
 
 ## The `terms` object

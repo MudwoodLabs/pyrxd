@@ -50,7 +50,7 @@ it refuses to write a file whose keys look like a secret (`preimage`, `wif`, `se
 | 1 | `taker_intro.json` | taker → maker | the taker's RXD pubkey-hash + ETH addresses |
 | 2 | `envelope.json` | maker → taker | the `NegotiatedTerms` (hashlock **H** only), the maker's public ETH/RXD payout config, and the funded covenant SPK |
 | 3 | `taker_funding.json` | taker → maker | the funded ETH HTLC locator (`EthHtlcLocator` — carries H, never p) |
-| 4 | `maker_claim.json` | maker → taker | the maker's ETH claim **tx hash** (the taker scrapes `p` from that tx **on-chain**, never from this file) |
+| 4 | `maker_claim.json` | maker → taker | the maker's ETH claim **tx hash** (the taker scrapes `p` from that tx **on-chain**, never from this file). Optional: without it, `--phase claim` finds the claim in the HTLC contract's logs |
 
 ## The envelope (`envelope.json`)
 
@@ -237,6 +237,9 @@ On ETH, taker `refund` refunds the ETH HTLC **only** and leaves the record at `b
 (#850). The covenant's refund pays the maker and is the maker's to send: if the maker claimed
 the ETH before its timeout, the taker can still claim the covenant with the revealed `p`
 (`--phase claim`), and a covenant refund sent from the taker's side would take that away.
+When the ETH refund fails, the phase reads the contract to say why: a verified maker claim
+(it names the claim tx and `--phase claim`), or a contract that was already refunded (nothing
+more to do on the ETH side). Any other failure is shown as it came.
 
 `scripts/btc_swap_two_host.py` has the same four phases, with the BTC HTLC's CSV (`t_btc`) in
 place of the ETH timeout — but its taker `refund` is **unchanged for now**: it still refunds

@@ -133,9 +133,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   On a `SwapRole.TAKER` coordinator with an ETH or ERC-20 counter leg, `mutual_refund` now
   refunds the counter leg only, leaves the covenant for the maker to refund, and leaves the
   record at `BOTH_LOCKED`, from where `taker_observed_reveal` can still follow a maker claim.
-  Maker-role and role-less coordinators are unchanged. `scripts/eth_swap_two_host.py --role taker
-  --phase refund` now refunds only the ETH HTLC, cannot spend the covenant, and no longer needs
-  `--fee-*`; the watchtower's ETH refund page says that it repeats after the refund has run.
+  Maker-role and role-less coordinators are unchanged. When that refund fails, the coordinator
+  reads the contract to say why: `CounterLegClaimedByCounterparty` for a maker claim it has
+  verified (it names the claim tx and the claim step), `CounterLegAlreadySettled` for a contract
+  already refunded, otherwise the original error. Before, both cases surfaced as the same
+  preflight revert. `scripts/eth_swap_two_host.py --role taker --phase refund` now refunds only
+  the ETH HTLC, cannot spend the covenant, and no longer needs `--fee-*`; `--phase claim` finds
+  the maker's claim in the contract's logs when `maker_claim.json` is absent. The watchtower's
+  ETH refund page says the situation does not clear after the taker's refund has run.
   **The BTC counter leg is unchanged in this release and has the same race** (its claim leaf has
   no timelock, so a maker can claim while the taker's refund is unconfirmed); fixing it first
   needs the watchtower to tell the taker's own refund from a maker claim. Found in review of #850.

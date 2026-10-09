@@ -322,26 +322,32 @@ _STEP_FROM_VULNERABLE = "taker_claim_asset_from_vulnerable"
 
 # The BOTH_LOCKED maker-stall page, per counter chain (#850). The two differ because mutual_refund
 # does: on an ETH counter leg a TAKER-role coordinator refunds only the taker's ETH HTLC and leaves
-# the record BOTH_LOCKED (the covenant refund pays the maker and is the maker's to send), so this
-# tower, which sees no Claimed event for a refund, keeps paging this after it has run. On a BTC
-# counter leg mutual_refund is unchanged in this release: it also sends the covenant refund, which
-# cannot be mined before t_rxd, and reaches the terminal MUTUAL_REFUND.
+# the record BOTH_LOCKED (the covenant refund pays the maker and is the maker's to send). The tower
+# sees no claim in a refund and the situation does not change, so this stays the decision on every
+# tick; DedupAlerter delivers a WARN once per situation, from in-memory state, so the operator sees
+# it again only after a tower restart. On a BTC counter leg mutual_refund is unchanged in this
+# release: it also sends the covenant refund, which cannot be mined before t_rxd, and reaches the
+# terminal MUTUAL_REFUND.
 #
 # Both replace a sentence that said the counter leg "cannot mature until t_btc > t_rxd". The
-# relation was inverted in #482: t_rxd > t_btc + margin, so the counter leg's timeout comes first.
+# relation was inverted in #482. The gates require t_rxd's refund to open no earlier than the
+# counter deadline plus the margin (``assert_timelock_margin`` on BTC, in wall clock; the
+# ``eth_rxd_timelock`` cross-clock gate on ETH, against ``eth_timeout_unix_s``).
 _BOTH_LOCKED_REFUND_COMMON = (
     "maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund. The deadline "
-    "shown is t_rxd, when the maker's CSV refund of the covenant opens; the counter leg's timeout "
-    "comes before it (t_rxd > t_btc + margin). "
+    "shown is t_rxd, when the maker's CSV refund of the covenant opens. "
 )
 _BOTH_LOCKED_REFUND_REASON_BTC = _BOTH_LOCKED_REFUND_COMMON + (
-    "On a BTC counter leg mutual_refund also broadcasts the covenant refund, so run it once BOTH timeouts have elapsed."
+    "The BTC refund opens first (the swap was gated so the covenant refund opens no earlier than the BTC refund plus the margin, in wall-clock time). On "
+    "a BTC counter leg mutual_refund also broadcasts the covenant refund, so run it once BOTH timeouts "
+    "have elapsed."
 )
 _BOTH_LOCKED_REFUND_REASON_ETH = _BOTH_LOCKED_REFUND_COMMON + (
-    "On an ETH counter leg a TAKER-role mutual_refund refunds only your ETH HTLC and leaves the record "
-    "BOTH_LOCKED (the covenant is the maker's to refund), so this page repeats after you have run it: "
-    "check the refund on-chain rather than re-running it. If the maker claimed the HTLC before its "
-    "timeout, the refund fails and the claim race pages instead."
+    "The ETH refund opens first (the swap was gated on the covenant refund opening no earlier than "
+    "eth_timeout_unix_s + margin). On an ETH counter leg a TAKER-role mutual_refund refunds only your "
+    "ETH HTLC and leaves the record BOTH_LOCKED (the covenant is the maker's to refund), so this "
+    "situation does not clear after you run it: check the refund on-chain rather than re-running it. "
+    "If the maker claimed the HTLC first, mutual_refund says so and names the claim step."
 )
 
 #: Coordinator steps, IN ORDER, that carry a record at this state to a claimed asset. A state

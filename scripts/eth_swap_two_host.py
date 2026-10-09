@@ -636,13 +636,17 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
 async def taker_phase_claim(args: argparse.Namespace) -> None:
     """TAKER step 3: the maker has claimed ETH on-chain (revealing p). Scrape p FROM THE CHAIN (via
     the maker's claim tx hash, exchanged in maker_claim.json — the hash is public; p is read off the
-    chain, never from a file) and claim the RXD covenant before its refund window opens."""
+    chain, never from a file) and claim the RXD covenant before its refund window opens. If
+    maker_claim.json is absent, the claim tx is found in this swap's HTLC contract logs instead."""
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
-    claim_doc = _read_public(io_dir, "maker_claim.json")
-    eth_claim_tx = claim_doc["eth_claim_tx_hash"]
+    claim_path = io_dir / "maker_claim.json"
+    # The maker publishes its claim tx hash here. When it has not (a maker that claimed and went
+    # quiet), the claim is found on the chain below, from this swap's own contract logs, and then
+    # verified like any reveal by taker_observed_reveal — the file is a convenience, not a trust input.
+    eth_claim_tx = _read_public(io_dir, "maker_claim.json")["eth_claim_tx_hash"] if claim_path.exists() else None
 
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -669,6 +673,15 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
     coord = _coordinator(args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
 
     try:
+        if eth_claim_tx is None:
+            eth_claim_tx = await eth_leg.observed_claim_tx(loc)
+            if eth_claim_tx is None:
+                raise SystemExit(
+                    f"no {claim_path} and no claim found in the logs of this swap's HTLC "
+                    f"{loc.contract_address} through this RPC: the maker has not claimed (or this RPC does "
+                    "not serve the contract's log history — check another before concluding that)."
+                )
+            print(f"  maker_claim.json absent; found claim tx {eth_claim_tx} on the HTLC contract's logs")
         # First-class observe-reveal (replaces the old fabricated-SECRET_REVEALED seam): verify the
         # maker's on-chain ETH claim genuinely reveals THIS swap's p — sha256(p)==H + the R6 provenance
         # gate, all read FROM CHAIN — and advance BOTH_LOCKED -> SECRET_REVEALED. A fabricated or
@@ -1095,16 +1108,30 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
             "mutual_refund: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
             auto_yes=args.yes,
         )
-        rec = await coord.mutual_refund()
+        from pyrxd.security.errors import CounterLegAlreadySettled, CounterLegClaimedByCounterparty
+
+        try:
+            rec = await coord.mutual_refund()
+        except CounterLegClaimedByCounterparty as exc:
+            # The maker claimed first, verified from the chain. The covenant is untouched and the
+            # taker's to claim with p: say exactly that, and name the phase that does it.
+            raise SystemExit(
+                f"{exc}\n  NEXT: python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ... "
+                f"(it reads the claim tx from maker_claim.json, or finds {exc.tx_hash} on the contract if that "
+                "file is absent)."
+            ) from None
+        except CounterLegAlreadySettled as exc:
+            # Not a failure of the taker's recovery: the ETH leg is already back with the refundee.
+            print(f"  -> {exc}")
+            return
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(
                 f"mutual_refund landed in {rec.state.value}; a TAKER-role ETH refund leaves the record both_locked"
             )
         print(
             "  -> ETH refund sent to the taker; the record stays both_locked because the covenant is "
-            "still the maker's to refund. Check the refund on-chain; the maker cannot claim the ETH "
-            "after its timeout. (Had the maker claimed it before, this refund would have failed — then "
-            "run --phase claim to claim the covenant with the revealed p.)"
+            "still the maker's to refund. Check the refund on-chain; once it has landed the maker can no "
+            "longer claim the ETH (the contract refuses a claim at or after its timeout)."
         )
     finally:
         await rpc.close()
