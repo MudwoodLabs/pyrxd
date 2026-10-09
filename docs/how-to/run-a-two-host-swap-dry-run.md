@@ -237,9 +237,12 @@ On ETH, taker `refund` refunds the ETH HTLC **only** and leaves the record at `b
 (#850). The covenant's refund pays the maker and is the maker's to send: if the maker claimed
 the ETH before its timeout, the taker can still claim the covenant with the revealed `p`
 (`--phase claim`), and a covenant refund sent from the taker's side would take that away.
-When the ETH refund fails, the phase reads the contract to say why: a verified maker claim
-(it names the claim tx and `--phase claim`), or a contract that was already refunded (nothing
-more to do on the ETH side). Any other failure is shown as it came.
+When the ETH refund fails, the phase reads the contract to say why. For a verified maker claim,
+it names the claim tx and `--phase claim`. For a settled contract with no verified claim, it
+exits non-zero and does **not** conclude "refunded": an honest node always shows a claim or a
+refund event, and the logs come from one RPC, so check the contract's events elsewhere, and if
+there is a claim, put its tx hash in `maker_claim.json` and run `--phase claim` before `t_rxd`.
+Any other failure is shown as it came.
 
 `scripts/btc_swap_two_host.py` has the same four phases, with the BTC HTLC's CSV (`t_btc`) in
 place of the ETH timeout — but its taker `refund` is **unchanged for now**: it still refunds

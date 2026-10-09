@@ -32,8 +32,8 @@ __all__ = [
     "ClaimNotConfirmed",
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
-    "CounterLegAlreadySettled",
     "CounterLegClaimedByCounterparty",
+    "CounterLegSettledUnverified",
     "CovenantError",
     "DmintError",
     "FeePoolExhaustedError",
@@ -386,14 +386,19 @@ class CounterLegClaimedByCounterparty(ValidationError):
         self.contract_address = contract_address
 
 
-class CounterLegAlreadySettled(ValidationError):
-    """A taker's counter-leg refund failed because the HTLC is already settled and no claim was found.
+class CounterLegSettledUnverified(ValidationError):
+    """A taker's counter-leg refund failed: the HTLC is already settled, and no claim was VERIFIED.
 
-    The contract's ``settled`` flag is set and the contract's logs, as read through the configured
-    RPC, carry no claim, so it was refunded, by an earlier run or by anyone (``refund()`` pays the
-    immutable refundee whoever sends it). Nothing more is needed on that leg. Not proof against an
-    RPC that withholds logs: the message says to check a second source if the covenant is still
-    claimable and that matters. ``contract_address`` names the contract to check.
+    This is NOT "refunded". The contract's ``settled`` flag says someone claimed or refunded it, and
+    both emit an event, so an honest log source always shows one of them. Seeing no verified claim
+    therefore means either a refund or a log source that is incomplete or not telling the truth (a
+    pruned node, a log-range limit, withheld or forged logs) — and the logs are read from ONE
+    endpoint. The two call for opposite actions, and if the maker did claim, the taker must claim
+    the covenant with ``p`` before ``t_rxd``. So this never concludes anything: it tells the operator
+    to check the contract's events on another source. ``contract_address`` names the contract.
+
+    Proving "refunded" without trusting logs (settled before the timeout ⇒ claimed) is #850's
+    disposition reader, not this exception.
     """
 
     def __init__(self, message: str, *, contract_address: str | None = None) -> None:

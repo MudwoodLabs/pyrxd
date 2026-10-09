@@ -42,8 +42,8 @@ from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, Swap
 from pyrxd.gravity.swap_state import SwapRole, SwapState
 from pyrxd.gravity.watch import Intent, Observations, decide
 from pyrxd.security.errors import (
-    CounterLegAlreadySettled,
     CounterLegClaimedByCounterparty,
+    CounterLegSettledUnverified,
     NetworkError,
     ValidationError,
 )
@@ -214,38 +214,33 @@ async def test_the_race_past_t_rxd_goes_through_asset_vulnerable_to_completed(tm
     assert sink.load_record().state is SwapState.COMPLETED
 
 
-async def test_a_failed_refund_on_an_already_refunded_contract_says_so(tmp_path):
-    """(b): settled, and no claim in the logs — it was refunded (by an earlier run, or anyone).
-    Nothing more is needed on ETH; the error says that rather than a bare revert."""
-    secret, h = generate_secret()
-    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
-    eth, rxd = _ChainEthLeg(settled=True, preimage=secret, verdict=_final()), FakeRadiantLeg()
-    coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
-    with pytest.raises(CounterLegAlreadySettled, match="REFUNDED") as raised:
-        await coord.mutual_refund()
-    assert isinstance(raised.value.__cause__, ValidationError)  # the original preflight error is chained
-    assert "refund_asset" not in rxd.calls
-    assert sink.load_record().state is SwapState.BOTH_LOCKED
+def _assert_settled_unverified_never_says_refunded(exc: CounterLegSettledUnverified, contract: str) -> None:
+    """The (b) message must not conclude "refunded" / "nothing more is needed" — that conclusion is
+    what made the taker stop while the maker kept both legs (#851 re-review probe)."""
+    msg = str(exc)
+    assert "ALREADY SETTLED" in msg and "NO VERIFIED CLAIM" in msg, msg
+    assert "does not mean it was refunded" in msg, msg
+    assert "it was REFUNDED" not in msg and "Nothing more is needed on the ETH side" not in msg, msg
+    assert contract in msg and "t_rxd" in msg and "maker_claim.json" in msg and "--phase claim" in msg, msg
+    assert exc.contract_address == contract
 
 
 @pytest.mark.parametrize(
     "case",
-    ["not_yet_expired", "claim_does_not_verify", "log_read_fails"],
+    ["no_claim_log", "claim_does_not_verify", "log_read_fails"],
 )
-async def test_any_other_failure_propagates_the_original_error(tmp_path, case):
-    """(c): nothing on chain explains it, or the explanation cannot be verified — the original
-    error, unchanged. A claim that fails provenance must never be reported as the maker's claim."""
+async def test_settled_without_a_verified_claim_is_never_concluded_refunded(tmp_path, case):
+    """(b): the contract is settled and no claim VERIFIES. Every one of these is also what a real
+    maker claim looks like through a log source that is incomplete or lying, so the error tells the
+    operator to check elsewhere and how to claim, and never says "refunded"."""
     secret, h = generate_secret()
     sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
-    if case == "not_yet_expired":
-        original = NetworkError("ETH HTLC refund is not yet mature: matures at unix 1, now 0")
-        eth = _ChainEthLeg(refund_error=original, preimage=secret, verdict=_final())
+    if case == "no_claim_log":
+        eth = _ChainEthLeg(settled=True, preimage=secret, verdict=_final())
     elif case == "claim_does_not_verify":
-        original = _preflight_revert()
-        eth = _ChainEthLeg(claimed=True, refund_error=original, preimage=secret, verdict=_final(), provenance_ok=False)
+        eth = _ChainEthLeg(claimed=True, preimage=secret, verdict=_final(), provenance_ok=False)
     else:
-        original = _preflight_revert()
-        eth = _ChainEthLeg(claimed=True, refund_error=original, preimage=secret, verdict=_final())
+        eth = _ChainEthLeg(claimed=True, preimage=secret, verdict=_final())
 
         async def _boom(locator):
             raise NetworkError("eth_getLogs: range too large")
@@ -253,10 +248,36 @@ async def test_any_other_failure_propagates_the_original_error(tmp_path, case):
         eth.observed_claim_tx = _boom
     rxd = FakeRadiantLeg()
     coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
+    with pytest.raises(CounterLegSettledUnverified) as raised:
+        await coord.mutual_refund()
+    assert not isinstance(raised.value, CounterLegClaimedByCounterparty)
+    assert isinstance(raised.value.__cause__, ValidationError)  # the original preflight error is chained
+    _assert_settled_unverified_never_says_refunded(raised.value, coord.record.counterchain_locator.contract_address)
+    assert "refund_asset" not in rxd.calls
+    assert sink.load_record().state is SwapState.BOTH_LOCKED
+
+
+@pytest.mark.parametrize("case", ["not_yet_expired", "settled_flag_unreadable"])
+async def test_any_other_failure_propagates_the_original_error(tmp_path, case):
+    """(c): not settled, or the settled flag cannot be read — the original error, unchanged."""
+    secret, h = generate_secret()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    if case == "not_yet_expired":
+        original = NetworkError("ETH HTLC refund is not yet mature: matures at unix 1, now 0")
+        eth = _ChainEthLeg(refund_error=original, preimage=secret, verdict=_final())
+    else:
+        original = _preflight_revert()
+        eth = _ChainEthLeg(refund_error=original, preimage=secret, verdict=_final())
+
+        async def _boom(locator):
+            raise NetworkError("eth_getStorageAt failed")
+
+        eth.is_settled = _boom
+    rxd = FakeRadiantLeg()
+    coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=SwapRole.TAKER)
     with pytest.raises(type(original)) as raised:
         await coord.mutual_refund()
     assert raised.value is original
-    assert not isinstance(raised.value, (CounterLegClaimedByCounterparty, CounterLegAlreadySettled))
     assert "refund_asset" not in rxd.calls
     assert sink.load_record().state is SwapState.BOTH_LOCKED
 
@@ -279,9 +300,19 @@ class _ChainRpc:
 
     ``claim_p`` set → the contract was claimed with it (a ``Claimed(p)`` log, a claim tx whose
     calldata carries p, settled). ``claim_p`` None and ``refunded`` → only ``Refunded()``, settled.
+    ``serve_logs`` overrides what the (single) endpoint's ``eth_getLogs`` returns, to model one that
+    withholds the claim (``[]``) or forges a refund, while storage still says what the chain says.
     """
 
-    def __init__(self, *, contract: str, deploy_tx: str, claim_p: bytes | None, refunded: bool = False):
+    def __init__(
+        self,
+        *,
+        contract: str,
+        deploy_tx: str,
+        claim_p: bytes | None,
+        refunded: bool = False,
+        serve_logs: list | None = None,
+    ):
         from types import SimpleNamespace
 
         from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
@@ -304,6 +335,8 @@ class _ChainRpc:
         else:
             self._logs = []
         settled = claim_p is not None or refunded
+        if serve_logs is not None:
+            self._logs = serve_logs
 
         async def _get_storage_at(addr, slot, block_identifier=None):
             return (b"\x00" * 31 + b"\x01") if settled else b"\x00" * 32
@@ -363,14 +396,38 @@ async def test_the_shipped_eth_leg_turns_a_maker_claim_into_the_claim_error(tmp_
     assert "refund_asset" not in rxd.calls
 
 
-async def test_the_shipped_eth_leg_turns_an_earlier_refund_into_the_settled_error(tmp_path):
+def _forged_refunded_log(contract: str) -> dict:
+    from pyrxd.eth_wallet.events import REFUNDED_TOPIC0
+
+    return {"address": contract, "topics": [REFUNDED_TOPIC0], "data": "0x", "transactionHash": "0x" + "77" * 32}
+
+
+@pytest.mark.parametrize("served", ["withheld", "forged_refunded", "honest_refund"])
+async def test_the_shipped_eth_leg_never_concludes_refunded_from_one_endpoints_logs(tmp_path, served):
+    """The #851 re-review probe, as a regression test. A REAL maker claim (settled on chain), seen
+    through one endpoint that withholds the claim log or serves a forged ``Refunded()`` — and, for
+    contrast, a contract genuinely refunded. From one endpoint's logs the three are the same
+    answer, so all three raise CounterLegSettledUnverified; none may conclude "refunded"."""
     secret, h = generate_secret()
     sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
     loc = sink.load_record().counterchain_locator
-    rpc = _ChainRpc(contract=loc.contract_address, deploy_tx=loc.deploy_tx_hash, claim_p=None, refunded=True)
-    coord = _eth_reloaded(sink, eth_leg=_real_eth_leg(rpc), radiant_leg=FakeRadiantLeg(), role=SwapRole.TAKER)
-    with pytest.raises(CounterLegAlreadySettled):
+    if served == "honest_refund":
+        rpc = _ChainRpc(contract=loc.contract_address, deploy_tx=loc.deploy_tx_hash, claim_p=None, refunded=True)
+    else:
+        logs = [] if served == "withheld" else [_forged_refunded_log(loc.contract_address)]
+        rpc = _ChainRpc(
+            contract=loc.contract_address,
+            deploy_tx=loc.deploy_tx_hash,
+            claim_p=secret.unsafe_raw_bytes(),
+            serve_logs=logs,
+        )
+    rxd = FakeRadiantLeg()
+    coord = _eth_reloaded(sink, eth_leg=_real_eth_leg(rpc), radiant_leg=rxd, role=SwapRole.TAKER)
+    with pytest.raises(CounterLegSettledUnverified) as raised:
         await coord.mutual_refund()
+    _assert_settled_unverified_never_says_refunded(raised.value, loc.contract_address)
+    assert "refund_asset" not in rxd.calls
+    assert sink.load_record().state is SwapState.BOTH_LOCKED
 
 
 async def test_the_shipped_eth_leg_leaves_an_unexplained_failure_alone(tmp_path):
@@ -381,7 +438,7 @@ async def test_the_shipped_eth_leg_leaves_an_unexplained_failure_alone(tmp_path)
     coord = _eth_reloaded(sink, eth_leg=_real_eth_leg(rpc), radiant_leg=FakeRadiantLeg(), role=SwapRole.TAKER)
     with pytest.raises(ValidationError, match="tx would revert") as raised:
         await coord.mutual_refund()
-    assert not isinstance(raised.value, (CounterLegClaimedByCounterparty, CounterLegAlreadySettled))
+    assert not isinstance(raised.value, (CounterLegClaimedByCounterparty, CounterLegSettledUnverified))
 
 
 # ---------------------------------------------------------------------------

@@ -134,9 +134,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refunds the counter leg only, leaves the covenant for the maker to refund, and leaves the
   record at `BOTH_LOCKED`, from where `taker_observed_reveal` can still follow a maker claim.
   Maker-role and role-less coordinators are unchanged. When that refund fails, the coordinator
-  reads the contract to say why: `CounterLegClaimedByCounterparty` for a maker claim it has
-  verified (it names the claim tx and the claim step), `CounterLegAlreadySettled` for a contract
-  already refunded, otherwise the original error. Before, both cases surfaced as the same
+  reads the contract: `CounterLegClaimedByCounterparty` for a maker claim it has verified (it
+  names the claim tx and the claim step); `CounterLegSettledUnverified` when the contract is
+  settled but no claim verifies, which it does not read as "refunded" because the logs come from
+  one endpoint that may be incomplete, and which tells the operator to check the contract's events
+  elsewhere before `t_rxd`; otherwise the original error. Before, every case surfaced as the same
   preflight revert. `scripts/eth_swap_two_host.py --role taker --phase refund` now refunds only
   the ETH HTLC, cannot spend the covenant, and no longer needs `--fee-*`; `--phase claim` finds
   the maker's claim in the contract's logs when `maker_claim.json` is absent. The watchtower's

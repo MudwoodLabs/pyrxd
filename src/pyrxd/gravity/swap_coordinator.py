@@ -4244,16 +4244,23 @@ class SwapCoordinator:
         (a) a claim tx in the contract's logs that VERIFIES (``p`` scraped with ``sha256 == H``, and
             the provenance gate: a successful tx emitting ``p`` from this swap's contract) →
             :class:`CounterLegClaimedByCounterparty`, naming the claim tx and the next step;
-        (b) no claim in the logs and the contract's ``settled`` flag set → it was refunded, by an
-            earlier run or anyone → :class:`CounterLegAlreadySettled`;
-        (c) anything else, including a read that fails or a log that does not verify → returns,
-            and the caller re-raises the original error.
+        (b) the contract's ``settled`` flag set and NO verified claim →
+            :class:`CounterLegSettledUnverified`. Deliberately not "refunded": a claim and a refund
+            both emit an event, so an honest log source always shows one, and "no verified claim"
+            can equally be a log source that is incomplete or lying (read from ONE endpoint). It
+            tells the operator to check the contract's events elsewhere before ``t_rxd``;
+        (c) anything else (not settled, or the settled flag cannot be read) → returns, and the
+            caller re-raises the original error.
+
+        A claim log that does NOT verify, or a log read that fails, falls through to (b) when the
+        contract is settled: neither may be reported as the maker's claim, and neither is evidence
+        of a refund.
 
         Read-only. Needs the leg's optional ``observed_claim_tx`` / ``is_settled`` (the shipped
         :class:`pyrxd.gravity.eth_leg.EthLeg` has both); a leg without them gets (c).
         """
         # Local import: keeps this module's import block (and the doc citations into it) unchanged.
-        from pyrxd.security.errors import CounterLegAlreadySettled, CounterLegClaimedByCounterparty
+        from pyrxd.security.errors import CounterLegClaimedByCounterparty, CounterLegSettledUnverified
 
         find_claim = getattr(self.counter_leg, "observed_claim_tx", None)
         is_settled = getattr(self.counter_leg, "is_settled", None)
@@ -4263,8 +4270,9 @@ class SwapCoordinator:
         try:
             claim_tx = await find_claim(locator)
         except Exception as exc:
+            # No verified claim — which, on a settled contract, is exactly case (b), not (c).
             logger.warning("could not read the ETH HTLC %s's logs to explain a failed refund: %s", contract, exc)
-            return
+            claim_tx = None
         if claim_tx is not None:
             hashlock = self.record.terms.hashlock
             try:
@@ -4280,7 +4288,8 @@ class SwapCoordinator:
                     claim_tx,
                     exc,
                 )
-                return
+                claim_tx = None
+        if claim_tx is not None:
             raise CounterLegClaimedByCounterparty(
                 f"the ETH refund failed because the MAKER CLAIMED the HTLC {contract} in tx {claim_tx}, "
                 "revealing p (verified: sha256(p) == H, and the claim emits p from this swap's contract). "
@@ -4301,13 +4310,19 @@ class SwapCoordinator:
             )
             return
         if settled:
-            raise CounterLegAlreadySettled(
-                f"the ETH refund failed because the HTLC {contract} is already settled, and its logs (as "
-                "this RPC serves them) carry no claim: it was REFUNDED, by an earlier run or by anyone — "
-                "refund() pays the immutable refundee whoever sends it. Nothing more is needed on the ETH "
-                "side, and the covenant is the maker's to refund. An RPC that does not serve the contract's "
-                "log history would look the same; if the covenant is still unspent and that matters, check "
-                "the contract on a second RPC or an explorer before t_rxd.",
+            t_rxd = self.record.terms.t_rxd
+            raise CounterLegSettledUnverified(
+                f"the ETH refund failed: the HTLC {contract} is ALREADY SETTLED (claimed or refunded), and "
+                "this endpoint showed NO VERIFIED CLAIM. That does not mean it was refunded: a claim and a "
+                "refund both emit an event, so an honest node always shows one of them, and the logs here "
+                "come from one endpoint that may be incomplete (pruned, range-limited) or not telling the "
+                f"truth. CHECK the events of {contract} on another RPC or a block explorer NOW. If the maker "
+                "CLAIMED it, p is public and the RXD covenant "
+                f"{self.record.radiant_covenant_outpoint} is yours to claim before its CSV refund to the "
+                f"maker opens, t_rxd = {t_rxd.value} {t_rxd.unit.value} after the covenant was mined: run "
+                "taker_observed_reveal(<claim tx hash>) then taker_scrape_and_claim_asset (two-host runner: "
+                'put {"eth_claim_tx_hash": "<claim tx hash>"} in maker_claim.json and run --phase claim). '
+                "If it shows only a refund to your address, nothing more is needed on the ETH side.",
                 contract_address=contract,
             ) from refund_error
 
@@ -4333,8 +4348,9 @@ class SwapCoordinator:
         unreachable. When the counter refund fails nothing else is broadcast, and the failure is
         explained from the chain (:meth:`_explain_failed_taker_eth_refund`):
         :class:`~pyrxd.security.errors.CounterLegClaimedByCounterparty` if the maker's claim is
-        found and verifies (claim the covenant next), :class:`~pyrxd.security.errors.CounterLegAlreadySettled`
-        if the contract was already refunded (nothing more to do on ETH), else the original error.
+        found and verifies (claim the covenant next), :class:`~pyrxd.security.errors.CounterLegSettledUnverified`
+        if the contract is settled with no verified claim (check its events elsewhere; never read as
+        "refunded"), else the original error.
         ``EthHtlc``/``Erc20Htlc`` refuse a claim at or after the timeout, so once the refund has
         landed the maker can no longer claim.
 

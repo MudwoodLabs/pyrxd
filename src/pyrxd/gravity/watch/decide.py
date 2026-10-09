@@ -347,7 +347,9 @@ _BOTH_LOCKED_REFUND_REASON_ETH = _BOTH_LOCKED_REFUND_COMMON + (
     "eth_timeout_unix_s + margin). On an ETH counter leg a TAKER-role mutual_refund refunds only your "
     "ETH HTLC and leaves the record BOTH_LOCKED (the covenant is the maker's to refund), so this "
     "situation does not clear after you run it: check the refund on-chain rather than re-running it. "
-    "If the maker claimed the HTLC first, mutual_refund says so and names the claim step."
+    "If the refund fails, mutual_refund names a maker claim only when it can verify one from the "
+    "contract's logs, which it reads from one endpoint; if it reports the contract settled with no "
+    "verified claim, check the contract's events on another source before the covenant's CSV refund opens."
 )
 
 #: Coordinator steps, IN ORDER, that carry a record at this state to a claimed asset. A state

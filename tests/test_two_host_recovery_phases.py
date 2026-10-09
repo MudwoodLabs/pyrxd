@@ -814,12 +814,27 @@ class TestTakerEthRefundSaysWhatHappenedWhenItFails:
         assert leg.provenance_checked == ["0x" + "55" * 32], "the claim was not verified before being reported"
         assert built["rxd"].refund_calls == []
 
-    async def test_already_refunded_is_reported_as_done_not_as_a_failure(self, eth_mod, tmp_path, monkeypatch, capsys):
+    async def test_a_real_claim_hidden_by_the_logs_exits_non_zero_and_never_says_done(
+        self, eth_mod, tmp_path, monkeypatch, capsys
+    ):
+        """The #851 re-review probe through the runner: the maker really claimed (settled), but the
+        one endpoint withholds the claim log or forges a Refunded(). The phase used to print "done"
+        and exit 0 right after confirming the covenant was unspent; the taker stopped and the maker
+        kept both legs. It must exit non-zero with the check and the claim steps."""
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        # The leg's log scan finds no claim (withheld; a forged Refunded() reads the same through the
+        # real scan — that half is tested through the shipped EthLeg in
+        # test_taker_mutual_refund_leaves_covenant.py) while storage says settled.
         leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True)
         built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
-        await eth_mod.taker_phase_refund(args)
-        assert "REFUNDED" in capsys.readouterr().out
+        with pytest.raises(SystemExit) as raised:
+            await eth_mod.taker_phase_refund(args)
+        assert raised.value.code not in (None, 0), "the phase exited 0: the operator would stop here"
+        msg = str(raised.value.code)
+        assert "ALREADY SETTLED" in msg and "does not mean it was refunded" in msg, msg
+        assert "maker_claim.json" in msg and "--phase claim" in msg and "t_rxd" in msg, msg
+        assert "0x" + "33" * 20 in msg  # the contract to check
+        assert "done" not in capsys.readouterr().out.lower()
         assert built["rxd"].refund_calls == []
 
     async def test_claim_phase_finds_the_claim_on_the_contract_without_maker_claim_json(
@@ -848,8 +863,10 @@ class TestTakerEthRefundSaysWhatHappenedWhenItFails:
     ):
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
         _wire_eth_claimed(eth_mod, monkeypatch, _ClaimedEthCounterLeg(None, claim_tx=None, settled=False))
-        with pytest.raises(SystemExit, match="no claim found in the logs"):
+        with pytest.raises(SystemExit, match="no claim found in the logs") as raised:
             await eth_mod.taker_phase_claim(_with_fee(args))
+        msg = str(raised.value.code)
+        assert "NOT proof" in msg and "t_rxd = 120" in msg and "eth_claim_tx_hash" in msg, msg
 
 
 class TestTakerRefundOnBtcIsStillTheMutualUnwind:

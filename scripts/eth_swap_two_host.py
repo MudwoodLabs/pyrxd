@@ -678,8 +678,12 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
             if eth_claim_tx is None:
                 raise SystemExit(
                     f"no {claim_path} and no claim found in the logs of this swap's HTLC "
-                    f"{loc.contract_address} through this RPC: the maker has not claimed (or this RPC does "
-                    "not serve the contract's log history — check another before concluding that)."
+                    f"{loc.contract_address} through this RPC. That is NOT proof the maker has not claimed: "
+                    "this RPC may not serve the contract's log history. Check its events on another RPC or an "
+                    "explorer; if there is a Claimed event, write its tx hash into "
+                    f'{claim_path} as {{"eth_claim_tx_hash": "0x…"}} and re-run this phase. It must run '
+                    f"before the covenant's CSV refund to the maker opens, t_rxd = {terms.t_rxd.value} "
+                    f"{terms.t_rxd.unit.value} after the covenant was mined."
                 )
             print(f"  maker_claim.json absent; found claim tx {eth_claim_tx} on the HTLC contract's logs")
         # First-class observe-reveal (replaces the old fabricated-SECRET_REVEALED seam): verify the
@@ -1108,7 +1112,7 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
             "mutual_refund: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
             auto_yes=args.yes,
         )
-        from pyrxd.security.errors import CounterLegAlreadySettled, CounterLegClaimedByCounterparty
+        from pyrxd.security.errors import CounterLegClaimedByCounterparty, CounterLegSettledUnverified
 
         try:
             rec = await coord.mutual_refund()
@@ -1120,10 +1124,15 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
                 f"(it reads the claim tx from maker_claim.json, or finds {exc.tx_hash} on the contract if that "
                 "file is absent)."
             ) from None
-        except CounterLegAlreadySettled as exc:
-            # Not a failure of the taker's recovery: the ETH leg is already back with the refundee.
-            print(f"  -> {exc}")
-            return
+        except CounterLegSettledUnverified as exc:
+            # NEVER "done": settled with no verified claim is also what a withheld or forged log
+            # looks like after a real maker claim. Exit non-zero with the check and the next steps.
+            raise SystemExit(
+                f"{exc}\n  NEXT: check the events of {exc.contract_address} on another RPC or an explorer. If "
+                f"there is a Claimed event, write its tx hash into {args.io}/maker_claim.json as "
+                '{"eth_claim_tx_hash": "0x…"} and run: python scripts/eth_swap_two_host.py --role taker '
+                f"--phase claim --io {args.io} ... (before t_rxd)."
+            ) from None
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(
                 f"mutual_refund landed in {rec.state.value}; a TAKER-role ETH refund leaves the record both_locked"
