@@ -487,10 +487,12 @@ def prior_fund_record(sink: Any, *, terms: Any) -> Any:
             "Settle that swap, or use a different --local-out for this one."
         )
     if prior.state is not SwapState.NEGOTIATED:
+        refusal = f" The record also says the fund was refused: {prior.fund_refusal}." if prior.fund_refusal else ""
         raise SystemExit(
             f"REFUSING taker --phase fund: the swap record at {path} says this swap's counter leg is already "
-            f"funded (state {prior.state.value}). Nothing was sent. Hand taker_funding.json to the maker if you "
-            "have not, then continue with --phase claim, or --phase abort to recover your leg."
+            f"on chain (state {prior.state.value}).{refusal} Nothing was sent. A second fund would lock a second "
+            "counter leg under the same hashlock. Continue from the record: --phase claim once the maker has "
+            "claimed, or --phase abort to recover your leg after its timeout."
         )
     return prior
 

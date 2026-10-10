@@ -1562,7 +1562,7 @@ class TestARerunFundNeverOverwritesTheRecord:
         await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.BTC_LOCKED, pending=False))
         before = _record_path(args).read_bytes()
         built = _wire_eth(mod, monkeypatch) if eth else _wire_btc(mod, monkeypatch)
-        with pytest.raises(SystemExit, match="already funded"):
+        with pytest.raises(SystemExit, match="already on chain"):
             await mod.taker_phase_fund(_with_fee(args))
         assert _record_path(args).read_bytes() == before
         assert built == {}
