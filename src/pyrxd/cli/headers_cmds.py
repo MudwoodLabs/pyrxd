@@ -36,7 +36,7 @@ from typing import Any
 
 import click
 
-from ..glyph import header_cache as _hc
+from ..glyph import mark_block as _mb
 from ..glyph.header_cache import (
     ADVICE_RERUN,
     ADVICE_RESET,
@@ -259,7 +259,7 @@ async def sync_headers(
         if old is not None and chain.top <= old.top:
             report["advice"] = "upgrade"
             report["stopped"] += (
-                f" A reset holds headers to 1/{_hc.FLOOR_WORK_DIVISOR} of the shipped checkpoint's work, which this "
+                f" A reset holds headers to 1/{_mb.FLOOR_WORK_DIVISOR} of the shipped checkpoint's work, which this "
                 f"header does not meet, so only a newer pyrxd release can get past it. The existing cache (blocks "
                 f"{old.base_height}..{old.top}) was kept unchanged."
             )
@@ -273,7 +273,7 @@ async def sync_headers(
         # that cache is on disk (below); a save that fails withdraws it.
         advice, next_floor = floor_stop_advice(chain, report["stopped_work"])
         report["advice"], report["next_floor_work"] = advice, next_floor
-        d = _hc.FLOOR_WORK_DIVISOR
+        d = _mb.FLOOR_WORK_DIVISOR
         if advice == ADVICE_RERUN:
             advice_text = (
                 f" Re-run `pyrxd headers sync`: the headers this sync added move the floor to {next_floor}, "

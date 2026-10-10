@@ -13,11 +13,13 @@ alone is faked, so every reply crosses the client's own parsing. Sync's operator
 :func:`pyrxd.cli.headers_cmds.operator_sources`; how that function groups configured endpoints
 into operators is tested on its own, against a real config.
 
-THE FLOOR TESTS NEED A DIVISOR OF 1. Real Radiant headers 17 blocks apart differ in work by a few
+THE FLOOR TESTS NEED A SMALL DIVISOR. Real Radiant headers 17 blocks apart differ in work by a few
 percent, never 16x, so the default ``FLOOR_WORK_DIVISOR`` cannot separate "the floor rests on the
 shipped checkpoint" from "the floor rests on the cached anchor" with real data. Those tests set the
-divisor to 1 for the verifier only, which leaves the rule under test (WHICH work the floor is taken
-from) unchanged and makes the two answers differ on real headers.
+divisor to 1 (or an exact Fraction just above 1), which leaves the rule under test (WHICH work the
+floor is taken from) unchanged and makes the two answers differ on real headers. There is ONE
+divisor, ``mark_block.FLOOR_WORK_DIVISOR``, which the cache reads at call time too, so a test sets
+it for the cache and the verifier alike, as production has it.
 """
 
 from __future__ import annotations
@@ -112,8 +114,19 @@ def test_the_fixture_is_what_these_tests_lean_on() -> None:
     work = {h: radiant_header_work(HEADERS[h]) for h in HEADERS}
     assert max(work, key=work.get) == 460566
     assert work[460575] < work[460576] < work[460566]
-    assert mark_block.FLOOR_WORK_DIVISOR is header_cache.FLOOR_WORK_DIVISOR == 16
+    assert mark_block.FLOOR_WORK_DIVISOR == 16
     assert type(mark_block.FLOOR_WORK_DIVISOR) is int, "an int: a float floor is inexact (see _floor_of)"
+
+
+def test_the_floor_divisor_has_one_source(monkeypatch) -> None:
+    """The cache and the verifier read ONE divisor, ``mark_block.FLOOR_WORK_DIVISOR``, at call time.
+    A copy imported by value let tests set the cache's to 1 while the verifier's stayed 16, a
+    combination production cannot have."""
+    assert not hasattr(header_cache, "FLOOR_WORK_DIVISOR"), "no second copy for a test to set apart"
+    w = radiant_header_work(HEADERS[START])
+    assert _chain(START, START).floor_work == w // 16
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
+    assert _chain(START, START).floor_work == w, "the cache's floor follows mark_block's divisor"
 
 
 # ── the pure core ───────────────────────────────────────────────────────────────────────────
@@ -485,7 +498,7 @@ def test_a_header_below_the_floor_ends_the_sync_and_keeps_what_is_under_it(monke
     """An honest difficulty drop is not a lie: the agreed headers below it are cached, and why it
     stopped is said. (Divisor 1: see the module docstring.) 460,575's work is the floor; 460,576
     and 460,577 carry more, 460,578 less."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, 460575)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
     assert r.exit_code == 6, r.output
@@ -511,7 +524,7 @@ def test_a_lie_in_the_second_request_writes_nothing(monkeypatch, tmp_path) -> No
 
 
 def test_a_floor_stop_in_the_second_request_keeps_the_first(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     monkeypatch.setattr(headers_cmds, "MAX_HEADERS_PER_REQUEST", 2)
     _patch_table(monkeypatch, 460575)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
@@ -862,7 +875,7 @@ def _sync2(monkeypatch, tmp_path, stop: int):
 def test_the_sync_floor_rises_with_the_cached_median(monkeypatch, tmp_path) -> None:
     w = {h: radiant_header_work(HEADERS2[h]) for h in range(CP2, CP2 + 4)}
     assert w[CP2] < w[CP2 + 3] < sorted([w[CP2], w[CP2 + 1], w[CP2 + 2]])[1], "the work pattern this test needs"
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, CP2)
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 2)
     assert r.exit_code == 0 and out["cached_to"] == CP2 + 2
@@ -896,7 +909,7 @@ def test_advice_rerun_when_the_added_headers_move_the_floor(monkeypatch, tmp_pat
     the header the first sync stopped at. Real headers 460,564..460,569 with a divisor of 1.0065, exact (a
     test-scale ratio; see the module docstring): the cache holds 460,564..460,566; a sync adds
     460,567 and stops at 460,568; the next floor (computed exactly, not as a power of two) admits it."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
     _patch_table(monkeypatch, START)
     ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
     r, out = _sync(monkeypatch, tmp_path, ops(START + 2))
@@ -914,7 +927,7 @@ def test_advice_rerun_when_the_added_headers_move_the_floor(monkeypatch, tmp_pat
 def test_advice_upgrade_when_nothing_this_release_can_use_admits_the_header(monkeypatch, tmp_path) -> None:
     """The upgrade branch. Divisor 1, checkpoint 460,566 (the most work of the stretch): 460,567 is
     below the checkpoint's own floor, so neither a re-run nor a reset can cache it."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, 460566)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
     assert r.exit_code == 6 and out["state"] == "stopped" and out["advice"] == "upgrade"
@@ -947,12 +960,12 @@ def test_a_stopped_reset_keeps_the_existing_cache(monkeypatch, tmp_path) -> None
     _patch_table(monkeypatch, 460566)
     _store(460566, TOP)
     before = header_store.store_path("mainnet").read_bytes()
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     r, out = _reset(monkeypatch, tmp_path, DEEP)
     assert r.exit_code == 6 and out["state"] == "stopped" and out["added"] == 0
     assert "was kept unchanged" in out["stopped"]
     assert header_store.store_path("mainnet").read_bytes() == before
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 16)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 16)
     assert _cached(460566).top == TOP  # type: ignore[union-attr]
 
 
@@ -1014,7 +1027,7 @@ def test_sync_records_accumulate_on_disk(tmp_path) -> None:
 def test_a_sync_does_not_raise_its_own_bar_one_header_per_request(monkeypatch, tmp_path) -> None:
     """The bar is fixed once per SYNC, not per request: with one header per request, recomputing it
     per request would take the median of 468,524..468,526 and refuse 468,527."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     monkeypatch.setattr(headers_cmds, "MAX_HEADERS_PER_REQUEST", 1)
     _patch_table(monkeypatch, CP2)
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 5)
@@ -1024,7 +1037,7 @@ def test_a_sync_does_not_raise_its_own_bar_one_header_per_request(monkeypatch, t
 def test_a_sync_does_not_raise_its_own_bar(monkeypatch, tmp_path) -> None:
     """Honest pair: the same headers in ONE sync are held to the bar set before it began (the
     checkpoint's, as nothing else was cached), so 468,527 is cached."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, CP2)
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 5)
     assert r.exit_code == 0 and out["cached_to"] == CP2 + 5 and out["stopped"] is None
@@ -1067,24 +1080,37 @@ def test_a_cache_built_against_another_table_is_a_programming_error() -> None:
 
 # ── THE FLOOR: never lowered by headers the cache supplied ──────────────────────────────────
 #
-# Checkpoint 460,566 carries the most work of the 17 headers; the cache holds 460,566..460,575.
-# The mark (460,572) with 6 confirmations needs 460,576 and 460,577 above the cached anchor
-# (460,575). Both carry MORE work than the anchor and LESS than the checkpoint. With divisor 1, a
-# floor resting on the checkpoint refuses them; one resting on the cached anchor alone would pass.
+# Checkpoint 460,566 carries the most work of the 17 headers; the cache holds 460,566..460,574.
+# The mark (460,572) with 6 confirmations needs 460,575..460,577 above the cached anchor (460,574).
+# ONE divisor, read by the cache and the verifier alike (a cache held to a looser divisor than the
+# verifier is a combination production cannot have): 1.033, exact. Every cached header meets the
+# checkpoint's floor under it, so the store is whole; 460,575 does not, though it meets the floor a
+# rule resting on the cached anchor ALONE would set.
+
+_ANCHOR_D = Fraction(1033, 1000)
 
 
 def test_a_cached_anchor_does_not_lower_the_floor(monkeypatch, tmp_path) -> None:
+    w = {h: radiant_header_work(HEADERS[h]) for h in range(460566, 460578)}
+    cp_floor, anchor_floor = int(w[460566] // _ANCHOR_D), int(w[460574] // _ANCHOR_D)
+    assert all(w[h] >= cp_floor for h in range(460567, 460575)), "the cache can hold 460,567..460,574"
+    assert anchor_floor <= w[460575] < cp_floor, "the anchor-only floor would admit 460,575; the rule's does not"
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", _ANCHOR_D)
     _patch_table(monkeypatch, 460566)
-    _store(460566, 460575)
-    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
+    _store(460566, 460574)
+    assert _cached(460566).top == 460574, "the store re-reads whole under the same divisor"  # type: ignore[union-attr]
     out = json.loads(_verify(monkeypatch, tmp_path).output)
     bv = out["mark_anchor"]["block_verification"]
-    assert bv["cached_anchor_height"] == 460575
+    assert bv["cached_anchor_height"] == 460574
     assert bv["state"] == "NOT VERIFIED", bv["claim"]
     assert dict(bv["steps"])["floor"] == "failed"
-    assert "the header at 460576 carries less work than the floor" in bv["reason"]
-    assert "the greater of checkpoint 460566's and cached header 460575's" in bv["reason"]
+    assert "the header at 460575 carries less work than the floor" in bv["reason"]
+    assert "the greater of checkpoint 460566's and cached header 460574's" in bv["reason"]
     assert out["mark_anchor"]["height_is_verified"] is False
+    # Honest pair: at the shipped divisor the same store verifies from the same cached anchor.
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 16)
+    bv = json.loads(_verify(monkeypatch, tmp_path).output)["mark_anchor"]["block_verification"]
+    assert bv["state"] == "VERIFIED" and bv["cached_anchor_height"] == 460574, bv["reason"]
 
 
 def test_the_same_cached_anchor_verifies_at_the_real_floor(monkeypatch, tmp_path) -> None:
@@ -1104,10 +1130,9 @@ def test_a_cached_anchor_with_more_work_raises_the_floor(monkeypatch, tmp_path) 
     divisor 1, a floor resting on the checkpoint alone would pass 468,527; this one refuses it."""
     w = {h: radiant_header_work(HEADERS2[h]) for h in (468524, 468525, 468526, 468527)}
     assert w[468524] < w[468527] < w[468525] < w[468526], "the work pattern this test needs"
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)  # one source: the cache's and the verifier's
     _patch_table(monkeypatch, 468524)
     _store(468524, 468525)
-    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     bv = json.loads(_verify(monkeypatch, tmp_path, conf=7, txid=TXID2).output)["mark_anchor"]["block_verification"]
     assert bv["cached_anchor_height"] == 468525
     assert bv["state"] == "NOT VERIFIED" and "the header at 468527 carries less work than the floor" in bv["reason"]
@@ -1143,10 +1168,9 @@ def test_a_server_cannot_switch_the_cache_off_to_get_a_lower_floor(monkeypatch, 
     """Regression (hostile review A1): a server that makes the cache disagree must not get the
     fallback's checkpoint-only floor where an honest server is held to the cached anchor's.
     Setup as in the test above: an honest server gets NOT VERIFIED (468,527 below the floor)."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)  # one source: the cache's and the verifier's
     _patch_table(monkeypatch, 468524)
     _store(468524, 468525)
-    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     honest = json.loads(_verify(monkeypatch, tmp_path, conf=7, txid=TXID2).output)["mark_anchor"]
     assert honest["block_verification"]["state"] == "NOT VERIFIED"
     server = _steering_server()
@@ -1169,7 +1193,7 @@ def test_a_float_divisor_is_refused() -> None:
     """``int(W // 16.0)`` is inexact on real work; the floor refuses a float divisor outright."""
     mp = pytest.MonkeyPatch()
     try:
-        mp.setattr(header_cache, "FLOOR_WORK_DIVISOR", 16.0)
+        mp.setattr(mark_block, "FLOOR_WORK_DIVISOR", 16.0)
         with pytest.raises(ValidationError, match="positive int"):
             header_cache.sync_floor(_chain(START, START))
     finally:
@@ -1183,7 +1207,7 @@ def test_following_the_advice_never_loops(monkeypatch, tmp_path) -> None:
     stops at 460,567 and advises `--reset`; the reset passes 460,567 and stops at 460,568, and is
     SAVED, because it agrees with the cache and extends it; its advice is then computed from that
     saved cache. Following every piece of advice ends, and no step repeats."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(1004, 1000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(1004, 1000))
     _patch_table(monkeypatch, START)
     ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
     _, out = _sync(monkeypatch, tmp_path, ops(START + 2))
@@ -1212,7 +1236,7 @@ def test_following_the_advice_never_loops(monkeypatch, tmp_path) -> None:
 def test_a_failed_save_withdraws_the_advice(monkeypatch, tmp_path) -> None:
     """A stopped sync that added headers but could not write them gives no advice: its premise
     (the cache it would have left) is not on disk."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
     _patch_table(monkeypatch, START)
     ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
     _sync(monkeypatch, tmp_path, ops(START + 2))
@@ -1282,7 +1306,7 @@ def test_a_stopped_reset_that_disagrees_and_reaches_past_the_top_replaces_the_st
     and a reset that stops at 460,571, past the store's top: it is written, though it disagrees,
     so the user is not left on the abandoned branch. Divisor 1.015 (exact), so the reset's floor
     (the checkpoint's alone) admits 460,570 and not 460,571."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(1015, 1000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(1015, 1000))
     _patch_table(monkeypatch, START)
     branch = _fork_branch()[:2]
     real = header_cache.verify_radiant_header_pow

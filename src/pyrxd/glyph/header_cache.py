@@ -85,7 +85,9 @@ from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work, verify_radiant_header_pow
 from pyrxd.spv.radiant_checkpoints import MIN_DEPTH_BELOW_TIP
 
-from .mark_block import FLOOR_WORK_DIVISOR
+# The floor divisor has ONE source, ``mark_block.FLOOR_WORK_DIVISOR``, read at call time (never
+# imported by value), so the cache and the verifier cannot hold different divisors.
+from . import mark_block as _mark_block
 
 __all__ = [
     "CACHE_MIN_DEPTH",
@@ -202,10 +204,10 @@ def _require_table(table: Sequence[tuple[int, str]]) -> tuple[tuple[int, str], .
 
 
 def _floor_of(work: int) -> int:
-    """``work // FLOOR_WORK_DIVISOR``, EXACTLY. The divisor ships as the int 16; a test may set an
-    exact :class:`~fractions.Fraction` to emulate a work ratio real headers cannot show. A float is
-    refused: ``int(W // 16.0)`` rounds real work (about 2**56) and can come out one too high."""
-    d = FLOOR_WORK_DIVISOR
+    """``work // mark_block.FLOOR_WORK_DIVISOR``, EXACTLY. The divisor ships as the int 16; a test
+    may set an exact :class:`~fractions.Fraction` to emulate a work ratio real headers cannot show. A
+    float is refused: ``int(W // 16.0)`` rounds real work (about 2**56) and can come out one too high."""
+    d = _mark_block.FLOOR_WORK_DIVISOR
     if isinstance(d, bool) or not isinstance(d, (int, Fraction)) or d <= 0:
         raise ValidationError(f"FLOOR_WORK_DIVISOR must be a positive int (or an exact Fraction), not {d!r}")
     return int(work // d)
@@ -244,8 +246,8 @@ def _walk(
             return (
                 hashes,
                 "floor",
-                f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of {floor_of}); "
-                f"its difficulty may be honest, but it is not cached",
+                f"the header at {h} carries less work than the floor (1/{_mark_block.FLOOR_WORK_DIVISOR} of "
+                f"{floor_of}); its difficulty may be honest, but it is not cached",
             )
         hashes.append(got)
         below = got
