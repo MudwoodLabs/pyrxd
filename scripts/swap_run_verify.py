@@ -686,7 +686,8 @@ def verify_counter_leg_eth(
                 [
                     *notes,
                     "eth deploy init code != canonical EthHtlc creation bytecode — NOT our audited HTLC "
-                    "(a look-alike could decode honest ctor args yet pay the taker)",
+                    "(a look-alike could decode honest ctor args yet pay the taker). A run deployed by "
+                    "pyrxd 0.26.1 or earlier used the previous contract build and does not match this pin",
                 ],
             )
         args = deploy_input[-128:]
