@@ -83,6 +83,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
+    MAKER_ABORT_CONFIRM,
     add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
@@ -90,6 +91,7 @@ from _dust_swap_shared import (
     elapsed_reserve_blocks,
     merge_with_persisted_record,
     refuse_by_persisted_state,
+    refuse_maker_abort_with_a_counter_leg,
     resolve_asset_locked_at_height,
     resolve_eth_key_file,
     wait_for_covenant_via_leg,
@@ -1348,7 +1350,9 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     primitive both coordinator refunds call and does not advance the FSM at all.
 
     Refuses once the taker HAS published a funded counter leg: that is the mutual unwind, and it
-    belongs in ``--phase refund`` where the coordinator's trigger and role guard apply.
+    belongs in ``--phase refund`` where the coordinator's trigger and role guard apply. Refuses as
+    well when this host's record holds a counter-leg locator (the taker did fund, whatever the
+    exchange directory holds now) or says this maker claimed the counter leg.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
@@ -1377,10 +1381,8 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     record = _merged_record(
         args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out, phase="abort"
     )
-    confirm(
-        "refund_asset: CSV-refund the RXD covenant to the maker (the taker never funded a counter leg)",
-        auto_yes=args.yes,
-    )
+    refuse_maker_abort_with_a_counter_leg(record, path=_record_sink(args.local_out).path)
+    confirm(MAKER_ABORT_CONFIRM, auto_yes=args.yes)
     # The leg's own P3 maturity self-check refuses before t_rxd with an exact "needs N, has M" a
     # block-based poller retries on, so there is nothing to pre-check here: this is the only
     # broadcast on this path, and a premature call cannot half-unwind anything.

@@ -231,8 +231,8 @@ _TAKER_P_PUBLIC = (
 )
 _MAKER_ABORT = (
     "allow",
-    "the phase refuses on its own whenever taker_funding.json is present; with no funded counter leg "
-    "the covenant is the maker's to recover",
+    "the phase refuses on its own whenever taker_funding.json is present or the merged record holds a "
+    "counter-leg locator; with no funded counter leg the covenant is the maker's to recover",
 )
 _MAKER_REFUND = (
     "allow",
@@ -350,8 +350,8 @@ PHASE_STATE_RULES: dict[tuple[str, str], dict[SwapState, tuple[str, str]]] = {
         NEGOTIATED=_MAKER_ABORT,
         BTC_LOCKED=_MAKER_ABORT,
         BOTH_LOCKED=_MAKER_ABORT,
-        SECRET_REVEALED=_MAKER_ABORT,
-        COMPLETED=_MAKER_ABORT,
+        SECRET_REVEALED=_MAKER_REVEALED,
+        COMPLETED=_MAKER_REVEALED,
         MUTUAL_REFUND=_MAKER_ABORT,
         PARAMS_MISMATCH=_MAKER_ABORT,
         MAKER_STALLS=_MAKER_ABORT,
@@ -433,6 +433,28 @@ def refuse_by_persisted_state(sink: Any, *, terms: Any, role: str, phase: str) -
     refusal = persisted_state_refusal(role, phase, persisted)
     if refusal is not None:
         raise SystemExit(f"REFUSING {role} --phase {phase}: {refusal}. Nothing was sent. (record: {path})")
+
+
+#: What the maker's ``--phase abort`` confirms before it sends the covenant refund. It states what
+#: the phase checked, not what it cannot know: the taker may have funded a leg this host never saw.
+MAKER_ABORT_CONFIRM = (
+    "refund_asset: CSV-refund the RXD covenant to the maker (no taker_funding.json here and no counter "
+    "leg in this host's record)"
+)
+
+
+def refuse_maker_abort_with_a_counter_leg(record: Any, *, path: Any) -> None:
+    """The maker's ``--phase abort`` is for a taker that never funded. A record holding a counter-leg
+    locator says the taker DID fund (this host verified it in lock-claim), whatever the exchange
+    directory holds now: the covenant refund then belongs to ``--phase refund``, whose coordinator
+    checks whether this maker has claimed the counter leg."""
+    if record.counterchain_locator is not None:
+        raise SystemExit(
+            f"REFUSING maker --phase abort: this host's record holds a funded counter leg ({path}), so the "
+            "taker did fund one; abort is only for a taker that never funded. Nothing was sent. Use --phase "
+            "refund (it checks whether you have claimed the counter leg), with taker_funding.json restored "
+            "to the exchange directory."
+        )
 
 
 def _comparable(value: Any, *, field: str = "") -> Any:

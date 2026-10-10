@@ -1098,6 +1098,36 @@ class TestMakerAbortUnlocksAnAssetTheTakerNeverMatched:
         assert "rxd" not in built
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    @pytest.mark.parametrize("state", [SwapState.SECRET_REVEALED, SwapState.COMPLETED])
+    async def test_it_refuses_when_the_record_says_the_maker_claimed(self, name, state, tmp_path, monkeypatch):
+        """taker_funding.json can be absent on this host (never copied, deleted) while the record
+        says this maker claimed the counter leg. Refunding the covenant then takes both legs."""
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=True)
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=state, pending=False))
+        (io_dir / "taker_funding.json").unlink()
+        built = _wire_eth(mod, monkeypatch) if eth else _wire_btc(mod, monkeypatch)
+        with pytest.raises(SystemExit, match="claimed the counter leg and revealed p"):
+            await mod.maker_phase_abort(_with_fee(args))
+        assert "rxd" not in built
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_it_refuses_when_the_record_holds_a_funded_counter_leg(self, name, tmp_path, monkeypatch):
+        """At a state the table allows (BTC_LOCKED), a counter-leg locator in this host's record says
+        the taker DID fund: abort is only for a taker that never funded."""
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=True)
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.BTC_LOCKED, pending=False))
+        (io_dir / "taker_funding.json").unlink()
+        built = _wire_eth(mod, monkeypatch) if eth else _wire_btc(mod, monkeypatch)
+        with pytest.raises(SystemExit, match="record holds a funded counter leg") as raised:
+            await mod.maker_phase_abort(_with_fee(args))
+        assert "Nothing was sent" in str(raised.value.code)
+        assert built["rxd"].refund_calls == []
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     async def test_without_a_fee_utxo_it_refuses_up_front_naming_the_flags(self, name, tmp_path, monkeypatch):
         """The gap #520 named: this path used to reach _NoFeeSource and raise from inside the
         transaction builder, which reads like a crash rather than a missing flag."""
@@ -1835,6 +1865,7 @@ class TestThePhaseStateTable:
         }
         expected = {("taker", phase, state) for phase in ("abort", "refund") for state in _P_PUBLIC}
         expected.add(("maker", "refund", SwapState.SECRET_REVEALED))
+        expected |= {("maker", "abort", SwapState.SECRET_REVEALED), ("maker", "abort", SwapState.COMPLETED)}
         assert refused == expected
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
