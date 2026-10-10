@@ -1527,6 +1527,44 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
         assert _read_back(args).counterchain_locator.deploy_tx_hash == exchanged.deploy_tx_hash
 
 
+class TestARetryNeverRewindsTheRecordOfTheReveal:
+    """A maker whose record says SECRET_REVEALED (the claim was sent, p may be public) but who lacks
+    maker_claim.json is told to re-run lock-claim. That retry rebuilds BTC_LOCKED and its first
+    coordinator step persists; if it then stops, the record must still say the reveal happened, or
+    the maker's next --phase refund takes the asset as well. Each phase is a fresh module: a process
+    restart in between."""
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    @pytest.mark.parametrize("revealed", [SwapState.SECRET_REVEALED, SwapState.COMPLETED])
+    async def test_a_stopped_lock_claim_retry_keeps_the_refund_refused(self, name, revealed, tmp_path, monkeypatch):
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=revealed, pending=False))
+        assert not (io_dir / "maker_claim.json").exists()
+
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        assert _read_back(args).state is revealed, "the retry moved the persisted record back before the reveal"
+
+        mod = _load(name)
+        built = (_wire_eth if eth else _wire_btc)(mod, monkeypatch)
+        _wire_rxd_height(mod, monkeypatch, tip=1_120, locked_at=1_000)
+        if revealed is SwapState.SECRET_REVEALED:
+            with pytest.raises(SystemExit, match="claimed the counter leg and revealed p"):
+                await mod.maker_phase_refund(_with_fee(argparse.Namespace(**vars(args))))
+        with pytest.raises(SystemExit, match="claimed the counter leg and revealed p"):
+            await mod.maker_phase_abort(_with_fee(argparse.Namespace(**vars(args))))
+        assert built.get("rxd") is None or built["rxd"].refund_calls == []
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_a_retry_from_before_the_reveal_still_persists_its_own_state(self, name, tmp_path, monkeypatch):
+        """The honest-path pair: from BOTH_LOCKED the lock-claim retry persists BTC_LOCKED as before."""
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.BOTH_LOCKED, pending=False))
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        assert _read_back(args).state is SwapState.BTC_LOCKED
+
+
 class TestADisagreementRefusesAndSendsNothing:
     """A binding field (terms, hashlock, the counter-leg contract, the covenant) that differs between
     the persisted record and what a phase rebuilt REFUSES: nothing is broadcast and the file is left
@@ -2021,8 +2059,10 @@ class TestThePersistedStateGuardThroughTheRunners:
             # A claim retry must rewind the reveal it already recorded.
             ("taker", "claim", SwapState.SECRET_REVEALED, SwapState.SECRET_REVEALED),
             ("taker", "claim", SwapState.ASSET_VULNERABLE, SwapState.SECRET_REVEALED),
-            # A lock-claim retry after the maker's claim was sent (and may have been dropped).
-            ("maker", "lock-claim", SwapState.SECRET_REVEALED, SwapState.BTC_LOCKED),
+            # A lock-claim retry after the maker's claim was sent (and may have been dropped). It runs
+            # (its verification persists, then the run is stopped), and the record keeps the reveal:
+            # the record sink never writes a state before SECRET_REVEALED over one at or after it.
+            ("maker", "lock-claim", SwapState.SECRET_REVEALED, SwapState.SECRET_REVEALED),
             # The maker's refund after a covenant mismatch.
             ("maker", "refund", SwapState.PARAMS_MISMATCH, SwapState.ASSET_REFUNDED_TAKER_ACTS),
             # Re-sending a refund whose broadcast already wrote the terminal state.

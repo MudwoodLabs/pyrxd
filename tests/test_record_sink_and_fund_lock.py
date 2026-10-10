@@ -280,3 +280,48 @@ class TestItRefusesToClobberADifferentSwap:
         with pytest.raises(ValidationError):
             asyncio.run(JsonFileRecordSink(path)(self._rec(b"\x33" * 32)))
         assert path.read_text() == '{"state": "negotiated", "ter', "the torn file was overwritten"
+
+
+class TestItNeverRewindsARecordedReveal:
+    """A write of a state before the reveal over a record at or after it keeps the state on disk
+    (#850 PR R review): a runner retry rebuilds an earlier state in memory, and writing it through
+    erased the only record that ``p`` may be public."""
+
+    def test_the_revealed_set_is_derived_from_the_transition_table(self) -> None:
+        from pyrxd.gravity.swap_state import REVEALED_STATES, TRANSITIONS, SwapState
+
+        assert {
+            SwapState.SECRET_REVEALED,
+            SwapState.COMPLETED,
+            SwapState.ASSET_VULNERABLE,
+            SwapState.ONE_SIDED_LOSS_TAKER,
+        } == REVEALED_STATES
+        # Closed under the table: no edge leaves it, so a coordinator never makes the move itself.
+        assert not [(s, d) for s, d in TRANSITIONS if s in REVEALED_STATES and d not in REVEALED_STATES]
+
+    @pytest.mark.parametrize("revealed", ["secret_revealed", "completed", "asset_vulnerable", "one_sided_loss_taker"])
+    @pytest.mark.parametrize("earlier", ["negotiated", "btc_locked", "both_locked", "params_mismatch", "maker_stalls"])
+    def test_an_earlier_state_keeps_the_reveal_and_the_other_fields_are_written(
+        self, tmp_path: Path, revealed: str, earlier: str
+    ) -> None:
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(_Rec({"state": revealed, "terms": {"hashlock": "aa"}, "n": 1})))
+        asyncio.run(sink(_Rec({"state": earlier, "terms": {"hashlock": "aa"}, "n": 2})))
+        assert sink.load() == {"state": revealed, "terms": {"hashlock": "aa"}, "n": 2}
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("btc_locked", "both_locked"),  # forward
+            ("both_locked", "btc_locked"),  # a lock-claim retry before any reveal still rewinds
+            ("both_locked", "secret_revealed"),
+            ("secret_revealed", "completed"),
+            ("asset_vulnerable", "secret_revealed"),  # a taker claim retry stays inside the set
+            ("aborted", "btc_locked"),
+        ],
+    )
+    def test_every_other_write_goes_through(self, tmp_path: Path, before: str, after: str) -> None:
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(_Rec({"state": before, "terms": {"hashlock": "aa"}})))
+        asyncio.run(sink(_Rec({"state": after, "terms": {"hashlock": "aa"}})))
+        assert sink.load()["state"] == after

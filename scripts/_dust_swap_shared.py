@@ -194,7 +194,9 @@ LOCATOR_INFORMATIONAL_KEYS = frozenset({"deploy_tx_hash"})
 #: is not hidden behind "not yet mature"), and again inside the merge.
 #:
 #: Every rebuild still drives the state its coordinator step needs (a claim retry rewinds
-#: SECRET_REVEALED or ASSET_VULNERABLE to BOTH_LOCKED; a lock-claim retry rewinds to BTC_LOCKED).
+#: SECRET_REVEALED or ASSET_VULNERABLE to BOTH_LOCKED; a lock-claim retry rewinds to BTC_LOCKED),
+#: IN MEMORY: the record sink never writes a state before the reveal over one at or after it
+#: (``REVEALED_STATES``), so a retry that stops part-way cannot erase the record of a reveal.
 #: The refusals are the cases where the persisted state says the phase would act against the
 #: operator: a taker refunding after p is public, a maker refunding the asset after claiming the
 #: counter leg. TERMINAL states (ABORTED, MUTUAL_REFUND, COMPLETED, ASSET_REFUNDED_TAKER_ACTS) are
@@ -509,6 +511,8 @@ def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: s
       clears them when it attaches a locator.
     * **state**: the rebuild's. Each phase builds the state its coordinator entry point requires,
       and a retry must be able to rewind (a claim retry from SECRET_REVEALED, a lock-claim retry).
+      The rewind is in memory only: ``JsonFileRecordSink`` keeps a persisted state at or after the
+      reveal (``REVEALED_STATES``) when a coordinator step writes an earlier one.
       The PERSISTED state is checked first against :data:`PHASE_STATE_RULES` for ``(role, phase)``,
       and a refused combination exits before anything is merged or sent.
 

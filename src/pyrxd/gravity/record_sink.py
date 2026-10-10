@@ -42,7 +42,7 @@ class JsonFileRecordSink:
     def path(self) -> Path:
         return self._path
 
-    def _refuse_to_clobber_a_different_swap(self, incoming: dict) -> None:
+    def _refuse_to_clobber_a_different_swap(self, incoming: dict) -> dict | None:
         """Refuse to overwrite a record that belongs to a DIFFERENT swap (#504 item 3).
 
         `os.replace` below is unconditional, and the record path derives from `--keys-out`, which
@@ -63,12 +63,14 @@ class JsonFileRecordSink:
         A record whose hashlock cannot be read is refused too, by `load()` — which already fails
         closed on a torn or hand-edited file, and says so in its own words. Deliberately not
         `NetworkError`: this is not transient and must not be retried.
+
+        Returns the record on disk (its raw dict), or ``None`` when there is none.
         """
         if not self._path.exists():
-            return
+            return None
         prior = self.load()  # fails closed on torn / corrupt / non-object, with its own message
         if prior is None:  # pragma: no cover - exists() was true, so load() returns a dict or raises
-            return
+            return None
         prior_h = (prior.get("terms") or {}).get("hashlock")
         incoming_h = (incoming.get("terms") or {}).get("hashlock")
         if prior_h and incoming_h and prior_h != incoming_h:
@@ -80,10 +82,33 @@ class JsonFileRecordSink:
                 "sweep that swap, verify the record is no longer needed, then move it aside — or "
                 "use a different --keys-out for this run."
             )
+        return prior
+
+    @staticmethod
+    def _keep_a_persisted_reveal(prior: dict | None, incoming: dict) -> None:
+        """Never move the record from a state at or after the reveal to one before it.
+
+        ``REVEALED_STATES`` (SECRET_REVEALED and every state reachable from it, derived from the
+        transition table) say the maker's counter-leg claim was sent, so ``p`` may be public. No FSM
+        edge leaves that set, so a coordinator never makes that move on its own. A runner retry does:
+        a maker lock-claim retry rebuilds BTC_LOCKED in memory and its first step persists. Written
+        through, that erased the only record of the reveal, and a later ``--phase refund`` from the
+        rewound state sent the asset refund while the counter leg had been claimed (#850 PR R
+        review). So the write keeps every other field it carries and the state on disk. The
+        coordinator's in-memory record is untouched; its next forward step writes normally.
+        """
+        if prior is None:
+            return
+        from pyrxd.gravity.swap_state import REVEALED_STATES
+
+        revealed = {s.value for s in REVEALED_STATES}
+        if prior.get("state") in revealed and incoming.get("state") not in revealed:
+            incoming["state"] = prior["state"]
 
     async def __call__(self, record: Any) -> None:
         as_dict = record.to_dict()
-        self._refuse_to_clobber_a_different_swap(as_dict)
+        prior = self._refuse_to_clobber_a_different_swap(as_dict)
+        self._keep_a_persisted_reveal(prior, as_dict)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
         tmp = None
         try:
