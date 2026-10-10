@@ -25,6 +25,7 @@ import pytest
 
 from pyrxd.btc_wallet.taproot import BtcOutpoint, btc_txid_from_raw
 from pyrxd.cli import swap_recovery as sr
+from pyrxd.eth_wallet.events import keccak256
 from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.keys import PrivateKey
@@ -1289,8 +1290,9 @@ async def test_a_matching_chain_id_and_no_recorded_chain_id_both_read_on() -> No
 
 
 def test_refund_selector_is_keccak_of_the_signature() -> None:
-    assert sr._keccak256(b"refund()")[:4] == sr.ETH_REFUND_SELECTOR
-    assert sr._keccak256(b"")[:4].hex() == "c5d24601"  # the well-known keccak256 of the empty string
+    assert keccak256(b"refund()")[:4] == sr.ETH_REFUND_SELECTOR
+    assert sr.ETH_REFUND_SELECTOR.hex() == "590e1ae3"  # the value shipped before it was derived
+    assert keccak256(b"")[:4].hex() == "c5d24601"  # the well-known keccak256 of the empty string
 
 
 @pytest.mark.parametrize(
@@ -1305,7 +1307,7 @@ def test_refund_selector_is_keccak_of_the_signature() -> None:
     ],
 )
 def test_undecodable_raw_bytes_are_refused_on_provenance(raw) -> None:
-    computed = "0x" + sr._keccak256(raw).hex()
+    computed = "0x" + keccak256(raw).hex()
     with pytest.raises(sr.ProvenanceRefused):
         sr.verify_raw_eth_tx(raw, computed)
 
@@ -1354,9 +1356,9 @@ def test_a_signed_transaction_respelled_non_canonically_is_refused() -> None:
     assert fields[0] == b"\x05"
     payload = b"\x81\x05" + b"".join(rlp.encode(f) for f in fields[1:])
     respelled = rlp.codec.length_prefix(len(payload), 0xC0) + payload
-    assert sr.verify_raw_eth_tx(raw, "0x" + sr._keccak256(raw).hex()).chain_id == 1  # control: canonical reads
+    assert sr.verify_raw_eth_tx(raw, "0x" + keccak256(raw).hex()).chain_id == 1  # control: canonical reads
     with pytest.raises(sr.ProvenanceRefused, match="non-canonical"):
-        sr.verify_raw_eth_tx(respelled, "0x" + sr._keccak256(respelled).hex())
+        sr.verify_raw_eth_tx(respelled, "0x" + keccak256(respelled).hex())
 
 
 @pytest.mark.asyncio
