@@ -195,9 +195,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without the deploy transaction (it carries `UNKNOWN_DEPLOY_TX_HASH`, a new constant in
   `pyrxd.eth_wallet.locator`), while later phases rebuild it from taker_funding.json with the real
   hash, and the merge compared the whole locator. The merge now compares the locator without the
-  deploy hash (it binds nothing) and fills the placeholder from the rebuild; the coordinator keeps
-  a known deploy hash for the same contract when it re-verifies. The BTC locator was checked the
-  same way and is not affected.
+  deploy hash (it binds nothing), and the maker phases read the taker's locator with the
+  placeholder, so a maker's record never holds the taker's deploy hash: the watchtower's claim scan
+  starts at that transaction's block, and a later one named there could hide a real claim. A scan
+  from the placeholder fails closed. The BTC locator was checked the same way and is not affected.
 - **A re-run of the taker's `--phase fund` could overwrite the record of an earlier fund.** The ETH
   runner built its coordinator on a fresh record. With the seen-store holding the hashlock the
   coordinator's reuse check refused first; with a seen-store that had lost it, the coordinator
@@ -205,7 +206,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hashlock (the BTC runner reached the same path after a completed fund). `taker_funds_btc` now
   refuses, before its gate, when its persist hook holds this swap's counter leg in a record it was
   not built from, and both runners read the record first: past `negotiated`, unreadable or another
-  swap's refuses, and on ETH so does an interrupted deploy, which that runner does not resume.
+  swap's refuses, and on ETH so does an interrupted deploy, which that runner does not resume; that
+  refusal gives the contract's deadline and how anyone can call its `refund()` after it.
 - **The maker's `--phase abort` could refund the covenant after the maker had claimed the counter
   leg.** It allowed a record at `secret_revealed` or `completed`, and its only other check was
   whether taker_funding.json existed. Those states now refuse, as does any record holding a
