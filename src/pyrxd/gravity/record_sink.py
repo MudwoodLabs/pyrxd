@@ -145,9 +145,16 @@ class JsonFileRecordSink:
         if not self._path.exists():
             return None
         try:
-            raw = self._path.read_text()
+            raw_bytes = self._path.read_bytes()
         except OSError as exc:
             raise NetworkError(f"could not read the swap record at {self._path}: {exc}") from exc
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(
+                f"the swap record at {self._path} is not UTF-8 text ({exc}); this sink writes only UTF-8 JSON. "
+                "Inspect the file by hand: the contract it referenced may hold real value."
+            ) from None
         if not raw.strip():
             raise ValidationError(
                 f"the swap record at {self._path} is EMPTY. A zero-length record is a torn write, "
@@ -161,6 +168,11 @@ class JsonFileRecordSink:
                 "write. Do NOT re-run the swap from scratch: the contract it referenced may hold "
                 "real value. Inspect the file by hand before doing anything else."
             ) from exc
+        except (RecursionError, ValueError) as exc:  # nesting deeper than the decoder recurses, and the like
+            raise ValidationError(
+                f"the swap record at {self._path} could not be decoded ({type(exc).__name__}); this sink never "
+                "writes such a file. Inspect it by hand: the contract it referenced may hold real value."
+            ) from None
         if not isinstance(loaded, dict):
             raise ValidationError(f"the swap record at {self._path} is a {type(loaded).__name__}, not an object")
         return loaded

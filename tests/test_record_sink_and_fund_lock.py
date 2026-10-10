@@ -152,6 +152,35 @@ class TestLoadingBackIsFailClosed:
             pending_push_nonce=41,
         )
 
+    @pytest.mark.parametrize(
+        ("what", "data"),
+        [
+            pytest.param("deeply nested JSON", b"[" * 100_000 + b"]" * 100_000, id="nested"),
+            pytest.param(
+                "deeply nested inside an object",
+                b'{"state": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+                id="nested-in-object",
+            ),
+            pytest.param("bytes that are not UTF-8", b'{"state": "\xff\xfe"}', id="not-utf8"),
+        ],
+    )
+    def test_any_undecodable_file_is_a_classified_refusal_not_a_traceback(
+        self, tmp_path: Path, what: str, data: bytes
+    ) -> None:
+        """RecursionError and UnicodeDecodeError escaped `load()` as themselves, so a runner showed a
+        traceback instead of its "could not be read" refusal, and the coordinator's persist (which
+        loads first) raised something it could not classify."""
+        path = tmp_path / "swap.json"
+        path.write_bytes(data)
+        sink = JsonFileRecordSink(path)
+        with pytest.raises(ValidationError, match="could not be decoded|not valid JSON|not UTF-8"):
+            sink.load()
+        with pytest.raises(ValidationError):
+            sink.load_record()
+        with pytest.raises(ValidationError):
+            asyncio.run(sink(self._rec()))
+        assert path.read_bytes() == data, what
+
     def test_a_written_record_round_trips_as_a_SwapRecord(self, tmp_path: Path) -> None:
         """THE property the write side was missing. Not a dict — the real type, so `__post_init__`
         runs and the pending handle is validated on the way back in."""

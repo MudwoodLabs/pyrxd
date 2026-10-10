@@ -1790,14 +1790,27 @@ class TestTheMergeHelperOnItsOwn:
         merged = self._merge(_record_path(args), rebuilt)
         assert merged.counterchain_locator.to_dict() == persisted_loc.to_dict()
 
-    async def test_an_unreadable_record_refuses(self, btc_mod, tmp_path):
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param(b'{"state": "btc_lo', id="torn"),
+            pytest.param(b"[" * 100_000 + b"]" * 100_000, id="nested-past-the-recursion-limit"),
+            pytest.param(b'{"state": "\xff"}', id="not-utf8"),
+        ],
+    )
+    async def test_an_unreadable_record_refuses(self, btc_mod, tmp_path, monkeypatch, data):
         from pyrxd.gravity.swap_state import SwapRecord
 
-        _args, terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        args, terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
         torn = tmp_path / "torn.swaprec.json"
-        torn.write_text('{"state": "btc_lo')
+        torn.write_bytes(data)
         with pytest.raises(SystemExit, match="could not be read"):
             self._merge(torn, SwapRecord(state=SwapState.BTC_LOCKED, terms=terms))
+        # And through a runner phase: the refusal, not a traceback.
+        _record_path(args).write_bytes(data)
+        _wire_btc(btc_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="could not be read"):
+            await btc_mod.taker_phase_abort(args)
 
     def test_exactly_the_informational_locator_keys_are_left_out_of_the_compare(self, eth_mod, btc_mod, tmp_path):
         """Derived from the real locators' wire keys: changing any key refuses except the ones in
