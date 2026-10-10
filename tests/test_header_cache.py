@@ -530,9 +530,12 @@ def test_headers_shallower_than_288_below_the_lowest_tip_are_not_cached(monkeypa
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP + 50), "operator:b": _operator(DEEP - 1)})
     assert r.exit_code == 0, r.output
     assert out["cached_to"] == TOP - 1 and out["lowest_tip"] == DEEP - 1
+    # Headers were added, so it is "synced" (exit 0), and the operator that held it short is named.
+    assert out["state"] == "synced" and out["held_back_by"] == ["operator:b"]
+    assert f"operator:b reported tip {DEEP - 1}" in out["reason"]
     # Honest pair: at exactly 288 deep it is cached.
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
-    assert out["cached_to"] == TOP and out["added"] == 1
+    assert out["cached_to"] == TOP and out["added"] == 1 and out["held_back_by"] is None and out["reason"] is None
 
 
 def test_nothing_deep_enough_is_up_to_date_not_an_error(monkeypatch, tmp_path) -> None:
@@ -573,6 +576,69 @@ def test_operators_that_disagree_are_refused(monkeypatch, tmp_path) -> None:
     assert r.exit_code == 2 and out["state"] == "refused"
     assert "disagree on the header at block 460575" in out["reason"]
     assert _cached(START) is None
+
+
+def test_a_disagreement_names_the_dissenting_operator(monkeypatch, tmp_path) -> None:
+    """Three operators, one serving another header at 460,575: the sync is still refused (a
+    disagreeing operator is never outvoted), and the refusal names THAT operator, not all three."""
+    _patch_table(monkeypatch, START)
+    other = _lie(460575, _renonced(HEADERS[460575]))
+    ops = {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP), "operator:c": _operator(DEEP, other)}
+    for json_out in (True, False):
+        r, out = _sync(monkeypatch, tmp_path, ops, json_out=json_out)
+        assert r.exit_code == 2, r.output
+        flat = _flat(r.output)
+        assert "disagree on the header at block 460575" in flat
+        assert "operator:c served a different header from the other 2 (operator:a, operator:b)" in flat
+        assert "never outvoted" in flat and "nothing was cached" in flat
+        if out:
+            assert out["state"] == "refused" and out["dissenters"] == ["operator:c"]
+        ops = {k: _operator(DEEP, other if k == "operator:c" else None) for k in ops}
+    assert _cached(START) is None
+
+
+def test_a_disagreement_with_no_majority_says_so_and_lists_the_groups() -> None:
+    got = [HEADERS[h] for h in range(START, START + 3)]
+    other = [got[0], _renonced(got[1]), got[2]]
+    for replies, groups in (
+        ({"operator:a": got, "operator:b": other}, ["operator:a", "operator:b"]),
+        (
+            {"operator:a": got, "operator:b": other, "operator:c": got, "operator:d": other},
+            ["operator:a, operator:c", "operator:b, operator:d"],
+        ),
+    ):
+        with pytest.raises(HeaderCacheRefusal) as caught:
+            agreed_headers(replies, START, 3)
+        why = str(caught.value)
+        assert f"disagree on the header at block {START + 1}, with no majority" in why, why
+        for group, served in zip(groups, (got[1], other[1])):
+            assert f"{group} served block hash {radiant_block_hash(served)}" in why, why
+        assert caught.value.dissenters == ()
+    # A reply that is not a header at all is its own group.
+    with pytest.raises(HeaderCacheRefusal, match=r"operator:c served something that is not a header") as caught:
+        agreed_headers({"operator:a": got, "operator:b": got, "operator:c": [got[0], None, got[2]]}, START, 3)
+    assert caught.value.dissenters == ("operator:c",)
+
+
+def test_one_operators_low_tip_holding_the_sync_back_is_named_and_not_up_to_date(monkeypatch, tmp_path) -> None:
+    """The depth rule counts from the LOWEST tip, so one operator reporting a low tip holds every
+    sync back. When it is the reason nothing was added, the sync says so and which operator, and
+    exits 7, not "up to date" with 0."""
+    _patch_table(monkeypatch, START)
+    low = START + 100
+    ops = {"operator:a": _operator(DEEP + 50), "operator:b": _operator(low)}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == headers_cmds.EXIT_SYNC_HELD_BACK == 7, r.output
+    assert out["state"] == "held back" and out["added"] == 0 and out["held_back_by"] == ["operator:b"]
+    assert out["tips"] == {"operator:a": DEEP + 50, "operator:b": low}
+    assert f"operator:b reported tip {low}" in out["reason"] and f"({DEEP + 50})" in out["reason"]
+    assert _cached(START) is None
+    ops = {"operator:a": _operator(DEEP + 50), "operator:b": _operator(low)}
+    r, _ = _sync(monkeypatch, tmp_path, ops, json_out=False)
+    assert r.exit_code == 7 and "HELD BACK" in r.output and "operator:b reported tip" in _flat(r.output)
+    # Honest pair: equal tips with nothing deep enough is "up to date", exit 0, no one named.
+    r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(low), "operator:b": _operator(low)})
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None
 
 
 def test_a_header_below_the_floor_ends_the_sync_and_keeps_what_is_under_it(monkeypatch, tmp_path) -> None:

@@ -252,6 +252,9 @@ Skip with `--yes`. With `--json` (machine-readable mode), `--yes` is **required*
     The full report is still printed on stdout; only the status says no.
 6   `pyrxd headers sync` stopped at a header below its floor. The status is still printed;
     its reason says what gets past that header (a re-run, `--reset`, or only a newer release).
+7   `pyrxd headers sync` added nothing only because one operator reported a lower tip than the
+    others (headers are cached only below the LOWEST tip). The status names that operator; an
+    operator a block or two behind can cause this briefly, and a re-run later clears it.
 ```
 
 ## Configuration

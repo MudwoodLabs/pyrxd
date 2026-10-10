@@ -14,7 +14,8 @@ depth bound (``pyrxd headers sync``): a header is cached only when at least
 least :data:`CACHE_MIN_DEPTH` blocks below the lowest tip any of them reported.
 
 THE FLOOR. Each cached header, and each header :mod:`~pyrxd.glyph.mark_block` links above a cached
-anchor, must carry at least ``W // FLOOR_WORK_DIVISOR`` expected hash evaluations, where:
+anchor, must carry at least ``W // FLOOR_WORK_DIVISOR`` expected hash evaluations (the divisor is
+:data:`pyrxd.glyph.mark_block.FLOOR_WORK_DIVISOR`, the verifier's own, read at call time), where:
 
 * while syncing (:func:`sync_floor`), ``W`` is the GREATER of the newest shipped checkpoint's work
   and the median work of the newest :data:`RECENT_WINDOW` headers ALREADY in the cache when the
@@ -137,7 +138,14 @@ def _issue_seal() -> object:
 
 class HeaderCacheRefusal(Exception):
     """Sources disagreed, too few operators answered, or a served header is a lie (a broken link,
-    a failed proof-of-work). Nothing is cached when this is raised."""
+    a failed proof-of-work). Nothing is cached when this is raised.
+
+    ``dissenters``: for a disagreement with a majority, the operators outside it (they are named,
+    never outvoted: the refusal stands). Empty otherwise."""
+
+    def __init__(self, message: str, *, dissenters: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.dissenters: tuple[str, ...] = tuple(dissenters)
 
 
 class HeaderStoreCorrupt(Exception):
@@ -431,11 +439,39 @@ def agreed_headers(replies: Mapping[str, Sequence[Any]], start: int, count: int)
         seen = {op: bytes(got[i]) if isinstance(got[i], (bytes, bytearray)) else None for op, got in replies.items()}
         values = set(seen.values())
         if None in values or len(values) != 1:
-            raise HeaderCacheRefusal(
-                f"operators disagree on the header at block {start + i} ({', '.join(seen)}); nothing was cached"
-            )
+            raise _disagreement(seen, start + i)
         out.append(next(iter(values)))  # type: ignore[arg-type]
     return out
+
+
+def _disagreement(seen: Mapping[str, bytes | None], height: int) -> HeaderCacheRefusal:
+    """The refusal for operators that served different things at *height*, grouped by what each
+    served: the operators outside a strict majority are named as the dissenters; with no strict
+    majority, every group is listed."""
+    groups: dict[bytes | None, list[str]] = {}
+    for op, value in seen.items():
+        groups.setdefault(value, []).append(op)
+
+    def served(value: bytes | None) -> str:
+        if value is None:
+            return "something that is not a header"
+        if len(value) != 80:
+            return f"{len(value)} bytes, not an 80-byte header"
+        return f"block hash {radiant_block_hash(value)}"
+
+    ranked = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)  # stable: first seen first
+    top_ops, rest = ranked[0][1], ranked[1:]
+    where = f"operators disagree on the header at block {height}"
+    if 2 * len(top_ops) > len(seen):
+        dissenters = [op for _, ops in rest for op in ops]
+        each = "; ".join(f"{', '.join(ops)} served {served(value)}" for value, ops in ranked)
+        return HeaderCacheRefusal(
+            f"{where}: {', '.join(dissenters)} served a different header from the other {len(top_ops)} "
+            f"({', '.join(top_ops)}). {each}. A disagreeing operator is never outvoted, so nothing was cached",
+            dissenters=dissenters,
+        )
+    each = "; ".join(f"{', '.join(ops)} served {served(value)}" for value, ops in ranked)
+    return HeaderCacheRefusal(f"{where}, with no majority: {each}; nothing was cached")
 
 
 # ── The store's bytes ──────────────────────────────────────────────────────────────────────────

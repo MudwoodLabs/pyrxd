@@ -58,13 +58,27 @@ from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
 from .format import emit
 
-__all__ = ["EXIT_SYNC_STOPPED", "OperatorSource", "headers_group", "operator_sources", "sync_headers"]
+__all__ = [
+    "EXIT_SYNC_HELD_BACK",
+    "EXIT_SYNC_STOPPED",
+    "OperatorSource",
+    "headers_group",
+    "operator_sources",
+    "sync_headers",
+]
 
 #: Exit status of `pyrxd headers sync` when a header below the floor stopped it: the cache could not
 #: be brought up to date, and retrying unchanged may not help (the reason says what will). Distinct
 #: from 2 (the servers' answers were unusable) and 1 (the local store could not be written), so a
 #: script can tell them apart. Listed with the other codes in pyrxd.cli.errors.
 EXIT_SYNC_STOPPED = 6
+
+#: Exit status of `pyrxd headers sync` when nothing was added only because one operator's tip was
+#: lower than the others': the depth rule counts from the LOWEST tip, so that operator held the
+#: sync back, and "up to date" would not be true. Nothing was written; the reason names the
+#: operator. An operator a block or two behind can cause this briefly, and a re-run later clears
+#: it; one that stays far behind keeps every sync from adding anything. Listed in pyrxd.cli.errors.
+EXIT_SYNC_HELD_BACK = 7
 
 
 @dataclass(frozen=True)
@@ -129,12 +143,17 @@ async def sync_headers(
 
     * ``"synced"``: headers were added and written;
     * ``"up to date"``: nothing new was deep enough, or a reset was not needed (``reason`` says which);
+    * ``"held back"``: nothing new was deep enough below the LOWEST tip, and the next-lowest tip
+      would have allowed more: ``held_back_by`` names the operator(s) with the low tip, ``reason``
+      says by how much; nothing was written; ``exit_code`` 7. (When headers WERE added but the low
+      tip kept the sync short, the state is ``"synced"`` and ``held_back_by``/``reason`` say the same.)
     * ``"stopped"``: a header below the floor ended the sync. A plain sync writes the agreed headers
       under it, when there are any; a reset writes them only when they reach past the existing
       cache's top (see below). ``stopped`` says why and what was kept, and ``advice`` (``"rerun"``,
       ``"reset"`` or ``"upgrade"``) is what the cache on disk admits next; ``exit_code`` 6;
     * ``"refused"``: nothing was written; ``reason`` and ``fix`` say why; ``exit_code`` 2 for the
-      servers' answers, 1 for a store that could not be written (``advice`` is then ``None``).
+      servers' answers, 1 for a store that could not be written (``advice`` is then ``None``). When
+      operators disagreed and a strict majority of them agreed, ``dissenters`` names the others.
 
     *reset* rebuilds the cache from the newest shipped checkpoint instead of extending it, under the
     same rules, holding every header to the shipped checkpoint's floor alone (as a first sync with no
@@ -168,6 +187,9 @@ async def sync_headers(
         "stopped_at": None,
         "stopped_work": None,
         "advice": None,
+        "tips": {},
+        "held_back_by": None,
+        "dissenters": [],
     }
 
     def refuse(reason: str, fix: str | None = None, exit_code: int = NetworkBoundaryError.exit_code) -> dict[str, Any]:
@@ -195,7 +217,7 @@ async def sync_headers(
                 f"reached {len(reached)} ({', '.join(reached) or 'none'}) of {len(sources)} configured"
             )
         lowest = min(tips.values())
-        report["lowest_tip"] = lowest
+        report["lowest_tip"], report["tips"] = lowest, dict(tips)
         stop = lowest - min_depth
 
         chain = None if reset else loaded.chain
@@ -233,6 +255,7 @@ async def sync_headers(
                 h += n
         except HeaderCacheRefusal as exc:
             why = str(exc)
+            report["dissenters"] = list(exc.dissenters)
             fork_at = loaded.chain.top + 1 if loaded.chain is not None else None
             if fork_at is not None and not reset and why.startswith(f"the header at {fork_at} does not"):
                 why += (
@@ -248,6 +271,18 @@ async def sync_headers(
     stopped_reset_saved = False
     report["added"] = chain.top - old_top
     report["cached_from"], report["cached_to"] = chain.base_height, chain.top
+    # WHO HELD IT BACK. The depth rule counts from the LOWEST tip, so one operator reporting a low
+    # tip bounds every sync. When the sync reached that bound (no floor stop) and the next-lowest
+    # tip would have allowed more, the low operator(s) are named (see EXIT_SYNC_HELD_BACK).
+    held_back, held_back_by = "", [k for k, t in tips.items() if t == lowest]
+    higher = min((t for t in tips.values() if t > lowest), default=None)
+    if not report["stopped"] and higher is not None and higher - min_depth > chain.top:
+        held_back = (
+            f"{', '.join(held_back_by)} reported tip {lowest}, below the next-lowest tip ({higher}); headers are "
+            f"cached only {min_depth} blocks below the lowest tip, so the cache reaches block {chain.top} instead "
+            f"of {higher - min_depth}. Re-run once {', '.join(held_back_by)} catches up, or check that it "
+            f"follows the live chain"
+        )
     advice_text = ""
     if report["stopped"]:
         report["exit_code"] = EXIT_SYNC_STOPPED
@@ -295,6 +330,9 @@ async def sync_headers(
         report["state"] = "stopped" if report["stopped"] else "up to date"
         if report["stopped"]:
             report["stopped"] += advice_text  # nothing to write: the cache on disk is the one advised on
+        elif held_back:
+            report["state"], report["reason"], report["held_back_by"] = "held back", held_back, held_back_by
+            report["exit_code"] = EXIT_SYNC_HELD_BACK
         else:
             report["reason"] = (
                 f"no new header is at least {min_depth} blocks below the lowest tip reported ({lowest})"
@@ -345,6 +383,8 @@ async def sync_headers(
         )
     if report["stopped"]:
         report["stopped"] += advice_text
+    elif held_back:  # headers were added, so "synced" (exit 0); who kept it short is still said
+        report["reason"], report["held_back_by"] = held_back, held_back_by
     report["state"] = "stopped" if report["stopped"] else "synced"
     return report
 
@@ -394,7 +434,8 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     sync writes the headers below it, a --reset only when they reach past the existing cache's top,
     and the reason says what was kept and what gets past that header, computed from the cache on
     disk afterwards. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot
-    be written, 6 when a header below the floor stopped it.
+    be written, 6 when a header below the floor stopped it, 7 when nothing was added only because
+    one operator's tip was lower than the others' (the status names it).
     """
     from .swap_recovery import electrumx_urls
 
@@ -431,6 +472,8 @@ def _sync_lines(r: dict[str, Any]) -> list[str]:
         f"  agreed by:   {len(r['operators'])} operators ({', '.join(r['operators'])})",
         f"  depth rule:  cached only up to the lowest tip reported ({r['lowest_tip']}) minus {r['min_depth']}",
     ]
+    if r.get("held_back_by"):
+        lines.append("  tips:        " + ", ".join(f"{k} {t}" for k, t in r["tips"].items()))
     if r.get("reason"):
         lines.append(f"  note:        {r['reason']}")
     if r.get("stopped"):

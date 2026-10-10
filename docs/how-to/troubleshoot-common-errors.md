@@ -96,7 +96,7 @@ error: Could not decrypt wallet file
 ```
 
 — `WalletDecryptError`'s default message
-([`src/pyrxd/cli/errors.py:166-171`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/errors.py)).
+([`src/pyrxd/cli/errors.py:169-174`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/errors.py)).
 **Verified:** the CLI's wallet loader deliberately discards the library's
 more specific decrypt-failure message (which, called directly, includes an
 NFKD hint pointing at this exact cause) and always re-raises this generic
