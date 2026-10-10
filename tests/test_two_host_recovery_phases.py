@@ -1567,6 +1567,60 @@ class TestADisagreementRefusesAndSendsNothing:
             await eth_mod.taker_phase_abort(args)
         assert built["counter"].refund_calls == []
 
+    async def test_btc_taker_abort_refuses_a_pending_funding_that_is_not_the_funded_one(
+        self, btc_mod, tmp_path, monkeypatch
+    ):
+        """The BTC twin of the pending-contract check: a record holding an interrupted fund's
+        transaction whose txid is not the funding outpoint taker_funding.json names refuses."""
+        from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        payment = build_payment_tx(
+            generate_keypair("bcrt"),
+            BtcUtxo(txid="cd" * 32, vout=0, value=terms.btc_sats * 3),
+            to_hash=b"\x11" * 32,
+            to_type="p2tr",
+            amount_sats=terms.btc_sats,
+            fee_sats=1_000,
+        )
+        pending = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=payment.tx_hex)
+        assert pending.pending_btc_funding_txid != _exchange_locator(io_dir, eth=False).funding_outpoint.txid
+        await _seed(args, pending)
+        before = _record_path(args).read_bytes()
+        built = _wire_btc(btc_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="BTC funding transaction") as raised:
+            await btc_mod.taker_phase_abort(args)
+        assert "Nothing was sent" in str(raised.value.code)
+        assert built["counter"].refund_calls == []
+        assert _record_path(args).read_bytes() == before
+
+    async def test_btc_taker_abort_accepts_the_pending_funding_that_is_the_funded_one(
+        self, btc_mod, tmp_path, monkeypatch
+    ):
+        """The honest-path pair: the same pending transaction, and taker_funding.json naming its
+        output, merges, and the abort refunds the taker's own leg."""
+        from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        payment = build_payment_tx(
+            generate_keypair("bcrt"),
+            BtcUtxo(txid="cd" * 32, vout=0, value=terms.btc_sats * 3),
+            to_hash=b"\x11" * 32,
+            to_type="p2tr",
+            amount_sats=terms.btc_sats,
+            fee_sats=1_000,
+        )
+        pending = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=payment.tx_hex)
+        loc = _exchange_locator(io_dir, eth=False)
+        funded = dataclasses.replace(loc, funding_outpoint=bt.BtcOutpoint(pending.pending_btc_funding_txid, 0))
+        (io_dir / "taker_funding.json").write_text(json.dumps({"btc_locator": funded.to_dict()}))
+        await _seed(args, pending)
+        built = _wire_btc(btc_mod, monkeypatch)
+        await btc_mod.taker_phase_abort(args)
+        assert len(built["counter"].refund_calls) == 1
+
     async def test_btc_taker_refund_refuses_a_different_covenant_outpoint(self, btc_mod, tmp_path, monkeypatch):
         args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
         seeded = _seeded_record(terms, io_dir, eth=False, state=SwapState.BOTH_LOCKED)
