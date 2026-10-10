@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from pyrxd.security.errors import NetworkError, ValidationError
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["FileFundLock", "JsonFileRecordSink"]
 
@@ -85,7 +88,7 @@ class JsonFileRecordSink:
         return prior
 
     @staticmethod
-    def _keep_a_persisted_reveal(prior: dict[str, Any] | None, incoming: dict[str, Any]) -> None:
+    def _keep_a_persisted_reveal(prior: dict[str, Any] | None, incoming: dict[str, Any], where: Any = None) -> None:
         """Never move the record from a state at or after the reveal to one before it.
 
         ``REVEALED_STATES`` (SECRET_REVEALED and every state reachable from it, derived from the
@@ -103,12 +106,20 @@ class JsonFileRecordSink:
 
         revealed = {s.value for s in REVEALED_STATES}
         if prior.get("state") in revealed and incoming.get("state") not in revealed:
+            logger.warning(
+                "swap record %s: kept the persisted state %s instead of writing %s (a state before the reveal "
+                "is never written over one at or after it); the coordinator's in-memory state differs from the file "
+                "until its next forward step",
+                where,
+                prior["state"],
+                incoming.get("state"),
+            )
             incoming["state"] = prior["state"]
 
     async def __call__(self, record: Any) -> None:
         as_dict = record.to_dict()
         prior = self._refuse_to_clobber_a_different_swap(as_dict)
-        self._keep_a_persisted_reveal(prior, as_dict)
+        self._keep_a_persisted_reveal(prior, as_dict, self._path)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
         tmp = None
         try:

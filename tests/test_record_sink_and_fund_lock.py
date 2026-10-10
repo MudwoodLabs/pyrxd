@@ -331,12 +331,17 @@ class TestItNeverRewindsARecordedReveal:
     @pytest.mark.parametrize("revealed", ["secret_revealed", "completed", "asset_vulnerable", "one_sided_loss_taker"])
     @pytest.mark.parametrize("earlier", ["negotiated", "btc_locked", "both_locked", "params_mismatch", "maker_stalls"])
     def test_an_earlier_state_keeps_the_reveal_and_the_other_fields_are_written(
-        self, tmp_path: Path, revealed: str, earlier: str
+        self, tmp_path: Path, revealed: str, earlier: str, caplog: pytest.LogCaptureFixture
     ) -> None:
         sink = JsonFileRecordSink(tmp_path / "swap.json")
         asyncio.run(sink(_Rec({"state": revealed, "terms": {"hashlock": "aa"}, "n": 1})))
-        asyncio.run(sink(_Rec({"state": earlier, "terms": {"hashlock": "aa"}, "n": 2})))
+        with caplog.at_level("WARNING", logger="pyrxd.gravity.record_sink"):
+            asyncio.run(sink(_Rec({"state": earlier, "terms": {"hashlock": "aa"}, "n": 2})))
         assert sink.load() == {"state": revealed, "terms": {"hashlock": "aa"}, "n": 2}
+        # Said, so a printed in-memory state and the file do not differ in silence.
+        assert any(
+            f"kept the persisted state {revealed} instead of writing {earlier}" in r.message for r in caplog.records
+        )
 
     @pytest.mark.parametrize(
         ("before", "after"),

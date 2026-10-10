@@ -129,6 +129,23 @@ def test_the_floor_divisor_has_one_source(monkeypatch) -> None:
     assert _chain(START, START).floor_work == w, "the cache's floor follows mark_block's divisor"
 
 
+def test_no_module_imports_the_floor_divisor_by_value() -> None:
+    """Derived over every module in src/: none binds ``FLOOR_WORK_DIVISOR`` with ``from ... import``,
+    so each reads mark_block's at call time (funding_spv did, until the panel round)."""
+    import ast
+
+    src = Path(__file__).resolve().parent.parent / "src" / "pyrxd"
+    files = sorted(src.rglob("*.py"))
+    assert len(files) > 50, "the scan found too few modules: it is broken"
+    by_value = [
+        f"{p.relative_to(src)}:{node.lineno}"
+        for p in files
+        for node in ast.walk(ast.parse(p.read_text()))
+        if isinstance(node, ast.ImportFrom) and any(a.name == "FLOOR_WORK_DIVISOR" for a in node.names)
+    ]
+    assert by_value == [], by_value
+
+
 # ── the pure core ───────────────────────────────────────────────────────────────────────────
 
 
