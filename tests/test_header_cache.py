@@ -258,6 +258,45 @@ def test_a_write_that_fails_leaves_the_old_store_whole(tmp_path, monkeypatch) ->
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir()), "the temporary file is removed"
 
 
+_KILLED_SAVE = """
+import os, signal, sys
+from pathlib import Path
+from pyrxd.cli import header_store
+from pyrxd.glyph.header_cache import start_verified_headers
+
+path, cp, cp_hash, header = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], bytes.fromhex(sys.argv[4])
+chain = start_verified_headers("mainnet", header, table=((cp, cp_hash),))
+header_store.os.replace = lambda src, dst: os.kill(os.getpid(), signal.SIGKILL)  # killed before the rename
+header_store.save(chain, table=((cp, cp_hash),), path=path)
+"""
+
+
+def test_a_save_cleans_up_the_temporary_file_a_killed_save_left(tmp_path) -> None:
+    """A save SIGKILLed between its fsync and its os.replace leaves its temporary file (no
+    ``finally`` runs). The next save of the same store removes it, under the lock, and touches no
+    other file. The orphan here is made by a real save in a real process killed at that point, so
+    its name is the one save() really uses."""
+    import signal
+    import subprocess
+    import sys
+
+    path = tmp_path / "mainnet.bin"
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+    args = [str(path), str(START), _hash(START), HEADERS[START].hex()]
+    done = subprocess.run([sys.executable, "-c", _KILLED_SAVE, *args], env=env, timeout=60, check=False)
+    assert done.returncode == -signal.SIGKILL, done
+    orphans = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert len(orphans) == 1 and orphans[0].startswith(".mainnet.bin.") and not path.exists(), orphans
+    # Files that are not this store's temporary files are left alone.
+    others = [".testnet.bin.1.deadbeef.tmp", ".mainnet.bin.notes.tmp", "mainnet.bin.1.deadbeef.tmp"]
+    for name in others:
+        (tmp_path / name).write_bytes(b"x")
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)
+    left = sorted(p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp"))
+    assert left == sorted(others), left
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
+
+
 def test_two_saves_at_once_cannot_shorten_the_store(tmp_path) -> None:
     """The append-only check and the replace happen under one lock. Interleaving, made
     deterministic: this test holds the lock while a save of a SHORTER chain starts (it read nothing
