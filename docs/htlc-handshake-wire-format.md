@@ -51,7 +51,7 @@ re-derive from it.
 | BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:396-422` (`BitcoinTaprootLeg._htlc`, `derive_funding_scriptpubkey` and `promised_funding_scriptpubkey`) |
 | ETH counter-leg binding | `src/pyrxd/gravity/eth_leg.py:121-197` (`EthLeg.fund`), `src/pyrxd/gravity/eth_leg.py:252-313` (`EthLeg.verify_counterparty_funded`), `src/pyrxd/eth_wallet/locator.py:125-228` (`EthHtlcLocator`) |
 | Counter-leg locators (durable, JSON) | `src/pyrxd/btc_wallet/taproot.py:616-691` (`BtcHtlcLocator`), `src/pyrxd/eth_wallet/locator.py:125-228` (`EthHtlcLocator`) |
-| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-50` (the exchanged files), `scripts/btc_swap_two_host.py:572-947` (the five phases, `taker_phase_intro` through `maker_phase_lock_claim`), `scripts/eth_swap_two_host.py:499-910` (the same five) |
+| The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-50` (the exchanged files), `scripts/btc_swap_two_host.py:572-947` (the five phases, `taker_phase_intro` through `maker_phase_lock_claim`), `scripts/eth_swap_two_host.py:499-915` (the same five) |
 | Conformance vectors | `conformance/htlc-handshake-vectors.json`, guarded by `tests/test_htlc_handshake_conformance_vectors.py` |
 
 ## Roles, and the one invariant everything rests on
@@ -86,7 +86,7 @@ states it as such (`scripts/btc_swap_two_host.py:42-50`).
 
 Message ordering is strict: a receiver MUST NOT accept message *n+1* before message *n*, and the
 coordinator enforces this by refusing every step that is not valid from the current state
-(`swap_coordinator.py:2829, 3289, 3624, 3930, 3999` — the state checks opening `taker_funds_btc`,
+(`swap_coordinator.py:2829, 3289, 3604, 3910, 3979` — the state checks opening `taker_funds_btc`,
 `post_asset_lock_revalidate`, `maker_claims_btc`, `taker_observed_reveal` and
 `taker_scrape_and_claim_asset`).
 
@@ -101,7 +101,7 @@ Every message is a JSON object carrying a `schema` string:
 | Value | Meaning |
 |---|---|
 | `btc_rxd_two_host_envelope_v1` | BTC counter leg (`scripts/btc_swap_two_host.py:855`) |
-| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:820`) |
+| `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:825`) |
 
 **A conforming implementation MUST read `schema` and MUST refuse an unrecognised value**, exactly
 as `gravity/watch/escalation.py:210-214` does for the watchtower heartbeat's `schema_version`
@@ -143,7 +143,7 @@ The core message. Carries `H` — never `p`.
 | `eth_chain_id` | int | ETH only | **not validated** | EIP-155 chain id. See **HZ-5**. |
 | `btc_network` / `rxd_network` | string | yes | **not validated** | Network tags. See **HZ-5**. |
 
-Source: `scripts/btc_swap_two_host.py:851-863`, `scripts/eth_swap_two_host.py:819-828`. The ETH envelope
+Source: `scripts/btc_swap_two_host.py:851-863`, `scripts/eth_swap_two_host.py:824-833`. The ETH envelope
 carries `rxd_network` and `eth_chain_id` but no `btc_network`.
 
 The maker MUST NOT place a private key, WIF, seed, or the preimage in this document. The harnesses
@@ -221,16 +221,16 @@ The maker's counter-chain claim, which reveals `p` on chain.
 | `btc_claim_tx_hex` | hex | BTC — the raw claim transaction |
 | `eth_claim_tx_hash` | `0x`-hex | ETH — the claim transaction hash |
 
-Source: `scripts/btc_swap_two_host.py:944`, `scripts/eth_swap_two_host.py:907`.
+Source: `scripts/btc_swap_two_host.py:944`, `scripts/eth_swap_two_host.py:912`.
 
 This message is a **convenience pointer, not a channel**. `p` is public on chain the moment the
 claim confirms; the taker can and should find it by watching the counter chain. A conforming taker
-MUST verify, before acting on it (`swap_coordinator.py:4005-4010`):
+MUST verify, before acting on it (`swap_coordinator.py:3985-3990`):
 
 1. `SHA256(scraped p) == terms.hashlock` — scraping is by hash over all candidate pushes, **never
    by byte offset** (`counter_chain_leg.py:45-48`);
 2. **provenance** — BTC: the transaction spends *this swap's* funding outpoint
-   (`swap_coordinator.py:3884-3906`); ETH: the transaction targets *this swap's* contract instance
+   (`swap_coordinator.py:3864-3886`); ETH: the transaction targets *this swap's* contract instance
    and emits `Claimed(p)` from it (`eth_leg.py:360-366`). Without this, a claim transaction from a
    different swap that happens to share `H` would be accepted.
 
@@ -541,7 +541,7 @@ ever locked, and the maker holds both `p` and the claim key from the moment the 
 published. Consensus permits the claim; the FSM simply has no edge for it (from `BTC_LOCKED` the
 only exits are `BOTH_LOCKED`, `ABORTED`, `PARAMS_MISMATCH` — `swap_state.py:175-179`), and
 `maker_claims_btc` refuses it only for an *honest* maker driving its own coordinator
-(`swap_coordinator.py:3624-3625`). A hostile maker does not use a coordinator.
+(`swap_coordinator.py:3604-3605`). A hostile maker does not use a coordinator.
 
 **Normative:** a taker MUST NOT fund the counter leg until it has confirmed the maker's asset lock
 on chain, at the agreed scriptPubKey, for the agreed value, at a depth the taker chose. The FSM's
@@ -599,7 +599,7 @@ funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG ent
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**
-(`scripts/btc_swap_two_host.py:855, 1392`; `scripts/eth_swap_two_host.py:820, 1561` — the second of
+(`scripts/btc_swap_two_host.py:855, 1392`; `scripts/eth_swap_two_host.py:825, 1579` — the second of
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only
@@ -721,7 +721,7 @@ omit the checks that actually bind.
 ### HZ-5: Network identity is carried but never checked
 
 `envelope` carries `btc_network`, `rxd_network` and (ETH) `eth_chain_id`
-(`scripts/btc_swap_two_host.py:859-860`, `scripts/eth_swap_two_host.py:825-826`), but no reader
+(`scripts/btc_swap_two_host.py:859-860`, `scripts/eth_swap_two_host.py:830-831`), but no reader
 compares them to its own configuration — the taker phases read `maker_pkh_hex`,
 `covenant_spk_hex` and the payout fields and nothing else. `terms` carries no network at all, and
 `BtcHtlcLocator.network` defaults to `"bc"` (`taproot.py:630`).
@@ -802,11 +802,11 @@ Notes a second implementation needs:
 
 - The reorg gate's `WAIT` verdict is **not** a transition. The record stays `SECRET_REVEALED` and
   the caller retries; no state is stranded because the gate runs before any advance
-  (`swap_coordinator.py:4031-4037`).
+  (`swap_coordinator.py:4011-4017`).
 - `ASSET_REFUNDED_TAKER_ACTS` is reached by a **maker-only** primitive. The covenant's CSV refund
   pays the *maker* in both directions, so a taker that runs it gifts the asset back and destroys
   its only recourse; the coordinator forbids it for a `TAKER`-role instance
-  (`swap_coordinator.py:4209-4214`). **The taker's stall recovery is `mutual_refund`.**
+  (`swap_coordinator.py:4189-4194`). **The taker's stall recovery is `mutual_refund`.**
 - Durable state MUST be persisted before an awaited broadcast and the post-broadcast write
   shielded from cancellation, or a retry double-funds (`swap_coordinator.py:2860-2863, 3131-3133`).
 
