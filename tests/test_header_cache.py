@@ -639,6 +639,19 @@ def test_one_operators_low_tip_holding_the_sync_back_is_named_and_not_up_to_date
     # Honest pair: equal tips with nothing deep enough is "up to date", exit 0, no one named.
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(low), "operator:b": _operator(low)})
     assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None
+    # And the ordinary lag just after a block: one tip a block or two lower (below HELD_BACK_MIN_GAP)
+    # is named in the note but stays "up to date", exit 0, where a deeper header would otherwise
+    # have been cached. A non-zero status for routine propagation would be wrong most times it fired.
+    at_edge = START + CACHE_MIN_DEPTH  # this tip admits nothing past START; one block more admits one
+    gap = headers_cmds.HELD_BACK_MIN_GAP - 1
+    ops = {"operator:a": _operator(at_edge + gap), "operator:b": _operator(at_edge)}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["added"] == 0, r.output
+    assert out["held_back_by"] == ["operator:b"] and f"operator:b reported tip {at_edge}" in out["reason"]
+    # At the gap itself it is held back.
+    ops = {"operator:a": _operator(at_edge + gap + 1), "operator:b": _operator(at_edge)}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 7 and out["state"] == "held back", r.output
 
 
 def test_a_header_below_the_floor_ends_the_sync_and_keeps_what_is_under_it(monkeypatch, tmp_path) -> None:

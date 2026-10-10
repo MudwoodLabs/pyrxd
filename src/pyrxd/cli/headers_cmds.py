@@ -61,6 +61,7 @@ from .format import emit
 __all__ = [
     "EXIT_SYNC_HELD_BACK",
     "EXIT_SYNC_STOPPED",
+    "HELD_BACK_MIN_GAP",
     "OperatorSource",
     "headers_group",
     "operator_sources",
@@ -76,9 +77,16 @@ EXIT_SYNC_STOPPED = 6
 #: Exit status of `pyrxd headers sync` when nothing was added only because one operator's tip was
 #: lower than the others': the depth rule counts from the LOWEST tip, so that operator held the
 #: sync back, and "up to date" would not be true. Nothing was written; the reason names the
-#: operator. An operator a block or two behind can cause this briefly, and a re-run later clears
-#: it; one that stays far behind keeps every sync from adding anything. Listed in pyrxd.cli.errors.
+#: operator. Only when its tip is at least :data:`HELD_BACK_MIN_GAP` blocks below the next-lowest:
+#: honest servers routinely differ by a block or two for a few seconds after each block, and a
+#: status that is non-zero for that would be wrong most of the times it fired. A smaller lag is
+#: still named in the note, with exit 0. Listed in pyrxd.cli.errors.
 EXIT_SYNC_HELD_BACK = 7
+
+#: How far (blocks) one operator's tip must trail the next-lowest before a sync it held back exits
+#: :data:`EXIT_SYNC_HELD_BACK`: 6 blocks, about half an hour of Radiant blocks, far past honest
+#: propagation lag. A judgement, not a measurement.
+HELD_BACK_MIN_GAP = 6
 
 
 @dataclass(frozen=True)
@@ -144,9 +152,10 @@ async def sync_headers(
     * ``"synced"``: headers were added and written;
     * ``"up to date"``: nothing new was deep enough, or a reset was not needed (``reason`` says which);
     * ``"held back"``: nothing new was deep enough below the LOWEST tip, and the next-lowest tip
-      would have allowed more: ``held_back_by`` names the operator(s) with the low tip, ``reason``
-      says by how much; nothing was written; ``exit_code`` 7. (When headers WERE added but the low
-      tip kept the sync short, the state is ``"synced"`` and ``held_back_by``/``reason`` say the same.)
+      would have allowed more, by at least :data:`HELD_BACK_MIN_GAP` blocks: ``held_back_by`` names
+      the operator(s) with the low tip, ``reason`` says by how much; nothing was written;
+      ``exit_code`` 7. (A smaller lag stays ``"up to date"``, and when headers WERE added the state is
+      ``"synced"``; in both ``held_back_by``/``reason`` still name the operator, with exit 0.)
     * ``"stopped"``: a header below the floor ended the sync. A plain sync writes the agreed headers
       under it, when there are any; a reset writes them only when they reach past the existing
       cache's top (see below). ``stopped`` says why and what was kept, and ``advice`` (``"rerun"``,
@@ -330,9 +339,11 @@ async def sync_headers(
         report["state"] = "stopped" if report["stopped"] else "up to date"
         if report["stopped"]:
             report["stopped"] += advice_text  # nothing to write: the cache on disk is the one advised on
-        elif held_back:
+        elif held_back and higher is not None and higher - lowest >= HELD_BACK_MIN_GAP:
             report["state"], report["reason"], report["held_back_by"] = "held back", held_back, held_back_by
             report["exit_code"] = EXIT_SYNC_HELD_BACK
+        elif held_back:  # a lag of a block or two: named, but "up to date" (exit 0)
+            report["reason"], report["held_back_by"] = held_back, held_back_by
         else:
             report["reason"] = (
                 f"no new header is at least {min_depth} blocks below the lowest tip reported ({lowest})"
@@ -435,7 +446,7 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     and the reason says what was kept and what gets past that header, computed from the cache on
     disk afterwards. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot
     be written, 6 when a header below the floor stopped it, 7 when nothing was added only because
-    one operator's tip was lower than the others' (the status names it).
+    one operator's tip was at least 6 blocks lower than the others' (the status names it).
     """
     from .swap_recovery import electrumx_urls
 

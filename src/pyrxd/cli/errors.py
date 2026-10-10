@@ -21,8 +21,9 @@ Exit codes (per docs/wallet-cli-plan.md §"Exit codes"):
       still printed; its reason says what gets past that header. See
       `headers_cmds.EXIT_SYNC_STOPPED`.
   7   `pyrxd headers sync` added nothing only because one operator reported a
-      lower tip than the others (headers are cached only below the LOWEST tip);
-      the status names that operator. See `headers_cmds.EXIT_SYNC_HELD_BACK`.
+      lower tip than the others, by at least `headers_cmds.HELD_BACK_MIN_GAP`
+      blocks (headers are cached only below the LOWEST tip); the status names that
+      operator. See `headers_cmds.EXIT_SYNC_HELD_BACK`.
 
 Debug traceback handling
 ------------------------
