@@ -456,6 +456,27 @@ def encode_store(chain: VerifiedHeaders, *, syncs: Sequence[Mapping[str, Any]] =
     return body + hashlib.sha256(body).digest()
 
 
+#: The deepest metadata :func:`decode_store` accepts. What :func:`encode_store` writes is at most 4
+#: deep (the metadata, its ``syncs`` list, a record, a record's ``operators`` list).
+_MAX_META_DEPTH = 8
+
+
+def _nesting_depth(value: Any) -> int:
+    """How deeply *value*'s lists and dicts nest (a scalar is 0), without recursing."""
+    deepest, stack = 0, [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children: Any = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        deepest = max(deepest, depth)
+        stack.extend((child, depth + 1) for child in children)
+    return deepest
+
+
 def decode_store(data: Any) -> tuple[dict[str, Any], list[bytes]]:
     """``(metadata, headers)`` from store bytes, or :class:`HeaderStoreCorrupt`. Shape only: what
     the headers SAY is checked by :func:`verify_header_chain`, never here."""
@@ -472,9 +493,13 @@ def decode_store(data: Any) -> tuple[dict[str, Any], list[bytes]]:
     at += 4
     try:
         meta = json.loads(body[at : at + n].decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        raise HeaderStoreCorrupt("the store's metadata is not JSON") from None
+    except Exception as exc:  # total over file contents: RecursionError on deep nesting, not only ValueError
+        raise HeaderStoreCorrupt(f"the store's metadata could not be parsed as JSON ({type(exc).__name__})") from None
     at += n
+    if _nesting_depth(meta) > _MAX_META_DEPTH:
+        # Deeper than anything encode_store writes; refused here so that nothing downstream (a
+        # re-encode on save, a JSON report of the sync records) recurses through it.
+        raise HeaderStoreCorrupt(f"the store's metadata is nested deeper than {_MAX_META_DEPTH} levels")
     if not isinstance(meta, dict) or meta.get("version") != _VERSION:
         raise HeaderStoreCorrupt(f"the store's metadata is not version {_VERSION}")
     count, base = meta.get("count"), meta.get("base_height")

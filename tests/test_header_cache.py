@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from collections.abc import Sequence
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -1312,3 +1313,58 @@ def test_a_reset_save_keeps_a_store_it_would_only_shorten(tmp_path) -> None:
     # Honest pair: a stopped rebuild reaching past the top is written.
     header_store.save(_chain(START, TOP), table=_table(START), path=path, reset=True, past_top_only=True)
     assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
+
+
+# ── a store whose metadata is hostile JSON ───────────────────────────────────────────────────
+
+
+def _store_bytes(blob: bytes, headers: Sequence[bytes] = ()) -> bytes:
+    """Store bytes with *blob* as the metadata and a CORRECT checksum: past every shape check that
+    runs before the metadata is parsed."""
+    import hashlib
+
+    body = b"pyrxd-header-cache\n" + len(blob).to_bytes(4, "big") + blob + b"".join(headers)
+    return body + hashlib.sha256(body).digest()
+
+
+def _deep_metadata() -> dict[str, bytes]:
+    deep = "[" * 100_000 + "]" * 100_000
+    good, _ = decode_store(encode_store(_chain(START, TOP)))
+    within = json.dumps({**good, "syncs": ["@"]}, sort_keys=True).replace('"@"', deep)
+    # Shallow enough to parse, and still deeper than any record pyrxd writes (records are flat).
+    shallow = json.dumps({**good, "syncs": [{"x": "@"}]}, sort_keys=True).replace('"@"', "[" * 40 + "]" * 40)
+    return {
+        "the_whole_metadata": deep.encode(),
+        "inside_the_sync_records": within.encode(),
+        "nested_deeper_than_any_record_pyrxd_writes": shallow.encode(),
+    }
+
+
+@pytest.mark.parametrize("case", list(_deep_metadata()), ids=list(_deep_metadata()))
+def test_deeply_nested_metadata_is_a_damaged_store_not_a_crash(monkeypatch, tmp_path, case: str) -> None:
+    """A valid checksum over metadata nested 100,000 deep made ``json.loads`` raise RecursionError
+    through ``load()``, crashing ``pyrxd verify`` and ``pyrxd headers status``/``sync``, and
+    ``sync --reset`` could not repair it. It is a damaged store: treated as empty, and replaced."""
+    headers = [HEADERS[h] for h in range(START, TOP + 1)]
+    data = _store_bytes(_deep_metadata()[case], headers)
+    with pytest.raises(header_cache.HeaderStoreCorrupt):
+        decode_store(data)
+    _patch_table(monkeypatch, START)
+    path = header_store.store_path("mainnet")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    got = header_store.load("mainnet", _table(START))
+    assert got.chain is None and got.untrusted and "is damaged" in (got.note or "")
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
+    status = CliRunner().invoke(cli, [*head, "--json", "headers", "status"])
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.output)["state"] == "untrusted"
+    human = CliRunner().invoke(cli, [*head, "headers", "status"])
+    assert human.exit_code == 0 and "UNTRUSTED" in human.output, human.output
+    # `pyrxd verify` runs as with no cache.
+    bv = json.loads(_verify(monkeypatch, tmp_path).output)["mark_anchor"]["block_verification"]
+    assert bv["state"] == "VERIFIED" and bv["cached_anchor_height"] is None
+    # And `pyrxd headers sync --reset` replaces it.
+    r, out = _reset(monkeypatch, tmp_path, DEEP)
+    assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == TOP, out
+    assert _cached(START).headers == tuple(headers)  # type: ignore[union-attr]
