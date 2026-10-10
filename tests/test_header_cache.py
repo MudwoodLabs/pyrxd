@@ -1261,3 +1261,54 @@ def test_a_stopped_reset_that_disagrees_and_reaches_past_the_top_replaces_the_st
     saved = header_store.load("mainnet", _table(START))
     assert saved.chain.headers == tuple(HEADERS[h] for h in range(START, 460571))  # type: ignore[union-attr]
     assert saved.syncs[-1].get("reset") is True, "the record of a written stopped reset keeps the flag"
+
+
+def _branch_chain(monkeypatch) -> VerifiedHeaders:
+    """A verified chain START..460,570 on the branch of :func:`_fork_branch` (it leaves the real
+    chain at 460,568). Only the cache's proof-of-work check is told to accept the branch headers."""
+    branch = _fork_branch()
+    real = header_cache.verify_radiant_header_pow
+    monkeypatch.setattr(
+        header_cache,
+        "verify_radiant_header_pow",
+        lambda h, **kw: radiant_block_hash(h) if h in branch else real(h, **kw),
+    )
+    chain, stopped = extend_verified_headers(_chain(START, 460567), branch)
+    assert stopped is None and chain.top == 460570 and chain.header_at(460568) != HEADERS[460568]
+    return chain
+
+
+def test_a_plain_save_of_another_branch_is_refused_and_the_store_is_unchanged(monkeypatch, tmp_path) -> None:
+    """The append-only rule's "different header" clause, on its own: the branch chain reaches PAST
+    the store's top (460,569 -> 460,570), so only that clause can refuse it."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460569), table=_table(START), record={"to": 460569}, path=path)
+    before = path.read_bytes()
+    branch = _branch_chain(monkeypatch)
+    assert branch.top > 460569, "longer than the store: the shorter-chain clause cannot be what refuses it"
+    with pytest.raises(header_store.AppendOnlyRefusal, match="holds a different header at block 460568"):
+        header_store.save(branch, table=_table(START), record={"to": 460570}, path=path)
+    assert path.read_bytes() == before, "the store is byte for byte what it was"
+    # The reset path, per the module docstring: a completed rebuild that disagrees replaces it.
+    header_store.save(branch, table=_table(START), record={"to": 460570, "reset": True}, path=path, reset=True)
+    got = header_store.load("mainnet", _table(START), path=path)
+    assert got.chain is not None and got.chain.headers == branch.headers
+    assert got.syncs == ({"to": 460569}, {"to": 460570, "reset": True})
+
+
+def test_a_reset_save_keeps_a_store_it_would_only_shorten(tmp_path) -> None:
+    """``save(reset=True)``'s two ResetKeptExisting cases, at the store: a rebuild that AGREES and
+    ends below the top, and a STOPPED rebuild (``past_top_only``) that does not reach past it. Each
+    leaves the file byte for byte unchanged; a rebuild reaching at least the top is written."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460575), table=_table(START), path=path)
+    before = path.read_bytes()
+    with pytest.raises(header_store.ResetKeptExisting, match="agrees with the existing cache"):
+        header_store.save(_chain(START, 460570), table=_table(START), path=path, reset=True)
+    assert path.read_bytes() == before
+    with pytest.raises(header_store.ResetKeptExisting, match="not past the existing cache's top"):
+        header_store.save(_chain(START, 460575), table=_table(START), path=path, reset=True, past_top_only=True)
+    assert path.read_bytes() == before
+    # Honest pair: a stopped rebuild reaching past the top is written.
+    header_store.save(_chain(START, TOP), table=_table(START), path=path, reset=True, past_top_only=True)
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
