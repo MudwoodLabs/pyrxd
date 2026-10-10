@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from pyrxd.security.errors import NetworkError, ValidationError
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["FileFundLock", "JsonFileRecordSink"]
 
@@ -42,7 +45,7 @@ class JsonFileRecordSink:
     def path(self) -> Path:
         return self._path
 
-    def _refuse_to_clobber_a_different_swap(self, incoming: dict) -> None:
+    def _refuse_to_clobber_a_different_swap(self, incoming: dict[str, Any]) -> dict[str, Any] | None:
         """Refuse to overwrite a record that belongs to a DIFFERENT swap (#504 item 3).
 
         `os.replace` below is unconditional, and the record path derives from `--keys-out`, which
@@ -63,12 +66,14 @@ class JsonFileRecordSink:
         A record whose hashlock cannot be read is refused too, by `load()` — which already fails
         closed on a torn or hand-edited file, and says so in its own words. Deliberately not
         `NetworkError`: this is not transient and must not be retried.
+
+        Returns the record on disk (its raw dict), or ``None`` when there is none.
         """
         if not self._path.exists():
-            return
+            return None
         prior = self.load()  # fails closed on torn / corrupt / non-object, with its own message
         if prior is None:  # pragma: no cover - exists() was true, so load() returns a dict or raises
-            return
+            return None
         prior_h = (prior.get("terms") or {}).get("hashlock")
         incoming_h = (incoming.get("terms") or {}).get("hashlock")
         if prior_h and incoming_h and prior_h != incoming_h:
@@ -80,10 +85,41 @@ class JsonFileRecordSink:
                 "sweep that swap, verify the record is no longer needed, then move it aside — or "
                 "use a different --keys-out for this run."
             )
+        return prior
+
+    @staticmethod
+    def _keep_a_persisted_reveal(prior: dict[str, Any] | None, incoming: dict[str, Any], where: Any = None) -> None:
+        """Never move the record from a state at or after the reveal to one before it.
+
+        ``REVEALED_STATES`` (SECRET_REVEALED and every state reachable from it, derived from the
+        transition table) say the maker's counter-leg claim was sent, so ``p`` may be public. No FSM
+        edge leaves that set, so a coordinator never makes that move on its own. A runner retry does:
+        a maker lock-claim retry rebuilds BTC_LOCKED in memory and its first step persists. Written
+        through, that erased the only record of the reveal, and a later ``--phase refund`` from the
+        rewound state sent the asset refund while the counter leg had been claimed (#850 PR R
+        review). So the write keeps every other field it carries and the state on disk. The
+        coordinator's in-memory record is untouched; its next forward step writes normally.
+        """
+        if prior is None:
+            return
+        from pyrxd.gravity.swap_state import REVEALED_STATES
+
+        revealed = {s.value for s in REVEALED_STATES}
+        if prior.get("state") in revealed and incoming.get("state") not in revealed:
+            logger.warning(
+                "swap record %s: kept the persisted state %s instead of writing %s (a state before the reveal "
+                "is never written over one at or after it); the coordinator's in-memory state differs from the file "
+                "until its next forward step",
+                where,
+                prior["state"],
+                incoming.get("state"),
+            )
+            incoming["state"] = prior["state"]
 
     async def __call__(self, record: Any) -> None:
         as_dict = record.to_dict()
-        self._refuse_to_clobber_a_different_swap(as_dict)
+        prior = self._refuse_to_clobber_a_different_swap(as_dict)
+        self._keep_a_persisted_reveal(prior, as_dict, self._path)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
         tmp = None
         try:
@@ -120,9 +156,16 @@ class JsonFileRecordSink:
         if not self._path.exists():
             return None
         try:
-            raw = self._path.read_text()
+            raw_bytes = self._path.read_bytes()
         except OSError as exc:
             raise NetworkError(f"could not read the swap record at {self._path}: {exc}") from exc
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(
+                f"the swap record at {self._path} is not UTF-8 text ({exc}); this sink writes only UTF-8 JSON. "
+                "Inspect the file by hand: the contract it referenced may hold real value."
+            ) from None
         if not raw.strip():
             raise ValidationError(
                 f"the swap record at {self._path} is EMPTY. A zero-length record is a torn write, "
@@ -136,6 +179,11 @@ class JsonFileRecordSink:
                 "write. Do NOT re-run the swap from scratch: the contract it referenced may hold "
                 "real value. Inspect the file by hand before doing anything else."
             ) from exc
+        except (RecursionError, ValueError) as exc:  # nesting deeper than the decoder recurses, and the like
+            raise ValidationError(
+                f"the swap record at {self._path} could not be decoded ({type(exc).__name__}); this sink never "
+                "writes such a file. Inspect it by hand: the contract it referenced may hold real value."
+            ) from None
         if not isinstance(loaded, dict):
             raise ValidationError(f"the swap record at {self._path} is a {type(loaded).__name__}, not an object")
         return loaded

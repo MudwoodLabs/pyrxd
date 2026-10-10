@@ -93,6 +93,7 @@ from pyrxd.btc_wallet.taproot import (
     btc_txid_from_raw,
     scrape_secret,
 )
+from pyrxd.eth_wallet.events import function_selector, keccak256
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE as MAX_FEE_OVERPAY_MULTIPLE  # re-export
 from pyrxd.fee_sizing import fee_overpay_ceiling, fee_overpay_multiple
@@ -891,20 +892,15 @@ def recover_preimage_from_eth_claim(
 
 
 #: ``refund()``'s 4-byte selector, ``keccak256("refund()")[:4]`` — the same in ``EthHtlc.sol`` and
-#: ``Erc20Htlc.sol`` (pinned against keccak by ``test_refund_selector_is_keccak_of_the_signature``).
-ETH_REFUND_SELECTOR = bytes.fromhex("590e1ae3")
+#: ``Erc20Htlc.sol``. Derived with the one Keccak helper (:mod:`pyrxd.eth_wallet.events`), so there is
+#: no literal to mistype; ``test_refund_selector_is_keccak_of_the_signature`` pins its value.
+ETH_REFUND_SELECTOR = function_selector("refund()")
 
 #: Typed-envelope field layouts: ``type -> (index of to, index of data, field count)``.
 #: EIP-2930 (1), EIP-1559 (2), EIP-4844 (3, canonical form without the blob sidecar), EIP-7702 (4).
 _TYPED_TX_LAYOUT = {1: (4, 6, 11), 2: (5, 7, 12), 3: (5, 7, 14), 4: (5, 7, 13)}
 _LEGACY_TX_LAYOUT = (3, 5, 9)
 _RLP_MAX_DEPTH = 8  # an access/authorization list nests 3 deep; bounds recursion on hostile bytes
-
-
-def _keccak256(data: bytes) -> bytes:
-    from Cryptodome.Hash import keccak  # pycryptodomex — a base dependency, not the [eth] extra
-
-    return keccak.new(digest_bits=256, data=bytes(data)).digest()
 
 
 def _rlp_item(data: bytes, pos: int, depth: int = 0) -> tuple[bytes | list[Any], int]:
@@ -1029,7 +1025,7 @@ def verify_raw_eth_tx(raw: bytes | str, expected_hash: str) -> VerifiedEthTx:
         the bytes are not a transaction pyrxd can decode.
     """
     blob = _hex_blob(raw) if isinstance(raw, str) else bytes(raw)
-    computed = "0x" + _keccak256(blob).hex()
+    computed = "0x" + keccak256(blob).hex()
     if not blob or not _same_address(computed, expected_hash):
         raise ProvenanceRefused(
             f"the raw transaction the RPC returned hashes to {computed}, not the requested {expected_hash!r} — "

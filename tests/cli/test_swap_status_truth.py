@@ -286,9 +286,9 @@ def _unsigned_raw(fields: list[Any], tx_type: int) -> tuple[str, str]:
     Encoded by pyrlp, independent of pyrxd's decoder. What a lying RPC can serve for free."""
     rlp = pytest.importorskip("rlp")
     raw = bytes([tx_type]) + rlp.encode(fields)
-    from pyrxd.cli.swap_recovery import _keccak256
+    from pyrxd.eth_wallet.events import keccak256
 
-    return "0x" + _keccak256(raw).hex(), "0x" + raw.hex()
+    return "0x" + keccak256(raw).hex(), "0x" + raw.hex()
 
 
 def _probe_unsigned_type2() -> tuple[str, str]:

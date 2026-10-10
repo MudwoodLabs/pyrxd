@@ -2828,6 +2828,7 @@ class SwapCoordinator:
         now_sampled_monotonic = _monotonic()
         if self.record.state is not SwapState.NEGOTIATED:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
+        self._refuse_to_overwrite_a_recorded_counter_leg(terms)
         btc_resume_tx = self._btc_resume_tx(terms)
         if btc_resume_tx is not None:
             landed = await self.counter_leg.read_confirmed_funding(terms, btc_resume_tx)
@@ -3041,6 +3042,39 @@ class SwapCoordinator:
                     raise NetworkError(msg) from exc
                 raise ValidationError(msg) from exc
         return await self._record_counter_lock(terms, locator)
+
+    def _refuse_to_overwrite_a_recorded_counter_leg(self, terms: NegotiatedTerms) -> None:
+        """Refuse a fund whose persist hook already holds THIS swap's counter leg in a record this
+        coordinator was not built from.
+
+        The fund persists its intent before broadcasting. A caller that built the coordinator on a
+        fresh NEGOTIATED record, instead of loading the one on disk, then overwrote the only record of
+        an earlier fund: the pending contract or funding transaction of an interrupted fund, or the
+        locator of a completed one. With the seen-store holding H the gate's reuse probe refuses
+        before that write; with a store that lost H (deleted, restored) the fund went ahead and put a
+        SECOND counter leg on chain under the same H. Checked first, before anything is read or
+        written. Applies when the persist hook can read back (``load_record``, as
+        :class:`~pyrxd.gravity.record_sink.JsonFileRecordSink` does); a different hashlock is the
+        sink's own refusal at the first write."""
+        load = getattr(self._persist, "load_record", None)
+        if not callable(load):
+            return
+        on_disk = load()
+        if on_disk is None or bytes(on_disk.terms.hashlock) != bytes(terms.hashlock):
+            return
+        handles = ("counterchain_locator", "pending_counter_contract", "pending_btc_funding_tx")
+        held = [
+            n for n in handles if getattr(on_disk, n) is not None and getattr(on_disk, n) != getattr(self.record, n)
+        ]
+        if on_disk.state is not SwapState.NEGOTIATED or held:
+            raise ValidationError(
+                f"the swap record at {getattr(self._persist, 'path', 'the persist hook')} already holds this swap's "
+                f"counter leg (state {on_disk.state.value}"
+                + (f"; {', '.join(held)}" if held else "")
+                + "), and this coordinator was not built from it. Nothing was sent and the record is unchanged. "
+                "Build the coordinator from that record (load_record) to resume or continue the swap; a fresh "
+                "fund here would overwrite the only reference to a contract or funding that may hold value"
+            )
 
     def _btc_resume_tx(self, terms: NegotiatedTerms) -> str | None:
         """The recorded BTC funding bytes when THIS call resumes an interrupted fund of THIS swap."""

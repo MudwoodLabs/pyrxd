@@ -83,13 +83,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
+    MAKER_ABORT_CONFIRM,
     add_eth_key_arguments,
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
     elapsed_reserve_blocks,
     merge_with_persisted_record,
+    prior_fund_record,
     refuse_by_persisted_state,
+    refuse_maker_abort_with_a_counter_leg,
     resolve_asset_locked_at_height,
     resolve_eth_key_file,
     wait_for_covenant_via_leg,
@@ -98,7 +101,7 @@ from _dust_swap_shared import (
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, assert_t_rxd_fits_the_eth_deadline
@@ -534,6 +537,25 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    # Before anything else, as the BTC runner does: the record an earlier fund of this swap left.
+    # Past NEGOTIATED refuses (already funded). An interrupted deploy refuses too: this runner holds
+    # no fund lock (see `_coordinator`), so it does not resume one, and a fresh fund built over that
+    # record used to overwrite the only reference to the deployed contract.
+    prior = prior_fund_record(_record_sink(args.local_out), terms=terms)
+    if prior is not None and prior.pending_counter_contract:
+        raise SystemExit(
+            f"REFUSING taker --phase fund: the swap record at {_record_sink(args.local_out).path} holds an "
+            f"interrupted fund: contract {prior.pending_counter_contract} (deploy "
+            f"{prior.pending_counter_deploy_tx}) was deployed for this swap and the fund did not complete. "
+            "Nothing was sent. This two-host runner does not resume a fund (it holds no fund lock).\n"
+            f"  The contract may hold value. Its deadline is unix {terms.eth_timeout_unix_s} "
+            f"({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(int(terms.eth_timeout_unix_s)))}); from then "
+            "on ANY account can call its refund(), which pays the contract's whole balance to its refundee "
+            "(your refund address), from any wallet or, for example:\n"
+            f"    cast send {prior.pending_counter_contract} 'refund()' --rpc-url <your RPC> --interactive\n"
+            "  A token contract whose push was never sent holds nothing, and its refund() reverts "
+            "(NothingToRefund)."
+        )
 
     # --- THE safety gate: check t_rxd against the COUNTER-CHAIN DEADLINE, from the envelope alone.
     #
@@ -824,7 +846,7 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
     terms = NegotiatedTerms.from_dict(env["terms"])
     _refuse_by_persisted_state(args, terms, phase="lock-claim")  # before any chain read
     funding = _read_public(io_dir, "taker_funding.json")
-    eth_loc = EthHtlcLocator.from_dict(funding["eth_locator"])
+    eth_loc = _maker_view(EthHtlcLocator.from_dict(funding["eth_locator"]))
 
     p_secret = SecretBytes(bytes.fromhex(local["preimage_p_hex"]))
     if hashlib.sha256(p_secret.unsafe_raw_bytes()).digest() != terms.hashlock:
@@ -1275,7 +1297,7 @@ async def maker_phase_refund(args: argparse.Namespace) -> None:
             "HTLC, so there is no mutual unwind and no BOTH_LOCKED record to drive. Use --phase abort "
             "(the covenant CSV refund) to recover the asset you locked."
         )
-    loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
+    loc = _maker_view(EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"]))
     maker_pkh = bytes.fromhex(local["maker_pkh_hex"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     cov = _rederive_covenant(args, terms=terms, taker_pkh=taker_pkh, maker_pkh=maker_pkh)
@@ -1348,7 +1370,9 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     primitive both coordinator refunds call and does not advance the FSM at all.
 
     Refuses once the taker HAS published a funded counter leg: that is the mutual unwind, and it
-    belongs in ``--phase refund`` where the coordinator's trigger and role guard apply.
+    belongs in ``--phase refund`` where the coordinator's trigger and role guard apply. Refuses as
+    well when this host's record holds a counter-leg locator (the taker did fund, whatever the
+    exchange directory holds now) or says this maker claimed the counter leg.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
@@ -1377,10 +1401,8 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     record = _merged_record(
         args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out, phase="abort"
     )
-    confirm(
-        "refund_asset: CSV-refund the RXD covenant to the maker (the taker never funded a counter leg)",
-        auto_yes=args.yes,
-    )
+    refuse_maker_abort_with_a_counter_leg(record, path=_record_sink(args.local_out).path)
+    confirm(MAKER_ABORT_CONFIRM, auto_yes=args.yes)
     # The leg's own P3 maturity self-check refuses before t_rxd with an exact "needs N, has M" a
     # block-based poller retries on, so there is nothing to pre-check here: this is the only
     # broadcast on this path, and a premature call cannot half-unwind anything.
@@ -1405,7 +1427,8 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None, phase=
     with the one this host persisted (``merge_with_persisted_record``, #850 PR R): the persisted
     fields are kept, the rebuild only fills what the record lacks, and a disagreement on the swap
     or contract identity refuses. ``record=None`` (the taker's fund) starts a fresh NEGOTIATED
-    record, as before.
+    record, once ``prior_fund_record`` has refused any record a fresh one would overwrite (the
+    coordinator refuses that write as well).
 
     The coordinator is ROLE-tagged (security review): this is a genuine two-party deployment, so the
     P3 role guard must be armed — without it a taker who mistakenly runs the maker-only
@@ -1464,6 +1487,19 @@ def _merged_record(args, rebuilt: SwapRecord, *, keys_out, phase: str) -> SwapRe
         role=args.role,
         phase=phase,
     )
+
+
+def _maker_view(loc: EthHtlcLocator) -> EthHtlcLocator:
+    """The taker's published locator as a MAKER records it: without the deploy transaction hash.
+
+    The hash is the taker's word, and nothing in the contract binds it; ``claim_status`` would start
+    its log scan at that transaction's block, so a later transaction named here could hide a real
+    claim from the scan. The maker's own verification cannot know the deploy either
+    (``EthLeg.expected_locator``), so the maker's record carries ``UNKNOWN_DEPLOY_TX_HASH``, which a
+    log scan refuses (the transaction does not exist) rather than trusts."""
+    import dataclasses
+
+    return dataclasses.replace(loc, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)
 
 
 def _io_dir(args) -> Path:

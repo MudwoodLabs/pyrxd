@@ -44,6 +44,7 @@ SWAP_RECORD_SCHEMA_VERSION = 2
 
 __all__ = [
     "ASSET_VARIANTS",
+    "REVEALED_STATES",
     "TERMINAL_STATES",
     "TRANSITIONS",
     "NegotiatedTerms",
@@ -200,6 +201,25 @@ _TRANSITION_TABLE: frozenset[tuple[SwapState, SwapEvent, SwapState]] = frozenset
 
 # The set of allowed (from, to) ordered pairs — the canonical "edges" view.
 TRANSITIONS: frozenset[tuple[SwapState, SwapState]] = frozenset((src, dst) for (src, _event, dst) in _TRANSITION_TABLE)
+
+
+def _reachable_from(start: SwapState) -> frozenset[SwapState]:
+    seen, todo = {start}, [start]
+    while todo:
+        src = todo.pop()
+        for s, dst in TRANSITIONS:
+            if s == src and dst not in seen:
+                seen.add(dst)
+                todo.append(dst)
+    return frozenset(seen)
+
+
+#: SECRET_REVEALED and every state reachable from it: the record says the maker's counter-leg
+#: claim was sent, so ``p`` may be public. Derived from the transition table; no edge leaves this
+#: set. :class:`pyrxd.gravity.record_sink.JsonFileRecordSink` never writes a state outside it over a
+#: record inside it: a runner retry rebuilds an earlier state in memory, and persisting that state
+#: would erase the only record that the reveal happened (#850 PR R review).
+REVEALED_STATES: frozenset[SwapState] = _reachable_from(SwapState.SECRET_REVEALED)
 
 
 def can_transition(src: SwapState, dst: SwapState) -> bool:

@@ -13,11 +13,13 @@ alone is faked, so every reply crosses the client's own parsing. Sync's operator
 :func:`pyrxd.cli.headers_cmds.operator_sources`; how that function groups configured endpoints
 into operators is tested on its own, against a real config.
 
-THE FLOOR TESTS NEED A DIVISOR OF 1. Real Radiant headers 17 blocks apart differ in work by a few
+THE FLOOR TESTS NEED A SMALL DIVISOR. Real Radiant headers 17 blocks apart differ in work by a few
 percent, never 16x, so the default ``FLOOR_WORK_DIVISOR`` cannot separate "the floor rests on the
 shipped checkpoint" from "the floor rests on the cached anchor" with real data. Those tests set the
-divisor to 1 for the verifier only, which leaves the rule under test (WHICH work the floor is taken
-from) unchanged and makes the two answers differ on real headers.
+divisor to 1 (or an exact Fraction just above 1), which leaves the rule under test (WHICH work the
+floor is taken from) unchanged and makes the two answers differ on real headers. There is ONE
+divisor, ``mark_block.FLOOR_WORK_DIVISOR``, which the cache reads at call time too, so a test sets
+it for the cache and the verifier alike, as production has it.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from collections.abc import Sequence
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -111,8 +114,36 @@ def test_the_fixture_is_what_these_tests_lean_on() -> None:
     work = {h: radiant_header_work(HEADERS[h]) for h in HEADERS}
     assert max(work, key=work.get) == 460566
     assert work[460575] < work[460576] < work[460566]
-    assert mark_block.FLOOR_WORK_DIVISOR is header_cache.FLOOR_WORK_DIVISOR == 16
+    assert mark_block.FLOOR_WORK_DIVISOR == 16
     assert type(mark_block.FLOOR_WORK_DIVISOR) is int, "an int: a float floor is inexact (see _floor_of)"
+
+
+def test_the_floor_divisor_has_one_source(monkeypatch) -> None:
+    """The cache and the verifier read ONE divisor, ``mark_block.FLOOR_WORK_DIVISOR``, at call time.
+    A copy imported by value let tests set the cache's to 1 while the verifier's stayed 16, a
+    combination production cannot have."""
+    assert not hasattr(header_cache, "FLOOR_WORK_DIVISOR"), "no second copy for a test to set apart"
+    w = radiant_header_work(HEADERS[START])
+    assert _chain(START, START).floor_work == w // 16
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
+    assert _chain(START, START).floor_work == w, "the cache's floor follows mark_block's divisor"
+
+
+def test_no_module_imports_the_floor_divisor_by_value() -> None:
+    """Derived over every module in src/: none binds ``FLOOR_WORK_DIVISOR`` with ``from ... import``,
+    so each reads mark_block's at call time (funding_spv did, until the panel round)."""
+    import ast
+
+    src = Path(__file__).resolve().parent.parent / "src" / "pyrxd"
+    files = sorted(src.rglob("*.py"))
+    assert len(files) > 50, "the scan found too few modules: it is broken"
+    by_value = [
+        f"{p.relative_to(src)}:{node.lineno}"
+        for p in files
+        for node in ast.walk(ast.parse(p.read_text()))
+        if isinstance(node, ast.ImportFrom) and any(a.name == "FLOOR_WORK_DIVISOR" for a in node.names)
+    ]
+    assert by_value == [], by_value
 
 
 # ── the pure core ───────────────────────────────────────────────────────────────────────────
@@ -231,6 +262,43 @@ def test_a_store_for_another_network_or_another_checkpoint_is_not_used(tmp_path)
     assert rebased is not None and (rebased.base_height, rebased.top) == (460570, TOP)
 
 
+@pytest.mark.parametrize(
+    ("case", "table_heights", "refused_at"),
+    [
+        ("an_intermediate_checkpoint", (START, 460568, 460570), 460568),
+        ("the_newest_checkpoint", (START, 460570), 460570),
+    ],
+)
+def test_a_store_that_links_but_is_not_a_shipped_checkpoint_is_refused(
+    monkeypatch, tmp_path, case: str, table_heights: tuple[int, ...], refused_at: int
+) -> None:
+    """Below the newest checkpoint only linkage is checked, so every checkpoint the stored headers
+    pass is pinned. The store here starts at a real shipped checkpoint and links hash by hash, but
+    leaves the real chain at 460,568 (the branch of :func:`_fork_branch`): the first checkpoint it
+    reaches above that refuses it, at an intermediate checkpoint or at the newest."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_branch_chain(monkeypatch), table=_table(START), path=path)
+    table = tuple((h, _hash(h)) for h in table_heights)
+    _, stored = decode_store(path.read_bytes())
+    chain, why = verify_header_chain("mainnet", START, stored, table=table)
+    assert chain is None
+    assert why == f"the stored header at {refused_at} is not the checkpoint this pyrxd ships for that height"
+    got = header_store.load("mainnet", table, path=path)
+    assert got.chain is None and got.untrusted and why in (got.note or "")
+    # Honest pair: the real chain over the same table verifies, rebased on the newest checkpoint.
+    real, why = verify_header_chain("mainnet", START, [HEADERS[h] for h in range(START, TOP + 1)], table=table)
+    assert why is None and real is not None and (real.base_height, real.top) == (table_heights[-1], TOP)
+
+
+def test_headers_that_end_below_the_newest_checkpoint_are_refused_not_an_index_error() -> None:
+    """``verify_header_chain`` is public: given headers from an older checkpoint that stop short of
+    the newest one, it refuses them (``load()`` reports such a store as stale before calling it, and
+    ``start_verified_headers`` always starts at the newest, but a direct caller reaches this)."""
+    table = ((START, _hash(START)), (460570, _hash(460570)))
+    chain, why = verify_header_chain("mainnet", START, [HEADERS[h] for h in range(START, 460568)], table=table)
+    assert chain is None and why == "the store ends at block 460567, below this pyrxd's newest checkpoint (460570)"
+
+
 def test_a_store_that_ends_below_the_newest_checkpoint_is_stale(tmp_path) -> None:
     path = tmp_path / "mainnet.bin"
     header_store.save(_chain(START, 460570), table=_table(START), path=path)
@@ -255,6 +323,45 @@ def test_a_write_that_fails_leaves_the_old_store_whole(tmp_path, monkeypatch) ->
         header_store.save(_chain(START, TOP), table=_table(START), path=path)
     assert path.read_bytes() == before
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir()), "the temporary file is removed"
+
+
+_KILLED_SAVE = """
+import os, signal, sys
+from pathlib import Path
+from pyrxd.cli import header_store
+from pyrxd.glyph.header_cache import start_verified_headers
+
+path, cp, cp_hash, header = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], bytes.fromhex(sys.argv[4])
+chain = start_verified_headers("mainnet", header, table=((cp, cp_hash),))
+header_store.os.replace = lambda src, dst: os.kill(os.getpid(), signal.SIGKILL)  # killed before the rename
+header_store.save(chain, table=((cp, cp_hash),), path=path)
+"""
+
+
+def test_a_save_cleans_up_the_temporary_file_a_killed_save_left(tmp_path) -> None:
+    """A save SIGKILLed between its fsync and its os.replace leaves its temporary file (no
+    ``finally`` runs). The next save of the same store removes it, under the lock, and touches no
+    other file. The orphan here is made by a real save in a real process killed at that point, so
+    its name is the one save() really uses."""
+    import signal
+    import subprocess
+    import sys
+
+    path = tmp_path / "mainnet.bin"
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+    args = [str(path), str(START), _hash(START), HEADERS[START].hex()]
+    done = subprocess.run([sys.executable, "-c", _KILLED_SAVE, *args], env=env, timeout=60, check=False)
+    assert done.returncode == -signal.SIGKILL, done
+    orphans = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert len(orphans) == 1 and orphans[0].startswith(".mainnet.bin.") and not path.exists(), orphans
+    # Files that are not this store's temporary files are left alone.
+    others = [".testnet.bin.1.deadbeef.tmp", ".mainnet.bin.notes.tmp", "mainnet.bin.1.deadbeef.tmp"]
+    for name in others:
+        (tmp_path / name).write_bytes(b"x")
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)
+    left = sorted(p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp"))
+    assert left == sorted(others), left
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
 
 
 def test_two_saves_at_once_cannot_shorten_the_store(tmp_path) -> None:
@@ -370,6 +477,50 @@ def test_two_operators_agreeing_extend_the_cache(monkeypatch, tmp_path) -> None:
     assert r2.exit_code == 0 and out2["state"] == "up to date" and out2["added"] == 0
 
 
+def _no_header_fetch(tip: int, headers: dict[int, bytes] | None = None) -> ElectrumXClient:
+    """An operator that fails ``blockchain.block.header``: the one RPC that fetches the checkpoint's
+    header, which a sync makes only when pyrxd does not ship it."""
+    return _operator(tip, headers, fail="blockchain.block.header")
+
+
+def test_the_shipped_checkpoint_header_is_used_without_fetching_it(monkeypatch, tmp_path) -> None:
+    """The REAL path: the newest checkpoint's header ships with pyrxd, so a first sync (and a
+    reset) starts from it and fetches nothing for it. Unpatched table and shipped header; the tip
+    the operators report puts nothing above the checkpoint deep enough, so no fixture header is
+    needed, and the reset writes the shipped header alone, which then reads back verified against
+    the real table."""
+    table, shipped = headers_cmds._shipped("mainnet")
+    cp_h, cp_hash = table[-1]
+    assert shipped is not None and radiant_block_hash(bytes.fromhex(shipped)) == cp_hash, "the shipped header"
+    ops = {k: _no_header_fetch(cp_h + 100) for k in ("operator:a", "operator:b")}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 0 and out["state"] == "up to date", r.output
+    two = [headers_cmds.OperatorSource(k, _no_header_fetch(cp_h + 100)) for k in ("operator:a", "operator:b")]
+    monkeypatch.setattr(headers_cmds, "operator_sources", lambda ctx: two)
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml"), "--json"]
+    r = CliRunner().invoke(cli, [*head, "headers", "sync", "--reset"])
+    out = json.loads(r.output)
+    assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == cp_h, r.output
+    back = header_store.load("mainnet", table)
+    assert back.chain is not None and back.chain.headers == (bytes.fromhex(shipped),)
+
+
+def test_a_shipped_checkpoint_header_is_used_only_when_it_hashes_to_the_checkpoint(monkeypatch, tmp_path) -> None:
+    """With the fixture's checkpoint: a shipped header that IS that checkpoint is used and nothing
+    fetches it; one that is not (another real header) is ignored, and the header is fetched from
+    the operators and agreed, as when none ships."""
+    _patch_table(monkeypatch, START)
+    monkeypatch.setitem(radiant_checkpoints.NEWEST_CHECKPOINT_HEADER, "mainnet", HEADERS[START].hex())
+    r, out = _sync(monkeypatch, tmp_path, {k: _no_header_fetch(DEEP) for k in ("operator:a", "operator:b")})
+    assert r.exit_code == 0 and out["state"] == "synced" and (out["cached_from"], out["cached_to"]) == (START, TOP)
+    header_store.store_path("mainnet").unlink()
+    monkeypatch.setitem(radiant_checkpoints.NEWEST_CHECKPOINT_HEADER, "mainnet", HEADERS[START + 1].hex())
+    r, out = _sync(monkeypatch, tmp_path, {k: _no_header_fetch(DEEP) for k in ("operator:a", "operator:b")})
+    assert r.exit_code == 2 and "operator is down" in out["reason"], "it was fetched, not taken from the table"
+    r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
+    assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == TOP
+
+
 def test_one_operator_is_refused_and_nothing_is_written(monkeypatch, tmp_path) -> None:
     _patch_table(monkeypatch, START)
     for json_out in (True, False):
@@ -396,9 +547,14 @@ def test_headers_shallower_than_288_below_the_lowest_tip_are_not_cached(monkeypa
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP + 50), "operator:b": _operator(DEEP - 1)})
     assert r.exit_code == 0, r.output
     assert out["cached_to"] == TOP - 1 and out["lowest_tip"] == DEEP - 1
+    # Headers were added, so it is "synced" (exit 0). With two operators neither tip is a strict
+    # minority, so the differing tips are listed and no one is named.
+    assert out["state"] == "synced" and out["held_back_by"] is None
+    assert "operators' tips differ" in out["reason"]
+    assert f"tip {DEEP - 1}: operator:b (1 of 2 answering, 2 configured)" in out["reason"]
     # Honest pair: at exactly 288 deep it is cached.
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
-    assert out["cached_to"] == TOP and out["added"] == 1
+    assert out["cached_to"] == TOP and out["added"] == 1 and out["held_back_by"] is None and out["reason"] is None
 
 
 def test_nothing_deep_enough_is_up_to_date_not_an_error(monkeypatch, tmp_path) -> None:
@@ -441,11 +597,154 @@ def test_operators_that_disagree_are_refused(monkeypatch, tmp_path) -> None:
     assert _cached(START) is None
 
 
+def test_a_disagreement_names_the_dissenting_operator(monkeypatch, tmp_path) -> None:
+    """Three operators, one serving another header at 460,575: the sync is still refused (a
+    disagreeing operator is never outvoted), and the refusal names THAT operator, not all three."""
+    _patch_table(monkeypatch, START)
+    other = _lie(460575, _renonced(HEADERS[460575]))
+    ops = {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP), "operator:c": _operator(DEEP, other)}
+    for json_out in (True, False):
+        r, out = _sync(monkeypatch, tmp_path, ops, json_out=json_out)
+        assert r.exit_code == 2, r.output
+        flat = _flat(r.output)
+        assert "disagree on the header at block 460575" in flat
+        assert "operator:c served a different header from the other 2 (operator:a, operator:b)" in flat
+        assert "never outvoted" in flat and "nothing was cached" in flat
+        if out:
+            assert out["state"] == "refused" and out["dissenters"] == ["operator:c"]
+        ops = {k: _operator(DEEP, other if k == "operator:c" else None) for k in ops}
+    assert _cached(START) is None
+
+
+def test_a_disagreement_with_no_majority_says_so_and_lists_the_groups() -> None:
+    got = [HEADERS[h] for h in range(START, START + 3)]
+    other = [got[0], _renonced(got[1]), got[2]]
+    for replies, groups in (
+        ({"operator:a": got, "operator:b": other}, ["operator:a", "operator:b"]),
+        (
+            {"operator:a": got, "operator:b": other, "operator:c": got, "operator:d": other},
+            ["operator:a, operator:c", "operator:b, operator:d"],
+        ),
+    ):
+        with pytest.raises(HeaderCacheRefusal) as caught:
+            agreed_headers(replies, START, 3)
+        why = str(caught.value)
+        assert f"disagree on the header at block {START + 1}, with no majority" in why, why
+        for group, served in zip(groups, (got[1], other[1])):
+            assert f"{group} served block hash {radiant_block_hash(served)}" in why, why
+        assert caught.value.dissenters == ()
+    # A reply that is not a header at all is its own group.
+    with pytest.raises(HeaderCacheRefusal, match=r"operator:c served something that is not a header") as caught:
+        agreed_headers({"operator:a": got, "operator:b": got, "operator:c": [got[0], None, got[2]]}, START, 3)
+    assert caught.value.dissenters == ("operator:c",)
+
+
+def test_a_strict_minority_low_tip_holding_the_sync_back_is_named_and_not_up_to_date(monkeypatch, tmp_path) -> None:
+    """The depth rule counts from the LOWEST tip, so a low tip holds every sync back. When the
+    operators at it are a STRICT MINORITY of the configured ones and it is the reason nothing was
+    added, the sync names them and exits 7, not "up to date" with 0."""
+    _patch_table(monkeypatch, START)
+    low = START + 100
+
+    def ops3(low_tip, high_tip):
+        return {"operator:a": _operator(high_tip), "operator:b": _operator(low_tip), "operator:c": _operator(high_tip)}
+
+    r, out = _sync(monkeypatch, tmp_path, ops3(low, DEEP + 50))
+    assert r.exit_code == headers_cmds.EXIT_SYNC_HELD_BACK == 7, r.output
+    assert out["state"] == "held back" and out["added"] == 0 and out["held_back_by"] == ["operator:b"]
+    assert out["tips"] == {"operator:a": DEEP + 50, "operator:b": low, "operator:c": DEEP + 50}
+    assert f"operator:b reported tip {low}" in out["reason"] and f"({DEEP + 50})" in out["reason"]
+    assert _cached(START) is None
+    r, _ = _sync(monkeypatch, tmp_path, ops3(low, DEEP + 50), json_out=False)
+    assert r.exit_code == 7 and "HELD BACK" in r.output and "operator:b reported tip" in _flat(r.output)
+    # Honest pair: equal tips with nothing deep enough is "up to date", exit 0, no one named.
+    r, out = _sync(monkeypatch, tmp_path, ops3(low, low))
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None
+    # The ordinary lag just after a block: a tip a block or two lower (below HELD_BACK_MIN_GAP) is
+    # named in the note but stays "up to date", exit 0. A non-zero status for routine propagation
+    # would be wrong most times it fired.
+    at_edge = START + CACHE_MIN_DEPTH  # this tip admits nothing past START; one block more admits one
+    gap = headers_cmds.HELD_BACK_MIN_GAP - 1
+    r, out = _sync(monkeypatch, tmp_path, ops3(at_edge, at_edge + gap))
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["added"] == 0, r.output
+    assert out["held_back_by"] == ["operator:b"] and f"operator:b reported tip {at_edge}" in out["reason"]
+    # At the gap itself it is held back.
+    r, out = _sync(monkeypatch, tmp_path, ops3(at_edge, at_edge + gap + 1))
+    assert r.exit_code == 7 and out["state"] == "held back", r.output
+
+
+def test_one_high_tip_does_not_blame_the_honest_majority(monkeypatch, tmp_path) -> None:
+    """A tip height is unauthenticated. Three operators at T and one reporting T+100000: the three
+    are not a minority, so no one is named, the tips are listed, and the exit is 0 (the review's
+    case: it used to name all three and tell them to check they follow the live chain)."""
+    _patch_table(monkeypatch, START)
+    t = START + 100
+
+    def ops():
+        out = {k: _operator(t) for k in ("operator:a", "operator:b", "operator:c")}
+        out["operator:d"] = _operator(t + 100_000)
+        return out
+
+    r, out = _sync(monkeypatch, tmp_path, ops())
+    assert r.exit_code == 0 and out["state"] == "up to date", r.output
+    assert out["held_back_by"] is None
+    assert "operators' tips differ" in out["reason"]
+    assert f"tip {t + 100_000}: operator:d (1 of 4 answering, 4 configured)" in out["reason"]
+    assert f"tip {t}: operator:a, operator:b, operator:c (3 of 4 answering, 4 configured)" in out["reason"]
+    assert "follows the live chain" not in out["reason"]
+    r, _ = _sync(monkeypatch, tmp_path, ops(), json_out=False)
+    assert r.exit_code == 0 and "HELD BACK" not in r.output and "tips:" in r.output
+
+
+def test_two_operators_that_differ_blame_neither(monkeypatch, tmp_path) -> None:
+    """With two operators nothing says which tip is wrong: neither is a strict minority."""
+    _patch_table(monkeypatch, START)
+    low = START + 100
+    r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP + 50), "operator:b": _operator(low)})
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None, r.output
+    assert "operators' tips differ" in out["reason"] and "not a strict minority" in out["reason"]
+
+
+def test_an_unreachable_operator_counts_for_neither_side(monkeypatch, tmp_path) -> None:
+    """Three configured, one unreachable, one low, one high: a two-answerer split, so no one is
+    blamed and the exit is 0, and the counts say 1 of 2 answering (3 configured). Counting the
+    unreachable one against the low tip named operator:b and said 2 operators reported the higher tip."""
+    _patch_table(monkeypatch, START)
+    low = START + 100
+    ops = {
+        "operator:a": _operator(DEEP + 50),
+        "operator:b": _operator(low),
+        "operator:c": _operator(DEEP + 50, fail="blockchain.headers.subscribe"),
+    }
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None, r.output
+    assert "operator:c" in out["unreachable"]
+    assert f"tip {low}: operator:b (1 of 2 answering, 3 configured)" in out["reason"]
+    assert f"tip {DEEP + 50}: operator:a (1 of 2 answering, 3 configured)" in out["reason"]
+
+
+def test_the_counts_are_exact_per_tip(monkeypatch, tmp_path) -> None:
+    """Tips low / mid / high among three answering: the low one is a strict minority and is named,
+    and each tip's own count is given (the mid tip was reported by one operator, not two)."""
+    _patch_table(monkeypatch, START)
+    low, mid, high = START + 100, DEEP + 50, DEEP + 80
+    ops = {"operator:a": _operator(high), "operator:b": _operator(low), "operator:c": _operator(mid)}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 7 and out["held_back_by"] == ["operator:b"], r.output
+    for tip, op in ((low, "operator:b"), (mid, "operator:c"), (high, "operator:a")):
+        assert f"tip {tip}: {op} (1 of 3 answering, 3 configured)" in out["reason"], out["reason"]
+    # 2 of 3 at the low tip is not a minority: no one named.
+    ops = {"operator:a": _operator(high), "operator:b": _operator(low), "operator:c": _operator(low)}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 0 and out["held_back_by"] is None, r.output
+    assert f"tip {low}: operator:b, operator:c (2 of 3 answering, 3 configured)" in out["reason"]
+
+
 def test_a_header_below_the_floor_ends_the_sync_and_keeps_what_is_under_it(monkeypatch, tmp_path) -> None:
     """An honest difficulty drop is not a lie: the agreed headers below it are cached, and why it
     stopped is said. (Divisor 1: see the module docstring.) 460,575's work is the floor; 460,576
     and 460,577 carry more, 460,578 less."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, 460575)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
     assert r.exit_code == 6, r.output
@@ -471,7 +770,7 @@ def test_a_lie_in_the_second_request_writes_nothing(monkeypatch, tmp_path) -> No
 
 
 def test_a_floor_stop_in_the_second_request_keeps_the_first(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     monkeypatch.setattr(headers_cmds, "MAX_HEADERS_PER_REQUEST", 2)
     _patch_table(monkeypatch, 460575)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
@@ -822,7 +1121,7 @@ def _sync2(monkeypatch, tmp_path, stop: int):
 def test_the_sync_floor_rises_with_the_cached_median(monkeypatch, tmp_path) -> None:
     w = {h: radiant_header_work(HEADERS2[h]) for h in range(CP2, CP2 + 4)}
     assert w[CP2] < w[CP2 + 3] < sorted([w[CP2], w[CP2 + 1], w[CP2 + 2]])[1], "the work pattern this test needs"
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, CP2)
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 2)
     assert r.exit_code == 0 and out["cached_to"] == CP2 + 2
@@ -856,7 +1155,7 @@ def test_advice_rerun_when_the_added_headers_move_the_floor(monkeypatch, tmp_pat
     the header the first sync stopped at. Real headers 460,564..460,569 with a divisor of 1.0065, exact (a
     test-scale ratio; see the module docstring): the cache holds 460,564..460,566; a sync adds
     460,567 and stops at 460,568; the next floor (computed exactly, not as a power of two) admits it."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
     _patch_table(monkeypatch, START)
     ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
     r, out = _sync(monkeypatch, tmp_path, ops(START + 2))
@@ -874,7 +1173,7 @@ def test_advice_rerun_when_the_added_headers_move_the_floor(monkeypatch, tmp_pat
 def test_advice_upgrade_when_nothing_this_release_can_use_admits_the_header(monkeypatch, tmp_path) -> None:
     """The upgrade branch. Divisor 1, checkpoint 460,566 (the most work of the stretch): 460,567 is
     below the checkpoint's own floor, so neither a re-run nor a reset can cache it."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, 460566)
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
     assert r.exit_code == 6 and out["state"] == "stopped" and out["advice"] == "upgrade"
@@ -907,12 +1206,12 @@ def test_a_stopped_reset_keeps_the_existing_cache(monkeypatch, tmp_path) -> None
     _patch_table(monkeypatch, 460566)
     _store(460566, TOP)
     before = header_store.store_path("mainnet").read_bytes()
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     r, out = _reset(monkeypatch, tmp_path, DEEP)
     assert r.exit_code == 6 and out["state"] == "stopped" and out["added"] == 0
     assert "was kept unchanged" in out["stopped"]
     assert header_store.store_path("mainnet").read_bytes() == before
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 16)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 16)
     assert _cached(460566).top == TOP  # type: ignore[union-attr]
 
 
@@ -974,7 +1273,7 @@ def test_sync_records_accumulate_on_disk(tmp_path) -> None:
 def test_a_sync_does_not_raise_its_own_bar_one_header_per_request(monkeypatch, tmp_path) -> None:
     """The bar is fixed once per SYNC, not per request: with one header per request, recomputing it
     per request would take the median of 468,524..468,526 and refuse 468,527."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     monkeypatch.setattr(headers_cmds, "MAX_HEADERS_PER_REQUEST", 1)
     _patch_table(monkeypatch, CP2)
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 5)
@@ -984,7 +1283,7 @@ def test_a_sync_does_not_raise_its_own_bar_one_header_per_request(monkeypatch, t
 def test_a_sync_does_not_raise_its_own_bar(monkeypatch, tmp_path) -> None:
     """Honest pair: the same headers in ONE sync are held to the bar set before it began (the
     checkpoint's, as nothing else was cached), so 468,527 is cached."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     _patch_table(monkeypatch, CP2)
     r, out = _sync2(monkeypatch, tmp_path, CP2 + 5)
     assert r.exit_code == 0 and out["cached_to"] == CP2 + 5 and out["stopped"] is None
@@ -1027,24 +1326,37 @@ def test_a_cache_built_against_another_table_is_a_programming_error() -> None:
 
 # ── THE FLOOR: never lowered by headers the cache supplied ──────────────────────────────────
 #
-# Checkpoint 460,566 carries the most work of the 17 headers; the cache holds 460,566..460,575.
-# The mark (460,572) with 6 confirmations needs 460,576 and 460,577 above the cached anchor
-# (460,575). Both carry MORE work than the anchor and LESS than the checkpoint. With divisor 1, a
-# floor resting on the checkpoint refuses them; one resting on the cached anchor alone would pass.
+# Checkpoint 460,566 carries the most work of the 17 headers; the cache holds 460,566..460,574.
+# The mark (460,572) with 6 confirmations needs 460,575..460,577 above the cached anchor (460,574).
+# ONE divisor, read by the cache and the verifier alike (a cache held to a looser divisor than the
+# verifier is a combination production cannot have): 1.033, exact. Every cached header meets the
+# checkpoint's floor under it, so the store is whole; 460,575 does not, though it meets the floor a
+# rule resting on the cached anchor ALONE would set.
+
+_ANCHOR_D = Fraction(1033, 1000)
 
 
 def test_a_cached_anchor_does_not_lower_the_floor(monkeypatch, tmp_path) -> None:
+    w = {h: radiant_header_work(HEADERS[h]) for h in range(460566, 460578)}
+    cp_floor, anchor_floor = int(w[460566] // _ANCHOR_D), int(w[460574] // _ANCHOR_D)
+    assert all(w[h] >= cp_floor for h in range(460567, 460575)), "the cache can hold 460,567..460,574"
+    assert anchor_floor <= w[460575] < cp_floor, "the anchor-only floor would admit 460,575; the rule's does not"
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", _ANCHOR_D)
     _patch_table(monkeypatch, 460566)
-    _store(460566, 460575)
-    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
+    _store(460566, 460574)
+    assert _cached(460566).top == 460574, "the store re-reads whole under the same divisor"  # type: ignore[union-attr]
     out = json.loads(_verify(monkeypatch, tmp_path).output)
     bv = out["mark_anchor"]["block_verification"]
-    assert bv["cached_anchor_height"] == 460575
+    assert bv["cached_anchor_height"] == 460574
     assert bv["state"] == "NOT VERIFIED", bv["claim"]
     assert dict(bv["steps"])["floor"] == "failed"
-    assert "the header at 460576 carries less work than the floor" in bv["reason"]
-    assert "the greater of checkpoint 460566's and cached header 460575's" in bv["reason"]
+    assert "the header at 460575 carries less work than the floor" in bv["reason"]
+    assert "the greater of checkpoint 460566's and cached header 460574's" in bv["reason"]
     assert out["mark_anchor"]["height_is_verified"] is False
+    # Honest pair: at the shipped divisor the same store verifies from the same cached anchor.
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 16)
+    bv = json.loads(_verify(monkeypatch, tmp_path).output)["mark_anchor"]["block_verification"]
+    assert bv["state"] == "VERIFIED" and bv["cached_anchor_height"] == 460574, bv["reason"]
 
 
 def test_the_same_cached_anchor_verifies_at_the_real_floor(monkeypatch, tmp_path) -> None:
@@ -1064,10 +1376,9 @@ def test_a_cached_anchor_with_more_work_raises_the_floor(monkeypatch, tmp_path) 
     divisor 1, a floor resting on the checkpoint alone would pass 468,527; this one refuses it."""
     w = {h: radiant_header_work(HEADERS2[h]) for h in (468524, 468525, 468526, 468527)}
     assert w[468524] < w[468527] < w[468525] < w[468526], "the work pattern this test needs"
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)  # one source: the cache's and the verifier's
     _patch_table(monkeypatch, 468524)
     _store(468524, 468525)
-    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     bv = json.loads(_verify(monkeypatch, tmp_path, conf=7, txid=TXID2).output)["mark_anchor"]["block_verification"]
     assert bv["cached_anchor_height"] == 468525
     assert bv["state"] == "NOT VERIFIED" and "the header at 468527 carries less work than the floor" in bv["reason"]
@@ -1103,10 +1414,9 @@ def test_a_server_cannot_switch_the_cache_off_to_get_a_lower_floor(monkeypatch, 
     """Regression (hostile review A1): a server that makes the cache disagree must not get the
     fallback's checkpoint-only floor where an honest server is held to the cached anchor's.
     Setup as in the test above: an honest server gets NOT VERIFIED (468,527 below the floor)."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", 1)
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)  # one source: the cache's and the verifier's
     _patch_table(monkeypatch, 468524)
     _store(468524, 468525)
-    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", 1)
     honest = json.loads(_verify(monkeypatch, tmp_path, conf=7, txid=TXID2).output)["mark_anchor"]
     assert honest["block_verification"]["state"] == "NOT VERIFIED"
     server = _steering_server()
@@ -1129,7 +1439,7 @@ def test_a_float_divisor_is_refused() -> None:
     """``int(W // 16.0)`` is inexact on real work; the floor refuses a float divisor outright."""
     mp = pytest.MonkeyPatch()
     try:
-        mp.setattr(header_cache, "FLOOR_WORK_DIVISOR", 16.0)
+        mp.setattr(mark_block, "FLOOR_WORK_DIVISOR", 16.0)
         with pytest.raises(ValidationError, match="positive int"):
             header_cache.sync_floor(_chain(START, START))
     finally:
@@ -1143,7 +1453,7 @@ def test_following_the_advice_never_loops(monkeypatch, tmp_path) -> None:
     stops at 460,567 and advises `--reset`; the reset passes 460,567 and stops at 460,568, and is
     SAVED, because it agrees with the cache and extends it; its advice is then computed from that
     saved cache. Following every piece of advice ends, and no step repeats."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(1004, 1000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(1004, 1000))
     _patch_table(monkeypatch, START)
     ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
     _, out = _sync(monkeypatch, tmp_path, ops(START + 2))
@@ -1172,7 +1482,7 @@ def test_following_the_advice_never_loops(monkeypatch, tmp_path) -> None:
 def test_a_failed_save_withdraws_the_advice(monkeypatch, tmp_path) -> None:
     """A stopped sync that added headers but could not write them gives no advice: its premise
     (the cache it would have left) is not on disk."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(10065, 10000))
     _patch_table(monkeypatch, START)
     ops = lambda stop: {k: _operator(stop + CACHE_MIN_DEPTH) for k in ("operator:a", "operator:b")}  # noqa: E731
     _sync(monkeypatch, tmp_path, ops(START + 2))
@@ -1242,7 +1552,7 @@ def test_a_stopped_reset_that_disagrees_and_reaches_past_the_top_replaces_the_st
     and a reset that stops at 460,571, past the store's top: it is written, though it disagrees,
     so the user is not left on the abandoned branch. Divisor 1.015 (exact), so the reset's floor
     (the checkpoint's alone) admits 460,570 and not 460,571."""
-    monkeypatch.setattr(header_cache, "FLOOR_WORK_DIVISOR", Fraction(1015, 1000))
+    monkeypatch.setattr(mark_block, "FLOOR_WORK_DIVISOR", Fraction(1015, 1000))
     _patch_table(monkeypatch, START)
     branch = _fork_branch()[:2]
     real = header_cache.verify_radiant_header_pow
@@ -1261,3 +1571,109 @@ def test_a_stopped_reset_that_disagrees_and_reaches_past_the_top_replaces_the_st
     saved = header_store.load("mainnet", _table(START))
     assert saved.chain.headers == tuple(HEADERS[h] for h in range(START, 460571))  # type: ignore[union-attr]
     assert saved.syncs[-1].get("reset") is True, "the record of a written stopped reset keeps the flag"
+
+
+def _branch_chain(monkeypatch) -> VerifiedHeaders:
+    """A verified chain START..460,570 on the branch of :func:`_fork_branch` (it leaves the real
+    chain at 460,568). Only the cache's proof-of-work check is told to accept the branch headers."""
+    branch = _fork_branch()
+    real = header_cache.verify_radiant_header_pow
+    monkeypatch.setattr(
+        header_cache,
+        "verify_radiant_header_pow",
+        lambda h, **kw: radiant_block_hash(h) if h in branch else real(h, **kw),
+    )
+    chain, stopped = extend_verified_headers(_chain(START, 460567), branch)
+    assert stopped is None and chain.top == 460570 and chain.header_at(460568) != HEADERS[460568]
+    return chain
+
+
+def test_a_plain_save_of_another_branch_is_refused_and_the_store_is_unchanged(monkeypatch, tmp_path) -> None:
+    """The append-only rule's "different header" clause, on its own: the branch chain reaches PAST
+    the store's top (460,569 -> 460,570), so only that clause can refuse it."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460569), table=_table(START), record={"to": 460569}, path=path)
+    before = path.read_bytes()
+    branch = _branch_chain(monkeypatch)
+    assert branch.top > 460569, "longer than the store: the shorter-chain clause cannot be what refuses it"
+    with pytest.raises(header_store.AppendOnlyRefusal, match="holds a different header at block 460568"):
+        header_store.save(branch, table=_table(START), record={"to": 460570}, path=path)
+    assert path.read_bytes() == before, "the store is byte for byte what it was"
+    # The reset path, per the module docstring: a completed rebuild that disagrees replaces it.
+    header_store.save(branch, table=_table(START), record={"to": 460570, "reset": True}, path=path, reset=True)
+    got = header_store.load("mainnet", _table(START), path=path)
+    assert got.chain is not None and got.chain.headers == branch.headers
+    assert got.syncs == ({"to": 460569}, {"to": 460570, "reset": True})
+
+
+def test_a_reset_save_keeps_a_store_it_would_only_shorten(tmp_path) -> None:
+    """``save(reset=True)``'s two ResetKeptExisting cases, at the store: a rebuild that AGREES and
+    ends below the top, and a STOPPED rebuild (``past_top_only``) that does not reach past it. Each
+    leaves the file byte for byte unchanged; a rebuild reaching at least the top is written."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460575), table=_table(START), path=path)
+    before = path.read_bytes()
+    with pytest.raises(header_store.ResetKeptExisting, match="agrees with the existing cache"):
+        header_store.save(_chain(START, 460570), table=_table(START), path=path, reset=True)
+    assert path.read_bytes() == before
+    with pytest.raises(header_store.ResetKeptExisting, match="not past the existing cache's top"):
+        header_store.save(_chain(START, 460575), table=_table(START), path=path, reset=True, past_top_only=True)
+    assert path.read_bytes() == before
+    # Honest pair: a stopped rebuild reaching past the top is written.
+    header_store.save(_chain(START, TOP), table=_table(START), path=path, reset=True, past_top_only=True)
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
+
+
+# ── a store whose metadata is hostile JSON ───────────────────────────────────────────────────
+
+
+def _store_bytes(blob: bytes, headers: Sequence[bytes] = ()) -> bytes:
+    """Store bytes with *blob* as the metadata and a CORRECT checksum: past every shape check that
+    runs before the metadata is parsed."""
+    import hashlib
+
+    body = b"pyrxd-header-cache\n" + len(blob).to_bytes(4, "big") + blob + b"".join(headers)
+    return body + hashlib.sha256(body).digest()
+
+
+def _deep_metadata() -> dict[str, bytes]:
+    deep = "[" * 100_000 + "]" * 100_000
+    good, _ = decode_store(encode_store(_chain(START, TOP)))
+    within = json.dumps({**good, "syncs": ["@"]}, sort_keys=True).replace('"@"', deep)
+    # Shallow enough to parse, and still deeper than any record pyrxd writes (records are flat).
+    shallow = json.dumps({**good, "syncs": [{"x": "@"}]}, sort_keys=True).replace('"@"', "[" * 40 + "]" * 40)
+    return {
+        "the_whole_metadata": deep.encode(),
+        "inside_the_sync_records": within.encode(),
+        "nested_deeper_than_any_record_pyrxd_writes": shallow.encode(),
+    }
+
+
+@pytest.mark.parametrize("case", list(_deep_metadata()), ids=list(_deep_metadata()))
+def test_deeply_nested_metadata_is_a_damaged_store_not_a_crash(monkeypatch, tmp_path, case: str) -> None:
+    """A valid checksum over metadata nested 100,000 deep made ``json.loads`` raise RecursionError
+    through ``load()``, crashing ``pyrxd verify`` and ``pyrxd headers status``/``sync``, and
+    ``sync --reset`` could not repair it. It is a damaged store: treated as empty, and replaced."""
+    headers = [HEADERS[h] for h in range(START, TOP + 1)]
+    data = _store_bytes(_deep_metadata()[case], headers)
+    with pytest.raises(header_cache.HeaderStoreCorrupt):
+        decode_store(data)
+    _patch_table(monkeypatch, START)
+    path = header_store.store_path("mainnet")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    got = header_store.load("mainnet", _table(START))
+    assert got.chain is None and got.untrusted and "is damaged" in (got.note or "")
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml")]
+    status = CliRunner().invoke(cli, [*head, "--json", "headers", "status"])
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.output)["state"] == "untrusted"
+    human = CliRunner().invoke(cli, [*head, "headers", "status"])
+    assert human.exit_code == 0 and "UNTRUSTED" in human.output, human.output
+    # `pyrxd verify` runs as with no cache.
+    bv = json.loads(_verify(monkeypatch, tmp_path).output)["mark_anchor"]["block_verification"]
+    assert bv["state"] == "VERIFIED" and bv["cached_anchor_height"] is None
+    # And `pyrxd headers sync --reset` replaces it.
+    r, out = _reset(monkeypatch, tmp_path, DEEP)
+    assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == TOP, out
+    assert _cached(START).headers == tuple(headers)  # type: ignore[union-attr]

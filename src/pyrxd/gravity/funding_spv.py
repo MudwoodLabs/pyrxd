@@ -189,8 +189,8 @@ from typing import Any
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.constants import GENESIS_BLOCK_HASHES
 from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS
+from pyrxd.glyph import mark_block as _mark_block  # FLOOR_WORK_DIVISOR read at call time: one source
 from pyrxd.glyph.mark_block import (
-    FLOOR_WORK_DIVISOR,
     MAX_HEADERS_PER_REQUEST,
     VERIFIED,
     plan_block_verification,
@@ -743,7 +743,7 @@ def forged_confirmation_cost_floor_photons(
     newest_h = chain.checkpoints[-1][0]
     subsidy = block_subsidy_photons(newest_h + cap, chain)
     worst = math.ceil(Fraction(policy.early_work_margin) * last_max)
-    return subsidy * (cp_work // FLOOR_WORK_DIVISOR) // worst
+    return subsidy * (cp_work // _mark_block.FLOOR_WORK_DIVISOR) // worst
 
 
 def required_funding_confirmations(
@@ -879,7 +879,7 @@ def early_elapsed_blocks_upper(
     """
     last_max, cp_work = _shipped_work(chain)
     newest_h = chain.checkpoints[-1][0]
-    floor = cp_work // FLOOR_WORK_DIVISOR
+    floor = cp_work // _mark_block.FLOOR_WORK_DIVISOR
     c_lo = forged_confirmation_cost_floor_photons(chain, policy, cap=cap)
     k_hi, v_hi = required_funding_confirmations(
         value_bearing=chain.value_bearing,
@@ -1357,7 +1357,9 @@ def verify_maker_funding(
                 radiant_header_work(bytes(headers[h]), pow_limit=chain.pow_limit) for h in range(prev_h, newest_h + 1)
             )
         max_work = max(radiant_header_work(bytes(headers[h]), pow_limit=chain.pow_limit) for h in verified_heights)
-        floor_work = radiant_header_work(bytes(headers[newest_h]), pow_limit=chain.pow_limit) // FLOOR_WORK_DIVISOR
+        floor_work = (
+            radiant_header_work(bytes(headers[newest_h]), pow_limit=chain.pow_limit) // _mark_block.FLOOR_WORK_DIVISOR
+        )
     except (KeyError, TypeError, ValueError, ValidationError):
         raise refuse(
             "the last checkpoint interval could not be linked from the headers served, so the cost of a "

@@ -1098,6 +1098,36 @@ class TestMakerAbortUnlocksAnAssetTheTakerNeverMatched:
         assert "rxd" not in built
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    @pytest.mark.parametrize("state", [SwapState.SECRET_REVEALED, SwapState.COMPLETED])
+    async def test_it_refuses_when_the_record_says_the_maker_claimed(self, name, state, tmp_path, monkeypatch):
+        """taker_funding.json can be absent on this host (never copied, deleted) while the record
+        says this maker claimed the counter leg. Refunding the covenant then takes both legs."""
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=True)
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=state, pending=False))
+        (io_dir / "taker_funding.json").unlink()
+        built = _wire_eth(mod, monkeypatch) if eth else _wire_btc(mod, monkeypatch)
+        with pytest.raises(SystemExit, match="claimed the counter leg and revealed p"):
+            await mod.maker_phase_abort(_with_fee(args))
+        assert "rxd" not in built
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_it_refuses_when_the_record_holds_a_funded_counter_leg(self, name, tmp_path, monkeypatch):
+        """At a state the table allows (BTC_LOCKED), a counter-leg locator in this host's record says
+        the taker DID fund: abort is only for a taker that never funded."""
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=True)
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.BTC_LOCKED, pending=False))
+        (io_dir / "taker_funding.json").unlink()
+        built = _wire_eth(mod, monkeypatch) if eth else _wire_btc(mod, monkeypatch)
+        with pytest.raises(SystemExit, match="record holds a funded counter leg") as raised:
+            await mod.maker_phase_abort(_with_fee(args))
+        assert "Nothing was sent" in str(raised.value.code)
+        assert built["rxd"].refund_calls == []
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     async def test_without_a_fee_utxo_it_refuses_up_front_naming_the_flags(self, name, tmp_path, monkeypatch):
         """The gap #520 named: this path used to reach _NoFeeSource and raise from inside the
         transaction builder, which reads like a crash rather than a missing flag."""
@@ -1205,7 +1235,7 @@ async def _seed(args, record) -> None:
     await JsonFileRecordSink(_record_path(args))(record)
 
 
-def _seeded_record(terms, io_dir: Path, *, eth: bool, state: SwapState, pending: bool = True):
+def _seeded_record(terms, io_dir: Path, *, eth: bool, state: SwapState, pending: bool = True, maker: bool = False):
     """The record an earlier phase of this host left behind, holding every field scenario 19 names.
 
     FIXTURE NOTE: on ETH this carries the funded locator AND the pending deploy/push handles of the
@@ -1216,6 +1246,10 @@ def _seeded_record(terms, io_dir: Path, *, eth: bool, state: SwapState, pending:
     from pyrxd.gravity.swap_state import SwapRecord
 
     loc = _exchange_locator(io_dir, eth=eth)
+    if eth and maker:  # a maker records the taker's locator without its deploy hash (`_maker_view`)
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+
+        loc = dataclasses.replace(loc, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)
     env = json.loads((io_dir / "envelope.json").read_text())
     rec = (
         SwapRecord(state=state, terms=terms)
@@ -1282,7 +1316,58 @@ class _RevealAndFundingLeg(_FakeCounterLeg):
         self.provenance_checked.append(tx_hash)
 
     async def verify_counterparty_funded(self, ref, terms, **kw):
-        return self._loc
+        # The REAL leg's method, over a stand-in for the chain only, so the locator it returns has
+        # the shape production returns. Returning the exchange-file locator here hid #853's
+        # regression: the real ETH leg rebuilds the locator without the deploy hash.
+        return await _real_verify_counterparty_funded(self._loc, ref, terms, **kw)
+
+
+async def _real_verify_counterparty_funded(funded, ref, terms, **kw):
+    """``EthLeg`` / ``BitcoinTaprootLeg.verify_counterparty_funded`` itself, run over a stand-in
+    for the chain reads that reports *funded* as what is on chain. Everything the method builds
+    from the maker's own config and the terms is the shipped code."""
+    import types
+
+    from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
+    from pyrxd.eth_wallet.locator import EthHtlcLocator
+    from pyrxd.gravity.eth_leg import EthLeg
+
+    if isinstance(funded, EthHtlcLocator):
+
+        class _Contract:
+            chain_id = funded.chain_id
+            token = None
+
+            async def verify_funded(self, expected, *, expected_amount_wei, block_identifier=None):
+                for key, value in expected.to_dict().items():
+                    if key != "deploy_tx_hash" and value != funded.to_dict()[key]:
+                        raise ValidationError(f"the contract on chain does not match the expected {key}")
+
+        leg = types.SimpleNamespace(
+            _leg=_Contract(),
+            _claim_to=funded.claimant,
+            _refund_to=funded.refundee,
+            _eth_timeout_unix_s=funded.timeout,
+        )
+        leg.expected_locator = types.MethodType(EthLeg.expected_locator, leg)
+        return await EthLeg.verify_counterparty_funded(leg, ref, terms, **kw)
+
+    class _Reader:
+        async def read_confirmed_unspent_output(self, txid, vout):
+            return funded.scriptpubkey, funded.amount_sats
+
+        async def confirmations(self, txid):
+            return 10_000
+
+    leg = types.SimpleNamespace(
+        network=funded.network,
+        min_confirmations=1,
+        funding_reader=_Reader(),
+        _counterparty_outpoint=BitcoinTaprootLeg._counterparty_outpoint,  # a staticmethod
+    )
+    for name in ("_htlc", "derive_funding_scriptpubkey"):
+        setattr(leg, name, types.MethodType(getattr(BitcoinTaprootLeg, name), leg))
+    return await BitcoinTaprootLeg.verify_counterparty_funded(leg, ref, terms, **kw)
 
 
 def _btc_claim_tx(locator) -> bytes:
@@ -1353,7 +1438,9 @@ class TestEveryPhaseKeepsThePersistedRecord:
         args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role=role, phase=phase)
         # The maker's lock-claim re-attaches the verified locator through `with_counter_lock`, which
         # clears pending handles by design; a maker record never holds them anyway.
-        seeded = _seeded_record(terms, io_dir, eth=eth, state=start, pending=phase != "lock-claim")
+        seeded = _seeded_record(
+            terms, io_dir, eth=eth, state=start, pending=phase != "lock-claim", maker=role == "maker"
+        )
         await _seed(args, seeded)
         before = _kept_fields(_read_back(args))
         assert before == _kept_fields(seeded), "the fixture did not round-trip through the sink"
@@ -1388,6 +1475,240 @@ class TestEveryPhaseKeepsThePersistedRecord:
         assert len(built["rxd"].refund_calls) == 1
         assert built["rxd"].refund_calls[0].radiant_covenant_outpoint == pinned
         assert _read_back(args).radiant_covenant_outpoint == pinned
+
+
+class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
+    """The maker's lock-claim persists the locator its leg RE-DERIVES (``verify_counterparty_funded``),
+    and every later maker phase rebuilds one from taker_funding.json. On ETH the re-derived locator
+    has no deploy hash (the leg cannot know it), so a whole-locator compare refused the maker's
+    --phase refund and its lock-claim retry on every honest swap (#853). Starts from NO record, as an
+    honest first run does, and each phase is a fresh module: a process restart in between."""
+
+    async def _lock_claim_then(self, name: str, tmp_path, monkeypatch, *, then: str):
+        eth = name == "eth_swap_two_host"
+        args, _terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        persisted = _read_back(args)
+        assert persisted is not None and persisted.counterchain_locator is not None, "lock-claim persisted nothing"
+        if then == "refund":
+            built = await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
+            assert len(built["rxd"].refund_calls) == 1, "the maker's own asset refund did not run"
+        else:
+            await _run_phase(
+                name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at
+            )
+        return eth, io_dir, _read_back(args)
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    @pytest.mark.parametrize("then", ["refund", "lock-claim"])
+    async def test_the_next_maker_phase_runs(self, name, then, tmp_path, monkeypatch):
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+
+        eth, io_dir, after = await self._lock_claim_then(name, tmp_path, monkeypatch, then=then)
+        exchanged = _exchange_locator(io_dir, eth=eth)
+        if eth:
+            # The maker's record never holds the taker's deploy hash: it is the taker's word, and a
+            # log scan would start at it. Every bound field is the taker's contract.
+            assert after.counterchain_locator.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
+            exchanged = dataclasses.replace(exchanged, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)
+        assert after.counterchain_locator.to_dict() == exchanged.to_dict()
+
+    @pytest.mark.parametrize("then", ["refund", "lock-claim"])
+    async def test_a_record_holding_the_takers_deploy_hash_still_recovers(self, then, tmp_path, monkeypatch):
+        """A maker record written before this change can hold taker_funding.json's deploy hash, while
+        the phase now rebuilds the locator with the placeholder. The merge compares the locator
+        without the hash, so the phase runs."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        name = "eth_swap_two_host"
+        args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase=then)
+        spk = json.loads((io_dir / "envelope.json").read_text())["covenant_spk_hex"]
+        left = (
+            SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms)
+            .with_counter_lock(_exchange_locator(io_dir, eth=True))
+            .with_radiant_lock(_FAKE_COVENANT_OUTPOINT, spk)
+        )
+        await _seed(args, left)
+        built = await _run_phase(name, args, monkeypatch, role="maker", phase=then, counter_leg=leg, stop_at=stop_at)
+        if then == "refund":
+            assert len(built["rxd"].refund_calls) == 1
+        assert _read_back(args).counterchain_locator.contract_address == left.counterchain_locator.contract_address
+
+    @pytest.mark.parametrize("first", ["lock-claim", "refund"])
+    async def test_a_lying_deploy_hash_cannot_move_the_claim_scan_past_a_real_claim(self, first, tmp_path, monkeypatch):
+        """taker_funding.json names a LATER transaction as the deploy, past a real claim. The maker's
+        record must not carry it: ``claim_status`` starts its log scan at that transaction's block and
+        would report the claimed contract unclaimed. With the placeholder the scan refuses instead. Both
+        orders: after a lock-claim (the leg re-derives the locator) and a refund that is the first phase
+        to write the record (the locator comes from taker_funding.json alone)."""
+        from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, RpcEthChainSource
+
+        name = "eth_swap_two_host"
+        args, _terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        lie = "0x" + "66" * 32
+        doc = json.loads((io_dir / "taker_funding.json").read_text())
+        real_deploy = doc["eth_locator"]["deploy_tx_hash"]
+        doc["eth_locator"]["deploy_tx_hash"] = lie
+        (io_dir / "taker_funding.json").write_text(json.dumps(doc))
+        leg = _RevealAndFundingLeg(leg._p, _exchange_locator(io_dir, eth=True))
+        if first == "lock-claim":
+            await _run_phase(
+                name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at
+            )
+        await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
+        loc = _read_back(args).counterchain_locator
+        assert loc.deploy_tx_hash != lie
+
+        class _Chain:  # deploy at block 10, a real claim at 100, the lying tx at 500
+            blocks = {real_deploy: 10, lie: 500}
+
+            async def get_transaction(self, tx_hash):
+                if tx_hash not in self.blocks:
+                    raise NetworkError(f"eth_getTransactionByHash failed: {tx_hash} not found")
+                return {"blockNumber": self.blocks[tx_hash]}
+
+            async def get_logs(self, *, address, topics=None, from_block="earliest", to_block="latest"):
+                claim = {"topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32, "blockNumber": 100}
+                return [claim] if int(from_block) <= 100 else []
+
+        source = RpcEthChainSource(_Chain())
+        assert (await source.claim_status(loc.contract_address, real_deploy)).claimed  # control
+        assert not (await source.claim_status(loc.contract_address, lie)).claimed  # what the lie did
+        with pytest.raises(NetworkError):
+            await source.claim_status(loc.contract_address, loc.deploy_tx_hash)
+
+
+class TestARerunFundNeverOverwritesTheRecord:
+    """Re-running ``--phase fund`` used to build a fresh NEGOTIATED record whatever the file held. The
+    ETH runner now reads the record first as the BTC one does, and both refuse a record a fresh fund
+    would overwrite, before anything is read from a chain."""
+
+    async def test_eth_refuses_an_interrupted_deploy_and_leaves_the_record(self, eth_mod, tmp_path, monkeypatch):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=False)
+        await _seed(
+            args,
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=terms,
+                pending_counter_contract="0x" + "98" * 20,
+                pending_counter_deploy_tx="0x" + "97" * 32,
+                pending_push_nonce=3,
+            ),
+        )
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(eth_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="interrupted fund") as raised:
+            await eth_mod.taker_phase_fund(_with_fee(args))
+        msg = str(raised.value.code)
+        assert "0x" + "98" * 20 in msg and "Nothing was sent" in msg
+        # The next step: the deadline, that anyone can call refund() after it, and how.
+        assert f"unix {terms.eth_timeout_unix_s}" in msg and "ANY account can call its refund()" in msg
+        assert ("cast send 0x" + "98" * 20 + " 'refund()'") in msg
+        assert _record_path(args).read_bytes() == before
+        assert built == {}, "a leg was built before the refusal"
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_a_completed_fund_is_not_funded_again(self, name, tmp_path, monkeypatch):
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="taker", with_funding=True)
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.BTC_LOCKED, pending=False))
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(mod, monkeypatch) if eth else _wire_btc(mod, monkeypatch)
+        with pytest.raises(SystemExit, match="already on chain"):
+            await mod.taker_phase_fund(_with_fee(args))
+        assert _record_path(args).read_bytes() == before
+        assert built == {}
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_an_unreadable_record_refuses_the_fund(self, name, tmp_path, monkeypatch):
+        mod = _load(name)
+        args, _terms, _io = (_eth_scenario if name == "eth_swap_two_host" else _btc_scenario)(
+            mod, tmp_path, role="taker", with_funding=False
+        )
+        _record_path(args).write_text('{"state": "negot')
+        with pytest.raises(SystemExit, match="could not be read"):
+            await mod.taker_phase_fund(_with_fee(args))
+        assert _record_path(args).read_text() == '{"state": "negot'
+
+
+def test_every_maker_phase_reads_the_takers_eth_locator_through_maker_view():
+    """Structural, derived from the runner's source: in every ``maker_phase_*`` function, each
+    ``EthHtlcLocator.from_dict`` call is the direct argument of ``_maker_view``. The lock-claim's
+    record would not show a bypass (its verification replaces the locator before anything persists),
+    so this is what pins it there."""
+    tree = ast.parse((_SCRIPTS / "eth_swap_two_host.py").read_text())
+    makers = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name.startswith("maker_phase_")]
+    assert len(makers) >= 3, "the scan found too few maker phases: it is broken"
+    wrapped, reads = set(), []
+    for fn in makers:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_maker_view":
+                wrapped.update(id(a) for a in node.args)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "EthHtlcLocator.from_dict":
+                reads.append((fn.name, node))
+    assert {name for name, _ in reads} == {"maker_phase_lock_claim", "maker_phase_refund"}, reads
+    bare = [f"{name}:{node.lineno}" for name, node in reads if id(node) not in wrapped]
+    assert bare == [], f"a maker phase reads the taker's locator without _maker_view: {bare}"
+
+
+@pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+async def test_build_refund_does_not_read_the_files_the_runners_write(name, tmp_path, monkeypatch):
+    """The maker-revealed refusal says `pyrxd swap build-refund` does not apply to a two-host
+    record as it stands. That sentence is checked here: its parser refuses the envelope, the local
+    file and the swap record the runner leaves."""
+    from pyrxd.cli.swap_cmds import parse_recovery_file
+    from pyrxd.gravity.swap_state import SwapRecord
+
+    mod = _load(name)
+    eth = name == "eth_swap_two_host"
+    args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=True)
+    await _seed(args, SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms))
+    for path in (io_dir / "envelope.json", Path(args.local_out), _record_path(args)):
+        os.chmod(path, 0o600)
+        with pytest.raises((ValueError, ValidationError)):
+            parse_recovery_file(path)
+    assert "pyrxd swap build-refund" in _shared().PHASE_STATE_RULES[("maker", "refund")][SwapState.SECRET_REVEALED][1]
+
+
+class TestARetryNeverRewindsTheRecordOfTheReveal:
+    """A maker whose record says SECRET_REVEALED (the claim was sent, p may be public) but who lacks
+    maker_claim.json is told to re-run lock-claim. That retry rebuilds BTC_LOCKED and its first
+    coordinator step persists; if it then stops, the record must still say the reveal happened, or
+    the maker's next --phase refund takes the asset as well. Each phase is a fresh module: a process
+    restart in between."""
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    @pytest.mark.parametrize("revealed", [SwapState.SECRET_REVEALED, SwapState.COMPLETED])
+    async def test_a_stopped_lock_claim_retry_keeps_the_refund_refused(self, name, revealed, tmp_path, monkeypatch):
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=revealed, pending=False))
+        assert not (io_dir / "maker_claim.json").exists()
+
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        assert _read_back(args).state is revealed, "the retry moved the persisted record back before the reveal"
+
+        mod = _load(name)
+        built = (_wire_eth if eth else _wire_btc)(mod, monkeypatch)
+        _wire_rxd_height(mod, monkeypatch, tip=1_120, locked_at=1_000)
+        if revealed is SwapState.SECRET_REVEALED:
+            with pytest.raises(SystemExit, match="claimed the counter leg and revealed p"):
+                await mod.maker_phase_refund(_with_fee(argparse.Namespace(**vars(args))))
+        with pytest.raises(SystemExit, match="claimed the counter leg and revealed p"):
+            await mod.maker_phase_abort(_with_fee(argparse.Namespace(**vars(args))))
+        assert built.get("rxd") is None or built["rxd"].refund_calls == []
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_a_retry_from_before_the_reveal_still_persists_its_own_state(self, name, tmp_path, monkeypatch):
+        """The honest-path pair: from BOTH_LOCKED the lock-claim retry persists BTC_LOCKED as before."""
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.BOTH_LOCKED, pending=False))
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        assert _read_back(args).state is SwapState.BTC_LOCKED
 
 
 class TestADisagreementRefusesAndSendsNothing:
@@ -1429,6 +1750,60 @@ class TestADisagreementRefusesAndSendsNothing:
         with pytest.raises(SystemExit, match="counter-leg contract"):
             await eth_mod.taker_phase_abort(args)
         assert built["counter"].refund_calls == []
+
+    async def test_btc_taker_abort_refuses_a_pending_funding_that_is_not_the_funded_one(
+        self, btc_mod, tmp_path, monkeypatch
+    ):
+        """The BTC twin of the pending-contract check: a record holding an interrupted fund's
+        transaction whose txid is not the funding outpoint taker_funding.json names refuses."""
+        from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        payment = build_payment_tx(
+            generate_keypair("bcrt"),
+            BtcUtxo(txid="cd" * 32, vout=0, value=terms.btc_sats * 3),
+            to_hash=b"\x11" * 32,
+            to_type="p2tr",
+            amount_sats=terms.btc_sats,
+            fee_sats=1_000,
+        )
+        pending = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=payment.tx_hex)
+        assert pending.pending_btc_funding_txid != _exchange_locator(io_dir, eth=False).funding_outpoint.txid
+        await _seed(args, pending)
+        before = _record_path(args).read_bytes()
+        built = _wire_btc(btc_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="BTC funding transaction") as raised:
+            await btc_mod.taker_phase_abort(args)
+        assert "Nothing was sent" in str(raised.value.code)
+        assert built["counter"].refund_calls == []
+        assert _record_path(args).read_bytes() == before
+
+    async def test_btc_taker_abort_accepts_the_pending_funding_that_is_the_funded_one(
+        self, btc_mod, tmp_path, monkeypatch
+    ):
+        """The honest-path pair: the same pending transaction, and taker_funding.json naming its
+        output, merges, and the abort refunds the taker's own leg."""
+        from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        payment = build_payment_tx(
+            generate_keypair("bcrt"),
+            BtcUtxo(txid="cd" * 32, vout=0, value=terms.btc_sats * 3),
+            to_hash=b"\x11" * 32,
+            to_type="p2tr",
+            amount_sats=terms.btc_sats,
+            fee_sats=1_000,
+        )
+        pending = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=payment.tx_hex)
+        loc = _exchange_locator(io_dir, eth=False)
+        funded = dataclasses.replace(loc, funding_outpoint=bt.BtcOutpoint(pending.pending_btc_funding_txid, 0))
+        (io_dir / "taker_funding.json").write_text(json.dumps({"btc_locator": funded.to_dict()}))
+        await _seed(args, pending)
+        built = _wire_btc(btc_mod, monkeypatch)
+        await btc_mod.taker_phase_abort(args)
+        assert len(built["counter"].refund_calls) == 1
 
     async def test_btc_taker_refund_refuses_a_different_covenant_outpoint(self, btc_mod, tmp_path, monkeypatch):
         args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
@@ -1509,14 +1884,89 @@ class TestTheMergeHelperOnItsOwn:
         merged = self._merge(_record_path(args), rebuilt)
         assert merged.counterchain_locator.to_dict() == persisted_loc.to_dict()
 
-    async def test_an_unreadable_record_refuses(self, btc_mod, tmp_path):
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param(b'{"state": "btc_lo', id="torn"),
+            pytest.param(b"[" * 100_000 + b"]" * 100_000, id="nested-past-the-recursion-limit"),
+            pytest.param(b'{"state": "\xff"}', id="not-utf8"),
+        ],
+    )
+    async def test_an_unreadable_record_refuses(self, btc_mod, tmp_path, monkeypatch, data):
         from pyrxd.gravity.swap_state import SwapRecord
 
-        _args, terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        args, terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
         torn = tmp_path / "torn.swaprec.json"
-        torn.write_text('{"state": "btc_lo')
+        torn.write_bytes(data)
         with pytest.raises(SystemExit, match="could not be read"):
             self._merge(torn, SwapRecord(state=SwapState.BTC_LOCKED, terms=terms))
+        # And through a runner phase: the refusal, not a traceback.
+        _record_path(args).write_bytes(data)
+        _wire_btc(btc_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="could not be read"):
+            await btc_mod.taker_phase_abort(args)
+
+    def test_exactly_the_informational_locator_keys_are_left_out_of_the_compare(self, eth_mod, btc_mod, tmp_path):
+        """Derived from the real locators' wire keys: changing any key refuses except the ones in
+        LOCATOR_INFORMATIONAL_KEYS, and that set is exactly the deploy hash."""
+        from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+        sys.path.insert(0, str(_SCRIPTS))
+        import _dust_swap_shared as shared
+
+        assert frozenset({"deploy_tx_hash"}) == shared.LOCATOR_INFORMATIONAL_KEYS
+        _a, _t, eth_io = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True)
+        _a, _t, btc_io = _btc_scenario(btc_mod, tmp_path, role="maker", with_funding=True)
+        eth_loc = _exchange_locator(eth_io, eth=True)
+        token_loc = Erc20HtlcLocator(**eth_loc.to_dict(), token_address="0x" + "aa" * 20)
+
+        class _Wire:
+            def __init__(self, wire: dict) -> None:
+                self._wire = wire
+
+            def to_dict(self) -> dict:
+                return dict(self._wire)
+
+        ignored: set[str] = set()
+        for loc in (eth_loc, token_loc, _exchange_locator(btc_io, eth=False)):
+            wire = loc.to_dict()
+            for key in wire:
+                changed = _Wire({**wire, key: ("changed", wire[key])})
+                if shared._comparable(_Wire(wire), field="counterchain_locator") == shared._comparable(
+                    changed, field="counterchain_locator"
+                ):
+                    ignored.add(key)
+        assert ignored == {"deploy_tx_hash"}, ignored
+
+    async def test_the_persisted_value_wins_and_the_rebuild_fills_only_gaps(self, eth_mod, tmp_path):
+        """A field outside the binding set that differs keeps the PERSISTED value; one the record
+        lacks takes the rebuild's. A persisted deploy hash is kept whether real or the placeholder: the
+        rebuild's hash is the taker's word."""
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True)
+        loc = _exchange_locator(io_dir, eth=True)
+        path = _record_path(args)
+        base = SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms)
+
+        await _seed(args, dataclasses.replace(base.with_counter_lock(loc), single_operator_override="persisted"))
+        rebuilt = dataclasses.replace(
+            base.with_counter_lock(dataclasses.replace(loc, deploy_tx_hash="0x" + "56" * 32)),
+            single_operator_override="rebuilt",
+            radiant_covenant_spk_hex="ab" * 25,
+        )
+        merged = self._merge(path, rebuilt)
+        assert merged.single_operator_override == "persisted"
+        assert merged.counterchain_locator.deploy_tx_hash == loc.deploy_tx_hash
+        assert merged.radiant_covenant_spk_hex == "ab" * 25  # a gap, filled
+
+        # A maker's placeholder is kept, not replaced by a hash the rebuild names (the taker's word).
+        path.unlink()
+        await _seed(args, base.with_counter_lock(dataclasses.replace(loc, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)))
+        merged = self._merge(path, base.with_counter_lock(loc))
+        assert merged.counterchain_locator.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
+        assert merged.single_operator_override is None
 
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +2117,7 @@ class TestThePhaseStateTable:
         }
         expected = {("taker", phase, state) for phase in ("abort", "refund") for state in _P_PUBLIC}
         expected.add(("maker", "refund", SwapState.SECRET_REVEALED))
+        expected |= {("maker", "abort", SwapState.SECRET_REVEALED), ("maker", "abort", SwapState.COMPLETED)}
         assert refused == expected
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
@@ -1768,8 +2219,10 @@ class TestThePersistedStateGuardThroughTheRunners:
             # A claim retry must rewind the reveal it already recorded.
             ("taker", "claim", SwapState.SECRET_REVEALED, SwapState.SECRET_REVEALED),
             ("taker", "claim", SwapState.ASSET_VULNERABLE, SwapState.SECRET_REVEALED),
-            # A lock-claim retry after the maker's claim was sent (and may have been dropped).
-            ("maker", "lock-claim", SwapState.SECRET_REVEALED, SwapState.BTC_LOCKED),
+            # A lock-claim retry after the maker's claim was sent (and may have been dropped). It runs
+            # (its verification persists, then the run is stopped), and the record keeps the reveal:
+            # the record sink never writes a state before SECRET_REVEALED over one at or after it.
+            ("maker", "lock-claim", SwapState.SECRET_REVEALED, SwapState.SECRET_REVEALED),
             # The maker's refund after a covenant mismatch.
             ("maker", "refund", SwapState.PARAMS_MISMATCH, SwapState.ASSET_REFUNDED_TAKER_ACTS),
             # Re-sending a refund whose broadcast already wrote the terminal state.

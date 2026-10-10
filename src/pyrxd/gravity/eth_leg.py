@@ -29,7 +29,7 @@ import hashlib
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
 from pyrxd.eth_wallet.erc20 import is_blacklisted
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
-from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
+from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH, Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality
 from pyrxd.security.errors import ValidationError
 
@@ -204,12 +204,14 @@ class EthLeg:
         does NOT trust any counterparty-supplied locator. :meth:`verify_counterparty_funded` checks
         the on-chain contract at ``contract_address`` matches THIS expected locator, which is what
         binds the taker-deployed contract to 'pays the maker on claim, refunds the taker, on the
-        agreed H/amount/deadline'. ``deploy_tx_hash`` is informational (not bound on-chain)."""
+        agreed H/amount/deadline'. ``deploy_tx_hash`` is informational (not bound on-chain); without
+        one the locator carries ``UNKNOWN_DEPLOY_TX_HASH``. The runners' record merge does not
+        compare the field, and a log scan from it fails closed (no such transaction)."""
         common = {
             "chain_id": self._leg.chain_id,
             "contract_address": contract_address,
             "deploy_tx_hash": (
-                deploy_tx_hash if (deploy_tx_hash and deploy_tx_hash.startswith("0x")) else "0x" + "00" * 32
+                deploy_tx_hash if (deploy_tx_hash and deploy_tx_hash.startswith("0x")) else UNKNOWN_DEPLOY_TX_HASH
             ),
             "hashlock": "0x" + bytes(terms.hashlock).hex(),
             "claimant": self._claim_to,

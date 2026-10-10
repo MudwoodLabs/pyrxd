@@ -257,6 +257,29 @@ async def test_settled_without_a_verified_claim_is_never_concluded_refunded(tmp_
     assert sink.load_record().state is SwapState.BOTH_LOCKED
 
 
+async def test_a_scraped_value_that_does_not_open_H_is_never_reported_as_the_makers_claim(tmp_path):
+    """The coordinator re-checks ``sha256(p) == H`` itself rather than trusting the leg's scrape:
+    a leg (or a log source) that hands back a value which does not open H, with a provenance check
+    that would pass, must give (b), and the provenance check is never reached."""
+    import os
+
+    class _WrongValueLeg(_ChainEthLeg):
+        def scrape_secret(self, artifacts, hashlock) -> bytes:
+            self.calls.append("scrape")
+            return os.urandom(32)
+
+    secret, h = generate_secret()
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    eth = _WrongValueLeg(claimed=True, preimage=secret, verdict=_final())
+    coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=FakeRadiantLeg(), role=SwapRole.TAKER)
+    with pytest.raises(CounterLegSettledUnverified) as raised:
+        await coord.mutual_refund()
+    assert not isinstance(raised.value, CounterLegClaimedByCounterparty)
+    assert "scrape" in eth.calls, "the claim log was never followed: this test would pass vacuously"
+    assert "provenance" not in eth.calls
+    assert sink.load_record().state is SwapState.BOTH_LOCKED
+
+
 @pytest.mark.parametrize("case", ["not_yet_expired", "settled_flag_unreadable"])
 async def test_any_other_failure_propagates_the_original_error(tmp_path, case):
     """(c): not settled, or the settled flag cannot be read — the original error, unchanged."""

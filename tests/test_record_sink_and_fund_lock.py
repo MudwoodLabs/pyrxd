@@ -152,6 +152,35 @@ class TestLoadingBackIsFailClosed:
             pending_push_nonce=41,
         )
 
+    @pytest.mark.parametrize(
+        ("what", "data"),
+        [
+            pytest.param("deeply nested JSON", b"[" * 100_000 + b"]" * 100_000, id="nested"),
+            pytest.param(
+                "deeply nested inside an object",
+                b'{"state": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+                id="nested-in-object",
+            ),
+            pytest.param("bytes that are not UTF-8", b'{"state": "\xff\xfe"}', id="not-utf8"),
+        ],
+    )
+    def test_any_undecodable_file_is_a_classified_refusal_not_a_traceback(
+        self, tmp_path: Path, what: str, data: bytes
+    ) -> None:
+        """RecursionError and UnicodeDecodeError escaped `load()` as themselves, so a runner showed a
+        traceback instead of its "could not be read" refusal, and the coordinator's persist (which
+        loads first) raised something it could not classify."""
+        path = tmp_path / "swap.json"
+        path.write_bytes(data)
+        sink = JsonFileRecordSink(path)
+        with pytest.raises(ValidationError, match="could not be decoded|not valid JSON|not UTF-8"):
+            sink.load()
+        with pytest.raises(ValidationError):
+            sink.load_record()
+        with pytest.raises(ValidationError):
+            asyncio.run(sink(self._rec()))
+        assert path.read_bytes() == data, what
+
     def test_a_written_record_round_trips_as_a_SwapRecord(self, tmp_path: Path) -> None:
         """THE property the write side was missing. Not a dict — the real type, so `__post_init__`
         runs and the pending handle is validated on the way back in."""
@@ -280,3 +309,53 @@ class TestItRefusesToClobberADifferentSwap:
         with pytest.raises(ValidationError):
             asyncio.run(JsonFileRecordSink(path)(self._rec(b"\x33" * 32)))
         assert path.read_text() == '{"state": "negotiated", "ter', "the torn file was overwritten"
+
+
+class TestItNeverRewindsARecordedReveal:
+    """A write of a state before the reveal over a record at or after it keeps the state on disk
+    (#850 PR R review): a runner retry rebuilds an earlier state in memory, and writing it through
+    erased the only record that ``p`` may be public."""
+
+    def test_the_revealed_set_is_derived_from_the_transition_table(self) -> None:
+        from pyrxd.gravity.swap_state import REVEALED_STATES, TRANSITIONS, SwapState
+
+        assert {
+            SwapState.SECRET_REVEALED,
+            SwapState.COMPLETED,
+            SwapState.ASSET_VULNERABLE,
+            SwapState.ONE_SIDED_LOSS_TAKER,
+        } == REVEALED_STATES
+        # Closed under the table: no edge leaves it, so a coordinator never makes the move itself.
+        assert not [(s, d) for s, d in TRANSITIONS if s in REVEALED_STATES and d not in REVEALED_STATES]
+
+    @pytest.mark.parametrize("revealed", ["secret_revealed", "completed", "asset_vulnerable", "one_sided_loss_taker"])
+    @pytest.mark.parametrize("earlier", ["negotiated", "btc_locked", "both_locked", "params_mismatch", "maker_stalls"])
+    def test_an_earlier_state_keeps_the_reveal_and_the_other_fields_are_written(
+        self, tmp_path: Path, revealed: str, earlier: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(_Rec({"state": revealed, "terms": {"hashlock": "aa"}, "n": 1})))
+        with caplog.at_level("WARNING", logger="pyrxd.gravity.record_sink"):
+            asyncio.run(sink(_Rec({"state": earlier, "terms": {"hashlock": "aa"}, "n": 2})))
+        assert sink.load() == {"state": revealed, "terms": {"hashlock": "aa"}, "n": 2}
+        # Said, so a printed in-memory state and the file do not differ in silence.
+        assert any(
+            f"kept the persisted state {revealed} instead of writing {earlier}" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("btc_locked", "both_locked"),  # forward
+            ("both_locked", "btc_locked"),  # a lock-claim retry before any reveal still rewinds
+            ("both_locked", "secret_revealed"),
+            ("secret_revealed", "completed"),
+            ("asset_vulnerable", "secret_revealed"),  # a taker claim retry stays inside the set
+            ("aborted", "btc_locked"),
+        ],
+    )
+    def test_every_other_write_goes_through(self, tmp_path: Path, before: str, after: str) -> None:
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(_Rec({"state": before, "terms": {"hashlock": "aa"}})))
+        asyncio.run(sink(_Rec({"state": after, "terms": {"hashlock": "aa"}})))
+        assert sink.load()["state"] == after

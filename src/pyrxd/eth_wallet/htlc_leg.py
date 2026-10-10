@@ -573,7 +573,13 @@ class EthHtlcContractLeg:
             # Say HOW it differs: a length mismatch is a different contract altogether, while a
             # same-length difference at an immutable offset is the #798 forged-copy shape.
             if len(code) != len(expected):
-                how = f"{len(code)} bytes present, {len(expected)} expected"
+                # A different contract build is a different length too: the canonical build changed
+                # after 0.26.1 (#846), so two hosts on different pyrxd releases disagree here.
+                how = (
+                    f"{len(code)} bytes present, {len(expected)} expected; if the counterparty runs a "
+                    "different pyrxd release, its contract build may differ (the canonical build changed "
+                    "after 0.26.1), so check both hosts run the same release"
+                )
             else:
                 first = next(i for i, (a, b) in enumerate(zip(code, expected)) if a != b)
                 how = f"same length ({len(code)} bytes), first difference at byte {first}"

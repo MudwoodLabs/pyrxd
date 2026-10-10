@@ -21,6 +21,7 @@ them. Three rules:
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -130,24 +131,47 @@ def lock_path(where: Path) -> Path:
 
 
 @contextmanager
-def _locked(where: Path) -> Iterator[None]:
-    """An exclusive advisory lock (``fcntl.flock``) on the store's lock file, held for the block.
+def _locked(where: Path) -> Iterator[bool]:
+    """An exclusive advisory lock (``fcntl.flock``) on the store's lock file, held for the block;
+    yields whether a lock was taken.
 
-    POSIX only. On Windows ``fcntl`` does not exist and no lock is taken: two syncs run at the same
-    moment there can still race, and the later one may shorten the store (the store stays a
-    verified chain either way; the next sync extends it again)."""
+    POSIX only. On Windows ``fcntl`` does not exist and no lock is taken (``False``): two syncs run
+    at the same moment there can still race, and the later one may shorten the store (the store
+    stays a verified chain either way; the next sync extends it again)."""
     try:
         import fcntl
     except ImportError:  # Windows
-        yield
+        yield False
         return
     fd = os.open(lock_path(where), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        yield True
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+def _tmp_name_pattern(where: Path) -> re.Pattern[str]:
+    """The names :func:`save` gives its temporary files for *where*: ``.<name>.<pid>.<8 hex>.tmp``."""
+    return re.compile(rf"\.{re.escape(where.name)}\.[0-9]+\.[0-9a-f]{{8}}\.tmp")
+
+
+def _remove_orphaned_tmp_files(where: Path) -> None:
+    """Delete temporary files a save of *where* left behind when it was killed between writing and
+    renaming. Called only while holding the lock, so no live save of this store owns one; only
+    names matching :func:`_tmp_name_pattern`, in the store's own directory, are touched."""
+    pattern = _tmp_name_pattern(where)
+    try:
+        entries = list(os.scandir(where.parent))
+    except OSError:
+        return
+    for entry in entries:
+        if pattern.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
+            try:
+                os.unlink(entry.path)
+            except OSError:
+                pass  # best effort: a leftover file is harmless, and the save itself goes on
 
 
 class AppendOnlyRefusal(ValueError):
@@ -183,7 +207,9 @@ def save(
     where.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Read, check and replace under ONE lock, so two concurrent syncs cannot both pass the
     # append-only check against the same old store and the second shorten what the first wrote.
-    with _locked(where):
+    with _locked(where) as locked:
+        if locked:  # without the lock, another save's temporary file could be live
+            _remove_orphaned_tmp_files(where)
         current = load(chain.network, table, path=where)
         old = current.chain
         if old is not None:

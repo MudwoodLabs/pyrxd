@@ -14,7 +14,8 @@ depth bound (``pyrxd headers sync``): a header is cached only when at least
 least :data:`CACHE_MIN_DEPTH` blocks below the lowest tip any of them reported.
 
 THE FLOOR. Each cached header, and each header :mod:`~pyrxd.glyph.mark_block` links above a cached
-anchor, must carry at least ``W // FLOOR_WORK_DIVISOR`` expected hash evaluations, where:
+anchor, must carry at least ``W // FLOOR_WORK_DIVISOR`` expected hash evaluations (the divisor is
+:data:`pyrxd.glyph.mark_block.FLOOR_WORK_DIVISOR`, the verifier's own, read at call time), where:
 
 * while syncing (:func:`sync_floor`), ``W`` is the GREATER of the newest shipped checkpoint's work
   and the median work of the newest :data:`RECENT_WINDOW` headers ALREADY in the cache when the
@@ -85,7 +86,9 @@ from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work, verify_radiant_header_pow
 from pyrxd.spv.radiant_checkpoints import MIN_DEPTH_BELOW_TIP
 
-from .mark_block import FLOOR_WORK_DIVISOR
+# The floor divisor has ONE source, ``mark_block.FLOOR_WORK_DIVISOR``, read at call time (never
+# imported by value), so the cache and the verifier cannot hold different divisors.
+from . import mark_block as _mark_block
 
 __all__ = [
     "CACHE_MIN_DEPTH",
@@ -135,7 +138,14 @@ def _issue_seal() -> object:
 
 class HeaderCacheRefusal(Exception):
     """Sources disagreed, too few operators answered, or a served header is a lie (a broken link,
-    a failed proof-of-work). Nothing is cached when this is raised."""
+    a failed proof-of-work). Nothing is cached when this is raised.
+
+    ``dissenters``: for a disagreement with a majority, the operators outside it (they are named,
+    never outvoted: the refusal stands). Empty otherwise."""
+
+    def __init__(self, message: str, *, dissenters: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.dissenters: tuple[str, ...] = tuple(dissenters)
 
 
 class HeaderStoreCorrupt(Exception):
@@ -202,10 +212,10 @@ def _require_table(table: Sequence[tuple[int, str]]) -> tuple[tuple[int, str], .
 
 
 def _floor_of(work: int) -> int:
-    """``work // FLOOR_WORK_DIVISOR``, EXACTLY. The divisor ships as the int 16; a test may set an
-    exact :class:`~fractions.Fraction` to emulate a work ratio real headers cannot show. A float is
-    refused: ``int(W // 16.0)`` rounds real work (about 2**56) and can come out one too high."""
-    d = FLOOR_WORK_DIVISOR
+    """``work // mark_block.FLOOR_WORK_DIVISOR``, EXACTLY. The divisor ships as the int 16; a test
+    may set an exact :class:`~fractions.Fraction` to emulate a work ratio real headers cannot show. A
+    float is refused: ``int(W // 16.0)`` rounds real work (about 2**56) and can come out one too high."""
+    d = _mark_block.FLOOR_WORK_DIVISOR
     if isinstance(d, bool) or not isinstance(d, (int, Fraction)) or d <= 0:
         raise ValidationError(f"FLOOR_WORK_DIVISOR must be a positive int (or an exact Fraction), not {d!r}")
     return int(work // d)
@@ -244,8 +254,8 @@ def _walk(
             return (
                 hashes,
                 "floor",
-                f"the header at {h} carries less work than the floor (1/{FLOOR_WORK_DIVISOR} of {floor_of}); "
-                f"its difficulty may be honest, but it is not cached",
+                f"the header at {h} carries less work than the floor (1/{_mark_block.FLOOR_WORK_DIVISOR} of "
+                f"{floor_of}); its difficulty may be honest, but it is not cached",
             )
         hashes.append(got)
         below = got
@@ -376,6 +386,12 @@ def extend_verified_headers(
     if kind == "lie":
         raise HeaderCacheRefusal(str(reason))
     added = tuple(bytes(x) for x in new[: len(hashes)])
+    # Copies the whole tuple per call, so a sync of N headers in batches of 2,016 copies about
+    # N**2 / 4,032 references in all. Kept: measured 2026-10-10 (a plain tuple-concatenation loop of
+    # that shape, this machine), 105,000 headers took 0.01 s and 525,000 took 0.25 s, small beside
+    # the per-header proof-of-work check. A buffer shared between a chain and its extensions would
+    # make it linear, but two extensions of one chain would then write into the same buffer, and
+    # keeping each VerifiedHeaders immutable under that is more code than this cost justifies.
     return (
         VerifiedHeaders(
             network=chain.network,
@@ -423,11 +439,41 @@ def agreed_headers(replies: Mapping[str, Sequence[Any]], start: int, count: int)
         seen = {op: bytes(got[i]) if isinstance(got[i], (bytes, bytearray)) else None for op, got in replies.items()}
         values = set(seen.values())
         if None in values or len(values) != 1:
-            raise HeaderCacheRefusal(
-                f"operators disagree on the header at block {start + i} ({', '.join(seen)}); nothing was cached"
-            )
+            raise _disagreement(seen, start + i)
         out.append(next(iter(values)))  # type: ignore[arg-type]
     return out
+
+
+def _disagreement(seen: Mapping[str, bytes | None], height: int) -> HeaderCacheRefusal:
+    """The refusal for operators that served different things at *height*, grouped by what each
+    served: when a STRICT MAJORITY of the operators in *seen* (those that answered) served the same
+    bytes, the others are named as the dissenters; with no strict majority (two operators that
+    differ, for one) no one is named and every group is listed. Being named says only that an
+    operator was outside the majority, not that it is the one lying."""
+    groups: dict[bytes | None, list[str]] = {}
+    for op, value in seen.items():
+        groups.setdefault(value, []).append(op)
+
+    def served(value: bytes | None) -> str:
+        if value is None:
+            return "something that is not a header"
+        if len(value) != 80:
+            return f"{len(value)} bytes, not an 80-byte header"
+        return f"block hash {radiant_block_hash(value)}"
+
+    ranked = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)  # stable: first seen first
+    top_ops, rest = ranked[0][1], ranked[1:]
+    where = f"operators disagree on the header at block {height}"
+    if 2 * len(top_ops) > len(seen):
+        dissenters = [op for _, ops in rest for op in ops]
+        each = "; ".join(f"{', '.join(ops)} served {served(value)}" for value, ops in ranked)
+        return HeaderCacheRefusal(
+            f"{where}: {', '.join(dissenters)} served a different header from the other {len(top_ops)} "
+            f"({', '.join(top_ops)}). {each}. A disagreeing operator is never outvoted, so nothing was cached",
+            dissenters=dissenters,
+        )
+    each = "; ".join(f"{', '.join(ops)} served {served(value)}" for value, ops in ranked)
+    return HeaderCacheRefusal(f"{where}, with no majority: {each}; nothing was cached")
 
 
 # ── The store's bytes ──────────────────────────────────────────────────────────────────────────
@@ -456,6 +502,27 @@ def encode_store(chain: VerifiedHeaders, *, syncs: Sequence[Mapping[str, Any]] =
     return body + hashlib.sha256(body).digest()
 
 
+#: The deepest metadata :func:`decode_store` accepts. What :func:`encode_store` writes is at most 4
+#: deep (the metadata, its ``syncs`` list, a record, a record's ``operators`` list).
+_MAX_META_DEPTH = 8
+
+
+def _nesting_depth(value: Any) -> int:
+    """How deeply *value*'s lists and dicts nest (a scalar is 0), without recursing."""
+    deepest, stack = 0, [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children: Any = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        deepest = max(deepest, depth)
+        stack.extend((child, depth + 1) for child in children)
+    return deepest
+
+
 def decode_store(data: Any) -> tuple[dict[str, Any], list[bytes]]:
     """``(metadata, headers)`` from store bytes, or :class:`HeaderStoreCorrupt`. Shape only: what
     the headers SAY is checked by :func:`verify_header_chain`, never here."""
@@ -472,9 +539,13 @@ def decode_store(data: Any) -> tuple[dict[str, Any], list[bytes]]:
     at += 4
     try:
         meta = json.loads(body[at : at + n].decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        raise HeaderStoreCorrupt("the store's metadata is not JSON") from None
+    except Exception as exc:  # total over file contents: RecursionError on deep nesting, not only ValueError
+        raise HeaderStoreCorrupt(f"the store's metadata could not be parsed as JSON ({type(exc).__name__})") from None
     at += n
+    if _nesting_depth(meta) > _MAX_META_DEPTH:
+        # Deeper than anything encode_store writes; refused here so that nothing downstream (a
+        # re-encode on save, a JSON report of the sync records) recurses through it.
+        raise HeaderStoreCorrupt(f"the store's metadata is nested deeper than {_MAX_META_DEPTH} levels")
     if not isinstance(meta, dict) or meta.get("version") != _VERSION:
         raise HeaderStoreCorrupt(f"the store's metadata is not version {_VERSION}")
     count, base = meta.get("count"), meta.get("base_height")
