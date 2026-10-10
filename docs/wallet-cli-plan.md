@@ -252,10 +252,12 @@ Skip with `--yes`. With `--json` (machine-readable mode), `--yes` is **required*
     The full report is still printed on stdout; only the status says no.
 6   `pyrxd headers sync` stopped at a header below its floor. The status is still printed;
     its reason says what gets past that header (a re-run, `--reset`, or only a newer release).
-7   `pyrxd headers sync` added nothing only because one operator reported a lower tip than the
-    others (headers are cached only below the LOWEST tip) by at least 6 blocks. The status names
-    that operator. A smaller lag (honest servers differ by a block or two just after each block)
-    is named in the note with exit 0.
+7   `pyrxd headers sync` added nothing only because some operators reported a tip at least 6
+    blocks below the others' (headers are cached only below the LOWEST tip), and those operators
+    are a strict minority of the configured ones. The status names them. A smaller lag (honest
+    servers differ by a block or two just after each block) is named in the note with exit 0.
+    Tips that differ when the low tip is not a strict minority (with two operators, always) are
+    listed with exit 0 and no one is named: a tip height is unauthenticated.
 ```
 
 ## Configuration

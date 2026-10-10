@@ -220,10 +220,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now raises `ValidationError` for both.
 - **Header cache: a store with deeply nested metadata crashed `pyrxd verify` and `pyrxd headers
   status`/`sync`, and `sync --reset` could not replace it.** It is now read as a damaged store. A save
-  also removes temporary files a killed save left behind. `pyrxd headers sync` names the operator
-  that disagreed with the others, and names an operator whose tip, at least 6 blocks below the
-  next-lowest, held the sync back (new exit status 7; a smaller lag is named with exit 0). The floor
-  divisor has one source, `mark_block.FLOOR_WORK_DIVISOR`.
+  also removes temporary files a killed save left behind. When operators serve different headers
+  and a strict majority of those that answered agree, `pyrxd headers sync` names the others (a
+  disagreeing operator is still never outvoted; with no strict majority it lists what each
+  served). When some operators' tip, at least 6 blocks below the next-lowest, held the sync back
+  and they are a strict minority of the configured operators, it names them (new exit status 7; a
+  smaller lag is named with exit 0); otherwise it lists the differing tips with exit 0 and names no
+  one, since a tip height is unauthenticated. The floor divisor has one source,
+  `mark_block.FLOOR_WORK_DIVISOR`.
 - `pyrxd.cli.swap_recovery` uses `pyrxd.eth_wallet.events` for Keccak-256 and the `refund()`
   selector instead of its own copies (the selector value is unchanged). An ETH contract whose
   runtime length differs from the expected one now says the counterparty may run a different pyrxd

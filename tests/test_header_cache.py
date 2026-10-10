@@ -530,9 +530,10 @@ def test_headers_shallower_than_288_below_the_lowest_tip_are_not_cached(monkeypa
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP + 50), "operator:b": _operator(DEEP - 1)})
     assert r.exit_code == 0, r.output
     assert out["cached_to"] == TOP - 1 and out["lowest_tip"] == DEEP - 1
-    # Headers were added, so it is "synced" (exit 0), and the operator that held it short is named.
-    assert out["state"] == "synced" and out["held_back_by"] == ["operator:b"]
-    assert f"operator:b reported tip {DEEP - 1}" in out["reason"]
+    # Headers were added, so it is "synced" (exit 0). With two operators neither tip is a strict
+    # minority, so the differing tips are listed and no one is named.
+    assert out["state"] == "synced" and out["held_back_by"] is None
+    assert "operators' tips differ" in out["reason"] and f"operator:b {DEEP - 1}" in out["reason"]
     # Honest pair: at exactly 288 deep it is cached.
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
     assert out["cached_to"] == TOP and out["added"] == 1 and out["held_back_by"] is None and out["reason"] is None
@@ -620,38 +621,68 @@ def test_a_disagreement_with_no_majority_says_so_and_lists_the_groups() -> None:
     assert caught.value.dissenters == ("operator:c",)
 
 
-def test_one_operators_low_tip_holding_the_sync_back_is_named_and_not_up_to_date(monkeypatch, tmp_path) -> None:
-    """The depth rule counts from the LOWEST tip, so one operator reporting a low tip holds every
-    sync back. When it is the reason nothing was added, the sync says so and which operator, and
-    exits 7, not "up to date" with 0."""
+def test_a_strict_minority_low_tip_holding_the_sync_back_is_named_and_not_up_to_date(monkeypatch, tmp_path) -> None:
+    """The depth rule counts from the LOWEST tip, so a low tip holds every sync back. When the
+    operators at it are a STRICT MINORITY of the configured ones and it is the reason nothing was
+    added, the sync names them and exits 7, not "up to date" with 0."""
     _patch_table(monkeypatch, START)
     low = START + 100
-    ops = {"operator:a": _operator(DEEP + 50), "operator:b": _operator(low)}
-    r, out = _sync(monkeypatch, tmp_path, ops)
+
+    def ops3(low_tip, high_tip):
+        return {"operator:a": _operator(high_tip), "operator:b": _operator(low_tip), "operator:c": _operator(high_tip)}
+
+    r, out = _sync(monkeypatch, tmp_path, ops3(low, DEEP + 50))
     assert r.exit_code == headers_cmds.EXIT_SYNC_HELD_BACK == 7, r.output
     assert out["state"] == "held back" and out["added"] == 0 and out["held_back_by"] == ["operator:b"]
-    assert out["tips"] == {"operator:a": DEEP + 50, "operator:b": low}
+    assert out["tips"] == {"operator:a": DEEP + 50, "operator:b": low, "operator:c": DEEP + 50}
     assert f"operator:b reported tip {low}" in out["reason"] and f"({DEEP + 50})" in out["reason"]
     assert _cached(START) is None
-    ops = {"operator:a": _operator(DEEP + 50), "operator:b": _operator(low)}
-    r, _ = _sync(monkeypatch, tmp_path, ops, json_out=False)
+    r, _ = _sync(monkeypatch, tmp_path, ops3(low, DEEP + 50), json_out=False)
     assert r.exit_code == 7 and "HELD BACK" in r.output and "operator:b reported tip" in _flat(r.output)
     # Honest pair: equal tips with nothing deep enough is "up to date", exit 0, no one named.
-    r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(low), "operator:b": _operator(low)})
+    r, out = _sync(monkeypatch, tmp_path, ops3(low, low))
     assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None
-    # And the ordinary lag just after a block: one tip a block or two lower (below HELD_BACK_MIN_GAP)
-    # is named in the note but stays "up to date", exit 0, where a deeper header would otherwise
-    # have been cached. A non-zero status for routine propagation would be wrong most times it fired.
+    # The ordinary lag just after a block: a tip a block or two lower (below HELD_BACK_MIN_GAP) is
+    # named in the note but stays "up to date", exit 0. A non-zero status for routine propagation
+    # would be wrong most times it fired.
     at_edge = START + CACHE_MIN_DEPTH  # this tip admits nothing past START; one block more admits one
     gap = headers_cmds.HELD_BACK_MIN_GAP - 1
-    ops = {"operator:a": _operator(at_edge + gap), "operator:b": _operator(at_edge)}
-    r, out = _sync(monkeypatch, tmp_path, ops)
+    r, out = _sync(monkeypatch, tmp_path, ops3(at_edge, at_edge + gap))
     assert r.exit_code == 0 and out["state"] == "up to date" and out["added"] == 0, r.output
     assert out["held_back_by"] == ["operator:b"] and f"operator:b reported tip {at_edge}" in out["reason"]
     # At the gap itself it is held back.
-    ops = {"operator:a": _operator(at_edge + gap + 1), "operator:b": _operator(at_edge)}
-    r, out = _sync(monkeypatch, tmp_path, ops)
+    r, out = _sync(monkeypatch, tmp_path, ops3(at_edge, at_edge + gap + 1))
     assert r.exit_code == 7 and out["state"] == "held back", r.output
+
+
+def test_one_high_tip_does_not_blame_the_honest_majority(monkeypatch, tmp_path) -> None:
+    """A tip height is unauthenticated. Three operators at T and one reporting T+100000: the three
+    are not a minority, so no one is named, the tips are listed, and the exit is 0 (the review's
+    case: it used to name all three and tell them to check they follow the live chain)."""
+    _patch_table(monkeypatch, START)
+    t = START + 100
+
+    def ops():
+        out = {k: _operator(t) for k in ("operator:a", "operator:b", "operator:c")}
+        out["operator:d"] = _operator(t + 100_000)
+        return out
+
+    r, out = _sync(monkeypatch, tmp_path, ops())
+    assert r.exit_code == 0 and out["state"] == "up to date", r.output
+    assert out["held_back_by"] is None
+    assert "operators' tips differ" in out["reason"] and f"operator:d {t + 100_000}" in out["reason"]
+    assert "follows the live chain" not in out["reason"]
+    r, _ = _sync(monkeypatch, tmp_path, ops(), json_out=False)
+    assert r.exit_code == 0 and "HELD BACK" not in r.output and "tips:" in r.output
+
+
+def test_two_operators_that_differ_blame_neither(monkeypatch, tmp_path) -> None:
+    """With two operators nothing says which tip is wrong: neither is a strict minority."""
+    _patch_table(monkeypatch, START)
+    low = START + 100
+    r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP + 50), "operator:b": _operator(low)})
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None, r.output
+    assert "operators' tips differ" in out["reason"] and "not a strict minority" in out["reason"]
 
 
 def test_a_header_below_the_floor_ends_the_sync_and_keeps_what_is_under_it(monkeypatch, tmp_path) -> None:

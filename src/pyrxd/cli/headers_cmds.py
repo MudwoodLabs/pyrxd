@@ -77,7 +77,9 @@ EXIT_SYNC_STOPPED = 6
 #: Exit status of `pyrxd headers sync` when nothing was added only because one operator's tip was
 #: lower than the others': the depth rule counts from the LOWEST tip, so that operator held the
 #: sync back, and "up to date" would not be true. Nothing was written; the reason names the
-#: operator. Only when its tip is at least :data:`HELD_BACK_MIN_GAP` blocks below the next-lowest:
+#: operator. Only when the operators at the low tip are a STRICT MINORITY of the configured ones (a
+#: tip height is unauthenticated: with three at T and one at T+100000, the three are not blamed and
+#: the exit is 0), and only when that tip is at least :data:`HELD_BACK_MIN_GAP` blocks below the next-lowest:
 #: honest servers routinely differ by a block or two for a few seconds after each block, and a
 #: status that is non-zero for that would be wrong most of the times it fired. A smaller lag is
 #: still named in the note, with exit 0. Listed in pyrxd.cli.errors.
@@ -151,18 +153,23 @@ async def sync_headers(
 
     * ``"synced"``: headers were added and written;
     * ``"up to date"``: nothing new was deep enough, or a reset was not needed (``reason`` says which);
-    * ``"held back"``: nothing new was deep enough below the LOWEST tip, and the next-lowest tip
-      would have allowed more, by at least :data:`HELD_BACK_MIN_GAP` blocks: ``held_back_by`` names
-      the operator(s) with the low tip, ``reason`` says by how much; nothing was written;
-      ``exit_code`` 7. (A smaller lag stays ``"up to date"``, and when headers WERE added the state is
-      ``"synced"``; in both ``held_back_by``/``reason`` still name the operator, with exit 0.)
+    * ``"held back"``: nothing new was deep enough below the LOWEST tip, the next-lowest tip would
+      have allowed more by at least :data:`HELD_BACK_MIN_GAP` blocks, and the operators at the low
+      tip are a STRICT MINORITY of the configured operators: ``held_back_by`` names them, ``reason``
+      says by how much; nothing was written; ``exit_code`` 7. (A smaller lag stays ``"up to date"``,
+      and when headers WERE added the state is ``"synced"``; both still name the minority, exit 0.
+      When the low tip is NOT a strict minority, ``reason`` lists every operator's tip as
+      "operators' tips differ" and ``held_back_by`` is ``None``: a tip height is unauthenticated, so
+      no one is blamed, and the exit is 0.)
     * ``"stopped"``: a header below the floor ended the sync. A plain sync writes the agreed headers
       under it, when there are any; a reset writes them only when they reach past the existing
       cache's top (see below). ``stopped`` says why and what was kept, and ``advice`` (``"rerun"``,
       ``"reset"`` or ``"upgrade"``) is what the cache on disk admits next; ``exit_code`` 6;
     * ``"refused"``: nothing was written; ``reason`` and ``fix`` say why; ``exit_code`` 2 for the
       servers' answers, 1 for a store that could not be written (``advice`` is then ``None``). When
-      operators disagreed and a strict majority of them agreed, ``dissenters`` names the others.
+      operators disagreed and a STRICT MAJORITY of the operators that answered served the same
+      header, ``dissenters`` names the others; with no strict majority (two operators that differ,
+      for one) no one is named and the reason lists what each served.
 
     *reset* rebuilds the cache from the newest shipped checkpoint instead of extending it, under the
     same rules, holding every header to the shipped checkpoint's floor alone (as a first sync with no
@@ -280,18 +287,34 @@ async def sync_headers(
     stopped_reset_saved = False
     report["added"] = chain.top - old_top
     report["cached_from"], report["cached_to"] = chain.base_height, chain.top
-    # WHO HELD IT BACK. The depth rule counts from the LOWEST tip, so one operator reporting a low
-    # tip bounds every sync. When the sync reached that bound (no floor stop) and the next-lowest
-    # tip would have allowed more, the low operator(s) are named (see EXIT_SYNC_HELD_BACK).
-    held_back, held_back_by = "", [k for k, t in tips.items() if t == lowest]
+    # WHO HELD IT BACK. The depth rule counts from the LOWEST tip, so a low tip bounds every sync.
+    # A tip height is an unauthenticated number, so which side is wrong is not knowable from the
+    # heights: three honest operators at T and one reporting T+100000 must not have the three named.
+    # The low group is blamed (named in `held_back_by`, see EXIT_SYNC_HELD_BACK) only when it is a
+    # STRICT MINORITY of the configured operators; otherwise the tips are reported as differing,
+    # with no one named. Either way only when the sync reached that bound (no floor stop) and the
+    # next-lowest tip would have allowed more.
+    low_group = [k for k, t in tips.items() if t == lowest]
     higher = min((t for t in tips.values() if t > lowest), default=None)
+    held_back, held_back_by = "", None
     if not report["stopped"] and higher is not None and higher - min_depth > chain.top:
-        held_back = (
-            f"{', '.join(held_back_by)} reported tip {lowest}, below the next-lowest tip ({higher}); headers are "
-            f"cached only {min_depth} blocks below the lowest tip, so the cache reaches block {chain.top} instead "
-            f"of {higher - min_depth}. Re-run once {', '.join(held_back_by)} catches up, or check that it "
-            f"follows the live chain"
-        )
+        if 2 * len(low_group) < len(sources):
+            held_back_by = low_group
+            held_back = (
+                f"{', '.join(low_group)} reported tip {lowest}, below the next-lowest tip ({higher}) reported by "
+                f"{len(sources) - len(low_group)} of the {len(sources)} configured operators; headers are cached "
+                f"only {min_depth} blocks below the lowest tip, so the cache reaches block {chain.top} instead of "
+                f"{higher - min_depth}. Re-run once {', '.join(low_group)} catches up, or check that it follows "
+                f"the live chain"
+            )
+        else:
+            held_back = (
+                "operators' tips differ: "
+                + ", ".join(f"{k} {t}" for k, t in tips.items())
+                + f". Headers are cached only {min_depth} blocks below the lowest tip ({lowest}), so the cache "
+                f"reaches block {chain.top}. The low tip is not a strict minority of the {len(sources)} configured "
+                "operators, so this does not say which tip is wrong; a tip height is unauthenticated"
+            )
     advice_text = ""
     if report["stopped"]:
         report["exit_code"] = EXIT_SYNC_STOPPED
@@ -339,10 +362,10 @@ async def sync_headers(
         report["state"] = "stopped" if report["stopped"] else "up to date"
         if report["stopped"]:
             report["stopped"] += advice_text  # nothing to write: the cache on disk is the one advised on
-        elif held_back and higher is not None and higher - lowest >= HELD_BACK_MIN_GAP:
+        elif held_back_by and higher is not None and higher - lowest >= HELD_BACK_MIN_GAP:
             report["state"], report["reason"], report["held_back_by"] = "held back", held_back, held_back_by
             report["exit_code"] = EXIT_SYNC_HELD_BACK
-        elif held_back:  # a lag of a block or two: named, but "up to date" (exit 0)
+        elif held_back:  # a lag of a block or two, or tips differing with no minority: "up to date", exit 0
             report["reason"], report["held_back_by"] = held_back, held_back_by
         else:
             report["reason"] = (
@@ -446,7 +469,8 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     and the reason says what was kept and what gets past that header, computed from the cache on
     disk afterwards. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot
     be written, 6 when a header below the floor stopped it, 7 when nothing was added only because
-    one operator's tip was at least 6 blocks lower than the others' (the status names it).
+    a strict minority of the configured operators reported a tip at least 6 blocks below the others'
+    (the status names them).
     """
     from .swap_recovery import electrumx_urls
 
@@ -483,7 +507,7 @@ def _sync_lines(r: dict[str, Any]) -> list[str]:
         f"  agreed by:   {len(r['operators'])} operators ({', '.join(r['operators'])})",
         f"  depth rule:  cached only up to the lowest tip reported ({r['lowest_tip']}) minus {r['min_depth']}",
     ]
-    if r.get("held_back_by"):
+    if r.get("held_back_by") or len(set(r.get("tips", {}).values())) > 1:
         lines.append("  tips:        " + ", ".join(f"{k} {t}" for k, t in r["tips"].items()))
     if r.get("reason"):
         lines.append(f"  note:        {r['reason']}")

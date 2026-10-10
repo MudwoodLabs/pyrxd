@@ -446,8 +446,10 @@ def agreed_headers(replies: Mapping[str, Sequence[Any]], start: int, count: int)
 
 def _disagreement(seen: Mapping[str, bytes | None], height: int) -> HeaderCacheRefusal:
     """The refusal for operators that served different things at *height*, grouped by what each
-    served: the operators outside a strict majority are named as the dissenters; with no strict
-    majority, every group is listed."""
+    served: when a STRICT MAJORITY of the operators in *seen* (those that answered) served the same
+    bytes, the others are named as the dissenters; with no strict majority (two operators that
+    differ, for one) no one is named and every group is listed. Being named says only that an
+    operator was outside the majority, not that it is the one lying."""
     groups: dict[bytes | None, list[str]] = {}
     for op, value in seen.items():
         groups.setdefault(value, []).append(op)
