@@ -190,6 +190,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Unreadable logs on a contract that is not settled do not, since a landed claim would have settled
   it. The coordinator's failure-time explanation from #851 still covers a claim that lands between
   this check and the refund.
+- **The ETH maker's `--phase refund` and lock-claim retry were refused on honest swaps (a
+  regression in the record merge above).** The maker's leg re-derives the counter-leg locator
+  without the deploy transaction (it carries `UNKNOWN_DEPLOY_TX_HASH`, a new constant in
+  `pyrxd.eth_wallet.locator`), while later phases rebuild it from taker_funding.json with the real
+  hash, and the merge compared the whole locator. The merge now compares the locator without the
+  deploy hash (it binds nothing) and fills the placeholder from the rebuild; the coordinator keeps
+  a known deploy hash for the same contract when it re-verifies. The BTC locator was checked the
+  same way and is not affected.
+- **A re-run of the taker's `--phase fund` could overwrite the record of an earlier fund.** The ETH
+  runner built its coordinator on a fresh record. With the seen-store holding the hashlock the
+  coordinator's reuse check refused first; with a seen-store that had lost it, the coordinator
+  wrote over the record of the earlier fund and funded a second counter leg under the same
+  hashlock (the BTC runner reached the same path after a completed fund). `taker_funds_btc` now
+  refuses, before its gate, when its persist hook holds this swap's counter leg in a record it was
+  not built from, and both runners read the record first: past `negotiated`, unreadable or another
+  swap's refuses, and on ETH so does an interrupted deploy, which that runner does not resume.
+- **The maker's `--phase abort` could refund the covenant after the maker had claimed the counter
+  leg.** It allowed a record at `secret_revealed` or `completed`, and its only other check was
+  whether taker_funding.json existed. Those states now refuse, as does any record holding a
+  counter-leg locator; the confirmation prompt no longer claims the taker never funded.
+- **A stopped lock-claim retry could erase the record that the maker's claim was sent.** The retry
+  rebuilds `btc_locked` and its first step persisted it, so a later `--phase refund` sent the asset
+  refund as well. `JsonFileRecordSink` now never writes a state before `secret_revealed` over one at
+  or after it (`REVEALED_STATES` in `pyrxd.gravity.swap_state`, derived from the transition table);
+  the other fields are written and the in-memory rewind each retry needs is unchanged.
+- **A swap record nested past the JSON decoder's recursion limit, or holding bytes that are not
+  UTF-8, raised a traceback** instead of the "could not be read" refusal. `JsonFileRecordSink.load`
+  now raises `ValidationError` for both.
+- **Header cache: a store with deeply nested metadata crashed `pyrxd verify` and `pyrxd headers
+  status`/`sync`, and `sync --reset` could not replace it.** It is now read as a damaged store. A save
+  also removes temporary files a killed save left behind. `pyrxd headers sync` names the operator
+  that disagreed with the others, and names an operator whose tip, at least 6 blocks below the
+  next-lowest, held the sync back (new exit status 7; a smaller lag is named with exit 0). The floor
+  divisor has one source, `mark_block.FLOOR_WORK_DIVISOR`.
+- `pyrxd.cli.swap_recovery` uses `pyrxd.eth_wallet.events` for Keccak-256 and the `refund()`
+  selector instead of its own copies (the selector value is unchanged). An ETH contract whose
+  runtime length differs from the expected one now says the counterparty may run a different pyrxd
+  release, since the canonical contract build changed after 0.26.1, and `swap_run_verify` says the
+  same of a run deployed by 0.26.1 or earlier.
 
 ## [0.26.1] — 2026-10-07
 
