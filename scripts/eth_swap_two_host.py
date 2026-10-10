@@ -547,9 +547,14 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
             f"REFUSING taker --phase fund: the swap record at {_record_sink(args.local_out).path} holds an "
             f"interrupted fund: contract {prior.pending_counter_contract} (deploy "
             f"{prior.pending_counter_deploy_tx}) was deployed for this swap and the fund did not complete. "
-            "Nothing was sent. This two-host runner does not resume a fund (it holds no fund lock). The "
-            "contract may hold value: it refunds to your refund address by that address after the ETH "
-            "deadline."
+            "Nothing was sent. This two-host runner does not resume a fund (it holds no fund lock).\n"
+            f"  The contract may hold value. Its deadline is unix {terms.eth_timeout_unix_s} "
+            f"({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(int(terms.eth_timeout_unix_s)))}); from then "
+            "on ANY account can call its refund(), which pays the contract's whole balance to its refundee "
+            "(your refund address), from any wallet or, for example:\n"
+            f"    cast send {prior.pending_counter_contract} 'refund()' --rpc-url <your RPC> --interactive\n"
+            "  A token contract whose push was never sent holds nothing, and its refund() reverts "
+            "(NothingToRefund)."
         )
 
     # --- THE safety gate: check t_rxd against the COUNTER-CHAIN DEADLINE, from the envelope alone.

@@ -1601,7 +1601,11 @@ class TestARerunFundNeverOverwritesTheRecord:
         built = _wire_eth(eth_mod, monkeypatch)
         with pytest.raises(SystemExit, match="interrupted fund") as raised:
             await eth_mod.taker_phase_fund(_with_fee(args))
-        assert "0x" + "98" * 20 in str(raised.value.code) and "Nothing was sent" in str(raised.value.code)
+        msg = str(raised.value.code)
+        assert "0x" + "98" * 20 in msg and "Nothing was sent" in msg
+        # The next step: the deadline, that anyone can call refund() after it, and how.
+        assert f"unix {terms.eth_timeout_unix_s}" in msg and "ANY account can call its refund()" in msg
+        assert ("cast send 0x" + "98" * 20 + " 'refund()'") in msg
         assert _record_path(args).read_bytes() == before
         assert built == {}, "a leg was built before the refusal"
 
