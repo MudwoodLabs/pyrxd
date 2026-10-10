@@ -248,7 +248,13 @@ _MAKER_REVEALED = (
     "refuse",
     "the persisted record says {state}: this maker claimed the counter leg and revealed p. Refunding "
     "the asset as well would take both legs. If that claim has not confirmed, re-run --phase "
-    "lock-claim to re-send it; the covenant is the taker's to claim with p",
+    "lock-claim to re-send it; the covenant is the taker's to claim with p. If your claim was dropped "
+    "AND the taker has since refunded the counter leg (lock-claim then fails its verification: the "
+    "contract is settled), these runners have no phase that recovers the covenant from this record. "
+    "`pyrxd swap build-refund` builds a covenant CSV refund, but it reads only a recovery file "
+    "carrying hashlock_H, rxd_covenant_spk and t_rxd_blocks, which these runners do not write, so it "
+    "does not apply to this record as it stands; and p may be public, so the taker can still claim the "
+    "covenant until it is refunded",
 )
 _RESUME = (
     "allow",

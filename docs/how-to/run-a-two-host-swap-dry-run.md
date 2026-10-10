@@ -271,7 +271,10 @@ refuse when it says `secret_revealed`, `asset_vulnerable` or `completed`: `p` is
 covenant is yours to claim, so run `--phase claim` before `t_rxd`. Maker `refund` refuses when it
 says `secret_revealed`, and maker `abort` when it says `secret_revealed` or `completed`, because
 you claimed the counter leg and refunding the asset too would take both legs; re-run `--phase
-lock-claim` if that claim did not confirm. Maker `abort` also refuses whenever the record holds a
+lock-claim` if that claim did not confirm. If your claim was dropped and the taker has since
+refunded the counter leg, lock-claim fails its verification and these runners have no phase that
+recovers the covenant from that record; `pyrxd swap build-refund` reads only a recovery file with
+`hashlock_H`, `rxd_covenant_spk` and `t_rxd_blocks`, which they do not write. Maker `abort` also refuses whenever the record holds a
 counter-leg locator (the taker did fund): use `--phase refund`. Terminal states are not refused
 for being terminal, because today they are written when a transaction is broadcast, not when it
 confirms, so re-sending a dropped refund must stay possible.

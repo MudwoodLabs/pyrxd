@@ -1634,6 +1634,25 @@ class TestARerunFundNeverOverwritesTheRecord:
         assert _record_path(args).read_text() == '{"state": "negot'
 
 
+@pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+async def test_build_refund_does_not_read_the_files_the_runners_write(name, tmp_path, monkeypatch):
+    """The maker-revealed refusal says `pyrxd swap build-refund` does not apply to a two-host
+    record as it stands. That sentence is checked here: its parser refuses the envelope, the local
+    file and the swap record the runner leaves."""
+    from pyrxd.cli.swap_cmds import parse_recovery_file
+    from pyrxd.gravity.swap_state import SwapRecord
+
+    mod = _load(name)
+    eth = name == "eth_swap_two_host"
+    args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=True)
+    await _seed(args, SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms))
+    for path in (io_dir / "envelope.json", Path(args.local_out), _record_path(args)):
+        os.chmod(path, 0o600)
+        with pytest.raises((ValueError, ValidationError)):
+            parse_recovery_file(path)
+    assert "pyrxd swap build-refund" in _shared().PHASE_STATE_RULES[("maker", "refund")][SwapState.SECRET_REVEALED][1]
+
+
 class TestARetryNeverRewindsTheRecordOfTheReveal:
     """A maker whose record says SECRET_REVEALED (the claim was sent, p may be public) but who lacks
     maker_claim.json is told to re-run lock-claim. That retry rebuilds BTC_LOCKED and its first
