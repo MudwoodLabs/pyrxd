@@ -101,7 +101,7 @@ from _dust_swap_shared import (
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, assert_t_rxd_fits_the_eth_deadline
@@ -841,7 +841,7 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
     terms = NegotiatedTerms.from_dict(env["terms"])
     _refuse_by_persisted_state(args, terms, phase="lock-claim")  # before any chain read
     funding = _read_public(io_dir, "taker_funding.json")
-    eth_loc = EthHtlcLocator.from_dict(funding["eth_locator"])
+    eth_loc = _maker_view(EthHtlcLocator.from_dict(funding["eth_locator"]))
 
     p_secret = SecretBytes(bytes.fromhex(local["preimage_p_hex"]))
     if hashlib.sha256(p_secret.unsafe_raw_bytes()).digest() != terms.hashlock:
@@ -1292,7 +1292,7 @@ async def maker_phase_refund(args: argparse.Namespace) -> None:
             "HTLC, so there is no mutual unwind and no BOTH_LOCKED record to drive. Use --phase abort "
             "(the covenant CSV refund) to recover the asset you locked."
         )
-    loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
+    loc = _maker_view(EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"]))
     maker_pkh = bytes.fromhex(local["maker_pkh_hex"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     cov = _rederive_covenant(args, terms=terms, taker_pkh=taker_pkh, maker_pkh=maker_pkh)
@@ -1482,6 +1482,19 @@ def _merged_record(args, rebuilt: SwapRecord, *, keys_out, phase: str) -> SwapRe
         role=args.role,
         phase=phase,
     )
+
+
+def _maker_view(loc: EthHtlcLocator) -> EthHtlcLocator:
+    """The taker's published locator as a MAKER records it: without the deploy transaction hash.
+
+    The hash is the taker's word, and nothing in the contract binds it; ``claim_status`` would start
+    its log scan at that transaction's block, so a later transaction named here could hide a real
+    claim from the scan. The maker's own verification cannot know the deploy either
+    (``EthLeg.expected_locator``), so the maker's record carries ``UNKNOWN_DEPLOY_TX_HASH``, which a
+    log scan refuses (the transaction does not exist) rather than trusts."""
+    import dataclasses
+
+    return dataclasses.replace(loc, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)
 
 
 def _io_dir(args) -> Path:

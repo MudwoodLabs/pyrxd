@@ -31,7 +31,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
 from pyrxd.gravity import funding_spv
 from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY, ElapsedBoundPolicy, MakerFundingNotVerified
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
@@ -175,8 +174,9 @@ BINDING_RECORD_FIELDS = ("terms", "counterchain_locator", "radiant_covenant_outp
 #: ``deploy_tx_hash``: the ETH maker's leg re-derives the locator from its own config and the
 #: contract ADDRESS (``EthLeg.expected_locator``), and nothing in the contract names the transaction
 #: that created it, so its locator carries ``UNKNOWN_DEPLOY_TX_HASH`` while taker_funding.json
-#: carries the real hash. Comparing it refused the maker's ``--phase refund`` and its lock-claim
-#: retry on every honest swap (#853).
+#: carries the taker's hash (records written before the maker phases dropped it can hold either).
+#: Comparing it refused the maker's ``--phase refund`` and its lock-claim retry on every honest swap
+#: (#853).
 LOCATOR_INFORMATIONAL_KEYS = frozenset({"deploy_tx_hash"})
 
 
@@ -510,21 +510,6 @@ def _comparable(value: Any, *, field: str = "") -> Any:
     return value
 
 
-def _with_known_deploy_tx(kept: Any, rebuilt: Any) -> Any:
-    """The persisted locator, with the rebuild's deploy hash when the persisted one is the
-    ``UNKNOWN_DEPLOY_TX_HASH`` placeholder and the rebuild names a real one.
-
-    WHICH SIDE'S HASH IS KEPT, AND WHY. The persisted record wins, as it does for every other field:
-    it is what this host recorded (a taker's comes from its own deploy receipt). The placeholder is
-    not a value but the absence of one (the maker's leg cannot know the deploy), so it is a gap the
-    rebuild fills, as a ``None`` is. Two real hashes that differ keep the persisted one: the hash
-    binds nothing, so the difference is no reason to refuse."""
-    known = getattr(rebuilt, "deploy_tx_hash", None)
-    if getattr(kept, "deploy_tx_hash", None) == UNKNOWN_DEPLOY_TX_HASH and known not in (None, UNKNOWN_DEPLOY_TX_HASH):
-        return dataclasses.replace(kept, deploy_tx_hash=known)
-    return kept
-
-
 def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: str, phase: str) -> Any:
     """The record a phase drives: the persisted one where it exists, merged with the phase's rebuild.
 
@@ -542,8 +527,9 @@ def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: s
       different swaps or contracts; this does not guess which is right.
     * **Every other field**, derived from ``dataclasses.fields(SwapRecord)`` so a field added later
       is carried without editing this list: the persisted value when it is set, else the rebuilt one.
-      The exchange files only fill what the record lacks, including a locator deploy hash the
-      record holds only as the ``UNKNOWN_DEPLOY_TX_HASH`` placeholder (:func:`_with_known_deploy_tx`).
+      The exchange files only fill what the record lacks. A persisted locator is kept whole, deploy
+      hash included: a taker's is from its own deploy receipt, and a maker's is the
+      ``UNKNOWN_DEPLOY_TX_HASH`` placeholder, never the taker's word (``eth_swap_two_host._maker_view``).
     * **Locator filled into a record without one**: through ``SwapRecord.with_counter_lock``, so the
       pending handles and ``fund_refusal`` it supersedes are cleared exactly as the coordinator
       clears them when it attaches a locator.
@@ -612,8 +598,6 @@ def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: s
             continue
         kept = getattr(persisted, field.name)
         carried[field.name] = kept if kept is not None else getattr(rebuilt, field.name)
-    if persisted.counterchain_locator is not None and new_loc is not None:
-        carried["counterchain_locator"] = _with_known_deploy_tx(persisted.counterchain_locator, new_loc)
     try:
         merged = dataclasses.replace(persisted, state=rebuilt.state, **carried)
         if persisted.counterchain_locator is None and new_loc is not None:

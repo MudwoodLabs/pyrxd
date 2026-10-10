@@ -1235,7 +1235,7 @@ async def _seed(args, record) -> None:
     await JsonFileRecordSink(_record_path(args))(record)
 
 
-def _seeded_record(terms, io_dir: Path, *, eth: bool, state: SwapState, pending: bool = True):
+def _seeded_record(terms, io_dir: Path, *, eth: bool, state: SwapState, pending: bool = True, maker: bool = False):
     """The record an earlier phase of this host left behind, holding every field scenario 19 names.
 
     FIXTURE NOTE: on ETH this carries the funded locator AND the pending deploy/push handles of the
@@ -1246,6 +1246,10 @@ def _seeded_record(terms, io_dir: Path, *, eth: bool, state: SwapState, pending:
     from pyrxd.gravity.swap_state import SwapRecord
 
     loc = _exchange_locator(io_dir, eth=eth)
+    if eth and maker:  # a maker records the taker's locator without its deploy hash (`_maker_view`)
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+
+        loc = dataclasses.replace(loc, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)
     env = json.loads((io_dir / "envelope.json").read_text())
     rec = (
         SwapRecord(state=state, terms=terms)
@@ -1434,7 +1438,9 @@ class TestEveryPhaseKeepsThePersistedRecord:
         args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role=role, phase=phase)
         # The maker's lock-claim re-attaches the verified locator through `with_counter_lock`, which
         # clears pending handles by design; a maker record never holds them anyway.
-        seeded = _seeded_record(terms, io_dir, eth=eth, state=start, pending=phase != "lock-claim")
+        seeded = _seeded_record(
+            terms, io_dir, eth=eth, state=start, pending=phase != "lock-claim", maker=role == "maker"
+        )
         await _seed(args, seeded)
         before = _kept_fields(_read_back(args))
         assert before == _kept_fields(seeded), "the fixture did not round-trip through the sink"
@@ -1496,35 +1502,74 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     @pytest.mark.parametrize("then", ["refund", "lock-claim"])
     async def test_the_next_maker_phase_runs(self, name, then, tmp_path, monkeypatch):
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+
         eth, io_dir, after = await self._lock_claim_then(name, tmp_path, monkeypatch, then=then)
         exchanged = _exchange_locator(io_dir, eth=eth)
         if eth:
-            # Which deploy hash the record keeps: the real one from taker_funding.json, never the
-            # placeholder the leg's re-derivation carries (the watchtower's claim scan reads it).
-            assert after.counterchain_locator.deploy_tx_hash == exchanged.deploy_tx_hash
+            # The maker's record never holds the taker's deploy hash: it is the taker's word, and a
+            # log scan would start at it. Every bound field is the taker's contract.
+            assert after.counterchain_locator.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
+            exchanged = dataclasses.replace(exchanged, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)
         assert after.counterchain_locator.to_dict() == exchanged.to_dict()
 
     @pytest.mark.parametrize("then", ["refund", "lock-claim"])
-    async def test_a_record_holding_the_placeholder_deploy_hash_still_recovers(self, then, tmp_path, monkeypatch):
-        """The record a lock-claim wrote before this fix holds the leg's placeholder deploy hash. The
-        merge compares the locator without it, and fills it from taker_funding.json."""
-        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+    async def test_a_record_holding_the_takers_deploy_hash_still_recovers(self, then, tmp_path, monkeypatch):
+        """A maker record written before this change can hold taker_funding.json's deploy hash, while
+        the phase now rebuilds the locator with the placeholder. The merge compares the locator
+        without the hash, so the phase runs."""
         from pyrxd.gravity.swap_state import SwapRecord
 
         name = "eth_swap_two_host"
         args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase=then)
-        exchanged = _exchange_locator(io_dir, eth=True)
         spk = json.loads((io_dir / "envelope.json").read_text())["covenant_spk_hex"]
         left = (
             SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms)
-            .with_counter_lock(dataclasses.replace(exchanged, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH))
+            .with_counter_lock(_exchange_locator(io_dir, eth=True))
             .with_radiant_lock(_FAKE_COVENANT_OUTPOINT, spk)
         )
         await _seed(args, left)
         built = await _run_phase(name, args, monkeypatch, role="maker", phase=then, counter_leg=leg, stop_at=stop_at)
         if then == "refund":
             assert len(built["rxd"].refund_calls) == 1
-        assert _read_back(args).counterchain_locator.deploy_tx_hash == exchanged.deploy_tx_hash
+        assert _read_back(args).counterchain_locator.contract_address == left.counterchain_locator.contract_address
+
+    async def test_a_lying_deploy_hash_cannot_move_the_claim_scan_past_a_real_claim(self, tmp_path, monkeypatch):
+        """taker_funding.json names a LATER transaction as the deploy, past a real claim. The maker's
+        record must not carry it: ``claim_status`` starts its log scan at that transaction's block and
+        would report the claimed contract unclaimed. With the placeholder the scan refuses instead."""
+        from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, RpcEthChainSource
+
+        name = "eth_swap_two_host"
+        args, _terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        lie = "0x" + "66" * 32
+        doc = json.loads((io_dir / "taker_funding.json").read_text())
+        real_deploy = doc["eth_locator"]["deploy_tx_hash"]
+        doc["eth_locator"]["deploy_tx_hash"] = lie
+        (io_dir / "taker_funding.json").write_text(json.dumps(doc))
+        leg = _RevealAndFundingLeg(leg._p, _exchange_locator(io_dir, eth=True))
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
+        loc = _read_back(args).counterchain_locator
+        assert loc.deploy_tx_hash != lie
+
+        class _Chain:  # deploy at block 10, a real claim at 100, the lying tx at 500
+            blocks = {real_deploy: 10, lie: 500}
+
+            async def get_transaction(self, tx_hash):
+                if tx_hash not in self.blocks:
+                    raise NetworkError(f"eth_getTransactionByHash failed: {tx_hash} not found")
+                return {"blockNumber": self.blocks[tx_hash]}
+
+            async def get_logs(self, *, address, topics=None, from_block="earliest", to_block="latest"):
+                claim = {"topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32, "blockNumber": 100}
+                return [claim] if int(from_block) <= 100 else []
+
+        source = RpcEthChainSource(_Chain())
+        assert (await source.claim_status(loc.contract_address, real_deploy)).claimed  # control
+        assert not (await source.claim_status(loc.contract_address, lie)).claimed  # what the lie did
+        with pytest.raises(NetworkError):
+            await source.claim_status(loc.contract_address, loc.deploy_tx_hash)
 
 
 class TestARerunFundNeverOverwritesTheRecord:
@@ -1846,8 +1891,8 @@ class TestTheMergeHelperOnItsOwn:
 
     async def test_the_persisted_value_wins_and_the_rebuild_fills_only_gaps(self, eth_mod, tmp_path):
         """A field outside the binding set that differs keeps the PERSISTED value; one the record
-        lacks takes the rebuild's. Two real deploy hashes keep the persisted one; the placeholder is a
-        gap the rebuild fills."""
+        lacks takes the rebuild's. A persisted deploy hash is kept whether real or the placeholder: the
+        rebuild's hash is the taker's word."""
         from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
         from pyrxd.gravity.swap_state import SwapRecord
 
@@ -1867,10 +1912,11 @@ class TestTheMergeHelperOnItsOwn:
         assert merged.counterchain_locator.deploy_tx_hash == loc.deploy_tx_hash
         assert merged.radiant_covenant_spk_hex == "ab" * 25  # a gap, filled
 
+        # A maker's placeholder is kept, not replaced by a hash the rebuild names (the taker's word).
         path.unlink()
         await _seed(args, base.with_counter_lock(dataclasses.replace(loc, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)))
         merged = self._merge(path, base.with_counter_lock(loc))
-        assert merged.counterchain_locator.deploy_tx_hash == loc.deploy_tx_hash
+        assert merged.counterchain_locator.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
         assert merged.single_operator_override is None
 
 
