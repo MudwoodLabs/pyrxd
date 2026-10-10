@@ -1282,7 +1282,58 @@ class _RevealAndFundingLeg(_FakeCounterLeg):
         self.provenance_checked.append(tx_hash)
 
     async def verify_counterparty_funded(self, ref, terms, **kw):
-        return self._loc
+        # The REAL leg's method, over a stand-in for the chain only, so the locator it returns has
+        # the shape production returns. Returning the exchange-file locator here hid #853's
+        # regression: the real ETH leg rebuilds the locator without the deploy hash.
+        return await _real_verify_counterparty_funded(self._loc, ref, terms, **kw)
+
+
+async def _real_verify_counterparty_funded(funded, ref, terms, **kw):
+    """``EthLeg`` / ``BitcoinTaprootLeg.verify_counterparty_funded`` itself, run over a stand-in
+    for the chain reads that reports *funded* as what is on chain. Everything the method builds
+    from the maker's own config and the terms is the shipped code."""
+    import types
+
+    from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
+    from pyrxd.eth_wallet.locator import EthHtlcLocator
+    from pyrxd.gravity.eth_leg import EthLeg
+
+    if isinstance(funded, EthHtlcLocator):
+
+        class _Contract:
+            chain_id = funded.chain_id
+            token = None
+
+            async def verify_funded(self, expected, *, expected_amount_wei, block_identifier=None):
+                for key, value in expected.to_dict().items():
+                    if key != "deploy_tx_hash" and value != funded.to_dict()[key]:
+                        raise ValidationError(f"the contract on chain does not match the expected {key}")
+
+        leg = types.SimpleNamespace(
+            _leg=_Contract(),
+            _claim_to=funded.claimant,
+            _refund_to=funded.refundee,
+            _eth_timeout_unix_s=funded.timeout,
+        )
+        leg.expected_locator = types.MethodType(EthLeg.expected_locator, leg)
+        return await EthLeg.verify_counterparty_funded(leg, ref, terms, **kw)
+
+    class _Reader:
+        async def read_confirmed_unspent_output(self, txid, vout):
+            return funded.scriptpubkey, funded.amount_sats
+
+        async def confirmations(self, txid):
+            return 10_000
+
+    leg = types.SimpleNamespace(
+        network=funded.network,
+        min_confirmations=1,
+        funding_reader=_Reader(),
+        _counterparty_outpoint=BitcoinTaprootLeg._counterparty_outpoint,  # a staticmethod
+    )
+    for name in ("_htlc", "derive_funding_scriptpubkey"):
+        setattr(leg, name, types.MethodType(getattr(BitcoinTaprootLeg, name), leg))
+    return await BitcoinTaprootLeg.verify_counterparty_funded(leg, ref, terms, **kw)
 
 
 def _btc_claim_tx(locator) -> bytes:
@@ -1388,6 +1439,40 @@ class TestEveryPhaseKeepsThePersistedRecord:
         assert len(built["rxd"].refund_calls) == 1
         assert built["rxd"].refund_calls[0].radiant_covenant_outpoint == pinned
         assert _read_back(args).radiant_covenant_outpoint == pinned
+
+
+class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
+    """The maker's lock-claim persists the locator its leg RE-DERIVES (``verify_counterparty_funded``),
+    and every later maker phase rebuilds one from taker_funding.json. On ETH the re-derived locator
+    has no deploy hash (the leg cannot know it), so a whole-locator compare refused the maker's
+    --phase refund and its lock-claim retry on every honest swap (#853). Starts from NO record, as an
+    honest first run does, and each phase is a fresh module: a process restart in between."""
+
+    async def _lock_claim_then(self, name: str, tmp_path, monkeypatch, *, then: str):
+        eth = name == "eth_swap_two_host"
+        args, _terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        persisted = _read_back(args)
+        assert persisted is not None and persisted.counterchain_locator is not None, "lock-claim persisted nothing"
+        if then == "refund":
+            built = await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
+            assert len(built["rxd"].refund_calls) == 1, "the maker's own asset refund did not run"
+        else:
+            await _run_phase(
+                name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at
+            )
+        return eth, io_dir, _read_back(args)
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    @pytest.mark.parametrize("then", ["refund", "lock-claim"])
+    async def test_the_next_maker_phase_runs(self, name, then, tmp_path, monkeypatch):
+        eth, io_dir, after = await self._lock_claim_then(name, tmp_path, monkeypatch, then=then)
+        exchanged = _exchange_locator(io_dir, eth=eth)
+        if eth:
+            # Which deploy hash the record keeps: the real one from taker_funding.json, never the
+            # placeholder the leg's re-derivation carries (the watchtower's claim scan reads it).
+            assert after.counterchain_locator.deploy_tx_hash == exchanged.deploy_tx_hash
+        assert after.counterchain_locator.to_dict() == exchanged.to_dict()
 
 
 class TestADisagreementRefusesAndSendsNothing:
@@ -1517,6 +1602,67 @@ class TestTheMergeHelperOnItsOwn:
         torn.write_text('{"state": "btc_lo')
         with pytest.raises(SystemExit, match="could not be read"):
             self._merge(torn, SwapRecord(state=SwapState.BTC_LOCKED, terms=terms))
+
+    def test_exactly_the_informational_locator_keys_are_left_out_of_the_compare(self, eth_mod, btc_mod, tmp_path):
+        """Derived from the real locators' wire keys: changing any key refuses except the ones in
+        LOCATOR_INFORMATIONAL_KEYS, and that set is exactly the deploy hash."""
+        from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+        sys.path.insert(0, str(_SCRIPTS))
+        import _dust_swap_shared as shared
+
+        assert frozenset({"deploy_tx_hash"}) == shared.LOCATOR_INFORMATIONAL_KEYS
+        _a, _t, eth_io = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True)
+        _a, _t, btc_io = _btc_scenario(btc_mod, tmp_path, role="maker", with_funding=True)
+        eth_loc = _exchange_locator(eth_io, eth=True)
+        token_loc = Erc20HtlcLocator(**eth_loc.to_dict(), token_address="0x" + "aa" * 20)
+
+        class _Wire:
+            def __init__(self, wire: dict) -> None:
+                self._wire = wire
+
+            def to_dict(self) -> dict:
+                return dict(self._wire)
+
+        ignored: set[str] = set()
+        for loc in (eth_loc, token_loc, _exchange_locator(btc_io, eth=False)):
+            wire = loc.to_dict()
+            for key in wire:
+                changed = _Wire({**wire, key: ("changed", wire[key])})
+                if shared._comparable(_Wire(wire), field="counterchain_locator") == shared._comparable(
+                    changed, field="counterchain_locator"
+                ):
+                    ignored.add(key)
+        assert ignored == {"deploy_tx_hash"}, ignored
+
+    async def test_the_persisted_value_wins_and_the_rebuild_fills_only_gaps(self, eth_mod, tmp_path):
+        """A field outside the binding set that differs keeps the PERSISTED value; one the record
+        lacks takes the rebuild's. Two real deploy hashes keep the persisted one; the placeholder is a
+        gap the rebuild fills."""
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True)
+        loc = _exchange_locator(io_dir, eth=True)
+        path = _record_path(args)
+        base = SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms)
+
+        await _seed(args, dataclasses.replace(base.with_counter_lock(loc), single_operator_override="persisted"))
+        rebuilt = dataclasses.replace(
+            base.with_counter_lock(dataclasses.replace(loc, deploy_tx_hash="0x" + "56" * 32)),
+            single_operator_override="rebuilt",
+            radiant_covenant_spk_hex="ab" * 25,
+        )
+        merged = self._merge(path, rebuilt)
+        assert merged.single_operator_override == "persisted"
+        assert merged.counterchain_locator.deploy_tx_hash == loc.deploy_tx_hash
+        assert merged.radiant_covenant_spk_hex == "ab" * 25  # a gap, filled
+
+        path.unlink()
+        await _seed(args, base.with_counter_lock(dataclasses.replace(loc, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)))
+        merged = self._merge(path, base.with_counter_lock(loc))
+        assert merged.counterchain_locator.deploy_tx_hash == loc.deploy_tx_hash
+        assert merged.single_operator_override is None
 
 
 # ---------------------------------------------------------------------------

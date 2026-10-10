@@ -54,7 +54,7 @@ from pyrxd.btc_wallet.taproot import (
     btc_input_outpoints_from_raw,
 )
 from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
-from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
+from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
@@ -3369,6 +3369,26 @@ class SwapCoordinator:
             f"(the maker should refund the covenant via CSV): {reason}"
         )
 
+    def _keep_known_deploy_tx(self, verified: Any) -> Any:
+        """*verified*, carrying the deploy hash the record already holds for the same contract.
+
+        The ETH maker's leg re-derives the locator from its own config and the contract address, and
+        cannot know the deploy transaction, so its locator carries ``UNKNOWN_DEPLOY_TX_HASH``. Attaching
+        it as returned replaced the hash the record held (from taker_funding.json) on every
+        verification. The hash binds nothing (no claim, refund or verification reads it); the
+        watchtower's claim scan starts at its block, which a placeholder cannot give. Every BOUND
+        field still comes from the verification."""
+        known = self.record.counterchain_locator
+        if (
+            isinstance(verified, EthHtlcLocator)
+            and verified.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
+            and isinstance(known, EthHtlcLocator)
+            and known.deploy_tx_hash != UNKNOWN_DEPLOY_TX_HASH
+            and known.contract_address.lower() == verified.contract_address.lower()
+        ):
+            return dataclasses.replace(verified, deploy_tx_hash=known.deploy_tx_hash)
+        return verified
+
     def _counter_verify_callable(self):
         """The counter leg's maker-side verification entry point, or fail-closed.
 
@@ -3491,7 +3511,7 @@ class SwapCoordinator:
         block_id = "finalized" if self.config.margin_policy.is_measured else None
         try:
             reverified = await verify(locator.contract_address, self.record.terms, block_identifier=block_id)
-            self.record = self.record.with_counter_lock(reverified)
+            self.record = self.record.with_counter_lock(self._keep_known_deploy_tx(reverified))
             # THE COVENANT'S REAL DEPTH, read here rather than assumed (#564). NetworkError joins
             # the caught set because this read touches the chain and a failure must persist for
             # recovery before it propagates — the same discipline as the BTC twin below.
@@ -3550,7 +3570,7 @@ class SwapCoordinator:
         if terms.counter_chain == "btc":
             locator = await verify(counter_funding_ref, terms, min_confirmations=self._btc_counter_funding_depth())
         else:
-            locator = await verify(counter_funding_ref, terms)
+            locator = self._keep_known_deploy_tx(await verify(counter_funding_ref, terms))
         self.record = self.record.with_counter_lock(locator)
         await self._persist_record(self.record, shield=True)
         return self.record

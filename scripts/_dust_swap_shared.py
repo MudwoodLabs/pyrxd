@@ -31,6 +31,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
 from pyrxd.gravity import funding_spv
 from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY, ElapsedBoundPolicy, MakerFundingNotVerified
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
@@ -165,6 +166,18 @@ SINGLE_OPERATOR_ROLE = None
 #: and a phase's rebuild both hold one of these and they differ, the merge refuses instead of
 #: picking a side. Every other field is carried from the persisted record (see the merge below).
 BINDING_RECORD_FIELDS = ("terms", "counterchain_locator", "radiant_covenant_outpoint", "radiant_covenant_spk_hex")
+
+#: Locator keys (``to_dict()``) that neither the chain nor the terms bind, so the binding compare of
+#: ``counterchain_locator`` leaves them out. Every other key of each locator type is a contract
+#: immutable, a terms value, or the funding output itself; a test mutates each key in turn and pins
+#: that exactly these keys are the ones that do not refuse.
+#:
+#: ``deploy_tx_hash``: the ETH maker's leg re-derives the locator from its own config and the
+#: contract ADDRESS (``EthLeg.expected_locator``), and nothing in the contract names the transaction
+#: that created it, so its locator carries ``UNKNOWN_DEPLOY_TX_HASH`` while taker_funding.json
+#: carries the real hash. Comparing it refused the maker's ``--phase refund`` and its lock-claim
+#: retry on every honest swap (#853).
+LOCATOR_INFORMATIONAL_KEYS = frozenset({"deploy_tx_hash"})
 
 
 #: Which persisted ``SwapState`` each runner phase may run on (#850 PR R, review F1). Keyed by
@@ -422,13 +435,32 @@ def refuse_by_persisted_state(sink: Any, *, terms: Any, role: str, phase: str) -
         raise SystemExit(f"REFUSING {role} --phase {phase}: {refusal}. Nothing was sent. (record: {path})")
 
 
-def _comparable(value: Any) -> Any:
-    """A value in a form ``==`` compares by content: a locator or terms object by type and wire form."""
+def _comparable(value: Any, *, field: str = "") -> Any:
+    """A value in a form ``==`` compares by content: a locator or terms object by type and wire form.
+    A ``counterchain_locator`` is compared without :data:`LOCATOR_INFORMATIONAL_KEYS`."""
     if hasattr(value, "to_dict"):
-        return (type(value).__name__, value.to_dict())
+        wire = value.to_dict()
+        if field == "counterchain_locator":
+            wire = {k: v for k, v in wire.items() if k not in LOCATOR_INFORMATIONAL_KEYS}
+        return (type(value).__name__, wire)
     if isinstance(value, str):
         return value.lower()
     return value
+
+
+def _with_known_deploy_tx(kept: Any, rebuilt: Any) -> Any:
+    """The persisted locator, with the rebuild's deploy hash when the persisted one is the
+    ``UNKNOWN_DEPLOY_TX_HASH`` placeholder and the rebuild names a real one.
+
+    WHICH SIDE'S HASH IS KEPT, AND WHY. The persisted record wins, as it does for every other field:
+    it is what this host recorded (a taker's comes from its own deploy receipt). The placeholder is
+    not a value but the absence of one (the maker's leg cannot know the deploy), so it is a gap the
+    rebuild fills, as a ``None`` is. Two real hashes that differ keep the persisted one: the hash
+    binds nothing, so the difference is no reason to refuse."""
+    known = getattr(rebuilt, "deploy_tx_hash", None)
+    if getattr(kept, "deploy_tx_hash", None) == UNKNOWN_DEPLOY_TX_HASH and known not in (None, UNKNOWN_DEPLOY_TX_HASH):
+        return dataclasses.replace(kept, deploy_tx_hash=known)
+    return kept
 
 
 def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: str, phase: str) -> Any:
@@ -441,13 +473,15 @@ def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: s
 
     * **No persisted record** (a first run): the rebuild, unchanged.
     * **Binding fields** (:data:`BINDING_RECORD_FIELDS`): when both sides hold a value they must be
-      equal, or this REFUSES (``SystemExit``) and nothing is sent. A persisted pending counter
+      equal, or this REFUSES (``SystemExit``) and nothing is sent. The locator is compared without
+      :data:`LOCATOR_INFORMATIONAL_KEYS` (the deploy hash binds nothing). A persisted pending counter
       contract (ETH) or pending funding transaction (BTC) must also be the contract or funding the
       rebuilt locator describes. A disagreement means the record and the exchange files describe
       different swaps or contracts; this does not guess which is right.
     * **Every other field**, derived from ``dataclasses.fields(SwapRecord)`` so a field added later
       is carried without editing this list: the persisted value when it is set, else the rebuilt one.
-      The exchange files only fill what the record lacks.
+      The exchange files only fill what the record lacks, including a locator deploy hash the
+      record holds only as the ``UNKNOWN_DEPLOY_TX_HASH`` placeholder (:func:`_with_known_deploy_tx`).
     * **Locator filled into a record without one**: through ``SwapRecord.with_counter_lock``, so the
       pending handles and ``fund_refusal`` it supersedes are cleared exactly as the coordinator
       clears them when it attaches a locator.
@@ -489,7 +523,7 @@ def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: s
         raise SystemExit(f"REFUSING {role} --phase {phase}: {refusal}. Nothing was sent. (record: {path})")
     for name in BINDING_RECORD_FIELDS:
         kept, new = getattr(persisted, name), getattr(rebuilt, name)
-        if kept is not None and new is not None and _comparable(kept) != _comparable(new):
+        if kept is not None and new is not None and _comparable(kept, field=name) != _comparable(new, field=name):
             shown_kept = kept.to_dict() if hasattr(kept, "to_dict") else kept
             shown_new = new.to_dict() if hasattr(new, "to_dict") else new
             raise _refuse(name, shown_kept, shown_new)
@@ -514,6 +548,8 @@ def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: s
             continue
         kept = getattr(persisted, field.name)
         carried[field.name] = kept if kept is not None else getattr(rebuilt, field.name)
+    if persisted.counterchain_locator is not None and new_loc is not None:
+        carried["counterchain_locator"] = _with_known_deploy_tx(persisted.counterchain_locator, new_loc)
     try:
         merged = dataclasses.replace(persisted, state=rebuilt.state, **carried)
         if persisted.counterchain_locator is None and new_loc is not None:

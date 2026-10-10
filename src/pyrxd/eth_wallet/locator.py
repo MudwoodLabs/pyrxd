@@ -20,6 +20,7 @@ from typing import ClassVar
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
+    "UNKNOWN_DEPLOY_TX_HASH",
     "Erc20HtlcLocator",
     "EthHtlcLocator",
     "PendingDeploy",
@@ -37,6 +38,13 @@ __all__ = [
 #: first on-chain use — far from the construction that introduced it, and for the field that IS
 #: the identity of the asset being swapped. Three modules had independently copied that check.
 _HEX_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+
+#: The ``deploy_tx_hash`` of a locator built where the deploy transaction is not known: the maker's
+#: :meth:`pyrxd.gravity.eth_leg.EthLeg.expected_locator` re-derives a contract from terms and an
+#: address, and nothing in the contract names the transaction that created it. Not a real hash
+#: (none is all zeros in practice); a reader that needs the deploy (the watchtower's claim scan
+#: starts at its block) must treat it as absent. It is informational only and binds nothing.
+UNKNOWN_DEPLOY_TX_HASH = "0x" + "00" * 32
 
 
 def normalise_tx_hash(val: str) -> str:
