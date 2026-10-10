@@ -1534,10 +1534,13 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
             assert len(built["rxd"].refund_calls) == 1
         assert _read_back(args).counterchain_locator.contract_address == left.counterchain_locator.contract_address
 
-    async def test_a_lying_deploy_hash_cannot_move_the_claim_scan_past_a_real_claim(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("first", ["lock-claim", "refund"])
+    async def test_a_lying_deploy_hash_cannot_move_the_claim_scan_past_a_real_claim(self, first, tmp_path, monkeypatch):
         """taker_funding.json names a LATER transaction as the deploy, past a real claim. The maker's
         record must not carry it: ``claim_status`` starts its log scan at that transaction's block and
-        would report the claimed contract unclaimed. With the placeholder the scan refuses instead."""
+        would report the claimed contract unclaimed. With the placeholder the scan refuses instead. Both
+        orders: after a lock-claim (the leg re-derives the locator) and a refund that is the first phase
+        to write the record (the locator comes from taker_funding.json alone)."""
         from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, RpcEthChainSource
 
         name = "eth_swap_two_host"
@@ -1548,7 +1551,10 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
         doc["eth_locator"]["deploy_tx_hash"] = lie
         (io_dir / "taker_funding.json").write_text(json.dumps(doc))
         leg = _RevealAndFundingLeg(leg._p, _exchange_locator(io_dir, eth=True))
-        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        if first == "lock-claim":
+            await _run_phase(
+                name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at
+            )
         await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
         loc = _read_back(args).counterchain_locator
         assert loc.deploy_tx_hash != lie
