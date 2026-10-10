@@ -378,6 +378,12 @@ def extend_verified_headers(
     if kind == "lie":
         raise HeaderCacheRefusal(str(reason))
     added = tuple(bytes(x) for x in new[: len(hashes)])
+    # Copies the whole tuple per call, so a sync of N headers in batches of 2,016 copies about
+    # N**2 / 4,032 references in all. Kept: measured 2026-10-10 (a plain tuple-concatenation loop of
+    # that shape, this machine), 105,000 headers took 0.01 s and 525,000 took 0.25 s, small beside
+    # the per-header proof-of-work check. A buffer shared between a chain and its extensions would
+    # make it linear, but two extensions of one chain would then write into the same buffer, and
+    # keeping each VerifiedHeaders immutable under that is more code than this cost justifies.
     return (
         VerifiedHeaders(
             network=chain.network,

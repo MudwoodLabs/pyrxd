@@ -245,6 +245,43 @@ def test_a_store_for_another_network_or_another_checkpoint_is_not_used(tmp_path)
     assert rebased is not None and (rebased.base_height, rebased.top) == (460570, TOP)
 
 
+@pytest.mark.parametrize(
+    ("case", "table_heights", "refused_at"),
+    [
+        ("an_intermediate_checkpoint", (START, 460568, 460570), 460568),
+        ("the_newest_checkpoint", (START, 460570), 460570),
+    ],
+)
+def test_a_store_that_links_but_is_not_a_shipped_checkpoint_is_refused(
+    monkeypatch, tmp_path, case: str, table_heights: tuple[int, ...], refused_at: int
+) -> None:
+    """Below the newest checkpoint only linkage is checked, so every checkpoint the stored headers
+    pass is pinned. The store here starts at a real shipped checkpoint and links hash by hash, but
+    leaves the real chain at 460,568 (the branch of :func:`_fork_branch`): the first checkpoint it
+    reaches above that refuses it, at an intermediate checkpoint or at the newest."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_branch_chain(monkeypatch), table=_table(START), path=path)
+    table = tuple((h, _hash(h)) for h in table_heights)
+    _, stored = decode_store(path.read_bytes())
+    chain, why = verify_header_chain("mainnet", START, stored, table=table)
+    assert chain is None
+    assert why == f"the stored header at {refused_at} is not the checkpoint this pyrxd ships for that height"
+    got = header_store.load("mainnet", table, path=path)
+    assert got.chain is None and got.untrusted and why in (got.note or "")
+    # Honest pair: the real chain over the same table verifies, rebased on the newest checkpoint.
+    real, why = verify_header_chain("mainnet", START, [HEADERS[h] for h in range(START, TOP + 1)], table=table)
+    assert why is None and real is not None and (real.base_height, real.top) == (table_heights[-1], TOP)
+
+
+def test_headers_that_end_below_the_newest_checkpoint_are_refused_not_an_index_error() -> None:
+    """``verify_header_chain`` is public: given headers from an older checkpoint that stop short of
+    the newest one, it refuses them (``load()`` reports such a store as stale before calling it, and
+    ``start_verified_headers`` always starts at the newest, but a direct caller reaches this)."""
+    table = ((START, _hash(START)), (460570, _hash(460570)))
+    chain, why = verify_header_chain("mainnet", START, [HEADERS[h] for h in range(START, 460568)], table=table)
+    assert chain is None and why == "the store ends at block 460567, below this pyrxd's newest checkpoint (460570)"
+
+
 def test_a_store_that_ends_below_the_newest_checkpoint_is_stale(tmp_path) -> None:
     path = tmp_path / "mainnet.bin"
     header_store.save(_chain(START, 460570), table=_table(START), path=path)
@@ -421,6 +458,50 @@ def test_two_operators_agreeing_extend_the_cache(monkeypatch, tmp_path) -> None:
     # Again: nothing new, nothing rewritten.
     r2, out2 = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
     assert r2.exit_code == 0 and out2["state"] == "up to date" and out2["added"] == 0
+
+
+def _no_header_fetch(tip: int, headers: dict[int, bytes] | None = None) -> ElectrumXClient:
+    """An operator that fails ``blockchain.block.header``: the one RPC that fetches the checkpoint's
+    header, which a sync makes only when pyrxd does not ship it."""
+    return _operator(tip, headers, fail="blockchain.block.header")
+
+
+def test_the_shipped_checkpoint_header_is_used_without_fetching_it(monkeypatch, tmp_path) -> None:
+    """The REAL path: the newest checkpoint's header ships with pyrxd, so a first sync (and a
+    reset) starts from it and fetches nothing for it. Unpatched table and shipped header; the tip
+    the operators report puts nothing above the checkpoint deep enough, so no fixture header is
+    needed, and the reset writes the shipped header alone, which then reads back verified against
+    the real table."""
+    table, shipped = headers_cmds._shipped("mainnet")
+    cp_h, cp_hash = table[-1]
+    assert shipped is not None and radiant_block_hash(bytes.fromhex(shipped)) == cp_hash, "the shipped header"
+    ops = {k: _no_header_fetch(cp_h + 100) for k in ("operator:a", "operator:b")}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 0 and out["state"] == "up to date", r.output
+    two = [headers_cmds.OperatorSource(k, _no_header_fetch(cp_h + 100)) for k in ("operator:a", "operator:b")]
+    monkeypatch.setattr(headers_cmds, "operator_sources", lambda ctx: two)
+    head = ["--wallet", str(tmp_path / "w.dat"), "--config", str(tmp_path / "c.toml"), "--json"]
+    r = CliRunner().invoke(cli, [*head, "headers", "sync", "--reset"])
+    out = json.loads(r.output)
+    assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == cp_h, r.output
+    back = header_store.load("mainnet", table)
+    assert back.chain is not None and back.chain.headers == (bytes.fromhex(shipped),)
+
+
+def test_a_shipped_checkpoint_header_is_used_only_when_it_hashes_to_the_checkpoint(monkeypatch, tmp_path) -> None:
+    """With the fixture's checkpoint: a shipped header that IS that checkpoint is used and nothing
+    fetches it; one that is not (another real header) is ignored, and the header is fetched from
+    the operators and agreed, as when none ships."""
+    _patch_table(monkeypatch, START)
+    monkeypatch.setitem(radiant_checkpoints.NEWEST_CHECKPOINT_HEADER, "mainnet", HEADERS[START].hex())
+    r, out = _sync(monkeypatch, tmp_path, {k: _no_header_fetch(DEEP) for k in ("operator:a", "operator:b")})
+    assert r.exit_code == 0 and out["state"] == "synced" and (out["cached_from"], out["cached_to"]) == (START, TOP)
+    header_store.store_path("mainnet").unlink()
+    monkeypatch.setitem(radiant_checkpoints.NEWEST_CHECKPOINT_HEADER, "mainnet", HEADERS[START + 1].hex())
+    r, out = _sync(monkeypatch, tmp_path, {k: _no_header_fetch(DEEP) for k in ("operator:a", "operator:b")})
+    assert r.exit_code == 2 and "operator is down" in out["reason"], "it was fetched, not taken from the table"
+    r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
+    assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == TOP
 
 
 def test_one_operator_is_refused_and_nothing_is_written(monkeypatch, tmp_path) -> None:
