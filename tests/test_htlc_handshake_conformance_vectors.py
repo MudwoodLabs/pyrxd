@@ -473,7 +473,7 @@ def _rxd_vector() -> dict:
 
 
 def test_ft_nft_empty_genesis_ref_rejected_at_construction():
-    """``swap_state.py:339-341`` is a NON-EMPTINESS check — this is all it catches."""
+    """``swap_state.py:359-361`` is a NON-EMPTINESS check — this is all it catches."""
     for variant in ("ft", "nft"):
         d = dict(_rxd_vector()["terms"])
         d["asset_variant"] = variant

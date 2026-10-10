@@ -258,17 +258,28 @@ files, and then merges it with the record this host saved (`<--local-out>.swapre
 the record already holds are kept, such as the covenant outpoint pinned by an earlier phase and
 the pending deploy or push handles. The exchange files only fill fields the record lacks. If
 the record and the exchange files disagree on the terms, the hashlock, the counter-leg contract
-or the covenant outpoint, the phase refuses and sends nothing. Find out which one describes your
-swap before running it again. Each phase still drives the FSM state it always did, so a retry
-can rewind (a claim retry after the reveal was recorded, a lock-claim retry).
+or the covenant outpoint, the phase refuses and sends nothing. (An ETH locator's deploy
+transaction hash is not compared: it binds nothing, and the maker's own verification cannot know
+it.) Find out which one describes your swap before running it again. Each phase still drives the
+FSM state it always did, so a retry can rewind in memory (a claim retry after the reveal was
+recorded, a lock-claim retry), but the saved record never moves back from `secret_revealed` or a
+later state to an earlier one: a retry that stops part-way leaves the record of the reveal in
+place.
 
 The saved record's state is checked first, on both runners. Taker `abort` and taker `refund`
 refuse when it says `secret_revealed`, `asset_vulnerable` or `completed`: `p` is public and the
 covenant is yours to claim, so run `--phase claim` before `t_rxd`. Maker `refund` refuses when it
-says `secret_revealed`, because you claimed the counter leg and refunding the asset too would
-take both legs; re-run `--phase lock-claim` if that claim did not confirm. Terminal states are
-not refused, because today they are written when a transaction is broadcast, not when it
+says `secret_revealed`, and maker `abort` when it says `secret_revealed` or `completed`, because
+you claimed the counter leg and refunding the asset too would take both legs; re-run `--phase
+lock-claim` if that claim did not confirm. Maker `abort` also refuses whenever the record holds a
+counter-leg locator (the taker did fund): use `--phase refund`. Terminal states are not refused
+for being terminal, because today they are written when a transaction is broadcast, not when it
 confirms, so re-sending a dropped refund must stay possible.
+
+Taker `--phase fund` reads the record first as well: a record past `negotiated` (already funded)
+refuses, and on ETH so does a record holding an interrupted deploy, which this runner does not
+resume (it holds no fund lock); that contract refunds to you by its address after the ETH
+deadline. The BTC runner resumes a recorded funding transaction as before.
 
 `scripts/btc_swap_two_host.py` has the same four phases, with the BTC HTLC's CSV (`t_btc`) in
 place of the ETH timeout — but its taker `refund` is **unchanged for now**: it still refunds

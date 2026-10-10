@@ -292,9 +292,9 @@ def _btc_refund_matured(terms: NegotiatedTerms, obs: Observations) -> bool:
 # must still page the claim race. But WHICH step to name is a different question, and it is
 # answered by the record, because both claim methods are strictly state-gated:
 #
-#   taker_scrape_and_claim_asset       — SECRET_REVEALED only  (swap_coordinator.py:3330, :3400)
-#   taker_claim_asset_from_vulnerable  — ASSET_VULNERABLE only (swap_coordinator.py:3473, :3489)
-#   taker_observed_reveal              — BOTH_LOCKED only      (swap_coordinator.py:3261)
+#   taker_scrape_and_claim_asset       — SECRET_REVEALED only  (swap_coordinator.py:3999, :4069)
+#   taker_claim_asset_from_vulnerable  — ASSET_VULNERABLE only (swap_coordinator.py:4142, :4158)
+#   taker_observed_reveal              — BOTH_LOCKED only      (swap_coordinator.py:3930)
 #
 # Naming a step the record cannot run burns claim window at exactly the moment it is scarcest:
 # after ``p`` is public, under a running timelock, at 3am. The page said
