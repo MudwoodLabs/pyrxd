@@ -42,7 +42,7 @@ class JsonFileRecordSink:
     def path(self) -> Path:
         return self._path
 
-    def _refuse_to_clobber_a_different_swap(self, incoming: dict) -> dict | None:
+    def _refuse_to_clobber_a_different_swap(self, incoming: dict[str, Any]) -> dict[str, Any] | None:
         """Refuse to overwrite a record that belongs to a DIFFERENT swap (#504 item 3).
 
         `os.replace` below is unconditional, and the record path derives from `--keys-out`, which
@@ -85,7 +85,7 @@ class JsonFileRecordSink:
         return prior
 
     @staticmethod
-    def _keep_a_persisted_reveal(prior: dict | None, incoming: dict) -> None:
+    def _keep_a_persisted_reveal(prior: dict[str, Any] | None, incoming: dict[str, Any]) -> None:
         """Never move the record from a state at or after the reveal to one before it.
 
         ``REVEALED_STATES`` (SECRET_REVEALED and every state reachable from it, derived from the
