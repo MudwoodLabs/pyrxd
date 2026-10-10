@@ -1474,6 +1474,28 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
             assert after.counterchain_locator.deploy_tx_hash == exchanged.deploy_tx_hash
         assert after.counterchain_locator.to_dict() == exchanged.to_dict()
 
+    @pytest.mark.parametrize("then", ["refund", "lock-claim"])
+    async def test_a_record_holding_the_placeholder_deploy_hash_still_recovers(self, then, tmp_path, monkeypatch):
+        """The record a lock-claim wrote before this fix holds the leg's placeholder deploy hash. The
+        merge compares the locator without it, and fills it from taker_funding.json."""
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        name = "eth_swap_two_host"
+        args, terms, io_dir, leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase=then)
+        exchanged = _exchange_locator(io_dir, eth=True)
+        spk = json.loads((io_dir / "envelope.json").read_text())["covenant_spk_hex"]
+        left = (
+            SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms)
+            .with_counter_lock(dataclasses.replace(exchanged, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH))
+            .with_radiant_lock(_FAKE_COVENANT_OUTPOINT, spk)
+        )
+        await _seed(args, left)
+        built = await _run_phase(name, args, monkeypatch, role="maker", phase=then, counter_leg=leg, stop_at=stop_at)
+        if then == "refund":
+            assert len(built["rxd"].refund_calls) == 1
+        assert _read_back(args).counterchain_locator.deploy_tx_hash == exchanged.deploy_tx_hash
+
 
 class TestADisagreementRefusesAndSendsNothing:
     """A binding field (terms, hashlock, the counter-leg contract, the covenant) that differs between
