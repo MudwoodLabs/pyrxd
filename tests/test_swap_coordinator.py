@@ -3489,6 +3489,54 @@ async def test_a_crashed_fund_resumes_THROUGH_A_REAL_PERSISTED_FILE(tmp_path):
     assert leg2.push_nonce_seen == 7, "the recorded nonce pin was not carried into the resume"
 
 
+@pytest.mark.parametrize("held", ["pending_contract", "funded_locator"])
+async def test_a_FRESH_fund_never_overwrites_a_record_that_holds_this_swaps_counter_leg(tmp_path, held):
+    """A coordinator built on a fresh NEGOTIATED record (a runner re-run that did not load the file)
+    persisted its intent over the one record pointing at an earlier fund's contract. With the
+    seen-store holding H the gate's reuse probe refuses first; with a seen-store that lost H (a
+    deleted or restored store) the fund went ahead: a SECOND contract, and the first one's address
+    gone from the record. It now refuses before the gate, and the file is left as it was."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    if held == "pending_contract":
+        prior = SwapRecord(
+            state=SwapState.NEGOTIATED,
+            terms=terms,
+            pending_counter_contract="0x" + "ab" * 20,
+            pending_counter_deploy_tx="0x" + "cd" * 32,
+        )
+    else:
+        prior = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(_eth_locator(h))
+        prior = prior.with_state(SwapState.BTC_LOCKED)
+    await sink(prior)
+    before = sink.path.read_bytes()
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)  # a seen-store that does not hold H
+    coord._persist = sink
+    with pytest.raises(ValidationError, match="already holds this swap's counter leg"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert "fund" not in leg.calls
+    assert sink.path.read_bytes() == before
+
+
+async def test_a_fresh_fund_over_an_intent_only_record_still_funds(tmp_path):
+    """The honest-path pair: a record holding only the intent (NEGOTIATED, nothing on chain) is not
+    a counter leg, and a fresh fund over it proceeds."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(SwapRecord(state=SwapState.NEGOTIATED, terms=terms))
+    coord = _eth_coord_full(terms=terms, eth_leg=FakeEthLeg(preimage=secret, verdict=_final()))
+    coord._persist = sink
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED
+
+
 async def test_resume_REFUSES_when_there_is_nothing_to_resume(tmp_path):
     """Falling through to a fresh fund would deploy a SECOND contract."""
     from pyrxd.gravity.record_sink import JsonFileRecordSink

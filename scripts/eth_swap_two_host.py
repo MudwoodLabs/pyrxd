@@ -90,6 +90,7 @@ from _dust_swap_shared import (
     derive_counter_timelock,
     elapsed_reserve_blocks,
     merge_with_persisted_record,
+    prior_fund_record,
     refuse_by_persisted_state,
     refuse_maker_abort_with_a_counter_leg,
     resolve_asset_locked_at_height,
@@ -536,6 +537,20 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    # Before anything else, as the BTC runner does: the record an earlier fund of this swap left.
+    # Past NEGOTIATED refuses (already funded). An interrupted deploy refuses too: this runner holds
+    # no fund lock (see `_coordinator`), so it does not resume one, and a fresh fund built over that
+    # record used to overwrite the only reference to the deployed contract.
+    prior = prior_fund_record(_record_sink(args.local_out), terms=terms)
+    if prior is not None and prior.pending_counter_contract:
+        raise SystemExit(
+            f"REFUSING taker --phase fund: the swap record at {_record_sink(args.local_out).path} holds an "
+            f"interrupted fund: contract {prior.pending_counter_contract} (deploy "
+            f"{prior.pending_counter_deploy_tx}) was deployed for this swap and the fund did not complete. "
+            "Nothing was sent. This two-host runner does not resume a fund (it holds no fund lock). The "
+            "contract may hold value: it refunds to your refund address by that address after the ETH "
+            "deadline."
+        )
 
     # --- THE safety gate: check t_rxd against the COUNTER-CHAIN DEADLINE, from the envelope alone.
     #
@@ -1407,7 +1422,8 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None, phase=
     with the one this host persisted (``merge_with_persisted_record``, #850 PR R): the persisted
     fields are kept, the rebuild only fills what the record lacks, and a disagreement on the swap
     or contract identity refuses. ``record=None`` (the taker's fund) starts a fresh NEGOTIATED
-    record, as before.
+    record, once ``prior_fund_record`` has refused any record a fresh one would overwrite (the
+    coordinator refuses that write as well).
 
     The coordinator is ROLE-tagged (security review): this is a genuine two-party deployment, so the
     P3 role guard must be armed — without it a taker who mistakenly runs the maker-only

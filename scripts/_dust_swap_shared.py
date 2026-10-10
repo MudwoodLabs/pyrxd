@@ -206,8 +206,10 @@ LOCATOR_INFORMATIONAL_KEYS = frozenset({"deploy_tx_hash"})
 _NO_RECORD = ("n/a", "not applicable: this phase builds no record from the exchange files")
 _FUND = (
     "n/a",
-    "not applicable: the fund starts a fresh NEGOTIATED record (the BTC fund's own resume reads only a "
-    "recorded funding transaction); the coordinator's hashlock-reuse check refuses a second fund",
+    "not applicable: the fund reads the record itself (prior_fund_record): it refuses a record past "
+    "NEGOTIATED, an ETH record holding an interrupted deploy, or another swap's; the BTC fund resumes "
+    "a recorded funding transaction; and the coordinator refuses to write over a record that holds "
+    "this swap's counter leg",
 )
 _CLAIM = (
     "allow",
@@ -457,6 +459,39 @@ def refuse_maker_abort_with_a_counter_leg(record: Any, *, path: Any) -> None:
             "refund (it checks whether you have claimed the counter leg), with taker_funding.json restored "
             "to the exchange directory."
         )
+
+
+def prior_fund_record(sink: Any, *, terms: Any) -> Any:
+    """The record an earlier ``--phase fund`` of THIS swap left, read before anything else runs.
+
+    ``None`` when there is none. Refuses (``SystemExit``, nothing sent) an unreadable record, a record
+    for a different swap, and one past NEGOTIATED: that swap's counter leg is already funded, and a
+    second fund would at best be refused by the coordinator and at worst (a seen-store that lost H)
+    put a second counter leg on chain under the same H. A NEGOTIATED record is returned for the
+    caller to resume (BTC: a recorded funding transaction) or refuse (ETH: an interrupted deploy)."""
+    path = getattr(sink, "path", "the swap record")
+    try:
+        prior = sink.load_record()
+    except (ValidationError, NetworkError) as exc:
+        raise SystemExit(
+            f"REFUSING taker --phase fund: the swap record at {path} could not be read ({exc}). Nothing was "
+            "sent. Inspect the file before funding: it may reference a contract or funding that holds value."
+        ) from None
+    if prior is None:
+        return None
+    if prior.terms.hashlock != terms.hashlock:
+        raise SystemExit(
+            f"REFUSING taker --phase fund: the swap record at {path} is for a different swap (hashlock "
+            f"{prior.terms.hashlock.hex()[:16]}…, these terms {terms.hashlock.hex()[:16]}…). Nothing was sent. "
+            "Settle that swap, or use a different --local-out for this one."
+        )
+    if prior.state is not SwapState.NEGOTIATED:
+        raise SystemExit(
+            f"REFUSING taker --phase fund: the swap record at {path} says this swap's counter leg is already "
+            f"funded (state {prior.state.value}). Nothing was sent. Hand taker_funding.json to the maker if you "
+            "have not, then continue with --phase claim, or --phase abort to recover your leg."
+        )
+    return prior
 
 
 def _comparable(value: Any, *, field: str = "") -> Any:

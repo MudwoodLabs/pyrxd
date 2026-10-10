@@ -1527,6 +1527,58 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
         assert _read_back(args).counterchain_locator.deploy_tx_hash == exchanged.deploy_tx_hash
 
 
+class TestARerunFundNeverOverwritesTheRecord:
+    """Re-running ``--phase fund`` used to build a fresh NEGOTIATED record whatever the file held. The
+    ETH runner now reads the record first as the BTC one does, and both refuse a record a fresh fund
+    would overwrite, before anything is read from a chain."""
+
+    async def test_eth_refuses_an_interrupted_deploy_and_leaves_the_record(self, eth_mod, tmp_path, monkeypatch):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=False)
+        await _seed(
+            args,
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=terms,
+                pending_counter_contract="0x" + "98" * 20,
+                pending_counter_deploy_tx="0x" + "97" * 32,
+                pending_push_nonce=3,
+            ),
+        )
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(eth_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="interrupted fund") as raised:
+            await eth_mod.taker_phase_fund(_with_fee(args))
+        assert "0x" + "98" * 20 in str(raised.value.code) and "Nothing was sent" in str(raised.value.code)
+        assert _record_path(args).read_bytes() == before
+        assert built == {}, "a leg was built before the refusal"
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_a_completed_fund_is_not_funded_again(self, name, tmp_path, monkeypatch):
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="taker", with_funding=True)
+        await _seed(args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.BTC_LOCKED, pending=False))
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(mod, monkeypatch) if eth else _wire_btc(mod, monkeypatch)
+        with pytest.raises(SystemExit, match="already funded"):
+            await mod.taker_phase_fund(_with_fee(args))
+        assert _record_path(args).read_bytes() == before
+        assert built == {}
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_an_unreadable_record_refuses_the_fund(self, name, tmp_path, monkeypatch):
+        mod = _load(name)
+        args, _terms, _io = (_eth_scenario if name == "eth_swap_two_host" else _btc_scenario)(
+            mod, tmp_path, role="taker", with_funding=False
+        )
+        _record_path(args).write_text('{"state": "negot')
+        with pytest.raises(SystemExit, match="could not be read"):
+            await mod.taker_phase_fund(_with_fee(args))
+        assert _record_path(args).read_text() == '{"state": "negot'
+
+
 class TestARetryNeverRewindsTheRecordOfTheReveal:
     """A maker whose record says SECRET_REVEALED (the claim was sent, p may be public) but who lacks
     maker_claim.json is told to re-run lock-claim. That retry rebuilds BTC_LOCKED and its first

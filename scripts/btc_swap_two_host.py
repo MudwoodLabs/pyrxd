@@ -89,6 +89,7 @@ from _dust_swap_shared import (
     derive_counter_timelock,
     elapsed_reserve_blocks,
     merge_with_persisted_record,
+    prior_fund_record,
     refuse_by_persisted_state,
     refuse_maker_abort_with_a_counter_leg,
     resolve_asset_locked_at_height,
@@ -468,7 +469,8 @@ def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None, phase=
     with the one this host persisted (``merge_with_persisted_record``, #850 PR R): the persisted
     fields are kept, the rebuild only fills what the record lacks, and a disagreement on the swap
     or contract identity refuses. ``record=None`` (the taker's fund) starts a fresh NEGOTIATED
-    record, as before."""
+    record, once ``prior_fund_record`` has refused any record a fresh one would overwrite (the
+    coordinator refuses that write as well)."""
     if record is None:
         record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
     else:
@@ -601,6 +603,10 @@ async def taker_phase_fund(args) -> None:
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
+    # Before anything else: a record this swap's earlier fund left decides whether this run resumes
+    # it, and one past NEGOTIATED (already funded) refuses here rather than at the coordinator.
+    sink = _record_sink(args.local_out)
+    prior = prior_fund_record(sink, terms=terms)
 
     # THE safety gate: independent timelock-margin check from the envelope ALONE (the taker uses its
     # OWN policy, never a maker-supplied one) and REFUSE to fund on failure.
@@ -668,9 +674,7 @@ async def taker_phase_fund(args) -> None:
             "taker_funds_btc: fund the BTC HTLC (taker's UTXO; claim pays the maker, refund pays the taker)",
             auto_yes=args.yes,
         )
-        sink = _record_sink(args.local_out)
-        prior = sink.load_record()
-        if prior is not None and prior.pending_btc_funding_tx and prior.terms.hashlock == terms.hashlock:
+        if prior is not None and prior.pending_btc_funding_tx:
             # An earlier run recorded its funding transaction and then failed to read the amount back:
             # the BTC may already be on chain. Complete THAT fund (recorded if it confirmed, the same
             # bytes re-sent only if the gate still passes) instead of building a new one.
