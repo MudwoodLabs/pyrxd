@@ -199,10 +199,11 @@ LOCATOR_INFORMATIONAL_KEYS = frozenset({"deploy_tx_hash"})
 #: (``REVEALED_STATES``), so a retry that stops part-way cannot erase the record of a reveal.
 #: The refusals are the cases where the persisted state says the phase would act against the
 #: operator: a taker refunding after p is public, a maker refunding the asset after claiming the
-#: counter leg. TERMINAL states (ABORTED, MUTUAL_REFUND, COMPLETED, ASSET_REFUNDED_TAKER_ACTS) are
-#: NOT refused for being terminal: today they are written at BROADCAST, not confirmation, so
-#: re-sending a dropped transaction must stay possible. Terminal-state refusals come with PR 5b
-#: (ETH) and PR 9a (BTC), once terminal means confirmed.
+#: counter leg. The five ``TERMINAL_STATES`` (ABORTED, MUTUAL_REFUND, COMPLETED,
+#: ASSET_REFUNDED_TAKER_ACTS, ONE_SIDED_LOSS_TAKER) are NOT refused for BEING terminal (COMPLETED is
+#: refused where it means p is public, as SECRET_REVEALED is): today they are written at BROADCAST,
+#: not confirmation, so re-sending a dropped transaction must stay possible. Terminal-state refusals
+#: come with PR 5b (ETH) and PR 9a (BTC), once terminal means confirmed.
 _NO_RECORD = ("n/a", "not applicable: this phase builds no record from the exchange files")
 _FUND = (
     "n/a",
