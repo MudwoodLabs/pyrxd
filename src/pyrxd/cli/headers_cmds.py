@@ -77,7 +77,7 @@ EXIT_SYNC_STOPPED = 6
 #: Exit status of `pyrxd headers sync` when nothing was added only because one operator's tip was
 #: lower than the others': the depth rule counts from the LOWEST tip, so that operator held the
 #: sync back, and "up to date" would not be true. Nothing was written; the reason names the
-#: operator. Only when the operators at the low tip are a STRICT MINORITY of the configured ones (a
+#: operator. Only when the operators at the low tip are a STRICT MINORITY of those that answered (a
 #: tip height is unauthenticated: with three at T and one at T+100000, the three are not blamed and
 #: the exit is 0), and only when that tip is at least :data:`HELD_BACK_MIN_GAP` blocks below the next-lowest:
 #: honest servers routinely differ by a block or two for a few seconds after each block, and a
@@ -155,7 +155,7 @@ async def sync_headers(
     * ``"up to date"``: nothing new was deep enough, or a reset was not needed (``reason`` says which);
     * ``"held back"``: nothing new was deep enough below the LOWEST tip, the next-lowest tip would
       have allowed more by at least :data:`HELD_BACK_MIN_GAP` blocks, and the operators at the low
-      tip are a STRICT MINORITY of the configured operators: ``held_back_by`` names them, ``reason``
+      tip are a STRICT MINORITY of the operators that answered: ``held_back_by`` names them, ``reason``
       says by how much; nothing was written; ``exit_code`` 7. (A smaller lag stays ``"up to date"``,
       and when headers WERE added the state is ``"synced"``; both still name the minority, exit 0.
       When the low tip is NOT a strict minority, ``reason`` lists every operator's tip as
@@ -291,29 +291,34 @@ async def sync_headers(
     # A tip height is an unauthenticated number, so which side is wrong is not knowable from the
     # heights: three honest operators at T and one reporting T+100000 must not have the three named.
     # The low group is blamed (named in `held_back_by`, see EXIT_SYNC_HELD_BACK) only when it is a
-    # STRICT MINORITY of the configured operators; otherwise the tips are reported as differing,
+    # STRICT MINORITY of the operators that ANSWERED (one entry per operator, grouped by
+    # Endpoint.source); an unreachable one counts for neither side. Otherwise the tips are reported as differing,
     # with no one named. Either way only when the sync reached that bound (no floor stop) and the
     # next-lowest tip would have allowed more.
     low_group = [k for k, t in tips.items() if t == lowest]
     higher = min((t for t in tips.values() if t > lowest), default=None)
     held_back, held_back_by = "", None
     if not report["stopped"] and higher is not None and higher - min_depth > chain.top:
-        if 2 * len(low_group) < len(sources):
+        answering, configured = len(tips), len(sources)
+        counts = "; ".join(
+            f"tip {t}: {', '.join(k for k, v in tips.items() if v == t)} "
+            f"({sum(1 for v in tips.values() if v == t)} of {answering} answering, {configured} configured)"
+            for t in sorted(set(tips.values()))
+        )
+        if 2 * len(low_group) < answering:
             held_back_by = low_group
             held_back = (
-                f"{', '.join(low_group)} reported tip {lowest}, below the next-lowest tip ({higher}) reported by "
-                f"{len(sources) - len(low_group)} of the {len(sources)} configured operators; headers are cached "
-                f"only {min_depth} blocks below the lowest tip, so the cache reaches block {chain.top} instead of "
-                f"{higher - min_depth}. Re-run once {', '.join(low_group)} catches up, or check that it follows "
-                f"the live chain"
+                f"{', '.join(low_group)} reported tip {lowest}, below the next-lowest tip ({higher}) [{counts}]; "
+                f"headers are cached only {min_depth} blocks below the lowest tip, so the cache reaches block "
+                f"{chain.top} instead of {higher - min_depth}. Re-run once {', '.join(low_group)} catches up, or "
+                f"check that it follows the live chain"
             )
         else:
             held_back = (
-                "operators' tips differ: "
-                + ", ".join(f"{k} {t}" for k, t in tips.items())
-                + f". Headers are cached only {min_depth} blocks below the lowest tip ({lowest}), so the cache "
-                f"reaches block {chain.top}. The low tip is not a strict minority of the {len(sources)} configured "
-                "operators, so this does not say which tip is wrong; a tip height is unauthenticated"
+                f"operators' tips differ [{counts}]. Headers are cached only {min_depth} blocks below the lowest "
+                f"tip ({lowest}), so the cache reaches block {chain.top}. The low tip is not a strict minority of "
+                "the operators that answered, so this does not say which tip is wrong; a tip height is "
+                "unauthenticated"
             )
     advice_text = ""
     if report["stopped"]:
@@ -469,7 +474,7 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     and the reason says what was kept and what gets past that header, computed from the cache on
     disk afterwards. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot
     be written, 6 when a header below the floor stopped it, 7 when nothing was added only because
-    a strict minority of the configured operators reported a tip at least 6 blocks below the others'
+    a strict minority of the operators that answered reported a tip at least 6 blocks below the others'
     (the status names them).
     """
     from .swap_recovery import electrumx_urls

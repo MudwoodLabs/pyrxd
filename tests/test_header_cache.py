@@ -550,7 +550,8 @@ def test_headers_shallower_than_288_below_the_lowest_tip_are_not_cached(monkeypa
     # Headers were added, so it is "synced" (exit 0). With two operators neither tip is a strict
     # minority, so the differing tips are listed and no one is named.
     assert out["state"] == "synced" and out["held_back_by"] is None
-    assert "operators' tips differ" in out["reason"] and f"operator:b {DEEP - 1}" in out["reason"]
+    assert "operators' tips differ" in out["reason"]
+    assert f"tip {DEEP - 1}: operator:b (1 of 2 answering, 2 configured)" in out["reason"]
     # Honest pair: at exactly 288 deep it is cached.
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP), "operator:b": _operator(DEEP)})
     assert out["cached_to"] == TOP and out["added"] == 1 and out["held_back_by"] is None and out["reason"] is None
@@ -687,7 +688,9 @@ def test_one_high_tip_does_not_blame_the_honest_majority(monkeypatch, tmp_path) 
     r, out = _sync(monkeypatch, tmp_path, ops())
     assert r.exit_code == 0 and out["state"] == "up to date", r.output
     assert out["held_back_by"] is None
-    assert "operators' tips differ" in out["reason"] and f"operator:d {t + 100_000}" in out["reason"]
+    assert "operators' tips differ" in out["reason"]
+    assert f"tip {t + 100_000}: operator:d (1 of 4 answering, 4 configured)" in out["reason"]
+    assert f"tip {t}: operator:a, operator:b, operator:c (3 of 4 answering, 4 configured)" in out["reason"]
     assert "follows the live chain" not in out["reason"]
     r, _ = _sync(monkeypatch, tmp_path, ops(), json_out=False)
     assert r.exit_code == 0 and "HELD BACK" not in r.output and "tips:" in r.output
@@ -700,6 +703,41 @@ def test_two_operators_that_differ_blame_neither(monkeypatch, tmp_path) -> None:
     r, out = _sync(monkeypatch, tmp_path, {"operator:a": _operator(DEEP + 50), "operator:b": _operator(low)})
     assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None, r.output
     assert "operators' tips differ" in out["reason"] and "not a strict minority" in out["reason"]
+
+
+def test_an_unreachable_operator_counts_for_neither_side(monkeypatch, tmp_path) -> None:
+    """Three configured, one unreachable, one low, one high: a two-answerer split, so no one is
+    blamed and the exit is 0, and the counts say 1 of 2 answering (3 configured). Counting the
+    unreachable one against the low tip named operator:b and said 2 operators reported the higher tip."""
+    _patch_table(monkeypatch, START)
+    low = START + 100
+    ops = {
+        "operator:a": _operator(DEEP + 50),
+        "operator:b": _operator(low),
+        "operator:c": _operator(DEEP + 50, fail="blockchain.headers.subscribe"),
+    }
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 0 and out["state"] == "up to date" and out["held_back_by"] is None, r.output
+    assert "operator:c" in out["unreachable"]
+    assert f"tip {low}: operator:b (1 of 2 answering, 3 configured)" in out["reason"]
+    assert f"tip {DEEP + 50}: operator:a (1 of 2 answering, 3 configured)" in out["reason"]
+
+
+def test_the_counts_are_exact_per_tip(monkeypatch, tmp_path) -> None:
+    """Tips low / mid / high among three answering: the low one is a strict minority and is named,
+    and each tip's own count is given (the mid tip was reported by one operator, not two)."""
+    _patch_table(monkeypatch, START)
+    low, mid, high = START + 100, DEEP + 50, DEEP + 80
+    ops = {"operator:a": _operator(high), "operator:b": _operator(low), "operator:c": _operator(mid)}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 7 and out["held_back_by"] == ["operator:b"], r.output
+    for tip, op in ((low, "operator:b"), (mid, "operator:c"), (high, "operator:a")):
+        assert f"tip {tip}: {op} (1 of 3 answering, 3 configured)" in out["reason"], out["reason"]
+    # 2 of 3 at the low tip is not a minority: no one named.
+    ops = {"operator:a": _operator(high), "operator:b": _operator(low), "operator:c": _operator(low)}
+    r, out = _sync(monkeypatch, tmp_path, ops)
+    assert r.exit_code == 0 and out["held_back_by"] is None, r.output
+    assert f"tip {low}: operator:b, operator:c (2 of 3 answering, 3 configured)" in out["reason"]
 
 
 def test_a_header_below_the_floor_ends_the_sync_and_keeps_what_is_under_it(monkeypatch, tmp_path) -> None:

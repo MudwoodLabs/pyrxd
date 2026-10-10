@@ -226,7 +226,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a strict majority of those that answered agree, `pyrxd headers sync` names the others (a
   disagreeing operator is still never outvoted; with no strict majority it lists what each
   served). When some operators' tip, at least 6 blocks below the next-lowest, held the sync back
-  and they are a strict minority of the configured operators, it names them (new exit status 7; a
+  and they are a strict minority of the operators that answered, it names them (new exit status 7; a
   smaller lag is named with exit 0); otherwise it lists the differing tips with exit 0 and names no
   one, since a tip height is unauthenticated. The floor divisor has one source,
   `mark_block.FLOOR_WORK_DIVISOR`.

@@ -22,8 +22,9 @@ Exit codes (per docs/wallet-cli-plan.md §"Exit codes"):
       `headers_cmds.EXIT_SYNC_STOPPED`.
   7   `pyrxd headers sync` added nothing only because one operator reported a
       lower tip than the others, by at least `headers_cmds.HELD_BACK_MIN_GAP`
-      blocks, AND the operators at that tip are a strict minority of the configured
-      ones (headers are cached only below the LOWEST tip); the status names them.
+      blocks, AND the operators at that tip are a strict minority of the operators
+      that answered (an unreachable one counts for neither side; headers are cached
+      only below the LOWEST tip); the status names them.
       Tips that differ without a strict minority are listed with exit 0, no one
       named. See `headers_cmds.EXIT_SYNC_HELD_BACK`.
 

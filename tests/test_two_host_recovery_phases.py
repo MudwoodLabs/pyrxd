@@ -1634,6 +1634,26 @@ class TestARerunFundNeverOverwritesTheRecord:
         assert _record_path(args).read_text() == '{"state": "negot'
 
 
+def test_every_maker_phase_reads_the_takers_eth_locator_through_maker_view():
+    """Structural, derived from the runner's source: in every ``maker_phase_*`` function, each
+    ``EthHtlcLocator.from_dict`` call is the direct argument of ``_maker_view``. The lock-claim's
+    record would not show a bypass (its verification replaces the locator before anything persists),
+    so this is what pins it there."""
+    tree = ast.parse((_SCRIPTS / "eth_swap_two_host.py").read_text())
+    makers = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name.startswith("maker_phase_")]
+    assert len(makers) >= 3, "the scan found too few maker phases: it is broken"
+    wrapped, reads = set(), []
+    for fn in makers:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_maker_view":
+                wrapped.update(id(a) for a in node.args)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "EthHtlcLocator.from_dict":
+                reads.append((fn.name, node))
+    assert {name for name, _ in reads} == {"maker_phase_lock_claim", "maker_phase_refund"}, reads
+    bare = [f"{name}:{node.lineno}" for name, node in reads if id(node) not in wrapped]
+    assert bare == [], f"a maker phase reads the taker's locator without _maker_view: {bare}"
+
+
 @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
 async def test_build_refund_does_not_read_the_files_the_runners_write(name, tmp_path, monkeypatch):
     """The maker-revealed refusal says `pyrxd swap build-refund` does not apply to a two-host
