@@ -736,7 +736,7 @@ and `utxos_cmd` lists whatever `wallet.collect_spendable(client)` returns
 ([`:297-354`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
 backed by
 [`HdWallet.collect_spendable`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/wallet.py)
-at `src/pyrxd/hd/wallet.py:1243-1301`). Neither path decodes the locking
+at `src/pyrxd/hd/wallet.py:1270-1328`). Neither path decodes the locking
 script to check whether it's a Glyph FT/NFT envelope versus plain P2PKH —
 both just report the UTXO's raw `value` field from ElectrumX. A Glyph
 carrier's photon value (the 546-dust NFT carrier, or an FT's premined
