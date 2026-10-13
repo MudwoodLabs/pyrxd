@@ -112,6 +112,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The wallet's gap-limit scan has an upper bound (#772).** A server that reports history for
+  every address never lets the 20-unused gap close, and the scan that runs before every spend,
+  `address`, `balance` and `glyph list` kept deriving without end. It now derives at most 100,000
+  addresses per chain in one scan and then refuses with a network error (exit 2) that names the
+  server by host and says to use a different endpoint. It refuses rather than truncating, so a
+  wallet that really is that deep is never shown with addresses missing.
+
 - **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
   `Claimed(bytes32)` and `Refunded()` topic0 values were `hashlib.sha3_256` of the event
   signatures (NIST SHA3-256) rather than Ethereum Keccak-256, so they matched no log the

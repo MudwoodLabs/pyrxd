@@ -230,6 +230,13 @@ Each scenario lists actor → action → asset → control(s) → residual risk.
 - **Control:** Library N5 fix: `_scan_chain` re-raises `NetworkError` on lookup failure rather than silently treating as "unused." Re-using a known-funded address is impossible because the gap-limit logic stops at consecutive empty results, and each empty result is verified.
 - **Residual risk:** A *consistently* lying ElectrumX could still hide history. Mitigation is network-layer source diversity; wallet history reads do not have it. The default profile's two servers are failover, not a quorum (TA5), and the RXD quorum that does exist (`MultiSourceRxdChainSource`) serves only the watchtower's tip and covenant reads, not the wallet's gap-limit scan. Tracked as a future enhancement.
 
+### S9b: Hostile ElectrumX claims every address is used (TA5)
+
+- **Action:** During gap-limit scan, ElectrumX reports history for every address, so the 20-unused gap that ends the scan never appears. Every spend, `address`, `balance` and `glyph list` scans first.
+- **Asset:** Availability (the CLI never finishes), memory and network.
+- **Control:** `_scan_chain` derives at most `_MAX_SCAN_ADDRESSES_PER_CHAIN` (100,000) addresses per chain in one scan and then refuses with a `NetworkError` naming the server by host (#772). It refuses rather than truncating, so a wallet that really is that deep fails loudly instead of losing addresses.
+- **Residual risk:** Up to 100,000 history reads per chain before the refusal. The cap is a chosen bound, not a measured one.
+
 ### S10: Hostile counterparty exploits a Gravity covenant bug (TA8)
 
 - **Action:** Counterparty crafts a swap proposal that, if executed, leaves them with both legs.
