@@ -112,6 +112,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The wallet's gap-limit scan sees an address that has only received a Glyph token (#787).**
+  It read each address's P2PKH script hash only, and a Radiant ElectrumX lists a token output
+  under the token script's hash with its refs zeroed, so a token-only address looked unused.
+  `pyrxd address` could hand it out again, a change output could land on it, and `glyph list`
+  did not read it. When an address's P2PKH hash has no history, the scan now also reads its
+  token script hashes, one per owned token shape, and stops at the first with history. An
+  address with P2PKH history costs no extra reads; an empty one costs one per shape (five
+  today), so the 20-address gap that ends each chain's scan costs 100 more reads per chain. The
+  100,000-address bound from #772 still counts addresses, so one scan's reads stay bounded.
+
 - **The wallet's gap-limit scan has an upper bound (#772).** A server that reports history for
   every address never lets the 20-unused gap close, and the scan that runs before every spend,
   `address`, `balance` and `glyph list` kept deriving without end. It now derives at most 100,000
