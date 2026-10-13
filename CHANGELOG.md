@@ -112,6 +112,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A malformed endpoint URL in the config file is a config error, not an "unexpected failure"
+  (#775).** A plain-string `electrumx_servers` entry is parsed when a command first builds its
+  network client, not when the config loads, and a malformed one (`wss://`, `https://…`) reached
+  the bug path: exit 4 and "re-run with --debug". It now exits 1 with `error: invalid
+  configuration` and names the config file to correct, as a refusal at load already did.
+
 - **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
   `Claimed(bytes32)` and `Refunded()` topic0 values were `hashlib.sha3_256` of the event
   signatures (NIST SHA3-256) rather than Ethereum Keccak-256, so they matched no log the
