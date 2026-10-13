@@ -252,6 +252,9 @@ ignore = [
     # nested below the top level (.claude/skills/<name>/SKILL.md).
     ".vscode/**",
     ".claude/**",
+    # Rules for agents working in a git checkout, not for consumers of a
+    # source release.
+    "CLAUDE.md",
 
     # Dev/CI tooling config that's only actionable inside a git checkout (e.g.
     # `pre-commit install` needs `.git/hooks/`, which an sdist tarball doesn't
