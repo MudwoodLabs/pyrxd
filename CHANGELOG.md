@@ -112,6 +112,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Concurrent first calls on a fresh `ElectrumXClient` opened two sockets, and one call timed
+  out.** `_ensure_connected` checked `_ws is None` and then awaited the connect with no lock, so two
+  calls started together (an `asyncio.gather` on a new client, or after a lost connection) each
+  opened a socket and the second overwrote the first. The reader could stay blocked on the
+  discarded socket, so one call's reply was never read and it waited out its full timeout (30 s by
+  default). The connect and reader start now run under a per-client `asyncio.Lock`, so concurrent
+  callers share one socket; a failed connect releases the lock and the next call retries. The CLI
+  issues its reads sequentially and was not affected; library callers that gather reads were.
+  `FailoverElectrumXClient` can still run the one-time chain check twice on a race, now as two
+  reads over one socket (#732).
+
 - **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
   `Claimed(bytes32)` and `Refunded()` topic0 values were `hashlib.sha3_256` of the event
   signatures (NIST SHA3-256) rather than Ethereum Keccak-256, so they matched no log the

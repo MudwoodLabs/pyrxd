@@ -1006,6 +1006,109 @@ class TestConnectFirstRace:
         assert len(calls) == 1, "_connect_first should be called exactly once"
 
 
+# ── Connect serialization (#732) ──────────────────────────────────────────────
+#
+# `_ensure_connected` had no lock: two calls on a fresh client each saw `_ws is None`,
+# each opened a socket, and the second overwrote the first. The reader could then be
+# blocked on the discarded socket, so one call's reply was never read and it waited
+# out its whole timeout. Every wait below is bounded so a regression fails, not hangs.
+
+_BOUND = 2.0  # seconds; well above any honest run, well below a hung test's patience
+
+
+class _EchoServer:
+    """Fake ``websockets.connect``: each connect yields to the loop (opening the race
+    window a real handshake has) and returns a NEW socket that answers every request
+    with ``{"id": <id>, "result": "pong"}``. ``sockets`` records each one opened."""
+
+    def __init__(self, *, fail_first: int = 0) -> None:
+        self.sockets: list[Any] = []
+        self._fail_left = fail_first
+
+    async def connect(self, url: str) -> Any:
+        await asyncio.sleep(0)
+        if self._fail_left > 0:
+            self._fail_left -= 1
+            raise OSError("connection refused")
+        inbox: asyncio.Queue[str] = asyncio.Queue()
+        ws = MagicMock()
+
+        async def _send(payload: str) -> None:
+            await inbox.put(json.dumps({"id": json.loads(payload)["id"], "result": "pong"}))
+
+        async def _recv() -> str:
+            return await inbox.get()
+
+        ws.send = _send
+        ws.recv = _recv
+        ws.close = AsyncMock(return_value=None)
+        self.sockets.append(ws)
+        return ws
+
+
+class TestConnectIsSerialized:
+    async def test_concurrent_first_calls_share_one_socket(self):
+        """Two calls gathered on a fresh client open exactly ONE socket and both answer."""
+        server = _EchoServer()
+        client = ElectrumXClient(["wss://a.example.com"], timeout=_BOUND)
+        with patch("pyrxd.network.electrumx.websockets.connect", side_effect=server.connect):
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    client._call("server.ping", []),
+                    client._call("server.ping", []),
+                    return_exceptions=True,
+                ),
+                timeout=2 * _BOUND,
+            )
+        try:
+            assert len(server.sockets) == 1, f"opened {len(server.sockets)} sockets for one client"
+            assert results == ["pong", "pong"]
+        finally:
+            await client.close()
+
+    async def test_a_single_first_call_still_connects(self):
+        """Honest path: one call on a fresh client connects once and gets its answer."""
+        server = _EchoServer()
+        client = ElectrumXClient(["wss://a.example.com"], timeout=_BOUND)
+        with patch("pyrxd.network.electrumx.websockets.connect", side_effect=server.connect):
+            result = await asyncio.wait_for(client._call("server.ping", []), timeout=2 * _BOUND)
+        try:
+            assert result == "pong"
+            assert len(server.sockets) == 1
+        finally:
+            await client.close()
+
+    async def test_a_call_after_close_reconnects(self):
+        """The lock does not pin the old connection: after close() the next call opens a new socket."""
+        server = _EchoServer()
+        client = ElectrumXClient(["wss://a.example.com"], timeout=_BOUND)
+        with patch("pyrxd.network.electrumx.websockets.connect", side_effect=server.connect):
+            assert await asyncio.wait_for(client._call("server.ping", []), timeout=2 * _BOUND) == "pong"
+            await client.close()
+            assert await asyncio.wait_for(client._call("server.ping", []), timeout=2 * _BOUND) == "pong"
+        try:
+            # Whether close() actually closes the old socket is close()'s concern, not the
+            # connect path's; this test only pins that the lock lets a fresh connect happen.
+            assert len(server.sockets) == 2
+        finally:
+            await client.close()
+
+    async def test_a_failed_connect_does_not_wedge_later_calls(self):
+        """A connect that raises under the lock releases it: the failing call gets NetworkError
+        and the next call connects normally instead of waiting forever on the lock."""
+        server = _EchoServer(fail_first=1)
+        client = ElectrumXClient(["wss://a.example.com"], timeout=_BOUND)
+        with patch("pyrxd.network.electrumx.websockets.connect", side_effect=server.connect):
+            with pytest.raises(NetworkError):
+                await asyncio.wait_for(client._call("server.ping", []), timeout=2 * _BOUND)
+            result = await asyncio.wait_for(client._call("server.ping", []), timeout=2 * _BOUND)
+        try:
+            assert result == "pong"
+            assert len(server.sockets) == 1
+        finally:
+            await client.close()
+
+
 # ── Node-rejection classification (PolicyRejection) ───────────────────────────
 #
 # Every RPC error used to collapse to NetworkError("ElectrumX RPC error (code N)") with
