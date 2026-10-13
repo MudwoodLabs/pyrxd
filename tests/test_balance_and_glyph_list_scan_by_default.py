@@ -361,8 +361,8 @@ class TestGlyphListScansByDefault:
 # --------------------------------------------------------------------------- glyph list, unspent is the server's word (#788)
 
 _SPENT_NOTE = (
-    "Note: that these outputs are unspent is the ElectrumX server's word and was not verified; "
-    "a server can list an output this wallet has already spent."
+    "Note: the ElectrumX server says these outputs are unspent; pyrxd did not check that, "
+    "and a server can list an output this wallet has already spent."
 )
 
 

@@ -3559,8 +3559,8 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
 # outpoint has been spent since. A field, so a script can tell; a future check would change it.
 _SPENT_STATUS_SOURCE = "server"
 _SPENT_STATUS_NOTE = (
-    "Note: that these outputs are unspent is the ElectrumX server's word and was not verified; "
-    "a server can list an output this wallet has already spent."
+    "Note: the ElectrumX server says these outputs are unspent; pyrxd did not check that, "
+    "and a server can list an output this wallet has already spent."
 )
 
 
