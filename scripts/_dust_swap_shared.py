@@ -179,6 +179,14 @@ BINDING_RECORD_FIELDS = ("terms", "counterchain_locator", "radiant_covenant_outp
 #: (#853).
 LOCATOR_INFORMATIONAL_KEYS = frozenset({"deploy_tx_hash"})
 
+#: Locator keys (``to_dict()``) holding an ETH address, which the binding compare of
+#: ``counterchain_locator`` compares case-insensitively. An address is the same account in any
+#: case, but each side keeps the case it was given: ``EthLeg.expected_locator`` stores
+#: ``--eth-maker-addr``/``--eth-taker-addr`` as typed, while taker_funding.json carries the taker's
+#: checksum-cased locator. Comparing them case-sensitively refused an honest maker's
+#: ``--phase refund`` and its lock-claim retry whenever an address was typed in lowercase.
+LOCATOR_ADDRESS_KEYS = frozenset({"contract_address", "claimant", "refundee", "token_address"})
+
 
 #: Which persisted ``SwapState`` each runner phase may run on (#850 PR R, review F1). Keyed by
 #: ``(role, phase)``: the two-host runners' phases (both runners share them) and
@@ -505,11 +513,16 @@ def prior_fund_record(sink: Any, *, terms: Any) -> Any:
 
 def _comparable(value: Any, *, field: str = "") -> Any:
     """A value in a form ``==`` compares by content: a locator or terms object by type and wire form.
-    A ``counterchain_locator`` is compared without :data:`LOCATOR_INFORMATIONAL_KEYS`."""
+    A ``counterchain_locator`` is compared without :data:`LOCATOR_INFORMATIONAL_KEYS`, and with its
+    :data:`LOCATOR_ADDRESS_KEYS` lowercased."""
     if hasattr(value, "to_dict"):
         wire = value.to_dict()
         if field == "counterchain_locator":
-            wire = {k: v for k, v in wire.items() if k not in LOCATOR_INFORMATIONAL_KEYS}
+            wire = {
+                k: v.lower() if k in LOCATOR_ADDRESS_KEYS and isinstance(v, str) else v
+                for k, v in wire.items()
+                if k not in LOCATOR_INFORMATIONAL_KEYS
+            }
         return (type(value).__name__, wire)
     if isinstance(value, str):
         return value.lower()

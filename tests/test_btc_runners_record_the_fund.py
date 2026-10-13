@@ -60,6 +60,25 @@ def test_every_script_that_funds_btc_builds_its_coordinator_with_a_persist_hook(
     assert {"dust_swap_run.py", "btc_swap_two_host.py", "eth_swap_run.py"} <= set(funding_scripts), funding_scripts
 
 
+def test_every_script_that_merges_the_record_builds_its_coordinator_with_a_persist_hook():
+    """A script that loads and merges the persisted record must also write back what it drives:
+    ``dust_swap_resume`` merged the record but built its coordinator without ``persist=``, so the
+    reveal and claim it drove were never recorded."""
+    merging = []
+    for path in sorted(_SCRIPTS.glob("*.py")):
+        src = path.read_text()
+        calls = _coordinator_calls(ast.parse(src))
+        if "merge_with_persisted_record(" not in src or not calls:
+            continue
+        merging.append(path.name)
+        for call in calls:
+            assert "persist" in {k.arg for k in call.keywords}, (
+                f"{path.name}:{call.lineno} merges the persisted record but builds a SwapCoordinator "
+                "without persist=, so what it drives is never written back"
+            )
+    assert {"dust_swap_resume.py", "btc_swap_two_host.py", "eth_swap_two_host.py"} <= set(merging), merging
+
+
 def _signed_funding_tx_hex(terms) -> str:
     """A real signed transaction (any one parses); the record checks structure, not ownership."""
     kp = generate_keypair("bcrt")

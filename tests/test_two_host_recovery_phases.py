@@ -1938,6 +1938,31 @@ class TestTheMergeHelperOnItsOwn:
                     ignored.add(key)
         assert ignored == {"deploy_tx_hash"}, ignored
 
+    @pytest.mark.parametrize("key", ["contract_address", "claimant", "refundee"])
+    async def test_an_eth_address_differing_only_in_case_merges(self, eth_mod, tmp_path, key):
+        """The maker's rebuild stores an address as typed (``EthLeg.expected_locator``); the record holds
+        the taker's checksum-cased one. The same account in another case must merge, and the persisted
+        locator is kept. A different account in the same field still refuses."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True)
+        loc = dataclasses.replace(_exchange_locator(io_dir, eth=True), **{key: "0x" + "aB" * 20})
+        base = SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms)
+        await _seed(args, base.with_counter_lock(loc))
+        lowered = dataclasses.replace(loc, **{key: getattr(loc, key).lower()})
+        merged = self._merge(_record_path(args), base.with_counter_lock(lowered))
+        assert getattr(merged.counterchain_locator, key) == getattr(loc, key)
+
+        other = dataclasses.replace(loc, **{key: "0x" + "cd" * 20})
+        with pytest.raises(SystemExit, match="counterchain_locator"):
+            self._merge(_record_path(args), base.with_counter_lock(other))
+
+    def test_exactly_the_address_locator_keys_compare_case_insensitively(self):
+        sys.path.insert(0, str(_SCRIPTS))
+        import _dust_swap_shared as shared
+
+        assert frozenset({"contract_address", "claimant", "refundee", "token_address"}) == shared.LOCATOR_ADDRESS_KEYS
+
     async def test_the_persisted_value_wins_and_the_rebuild_fills_only_gaps(self, eth_mod, tmp_path):
         """A field outside the binding set that differs keeps the PERSISTED value; one the record
         lacks takes the rebuild's. A persisted deploy hash is kept whether real or the placeholder: the

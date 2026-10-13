@@ -110,6 +110,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Measured on Anvil: deploy gas rises from 318,414 to 319,422 (`EthHtlc`) and from 450,657 to
     458,657 (`Erc20Htlc`); an `Erc20Htlc` refund rises by 34 gas; claims are unchanged.
 
+- **A value-bearing BTC fund now records its funding transaction before broadcasting it, and
+  refuses without a place to record it (breaking).** `SwapCoordinator.taker_funds_btc` raises
+  `ValidationError("a value-bearing BTC counter-leg fund requires a durable persist hook …")` when
+  the coordinator has no `persist=` and either leg is value-bearing, as an ETH counter leg already
+  did. Pass `persist=` (for example `gravity.record_sink.JsonFileRecordSink`). The signed funding
+  transaction is written to the new `SwapRecord.pending_btc_funding_tx` field before it is
+  broadcast, and cleared when the funded locator is recorded, so a readback that fails after the
+  broadcast leaves a record that names the BTC it sent. `BitcoinTaprootLeg.fund(terms)` gains two
+  keyword arguments, `on_built` (awaited with the signed bytes before the broadcast) and
+  `resume_tx_hex` (re-send those recorded bytes instead of building new ones); a call with `terms`
+  alone behaves as before. `SwapCoordinator.resume_interrupted_fund` now completes an interrupted
+  BTC fund from the record, and `scripts/btc_swap_two_host.py --role taker --phase fund` uses it
+  when the record holds one. `scripts/dust_swap_run.py` passes `persist=`, and
+  `scripts/dust_swap_resume.py --btc-htlc-funding-txid` is no longer required: without it the
+  txid is read from `<--keys-out>.swaprec.json`.
+
 ### Fixed
 
 - **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
@@ -155,7 +171,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `single_operator_override` statement. Any other field the coordinator writes, such as the pending
   deploy and push handles, was exposed to the same overwrite. Those phases now load the persisted
   record and merge the rebuild into it. So do the maker's `--phase abort`, which hands its record to
-  the Radiant leg, and `scripts/dust_swap_resume.py`. The taker's fund still starts a fresh record.
+  the Radiant leg, and `scripts/dust_swap_resume.py`, which now also writes the reveal and claim it
+  drives back to that record (it built its coordinator without `persist=`, so they were never
+  recorded). The taker's fund still starts a fresh record.
   The merge rule:
   - a field the record holds is kept, and the rebuild only fills fields the record lacks;
   - the terms, the hashlock, the counter-leg locator and the covenant outpoint and SPK must agree
@@ -199,6 +217,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   placeholder, so a maker's record never holds the taker's deploy hash: the watchtower's claim scan
   starts at that transaction's block, and a later one named there could hide a real claim. A scan
   from the placeholder fails closed. The BTC locator was checked the same way and is not affected.
+  The merge also compares the locator's ETH addresses (contract, claimant, refundee, token)
+  case-insensitively: the maker's leg keeps `--eth-maker-addr`/`--eth-taker-addr` as typed, and
+  taker_funding.json carries the taker's checksum-cased locator, so a lowercase address refused
+  the same two phases.
 - **A re-run of the taker's `--phase fund` could overwrite the record of an earlier fund.** The ETH
   runner built its coordinator on a fresh record. With the seen-store holding the hashlock the
   coordinator's reuse check refused first; with a seen-store that had lost it, the coordinator
