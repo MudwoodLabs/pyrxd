@@ -584,3 +584,72 @@ def test_this_file_uses_the_fixture_it_says_it_does(two_outputs) -> None:
     payload = _classify_raw_tx(two_outputs["txid"], two_outputs["raw"])
     assert payload["output_count"] == 2
     assert [row["vout"] for row in payload["outputs"] if row.get("hashmark")] == [0]
+
+
+# --------------------------------------------------------------------------- #778 follow-ups
+
+
+class TestIssue778:
+    """Three follow-ups from #765's re-check: the refusal quotes what was typed, ``--json`` says
+    whether its record count is final, and ``--quiet`` does not point at a report it never prints."""
+
+    @pytest.mark.parametrize(
+        "typed",
+        [
+            pytest.param(lambda t: f"{t.upper()}:07", id="outpoint-upper-leading-zero"),
+            pytest.param(lambda t: _contract(t, 7).upper(), id="contract-upper"),
+        ],
+    )
+    def test_a_missing_output_refusal_quotes_what_was_typed(self, monkeypatch, tmp_path, two_outputs, typed) -> None:
+        given = typed(two_outputs["txid"])
+        r = _verify(monkeypatch, tmp_path, two_outputs["server"], given)
+        assert r.exit_code == 1, r.output
+        assert f", {given}, which names output 7" in _flat(r.output), r.output
+
+    def test_json_says_the_record_count_is_final_when_every_output_was_read(
+        self, monkeypatch, tmp_path, two_outputs
+    ) -> None:
+        j = _verify(monkeypatch, tmp_path, two_outputs["server"], two_outputs["txid"], "--json")
+        assert j.exit_code == 0, j.output
+        vr = json.loads(j.stdout)["verdict_record"]
+        assert vr["records_in_tx"] == 1 and vr["unread_vouts"] == [] and vr["records_in_tx_is_final"] is True
+
+    def test_json_says_the_record_count_is_not_final_when_an_output_was_unread(self, monkeypatch, tmp_path) -> None:
+        """A bare txid: the human report qualifies its count, and the JSON now does too."""
+        content = b"the advisory, as published\n"
+        txid, raw = _tx_with(_mark_script(content, PrivateKey(), label="advisory v1"), _UNREAD)
+        _crash_on(monkeypatch, _UNREAD)
+        j = _verify(monkeypatch, tmp_path, _FakeServer({txid: raw}), txid, "--json")
+        vr = json.loads(j.stdout)["verdict_record"]
+        assert vr["records_in_tx"] == 1, vr
+        assert vr["unread_vouts"] == [1] and vr["records_in_tx_is_final"] is False, vr
+
+    def test_quiet_does_not_point_at_a_report_it_never_prints(self, monkeypatch, tmp_path, two_outputs) -> None:
+        for n in (0, 1):
+            r = _verify(monkeypatch, tmp_path, two_outputs["server"], f"{two_outputs['txid']}:{n}", "--quiet")
+            assert r.exit_code == 0, r.output
+            assert r.stdout.strip() == "HOLDS"
+            err = _flat(r.stderr)
+            assert "the one you named" in err and "the verdict on stdout" in err, err
+            assert "below" not in err, err
+
+    def test_quiet_wording_rewrites_every_below_phrase(self) -> None:
+        """Every "below" phrase `_named_output` can write, rewritten. Derived from the source, so a
+        new phrase that is not handled fails here rather than reaching --quiet."""
+        import inspect
+        import re
+
+        from pyrxd.cli import hashmark_cmds
+
+        src = inspect.getsource(hashmark_cmds._named_output)
+        assert src.count("below") >= 5, "the phrases moved; re-derive this test"
+        samples = [
+            "Output 2, the one you named, holds the HashMark record the verdict below is about.",
+            "the verdict below is about the record at vout 0. Output 2's own record is listed below as \"HashMark "
+            'record at vout 2".',
+            "The transaction carries 3 HashMark records in other outputs; the verdict below is about the one at "
+            "vout 0, and each is listed separately.",
+        ]
+        for s in samples:
+            out = hashmark_cmds._quiet_wording(s)
+            assert not re.search(r"\bbelow\b|listed separately", out), out
