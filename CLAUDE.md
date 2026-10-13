@@ -85,6 +85,8 @@ This repo is public and published to PyPI. Each rule below exists because the op
 ## Security review
 
 - `.claude/skills/security-panel/SKILL.md` is the panel procedure. Its reviewer agents come from a plugin a fresh clone may not have; say so rather than skipping lanes silently.
+- Run reviewers on `opus` by default; it keeps token use down. Use `fable` only to vary the model across a panel (the skill's two `fable` lanes), not as the default for every lane.
+- A defensive Mythos review in the maintainer's contained sandbox VM is also available, and only the maintainer can start it. When you finish or scope a review, say whether one is worth running: recommend it for changes to keys, signing, covenants, money paths, wire formats, trust boundaries or a release range, and say it is not needed for docs, tests or small refactors. It runs alongside the other reviewers, never instead of them.
 - Re-derive a synthesis agent's conclusion from the raw findings: check the count and verify the top item yourself.
 - Treat findings, "checked, no finding" lists and fix prescriptions as hypotheses. Before a reviewer's "cannot", "none" or "every" goes into a brief, run the check that would falsify it.
 
