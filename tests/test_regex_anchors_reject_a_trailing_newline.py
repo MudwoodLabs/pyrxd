@@ -98,7 +98,7 @@ def test_redaction_still_redacts_a_key_with_a_trailing_newline(suffix) -> None:
     from pyrxd.security.errors import redact
 
     assert redact("cd" * 32 + suffix) == "<redacted>"
-    assert redact("5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ" + suffix) == "<redacted>"
+    assert redact("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy" + suffix) == "<redacted>"
 
 
 def test_redaction_still_leaves_prose_alone() -> None:
