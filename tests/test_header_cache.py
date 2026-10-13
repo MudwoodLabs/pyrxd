@@ -1688,3 +1688,225 @@ def test_a_non_json_constant_in_the_metadata_is_a_damaged_store(constant: str) -
     meta = json.dumps({**good, "syncs": [{"lowest_tip": "@"}]}, sort_keys=True).replace('"@"', constant)
     with pytest.raises(header_cache.HeaderStoreCorrupt, match="could not be parsed as JSON"):
         decode_store(_store_bytes(meta.encode(), [HEADERS[h] for h in range(START, TOP + 1)]))
+
+
+# ── the store's edges: what the 2026-10-13 mutation sweep of header_store.py found untested ─────
+
+
+def test_the_default_cache_dir_is_under_the_home_directory(monkeypatch, tmp_path) -> None:
+    """conftest points ``cache_dir`` at a temporary directory for every test, so the real one never
+    runs. Load the module from its file again, unpatched, to check where stores live by default."""
+    import importlib.util
+    import sys
+
+    name = "pyrxd.cli._header_store_unpatched"
+    spec = importlib.util.spec_from_file_location(name, header_store.__file__)
+    assert spec is not None and spec.loader is not None
+    fresh = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, fresh)  # its dataclass looks itself up there
+    spec.loader.exec_module(fresh)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert fresh.cache_dir() == tmp_path / ".pyrxd" / "headers"
+    assert fresh.store_path("mainnet") == tmp_path / ".pyrxd" / "headers" / "mainnet.bin"
+
+
+@pytest.mark.parametrize("network", ["../mainnet", "main net", "", "1mainnet", 7, None])
+def test_a_network_name_that_is_not_an_identifier_is_refused(network: Any) -> None:
+    """The name becomes a file name, so a string that is not an identifier (a path, a space) is
+    refused as firmly as a non-string."""
+    with pytest.raises(ValueError, match="not a network name"):
+        header_store.store_path(network)
+
+
+def test_a_loaded_store_cannot_be_changed_after_it_is_read(tmp_path) -> None:
+    import dataclasses
+
+    got = header_store.load("mainnet", _table(START), path=tmp_path / "mainnet.bin")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        got.chain = _chain(START, TOP)  # type: ignore[misc]
+
+
+def test_a_store_that_cannot_be_read_is_untrusted(tmp_path) -> None:
+    """A path that exists but cannot be read (here a directory, which fails as root too) is
+    untrusted, not missing."""
+    path = tmp_path / "mainnet.bin"
+    path.mkdir()
+    got = header_store.load("mainnet", _table(START), path=path)
+    assert got.chain is None and got.untrusted and not got.stale
+    assert "could not be read (IsADirectoryError); treated as empty" in (got.note or "")
+
+
+@pytest.mark.parametrize(("written_for", "read_as"), [("mainnet", "testnet"), ("testnet", "mainnet")])
+def test_a_store_for_another_network_is_untrusted_whichever_name_sorts_first(
+    tmp_path, written_for: str, read_as: str
+) -> None:
+    """Valid headers and a valid checksum, but the metadata names another network. Both orders, so
+    an ordering comparison standing in for ``!=`` cannot pass."""
+    meta, _ = decode_store(encode_store(_chain(START, TOP)))
+    blob = json.dumps({**meta, "network": written_for}, sort_keys=True, separators=(",", ":")).encode()
+    path = tmp_path / "store.bin"
+    path.write_bytes(_store_bytes(blob, [HEADERS[h] for h in range(START, TOP + 1)]))
+    got = header_store.load(read_as, _table(START), path=path)
+    assert got.chain is None and got.untrusted
+    assert f"is for {written_for}, not {read_as}; treated as empty" in (got.note or "")
+    # Honest pair: read under the name it was written for, it verifies.
+    assert header_store.load(written_for, _table(START), path=path).chain is not None
+
+
+def test_a_store_ending_one_block_below_the_newest_checkpoint_is_stale(tmp_path) -> None:
+    """The boundary of the stale check: the top is the LAST header's height, base + count - 1."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460575), table=_table(START), path=path)
+    got = header_store.load("mainnet", ((START, _hash(START)), (460576, _hash(460576))), path=path)
+    assert got.chain is None and got.stale and not got.untrusted
+    assert "ends at block 460575, behind this pyrxd's newest checkpoint (460576)" in (got.note or "")
+    # Honest pair: a store reaching the newest checkpoint exactly is not stale; it rebases onto it.
+    at = header_store.load("mainnet", ((START, _hash(START)), (460575, _hash(460575))), path=path)
+    assert at.chain is not None and not at.stale and (at.chain.base_height, at.chain.top) == (460575, 460575)
+
+
+def test_an_unexpected_error_while_checking_the_store_is_untrusted(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)
+
+    def broken(*a: Any, **kw: Any) -> Any:
+        raise ZeroDivisionError
+
+    monkeypatch.setattr(header_store, "verify_header_chain", broken)
+    got = header_store.load("mainnet", _table(START), path=path)
+    assert got.chain is None and got.untrusted
+    assert "could not be checked (ZeroDivisionError); treated as empty" in (got.note or "")
+
+
+def test_without_fcntl_a_save_takes_no_lock_and_leaves_temporary_files_alone(monkeypatch, tmp_path) -> None:
+    """Windows has no ``fcntl``. A save still writes, but takes no lock, so a temporary file that
+    looks orphaned may belong to a live save and is not removed."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # `import fcntl` raises ImportError
+    path = tmp_path / "mainnet.bin"
+    orphan = tmp_path / ".mainnet.bin.1.deadbeef.tmp"
+    orphan.write_bytes(b"x")
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)
+    assert orphan.exists()
+    assert not header_store.lock_path(path).exists()
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
+
+
+def test_the_store_directory_and_lock_file_are_private(tmp_path) -> None:
+    """A save makes missing parent directories with mode 0o700, and the lock file with 0o600."""
+    old = os.umask(0o022)
+    try:
+        path = tmp_path / "a" / "b" / "mainnet.bin"
+        header_store.save(_chain(START, TOP), table=_table(START), path=path)
+    finally:
+        os.umask(old)
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert header_store.lock_path(path).stat().st_mode & 0o777 == 0o600
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
+
+
+def test_a_tmp_named_symlink_is_not_removed_as_an_orphan(tmp_path) -> None:
+    """Only regular files are cleaned up; a symlink with a temporary file's name is left alone."""
+    path = tmp_path / "mainnet.bin"
+    target = tmp_path / "elsewhere"
+    target.write_bytes(b"x")
+    link = tmp_path / ".mainnet.bin.1.deadbeef.tmp"
+    link.symlink_to(target)
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)
+    assert link.is_symlink() and target.exists()
+
+
+@pytest.mark.parametrize("fails", ["scandir", "unlink"])
+def test_a_failed_orphan_cleanup_does_not_stop_the_save(monkeypatch, tmp_path, fails: str) -> None:
+    path = tmp_path / "mainnet.bin"
+    (tmp_path / ".mainnet.bin.1.deadbeef.tmp").write_bytes(b"x")
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise PermissionError(fails)
+
+    monkeypatch.setattr(header_store.os, fails, boom)
+    header_store.save(_chain(START, TOP), table=_table(START), path=path)
+    monkeypatch.undo()
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("fails", ["open", "fsync"])
+def test_a_directory_that_cannot_be_synced_does_not_fail_the_save(monkeypatch, tmp_path, fails: str) -> None:
+    """After the rename, the directory is fsynced on a best-effort basis: some platforms cannot open
+    a directory (Windows) or fsync one. The store is already in place, so the save succeeds."""
+    path = tmp_path / "mainnet.bin"
+    real_open, real_fsync = os.open, os.fsync
+    dir_fds: list[int] = []
+
+    def open_(p: Any, flags: int, *a: Any, **kw: Any) -> int:
+        if Path(p) == tmp_path:
+            if fails == "open":
+                raise PermissionError("cannot open a directory")
+            fd = real_open(p, flags, *a, **kw)
+            dir_fds.append(fd)
+            return fd
+        return real_open(p, flags, *a, **kw)
+
+    def fsync_(fd: int) -> None:
+        if fd in dir_fds:
+            raise OSError("fsync of a directory is not supported")
+        real_fsync(fd)
+
+    monkeypatch.setattr(header_store.os, "open", open_)
+    monkeypatch.setattr(header_store.os, "fsync", fsync_)
+    assert header_store.save(_chain(START, TOP), table=_table(START), path=path) == path
+    monkeypatch.undo()
+    assert (fails == "fsync") == bool(dir_fds), "the failure was reached"
+    assert header_store.load("mainnet", _table(START), path=path).chain.top == TOP  # type: ignore[union-attr]
+
+
+def _chain_with_a_new_top(monkeypatch, top: int) -> VerifiedHeaders:
+    """START..top with the header at *top* re-nonced: agrees with the real chain everywhere below
+    *top* and differs AT it. Only the cache's proof-of-work check is told to accept it."""
+    fork = _renonced(HEADERS[top])
+    real = header_cache.verify_radiant_header_pow
+    monkeypatch.setattr(
+        header_cache,
+        "verify_radiant_header_pow",
+        lambda h, **kw: radiant_block_hash(h) if h == fork else real(h, **kw),
+    )
+    chain, stopped = extend_verified_headers(_chain(START, top - 1), [fork])
+    assert stopped is None and chain.top == top and chain.header_at(top) != HEADERS[top]
+    return chain
+
+
+def test_a_plain_save_differing_only_at_the_stores_top_is_refused(monkeypatch, tmp_path) -> None:
+    """The comparison runs up to AND INCLUDING the highest height both chains hold. An odd height,
+    so ``hi | 1`` cannot stand in for ``hi + 1``."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460569), table=_table(START), path=path)
+    before = path.read_bytes()
+    other = _chain_with_a_new_top(monkeypatch, 460569)
+    with pytest.raises(header_store.AppendOnlyRefusal, match="holds a different header at block 460569"):
+        header_store.save(other, table=_table(START), path=path)
+    assert path.read_bytes() == before
+
+
+def test_a_stopped_reset_below_the_top_is_kept_even_when_it_disagrees(monkeypatch, tmp_path) -> None:
+    """``past_top_only``: a stopped rebuild that ends BELOW the store's top keeps the store whether
+    or not it agrees; only a stopped rebuild reaching past the top is written."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, 460575), table=_table(START), path=path)
+    before = path.read_bytes()
+    other = _chain_with_a_new_top(monkeypatch, 460569)
+    with pytest.raises(header_store.ResetKeptExisting, match="ends at block 460569, not past the existing"):
+        header_store.save(other, table=_table(START), path=path, reset=True, past_top_only=True)
+    assert path.read_bytes() == before
+    # Honest pair: without past_top_only (a completed rebuild), the disagreeing chain replaces it.
+    header_store.save(other, table=_table(START), path=path, reset=True)
+    assert header_store.load("mainnet", _table(START), path=path).chain.headers == other.headers  # type: ignore[union-attr]
+
+
+def test_saving_the_same_chain_again_is_allowed_and_keeps_both_records(tmp_path) -> None:
+    """A sync that adds nothing ends at the store's top: not shorter, so not refused."""
+    path = tmp_path / "mainnet.bin"
+    header_store.save(_chain(START, TOP), table=_table(START), record={"n": 1}, path=path)
+    header_store.save(_chain(START, TOP), table=_table(START), record={"n": 2}, path=path)
+    got = header_store.load("mainnet", _table(START), path=path)
+    assert got.chain.top == TOP and got.syncs == ({"n": 1}, {"n": 2})  # type: ignore[union-attr]
