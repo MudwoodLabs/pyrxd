@@ -329,7 +329,7 @@ _PRIVATE_KEY_MARKERS = (
 )
 
 #: 64 hex characters — a raw 32-byte value written the way a private key is written.
-_BARE_32_BYTE_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
+_BARE_32_BYTE_HEX = re.compile(r"^[0-9a-fA-F]{64}\Z")
 
 #: Field-name fragments under which a 64-hex value is a PUBLIC 32-byte quantity.
 #:
@@ -482,7 +482,8 @@ def _carries_private_key(value: Any) -> bool:
         elif isinstance(node, str) and node:
             if _value_is_spending_authority(node):
                 return True
-            if _BARE_32_BYTE_HEX.match(node) and not any(m in field for m in _PUBLIC_32_BYTE_FIELD_MARKERS):
+            # `.strip()`: a key with a trailing newline is still a key (#769 anchors at `\Z`).
+            if _BARE_32_BYTE_HEX.match(node.strip()) and not any(m in field for m in _PUBLIC_32_BYTE_FIELD_MARKERS):
                 return True
     return False
 

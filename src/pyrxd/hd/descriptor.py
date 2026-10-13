@@ -157,7 +157,7 @@ INTERNAL_CHAIN = 1
 """BIP44 chain index for change addresses (pyrxd calls this the *internal* chain)."""
 
 _BIP32_HARDENED_BIT = 0x80000000
-_PATH_STEP_RE = re.compile(r"^(\d+)([h'H])?$")
+_PATH_STEP_RE = re.compile(r"^(\d+)([h'H])?\Z")
 
 
 def normalize_path(path: str) -> str:

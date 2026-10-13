@@ -112,6 +112,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Validators no longer accept a value with a trailing newline (#769).** Patterns anchored with
+  `$` also match just before a final `\n`, so `"<txid>\n"` validated as a `Txid` and reached
+  network calls, and the same held for Bitcoin addresses, derivation-path steps and legacy
+  address decoding. Every constant regex in `src/` is now anchored at `\Z`, and a test fails if a
+  `$`-anchored one is added. The two patterns that detect secrets (error-message redaction and the
+  recovery-file private-key screen) now strip surrounding whitespace before matching, so the
+  stricter anchor does not narrow what they catch.
+
 - **`ElectrumXClient.close()` never closed its WebSocket (#731).** The reader task's `finally`
   clears the client's socket, and `close()` read the socket only after awaiting the cancelled
   reader, so it always found none and skipped the close. Every `close()`, `async with` exit and
