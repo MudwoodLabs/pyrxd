@@ -228,6 +228,21 @@ def test_the_init_code_pin_is_live_in_this_fixture() -> None:
     assert any("creation bytecode" in n for n in notes), notes
 
 
+@pytest.mark.parametrize(("wei", "hint"), [(0, True), (_WEI - 1, False)], ids=["zero-wei", "short-wei"])
+def test_a_mispriced_deploy_is_anomalous_and_a_zero_wei_one_names_erc20(wei: int, hint: bool) -> None:
+    """The verifier reads native-ETH funding only. An ERC-20 HTLC's deploy carries 0 wei, so it is
+    scored ANOMALOUS like any mispriced leg; the note says the verifier does not check ERC-20, rather
+    than leaving an honest ERC-20 run to read as under-funded."""
+    deploy_tx, deploy_rcpt = _funding()
+    tx, rcpt = _claim()
+    leg, _, notes = v.verify_counter_leg_eth(
+        _manifest(), tx, rcpt, funding=({**deploy_tx, "value": hex(wei)}, deploy_rcpt)
+    )
+    assert leg is v.CounterLeg.ANOMALOUS
+    assert any("value mismatch" in n for n in notes), notes
+    assert any("ERC-20" in n for n in notes) is hint, notes
+
+
 @pytest.mark.parametrize("old_topic", [_OLD_SHA3_CLAIMED, _OLD_SHA3_REFUNDED], ids=["claimed", "refunded"])
 def test_a_receipt_with_the_old_sha3_topic_is_not_accepted(old_topic: str) -> None:
     """The contract cannot emit the old value, so a receipt carrying it is not ours to score as a spend."""

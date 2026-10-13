@@ -523,6 +523,10 @@ def _nesting_depth(value: Any) -> int:
     return deepest
 
 
+def _refuse_non_json_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not a JSON value")
+
+
 def decode_store(data: Any) -> tuple[dict[str, Any], list[bytes]]:
     """``(metadata, headers)`` from store bytes, or :class:`HeaderStoreCorrupt`. Shape only: what
     the headers SAY is checked by :func:`verify_header_chain`, never here."""
@@ -538,7 +542,9 @@ def decode_store(data: Any) -> tuple[dict[str, Any], list[bytes]]:
     n = int.from_bytes(body[at : at + 4], "big")
     at += 4
     try:
-        meta = json.loads(body[at : at + n].decode("utf-8"))
+        # NaN and +/-Infinity are not JSON; Python's parser accepts them, and they would be written
+        # back on save and printed in a `--json` report that strict parsers then reject.
+        meta = json.loads(body[at : at + n].decode("utf-8"), parse_constant=_refuse_non_json_constant)
     except Exception as exc:  # total over file contents: RecursionError on deep nesting, not only ValueError
         raise HeaderStoreCorrupt(f"the store's metadata could not be parsed as JSON ({type(exc).__name__})") from None
     at += n

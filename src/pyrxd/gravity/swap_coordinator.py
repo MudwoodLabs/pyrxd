@@ -4332,7 +4332,7 @@ class SwapCoordinator:
                 f"taker_observed_reveal({claim_tx!r}) and then taker_scrape_and_claim_asset (two-host "
                 f"runner: --phase claim). Do it before the covenant's CSV refund to the maker opens, "
                 f"t_rxd = {self.record.terms.t_rxd.value} {self.record.terms.t_rxd.unit.value} after the "
-                "covenant was mined; the record is still BOTH_LOCKED.",
+                f"covenant was mined; the record is still {self.record.state.name}.",
                 tx_hash=claim_tx,
                 contract_address=contract,
             ) from refund_error

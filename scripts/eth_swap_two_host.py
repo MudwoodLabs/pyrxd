@@ -1076,7 +1076,10 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
         rec = await _taker_eth_refund_explained(args, coord, loc, coord.taker_refund_btc)
         if rec.state is not SwapState.ABORTED:
             raise SystemExit(f"taker_refund_btc landed in {rec.state.value}, expected aborted")
-        print(f"  -> {rec.state.value}; the taker's ETH is refunded to the taker. Nothing else is owed to you.")
+        print(
+            f"  -> {rec.state.value}; ETH refund sent to the taker (the record is written at broadcast, not "
+            "confirmation). Check the refund on-chain; once it has landed nothing else is owed to you."
+        )
     finally:
         await rpc.close()
 

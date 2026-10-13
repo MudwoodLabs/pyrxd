@@ -650,6 +650,12 @@ def verify_counter_leg_eth(
                 [
                     f"ETH HTLC funded with {funded_wei} wei, agreed {m.counter_amount} "
                     "(value mismatch — counter leg under/over-funded / mispriced)"
+                    + (
+                        "; a deploy carrying 0 wei may be an ERC-20 HTLC, which this verifier does not "
+                        "check (it reads native-ETH funding only)"
+                        if funded_wei == 0
+                        else ""
+                    )
                 ],
             )
         notes.append(f"ETH HTLC deploy funded the agreed {m.counter_amount} wei to our contract")
