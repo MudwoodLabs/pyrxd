@@ -2197,16 +2197,19 @@ class TestThePhaseStateTable:
 
     def test_the_refusals_are_exactly_these(self):
         """Membership pinned: a change to WHICH combinations refuse must be made here on purpose.
-        Terminal states are deliberately not refused yet (written at broadcast; PR 5b/9a)."""
+        Terminal states are not refused for being terminal (written at broadcast; PR 5b/9a); COMPLETED
+        is refused only as a state where p is public."""
         refused = {
             (role, phase, state)
             for (role, phase), row in _shared().PHASE_STATE_RULES.items()
             for state, (verdict, _why) in row.items()
             if verdict == "refuse"
         }
-        expected = {("taker", phase, state) for phase in ("abort", "refund") for state in _P_PUBLIC}
-        expected.add(("maker", "refund", SwapState.SECRET_REVEALED))
-        expected |= {("maker", "abort", SwapState.SECRET_REVEALED), ("maker", "abort", SwapState.COMPLETED)}
+        # Every state that means p is public refuses both sides' refunds and aborts (review F7: the
+        # maker's refund used to allow COMPLETED and ASSET_VULNERABLE, and its abort ASSET_VULNERABLE).
+        expected = {
+            (role, phase, state) for role in ("taker", "maker") for phase in ("abort", "refund") for state in _P_PUBLIC
+        }
         assert refused == expected
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])

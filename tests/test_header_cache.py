@@ -1677,3 +1677,14 @@ def test_deeply_nested_metadata_is_a_damaged_store_not_a_crash(monkeypatch, tmp_
     r, out = _reset(monkeypatch, tmp_path, DEEP)
     assert r.exit_code == 0 and out["state"] == "synced" and out["cached_to"] == TOP, out
     assert _cached(START).headers == tuple(headers)  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_a_non_json_constant_in_the_metadata_is_a_damaged_store(constant: str) -> None:
+    """Python's JSON parser accepts NaN and +/-Infinity, which are not JSON. A checksummed store
+    carrying one in a sync record would be written back on save and printed in `--json` output
+    that strict parsers reject, so it is refused as damaged, like any other unparseable metadata."""
+    good, _ = decode_store(encode_store(_chain(START, TOP)))
+    meta = json.dumps({**good, "syncs": [{"lowest_tip": "@"}]}, sort_keys=True).replace('"@"', constant)
+    with pytest.raises(header_cache.HeaderStoreCorrupt, match="could not be parsed as JSON"):
+        decode_store(_store_bytes(meta.encode(), [HEADERS[h] for h in range(START, TOP + 1)]))

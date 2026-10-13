@@ -164,7 +164,7 @@ group_files() {
     verdicts)    echo "glyph/authority glyph/burn glyph/relationships" ;;
     mutchain)    echo "glyph/mutable_chain glyph/mutable_chain_discovery" ;;
     waveverdicts) echo "glyph/wave_identity glyph/mark_anchor" ;;
-    markblock)   echo "spv/radiant spv/radiant_checkpoints glyph/mark_block glyph/header_cache cli/headers_cmds" ;;
+    markblock)   echo "spv/radiant spv/radiant_checkpoints glyph/mark_block glyph/header_cache cli/headers_cmds cli/header_store" ;;
     btcleg)      echo "btc_wallet/taproot btc_wallet/htlc_leg btc_wallet/payment btc_wallet/keys btc_wallet/chains btc_wallet/validate" ;;
     # `covenants`, `gravitycore` and `cryptoprim` were each ONE group until 2026-09-29, when
     # scheduled run 36558376548 cancelled all three at the 330-minute job timeout, having scored 2

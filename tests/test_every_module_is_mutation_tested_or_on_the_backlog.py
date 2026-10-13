@@ -72,9 +72,10 @@ _OUT_OF_SCOPE_MODULES = {
 #: The cli/ modules that are mutated ANYWAY, because they print verdicts or enforce a rule rather
 #: than plumb arguments (groups `markcli` and `inspectcli`, and `markblock` for
 #: `cli/headers_cmds`, which holds the header cache's operator count, depth bound and once-per-sync
-#: floor, in scripts/mutation_test.sh). The prefix rule above would let any of them drop out of its
+#: floor, and `cli/header_store`, which holds the cache file's append-only and reset-keeps-a-longer-
+#: cache rules, in scripts/mutation_test.sh). The prefix rule above would let any of them drop out of its
 #: group in silence; `test_the_verdict_printing_cli_stays_mutated` pins them.
-_MUTATED_CLI = frozenset({"cli/hashmark_cmds", "cli/glyph_inspect", "cli/headers_cmds"})
+_MUTATED_CLI = frozenset({"cli/hashmark_cmds", "cli/glyph_inspect", "cli/headers_cmds", "cli/header_store"})
 
 #: The backlog, not an exemption list. See the module docstring. MAY SHRINK, MUST NOT GROW.
 _NOT_YET_MUTATED = frozenset(

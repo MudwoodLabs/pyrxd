@@ -172,9 +172,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `SwapState`. On both two-host runners, taker `--phase abort` and `--phase refund` refuse on
     `SECRET_REVEALED`, `ASSET_VULNERABLE` or `COMPLETED`, naming `--phase claim` and the `t_rxd`
     deadline. Before this, a BTC taker `--phase refund` on such a record sent both refunds,
-    including the covenant refund that pays the maker. Maker `--phase refund` refuses on
-    `SECRET_REVEALED`. Terminal states are not refused yet: they are written at broadcast, so
-    re-sending a dropped transaction must stay possible.
+    including the covenant refund that pays the maker. Maker `--phase refund` refuses on the same
+    three states, and maker `--phase abort` on `SECRET_REVEALED`, `ASSET_VULNERABLE` or
+    `COMPLETED`: in each, p is public. Terminal states are not refused for being terminal: they are
+    written at broadcast, so re-sending a dropped transaction must stay possible.
 
   With no record on disk (a first run) the rebuild is used as before. `scripts/eth_swap_run.py`
   already loaded the record whole under `--resume`. The four single-process runners

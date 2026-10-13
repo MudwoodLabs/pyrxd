@@ -1085,7 +1085,10 @@ async def taker_phase_abort(args) -> None:
         rec = await coord.taker_refund_btc()
         if rec.state is not SwapState.ABORTED:
             raise SystemExit(f"taker_refund_btc landed in {rec.state.value}, expected aborted")
-        print(f"  -> {rec.state.value}; the taker's BTC is refunded to the taker. Nothing else is owed to you.")
+        print(
+            f"  -> {rec.state.value}; BTC refund sent to the taker (the record is written at broadcast, not "
+            "confirmation). Check the refund on-chain; once it has confirmed nothing else is owed to you."
+        )
     finally:
         await source.close()
 
@@ -1169,7 +1172,10 @@ async def taker_phase_refund(args) -> None:
         rec = await coord.mutual_refund()
         if rec.state is not SwapState.MUTUAL_REFUND:
             raise SystemExit(f"mutual_refund landed in {rec.state.value}, expected mutual_refund")
-        print(f"  -> {rec.state.value}; BTC refunded to the taker, the covenant refunded to the maker.")
+        print(
+            f"  -> {rec.state.value}; both refunds sent: BTC to the taker, the covenant to the maker (the "
+            "record is written at broadcast, not confirmation). Check both on-chain."
+        )
     finally:
         await source.close()
 
