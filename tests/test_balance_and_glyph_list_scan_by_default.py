@@ -358,6 +358,65 @@ class TestGlyphListScansByDefault:
         assert _shown(machine) == ""
 
 
+# --------------------------------------------------------------------------- glyph list, unspent is the server's word (#788)
+
+_SPENT_NOTE = (
+    "Note: that these outputs are unspent is the ElectrumX server's word and was not verified; "
+    "a server can list an output this wallet has already spent."
+)
+
+
+class TestGlyphListSaysUnspentIsTheServersWord:
+    """Nothing checks that a listed token output is still unspent: a server can re-list one the
+    wallet has spent and it passes every check the scanner makes. Until a second source is asked,
+    the output says whose word "unspent" is. The JSON gains a field; no existing field changes."""
+
+    def _held(self, tmp_path, monkeypatch):
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        nft_tx, nft_ref = _nft(w, 0, 0, "ab")
+        ft_tx, ft_ref = _ft(w, 0, 0, "cd", 5_000)
+        first = w.derive_address(0, 0)
+        return mnemonic, _ElectrumX({first: [_plain(first), nft_tx, ft_tx]}), first, nft_ref, ft_ref
+
+    def test_the_human_list_says_so_under_the_table(self, tmp_path, monkeypatch) -> None:
+        mnemonic, server, _first, nft_ref, ft_ref = self._held(tmp_path, monkeypatch)
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list", mode="human")
+        assert result.exit_code == 0, (result.output, result.exception)
+        lines = _shown(result).splitlines()
+        assert lines[-1] == _SPENT_NOTE
+        assert any(nft_ref in line for line in lines[:-1])
+        assert any(ft_ref in line for line in lines[:-1])
+
+    def test_an_empty_human_list_has_no_note(self, tmp_path, monkeypatch) -> None:
+        """No output is listed, so there is no "unspent" to qualify."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        first = w.derive_address(0, 0)
+        server = _ElectrumX({first: [_plain(first)]})
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list", mode="human")
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert _shown(result) == "(none)"
+
+    def test_each_json_row_names_the_server_and_keeps_every_old_field(self, tmp_path, monkeypatch) -> None:
+        mnemonic, server, first, nft_ref, ft_ref = self._held(tmp_path, monkeypatch)
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
+        assert result.exit_code == 0, (result.output, result.exception)
+        rows = _json(result)
+        assert len(rows) == 2
+        for row in rows:
+            assert set(row) == {"type", "ref", "address", "amount", "name", "spent_status_source"}, row
+            assert row["spent_status_source"] == "server"
+        assert sorted((r["type"], r["ref"], r["address"], r["amount"], r["name"]) for r in rows) == [
+            ("FT", ft_ref, first, "5000", ""),
+            ("NFT", nft_ref, first, "1", ""),
+        ]
+
+    def test_quiet_prints_only_the_refs(self, tmp_path, monkeypatch) -> None:
+        mnemonic, server, _first, nft_ref, ft_ref = self._held(tmp_path, monkeypatch)
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list", mode="quiet")
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert sorted(_shown(result).splitlines()) == sorted([nft_ref, ft_ref])
+
+
 # --------------------------------------------------------------------------- utxos, same rule
 
 

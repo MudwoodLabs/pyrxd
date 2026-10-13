@@ -20,7 +20,11 @@ Glyph tokens
 - ``pyrxd glyph deploy-dmint`` / ``claim-dmint`` — deploy a dMint contract and mine/claim from one.
 - ``pyrxd glyph dmint-estimate`` — benchmark this machine's SHA256d rate and estimate
   time-to-mint (MEASURED rate, EXACT attempt distribution, PROJECTED ETA — kept apart).
-- ``pyrxd glyph list`` — list the Glyph tokens a wallet holds.
+- ``pyrxd glyph list`` — list the Glyph tokens a wallet holds. Each token's owner and amount are
+  checked against its own transaction, but that the output is still **unspent is the ElectrumX
+  server's word, not verified**: a server can list an output the wallet has already spent. The
+  human output says so under the table, and each ``--json`` row carries
+  ``"spent_status_source": "server"``.
 - ``pyrxd glyph timelock-mint`` / ``timelock-reveal`` — seal content behind a timelock,
   and later publish the key that opens it. See below.
 
