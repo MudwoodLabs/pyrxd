@@ -7,7 +7,7 @@ This repo is public and published to PyPI. Each rule below exists because the op
 - Default branch `main`. One branch per change, cut from `origin/main`. Push with an explicit refspec (`git push origin HEAD:refs/heads/<branch>`).
 - Stage explicit paths, never `git add -A` or `git add .`. Before pushing, check `git diff --diff-filter=A --name-only origin/main HEAD` lists only files you meant to add.
 - Verify the commit, not the working tree: `git show --stat HEAD` after committing. A claim about "the repo" is a claim about a commit, so name it.
-- Squash-merge only after the required checks pass on the exact head: `gh pr merge --squash --match-head-commit <sha>`, never `--admin`. The required contexts are mirrored in `tests/test_ci_workflows_check_every_pr_base.py`.
+- Squash-merge only after the required checks pass on the exact head: `gh pr merge --squash --match-head-commit <sha>`. Admins are enforced on `main`, so no bypass flag works. The required contexts are mirrored in `tests/test_ci_workflows_check_every_pr_base.py`.
 - If a merge is refused with every check green, list unresolved review threads first. Branch protection requires conversation resolution, and CodeQL opens threads mid-run.
 - Merging, force-pushing, deleting remote branches, tagging and publishing need the maintainer's approval.
 - Pass `--repo MudwoodLabs/pyrxd` to `gh` (`docs/runbooks/cutting-a-release.md`, Gotchas). Set a PR body from a file (`gh api ... -F body=@file`, capital `-F`), then read it back.
