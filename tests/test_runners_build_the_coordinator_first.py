@@ -27,6 +27,7 @@ import ast
 import re
 import struct
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -877,6 +878,11 @@ async def test_the_sepolia_dust_default_deadline_is_the_shortest_that_holds_with
             return False
         return True
 
+    # The search probes the exact boundary, and the runner checks the terms twice, each time reading
+    # the wall clock: on a slow runner a deadline could pass the first check and fail the second one
+    # a second later (#838, #844). Freeze the clock the runner reads so each probe has one answer.
+    frozen = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: frozen)
     lo, hi = 7_200, 14_400
     assert await constructs(hi)
     while hi - lo > 1:
