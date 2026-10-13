@@ -110,7 +110,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Measured on Anvil: deploy gas rises from 318,414 to 319,422 (`EthHtlc`) and from 450,657 to
     458,657 (`Erc20Htlc`); an `Erc20Htlc` refund rises by 34 gas; claims are unchanged.
 
+### Deprecated
+
+- **`wave_identity.names_resolving_now` in `glyph inspect --verify-wave --json` and `pyrxd verify
+  --verify-wave --json`.** Use `names_held_now`, which carries the same list under an accurate name
+  (#729, below). The old field is kept, with the same value, for one minor release.
+
 ### Fixed
+
+- **`--verify-wave` said "names resolving to that key"; the lookup returns names the key holds
+  (#729).** RXinDexer's `wave.reverse_lookup` reads its owner index, so a hit is a name whose
+  claim singleton the signer's address holds. Where that name points is a separate target its
+  holder sets, and it can be any address, so "resolving to" claimed something the lookup never
+  checked. The output now reads "WAVE names held by that key RIGHT NOW", the JSON gains
+  `names_held_now`, and the caveat says the names come from the owner index and their targets are
+  not checked. The `pyrxd verify --verify-wave` help text and the library docstrings say the same.
 
 - **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
   `Claimed(bytes32)` and `Refunded()` topic0 values were `hashlib.sha3_256` of the event

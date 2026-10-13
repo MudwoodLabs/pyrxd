@@ -501,8 +501,10 @@ async def wave_names_for_hash160(client, pubkey_hash160: bytes, *, network: Netw
     """WAVE names owned by the address a public-key hash encodes.
 
     The bridge between a KEY and a NAME: a hash160 is what a P2PKH address
-    encodes, and WAVE resolves names to addresses, so the reverse lookup answers
-    "which names does the holder of this key own".
+    encodes, and RXinDexer indexes each name's holder by address, so the reverse
+    lookup answers "which names does the holder of this key hold". It does NOT
+    answer "which names point at this key": a name's target is set by its holder
+    and can be any address (#729).
 
     Written for HashMark v2 attestation — a verified signer is a hash160, and the
     question a recipient actually has is "was this recorded by company.rxd?" — but

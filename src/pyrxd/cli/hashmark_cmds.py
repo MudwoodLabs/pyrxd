@@ -1574,7 +1574,7 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
     "verify_wave",
     is_flag=True,
     default=False,
-    help="Also list the WAVE names resolving to the signing key RIGHT NOW. Present-tense context, "
+    help="Also list the WAVE names the signing key holds RIGHT NOW. Present-tense context, "
     "never part of the mark's verdict.",
 )
 @click.pass_obj
