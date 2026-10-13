@@ -240,8 +240,9 @@ async def resume(args) -> None:
     # kept, the rebuild fills only what it lacks, and different terms or a different locator refuse.
     from pyrxd.gravity.record_sink import JsonFileRecordSink
 
+    sink = JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json")
     record = merge_with_persisted_record(
-        JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+        sink,
         rebuilt,
         source="what this resume rebuilt from the keys file and the chain",
         role="none",
@@ -262,6 +263,10 @@ async def resume(args) -> None:
         config=CoordinatorConfig(
             margin_policy=policy, funding_bound=funding_bound_from_args(args), role=SINGLE_OPERATOR_ROLE
         ),
+        # Write every step back to the record it was merged from, as dust_swap_run.py does. Without
+        # it the reveal and the claims this resume drives never reached the file, and `pyrxd swap
+        # status`, the watchtower and a second resume read a record still at BTC_LOCKED.
+        persist=sink,
     )
     print(f"  coordinator seeded at {coord.record.state.value}")
 

@@ -409,6 +409,8 @@ def _wire_eth(mod, monkeypatch, *, covenant_confs=10_000, covenant_funded=True, 
 
     def _fake_eth(args, *, claim_to, refund_to, eth_timeout):
         rpc, leg = _FakeEthRpc(now_ts), (counter_leg if counter_leg is not None else _FakeCounterLeg())
+        if hasattr(leg, "configure"):  # the addresses the runner hands the REAL leg, as it typed them
+            leg.configure(claim_to=claim_to, refund_to=refund_to)
         built["rpc"], built["counter"] = rpc, leg
         return rpc, leg
 
@@ -1304,7 +1306,11 @@ class _RevealAndFundingLeg(_FakeCounterLeg):
         super().__init__()
         self._p = preimage
         self._loc = locator
+        self._addresses: dict[str, str] = {}
         self.provenance_checked: list[str] = []
+
+    def configure(self, *, claim_to: str, refund_to: str) -> None:
+        self._addresses = {"claim_to": claim_to, "refund_to": refund_to}
 
     async def fetch_claim_artifacts(self, tx_hash):
         return [b"\x00\x00\x00\x00" + self._p]
@@ -1319,13 +1325,17 @@ class _RevealAndFundingLeg(_FakeCounterLeg):
         # The REAL leg's method, over a stand-in for the chain only, so the locator it returns has
         # the shape production returns. Returning the exchange-file locator here hid #853's
         # regression: the real ETH leg rebuilds the locator without the deploy hash.
-        return await _real_verify_counterparty_funded(self._loc, ref, terms, **kw)
+        return await _real_verify_counterparty_funded(self._loc, ref, terms, **self._addresses, **kw)
 
 
-async def _real_verify_counterparty_funded(funded, ref, terms, **kw):
+async def _real_verify_counterparty_funded(funded, ref, terms, *, claim_to=None, refund_to=None, **kw):
     """``EthLeg`` / ``BitcoinTaprootLeg.verify_counterparty_funded`` itself, run over a stand-in
     for the chain reads that reports *funded* as what is on chain. Everything the method builds
-    from the maker's own config and the terms is the shipped code."""
+    from the maker's own config and the terms is the shipped code.
+
+    ``claim_to``/``refund_to`` are the ETH addresses the runner passed to ``_eth_leg``, i.e. the
+    maker's config as the operator typed it. Taking them from *funded* instead (the taker's
+    checksum-cased locator) hid a lowercase address refusing the maker's next phase."""
     import types
 
     from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
@@ -1339,14 +1349,18 @@ async def _real_verify_counterparty_funded(funded, ref, terms, **kw):
             token = None
 
             async def verify_funded(self, expected, *, expected_amount_wei, block_identifier=None):
+                # Addresses compare without case, as the real `verify_funded` checksums both sides.
+                def fold(v):
+                    return v.lower() if isinstance(v, str) and v.startswith("0x") else v
+
                 for key, value in expected.to_dict().items():
-                    if key != "deploy_tx_hash" and value != funded.to_dict()[key]:
+                    if key != "deploy_tx_hash" and fold(value) != fold(funded.to_dict()[key]):
                         raise ValidationError(f"the contract on chain does not match the expected {key}")
 
         leg = types.SimpleNamespace(
             _leg=_Contract(),
-            _claim_to=funded.claimant,
-            _refund_to=funded.refundee,
+            _claim_to=claim_to if claim_to is not None else funded.claimant,
+            _refund_to=refund_to if refund_to is not None else funded.refundee,
             _eth_timeout_unix_s=funded.timeout,
         )
         leg.expected_locator = types.MethodType(EthLeg.expected_locator, leg)
@@ -1512,6 +1526,56 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
             assert after.counterchain_locator.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
             exchanged = dataclasses.replace(exchanged, deploy_tx_hash=UNKNOWN_DEPLOY_TX_HASH)
         assert after.counterchain_locator.to_dict() == exchanged.to_dict()
+
+    @pytest.mark.parametrize("then", ["refund", "lock-claim"])
+    async def test_an_address_typed_in_lowercase_still_recovers(self, then, tmp_path, monkeypatch):
+        """The maker's leg records the ETH addresses as the operator typed them (``--eth-maker-addr``,
+        and the taker's from its intro), while taker_funding.json carries them EIP-55 checksum-cased,
+        as ``EthHtlcContractLeg.fund`` writes them. Same 20 bytes, so the swap is honest; a
+        case-sensitive compare refused the maker's next phase anyway (pre-release review F1). The
+        scenario's default addresses are digits only, whose checksum form IS their lowercase form."""
+        import web3
+
+        name = "eth_swap_two_host"
+        args, _terms, io_dir, _leg, stop_at = _phase_scenario(name, tmp_path, role="maker", phase="lock-claim")
+        typed = {"eth_maker_claim_addr": "0x" + "ab" * 20, "eth_taker_refund_addr": "0x" + "cd" * 20}
+        for path in (Path(args.local_out), io_dir / "envelope.json"):
+            path.write_text(json.dumps({**json.loads(path.read_text()), **typed}))
+        doc = json.loads((io_dir / "taker_funding.json").read_text())
+        doc["eth_locator"]["claimant"] = web3.Web3.to_checksum_address(typed["eth_maker_claim_addr"])
+        doc["eth_locator"]["refundee"] = web3.Web3.to_checksum_address(typed["eth_taker_refund_addr"])
+        assert doc["eth_locator"]["claimant"] != typed["eth_maker_claim_addr"], "the fixture must differ in case"
+        (io_dir / "taker_funding.json").write_text(json.dumps(doc))
+        leg = _RevealAndFundingLeg(_leg._p, _exchange_locator(io_dir, eth=True))
+
+        await _run_phase(name, args, monkeypatch, role="maker", phase="lock-claim", counter_leg=leg, stop_at=stop_at)
+        persisted = _read_back(args).counterchain_locator
+        assert persisted.claimant == typed["eth_maker_claim_addr"], "the record should hold the typed address"
+        built = await _run_phase(name, args, monkeypatch, role="maker", phase=then, counter_leg=leg, stop_at=stop_at)
+        if then == "refund":
+            assert len(built["rxd"].refund_calls) == 1, "the maker's own asset refund did not run"
+
+    async def test_a_different_address_in_another_case_still_refuses(self, tmp_path, monkeypatch):
+        """Folding hex case must not fold away a real disagreement: a DIFFERENT claimant, checksum-cased,
+        still refuses the maker's refund and sends nothing."""
+        import web3
+
+        name = "eth_swap_two_host"
+        args, terms, io_dir, _leg, _stop = _phase_scenario(name, tmp_path, role="maker", phase="refund")
+        seeded = _seeded_record(terms, io_dir, eth=True, state=SwapState.BOTH_LOCKED, pending=False, maker=True)
+        other = web3.Web3.to_checksum_address("0x" + "ef" * 20)
+        await _seed(
+            args,
+            dataclasses.replace(
+                seeded, counterchain_locator=dataclasses.replace(seeded.counterchain_locator, claimant=other)
+            ),
+        )
+        mod = _load(name)
+        built = _wire_eth(mod, monkeypatch)
+        _wire_rxd_height(mod, monkeypatch, tip=1_120, locked_at=1_000)
+        with pytest.raises(SystemExit, match="disagree on counterchain_locator"):
+            await mod.maker_phase_refund(_with_fee(args))
+        assert built.get("rxd") is None or built["rxd"].refund_calls == []
 
     @pytest.mark.parametrize("then", ["refund", "lock-claim"])
     async def test_a_record_holding_the_takers_deploy_hash_still_recovers(self, then, tmp_path, monkeypatch):
@@ -1905,6 +1969,31 @@ class TestTheMergeHelperOnItsOwn:
         _wire_btc(btc_mod, monkeypatch)
         with pytest.raises(SystemExit, match="could not be read"):
             await btc_mod.taker_phase_abort(args)
+
+    def test_only_0x_hex_case_is_folded_in_the_compare(self):
+        """An EIP-55 address and its lowercase form are one address; a base58 BTC address in two cases
+        is two addresses, so only ``0x`` hex is folded, at any depth of the wire form."""
+        sys.path.insert(0, str(_SCRIPTS))
+        import _dust_swap_shared as shared
+
+        class _Wire:
+            def __init__(self, wire: dict) -> None:
+                self._wire = wire
+
+            def to_dict(self) -> dict:
+                return dict(self._wire)
+
+        def same(a: dict, b: dict) -> bool:
+            return shared._comparable(_Wire(a), field="counterchain_locator") == shared._comparable(
+                _Wire(b), field="counterchain_locator"
+            )
+
+        assert same({"claimant": "0xABab" + "ab" * 18}, {"claimant": "0x" + "ab" * 20})
+        assert same({"nested": {"a": ["0xFF"]}}, {"nested": {"a": ["0xff"]}})
+        assert not same(
+            {"address": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"}, {"address": "1boatslrhtknngkdxeeobr76b53lettpyt"}
+        )
+        assert not same({"claimant": "0x" + "ab" * 20}, {"claimant": "0x" + "ac" * 20})
 
     def test_exactly_the_informational_locator_keys_are_left_out_of_the_compare(self, eth_mod, btc_mod, tmp_path):
         """Derived from the real locators' wire keys: changing any key refuses except the ones in
@@ -2449,6 +2538,30 @@ class TestDustSwapResumeMergesThroughTheScript:
         assert merged.radiant_covenant_outpoint == "cc" * 32 + ":0"
         assert merged.single_operator_override == _OVERRIDE_STATEMENT
         assert merged.counterchain_locator.to_dict() == rebuilt.counterchain_locator.to_dict()
+
+    async def test_the_coordinator_writes_back_to_the_record_it_merged(self, tmp_path, monkeypatch):
+        """The resume drives the reveal and the claims; with no ``persist=`` none of it reached the file
+        (pre-release review F3). The coordinator must get a sink, and a write through it must land in
+        the record the next process reads, the same file the merge read from."""
+        from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+        keys, htlc = self._keys(tmp_path)
+        mod = _load("dust_swap_resume")
+        seen: list = []
+        self._wire(mod, monkeypatch, htlc, seen)
+        handed: dict = {}
+
+        def _coordinator(**kw):
+            handed.update(kw)
+            raise _Stop
+
+        monkeypatch.setattr(mod, "SwapCoordinator", _coordinator)
+        with pytest.raises(_Stop):
+            await mod.resume(mod._parse_args(_resume_argv(keys)))
+        sink = handed.get("persist")
+        assert sink is not None, "the resume coordinator persists nothing"
+        await sink(handed["record"].with_state(SwapState.BOTH_LOCKED))
+        assert JsonFileRecordSink(str(keys) + ".swaprec.json").load_record().state is SwapState.BOTH_LOCKED
 
     async def test_different_terms_refuse_before_the_coordinator(self, tmp_path, monkeypatch):
         from pyrxd.gravity.record_sink import JsonFileRecordSink
