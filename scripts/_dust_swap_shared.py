@@ -503,14 +503,38 @@ def prior_fund_record(sink: Any, *, terms: Any) -> Any:
     return prior
 
 
+#: A ``0x``-prefixed hex string: an ETH address, hash or hashlock in a wire form. Its case carries no
+#: meaning (an EIP-55 checksum is a case pattern over the same 20 bytes), so the compare folds it.
+_HEX_0X = re.compile(r"0x[0-9a-fA-F]*\Z")
+
+
+def _fold_hex_case(value: Any) -> Any:
+    """``value`` with every nested ``0x`` hex string lowercased, and nothing else touched.
+
+    The maker's locator carries the ETH addresses exactly as the operator typed them
+    (``EthLeg.expected_locator``), while the taker's funded locator is EIP-55 checksum-cased
+    (``EthHtlcContractLeg.fund``), so a lowercase ``--eth-maker-addr`` made the two disagree on one
+    honest swap and refused the maker's ``--phase refund`` and its lock-claim retry. Only ``0x``
+    hex is folded: a base58 BTC address is case-SENSITIVE, and folding it would let two different
+    addresses compare equal."""
+    if isinstance(value, dict):
+        return {k: _fold_hex_case(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_fold_hex_case(v) for v in value]
+    if isinstance(value, str) and _HEX_0X.match(value):
+        return value.lower()
+    return value
+
+
 def _comparable(value: Any, *, field: str = "") -> Any:
-    """A value in a form ``==`` compares by content: a locator or terms object by type and wire form.
-    A ``counterchain_locator`` is compared without :data:`LOCATOR_INFORMATIONAL_KEYS`."""
+    """A value in a form ``==`` compares by content: a locator or terms object by type and wire form,
+    with ``0x`` hex case folded (:func:`_fold_hex_case`). A ``counterchain_locator`` is compared
+    without :data:`LOCATOR_INFORMATIONAL_KEYS`."""
     if hasattr(value, "to_dict"):
         wire = value.to_dict()
         if field == "counterchain_locator":
             wire = {k: v for k, v in wire.items() if k not in LOCATOR_INFORMATIONAL_KEYS}
-        return (type(value).__name__, wire)
+        return (type(value).__name__, _fold_hex_case(wire))
     if isinstance(value, str):
         return value.lower()
     return value

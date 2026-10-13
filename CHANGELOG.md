@@ -147,7 +147,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no timelock, so a maker can claim while the taker's refund is unconfirmed); fixing it first
   needs the watchtower to tell the taker's own refund from a maker claim. Found in review of #850.
 - **The swap runners no longer overwrite the persisted swap record on every recovery phase (#850,
-  PR R).** In `scripts/eth_swap_two_host.py` and `scripts/btc_swap_two_host.py`, every phase after
+  PR R).** In `scripts/eth_swap_two_host.py`, and in `scripts/btc_swap_two_host.py` once it began
+  keeping a record earlier in this release (see the BTC fund entry below), every phase after
   the taker's fund (claim, lock-claim, abort, refund) rebuilt a fresh record from the exchange
   files, and the coordinator then persisted it over `<--local-out>.swaprec.json`. Fields an earlier
   phase had saved were dropped. Examples are the covenant outpoint and SPK that the maker's
@@ -199,6 +200,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   placeholder, so a maker's record never holds the taker's deploy hash: the watchtower's claim scan
   starts at that transaction's block, and a later one named there could hide a real claim. A scan
   from the placeholder fails closed. The BTC locator was checked the same way and is not affected.
+- **The same two maker phases were refused when an ETH address was typed in lowercase (a second
+  regression in the record merge).** The maker's leg records `--eth-maker-addr` and the taker's
+  refund address exactly as typed, while taker_funding.json carries them EIP-55 checksum-cased, and
+  the merge compared the strings exactly. The merge now ignores the case of `0x` hex strings in the
+  values it compares (only `0x` hex: a base58 BTC address in another case is a different address).
+  A different address still refuses. The test scenarios used digit-only addresses, whose checksum
+  form is their lowercase form. Found by an independent defensive review (Claude Mythos).
+- **`scripts/dust_swap_resume.py` merged the persisted record but never wrote to it.** Its
+  coordinator had no `persist=`, so the reveal and the claims a resume drives never reached
+  `<--keys-out>.swaprec.json`, and `pyrxd swap status`, the watchtower and a second resume read a
+  record still at `btc_locked`. It now writes back to the record it merged, as `dust_swap_run.py`
+  does. Found by an independent defensive review (Claude Mythos).
+- **A BTC fund whose amount readback failed after its broadcast left real BTC locked and untracked
+  (#841).** `BitcoinTaprootLeg.fund` broadcast the funding transaction and then read its amount back.
+  If that read failed, the record stayed `negotiated` with no locator and the hashlock reserved, and
+  every in-band path refused. Now:
+  - the signed funding transaction is written to the record (new `SwapRecord` field
+    `pending_btc_funding_tx`) before it is broadcast, and cleared once the HTLC is recorded as
+    locked;
+  - `taker_funds_btc` and `resume_interrupted_fund` resume such a record: an output already
+    confirmed is recorded without re-running the gate; otherwise the gate runs again and only the
+    same signed bytes are re-sent. The record's terms are used, and a different hashlock refuses;
+  - `BitcoinTaprootLeg.fund(terms, *, on_built=None, resume_tx_hex=None)` gains the two keyword
+    arguments that carry this, and the leg gains `read_confirmed_funding` and `htlc_address`;
+  - **`taker_funds_btc` now raises `ValidationError` for a value-bearing BTC fund on a coordinator
+    built without `persist=`**, since the record is the only pointer back to BTC whose readback
+    failed. A library caller funding BTC on a value-bearing network must now pass a sink, such as
+    `gravity.record_sink.JsonFileRecordSink`;
+  - `scripts/dust_swap_run.py` and `scripts/btc_swap_two_host.py` now keep a swap record
+    (`<--keys-out>.swaprec.json` and `<--local-out>.swaprec.json`); the two-host taker's
+    `--phase fund` resumes from it, and `scripts/dust_swap_resume.py --btc-htlc-funding-txid` is now
+    optional, read from that record when omitted.
 - **A re-run of the taker's `--phase fund` could overwrite the record of an earlier fund.** The ETH
   runner built its coordinator on a fresh record. With the seen-store holding the hashlock the
   coordinator's reuse check refused first; with a seen-store that had lost it, the coordinator

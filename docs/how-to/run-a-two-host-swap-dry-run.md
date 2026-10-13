@@ -282,7 +282,9 @@ confirms, so re-sending a dropped refund must stay possible.
 Taker `--phase fund` reads the record first as well: a record past `negotiated` (already funded)
 refuses, and on ETH so does a record holding an interrupted deploy, which this runner does not
 resume (it holds no fund lock); that contract refunds to you by its address after the ETH
-deadline. The BTC runner resumes a recorded funding transaction as before.
+deadline. The BTC runner does resume one: it records its funding transaction before
+broadcasting it, and a re-run of `--phase fund` records that output if it has confirmed, or
+else re-sends the same bytes.
 
 `scripts/btc_swap_two_host.py` has the same four phases, with the BTC HTLC's CSV (`t_btc`) in
 place of the ETH timeout — but its taker `refund` is **unchanged for now**: it still refunds
