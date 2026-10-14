@@ -1,6 +1,6 @@
 """§7.6 form 2: what a name pointed at AT THE MARK'S BLOCK — and every way it must refuse to say.
 
-Form 1 is shipped and hedged: `names_resolving_now`, `point_in_time: false`, and a caveat that
+Form 1 is shipped and hedged: `names_held_now`, `point_in_time: false`, and a caveat that
 names change hands. That hedge protects people. Form 2 replaces it with an authoritative sentence,
 so every gap costs more here than the same gap costs there — which is why most of this file is
 degrade paths rather than the happy one.

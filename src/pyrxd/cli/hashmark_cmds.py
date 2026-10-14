@@ -32,6 +32,7 @@ publish a permanent claim about a chain nobody chose.
 from __future__ import annotations
 
 import asyncio
+import re
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -1344,13 +1345,23 @@ def _verify_target(arg: str) -> tuple[str, dict | None]:
         return str(ref["txid"]), {
             "form": "outpoint",
             "input": ref["outpoint"],
+            # What the user TYPED (stripped), so "you gave …" quotes it back unchanged (#778);
+            # `input` stays canonical, for the commands printed to re-run. It has passed the
+            # outpoint parser, so it is a txid and ASCII digits, nothing else.
+            "typed": wanted,
             "txid": str(ref["txid"]),
             "vout": ref["vout"],
         }
     lowered = wanted.lower()
     if len(lowered) == _CONTRACT_HEX_LEN and all(c in "0123456789abcdef" for c in lowered):
         ref = _inspect_contract(lowered)
-        return str(ref["txid"]), {"form": "contract", "input": lowered, "txid": str(ref["txid"]), "vout": ref["vout"]}
+        return str(ref["txid"]), {
+            "form": "contract",
+            "input": lowered,
+            "typed": wanted,
+            "txid": str(ref["txid"]),
+            "vout": ref["vout"],
+        }
     try:
         # `.strip()` above already removed any trailing newline, so `Txid`'s `$` gap cannot reach here.
         Txid(lowered)
@@ -1439,11 +1450,25 @@ def _require_named_output(named: dict, payload: dict) -> None:
     only = "only " if isinstance(count, int) and count > 0 else ""
     raise UserError(
         f"that transaction has {only}{_outputs_phrase(count)}, so there is no output {n}",
-        cause=f"you gave {what}, {named['input']}, which names output {n} of transaction {named['txid']}. "
+        cause=f"you gave {what}, {named.get('typed', named['input'])}, which names output {n} of transaction "
+        f"{named['txid']}. "
         "It points at nothing in that transaction, so no verdict was given",
         fix="check the output number you were given. To check the transaction itself, give its txid "
         f"alone as the argument: {named['txid']}",
     )
+
+
+def _quiet_wording(sentence: str) -> str:
+    """A ``named_by`` sentence as ``--quiet`` prints it (#778). Those sentences are written for the
+    full report, which they precede; under ``--quiet`` only the HOLDS / DOES-NOT-HOLD token follows,
+    on stdout, and no record is listed."""
+    sentence = sentence.replace("the verdict below", "the verdict on stdout")
+    sentence = re.sub(
+        r"Output (\d+)'s own record is listed below as \"HashMark record at vout \1\"\.",
+        r"Run without --quiet to see output \1's own record.",
+        sentence,
+    )
+    return sentence.replace(", and each is listed separately.", "; run without --quiet to see each one.")
 
 
 def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout: Any, refusal_vout: Any) -> dict:
@@ -1574,7 +1599,7 @@ def _named_output(named: dict, payload: dict, rows: list[dict], *, verdict_vout:
     "verify_wave",
     is_flag=True,
     default=False,
-    help="Also list the WAVE names resolving to the signing key RIGHT NOW. Present-tense context, "
+    help="Also list the WAVE names the signing key holds RIGHT NOW. Present-tense context, "
     "never part of the mark's verdict.",
 )
 @click.pass_obj
@@ -1799,6 +1824,11 @@ def verify_cmd(
         "verdict_record": {
             "vout": w_vout,
             "records_in_tx": len(per_record),
+            # `records_in_tx` counts the records that could be READ. An output the classifier
+            # could not read might be one more, so the count is final only when none is unread
+            # (#778); the human report says the same in words.
+            "unread_vouts": list(unread),
+            "records_in_tx_is_final": not unread,
             "all_record_checks_hold": _all_hold(w_checks),
             "refusal_vout": refusal[0] if refusal else None,
         },
@@ -1819,7 +1849,7 @@ def verify_cmd(
         if said:
             # To stderr: stdout stays ONE token. But not dropped — `<txid>:1`, a change output,
             # quietly printing HOLDS about output 0 is the silence this disclosure exists to end.
-            click.echo("\n".join(said), err=True)
+            click.echo("\n".join(_quiet_wording(line) for line in said), err=True)
         # ONE token, and it is the answer — not the txid the caller already typed.
         click.echo("HOLDS" if not failed else "DOES-NOT-HOLD")
     else:
