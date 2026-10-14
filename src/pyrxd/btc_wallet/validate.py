@@ -17,9 +17,9 @@ __all__ = ["validate_btc_address", "validate_satoshis"]
 
 # Bitcoin address validation regexes (from btc_wallet.js)
 # Base58Check: P2PKH (1...) or P2SH (3...) — charset excludes 0/O/I/l
-_BASE58_RE = re.compile(r"^[13][1-9A-HJ-NP-Za-km-z]{20,34}$")
+_BASE58_RE = re.compile(r"^[13][1-9A-HJ-NP-Za-km-z]{20,34}\Z")
 # bech32/bech32m: bc1 prefix, lowercase, no 1/b/i/o
-_BECH32_RE = re.compile(r"^bc1[02-9ac-hj-np-z]{20,87}$")
+_BECH32_RE = re.compile(r"^bc1[02-9ac-hj-np-z]{20,87}\Z")
 
 
 def validate_btc_address(address: str) -> None:

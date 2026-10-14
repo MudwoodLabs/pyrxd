@@ -112,6 +112,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Validators no longer accept a value with a trailing newline (#769).** Patterns anchored with
+  `$` also match just before a final `\n`, so `"<txid>\n"` validated as a `Txid` and reached
+  network calls, and the same held for Bitcoin addresses, derivation-path steps and legacy
+  address decoding. Every constant regex in `src/` is now anchored at `\Z`, and a test fails if a
+  `$`-anchored one is added. The two patterns that detect secrets (error-message redaction and the
+  recovery-file private-key screen) now strip surrounding whitespace before matching, so the
+  stricter anchor does not narrow what they catch.
+
 - **A malformed endpoint URL in the config file is a config error, not an "unexpected failure"
   (#775).** A plain-string `electrumx_servers` entry is parsed when a command first builds its
   network client, not when the config loads, and a malformed one (`wss://`, `https://…`) reached

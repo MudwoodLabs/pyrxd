@@ -59,8 +59,8 @@ __all__ = [
     "redact",
 ]
 
-_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
-_BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+$")
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+\Z")
+_BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+\Z")
 
 
 #: Every word of every BIP-39 wordlist the SDK ships, casefolded. Populated on
@@ -182,9 +182,12 @@ def _looks_like_key_material(value: str) -> bool:
       * a BIP-39 seed phrase, in any script and any case (see
         :func:`_looks_like_mnemonic`)
     """
-    if _HEX_RE.match(value):
+    # Surrounding whitespace does not make a key safe to print: `$` used to tolerate a trailing
+    # newline here, and anchoring at `\Z` (#769) must not narrow what is redacted.
+    stripped = value.strip()
+    if _HEX_RE.match(stripped):
         return True
-    if _BASE58_RE.match(value):
+    if _BASE58_RE.match(stripped):
         return True
     return _looks_like_mnemonic(value)
 
