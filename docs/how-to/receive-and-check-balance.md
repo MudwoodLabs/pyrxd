@@ -22,12 +22,12 @@ $ pyrxd address
 
 With no flags, `address` prints the **next unused external receive address** —
 the right default for "where do I get paid." It scans the chain first, the same
-scan `balance` runs, and prints the first receive address whose P2PKH script
-hash has no history. That catches plain RXD: an address that was paid RXD, even
-one later spent from, is not handed out again. It does not catch an address that
-has only ever received a Glyph token. The indexer lists a token output under its
-script hash with the refs zeroed, which the scan does not read, so such an
-address can be handed out again
+scan `balance` runs, and prints the first receive address with no history. An
+address that was paid RXD, even one later spent from, is not handed out again.
+Neither is an address that has only ever received a Glyph token: the indexer
+lists a token output under its script hash with the refs zeroed, not under the
+address's P2PKH hash, so when an address has no P2PKH history the scan also reads
+its token script hashes
 ([#787](https://github.com/MudwoodLabs/pyrxd/issues/787)). The scan is not saved
 to the wallet file. If an address cannot be read, `address` exits 2 and prints
 no address, because it cannot show the one it would print is unused. `--change`

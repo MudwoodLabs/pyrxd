@@ -33,12 +33,12 @@ from pathlib import Path
 import click
 
 from .. import __version__ as _pyrxd_version
-from ..network.redaction import redact_endpoint_secrets, redacted_url
+from ..network.redaction import redact_endpoint_secrets
 from ..security.errors import BroadcastEchoMismatch, ValidationError
 from . import config as _config
 from . import errors as _errors
 from .context import CliContext
-from .errors import CliError, UserError
+from .errors import CliError, UserError, config_error
 
 
 class _SafePath(click.Path):
@@ -164,7 +164,7 @@ def cli(
     try:
         cfg = _config.load(config_path)
     except ValidationError as exc:
-        raise _config_error(exc, config_path) from None
+        raise config_error(exc, config_path) from None
     # Before anything can fail on one of them: a keyed URL that lives only in the config file must
     # be as redactable in an error or a --debug traceback as one passed on the command line.
     _errors.set_config_endpoint_urls(cfg.every_endpoint_url())
@@ -179,7 +179,7 @@ def cli(
     try:
         cfg = cfg.for_network(network or cfg.network, electrumx_override=electrumx_url)
     except ValidationError as exc:
-        raise _config_error(exc, config_path) from None
+        raise config_error(exc, config_path) from None
     # Read the network back off the RESOLVED config rather than reusing the raw
     # input: `for_network` normalizes and validates it, and the context (and every
     # status line built from it) must report the name that was actually resolved.
@@ -201,20 +201,6 @@ def cli(
         debug=debug,
     )
     click_ctx.obj = ctx
-
-
-def _config_error(exc: ValidationError, config_path: Path | None) -> UserError:
-    """A configuration the loader REFUSED (an invalid or contradicting operator declaration, a host
-    split, a malformed value) as the user error it is: exit 1 and the standard error block, like any
-    other bad input — not the "unexpected failure" bug path (exit 4) that told the user to re-run
-    with ``--debug``. Every URL in the refusal is named by scheme, host and port only, and the
-    library exception is not chained, so ``--debug`` cannot print it either."""
-    where = str(config_path) if config_path is not None else "~/.pyrxd/config.toml"
-    return UserError(
-        "invalid configuration",
-        cause=_errors._URL_IN_ARG.sub(lambda m: redacted_url(m.group()), str(exc)),
-        fix=f"correct the config file ({where}) or the PYRXD_* environment variable it names, then re-run",
-    )
 
 
 # ---- error boundary ---------------------------------------------------------
