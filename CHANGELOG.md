@@ -112,6 +112,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ElectrumXClient.close()` never closed its WebSocket (#731).** The reader task's `finally`
+  clears the client's socket, and `close()` read the socket only after awaiting the cancelled
+  reader, so it always found none and skipped the close. Every `close()`, `async with` exit and
+  failover discard of a connected client left its socket open, which mattered for long-running
+  processes. `close()` now takes the socket before cancelling the reader.
 - **`scripts/eth_swap_run.py`: a refusal of the terms after the mint was a raw traceback (#838).**
   The runner checks the swap's terms before minting and again after, on the real asset, and the
   clock moves between the two (a fresh mint waits for its confirmations). A deadline that passed
