@@ -112,6 +112,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A malformed endpoint URL in the config file is a config error, not an "unexpected failure"
+  (#775).** A plain-string `electrumx_servers` entry is parsed when a command first builds its
+  network client, not when the config loads, and a malformed one (`wss://`, `https://…`) reached
+  the bug path: exit 4 and "re-run with --debug". It now exits 1 with `error: invalid
+  configuration` and names the config file to correct, as a refusal at load already did.
 - **The wallet's gap-limit scan sees an address that has only received a Glyph token (#787).**
   It read each address's P2PKH script hash only, and a Radiant ElectrumX lists a token output
   under the token script's hash with its refs zeroed, so a token-only address looked unused.
