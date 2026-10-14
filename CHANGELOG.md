@@ -118,6 +118,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`pyrxd verify <txid>:<n>` follow-ups (#778).**
+  - `--json` now says whether its record count is final: `verdict_record` gains `unread_vouts`
+    (outputs the classifier could not read) and `records_in_tx_is_final`. `records_in_tx` counts
+    only the records that could be read, so it read as final for a bare txid even when an output
+    might have been one more; the human report already said so in words.
+  - Under `--quiet`, the sentences about the output you named no longer say "the verdict below" or
+    "listed below": only the HOLDS / DOES-NOT-HOLD token follows, so they now point at stdout or
+    say to run without `--quiet`.
+  - The refusal for an output the transaction does not have quotes the reference as typed, not
+    its canonical form; `named_by` in `--json` gains `typed`. (The other half of the issue,
+    `<txid>:1_0` echoing as `:10`, could not happen any more: the outpoint parser accepts only
+    ASCII digits.)
 - **`--verify-wave` said "names resolving to that key"; the lookup returns names the key holds
   (#729).** RXinDexer's `wave.reverse_lookup` reads its owner index, so a hit is a name whose
   claim singleton the signer's address holds. Where that name points is a separate target its

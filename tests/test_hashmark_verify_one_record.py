@@ -631,6 +631,8 @@ class TestHonestWorkStillHolds:
             assert j["verdict_record"] == {
                 "vout": vout,
                 "records_in_tx": 2,
+                "unread_vouts": [],
+                "records_in_tx_is_final": True,
                 "all_record_checks_hold": True,
                 "refusal_vout": None,
             }
@@ -713,7 +715,14 @@ class TestABatchWithOneBadRecordFailsTheHonestOnesToo:
         r = _run(monkeypatch, {txid: raw}, args, tmp_path)
         assert r.exit_code == EXIT_VERDICT_DOES_NOT_HOLD, r.output
         j = json.loads(r.stdout)
-        assert j["verdict_record"] == {"vout": 0, "records_in_tx": 3, "all_record_checks_hold": True, "refusal_vout": 2}
+        assert j["verdict_record"] == {
+            "vout": 0,
+            "records_in_tx": 3,
+            "unread_vouts": [],
+            "records_in_tx_is_final": True,
+            "all_record_checks_hold": True,
+            "refusal_vout": 2,
+        }
         assert {k: v["state"] for k, v in j["records"][0]["checks"].items()} == {
             "signature": "VERIFIED",
             "digest": "MATCHES",
