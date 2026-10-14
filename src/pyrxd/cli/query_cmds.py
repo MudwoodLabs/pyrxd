@@ -121,7 +121,7 @@ def refuse_if_incomplete(ctx: CliContext, unread: Sequence[str], used: int, *, w
     "next_unused",
     is_flag=True,
     default=True,
-    help="First address with no plain-RXD history, after a gap-limit scan (default).",
+    help="First address with no history (plain RXD or token), after a gap-limit scan (default).",
 )
 @click.option("--index", type=int, default=None, help="Specific index lookup. Reads nothing from the network.")
 @click.option("--change", is_flag=True, help="Internal chain instead of external.")
@@ -138,11 +138,11 @@ def address_cmd(
 
     Default behavior is the next unused external receive address: the gap-limit
     scan runs first, on both chains, and the answer is the first address on the
-    chain whose P2PKH script hash has no history. That is plain-RXD history: an
-    address paid RXD, including one paid and then spent from, is not handed out
-    again. An address that has only received a Glyph token is not seen as used,
-    because the server lists a token output under its zeroed-ref script hash,
-    which the scan does not read (#787). If the scan cannot read an address the
+    chain with no history: none at its P2PKH script hash, and none at any of its
+    token script hashes. An address paid RXD, including one paid and then spent
+    from, is not handed out again, and neither is one that has only received a
+    Glyph token, which the server lists under the token script's zeroed-ref hash
+    rather than the P2PKH hash (#787). If the scan cannot read an address the
     command exits 2 and prints no address. Nothing is saved to the wallet file.
     `--index N` (with `--change` for the internal chain) derives that index
     directly and reads nothing from the network.
@@ -166,8 +166,8 @@ def address_cmd(
         # not (#781). This is the scan `scan_then_read` and `collect_spendable` run
         # (HdWallet.refresh): an address is used when ElectrumX reports history at its P2PKH
         # script hash, so an address paid and then spent from is used too. A token output is
-        # listed under a zeroed-ref hash the scan does not read, so a token-only address is
-        # not seen as used (#787). It reads every address it needs or
+        # listed under its zeroed-ref hash instead, which the scan reads when the P2PKH hash
+        # has no history, so a token-only address is used too (#787). It reads every address it needs or
         # raises, so there is no partial result to show; a failed read is refused before
         # anything is printed. The scan is not saved, as in #768 and #779.
         _scan_or_refuse(ctx, wallet)

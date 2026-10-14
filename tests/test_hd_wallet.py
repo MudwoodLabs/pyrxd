@@ -13,12 +13,15 @@ import pytest
 
 import pyrxd.constants
 import pyrxd.hd.wallet
+from pyrxd.glyph.scanner import OWNED_TOKEN_SHAPES
 from pyrxd.hash import hash256
 from pyrxd.hd import wallet as hd_wallet_module
 from pyrxd.hd.bip39 import mnemonic_from_entropy
 from pyrxd.hd.wallet import _GAP_LIMIT, AddressRecord, HdWallet
-from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
-from pyrxd.security.errors import ValidationError
+from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord, script_hash_for_address, script_hash_for_output
+from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.types import Hex20
+from pyrxd.utils import address_to_public_key_hash
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -2323,3 +2326,207 @@ def test_a_deep_honest_wallet_still_scans_fully(monkeypatch) -> None:
 def test_the_default_cap_is_far_above_the_gap() -> None:
     """The shipped cap must leave room for real wallets: thousands of gaps' worth of addresses."""
     assert hd_wallet_module._MAX_SCAN_ADDRESSES_PER_CHAIN >= 1_000 * _GAP_LIMIT
+
+
+# ── The gap-limit scan sees a token-only address (#787) ───────────────────────
+#
+# A Radiant ElectrumX lists a token output under the token script's hash with its refs zeroed
+# (``script_hash_for_output``), not under the owner's P2PKH hash. The fakes below list every
+# output where that server does, so an address that only received a token has no P2PKH history.
+
+#: The owned token shapes, read from the source rather than typed out here: a shape added there
+#: is tested here without an edit. In the source's order, which is the order the scan reads them.
+_SHAPES = list(OWNED_TOKEN_SHAPES)
+#: The most reads one address can cost: its P2PKH hash, then one per owned token shape.
+_READS_PER_EMPTY_ADDRESS = 1 + len(_SHAPES)
+#: Every scan here finishes well inside this. A planted defect that loops fails at this bound.
+_SCAN_TIMEOUT_S = 30
+
+
+def test_the_shapes_the_scan_reads_are_derived_and_non_empty() -> None:
+    assert _SHAPES, "OWNED_TOKEN_SHAPES is empty: the scan would read no token hash at all"
+
+
+def _token_hash(address: str, shape: str) -> bytes:
+    """Where a Radiant ElectrumX lists a token of *shape* owned by *address*."""
+    script = OWNED_TOKEN_SHAPES[shape](Hex20(address_to_public_key_hash(address)))
+    return bytes(script_hash_for_output(script))
+
+
+class _ListingServer:
+    """Answers ``get_history`` from *listed* (script hash -> txids) and records every hash read.
+    Past *budget* reads it fails the test instead of hanging it. A hash in *fail_on* raises."""
+
+    active_url = "wss://h.example:50022"
+
+    def __init__(self, listed: dict[bytes, list[str]] | None = None, *, budget: int, fail_on=frozenset()) -> None:
+        self.listed = dict(listed or {})
+        self.reads: list[bytes] = []
+        self.budget = budget
+        self.fail_on = set(fail_on)
+
+    async def get_history(self, script_hash):
+        self.reads.append(bytes(script_hash))
+        assert len(self.reads) <= self.budget, f"scan read {len(self.reads)} hashes and is still going"
+        if bytes(script_hash) in self.fail_on:
+            raise NetworkError("simulated: a token-hash read failed")
+        return [{"tx_hash": txid, "height": 1} for txid in self.listed.get(bytes(script_hash), [])]
+
+
+def _refresh(w: HdWallet, server) -> int:
+    async def _bounded() -> int:
+        return await asyncio.wait_for(w.refresh(server), timeout=_SCAN_TIMEOUT_S)
+
+    return asyncio.run(_bounded())
+
+
+_BUDGET = 200 * _READS_PER_EMPTY_ADDRESS
+
+
+class TestTheScanSeesTokenOnlyAddresses:
+    @pytest.mark.parametrize("shape", _SHAPES)
+    def test_a_token_only_address_is_found_and_counted_used(self, shape) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        owner = w.derive_address(0, 0)
+        token_hash = _token_hash(owner, shape)
+        assert token_hash != bytes(script_hash_for_address(owner)), "the token must not be at the P2PKH hash"
+        server = _ListingServer({token_hash: ["aa" * 32]}, budget=_BUDGET)
+        newly_used = _refresh(w, server)
+        assert w.addresses["0/0"].used is True
+        assert newly_used == 1
+        assert w.external_tip == 1
+        assert w.next_receive_address() == w.derive_address(0, 1)
+
+    def test_a_token_only_change_address_is_found(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        server = _ListingServer({_token_hash(w.derive_address(1, 0), _SHAPES[0]): ["aa" * 32]}, budget=_BUDGET)
+        _refresh(w, server)
+        assert w.addresses["1/0"].used is True
+        assert w.internal_tip == 1
+
+    def test_a_failed_token_read_is_refused_not_taken_as_unused(self) -> None:
+        """Refusal: a failed token-hash read raises, as a failed P2PKH read does. Its honest twin
+        is the test above, where every read answers."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        owner = w.derive_address(0, 0)
+        server = _ListingServer(budget=_BUDGET, fail_on={_token_hash(owner, _SHAPES[-1])})
+        with pytest.raises(NetworkError, match="token-hash read failed"):
+            _refresh(w, server)
+
+
+class TestTokenReadsAreSpentOnlyWhereTheyCanChangeTheAnswer:
+    """The honest path: an address with P2PKH history, or one the wallet already knows is used,
+    costs exactly one read. Only an address that would otherwise count toward the gap is asked
+    about its token hashes."""
+
+    def test_p2pkh_used_addresses_cost_one_read_each(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        used = 5
+        p2pkh = {bytes(script_hash_for_address(w.derive_address(0, i))) for i in range(used)}
+        server = _ListingServer({h: ["aa" * 32] for h in p2pkh}, budget=_BUDGET)
+        _refresh(w, server)
+        # The used addresses one read each, then each chain's closing gap a full set each.
+        assert len(server.reads) == used + 2 * _GAP_LIMIT * _READS_PER_EMPTY_ADDRESS, len(server.reads)
+        for i in range(used):
+            owner = w.derive_address(0, i)
+            for shape in _SHAPES:
+                assert _token_hash(owner, shape) not in server.reads, (i, shape)
+
+    def test_an_address_already_known_used_is_not_asked_about_tokens(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        owner = w.derive_address(0, 0)
+        w.addresses["0/0"] = AddressRecord(address=owner, change=0, index=0, used=True)
+        server = _ListingServer(budget=_BUDGET)
+        _refresh(w, server)
+        assert server.reads.count(bytes(script_hash_for_address(owner))) == 1
+        assert not {_token_hash(owner, s) for s in _SHAPES} & set(server.reads)
+        assert w.addresses["0/0"].used is True
+
+    def test_token_reads_stop_at_the_first_shape_with_history(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        owner = w.derive_address(0, 0)
+        owned = {_token_hash(owner, s) for s in _SHAPES}
+        server = _ListingServer({h: ["aa" * 32] for h in owned}, budget=_BUDGET)
+        _refresh(w, server)
+        assert [h for h in server.reads if h in owned] == [_token_hash(owner, _SHAPES[0])]
+
+    def test_an_empty_wallet_costs_the_derived_read_count(self) -> None:
+        """Derived from the code: 20 empty addresses per chain, each 1 + one read per shape."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        server = _ListingServer(budget=_BUDGET)
+        assert _refresh(w, server) == 0
+        assert len(server.reads) == 2 * _GAP_LIMIT * _READS_PER_EMPTY_ADDRESS
+
+
+class TestTheGapLimitStillHolds:
+    def test_a_token_at_the_last_index_of_the_gap_extends_the_scan(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        last = _GAP_LIMIT - 1
+        server = _ListingServer({_token_hash(w.derive_address(0, last), _SHAPES[-1]): ["aa" * 32]}, budget=_BUDGET)
+        _refresh(w, server)
+        assert w.addresses[f"0/{last}"].used is True
+        external = sorted(r.index for r in w.addresses.values() if r.change == 0)
+        assert external == list(range(last + _GAP_LIMIT + 1)), external[-3:]
+        assert w.external_tip == last + 1
+
+    def test_a_token_past_the_gap_is_not_seen(self) -> None:
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        beyond = w.derive_address(0, _GAP_LIMIT)
+        server = _ListingServer({_token_hash(beyond, _SHAPES[0]): ["aa" * 32]}, budget=_BUDGET)
+        assert _refresh(w, server) == 0
+        assert sorted(r.index for r in w.addresses.values() if r.change == 0) == list(range(_GAP_LIMIT))
+        assert _token_hash(beyond, _SHAPES[0]) not in server.reads
+
+
+class _TokenEverywhereServer:
+    """Lists a token of *shape* at each primed address, and nothing at any P2PKH hash. Counts
+    reads, and past *budget* of them fails the test instead of hanging it."""
+
+    active_url = "wss://h.example:50022"
+
+    def __init__(self, wallet: HdWallet, shape: str, *, budget: int) -> None:
+        self.reads = 0
+        self.budget = budget
+        self._wallet = wallet
+        self._shape = shape
+        self._token: set[bytes] = set()
+
+    def prime(self, change: int, count: int) -> None:
+        xprv = self._wallet._xprv
+        for i in range(count):
+            self._token.add(_token_hash(self._wallet._derive_address(change, i, xprv), self._shape))
+
+    async def get_history(self, script_hash):
+        self.reads += 1
+        assert self.reads <= self.budget, f"scan read {self.reads} hashes and is still going"
+        return [{"tx_hash": "aa" * 32, "height": 1}] if bytes(script_hash) in self._token else []
+
+
+class TestTheScanBoundCountsAddresses:
+    """The #772 cap counts addresses, not reads. A server that lists a token at every address is
+    refused at the cap, after at most cap x (1 + shapes) reads: the bound the cap's comment states."""
+
+    @pytest.mark.parametrize("position", ["first", "last"])
+    def test_a_server_listing_a_token_everywhere_is_refused_at_the_cap(self, monkeypatch, position) -> None:
+        cap = 60
+        monkeypatch.setattr(hd_wallet_module, "_MAX_SCAN_ADDRESSES_PER_CHAIN", cap)
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        shape = _SHAPES[0] if position == "first" else _SHAPES[-1]
+        server = _TokenEverywhereServer(w, shape, budget=2 * cap * _READS_PER_EMPTY_ADDRESS)
+        server.prime(0, cap + 1)
+        with pytest.raises(NetworkError, match=f"history for {cap:,} receive addresses"):
+            _refresh(w, server)
+        reads_per_address = 2 if position == "first" else _READS_PER_EMPTY_ADDRESS
+        assert server.reads == cap * reads_per_address, server.reads
+        assert sum(1 for r in w.addresses.values() if r.change == 0) == cap
+
+    def test_a_deep_token_only_wallet_scans_fully_under_the_cap(self, monkeypatch) -> None:
+        """Honest twin: token-only addresses right up to the cap, less the gap, are all found."""
+        cap = 60
+        monkeypatch.setattr(hd_wallet_module, "_MAX_SCAN_ADDRESSES_PER_CHAIN", cap)
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        used = cap - _GAP_LIMIT
+        server = _TokenEverywhereServer(w, _SHAPES[-1], budget=4 * cap * _READS_PER_EMPTY_ADDRESS)
+        server.prime(0, used)
+        assert _refresh(w, server) == used
+        assert w.external_tip == used
