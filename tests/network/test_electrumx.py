@@ -1431,3 +1431,63 @@ async def test_assert_chain_rejects_a_malformed_header() -> None:
     client = _client_serving(b"\x00" * 79)
     with pytest.raises(ValidationError, match="80 bytes"):
         await client.assert_chain(_MAINNET_GENESIS)
+
+
+# ── close() releases the socket (#731) ────────────────────────────────────────
+
+
+def _hanging_ws() -> AsyncMock:
+    """A socket whose recv() suspends until cancelled, like an idle real one."""
+    ws = AsyncMock()
+
+    async def _recv(*args: Any, **kwargs: Any) -> str:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    ws.recv = _recv
+    ws.close = AsyncMock(return_value=None)
+    return ws
+
+
+@pytest.mark.asyncio
+async def test_close_closes_the_socket_while_the_reader_is_running() -> None:
+    """The reader's `finally` clears `_ws`; close() read `_ws` only after awaiting the
+    cancelled reader, found None, and never closed the socket (#731). Every close(),
+    `__aexit__` and failover discard leaked one."""
+    ws = _hanging_ws()
+    client = ElectrumXClient(["wss://example.com"])
+    client._ws = ws
+    await client._ensure_connected()  # starts the reader on the existing socket
+    await asyncio.sleep(0)
+    assert client._reader_task is not None and not client._reader_task.done()
+
+    await client.close()
+
+    ws.close.assert_awaited_once()
+    assert client._ws is None
+    assert client._reader_task is None
+
+
+@pytest.mark.asyncio
+async def test_close_closes_a_socket_with_no_reader_and_is_idempotent() -> None:
+    """Honest path: a socket with no reader is closed too, and a second close() is a
+    no-op rather than a second close on the same socket."""
+    ws = _hanging_ws()
+    client = ElectrumXClient(["wss://example.com"])
+    client._ws = ws
+
+    await client.close()
+    await client.close()
+
+    ws.close.assert_awaited_once()
+    assert client._ws is None
+
+
+@pytest.mark.asyncio
+async def test_aexit_closes_the_socket() -> None:
+    ws = _hanging_ws()
+    client = ElectrumXClient(["wss://example.com"])
+    client._ws = ws
+    async with client:
+        await asyncio.sleep(0)
+    ws.close.assert_awaited_once()

@@ -517,6 +517,11 @@ class ElectrumXClient:
         Cancels the reader task, fails any in-flight requests with
         NetworkError, and closes the socket.
         """
+        # Take the socket BEFORE cancelling the reader: the reader's `finally` sets
+        # `self._ws = None`, so reading it after the await below found None and the
+        # socket was never closed (#731).
+        ws = self._ws
+        self._ws = None
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -526,13 +531,12 @@ class ElectrumXClient:
                 pass
         self._reader_task = None
 
-        if self._ws is not None:
+        if ws is not None:
             try:
-                await self._ws.close()
+                await ws.close()
             except (WebSocketException, OSError):
                 # Ignore errors on close — the connection is being torn down.
                 logger.debug("Error closing ElectrumX WebSocket (ignored)")
-            self._ws = None
 
         self._fail_all_pending(NetworkError("ElectrumX connection closed"))
 
