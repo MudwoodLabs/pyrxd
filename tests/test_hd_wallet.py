@@ -2255,3 +2255,71 @@ def test_the_load_path_never_stats_the_path_to_decide_the_mode(tmp_path, monkeyp
         "the wallet load stat()ed the path; the mode verdict must come from fstat on "
         "the descriptor the bytes were read from"
     )
+
+
+# ── The gap-limit scan is bounded (#772) ──────────────────────────────────────
+
+
+class _HistoryServer:
+    """A stand-in server: reports history for the first *used_through* + 1 addresses of each chain
+    (every address, if None), and counts the reads."""
+
+    active_url = "wss://user:SECRETPW@h.example:50022/SECRETPATH?apikey=SECRETQ"
+
+    def __init__(self, wallet: HdWallet, used_through: int | None, *, fail_after: int = 10**6) -> None:
+        self.calls = 0
+        self._fail_after = fail_after
+        self._used: set[str] | None = None
+        if used_through is not None:
+            from pyrxd.network.electrumx import script_hash_for_address
+
+            xprv = wallet._xprv
+            self._used = {
+                str(script_hash_for_address(wallet._derive_address(change, i, xprv)))
+                for change in (0, 1)
+                for i in range(used_through + 1)
+            }
+
+    async def get_history(self, script_hash):
+        self.calls += 1
+        # Without the cap the scan never ends: fail the test instead of hanging it.
+        assert self.calls <= self._fail_after, f"scan read {self.calls} addresses and is still going"
+        if self._used is None or str(script_hash) in self._used:
+            return [{"tx_hash": "aa" * 32, "height": 1}]
+        return []
+
+
+def test_a_server_claiming_history_everywhere_is_refused_not_scanned_forever(monkeypatch) -> None:
+    """#772: a server reporting history for every address never lets the 20-unused gap close, and
+    the scan derived without end (22,119 reads in about 3 s, still climbing, in the review of #768).
+    It now stops at a per-chain cap and refuses, naming the server by host only."""
+    from pyrxd.security.errors import NetworkError
+
+    cap = 300
+    monkeypatch.setattr(hd_wallet_module, "_MAX_SCAN_ADDRESSES_PER_CHAIN", cap)
+    w = HdWallet.from_mnemonic(MNEMONIC)
+    server = _HistoryServer(w, used_through=None, fail_after=2 * cap)
+    with pytest.raises(NetworkError) as exc:
+        asyncio.run(w.refresh(server))
+    message = str(exc.value)
+    assert "wss://h.example:50022" in message and "SECRET" not in message, message
+    assert f"{cap:,}" in message and "use a different ElectrumX endpoint" in message, message
+    assert server.calls == cap, server.calls  # stopped AT the cap, on the first chain
+
+
+def test_a_deep_honest_wallet_still_scans_fully(monkeypatch) -> None:
+    """Honest path: a wallet whose used addresses run right up to the cap, less the gap, scans to
+    completion and records every used address. The cap refuses only a scan that would pass it."""
+    cap = 300
+    monkeypatch.setattr(hd_wallet_module, "_MAX_SCAN_ADDRESSES_PER_CHAIN", cap)
+    w = HdWallet.from_mnemonic(MNEMONIC)
+    last_used = cap - _GAP_LIMIT - 1  # the last unused address of the closing gap is index cap - 1
+    server = _HistoryServer(w, used_through=last_used)
+    newly_used = asyncio.run(w.refresh(server))
+    assert newly_used == 2 * (last_used + 1), newly_used
+    assert w.external_tip == last_used + 1, w.external_tip
+
+
+def test_the_default_cap_is_far_above_the_gap() -> None:
+    """The shipped cap must leave room for real wallets: thousands of gaps' worth of addresses."""
+    assert hd_wallet_module._MAX_SCAN_ADDRESSES_PER_CHAIN >= 1_000 * _GAP_LIMIT

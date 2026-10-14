@@ -67,6 +67,7 @@ from ..hd.bip39 import seed_from_mnemonic
 from ..hd.descriptor import AccountDescriptors, account_descriptors
 from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address, verified_broadcast_txid
+from ..network.redaction import redacted_url
 from ..script.type import P2PKH
 from ..security.errors import KeyMaterialError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
@@ -90,6 +91,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _GAP_LIMIT = 20
+
+#: The most addresses one gap-limit scan derives on one chain (external or change). A server that
+#: reports history for every address never lets the 20-unused gap close, and the scan derived
+#: without end (#772). The cap is a choice, not a measurement: it is far above any wallet the CLI
+#: is built for, and reaching it is refused (a :class:`NetworkError` naming the server), never
+#: truncated, so a wallet that really is this deep fails loudly instead of losing addresses.
+_MAX_SCAN_ADDRESSES_PER_CHAIN = 100_000
 
 
 # Radiant's BIP44 derivation path. Default is the SLIP-0044 spec-correct
@@ -285,6 +293,18 @@ class Spendable(list):
     def __init__(self, triples: Iterable[tuple[UtxoRecord, str, PrivateKey]] = (), *, unread: Iterable[str] = ()):
         super().__init__(triples)
         self.unread: tuple[str, ...] = tuple(unread)
+
+
+def _server_name(client: object) -> str:
+    """The server a scan was reading from, for an error: its URL with any credential, path or query
+    removed, or a generic name for a client that does not expose one."""
+    url = getattr(client, "active_url", None)
+    if url is None:
+        urls = getattr(client, "_urls", None)
+        url = urls[0] if isinstance(urls, (list, tuple)) and len(urls) == 1 else None
+    if not isinstance(url, str):
+        return "the ElectrumX server"
+    return f"ElectrumX server {redacted_url(url)}"
 
 
 def raise_if_reads_failed(triples: object, shortfall: str) -> None:
@@ -868,6 +888,13 @@ class HdWallet:
         # caching keeps that O(1) HMAC per index instead of a full master walk each call).
         account_xprv = self._xprv
         while consecutive_unused < _GAP_LIMIT:
+            if index >= _MAX_SCAN_ADDRESSES_PER_CHAIN:
+                raise NetworkError(
+                    f"{_server_name(client)} reported history for {_MAX_SCAN_ADDRESSES_PER_CHAIN:,} "
+                    f"{'change' if change else 'receive'} addresses without the {_GAP_LIMIT}-address "
+                    "unused gap that ends a wallet scan; refusing to keep deriving. A server that "
+                    "claims history everywhere is misbehaving: use a different ElectrumX endpoint."
+                )
             # Fetch one address at a time — correct BIP44 gap-limit semantics.
             addr = self._derive_address(change, index, account_xprv)
             pkey = self._path_key(change, index)

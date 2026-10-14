@@ -112,6 +112,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The wallet's gap-limit scan has an upper bound (#772).** A server that reports history for
+  every address never lets the 20-unused gap close, and the scan that runs before every spend,
+  `address`, `balance` and `glyph list` kept deriving without end. It now derives at most 100,000
+  addresses per chain in one scan and then refuses with a network error (exit 2) that names the
+  server by host and says to use a different endpoint. It refuses rather than truncating, so a
+  wallet that really is that deep is never shown with addresses missing.
 - **Concurrent first calls on a fresh `ElectrumXClient` opened two sockets, and one call timed
   out.** `_ensure_connected` checked `_ws is None` and then awaited the connect with no lock, so two
   calls started together (an `asyncio.gather` on a new client, or after a lost connection) each
