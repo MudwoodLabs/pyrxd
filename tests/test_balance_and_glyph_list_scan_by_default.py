@@ -49,8 +49,8 @@ class _ElectrumX:
     where a Radiant ElectrumX lists it, under ``script_hash_for_output`` of its script: a plain
     output under the address's P2PKH hash, a token output under its script with the refs zeroed.
     That was measured against both public mainnet servers on 2026-09-29 (#782). It means an
-    address holding only a token has no P2PKH history, so the gap-limit scan does not mark it used
-    and ``glyph list`` does not read it; the tests that list tokens also fund their address.
+    address holding only a token has no P2PKH history; the gap-limit scan then reads its token
+    hashes to mark it used (#787).
 
     Failures, each the failure of one read: ``history_fails_after=n`` answers *n* history reads
     and fails every later one (a connection lost mid-scan); ``unreadable`` fails the balance and
@@ -459,14 +459,23 @@ class TestGlyphListChecksTheServer:
         assert "server inconsistency" in result.output
         assert "but its output is not there" in result.output
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="the gap-limit scan reads P2PKH history only, and a token output is not listed there, "
-        "so an address holding only a token is never marked used or read",
-    )
     def test_an_address_holding_only_a_token_is_listed(self, tmp_path, monkeypatch) -> None:
+        """#787: the address holds the NFT and no plain output, so its P2PKH hash has no history.
+        The scan reads its token hashes, marks it used, and ``glyph list`` reads it."""
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)
         nft_tx, ref = _nft(w, 0, 0, "ab")
-        server = _ElectrumX({w.derive_address(0, 0): [nft_tx]})
+        first = w.derive_address(0, 0)
+        server = _ElectrumX({first: [nft_tx]})
+        assert bytes(script_hash_for_address(first)) not in server.held, "the P2PKH hash must be empty"
         result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
-        assert [r["ref"] for r in _json(result)] == [ref]
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert [(r["ref"], r["address"]) for r in _json(result)] == [(ref, first)]
+
+    def test_a_token_only_address_past_index_zero_is_listed(self, tmp_path, monkeypatch) -> None:
+        """The same at index 3, with indexes 0 to 2 empty: within the gap, so the scan reaches it."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        nft_tx, ref = _nft(w, 0, 3, "ab")
+        server = _ElectrumX({w.derive_address(0, 3): [nft_tx]})
+        result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list")
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert [(r["ref"], r["address"]) for r in _json(result)] == [(ref, w.derive_address(0, 3))]
