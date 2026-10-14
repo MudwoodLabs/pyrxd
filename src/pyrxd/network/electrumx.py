@@ -455,6 +455,13 @@ class ElectrumXClient:
         # safe to call concurrently from multiple coroutines on the same
         # connection (interleaved fragments).
         self._send_lock: asyncio.Lock = asyncio.Lock()
+        # Connect must be serialized too: without it, two calls on a fresh client
+        # each see `_ws is None`, each open a socket, and the second overwrites the
+        # first while the reader may still be blocked on the first, so a reply is
+        # never read and that call waits out its timeout (#732). Created here like
+        # the locks above; since Python 3.10 a Lock binds to a loop on first use,
+        # not at construction, so building the client outside a loop is fine.
+        self._connect_lock: asyncio.Lock = asyncio.Lock()
         # Pending requests keyed by JSON-RPC id. Reader task pops the
         # matching entry and resolves its future when a response arrives.
         # Closes ultrareview Stream C #4 (response correlation race).
@@ -927,12 +934,18 @@ class ElectrumXClient:
         multiple URLs all endpoints are raced in parallel so a single dead
         endpoint no longer adds a full timeout period before failover.
         Closes N18.
-        """
-        if self._ws is None:
-            self._ws = await self._connect_first(self._urls, self._timeout)
 
-        if self._reader_task is None or self._reader_task.done():
-            self._reader_task = asyncio.create_task(self._reader_loop())
+        Serialized by ``_connect_lock`` so concurrent first calls (and concurrent
+        calls after a lost connection) share ONE socket and one reader. A failed
+        connect raises out of the ``async with``, which releases the lock, so the
+        next call retries rather than wedging.
+        """
+        async with self._connect_lock:
+            if self._ws is None:
+                self._ws = await self._connect_first(self._urls, self._timeout)
+
+            if self._reader_task is None or self._reader_task.done():
+                self._reader_task = asyncio.create_task(self._reader_loop())
 
     async def _connect_first(self, urls: list[str], timeout: float) -> Any:  # websockets.WebSocketClientProtocol
         """Race all *urls* concurrently; return the first successful WebSocket.
