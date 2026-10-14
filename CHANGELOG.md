@@ -125,6 +125,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked. The output now reads "WAVE names held by that key RIGHT NOW", the JSON gains
   `names_held_now`, and the caveat says the names come from the owner index and their targets are
   not checked. The `pyrxd verify --verify-wave` help text and the library docstrings say the same.
+- **Validators no longer accept a value with a trailing newline (#769).** Patterns anchored with
+  `$` also match just before a final `\n`, so `"<txid>\n"` validated as a `Txid` and reached
+  network calls, and the same held for Bitcoin addresses, derivation-path steps and legacy
+  address decoding. Every constant regex in `src/` is now anchored at `\Z`, and a test fails if a
+  `$`-anchored one is added. The two patterns that detect secrets (error-message redaction and the
+  recovery-file private-key screen) now strip surrounding whitespace before matching, so the
+  stricter anchor does not narrow what they catch.
+
+- **A malformed endpoint URL in the config file is a config error, not an "unexpected failure"
+  (#775).** A plain-string `electrumx_servers` entry is parsed when a command first builds its
+  network client, not when the config loads, and a malformed one (`wss://`, `https://…`) reached
+  the bug path: exit 4 and "re-run with --debug". It now exits 1 with `error: invalid
+  configuration` and names the config file to correct, as a refusal at load already did.
+- **The wallet's gap-limit scan sees an address that has only received a Glyph token (#787).**
+  It read each address's P2PKH script hash only, and a Radiant ElectrumX lists a token output
+  under the token script's hash with its refs zeroed, so a token-only address looked unused.
+  `pyrxd address` could hand it out again, a change output could land on it, and `glyph list`
+  did not read it. When an address's P2PKH hash has no history, the scan now also reads its
+  token script hashes, one per owned token shape, and stops at the first with history. An
+  address with P2PKH history costs no extra reads; an empty one costs one per shape (five
+  today), so the 20-address gap that ends each chain's scan costs 100 more reads per chain. The
+  100,000-address bound from #772 still counts addresses, so one scan's reads stay bounded.
+
+- **The wallet's gap-limit scan has an upper bound (#772).** A server that reports history for
+  every address never lets the 20-unused gap close, and the scan that runs before every spend,
+  `address`, `balance` and `glyph list` kept deriving without end. It now derives at most 100,000
+  addresses per chain in one scan and then refuses with a network error (exit 2) that names the
+  server by host and says to use a different endpoint. It refuses rather than truncating, so a
+  wallet that really is that deep is never shown with addresses missing.
+- **Concurrent first calls on a fresh `ElectrumXClient` opened two sockets, and one call timed
+  out.** `_ensure_connected` checked `_ws is None` and then awaited the connect with no lock, so two
+  calls started together (an `asyncio.gather` on a new client, or after a lost connection) each
+  opened a socket and the second overwrote the first. The reader could stay blocked on the
+  discarded socket, so one call's reply was never read and it waited out its full timeout (30 s by
+  default). The connect and reader start now run under a per-client `asyncio.Lock`, so concurrent
+  callers share one socket; a failed connect releases the lock and the next call retries. The CLI
+  issues its reads sequentially and was not affected; library callers that gather reads were.
+  `FailoverElectrumXClient` can still run the one-time chain check twice on a race, now as two
+  reads over one socket (#732).
 - **`ElectrumXClient.close()` never closed its WebSocket (#731).** The reader task's `finally`
   clears the client's socket, and `close()` read the socket only after awaiting the cancelled
   reader, so it always found none and skipped the close. Every `close()`, `async with` exit and

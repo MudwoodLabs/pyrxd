@@ -164,7 +164,7 @@ These exist not because pyrxd should replace `radiant-cli`, but because a user w
 ```
 pyrxd address [--next | --index N] [--change]
     --next       (default) first external address with no history at its
-                 P2PKH script hash (token-only addresses not seen, #787);
+                 P2PKH script hash or its token script hashes (#787);
                  runs the gap-limit scan first, not saved; exits 2 if the
                  scan cannot read an address
     --index N    deterministic index lookup, no network

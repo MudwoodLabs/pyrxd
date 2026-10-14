@@ -47,10 +47,11 @@ import re
 import sys
 import traceback
 from collections.abc import Iterable
+from pathlib import Path
 
 import click
 
-from ..network.redaction import redact_endpoint_secrets
+from ..network.redaction import redact_endpoint_secrets, redacted_url
 
 # Set by main.run() when --debug is passed. Read by CliError.show().
 _DEBUG: bool = False
@@ -181,6 +182,23 @@ class WalletDecryptError(CliError):
             cause="wrong mnemonic, wrong passphrase, or wallet file is corrupt",
             fix="check the mnemonic and passphrase exactly, then try again",
         )
+
+
+def config_error(exc: Exception, config_path: Path | None) -> UserError:
+    """A configuration the loader REFUSED (an invalid or contradicting operator declaration, a host
+    split, a malformed value) as the user error it is: exit 1 and the standard error block, like any
+    other bad input — not the "unexpected failure" bug path (exit 4) that told the user to re-run
+    with ``--debug``. Every URL in the refusal is named by scheme, host and port only, and the
+    library exception is not chained, so ``--debug`` cannot print it either.
+
+    Used where the config is loaded (``cli()``) and where an endpoint URL in it is first parsed
+    (:meth:`~pyrxd.cli.context.CliContext.make_client`, #775)."""
+    where = str(config_path) if config_path is not None else "~/.pyrxd/config.toml"
+    return UserError(
+        "invalid configuration",
+        cause=_URL_IN_ARG.sub(lambda m: redacted_url(m.group()), str(exc)),
+        fix=f"correct the config file ({where}) or the PYRXD_* environment variable it names, then re-run",
+    )
 
 
 def render_error(err: CliError) -> str:

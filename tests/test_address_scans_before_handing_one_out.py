@@ -5,8 +5,9 @@ the gap-limit scan (``HdWallet.refresh``) marks an address used, and no command 
 and #779 made the spend and read paths scan, without saving). So on a ``pyrxd wallet new`` file,
 ``address`` printed index 0 every time, including after index 0 was paid: address reuse. The same
 held for ``--change``. It now runs the scan first and prints the first address on the chain with
-no history at its P2PKH script hash; a scan that cannot finish exits 2 and prints no address. An
-address that has only received a Glyph token is not seen (#787); the xfail at the end pins that.
+no history; a scan that cannot finish exits 2 and prints no address. "No history" means none at
+its P2PKH script hash and, when that is empty, none at its token script hashes, so an address that
+has only received a Glyph token is not handed out again either (#787); the tests at the end pin that.
 
 Every test drives the real command on the real ``pyrxd wallet new`` file, with the mnemonic typed
 at the real prompt. The one fake is the ElectrumX client, swapped in at ``CliContext.make_client``.
@@ -22,12 +23,19 @@ from click.testing import CliRunner
 
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.main import cli
+from pyrxd.glyph.scanner import OWNED_TOKEN_SHAPES
 from pyrxd.glyph.script import build_ft_locking_script, build_nft_locking_script
 from pyrxd.glyph.types import GlyphRef
-from pyrxd.hd.wallet import HdWallet
-from pyrxd.network.electrumx import UtxoRecord, script_hash_for_address, script_hash_for_script
+from pyrxd.hd.wallet import _GAP_LIMIT, HdWallet
+from pyrxd.keys import PrivateKey
+from pyrxd.network.electrumx import (
+    UtxoRecord,
+    script_hash_for_address,
+    script_hash_for_output,
+    script_hash_for_script,
+)
 from pyrxd.security.errors import NetworkError
-from pyrxd.security.types import Txid
+from pyrxd.security.types import Hex20, Txid
 from pyrxd.utils import address_to_public_key_hash
 
 
@@ -73,6 +81,11 @@ class _ElectrumX:
 
     async def get_balance(self, script_hash):
         return 100_000 * len(self.utxos.get(bytes(script_hash), [])), 0
+
+
+#: The reads a scan of a wallet with no history makes: 20 addresses on each of the two chains,
+#: each its P2PKH hash and then one token hash per owned token shape (#787). Derived from the source.
+_EMPTY_SCAN_READS = 2 * _GAP_LIMIT * (1 + len(OWNED_TOKEN_SHAPES))
 
 
 def _txid(n: int) -> str:
@@ -150,7 +163,8 @@ class TestAddressSkipsWhatTheChainHasSeen:
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)
         server = _ElectrumX()
         assert _answer(_run(tmp_path, monkeypatch, server, mnemonic)) == _at(w, 0, 0)
-        assert server.history_reads == 40, "the scan reads 20 addresses on each chain before it stops"
+        # 20 addresses on each chain; each has no P2PKH history, so its token hashes are read too.
+        assert server.history_reads == _EMPTY_SCAN_READS, "the scan reads 20 addresses on each chain before it stops"
 
     def test_funds_past_the_first_gap_window_are_found(self, tmp_path, monkeypatch) -> None:
         """Indices 0..20 all paid: 21 addresses, one more than the first window of 20. The scan
@@ -225,7 +239,7 @@ class TestAnAddressNotProvenUnusedIsNotHandedOut:
         """Every read answered but the last one of the change chain: the receive chain was fully
         read, but the scan did not finish, so nothing is printed."""
         mnemonic, _w = _new_wallet(tmp_path, monkeypatch)
-        server = _ElectrumX(history_fails_after=39)
+        server = _ElectrumX(history_fails_after=_EMPTY_SCAN_READS - 1)
         result = _run(tmp_path, monkeypatch, server, mnemonic)
         assert result.exit_code == 2, result.output
         assert _shown(result) == ""
@@ -254,45 +268,64 @@ class TestAnAddressNotProvenUnusedIsNotHandedOut:
 
     def test_help_says_it_scans(self) -> None:
         text = " ".join(CliRunner().invoke(cli, ["address", "--help"]).output.split())
-        assert "no plain-RXD history, after a gap-limit scan" in text
+        assert "no history (plain RXD or token), after a gap-limit scan" in text
         assert "Reads nothing from the network" in text
 
 
-# --------------------------------------------------------------------------- the token-only gap (#787)
+# --------------------------------------------------------------------------- token-only addresses (#787)
 
 
-class TestAnAddressHoldingOnlyATokenIsKnownGap:
-    """What the scan does NOT check: history under a token output's script hash.
+class TestAnAddressHoldingOnlyATokenIsNotHandedOutAgain:
+    """History under a token output's script hash counts.
 
-    ``HdWallet.refresh`` reads each address's P2PKH script hash and nothing else. A Radiant
-    ElectrumX (RXinDexer) lists a token output under its script hash with the refs zeroed, not
-    under the owner's P2PKH hash, so an address that has only ever received a token has no
-    history the scan reads, and ``address`` hands it out again. Confirmed on mainnet; tracked as
-    #787, and fixed there, not here.
+    A Radiant ElectrumX (RXinDexer) lists a token output under its script hash with the refs
+    zeroed, not under the owner's P2PKH hash, so an address that has only ever received a token
+    has no P2PKH history. ``address`` used to hand it out again (#787). The scan now reads the
+    address's token script hashes when its P2PKH hash has no history.
 
-    The fake server lists index 0's token ONLY under the zeroed-ref hash, and its P2PKH hash
-    has no history: the shape measured on mainnet. The zeroed-ref hash is computed here, by
-    building the same token script with an all-zero ref, because the helper that computes it
-    (``script_hash_for_output``, PR #784) is not on main. ``strict=True``: when #787 lands this
-    XPASSes and fails the run, which forces the marker out.
+    The fake server lists index 0's token ONLY under the zeroed-ref hash, and its P2PKH hash has
+    no history: the shape measured on mainnet. The token carries a non-zero ref, and the hash
+    it is listed under is computed two ways that must agree: ``script_hash_for_output`` (the
+    repo's model of the server, from #784) and, independently, the plain hash of the same script
+    built with an all-zero ref.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#787: the scan reads only the P2PKH script hash; RXinDexer lists a token output "
-        "under its zeroed-ref script hash, so a token-only address looks unused",
-    )
     @pytest.mark.parametrize("builder", [build_nft_locking_script, build_ft_locking_script], ids=["nft", "ft"])
     def test_an_address_that_received_only_a_token_is_not_handed_out_again(
         self, tmp_path, monkeypatch, builder
     ) -> None:
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)
         owner = w.derive_address(0, 0)
+        pkh = address_to_public_key_hash(owner)
+        token = builder(pkh, GlyphRef(txid=Txid("ab" * 32), vout=3))
         zeroed_ref = GlyphRef(txid=Txid("00" * 32), vout=0)
         assert zeroed_ref.to_bytes() == bytes(36)
-        token_hash = bytes(script_hash_for_script(builder(address_to_public_key_hash(owner), zeroed_ref)))
+        token_hash = bytes(script_hash_for_output(token))
+        assert token_hash == bytes(script_hash_for_script(builder(pkh, zeroed_ref)))
         server = _ElectrumX()
         server.history[token_hash] = [_txid(7)]
         assert bytes(script_hash_for_address(owner)) not in server.history, "the P2PKH hash must be empty"
         assert _answer(_run(tmp_path, monkeypatch, server, mnemonic)) == _at(w, 0, 1)
+
+    @pytest.mark.parametrize("shape", sorted(OWNED_TOKEN_SHAPES))
+    def test_every_owned_token_shape_marks_its_address_used(self, tmp_path, monkeypatch, shape) -> None:
+        """The shapes come from the source (``OWNED_TOKEN_SHAPES``), so a new one is covered here."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        for change, args in ((0, ()), (1, ("--change",))):
+            owner = w.derive_address(change, 0)
+            token = OWNED_TOKEN_SHAPES[shape](Hex20(address_to_public_key_hash(owner)))
+            server = _ElectrumX()
+            server.history[bytes(script_hash_for_output(token))] = [_txid(8)]
+            assert _answer(_run(tmp_path, monkeypatch, server, mnemonic, *args)) == _at(w, change, 1), (shape, change)
+
+    def test_the_owned_token_shapes_are_not_empty(self) -> None:
+        assert OWNED_TOKEN_SHAPES, "no owned token shape: the scan would read no token hash"
+
+    def test_another_keys_token_does_not_make_an_address_used(self, tmp_path, monkeypatch) -> None:
+        """Honest twin: a token listed under ANOTHER key's hash leaves this wallet's index 0 unused."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        stranger = Hex20(PrivateKey().public_key().hash160())
+        token = build_nft_locking_script(stranger, GlyphRef(txid=Txid("cd" * 32), vout=0))
+        server = _ElectrumX()
+        server.history[bytes(script_hash_for_output(token))] = [_txid(9)]
+        assert _answer(_run(tmp_path, monkeypatch, server, mnemonic)) == _at(w, 0, 0)
