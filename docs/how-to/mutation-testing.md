@@ -515,6 +515,35 @@ objecting**, in modules that decide how much value moves and to whom.
   offline fixtures for the builder paths or accepting that the regtest suites own them; that is a
   scope decision, not a triage one.
 
+## `cli/header_store.py` triage (2026-10-13)
+
+Local cosmic-ray 8.7.0 runs at `3412229`, the `markblock` group's test list, one run each.
+Before: 248 mutants, 94 survived. The same count as an earlier local run that day.
+
+57 of the 94 were real gaps, now killed by the tests at the end of
+`tests/test_header_cache.py`:
+
+- `cache_dir()` never ran (conftest replaces it for every test): 20 mutants.
+- `store_path` accepting a non-identifier string (`or` -> `and`).
+- `LoadedStore` no longer frozen.
+- `load`: an unreadable store, a store for another network that sorts after the requested one
+  (`!=` -> `<`), the `untrusted` flag on both, the stale boundary at one block below the newest
+  checkpoint (`base + count - 1`), and an unexpected error while verifying.
+- `_locked`: the no-`fcntl` (Windows) branch, and the lock file's `0o600`.
+- `_remove_orphaned_tmp_files`: a failed `scandir` or `unlink`, and a tmp-named symlink.
+- `save`: the directory's `0o700` and `parents=True`, a chain differing only at the highest
+  shared height (`range(lo, hi + 1)`), a stopped reset ending below the top that disagrees
+  (`<=` -> `==`), re-saving the same chain (`<` -> `<=`), and a directory fsync that fails.
+
+After: 248 mutants, 37 survived. All 37 are equivalent:
+
+- 33 rewrite the `Path | None` / `Mapping[str, Any] | None` annotations on lines 82, 190 and 191
+  (`from __future__ import annotations`; the survivor script marks only 22 of them `annot`).
+- 2 turn the keyword-only `*` in `load` and `save` into a positional-only `/`. Every caller in
+  `src/` passes `network`/`table` positionally and `path`/`record` by keyword, so both behave the same.
+- 2 are `os.O_RDWR | os.O_CREAT` as `+` / `^` on the lock file: disjoint flag bits, the
+  BitOr-on-OS-flags class above.
+
 ## Where this runs
 
 Three places, deliberately, and **not** on the per-push path:
