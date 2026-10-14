@@ -34,6 +34,11 @@ $ pyrxd glyph list --type ft
 $ pyrxd glyph list --type nft
 ```
 
+The list is the ElectrumX server's view of what is unspent; pyrxd does not
+verify that part. A server can list an output you have already spent, so a
+total there can be higher than what you can send. Spending such an output
+fails at the node; it moves nothing.
+
 or decode any output you hold with the inspect tool — `ref_outpoint` in the
 output is the value to pass:
 

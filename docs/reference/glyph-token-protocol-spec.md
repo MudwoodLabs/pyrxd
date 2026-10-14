@@ -421,7 +421,7 @@ whose own txid is `b965b32d…9dd6`
 **Where the metadata lives.** Because the ref names the commit, fetching
 `ref.txid` finds only the commit — whose inputs are plain funding spends and carry
 no envelope. The envelope is in the transaction that **spends**
-`ref.txid:ref.vout` (`src/pyrxd/glyph/scanner.py:222-258`). An implementation
+`ref.txid:ref.vout` (`src/pyrxd/glyph/scanner.py:398-433`). An implementation
 resolving metadata from a ref MUST follow the spend, not the ref transaction.
 
 ## 6. The two-phase mint
@@ -1492,7 +1492,7 @@ in pyrxd are wallet policy, not chain rules, and are labelled as such at
 
 The commit covenant only constrains the input that spends it. Whether an envelope
 on some *other* input is meaningful is unspecified; pyrxd's scanner will find and
-use it (`src/pyrxd/glyph/scanner.py:317-353`), which is lenient rather than
+use it (`src/pyrxd/glyph/scanner.py:486-497`), which is lenient rather than
 normative.
 
 ## 17. Provenance of the claims in this document

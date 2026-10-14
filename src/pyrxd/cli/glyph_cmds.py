@@ -3467,6 +3467,11 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
     An address that cannot be read, or a token output whose transaction cannot be fetched, is
     never listed as holding nothing: the command exits 2, and only the human output shows what
     the other addresses hold, marked INCOMPLETE.
+
+    Each token's owner and amount are checked against its own transaction, but that the output
+    is still unspent is the ElectrumX server's word: it is not verified, and a server can list
+    an output this wallet has already spent. The human output says so under the table, and each
+    JSON row carries "spent_status_source": "server".
     """
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
     # The per-address reader logs a failed read and keeps only the address, which would report a
@@ -3520,6 +3525,7 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
                         "address": address,
                         "amount": "1",
                         "name": (item.metadata.name if item.metadata else ""),
+                        "spent_status_source": _SPENT_STATUS_SOURCE,
                     }
                 )
             elif isinstance(item, GlyphFt) and kind in ("ft", "all"):
@@ -3530,6 +3536,7 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
                         "address": address,
                         "amount": str(item.amount),
                         "name": (item.metadata.name if item.metadata else ""),
+                        "spent_status_source": _SPENT_STATUS_SOURCE,
                     }
                 )
 
@@ -3539,9 +3546,28 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
         reads.unread,
         reads.used,
         what="this list",
-        view=emit_table(rows, columns, mode="human") if rows else "",
+        view=_human_glyph_list(rows, columns) if rows else "",
     )
-    click.echo(emit_table(rows, columns, mode=ctx.output_mode, quiet_field="ref"))
+    if ctx.output_mode == "human":
+        click.echo(_human_glyph_list(rows, columns))
+    else:
+        click.echo(emit_table(rows, columns, mode=ctx.output_mode, quiet_field="ref"))
+
+
+# Who says a listed token output is unspent (#788). Nothing checks it: the scanner binds each
+# listed output to its transaction (owner, amount), but no second source is asked whether the
+# outpoint has been spent since. A field, so a script can tell; a future check would change it.
+_SPENT_STATUS_SOURCE = "server"
+_SPENT_STATUS_NOTE = (
+    "Note: the ElectrumX server says these outputs are unspent; pyrxd did not check that, "
+    "and a server can list an output this wallet has already spent."
+)
+
+
+def _human_glyph_list(rows: list[dict], columns: list[str]) -> str:
+    """The human table, with the unspent caveat under it when anything is listed."""
+    table = emit_table(rows, columns, mode="human")
+    return f"{table}\n{_SPENT_STATUS_NOTE}" if rows else table
 
 
 # ---------------------------------------------------------------------------

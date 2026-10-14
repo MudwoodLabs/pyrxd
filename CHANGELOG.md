@@ -50,6 +50,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `pyrxd glyph list` now says that a listed token output being unspent is the ElectrumX server's
+  word, not verified (refs #788). Each token's owner and amount are checked against its own
+  transaction, but nothing checks that the output has not been spent since, so a server can
+  re-list an output the wallet already spent. The human output prints a note under the table.
+  Each `--json` row gains `"spent_status_source": "server"`; no existing field changed. `--quiet`
+  output is unchanged. An independent spentness check is still to come.
 - `pyrxd verify`'s human report wraps a VERIFIED claim to at most 20 lines (was 14), never breaking
   inside "proof-of-work", so the longer claim from a cached anchor is printed whole.
 - **The ETH counter-leg contracts are now built in this repo, and the canonical build is

@@ -176,7 +176,8 @@ class GlyphScanner:
         at *script_hash* (or does not exist), or is listed twice, is a server
         inconsistency, and so is a token whose owner is not the address
         :meth:`scan_address` was asked about. An FT's amount is the output's
-        value in that transaction, never the server's ``value``.
+        value in that transaction, never the server's ``value``. That a listed
+        output is still unspent is the server's word: nothing here checks it.
 
         A UTXO whose raw transaction cannot be fetched or parsed, or that is a
         server inconsistency, is logged and left out by default. For a failed
