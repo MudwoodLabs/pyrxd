@@ -132,13 +132,16 @@ def add_value_at_risk_arg(ap: argparse.ArgumentParser) -> None:
     )
 
 
-def preflight_coordinator(build: Any, *, before: str) -> Any:
+def preflight_coordinator(build: Any, *, before: str, then: str = "") -> Any:
     """Construct the swap coordinator — every construction-time check it runs — BEFORE *before*.
 
     *build* is a zero-argument callable returning the ``SwapCoordinator`` the run will use (the same
     wiring the run uses, with the terms it would negotiate). A refusal becomes a ``SystemExit`` naming
     what was refused and, where the coordinator asks for a value at risk, the flag that sets it — so a
     run is refused before anything is minted or broadcast, never after.
+
+    *then*, when given, is appended to the refusal: what has already happened and what to do next,
+    for a construction that runs after a step that cannot be undone (a mint).
     """
     try:
         return build()
@@ -148,7 +151,10 @@ def preflight_coordinator(build: Any, *, before: str) -> Any:
             hint = f"\n  pass {VALUE_AT_RISK_FLAG} with the swap's value in photons"
         elif "rxd_block_interval_fast_s" in str(exc):
             hint = "\n  pass --rxd-block-interval-fast-s (the MEASURED p10 Radiant inter-block interval, seconds)"
-        raise SystemExit(f"refused before {before}: the swap coordinator refuses these terms:\n  {exc}{hint}") from None
+        raise SystemExit(
+            f"refused before {before}: the swap coordinator refuses these terms:\n  {exc}{hint}"
+            + (f"\n  {then}" if then else "")
+        ) from None
 
 
 # ---------------------------------------------------------------------------

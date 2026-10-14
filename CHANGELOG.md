@@ -118,6 +118,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   addresses per chain in one scan and then refuses with a network error (exit 2) that names the
   server by host and says to use a different endpoint. It refuses rather than truncating, so a
   wallet that really is that deep is never shown with addresses missing.
+- **`ElectrumXClient.close()` never closed its WebSocket (#731).** The reader task's `finally`
+  clears the client's socket, and `close()` read the socket only after awaiting the cancelled
+  reader, so it always found none and skipped the close. Every `close()`, `async with` exit and
+  failover discard of a connected client left its socket open, which mattered for long-running
+  processes. `close()` now takes the socket before cancelling the reader.
+- **`scripts/eth_swap_run.py`: a refusal of the terms after the mint was a raw traceback (#838).**
+  The runner checks the swap's terms before minting and again after, on the real asset, and the
+  clock moves between the two (a fresh mint waits for its confirmations). A deadline that passed
+  the first check could fail the second, and that refusal surfaced as a `ValidationError`
+  traceback after a mainnet mint. It is now a refusal like the first one: it says nothing is
+  locked and, after a fresh NFT/FT mint, names the reveal txid and the `--nft-reuse-reveal-txid` /
+  `--ft-reuse-reveal-txid` flags so the rerun reuses the asset instead of minting another. The
+  test that searches for the shortest default deadline now freezes the clock, so it no longer
+  flakes at the boundary (#844).
 
 - **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
   `Claimed(bytes32)` and `Refunded()` topic0 values were `hashlib.sha3_256` of the event
