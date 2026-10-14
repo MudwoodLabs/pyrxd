@@ -155,8 +155,11 @@ class RxinDexerClient:
         ``str(dict)``. Both halves are fixed here.
 
         Entries flagged ``status == "expired"`` are dropped: upstream keeps a lapsed name listed
-        so the owner can see it needs renewal, but it no longer RESOLVES, and this method's
-        contract is names that resolve.
+        so the owner can see it needs renewal, but it no longer RESOLVES, and a lapsed name is
+        not one the address holds in any useful sense.
+
+        These are names the address HOLDS (the ``WR`` owner index), not names whose target
+        points at it: a holder can set a name's target to any address (#729).
         """
         from .electrumx import script_hash_for_address
 

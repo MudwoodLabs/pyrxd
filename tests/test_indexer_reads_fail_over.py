@@ -481,7 +481,7 @@ def test_glyph_inspect_verify_wave_names_the_signer_with_the_shipped_defaults(mo
     identities = [row["hashmark"]["wave_identity"] for row in out["outputs"] if row.get("hashmark")]
     assert len(identities) == 1
     assert identities[0]["resolved"] is True, identities[0]
-    assert identities[0]["names_resolving_now"] == ["mark-signer.rxd"]
+    assert identities[0]["names_held_now"] == ["mark-signer.rxd"]
     # Non-vacuity: the fetch came from the plain server, and it WAS asked for the names first.
     assert "blockchain.transaction.get" in plain.received
     assert "wave.reverse_lookup" in plain.received
