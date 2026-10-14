@@ -143,25 +143,25 @@ from .types import GlyphRef
 # Classifier regexes
 # ---------------------------------------------------------------------------
 
-NFT_SCRIPT_RE = re.compile(r"^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$")
+NFT_SCRIPT_RE = re.compile(r"^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac\Z")
 # The 100-byte shape ``prepare_container_reveal(child_ref=...)`` emitted in
 # pyrxd 0.9.0 through 0.14.0. It is recognised ONLY so that a holder of one can
 # be told what it is; it is NOT a token shape pyrxd builds any more, and any
 # output carrying it is permanently unspendable. See
 # :func:`is_legacy_container_script`.
-LEGACY_CONTAINER_SCRIPT_RE = re.compile(r"^d0[0-9a-f]{72}d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$")
+LEGACY_CONTAINER_SCRIPT_RE = re.compile(r"^d0[0-9a-f]{72}d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac\Z")
 LEGACY_CONTAINER_SCRIPT_SIZE = 100
-FT_SCRIPT_RE = re.compile(r"^76a914[0-9a-f]{40}88acbdd0[0-9a-f]{72}dec0e9aa76e378e4a269e69d$")
+FT_SCRIPT_RE = re.compile(r"^76a914[0-9a-f]{40}88acbdd0[0-9a-f]{72}dec0e9aa76e378e4a269e69d\Z")
 # NFT commit uses OP_2 (52) for SINGLETON ref type; FT commit uses OP_1 (51) for NORMAL ref type.
-COMMIT_SCRIPT_NFT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda529d76a914[0-9a-f]{40}88ac$")
-COMMIT_SCRIPT_FT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda519d76a914[0-9a-f]{40}88ac$")
+COMMIT_SCRIPT_NFT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda529d76a914[0-9a-f]{40}88ac\Z")
+COMMIT_SCRIPT_FT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda519d76a914[0-9a-f]{40}88ac\Z")
 # Either variant — and ONLY those two. The ref-type operand is ``OP_2`` or ``OP_1``, the two
 # values pyrxd's builder and Photonic's ``nftCommitScript`` / ``ftCommitScript``
 # (``packages/lib/src/script.ts``) emit. It used to accept ANY byte there, including ``00``:
 # ``OP_REFTYPE_OUTPUT OP_0 OP_NUMEQUALVERIFY`` demands that the reveal create NO ref for the
 # commit's outpoint, so a commit carrying it mints nothing — and a reveal spending one placed
 # first had its decoy envelope read as the payload a commit bound (``payload_binding``).
-COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda5[12]9d76a914[0-9a-f]{40}88ac$")
+COMMIT_SCRIPT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda5[12]9d76a914[0-9a-f]{40}88ac\Z")
 
 # A DAT commit carries NO OP_REFTYPE_OUTPUT block — it demands no token of its reveal (and does
 # not prevent one) — and adds a "dat" marker push ahead of "gly". 70 bytes.
@@ -179,7 +179,7 @@ DAT_COMMIT_SCRIPT_RE = re.compile(
 # that shared obligation, and because the reveals seen spending it are DAT reveals (``p = [3]``:
 # ``77df45a9…1b22:0``, spent by ``e5c67100…be5d``). Bare only: no delegate prefix has been seen on
 # it, and none is accepted.
-DAT_GLY_ONLY_COMMIT_SCRIPT_RE = re.compile(r"^aa20([0-9a-f]{64})8803676c798876a914([0-9a-f]{40})88ac$")
+DAT_GLY_ONLY_COMMIT_SCRIPT_RE = re.compile(r"^aa20([0-9a-f]{64})8803676c798876a914([0-9a-f]{40})88ac\Z")
 
 # --- Authority-gated NFT (Photonic ``packages/lib/src/authority.ts:239``) -----
 # ``OP_REQUIREINPUTREF <auth_ref> OP_DROP OP_PUSHINPUTREFSINGLETON <ref> OP_DROP``
@@ -187,7 +187,7 @@ DAT_GLY_ONLY_COMMIT_SCRIPT_RE = re.compile(r"^aa20([0-9a-f]{64})8803676c798876a9
 # :func:`build_authority_gated_nft_script` for what the gate does and does NOT
 # bind.
 AUTHORITY_GATED_SCRIPT_SIZE = 101
-AUTHORITY_GATED_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})75d8([0-9a-f]{72})7576a914([0-9a-f]{40})88ac$")
+AUTHORITY_GATED_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})75d8([0-9a-f]{72})7576a914([0-9a-f]{40})88ac\Z")
 
 # --- Delegate refs (Photonic ``packages/lib/src/script.ts:455-499``) ----------
 # A delegate authorises a token's ``in``/``by`` claim WITHOUT the minting wallet
@@ -204,8 +204,8 @@ DELEGATE_COMMIT_PREFIX_SIZE = 56
 # 63 bytes as an NFT singleton, differing only in the first opcode (0xd0 vs
 # 0xd8). It is token-bearing: spending one as ordinary funding destroys it, so
 # coin selection must exclude it via ``is_token_bearing_script``.
-DELEGATE_TOKEN_SCRIPT_RE = re.compile(r"^d0[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$")
-DELEGATE_BURN_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})6a0364656c$")
+DELEGATE_TOKEN_SCRIPT_RE = re.compile(r"^d0[0-9a-f]{72}7576a914[0-9a-f]{40}88ac\Z")
+DELEGATE_BURN_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})6a0364656c\Z")
 
 #: The delegate commit prefix, spelled INDEPENDENTLY of the builder that emits it.
 #:
@@ -225,7 +225,7 @@ DELEGATE_BURN_SCRIPT_RE = re.compile(r"^d1([0-9a-f]{72})6a0364656c$")
 #: appears in no output), PUSH<0xd1>, OP_SWAP, PUSH<OP_RETURN "del">, OP_CAT, OP_CAT (rebuild the
 #: burn script), OP_HASH256, OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS, OP_1, OP_NUMEQUALVERIFY
 #: (exactly one such output exists).
-DELEGATE_COMMIT_PREFIX_RE = re.compile(r"^d0([0-9a-f]{72})76de009d01d17c056a0364656c7e7eaae6519d$")
+DELEGATE_COMMIT_PREFIX_RE = re.compile(r"^d0([0-9a-f]{72})76de009d01d17c056a0364656c7e7eaae6519d\Z")
 
 
 # ---------------------------------------------------------------------------

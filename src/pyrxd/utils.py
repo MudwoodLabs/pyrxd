@@ -44,7 +44,7 @@ def decode_address(address: str) -> tuple[bytes, Network]:
     """
     :returns: tuple (public_key_hash_bytes, network)
     """
-    if not re.match(r"^[1mn][a-km-zA-HJ-NP-Z1-9]{24,33}$", address):
+    if not re.match(r"^[1mn][a-km-zA-HJ-NP-Z1-9]{24,33}\Z", address):
         # - a Bitcoin address is between 25 and 34 characters long;
         # - the address always starts with a 1, m, or n
         # - an address can contain all alphanumeric characters, with the exceptions of 0, O, I, and l.

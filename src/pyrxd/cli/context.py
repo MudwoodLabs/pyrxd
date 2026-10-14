@@ -17,8 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..security.errors import ValidationError
 from .config import DEFAULT_FEE_RATE_PHOTONS_PER_BYTE, Config
-from .errors import UserError
+from .errors import UserError, config_error
 
 if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
@@ -87,7 +88,12 @@ class CliContext:
             # `require_profile()` would raise — same content, house error shape,
             # documented exit code 1 instead of the "unexpected failure" path.
             raise UserError(gap.message, cause=gap.cause, fix=gap.fix)
-        profile = self.config.require_profile()
+        try:
+            profile = self.config.require_profile()
+        except ValidationError as exc:
+            # A plain-string `electrumx_servers` URL is first parsed here, not at load: a malformed
+            # one is a config mistake (exit 1, naming the file), not the bug path (exit 4, #775).
+            raise config_error(exc, self.config.source_path) from None
         return FailoverElectrumXClient(profile)
 
     def is_destructive_mode_safe(self) -> tuple[bool, str | None]:

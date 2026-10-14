@@ -96,7 +96,7 @@ error: Could not decrypt wallet file
 ```
 
 — `WalletDecryptError`'s default message
-([`src/pyrxd/cli/errors.py:178-183`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/errors.py)).
+([`src/pyrxd/cli/errors.py:179-184`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/errors.py)).
 **Verified:** the CLI's wallet loader deliberately discards the library's
 more specific decrypt-failure message (which, called directly, includes an
 NFKD hint pointing at this exact cause) and always re-raises this generic
@@ -377,15 +377,15 @@ means.
 Three real strings from `ElectrumXClient`:
 
 - `"Failed to connect to any ElectrumX server"` —
-  [`src/pyrxd/network/electrumx.py:1042`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`src/pyrxd/network/electrumx.py:1055`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   every server in your URL list failed to connect. Check the URL(s), your
   network, and that the server is up.
 - `"ElectrumX connection lost"` —
-  [`:718`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`:1143`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   the WebSocket dropped mid-session; all pending requests fail with this.
   Reconnect (a fresh `ElectrumXClient` / `async with` block).
 - `"ElectrumX request timed out"` (or `"... (send)"`) —
-  [`:766, :771`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`:1192, :1197`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   a single RPC call exceeded its timeout. Retry, or pass a longer timeout if
   the server is just slow.
 
@@ -736,7 +736,7 @@ and `utxos_cmd` lists whatever `wallet.collect_spendable(client)` returns
 ([`:297-354`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/query_cmds.py),
 backed by
 [`HdWallet.collect_spendable`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/wallet.py)
-at `src/pyrxd/hd/wallet.py:1243-1301`). Neither path decodes the locking
+at `src/pyrxd/hd/wallet.py:1285-1343`). Neither path decodes the locking
 script to check whether it's a Glyph FT/NFT envelope versus plain P2PKH —
 both just report the UTXO's raw `value` field from ElectrumX. A Glyph
 carrier's photon value (the 546-dust NFT carrier, or an FT's premined

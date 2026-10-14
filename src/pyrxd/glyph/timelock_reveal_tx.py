@@ -88,7 +88,7 @@ REVEAL_MARKER = 0x09
 REVEAL_ACTION = "reveal"
 
 #: Regex enforcing "txid:vout" form for token_ref.
-_TOKEN_REF_RE = re.compile(r"^[0-9a-fA-F]{64}:[0-9]+$")
+_TOKEN_REF_RE = re.compile(r"^[0-9a-fA-F]{64}:[0-9]+\Z")
 
 
 @dataclass(frozen=True)

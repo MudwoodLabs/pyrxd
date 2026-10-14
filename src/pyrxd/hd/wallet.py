@@ -67,13 +67,14 @@ from ..hd.bip39 import seed_from_mnemonic
 from ..hd.descriptor import AccountDescriptors, account_descriptors
 from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address, verified_broadcast_txid
+from ..network.redaction import redacted_url
 from ..script.type import P2PKH
 from ..security.errors import KeyMaterialError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
 from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
-from ..utils import validate_address
+from ..utils import address_to_public_key_hash, validate_address
 from ..wallet import (
     DEFAULT_FEE_RATE,
     DUST_THRESHOLD,
@@ -90,6 +91,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _GAP_LIMIT = 20
+
+#: The most addresses one gap-limit scan derives on one chain (external or change). A server that
+#: reports history for every address never lets the 20-unused gap close, and the scan derived
+#: without end (#772). The cap is a choice, not a measurement: it is far above any wallet the CLI
+#: is built for, and reaching it is refused (a :class:`NetworkError` naming the server), never
+#: truncated, so a wallet that really is this deep fails loudly instead of losing addresses.
+#: It counts addresses, not server calls: each address costs at most one P2PKH read plus one read
+#: per owned token shape (see :func:`_has_token_history`), a constant, so the calls one chain's
+#: scan makes are bounded by this cap times that constant. Counting calls instead would let a
+#: wallet of token-only addresses reach a shallower depth than one of plain-RXD addresses.
+_MAX_SCAN_ADDRESSES_PER_CHAIN = 100_000
 
 
 # Radiant's BIP44 derivation path. Default is the SLIP-0044 spec-correct
@@ -285,6 +297,18 @@ class Spendable(list):
     def __init__(self, triples: Iterable[tuple[UtxoRecord, str, PrivateKey]] = (), *, unread: Iterable[str] = ()):
         super().__init__(triples)
         self.unread: tuple[str, ...] = tuple(unread)
+
+
+def _server_name(client: object) -> str:
+    """The server a scan was reading from, for an error: its URL with any credential, path or query
+    removed, or a generic name for a client that does not expose one."""
+    url = getattr(client, "active_url", None)
+    if url is None:
+        urls = getattr(client, "_urls", None)
+        url = urls[0] if isinstance(urls, (list, tuple)) and len(urls) == 1 else None
+    if not isinstance(url, str):
+        return "the ElectrumX server"
+    return f"ElectrumX server {redacted_url(url)}"
 
 
 def raise_if_reads_failed(triples: object, shortfall: str) -> None:
@@ -852,6 +876,13 @@ class HdWallet:
         that lags or indexes partially does not get to hide funds the
         wallet already knew about.
 
+        An address counts as used when its P2PKH script hash has history,
+        or, when that is empty, when any of its token script hashes does
+        (:func:`_has_token_history`). A Radiant ElectrumX lists a token
+        output under the token script's hash with its refs zeroed, not under
+        the owner's P2PKH hash, so an address that has only received a Glyph
+        token has no P2PKH history at all (#787).
+
         Returns the count of newly discovered used addresses.
         """
         newly_used = 0
@@ -868,6 +899,13 @@ class HdWallet:
         # caching keeps that O(1) HMAC per index instead of a full master walk each call).
         account_xprv = self._xprv
         while consecutive_unused < _GAP_LIMIT:
+            if index >= _MAX_SCAN_ADDRESSES_PER_CHAIN:
+                raise NetworkError(
+                    f"{_server_name(client)} reported history for {_MAX_SCAN_ADDRESSES_PER_CHAIN:,} "
+                    f"{'change' if change else 'receive'} addresses without the {_GAP_LIMIT}-address "
+                    "unused gap that ends a wallet scan; refusing to keep deriving. A server that "
+                    "claims history everywhere is misbehaving: use a different ElectrumX endpoint."
+                )
             # Fetch one address at a time — correct BIP44 gap-limit semantics.
             addr = self._derive_address(change, index, account_xprv)
             pkey = self._path_key(change, index)
@@ -884,7 +922,11 @@ class HdWallet:
             # funds the wallet knew about, on this scan or any later one. (Demoting here made a
             # guard in collect_spendable protect only the first of two calls in a row.)
             was_used = old is not None and old.used
-            is_used = bool(hist) or was_used
+            # An address with no P2PKH history may still have received a token, listed under the
+            # token script's zeroed-ref hash (#787). Ask only then: an address with P2PKH history,
+            # or one already known used, is used whatever its token hashes say, so the token reads
+            # are spent only on addresses that would otherwise count toward the gap.
+            is_used = bool(hist) or was_used or await _has_token_history(client, addr)
             self.addresses[pkey] = AddressRecord(address=addr, change=change, index=index, used=is_used)
             if is_used:
                 consecutive_unused = 0
@@ -1567,6 +1609,26 @@ class HdWallet:
         )
         raw = tx.serialize()
         return str(verified_broadcast_txid(raw, await client.broadcast(raw)))  # as in `send`
+
+
+async def _has_token_history(client: ElectrumXClient, address: str) -> bool:
+    """Whether a Radiant ElectrumX lists history for any token output *address* owns.
+
+    Reads the hashes of :func:`~pyrxd.glyph.scanner.owned_token_script_hashes`, one per owned
+    token shape, in order, and stops at the first with history: an address with no token history
+    costs one read per shape, and one holding a token stops at its shape. A failed read raises,
+    as the P2PKH read in :meth:`HdWallet._scan_chain` does: a lookup that failed is not evidence
+    the address is unused.
+    """
+    # Lazy: ``pyrxd.glyph`` is a heavier import than this module, so importing the wallet does
+    # not load it; the first address a scan finds with no P2PKH history does.
+    from ..glyph.scanner import owned_token_script_hashes
+    from ..security.types import Hex20
+
+    for script_hash in owned_token_script_hashes(Hex20(address_to_public_key_hash(address))):
+        if await client.get_history(script_hash):
+            return True
+    return False
 
 
 def _derive_enc_key(seed: bytes, salt: bytes) -> bytes:

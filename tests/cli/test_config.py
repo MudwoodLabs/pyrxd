@@ -830,3 +830,28 @@ def test_a_config_refusal_quoting_a_url_is_redacted_and_not_chained(monkeypatch)
     assert result.exit_code == 1 and "error: invalid configuration" in out, out
     assert "wss://h.example:50022" in out and "SECRET" not in out, out
     assert "Traceback" not in out, "a chained library exception would be printed under --debug"
+
+
+_VERIFY_ARGS = ("verify", "--min-confirmations", "6", "00" * 31 + "aa:0")
+
+
+@pytest.mark.parametrize("url", ["wss://", "https://h.example/"])
+def test_a_malformed_endpoint_url_in_config_is_a_user_error_not_the_bug_path(tmp_path, url) -> None:
+    """#775: a plain-string ``electrumx_servers`` URL is parsed when the client is built, not at load,
+    and that ``ValidationError`` reached ``run()``'s bug path: "unexpected failure", exit 4, "re-run
+    with --debug". It is a typo in the operator's config: exit 1, naming the file to correct."""
+    cfg = tmp_path / "pyrxd.toml"
+    cfg.write_text(f'electrumx_servers = ["{url}"]\n', encoding="utf-8")
+    rc, _out, err = _run_cli(tmp_path, "--config", str(cfg), *_VERIFY_ARGS)
+    assert rc == 1, (rc, err)
+    assert "error: invalid configuration" in err and str(cfg) in err, err
+    assert "unexpected failure" not in err and "--debug" not in err, err
+
+
+def test_a_well_formed_but_unreachable_endpoint_is_still_a_network_error(tmp_path) -> None:
+    """Honest path for the test above: a URL that parses is not a config error; the command goes on
+    to reach it and fails as a network error (exit 2)."""
+    cfg = tmp_path / "pyrxd.toml"
+    cfg.write_text('electrumx_servers = ["wss://127.0.0.1:1/"]\n', encoding="utf-8")
+    rc, _out, err = _run_cli(tmp_path, "--config", str(cfg), *_VERIFY_ARGS)
+    assert rc == 2 and "invalid configuration" not in err, (rc, err)
