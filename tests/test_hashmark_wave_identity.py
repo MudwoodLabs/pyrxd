@@ -22,7 +22,7 @@ Two gates, then:
 * the SIGNATURE gate, tested below — resolving an unverified signer would dress a
   claim up as an identity, since anyone can put someone else's hash160 in a record;
 * the TENSE gate, tested in `test_hashmark_attestation.py` — the result is named
-  `names_resolving_now`, carries `point_in_time: False`, and is rendered after the
+  `names_held_now`, carries `point_in_time: False`, and is rendered after the
   mark's own statement closes rather than inside it.
 
 The sound historical form needs point-in-time resolution against the mark's own
@@ -149,7 +149,12 @@ class TestSection76TheTenseGate:
     tense, and the placement.
 
     §7.6 form 1 is two facts, separately sourced: the signer ADDRESS, which the mark
-    really does carry, and the names resolving to it right now, which it does not.
+    really does carry, and the names it holds right now, which it does not.
+
+    "Holds", not "resolves to" (#729): RXinDexer's ``wave.reverse_lookup`` reads its owner
+    index, so a hit is a name this key's address holds; the name's target is the holder's
+    to set and can point anywhere. The JSON keeps ``names_resolving_now`` (same list) for one
+    minor release, deprecated.
     """
 
     HM = {
@@ -166,7 +171,7 @@ class TestSection76TheTenseGate:
         },
         "wave_identity": {
             "resolved": True,
-            "names_resolving_now": ["company.rxd"],
+            "names_held_now": ["company.rxd"],
             "point_in_time": False,
         },
     }
@@ -203,8 +208,22 @@ class TestSection76TheTenseGate:
 
     def test_a_mark_with_NO_name_still_renders_its_verdict(self) -> None:
         """The honest path. Nothing about the name may gate the mark's own result."""
-        text = self._render(wave_identity={"resolved": True, "names_resolving_now": [], "point_in_time": False})
-        assert "signature VERIFIED" in text and "no WAVE name resolves" in text
+        text = self._render(wave_identity={"resolved": True, "names_held_now": [], "point_in_time": False})
+        assert "signature VERIFIED" in text and "no WAVE name is held" in text
+
+    def test_the_names_are_called_HELD_not_resolving(self) -> None:
+        """#729: the lookup is an owner index. "Resolving to that key" claimed the names'
+        targets point at the signer, which the lookup never checked."""
+        text = self._render()
+        assert "WAVE names held by that key RIGHT NOW: company.rxd" in text
+        assert "resolving to" not in text.lower() and "resolves to" not in text.lower()
+
+    def test_a_record_written_before_the_rename_still_renders(self) -> None:
+        """A saved --json from an older pyrxd carries only `names_resolving_now`."""
+        text = self._render(
+            wave_identity={"resolved": True, "names_resolving_now": ["company.rxd"], "point_in_time": False}
+        )
+        assert "WAVE names held by that key RIGHT NOW: company.rxd" in text
 
     def test_a_failed_lookup_says_why_and_does_not_swallow_the_verdict(self) -> None:
         text = self._render(wave_identity={"resolved": False, "reason": "lookup failed: timeout"})
@@ -242,6 +261,8 @@ class TestSection76TheTenseGate:
             wave.wave_names_for_hash160 = original
 
         wi = record["wave_identity"]
-        assert wi["names_resolving_now"] == ["company.rxd"]
+        assert wi["names_held_now"] == ["company.rxd"]
+        assert wi["names_resolving_now"] == ["company.rxd"], "the deprecated alias is kept for one minor"
         assert wi["point_in_time"] is False and "names" not in wi
+        assert "owner index" in wi["caveat"]
         assert "present-tense" in wi["caveat"]

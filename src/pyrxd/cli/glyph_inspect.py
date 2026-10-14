@@ -985,7 +985,12 @@ def mark_anchor_lines(a: Mapping[str, object] | None, indent: str = "  ") -> lis
 
 
 def _wave_context_lines(wi: dict | None, indent: str) -> list[str]:
-    """Names resolving to the signer's key NOW — as context, never as part of the mark.
+    """Names the signer's key HOLDS now — as context, never as part of the mark.
+
+    "Holds", not "resolves to": RXinDexer's ``wave.reverse_lookup`` reads its owner index
+    (``WR`` + owner scripthash), so a hit is a name whose claim singleton this key's address
+    holds. Where that name's target points is a separate field the holder sets; it can point
+    anywhere (#729).
 
     HashMark §7.6 is explicit that a naming system must not be folded into a mark's
     verdict. A name resolves to whatever it points at now; a mark was made at a past
@@ -1014,12 +1019,12 @@ def _wave_context_lines(wi: dict | None, indent: str) -> list[str]:
         return []
     if not wi.get("resolved"):
         return [f"{indent}separately — WAVE names: not resolved ({wi.get('reason')})"]
-    names = wi.get("names_resolving_now") or []
+    names = wi.get("names_held_now", wi.get("names_resolving_now")) or []
     if not names:
-        return [f"{indent}separately — no WAVE name resolves to that key right now"]
+        return [f"{indent}separately — no WAVE name is held by that key right now"]
     return [
         f"{indent}separately, and NOT part of the mark above:",
-        f"{indent}  WAVE names resolving to that key RIGHT NOW: {', '.join(names)}",
+        f"{indent}  WAVE names held by that key RIGHT NOW: {', '.join(names)}",
         f"{indent}  (a present-tense lookup. Names change hands, so this does not say who",
         f"{indent}   held the name when the mark was made, nor that the named party made it)",
     ]
@@ -1958,7 +1963,7 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
     default=False,
     help=(
         "For a VERIFIED HashMark v2 signature, look up the WAVE names the signing "
-        "key owns. Needs the network. Never runs on an unverified signature."
+        "key holds right now. Needs the network. Never runs on an unverified signature."
     ),
 )
 @click.option(
@@ -2180,10 +2185,12 @@ def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str, raw_out: list[
 
 
 def _attach_wave_identity(ctx: CliContext, payload: dict) -> None:
-    """Attach the WAVE names that resolve to a VERIFIED signer's key RIGHT NOW.
+    """Attach the WAVE names a VERIFIED signer's key HOLDS RIGHT NOW.
 
-    Present tense throughout, and deliberately not "the names the signer owns" — that
-    phrasing was the bug. See :func:`_resolve_one_wave_identity` and HashMark §7.6.
+    Present tense throughout: "the names the signer owns", unqualified, read as a past-tense
+    claim about the mark, and that was the bug. See :func:`_resolve_one_wave_identity` and
+    HashMark §7.6. "Holds", not "resolves to": the indexer's reverse lookup is an owner index,
+    and a name's target can point elsewhere (#729).
 
     ONLY runs on a signature that actually verified. Resolving an unverified
     signer would dress a claim up as an identity — the exact failure the
@@ -2241,6 +2248,7 @@ def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
     # under "signature VERIFIED" — the one line in this output that states an
     # independently checked cryptographic fact. Raw, it can carry the ANSI to
     # scroll that line off the screen and reprint it saying something else.
+    held = [_sanitize_display_string(n) for n in names]
     hm["wave_identity"] = {
         "resolved": True,
         # NAMED FOR WHAT IT IS. This was `names`, which invites exactly the inference
@@ -2250,7 +2258,11 @@ def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
         # the previous holder starts failing, and whoever picks up a lapsed name can
         # make NEW marks that truthfully verify as "signed by whoever owns
         # company.rxd", which a reader hears as "the company made this".
-        "names_resolving_now": [_sanitize_display_string(n) for n in names],
+        "names_held_now": held,
+        # DEPRECATED, same list: the old name claimed these names RESOLVE to the key, but the
+        # indexer's reverse lookup returns names the key's address HOLDS (owner index), and a
+        # name's target can point elsewhere (#729). Kept for one minor release for consumers.
+        "names_resolving_now": list(held),
         # Explicit so a downstream consumer cannot reach for this field believing it
         # is the historical answer. Doing that properly means establishing what the
         # name pointed at AT THE MARK'S OWN BLOCK, by fetching and verifying the chain
@@ -2258,6 +2270,8 @@ def _resolve_one_wave_identity(ctx: CliContext, hm: dict) -> None:
         "point_in_time": False,
         "caveat": (
             "present-tense lookup, not a property of the mark: names change hands, so this "
-            "does not establish who held the name when the mark was made"
+            "does not establish who held the name when the mark was made. These are names "
+            "this key's address holds per the indexer's owner index; where each name points "
+            "is set by its holder and is not checked here"
         ),
     }

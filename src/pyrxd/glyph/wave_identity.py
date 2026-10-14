@@ -1,7 +1,7 @@
 """HashMark §7.6 form 2 — what a WAVE name pointed at AT THE BLOCK THAT CARRIED THE MARK.
 
 Form 1 (shipped, ``cli/glyph_inspect.py``) answers a present-tense question and refuses the
-inference: it reports ``names_resolving_now`` with ``point_in_time: false`` and a caveat saying
+inference: it reports ``names_held_now`` with ``point_in_time: false`` and a caveat saying
 names change hands. That hedge is doing real protective work, and form 2 replaces it with an
 authoritative sentence — so every gap here costs more than the same gap costs there.
 
