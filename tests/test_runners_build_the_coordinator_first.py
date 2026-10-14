@@ -28,6 +28,7 @@ import re
 import struct
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -944,3 +945,60 @@ async def test_the_erc20_lifecycle_e2e_terms_pass_the_mainnet_construction_check
     outcome = await _run(mod.run_sepolia_dust(args))
     assert outcome == "stopped at wait_for_covenant_funding", (outcome, events)
     assert "judged:ok" in events, events
+
+
+async def test_a_refusal_after_the_mint_is_a_clean_refusal_not_a_traceback(tmp_path, monkeypatch):
+    """``eth_swap_run`` checks the terms before minting and again after, on the real asset. The clock
+    moves between the two (a real mint waits for its confirmations), so a deadline that passes the
+    first check can fail the second. That second refusal was a raw ``ValidationError`` traceback after
+    a mainnet mint (#838); it is now a ``SystemExit`` that says nothing is locked and how to rerun.
+
+    Driven through the runner: the clock is moved forward between the two checks by enough to leave
+    the default deadline too little room, so the first check passes and the second refuses."""
+    shared = sys.modules.get("_dust_swap_shared")
+    if shared is None:
+        _load("eth_swap_run")
+        shared = sys.modules["_dust_swap_shared"]
+    real_preflight = shared.preflight_coordinator
+    clock = {"now": int(time.time()), "checks": 0}
+
+    def preflight_then_wait(build, **kwargs):
+        built = real_preflight(build, **kwargs)
+        clock["checks"] += 1
+        if clock["checks"] == 1:
+            clock["now"] += 12_000  # the time a mint (or a stall) takes, out of a 14,400 s deadline
+        return built
+
+    monkeypatch.setattr(shared, "preflight_coordinator", preflight_then_wait)
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+
+    with pytest.raises(SystemExit, match=r"(?s)refused before anyone locks: .*nothing is locked.*--eth-timeout-s"):
+        await _drive_eth(tmp_path, monkeypatch)
+    assert clock["checks"] == 1, "the second check refused, so it never returned"
+
+
+async def test_the_default_run_passes_both_checks_with_the_clock_still(tmp_path, monkeypatch):
+    """Honest path for the test above: with no time passing between the checks, both pass and the run
+    reaches its first fund-moving step."""
+    frozen = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: frozen)
+    events, outcome = await _drive_eth(tmp_path, monkeypatch)
+    assert events.count("construct") >= 2, events
+    assert outcome.startswith("stopped at"), (outcome, events)
+
+
+def test_the_after_mint_refusal_names_the_reveal_to_reuse(tmp_path):
+    """A refusal after a fresh NFT/FT mint must not send the operator to mint a second asset: it names
+    the reveal txid and the flags that reuse it. The reuse flags take the REVEAL txid (where the asset
+    sits), not the genesis (commit) txid."""
+    mod = _load("eth_swap_run")
+    keys = str(tmp_path / "k.json")
+    for variant in ("nft", "ft"):
+        args = types.SimpleNamespace(asset_variant=variant, keys_out=keys)
+        minted = types.SimpleNamespace(ref_str="aa" * 32 + ":0", genesis_txid="aa" * 32, reveal_txid="bb" * 32)
+        msg = mod._after_mint_remedy(args, minted)
+        assert f"--{variant}-reuse-reveal-txid {'bb' * 32}" in msg, msg
+        assert f"--{variant}-owner-wif" in msg and keys in msg, msg
+        assert "nothing is locked" in msg, msg
+    plain = mod._after_mint_remedy(types.SimpleNamespace(asset_variant="rxd", keys_out=keys), None)
+    assert "nothing is locked" in plain and "reuse" not in plain, plain

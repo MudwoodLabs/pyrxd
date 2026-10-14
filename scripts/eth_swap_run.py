@@ -944,6 +944,20 @@ def _gate_reserve(args, policy, funding_bound) -> int:
 _RXD_MIN_CONFIRMATIONS = 1
 
 
+def _after_mint_remedy(args, minted) -> str:
+    """What a refusal of the post-mint terms check tells the operator (#838): what already happened,
+    and how to run again. A fresh mint stays with the maker; the rerun reuses it rather than minting
+    a second asset."""
+    if minted is None or args.asset_variant not in ("nft", "ft"):
+        return "nothing is locked and nothing was broadcast; rerun with a later --eth-timeout-s"
+    flag = f"--{args.asset_variant}"
+    return (
+        f"the {args.asset_variant.upper()} is already minted (genesis {minted.ref_str}) and stays in the maker's "
+        f"wallet; nothing is locked. Rerun with a later --eth-timeout-s and reuse it: "
+        f"{flag}-reuse-reveal-txid {minted.reveal_txid} {flag}-owner-wif <asset_owner_wif from {args.keys_out}>"
+    )
+
+
 def _build_terms_and_covenant(
     args, *, eth_timeout: int, elapsed_reserve: int, minted=None, restore: dict | None = None
 ):
@@ -1591,7 +1605,14 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                     "the persisted record is for a DIFFERENT swap (hashlock mismatch) — refusing to "
                     "drive it with these terms."
                 )
-        coord = coordinator_for(terms, _rkeys, indexer=indexer, record=_loaded, funding_confs=funding_confs)
+        # The terms are checked AGAIN here, on the real asset, and the clock has moved since the
+        # preflight (a fresh mint waits for its confirmations), so a deadline that passed there can
+        # fail here. Nothing is locked yet; refuse the same way, and say what already happened (#838).
+        coord = preflight_coordinator(
+            lambda: coordinator_for(terms, _rkeys, indexer=indexer, record=_loaded, funding_confs=funding_confs),
+            before="anyone locks",
+            then=_after_mint_remedy(args, minted),
+        )
 
         # Before funding the counter-leg, wait for the NFT genesis to reach the REF-gate reorg depth
         # (the pre-lock gate fails CLOSED on a shallow genesis). No-op for plain RXD (no genesis ref).
