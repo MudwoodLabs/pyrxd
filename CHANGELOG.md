@@ -112,6 +112,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`scripts/eth_swap_run.py`: a refusal of the terms after the mint was a raw traceback (#838).**
+  The runner checks the swap's terms before minting and again after, on the real asset, and the
+  clock moves between the two (a fresh mint waits for its confirmations). A deadline that passed
+  the first check could fail the second, and that refusal surfaced as a `ValidationError`
+  traceback after a mainnet mint. It is now a refusal like the first one: it says nothing is
+  locked and, after a fresh NFT/FT mint, names the reveal txid and the `--nft-reuse-reveal-txid` /
+  `--ft-reuse-reveal-txid` flags so the rerun reuses the asset instead of minting another. The
+  test that searches for the shortest default deadline now freezes the clock, so it no longer
+  flakes at the boundary (#844).
+
 - **`scripts/swap_run_verify.py` could not recognise a real ETH claim or refund.** Its
   `Claimed(bytes32)` and `Refunded()` topic0 values were `hashlib.sha3_256` of the event
   signatures (NIST SHA3-256) rather than Ethereum Keccak-256, so they matched no log the
