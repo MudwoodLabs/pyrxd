@@ -47,8 +47,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     behind by an upgrade is reported as stale. With no usable cache, `pyrxd verify` behaves
     exactly as before.
   - The browser pages do not use a cache yet.
+- **`BitcoinCoreRpcSource.get_outpoint_spender(txid, vout)`: the transaction spending a BTC
+  outpoint, as one Bitcoin Core node sees it (#850 PR 1c).** It returns `None` while the node holds
+  the outpoint unspent. Otherwise it looks in the mempool (`gettxspendingprevout`, Core 24+) and
+  then in the blocks from the funding transaction's block to the tip, at most `max_scan_blocks`
+  (2016 by default). Each spender's bytes are re-hashed against its txid (which does not cover the
+  witness) and must spend the outpoint. It trusts the one node it asks. Anything it cannot tell (an unknown or unconfirmed funding transaction with no mempool
+  spender, a longer span, a spender not found) raises `NetworkError`; it never answers "unspent"
+  by default.
 
 ### Changed
+
+- **The BTC two-host runner's taker `--phase refund` and `--phase abort` refuse when the BTC HTLC
+  is already spent (#850 PR 1c).** Before anything is sent they read the HTLC's funding outpoint.
+  If the maker has claimed it (the spender's witness opens this swap's hashlock), the refusal says
+  `p` is public, names `--phase claim` and the t_rxd window, and prints the claim's raw hex for
+  `maker_claim.json`: a refund could at best race the claim, and `--phase refund` would also have
+  pushed the covenant refund to the maker. Any other spender is reported as most likely the taker's
+  own refund, and the taker is told nothing more is owed only once it is 6 blocks deep; until then
+  the refusal says a claim could still replace it and to re-run before t_rxd. An unreadable outpoint
+  refuses too.
+  The coordinator is unchanged, so a claim that lands after this check is still not caught
+  (#850 PR 9a).
 
 - `pyrxd glyph list` now says that a listed token output being unspent is the ElectrumX server's
   word, not verified (refs #788). Each token's owner and amount are checked against its own

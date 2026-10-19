@@ -42,6 +42,7 @@ import coincurve
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.security.errors import ValidationError
 
 pytestmark = pytest.mark.integration
 
@@ -308,3 +309,82 @@ class TestBtcHtlcOnConsensus:
         btc.mine(1)
         spent = btc.cli("gettxout", locator.funding_outpoint.txid, str(locator.funding_outpoint.vout))
         assert spent in (None, ""), "HTLC UTXO should be spent after refund"
+
+
+def _core_source_via_cli(btc: _BtcRegtest):
+    """A real ``BitcoinCoreRpcSource`` whose JSON-RPC goes through the node's own CLI (the container
+    publishes no port), so every reply has Bitcoin Core's real shape. Errors become the
+    ``NetworkError`` the HTTP path raises for an RPC error."""
+    import asyncio
+
+    from pyrxd.network.bitcoin import BitcoinCoreRpcSource
+    from pyrxd.security.errors import NetworkError
+
+    source = BitcoinCoreRpcSource("http://node.invalid:18443/", btc.user, btc.password)
+
+    async def _rpc(method: str, params: list) -> object:
+        args = [json.dumps(x) if not isinstance(x, str) else x for x in params]
+        try:
+            out = await asyncio.to_thread(btc.cli, method, *args)
+        except RuntimeError as exc:
+            raise NetworkError(f"Bitcoin Core RPC error: {exc}") from None
+        return None if out == "" else out
+
+    source._rpc = _rpc  # type: ignore[method-assign]
+    return source
+
+
+class TestOutpointSpenderOnARealNode:
+    """``BitcoinCoreRpcSource.get_outpoint_spender`` (#850 PR 1c) against real Bitcoin Core replies:
+    unspent, a claim in the mempool, the same claim mined, and a matured refund. Its unit tests
+    model every RPC shape by hand; one of those models (a `blockheight` that Core does not send)
+    was wrong until a real node was asked."""
+
+    def test_unspent_then_claimed_in_the_mempool_then_mined_then_a_refund(self, btc):
+        import asyncio
+
+        maker, taker, claim_xo, refund_xo = _htlc_keys()
+        p = os.urandom(32)
+        h = hashlib.sha256(p).digest()
+        timeout = t.Timelock(_REFUND_CSV, t.TimeUnit.BLOCKS)
+        htlc = t.build_htlc(
+            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=timeout, network=_HRP
+        )
+        source = _core_source_via_cli(btc)
+        spender = lambda loc: asyncio.run(  # noqa: E731
+            source.get_outpoint_spender(loc.funding_outpoint.txid, loc.funding_outpoint.vout)
+        )
+
+        claimed = btc.fund_htlc(htlc)
+        assert spender(claimed) is None
+        claim = t.build_claim_tx(
+            locator=claimed,
+            preimage=p,
+            claim_privkey=maker.secret,
+            to_scriptpubkey=btc.payout_spk(),
+            fee_sats=_FEE_SATS,
+            aux_rand=os.urandom(32),
+        )
+        btc.cli("sendrawtransaction", claim.hex())
+        if _CHAIN == "btc":  # gettxspendingprevout is Bitcoin Core 24+; Litecoin 0.21 lacks it
+            assert bytes(spender(claimed)) == claim
+            assert t.scrape_secret(bytes(spender(claimed)), h) == p
+        btc.mine(2)
+        assert bytes(spender(claimed)) == claim
+
+        refunded = btc.fund_htlc(htlc)
+        refund = t.build_refund_tx(
+            locator=refunded,
+            refund_privkey=taker.secret,
+            timeout=timeout,
+            to_scriptpubkey=btc.payout_spk(),
+            fee_sats=_FEE_SATS,
+            aux_rand=os.urandom(32),
+        )
+        btc.mine(_REFUND_CSV)
+        btc.cli("sendrawtransaction", refund.hex())
+        btc.mine(1)
+        found = bytes(spender(refunded))
+        assert found == refund
+        with pytest.raises(ValidationError, match="hashlock"):
+            t.scrape_secret(found, h)

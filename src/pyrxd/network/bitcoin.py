@@ -792,6 +792,103 @@ class BitcoinCoreRpcSource(BtcDataSource):
         except (KeyError, IndexError, TypeError):
             raise NetworkError("Could not parse output script type from Bitcoin Core response")
 
+    async def get_outpoint_spender(self, txid: Txid, vout: int, *, max_scan_blocks: int = 2016) -> RawTx | None:
+        """The transaction spending ``txid:vout`` as this node sees it, or ``None`` while it is unspent.
+
+        ``gettxout`` (mempool included) answers "unspent". Otherwise the spender is looked for in
+        the mempool (``gettxspendingprevout``, Bitcoin Core 24 and later; an older node skips this)
+        and then in every block from the funding transaction's block to the tip. Each candidate's
+        bytes are re-hashed against its txid and must spend the outpoint.
+
+        Fails closed: ``NetworkError`` when the node does not hold the outpoint unspent and no
+        spender is found. That covers a funding transaction the node does not know, one that is
+        unconfirmed with no spender in the mempool, and a confirmed span longer than
+        ``max_scan_blocks``. A spender is returned at whatever depth it has, mempool included;
+        the caller decides what depth it needs before acting on it.
+
+        It trusts this one node. A node that lags the chain (still syncing, or partitioned) answers
+        from stale state, so "unspent" means unspent at that node's tip. The txid check covers the
+        witness-stripped bytes only: a witness the node serves is not bound by it.
+        """
+        if not isinstance(txid, Txid):
+            txid = Txid(txid)
+        index = _output_index(vout)
+        prevout = bytes.fromhex(str(txid))[::-1] + index.to_bytes(4, "little")
+        utxo = await self._rpc("gettxout", [str(txid), index, True])
+        if utxo is not None:
+            if not isinstance(utxo, dict):
+                raise NetworkError("Unexpected gettxout response from Bitcoin Core")
+            return None
+        try:
+            mempool = await self._rpc("gettxspendingprevout", [[{"txid": str(txid), "vout": index}]])
+        except NetworkError:
+            mempool = None  # a node without the RPC: only the block scan below can find the spender
+        if isinstance(mempool, list):
+            for entry in mempool:
+                spender = entry.get("spendingtxid") if isinstance(entry, dict) else None
+                if isinstance(spender, str):
+                    return self._spender_bytes(
+                        await self._rpc("getrawtransaction", [spender, True]), Txid(spender), prevout
+                    )
+        # The funding tx's height, from its block hash: Core's getrawtransaction reports
+        # `blockhash` and no height (checked on a Core 24 regtest node).
+        funding = await self._rpc("getrawtransaction", [str(txid), True])
+        _assert_tx_identity(funding, txid)
+        block_hash = funding.get("blockhash")
+        if not isinstance(block_hash, str):
+            raise NetworkError(
+                f"outpoint {str(txid)[:16]}…:{index} is not unspent, its funding tx is unconfirmed, and no "
+                "spender is in the mempool; fail-closed"
+            )
+        header = await self._rpc("getblockheader", [block_hash, True])
+        try:
+            funding_height = nonneg_int(header.get("height") if isinstance(header, dict) else None)
+        except ValueError as exc:
+            raise NetworkError("Invalid height in getblockheader response") from exc
+        tip = int(await self.get_tip_height())
+        if tip - funding_height > max_scan_blocks:
+            raise NetworkError(
+                f"outpoint {str(txid)[:16]}…:{index} is spent and its spender is not in the mempool; it lies in "
+                f"{tip - funding_height + 1} blocks, more than this search reads ({max_scan_blocks}); fail-closed"
+            )
+        for height in range(funding_height, tip + 1):
+            block_hash = await self._rpc("getblockhash", [height])
+            block = await self._rpc("getblock", [block_hash, 2])
+            txs = block.get("tx") if isinstance(block, dict) else None
+            if not isinstance(txs, list):
+                raise NetworkError(f"Unexpected getblock response at height {height}")
+            for tx in txs:
+                vins = tx.get("vin") if isinstance(tx, dict) else None
+                if not isinstance(vins, list):
+                    raise NetworkError(f"Unexpected transaction in getblock response at height {height}")
+                if any(isinstance(v, dict) and v.get("txid") == str(txid) and v.get("vout") == index for v in vins):
+                    return self._spender_bytes(tx, Txid(str(tx.get("txid"))), prevout)
+        raise NetworkError(
+            f"outpoint {str(txid)[:16]}…:{index} is not unspent at this node, and no transaction spending it was "
+            "found in the mempool or the blocks since it was mined; fail-closed"
+        )
+
+    @staticmethod
+    def _spender_bytes(data: Any, spender: Txid, prevout: bytes) -> RawTx:
+        """A spender candidate's raw bytes, bound to its txid and checked to spend *prevout*."""
+        from pyrxd.btc_wallet.taproot import btc_input_outpoints_from_raw
+
+        hex_str = data.get("hex") if isinstance(data, dict) else None
+        if not isinstance(hex_str, str):
+            raise NetworkError("Missing hex field for a spending transaction")
+        try:
+            raw = bytes.fromhex(hex_str)
+        except ValueError:
+            raise NetworkError("Invalid hex for a spending transaction")
+        _verify_raw_matches_txid(raw, spender)
+        try:
+            spends = prevout in btc_input_outpoints_from_raw(raw)
+        except ValidationError as exc:
+            raise NetworkError(f"could not parse a spending transaction's inputs; fail-closed ({exc})") from exc
+        if not spends:
+            raise NetworkError("the reported spending transaction does not spend the outpoint; fail-closed")
+        return RawTx(raw)
+
     async def get_merkle_proof(self, txid: Txid, height: BlockHeight) -> tuple[list[str], int]:
         # gettxoutproof returns a hex-encoded merkle block; parsing it fully is
         # out of scope here.  Return a stub that raises unless overridden.
