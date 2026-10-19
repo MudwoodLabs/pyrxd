@@ -11,6 +11,7 @@ Three properties are worth more than the rest:
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -53,6 +54,9 @@ class FakeClient:
         self.broadcast_result: str | None = None
         self.chain_error: Exception | None = None
         self.chain_checks = 0
+        # When set, a chain check is a round trip that stays open until the test releases it,
+        # so concurrent callers really overlap (#732).
+        self.chain_gate: asyncio.Event | None = None
         self.extension_error: Exception | None = None
         # The read-back an "already known" claim must survive (audit B6): by default the
         # node really does hold the transaction it says it holds.
@@ -62,6 +66,8 @@ class FakeClient:
     async def assert_chain(self, expected: str) -> str:
         self.chain_checks += 1
         self.calls.append(("assert_chain", expected))
+        if self.chain_gate is not None:
+            await asyncio.wait_for(self.chain_gate.wait(), timeout=5)
         if self.chain_error is not None:
             raise self.chain_error
         return expected
@@ -457,6 +463,114 @@ async def test_each_endpoint_is_chain_checked_once() -> None:
     await client.get_tip_height()
     assert fakes[A].chain_checks == 1
     assert fakes[B].chain_checks == 0  # never needed
+
+
+async def _overlapping(client: FailoverElectrumXClient, gate: asyncio.Event, n: int = 2) -> list:
+    """Start *n* reads on a fresh endpoint whose chain check stays open, let every one of them
+    reach it, then release the check. Bounded: each check waits at most 5 s for the gate."""
+    tasks = [asyncio.ensure_future(client.get_tip_height()) for _ in range(n)]
+    for _ in range(20):
+        await asyncio.sleep(0)
+    gate.set()
+    return await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+
+
+async def test_concurrent_first_calls_share_one_chain_check() -> None:
+    """#732: two reads started together on a fresh endpoint each ran `assert_chain`, because the
+    check ran outside the lock with nothing recording that one was already under way."""
+    client, fakes = build([A], genesis=_GENESIS, verify_chain=True)
+    fakes[A].chain_gate = asyncio.Event()
+    fakes[A].tip_value = 9
+
+    results = await _overlapping(client, fakes[A].chain_gate, n=3)
+    assert [int(r) for r in results] == [9, 9, 9]
+    assert fakes[A].chain_checks == 1, f"ran {fakes[A].chain_checks} chain checks for one endpoint"
+    assert await client.get_tip_height() == 9
+    assert fakes[A].chain_checks == 1  # verified once, then never again
+
+
+async def test_a_shared_wrong_chain_verdict_reaches_every_waiter() -> None:
+    """A wrong chain is refused for EVERY caller that waited on the check, not only the one that
+    started it, nobody fails over to the next endpoint, and the refusal is not remembered."""
+    client, fakes = build([A, B], genesis=_GENESIS, verify_chain=True)
+    fakes[A].chain_gate = asyncio.Event()
+    fakes[A].chain_error = ValidationError("ElectrumX endpoint is on the wrong chain")
+
+    results = await _overlapping(client, fakes[A].chain_gate)
+    assert all(isinstance(r, ValidationError) for r in results), results
+    assert fakes[A].chain_checks == 1
+    assert fakes[B].calls == []
+
+    # The refusal is not cached: once the endpoint answers with the right genesis, the next
+    # call checks it again and goes through.
+    fakes[A].chain_error = None
+    assert int(await client.get_tip_height()) == 100
+    assert fakes[A].chain_checks == 2
+
+
+async def test_a_shared_check_that_dies_fails_every_waiter_over_and_is_retried_later() -> None:
+    """A transport failure during the shared check fails both waiters over to the next endpoint,
+    and the failed check is not cached: the endpoint is checked afresh when it is next used."""
+    client, fakes = build([A, B], genesis=_GENESIS, verify_chain=True)
+    fakes[A].chain_gate = asyncio.Event()
+    fakes[A].chain_error = NetworkError("connection lost")
+    fakes[B].tip_value = 77
+
+    results = await _overlapping(client, fakes[A].chain_gate)
+    assert [int(r) for r in results] == [77, 77]
+    assert fakes[A].chain_checks == 1
+    assert fakes[B].chain_checks == 1
+
+    fakes[A].chain_error = None
+    fakes[B].tip_error = NetworkError("down")
+    fakes[A].tip_value = 5
+    assert int(await client.get_tip_height()) == 5
+    assert fakes[A].chain_checks == 2
+
+
+async def test_cancelling_one_waiter_does_not_cancel_the_check_the_others_await() -> None:
+    client, fakes = build([A], genesis=_GENESIS, verify_chain=True)
+    gate = fakes[A].chain_gate = asyncio.Event()
+    fakes[A].tip_value = 3
+
+    first = asyncio.ensure_future(client.get_tip_height())
+    second = asyncio.ensure_future(client.get_tip_height())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    first.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    gate.set()
+    assert int(await asyncio.wait_for(second, timeout=10)) == 3
+    assert first.cancelled()
+    assert fakes[A].chain_checks == 1
+
+
+async def test_a_check_that_outlives_its_client_does_not_verify_the_replacement() -> None:
+    """A check still running when its client is closed must not mark the endpoint verified,
+    or the endpoint's NEXT client would be used without ever being checked."""
+    profile = NetworkProfile(network="regtest", endpoints=(Endpoint(url=A),), genesis_hash=_GENESIS)
+    gate = asyncio.Event()
+    built: list[FakeClient] = []
+
+    def factory(endpoint: Endpoint) -> FakeClient:
+        fake = FakeClient(endpoint.url)
+        fake.chain_gate = gate
+        built.append(fake)
+        return fake
+
+    client = FailoverElectrumXClient(profile, client_factory=factory, verify_chain=True)  # type: ignore[arg-type]
+    first = asyncio.ensure_future(client.get_tip_height())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(built) == 1 and built[0].chain_checks == 1 and not first.done()
+    await client.close()
+    gate.set()
+    await asyncio.wait_for(first, timeout=10)
+
+    await client.get_tip_height()
+    assert len(built) == 2
+    assert built[1].chain_checks == 1, "the replacement client was used without a chain check"
 
 
 async def test_a_wrong_chain_endpoint_is_refused_not_failed_over() -> None:
