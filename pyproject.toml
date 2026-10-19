@@ -32,7 +32,7 @@ classifiers = [
 # replaced, so the built metadata is unchanged. Dependency GROUPS remain under
 # [tool.poetry.group.*]; Poetry only reads the main deps from here.
 dependencies = [
-    "aiohttp>=3.14.3",
+    "aiohttp>=3.14.4",
     "base58>=2.1.1,<3.0.0",
     "cbor2>=6.1.5,<7.0",
     "click>=8.5.0,<9.0",
@@ -41,7 +41,7 @@ dependencies = [
     # (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
     # transitive dep in most environments.
     "cryptography>=50.0.2",
-    "pycryptodomex>=3.23.0,<4.0.0",
+    "pycryptodomex>=3.24.0,<4.0.0",
     # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
     # pyrxd.cli.config falls back to this when running on 3.10.
     "tomli>=2.4,<3.0; python_version < '3.11'",
@@ -450,11 +450,11 @@ dev = [
     "bandit[toml]>=1.9.4,<2.0.0",
     "cosmic-ray>=8.7.0,<9.0.0",
     "detect-secrets>=1.5.0,<2.0.0",
-    "hypothesis>=6.168.1,<7.0.0",
+    "hypothesis>=6.168.5,<7.0.0",
     "mypy>=2.4.0,<3.0.0",
     "pip-audit>=2.10.1,<3.0.0",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.10,<0.17.0",
+    "ruff>=0.17.0,<0.18.0",
     "taskipy>=1.14.1,<2.0.0",
     # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
     # out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
