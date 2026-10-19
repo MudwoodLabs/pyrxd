@@ -102,6 +102,13 @@ def _is_already_have(exc: PolicyRejection) -> bool:
     return any(marker in reason for marker in _ALREADY_HAVE_MARKERS)
 
 
+def _consume_outcome(check: asyncio.Future[None]) -> None:
+    """Mark a shared chain check's exception as retrieved. Its waiters re-raise it; this only
+    keeps asyncio from logging "exception was never retrieved" when every waiter was cancelled."""
+    if not check.cancelled():
+        check.exception()
+
+
 def _txid_of(raw_tx: bytes) -> Txid:
     """Radiant txid for *raw_tx*: SHA-256d of the serialised transaction, reversed.
 
@@ -181,6 +188,10 @@ class FailoverElectrumXClient:
         self._order: list[Endpoint] = list(profile.endpoints)
         self._clients: dict[str, ElectrumXClient] = {}
         self._chain_verified: set[str] = set()
+        # One in-flight chain check per endpoint, with the client it is checking. Concurrent
+        # first calls on a fresh endpoint await the same check instead of each running one
+        # (#732). An entry is removed when its check ends, so a failed check is retried.
+        self._chain_checks: dict[str, tuple[ElectrumXClient, asyncio.Future[None]]] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ properties
@@ -214,6 +225,7 @@ class FailoverElectrumXClient:
         clients = list(self._clients.values())
         self._clients.clear()
         self._chain_verified.clear()
+        self._chain_checks.clear()
         for client in clients:
             try:
                 await client.close()
@@ -452,24 +464,45 @@ class FailoverElectrumXClient:
     async def _client_for(self, endpoint: Endpoint) -> ElectrumXClient:
         """Return (creating if needed) the chain-verified client for *endpoint*."""
         genesis = self._profile.genesis_hash if self._verify_chain else None
+        check: asyncio.Future[None] | None = None
         async with self._lock:
             client = self._clients.get(endpoint.key)
             if client is None:
                 client = self._factory(endpoint)
                 self._clients[endpoint.key] = client
-            needs_check = genesis is not None and endpoint.key not in self._chain_verified
-        if needs_check and genesis is not None:
-            # Outside the lock: a genesis read is a network round trip, and holding
-            # the creation lock across it would serialise every concurrent caller.
-            # A duplicate check under a race costs one extra cheap read, nothing more.
-            await client.assert_chain(genesis)
-            self._chain_verified.add(endpoint.key)
+            if genesis is not None and endpoint.key not in self._chain_verified:
+                pending = self._chain_checks.get(endpoint.key)
+                if pending is not None and pending[0] is client:
+                    check = pending[1]
+                else:
+                    check = asyncio.ensure_future(self._check_chain(endpoint.key, client, genesis))
+                    check.add_done_callback(_consume_outcome)
+                    self._chain_checks[endpoint.key] = (client, check)
+        if check is not None:
+            # Awaited outside the lock: a genesis read is a network round trip, and holding
+            # the creation lock across it would serialise calls to every other endpoint.
+            # Shielded, so one caller being cancelled does not cancel the check the
+            # others are waiting on.
+            await asyncio.shield(check)
         return client
+
+    async def _check_chain(self, key: str, client: ElectrumXClient, genesis: str) -> None:
+        """Run the one chain check for *client*, and record it only if *client* is still the
+        endpoint's client (a discard during the read must not mark its replacement verified)."""
+        try:
+            await client.assert_chain(genesis)
+            if self._clients.get(key) is client:
+                self._chain_verified.add(key)
+        finally:
+            pending = self._chain_checks.get(key)
+            if pending is not None and pending[0] is client:
+                del self._chain_checks[key]
 
     async def _discard(self, endpoint: Endpoint) -> None:
         """Close and forget the client for *endpoint* after a transport failure."""
         client = self._clients.pop(endpoint.key, None)
         self._chain_verified.discard(endpoint.key)
+        self._chain_checks.pop(endpoint.key, None)
         if client is None:
             return
         try:
