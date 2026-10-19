@@ -180,8 +180,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default). The connect and reader start now run under a per-client `asyncio.Lock`, so concurrent
   callers share one socket; a failed connect releases the lock and the next call retries. The CLI
   issues its reads sequentially and was not affected; library callers that gather reads were.
-  `FailoverElectrumXClient` can still run the one-time chain check twice on a race, now as two
-  reads over one socket (#732).
+  `FailoverElectrumXClient` also runs its one-time chain check once per endpoint on a race:
+  concurrent first calls await the same check, a refused or failed check is not remembered (the
+  next call checks again), and cancelling one caller does not cancel the check for the others
+  (#732).
 - **`ElectrumXClient.close()` never closed its WebSocket (#731).** The reader task's `finally`
   clears the client's socket, and `close()` read the socket only after awaiting the cancelled
   reader, so it always found none and skipped the close. Every `close()`, `async with` exit and
