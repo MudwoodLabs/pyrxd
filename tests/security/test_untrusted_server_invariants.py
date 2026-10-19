@@ -272,7 +272,7 @@ async def test_core_source_tx_block_height_refuses_another_transactions_body() -
     source = BitcoinCoreRpcSource("http://node.invalid:8332/", "u", "p")
 
     async def _rpc(_m: str, _p: list) -> Any:
-        return {"txid": OTHER_TXID, "blockheight": 700_000}
+        return {"txid": OTHER_TXID, "blockhash": "44" * 32}
 
     source._rpc = _rpc  # type: ignore[method-assign]
     with pytest.raises(NetworkError, match="does not identify the requested transaction"):

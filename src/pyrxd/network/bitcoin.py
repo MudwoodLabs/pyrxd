@@ -765,13 +765,22 @@ class BitcoinCoreRpcSource(BtcDataSource):
         # audit B7, missed site: the height this returns picks the header the SPV proof is
         # verified against, so it must come from the transaction we asked about.
         _assert_tx_identity(data, txid)
-        block_height = data.get("blockheight")
-        if block_height is None:
-            raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed or blockheight missing")
+        # Core's getrawtransaction names the block by hash and reports no height (checked on a
+        # Core 24 regtest node: no `blockheight` key). This read a `blockheight` key, so against a
+        # real node it raised "unconfirmed" for every mined transaction. The height comes from
+        # the block's own header.
+        block_hash = data.get("blockhash")
+        if not isinstance(block_hash, str):
+            raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed (no blockhash)")
+        header = await self._rpc("getblockheader", [block_hash, True])
+        if not isinstance(header, dict) or header.get("hash") != block_hash:
+            raise NetworkError(
+                "getblockheader returned a header for another block than the tx's blockhash; fail-closed"
+            )
         try:
-            return BlockHeight(nonneg_int(block_height))
+            return BlockHeight(nonneg_int(header.get("height")))
         except (ValueError, ValidationError):
-            raise NetworkError("Invalid blockheight in getrawtransaction response")
+            raise NetworkError("Invalid height in getblockheader response")
 
     async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         if not isinstance(txid, Txid):
