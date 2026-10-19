@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import multiprocessing as mp
+import os
 import time
 from pathlib import Path
 
@@ -58,6 +59,9 @@ class TestTheRecordSinkWritesAtomically:
         asyncio.run(sink(_Rec(big)))
         assert json.loads(sink.path.read_text())["pending_counter_contract"] == "0x" + "22" * 20
 
+    @pytest.mark.skipif(
+        os.geteuid() == 0, reason="root can write into a 0o500 directory, so the unwritable-location case cannot arise"
+    )
     def test_an_unwritable_location_RAISES_rather_than_silently_dropping(self, tmp_path: Path) -> None:
         """The whole failure being fixed is a persist that silently does nothing. If the record
         cannot be written the caller must find out, because the coordinator awaits this before

@@ -216,4 +216,23 @@ EXPECTED_SKIPS: tuple[ExpectedSkip, ...] = (
         r"|nft_and_ft_bind_exactly_the_genesis_ref"
         r")$",
     ),
+    # --- permission-denial tests cannot deny root -----------------------------------------
+    ExpectedSkip(
+        reason=r"^root can (write|chmod) a 0444 file, so the unrunnable-remedy case cannot arise$"
+        r"|^root can write into a 0o500 directory, so the unwritable-location case cannot arise$",
+        why=(
+            "These tests make a file or directory read-only and assert on what happens when a "
+            "write is refused. Root bypasses file modes, so under uid 0 the refusal never "
+            "happens and the test cannot assert anything. They skip when run as root (a "
+            "container that runs as root, as some sandboxes and CI images do) and run "
+            "everywhere else, including GitHub Actions, which runs as a normal user.\n\n"
+            "Node-id-scoped on purpose: a NEW permission test that skips as root is still "
+            "reported as unexpected, so it gets its own entry and its own review."
+        ),
+        nodeid=r"^tests/(cli/test_swap_recovery\.py::test_the_mode_remedy_is_one_the_operator_can_actually_run"
+        r"|cli/test_swap_recovery_cmds\.py::test_the_(CLI_PRINTS_a_remedy_the_operator_can_actually_run"
+        r"|runnable_remedy_survives_even_a_hard_truncation)"
+        r"|test_record_sink_and_fund_lock\.py::TestTheRecordSinkWritesAtomically::"
+        r"test_an_unwritable_location_RAISES_rather_than_silently_dropping)$",
+    ),
 )
