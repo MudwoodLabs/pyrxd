@@ -325,6 +325,10 @@ _ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
 #: that ends where the shell's word would. Quoting the delimiter is what stops the shell expanding
 #: the body, so the body is data.
 _QUOTED_HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'(\w+)'|\"(\w+)\")(?=[ \t\n;&|()<>]|$)")
+#: An arithmetic expansion over digits and operators only, such as `$((1+1))`. Anything else in
+#: one (a variable, an array subscript, a `$(…)`) is refused: bash evaluates a variable's value as
+#: arithmetic in turn, and an array subscript there can run a command.
+_CONSTANT_ARITHMETIC = re.compile(r"\$\(\([0-9 \t+\-*/%]*\)\)")
 
 #: `gh api` options that take a value, so the word after them is not the endpoint.
 _GH_API_VALUED_OPTIONS = frozenset(
@@ -376,6 +380,21 @@ def _is_operator(word: str) -> bool:
     return bool(word) and set(word) <= set("();<>|&")
 
 
+def _constant_arithmetic_end(text: str, i: int, out: list[str]) -> int:
+    """At a `$((` outside single quotes: write the digit `0` in place of a constant arithmetic
+    expansion and return the index after it. Its value is a number, so it can neither name a
+    command nor run one. Any other arithmetic expansion fails the check."""
+    m = _CONSTANT_ARITHMETIC.match(text, i)
+    line = text[i:].split("\n", 1)[0]
+    assert m, (
+        f"{_PROTECTION_SCRIPT.name}: `{line}` holds an arithmetic expansion over more than digits and "
+        f"operators, which this check cannot evaluate (bash arithmetic can run a command through an "
+        f"array subscript)"
+    )
+    out.append("0")
+    return m.end()
+
+
 def _script_commands(text: str) -> str:
     """`text` as the shell would run it, minus what the shell does not run.
 
@@ -390,6 +409,9 @@ def _script_commands(text: str) -> str:
     Rather than guess, it fails on forms it would otherwise read differently from bash: a heredoc
     delimiter that is unquoted or written any other way, a heredoc never closed, `$'…'` quoting
     (in which `\\'` does not end the string), and an unbalanced quote.
+
+    An arithmetic expansion `$((…))` outside single quotes becomes `0` when it holds only digits
+    and operators (#777), and fails the check otherwise: see `_constant_arithmetic_end`.
     """
     name = _PROTECTION_SCRIPT.name
     out: list[str] = []
@@ -404,6 +426,9 @@ def _script_commands(text: str) -> str:
             quote = "" if c == "'" else quote
             i += 1
         elif quote == '"':
+            if text.startswith("$((", i):
+                i = _constant_arithmetic_end(text, i, out)
+                continue
             if c == "\\" and i + 1 < n:
                 if text[i + 1] != "\n":
                     out.append(text[i : i + 2])
@@ -417,6 +442,9 @@ def _script_commands(text: str) -> str:
                 out.append(text[i : i + 2])
                 word_start = False
             i += 2
+        elif text.startswith("$((", i):
+            i = _constant_arithmetic_end(text, i, out)
+            word_start = False
         elif c in "'\"":
             assert not (c == "'" and out and out[-1] == "$"), (
                 f"{name} uses `$'…'` (ANSI-C) quoting, in which `\\'` does not end the string; this "
@@ -511,23 +539,42 @@ def _gh_api_calls(words: list[str]) -> list[list[str]]:
     return calls
 
 
+_GH_API_BODY_OPTIONS = frozenset({"-f", "--raw-field", "-F", "--field", "--input"})
+
+
 def _method_and_endpoint(argv: list[str]) -> tuple[str, str]:
     """The HTTP method `gh api` will use, and its endpoint argument. With no `-X`, `gh api` sends
-    GET, or POST when any field or input is given."""
-    method, positional, i = "", [], 0
+    GET, or POST when any field or input is given.
+
+    A valued option may carry its value in the same word, as `gh`'s flag parser accepts:
+    `--method=PUT`, `-XPUT` and `-X=PUT` (#777), and likewise `--input=-` or `-Fkey=value`.
+    Short flags bundled with another flag before them (`-iXPUT`) are not parsed; the exact
+    comparison with `_REVIEWED_GH_API_CALLS` refuses those."""
+    method, positional, has_body, i = "", [], False, 0
     while i < len(argv):
         word = argv[i]
         if word in _GH_API_VALUED_OPTIONS:
             if word in ("-X", "--method"):
                 method = argv[i + 1].upper()
+            has_body = has_body or word in _GH_API_BODY_OPTIONS
             i += 2
             continue
-        if not word.startswith("-"):
+        if word.startswith("--") and "=" in word:
+            option, _, value = word.partition("=")
+        elif not word.startswith("--") and word[:2] in _GH_API_VALUED_OPTIONS and len(word) > 2:
+            option, value = word[:2], word[2:]
+            value = value[1:] if value.startswith("=") else value
+        else:
+            option, value = "", ""
+        if option in _GH_API_VALUED_OPTIONS:
+            if option in ("-X", "--method"):
+                method = value.upper()
+            has_body = has_body or option in _GH_API_BODY_OPTIONS
+        elif not word.startswith("-"):
             positional.append(word)
         i += 1
     assert len(positional) == 1, f"`gh api {' '.join(argv)}` has {len(positional)} endpoint arguments, not 1"
     if not method:
-        has_body = any(w in ("-f", "--raw-field", "-F", "--field", "--input") for w in argv)
         method = "POST" if has_body else "GET"
     return method, positional[0]
 
@@ -633,7 +680,8 @@ def test_the_protection_script_makes_only_the_reviewed_api_calls() -> None:
 
     * none of the forms `_script_commands` would read differently from bash: an unquoted heredoc
       delimiter (the shell expands such a body, so a `$(…)` there would run), a heredoc never
-      closed, `$'…'` quoting, an unbalanced quote;
+      closed, `$'…'` quoting, an unbalanced quote, and an arithmetic expansion `$((…))` outside
+      single quotes over anything but digits and operators (a constant one reads as `0`);
     * no word is `bash`, `sh` or `python…` (with or without a directory), `eval`, `source`,
       `curl` or `wget`; there is no `<<<`; no word holds `$(` or a backtick (a command
       substitution inside quotes, which this parser does not split into commands); no command
@@ -644,8 +692,9 @@ def test_the_protection_script_makes_only_the_reviewed_api_calls() -> None:
       `required_signatures`;
     * `REPO` and `BRANCH` are each assigned exactly once, to `MudwoodLabs/pyrxd` and `main`;
     * every endpoint is a literal path whose only variables are `${REPO}` and `${BRANCH}`;
-    * the method is never DELETE or POST, the only call whose endpoint mentions `protection` is
-      the PUT the test above checks, and the calls equal `_REVIEWED_GH_API_CALLS` word for word.
+    * the method, including one joined to its flag (`--method=PUT`, `-XPUT`), is never DELETE or
+      POST, the only call whose endpoint mentions `protection` is the PUT the test above checks,
+      and the calls equal `_REVIEWED_GH_API_CALLS` word for word.
 
     WHAT IT CANNOT SEE: it reads text, it is not a shell. A command the script builds while it
     runs, out of pieces that are each harmless text, and then has the shell evaluate (arithmetic
@@ -702,7 +751,69 @@ _BYPASSES: dict[str, tuple[str, str]] = {
         f"cat <<'EOF'\na \\\nEOF\n{_DELETE_ENFORCE_ADMINS}\ncat <<'EOF'\nb\nEOF\n",
         "is a DELETE",
     ),
+    # #777 lets a constant `$((…))` through; one that holds a command substitution must still fail.
+    "substitution-in-quoted-arithmetic": (f'ok "$(( $({_DELETE_ENFORCE_ADMINS_LITERAL}) ))"\n', "arithmetic expansion"),
+    "substitution-in-unquoted-arithmetic": (f"ok $(( $({_DELETE_ENFORCE_ADMINS_LITERAL}) ))\n", "arithmetic expansion"),
 }
+
+
+#: The DELETE with its method joined to the flag, as `gh` accepts it (#777). Before #777 the parser
+#: read these as an inferred GET; each must now fail as a DELETE. Kept apart from `_BYPASSES`
+#: because under bash the stand-in `gh` records the joined word, not `-X DELETE`.
+_JOINED_METHOD_BYPASSES: dict[str, str] = {
+    "method-equals": 'gh api --method=DELETE "repos/${REPO}/branches/${BRANCH}/protection/enforce_admins" --silent',
+    "x-joined": 'gh api -XDELETE "repos/${REPO}/branches/${BRANCH}/protection/enforce_admins" --silent',
+    "x-equals": 'gh api -X=DELETE "repos/${REPO}/branches/${BRANCH}/protection/enforce_admins" --silent',
+}
+
+
+@pytest.mark.parametrize("bypass", _JOINED_METHOD_BYPASSES)
+def test_a_joined_method_flag_is_read_as_the_method_it_names(tmp_path: Path, bypass: str) -> None:
+    """The text check names the DELETE, and bash really sends it, so the plant is a real one."""
+    plant = _JOINED_METHOD_BYPASSES[bypass]
+    with pytest.raises(AssertionError, match="is a DELETE"):
+        _check_protection_script(_planted(plant + "\n"))
+    _, calls = _run_with_stub_gh(tmp_path, _planted(plant + "\n"))
+    joined = plant.replace("${REPO}", "MudwoodLabs/pyrxd").replace("${BRANCH}", "main").replace('"', "")
+    assert joined.split()[1:] in calls, calls
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["-X", "PUT", "repos/r/x", "--input", "-"], ("PUT", "repos/r/x")),
+        (["--method=PUT", "repos/r/x", "--input", "-"], ("PUT", "repos/r/x")),
+        (["-XPUT", "repos/r/x", "--input", "-"], ("PUT", "repos/r/x")),
+        (["-X=put", "repos/r/x"], ("PUT", "repos/r/x")),
+        (["repos/r/x", "--input=-"], ("POST", "repos/r/x")),
+        (["repos/r/x", "-Fname=v"], ("POST", "repos/r/x")),
+        (["repos/r/x", "--raw-field=name=v"], ("POST", "repos/r/x")),
+        (["repos/r/x", "--jq=.visibility"], ("GET", "repos/r/x")),
+        (["repos/r/x", "--jq", ".visibility"], ("GET", "repos/r/x")),
+    ],
+)
+def test_method_and_endpoint_reads_joined_and_separate_flag_forms(argv: list[str], expected: tuple[str, str]) -> None:
+    """Honest path for #777: a PUT written `--method=PUT` or `-XPUT` is a PUT, not an inferred POST,
+    and a joined body flag still implies POST while a joined `--jq=` does not."""
+    assert _method_and_endpoint(argv) == expected
+
+
+@pytest.mark.parametrize("plant", ['ok "step $((1+1))"\n', "ok step-$((2 * 3))\n"])
+def test_a_constant_arithmetic_expansion_passes_and_runs_as_reviewed(tmp_path: Path, plant: str) -> None:
+    """Honest path for #777: `$((…))` over digits and operators is not a command substitution. The
+    text check passes the script with it, and under bash the calls are still exactly the reviewed ones."""
+    text = _planted(plant)
+    _check_protection_script(text)
+    proc, calls = _run_with_stub_gh(tmp_path, text)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(calls) == len(_REVIEWED_GH_API_CALLS), calls
+
+
+def test_arithmetic_over_a_variable_is_refused_as_arithmetic_not_as_a_substitution() -> None:
+    """`$((x))` is refused (bash would evaluate x's VALUE as arithmetic, and a subscript there can run
+    a command), and the message names what it is."""
+    with pytest.raises(AssertionError, match="arithmetic expansion over more than digits"):
+        _check_protection_script(_planted('ok "$((x))"\n'))
 
 
 #: A DELETE the text check CANNOT see, kept so the docstring's WHAT IT CANNOT SEE stays true: `$`
