@@ -120,7 +120,7 @@ from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, Swap
 from pyrxd.keys import PrivateKey
 from pyrxd.network.bitcoin import BitcoinCoreFundingReader, BitcoinCoreRpcSource
 from pyrxd.network.electrumx import ElectrumXClient
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 
 # Regtest-only: both HRPs are in AUDIT_CLEARED_NETWORKS so the legs' audit gates pass without an
@@ -1034,6 +1034,83 @@ def _taker_btc_leg_for_recovery(args, source, *, local: dict, env: dict, terms, 
     )
 
 
+#: BTC confirmations after which ``_refuse_if_btc_leg_spent`` calls a spender that reveals no p
+#: buried enough to tell the taker nothing more is owed on the BTC side. Below it the spender can
+#: still be replaced (while unconfirmed: the refund signals BIP125, and the claim leaf has no
+#: timelock) or reorged out, and a maker claim could take its place.
+_BTC_SPENDER_BURIED_CONFS = 6
+
+
+async def _refuse_if_btc_leg_spent(args, source, loc, terms, *, phase: str) -> None:
+    """The taker's ``--phase refund`` and ``--phase abort`` pre-check (#850 PR 1c, the BTC sibling
+    of the ETH runner's ``_refuse_if_counter_leg_settled_or_claimed``). It refuses; it never
+    concludes, and the coordinator is unchanged.
+
+    Refuses when the BTC HTLC's funding outpoint is already spent, as the ``--btc-rpc-url`` node
+    sees it (its mempool included on Bitcoin Core 24 or later; an older node sees confirmed
+    spenders only, and says so in the refusal). A spender whose witness opens this swap's hashlock is the maker's
+    claim: ``p`` is public, and the taker's move is ``--phase claim`` on the covenant, not a refund
+    (a refund could at best race the claim, and ``--phase refund`` would also push the covenant
+    refund to the maker). Any other spender is most likely the taker's own refund, and the taker is
+    told nothing more is owed only once it is ``_BTC_SPENDER_BURIED_CONFS`` deep; until then a claim
+    can still replace it, so the refusal says to re-run before t_rxd. A spentness the node cannot
+    read refuses too: nothing is known, and nothing is sent.
+
+    It trusts the one ``--btc-rpc-url`` node: a node that lags the chain answers from stale state,
+    and the witness that decides "claim" is not covered by the txid the bytes are checked against.
+    """
+    op = loc.funding_outpoint
+    outpoint = f"{op.txid}:{op.vout}"
+    claim_cmd = f"python scripts/btc_swap_two_host.py --role taker --phase claim --io {args.io} ..."
+    window = f"t_rxd = {terms.t_rxd.value} {terms.t_rxd.unit.value} after the covenant was mined"
+    try:
+        spender = await source.get_outpoint_spender(op.txid, op.vout)
+    except Exception as exc:
+        raise SystemExit(
+            f"REFUSING --phase {phase}: could not read whether the BTC HTLC funding outpoint {outpoint} is "
+            f"already spent ({str(exc)[:160]}). Nothing was sent. Retry once the BTC node can answer."
+        ) from None
+    if spender is None:
+        return
+    spender_txid = bt.btc_txid_from_raw(bytes(spender))
+    try:
+        bt.scrape_secret(bytes(spender), terms.hashlock)  # p is public by now, but it is not printed here
+    except ValidationError:
+        pass
+    else:
+        raise SystemExit(
+            f"REFUSING --phase {phase}: the maker CLAIMED the BTC HTLC in tx {spender_txid} (its witness opens "
+            "this swap's hashlock), so p is public and the RXD covenant is yours to claim before its CSV refund "
+            f"to the maker opens, {window}. A refund now could at best race that claim. Nothing was sent.\n"
+            f'  NEXT: write {{"btc_claim_tx_hex": "{bytes(spender).hex()}"}} into {args.io}/maker_claim.json '
+            f"and run: {claim_cmd}"
+        )
+    try:
+        await source.get_raw_tx(spender_txid, min_confirmations=_BTC_SPENDER_BURIED_CONFS)
+        depth = None  # buried
+    except InsufficientConfirmationsError as exc:
+        depth = f"{exc.have} confirmation(s)"
+    except Exception as exc:
+        depth = f"an unknown depth ({str(exc)[:80]})"
+    head = (
+        f"REFUSING --phase {phase}: the BTC HTLC funding outpoint {outpoint} is already spent by tx "
+        f"{spender_txid}, whose witness reveals no preimage of this swap's hashlock. That is most likely your "
+        "own refund (an earlier --phase abort or refund, or the watchtower's pre-signed refund). Nothing was "
+        "sent.\n"
+    )
+    if depth is None:
+        raise SystemExit(
+            head + f"  It is at least {_BTC_SPENDER_BURIED_CONFS} blocks deep. NEXT: check that {spender_txid} "
+            "pays your refund address; if it does, nothing more is owed to you on the BTC side."
+        )
+    raise SystemExit(
+        head + f"  It has {depth}, below {_BTC_SPENDER_BURIED_CONFS}: until it is buried, the maker can still "
+        "replace it with a claim (or a reorg can drop it), and then p would be public and the covenant yours to "
+        f"claim. NEXT: re-run this phase until it reports the refund buried, and before {window}; if it then "
+        "names a claim, follow that."
+    )
+
+
 async def taker_phase_abort(args) -> None:
     """TAKER recovery — get the TAKER'S OWN BTC leg back and stop (``--phase abort``).
 
@@ -1044,6 +1121,9 @@ async def taker_phase_abort(args) -> None:
     It CANNOT touch the covenant — the Radiant leg is built with ``_NoFeeSource`` and every covenant
     spend dispenses a fee input first. The covenant's CSV refund pays the MAKER; leaving it alone is
     the unwind working as designed, not value the taker is giving up.
+
+    It first refuses when the BTC HTLC's funding outpoint is already spent, naming ``--phase claim``
+    when the spender is the maker's claim (``_refuse_if_btc_leg_spent``, #850 PR 1c).
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
@@ -1065,6 +1145,7 @@ async def taker_phase_abort(args) -> None:
     )
 
     try:
+        await _refuse_if_btc_leg_spent(args, source, loc, terms, phase="abort")
         # A DISCLOSURE, never a gate: say what the maker's asset is doing so the operator is not
         # surprised later, but a Radiant node that cannot answer must not block the taker's own
         # recovery — which is exactly why nothing on this path depends on the read.
@@ -1103,8 +1184,10 @@ async def taker_phase_refund(args) -> None:
     KNOWN OPEN (#850, interim): the ETH sibling no longer sends the covenant refund from the
     taker's side, because a maker that claims the counter leg with ``p`` must leave the taker able
     to claim the covenant. On BTC the same race exists (the claim leaf has no timelock, so the maker
-    can claim while this BTC refund is unconfirmed), but this phase is unchanged until the
-    watchtower can tell the taker's own refund from a maker claim.
+    can claim while this BTC refund is unconfirmed), and the coordinator is unchanged until #850
+    PR 9a. What this phase does now (PR 1c) is refuse up front when the BTC outpoint is ALREADY
+    spent, naming ``--phase claim`` when the spender is the maker's claim
+    (``_refuse_if_btc_leg_spent``). A claim that lands after this check is not caught here.
 
     BOTH timeouts are checked BEFORE anything broadcasts. ``mutual_refund`` attempts the counter leg
     first and only then the asset, so calling it while the covenant is still immature would refund
@@ -1128,6 +1211,7 @@ async def taker_phase_refund(args) -> None:
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
 
     try:
+        await _refuse_if_btc_leg_spent(args, source, loc, terms, phase="refund")
         try:
             outpoint, value, confs = await _covenant_state(rxd_leg, cov=cov, expected_photons=terms.radiant_amount)
         except Exception as exc:

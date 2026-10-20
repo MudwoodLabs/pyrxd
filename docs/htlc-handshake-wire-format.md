@@ -599,7 +599,7 @@ funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG ent
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**
-(`scripts/btc_swap_two_host.py:855, 1398`; `scripts/eth_swap_two_host.py:825, 1582` — the second of
+(`scripts/btc_swap_two_host.py:855, 1482`; `scripts/eth_swap_two_host.py:825, 1582` — the second of
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only `SWAP_RECORD_SCHEMA_VERSION` (`swap_state.py:47`) versions the *durable
@@ -767,7 +767,7 @@ say "I will require 6 confirmations", and no message with which to renegotiate.
 
 `RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:863`). The
 harness threads an operator flag into it and defaults that to 1 as well, with the flag's own help
-text warning that real value must set it deep (`scripts/btc_swap_two_host.py:1539-1546`). A
+text warning that real value must set it deep (`scripts/btc_swap_two_host.py:1629-1636`). A
 shallow or mempool-only covenant funding is replaceable/reorgable: a maker who double-spends it
 after the taker has locked strands the taker's counter leg.
 

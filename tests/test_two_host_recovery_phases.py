@@ -40,7 +40,7 @@ from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.eth_wallet.events import function_selector
 from pyrxd.gravity.swap_state import SwapRole, SwapState
 from pyrxd.keys import PrivateKey
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 
 _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
@@ -153,8 +153,28 @@ class _FakeEthRpc:
 
 
 class _FakeBtcSource:
-    def __init__(self) -> None:
+    """The BTC node as the runner reads it. ``spender`` is what ``get_outpoint_spender`` returns
+    (``None`` = the HTLC outpoint is unspent), and ``spender_error`` makes that read fail."""
+
+    def __init__(
+        self, spender: bytes | None = None, spender_error: Exception | None = None, spender_confs: int = 0
+    ) -> None:
         self.closed = False
+        self.spender, self.spender_error, self.spender_confs = spender, spender_error, spender_confs
+        self.spender_reads: list[tuple[str, int]] = []
+
+    async def get_raw_tx(self, txid, min_confirmations: int = 6):
+        """The spender's depth, as ``BitcoinCoreRpcSource.get_raw_tx`` reports it."""
+        assert self.spender is not None and str(txid) == bt.btc_txid_from_raw(self.spender)
+        if self.spender_confs < min_confirmations:
+            raise InsufficientConfirmationsError(have=self.spender_confs, required=min_confirmations)
+        return self.spender
+
+    async def get_outpoint_spender(self, txid, vout):
+        self.spender_reads.append((str(txid), int(vout)))
+        if self.spender_error is not None:
+            raise self.spender_error
+        return self.spender
 
     async def close(self) -> None:
         self.closed = True
@@ -419,7 +439,18 @@ def _wire_eth(mod, monkeypatch, *, covenant_confs=10_000, covenant_funded=True, 
     return built
 
 
-def _wire_btc(mod, monkeypatch, *, covenant_confs=10_000, covenant_funded=True, btc_confs=10_000, counter_leg=None):
+def _wire_btc(
+    mod,
+    monkeypatch,
+    *,
+    covenant_confs=10_000,
+    covenant_funded=True,
+    btc_confs=10_000,
+    counter_leg=None,
+    spender=None,
+    spender_error=None,
+    spender_confs=0,
+):
     built: dict[str, object] = {}
 
     def _fake_radiant(args, *, taker_pkh, maker_pkh, fee_source):
@@ -428,7 +459,7 @@ def _wire_btc(mod, monkeypatch, *, covenant_confs=10_000, covenant_funded=True, 
         return leg
 
     def _fake_source(args):
-        src = _FakeBtcSource()
+        src = _FakeBtcSource(spender, spender_error, spender_confs)
         built["source"] = src
         return src
 
@@ -909,11 +940,106 @@ class TestTakerEthRefundSaysWhatHappenedWhenItFails:
         assert "NOT proof" in msg and "t_rxd = 120" in msg and "eth_claim_tx_hash" in msg, msg
 
 
+def _btc_spend(outpoint, witness: list[bytes]) -> bytes:
+    """A minimal segwit transaction spending *outpoint* with *witness* as its one input's stack."""
+
+    def varint(n: int) -> bytes:
+        return bytes([n])
+
+    body = (2).to_bytes(4, "little") + b"\x00\x01" + varint(1)
+    body += outpoint.prevout_bytes() + b"\x00" + (0xFFFFFFFD).to_bytes(4, "little")
+    body += varint(1) + (90_000).to_bytes(8, "little") + varint(1) + b"\x51"
+    body += varint(len(witness)) + b"".join(varint(len(item)) + item for item in witness)
+    return body + (0).to_bytes(4, "little")
+
+
+def _funding_outpoint(io_dir: Path):
+    return bt.BtcHtlcLocator.from_dict(
+        json.loads((io_dir / "taker_funding.json").read_text())["btc_locator"]
+    ).funding_outpoint
+
+
+class TestTakerBtcRecoveryRefusesWhenTheBtcLegIsAlreadySpent:
+    """#850 PR 1c: the BTC sibling of the ETH runner pre-check. ``--phase refund`` and ``--phase
+    abort`` read the BTC HTLC's funding outpoint first and refuse if it is already spent. A spender
+    whose witness opens H is the maker's claim, and the refusal names ``--phase claim`` and t_rxd;
+    any other spender is most likely the taker's own refund. Nothing is broadcast either way. The
+    coordinator is unchanged (PR 9a), so a claim that lands after the check is not caught here."""
+
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
+    async def test_a_maker_claim_refuses_and_names_the_claim_phase(self, btc_mod, tmp_path, monkeypatch, phase):
+        p = os.urandom(32)
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True, preimage=p)
+        claim = _btc_spend(
+            _funding_outpoint(io_dir), [os.urandom(64), p, b"\x20" + terms.hashlock + b"\x87", b"\xc0" + os.urandom(32)]
+        )
+        built = _wire_btc(btc_mod, monkeypatch, spender=claim)
+        with pytest.raises(SystemExit) as raised:
+            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
+        msg = str(raised.value.code)
+        assert "maker CLAIMED" in msg and bt.btc_txid_from_raw(claim) in msg, msg
+        assert "--phase claim" in msg and "maker_claim.json" in msg and "t_rxd = 120" in msg, msg
+        assert f'{{"btc_claim_tx_hex": "{claim.hex()}"}}' in msg, "the claim's bytes are in hand: print them"
+        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
+        assert built["source"].closed
+
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
+    @pytest.mark.parametrize("confs", [0, 5])
+    async def test_a_shallow_non_claim_spender_says_a_claim_can_still_replace_it(
+        self, btc_mod, tmp_path, monkeypatch, phase, confs
+    ):
+        """Hostile-review finding: "nothing more is owed" for an unconfirmed refund sent the taker
+        away while the maker could still replace it with a claim and keep both legs."""
+        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        refund = _btc_spend(_funding_outpoint(io_dir), [os.urandom(64), os.urandom(40), b"\xc0" + os.urandom(32)])
+        built = _wire_btc(btc_mod, monkeypatch, spender=refund, spender_confs=confs)
+        with pytest.raises(SystemExit) as raised:
+            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
+        msg = str(raised.value.code)
+        assert "already spent" in msg and "reveals no preimage" in msg and "your own refund" in msg, msg
+        assert f"{confs} confirmation(s)" in msg and "replace it with a claim" in msg and "t_rxd = 120" in msg, msg
+        assert "nothing more is owed" not in msg
+        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
+
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
+    async def test_a_buried_non_claim_spender_says_nothing_more_is_owed(self, btc_mod, tmp_path, monkeypatch, phase):
+        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        refund = _btc_spend(_funding_outpoint(io_dir), [os.urandom(64), os.urandom(40), b"\xc0" + os.urandom(32)])
+        built = _wire_btc(btc_mod, monkeypatch, spender=refund, spender_confs=6)
+        with pytest.raises(SystemExit) as raised:
+            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
+        msg = str(raised.value.code)
+        assert "at least 6 blocks deep" in msg and "nothing more is owed" in msg, msg
+        assert "--phase claim" not in msg
+        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
+
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
+    async def test_an_unreadable_spentness_refuses(self, btc_mod, tmp_path, monkeypatch, phase):
+        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_btc(btc_mod, monkeypatch, spender_error=NetworkError("node unreachable"))
+        with pytest.raises(SystemExit, match="could not read whether the BTC HTLC funding outpoint"):
+            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
+        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
+
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
+    async def test_an_unspent_outpoint_lets_the_phase_run_and_reads_the_right_outpoint(
+        self, btc_mod, tmp_path, monkeypatch, phase
+    ):
+        """Honest path: an unspent HTLC outpoint refunds as before, and the read named it."""
+        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_btc(btc_mod, monkeypatch)
+        await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
+        op = _funding_outpoint(io_dir)
+        assert built["source"].spender_reads == [(str(op.txid), op.vout)]
+        assert len(built["counter"].refund_calls) == 1
+
+
 class TestTakerRefundOnBtcIsStillTheMutualUnwind:
-    """#850 interim, BTC: unchanged in this release, so these pin the OLD behaviour on purpose. On
-    BTC the taker's run still sends the covenant refund — the same race is open there — until the
-    watchtower can tell the taker's own BTC refund from a maker claim. When that lands, the first
-    test here must fail and be rewritten to the ETH shape above."""
+    """#850 interim, BTC: the coordinator is unchanged in this release, so these pin the OLD
+    behaviour on purpose. On BTC the taker's run still sends the covenant refund when the BTC
+    outpoint is unspent at the pre-check (PR 1c refuses only when it is ALREADY spent, above), so
+    the same race stays open until PR 9a. When that lands, the first test here must fail and be
+    rewritten to the ETH shape above."""
 
     async def test_btc_refund_still_unwinds_both_legs(self, btc_mod, tmp_path, monkeypatch):
         args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
