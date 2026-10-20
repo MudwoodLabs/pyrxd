@@ -2712,7 +2712,7 @@ class _MemLock:
         yield
 
 
-def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None, fund_lock=None):
+def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None, fund_lock=None, role=None):
     """An ETH coordinator wired the way production must be.
 
     `persist` is supplied unconditionally because the coordinator now REFUSES an ETH counter-leg
@@ -2733,6 +2733,7 @@ def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy
             margin_policy=policy or _eth_fund_policy(),
             maker_stall_safety_window_blocks=6,
             fund_lock=fund_lock,
+            role=role,
         ),
     )
     coord.persisted = []

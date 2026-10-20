@@ -422,6 +422,19 @@ def persisted_state_refusal(role: str, phase: str, persisted: Any) -> str | None
     return why.format(state=persisted.state.value, t_rxd=f"{t_rxd.value} {t_rxd.unit.value}")
 
 
+def _refuse_another_roles_record(persisted: Any, *, role: str, path: Any) -> None:
+    """The record names the side that wrote it (#850 PR 3). A phase run as the other side would act
+    on that side's record, including the phases that build no coordinator, so the runners check it
+    here as well as in the coordinator. A record from before 0.27 names no role and passes."""
+    written = getattr(persisted, "role", None)
+    if written is not None and written.value != role:
+        raise SystemExit(
+            f"REFUSING: the swap record at {path} was written by the {written.value} side, and this phase "
+            f"runs as {role}. Nothing was sent. Run it with --role {written.value}, or check you have the "
+            "right record."
+        )
+
+
 def refuse_by_persisted_state(sink: Any, *, terms: Any, role: str, phase: str) -> None:
     """Apply :data:`PHASE_STATE_RULES` at the TOP of a phase, before any chain read.
 
@@ -447,6 +460,7 @@ def refuse_by_persisted_state(sink: Any, *, terms: Any, role: str, phase: str) -
             f"different swaps): record {persisted.terms.hashlock.hex()[:16]}…, terms {terms.hashlock.hex()[:16]}…. "
             "Nothing was sent. Find out which swap you mean to recover before running this phase again."
         )
+    _refuse_another_roles_record(persisted, role=role, path=path)
     refusal = persisted_state_refusal(role, phase, persisted)
     if refusal is not None:
         raise SystemExit(f"REFUSING {role} --phase {phase}: {refusal}. Nothing was sent. (record: {path})")
@@ -590,6 +604,7 @@ def merge_with_persisted_record(sink: Any, rebuilt: Any, *, source: str, role: s
         ) from None
     if persisted is None:
         return rebuilt
+    _refuse_another_roles_record(persisted, role=role, path=path)
 
     def _refuse(field: str, kept: Any, rebuilt_value: Any) -> SystemExit:
         return SystemExit(

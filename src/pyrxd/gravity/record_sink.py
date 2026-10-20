@@ -116,9 +116,27 @@ class JsonFileRecordSink:
             )
             incoming["state"] = prior["state"]
 
+    def _keep_the_persisted_role(self, prior: dict[str, Any] | None, incoming: dict[str, Any]) -> None:
+        """The role on disk binds every later write (#850 PR 3). A write naming ANOTHER role is
+        refused: the record is the other party's, and its role-scoped steps would act for the wrong
+        side. A write naming none (a record built outside a coordinator) keeps the persisted one,
+        and the schema version that comes with it, rather than dropping it."""
+        if prior is None or prior.get("role") is None:
+            return
+        role = incoming.get("role")
+        if role is None:
+            incoming["role"] = prior["role"]
+            incoming["schema_version"] = max(int(incoming.get("schema_version") or 0), int(prior["schema_version"]))
+        elif role != prior["role"]:
+            raise ValidationError(
+                f"the swap record at {self._path} was written by the {prior['role']} side; refusing to "
+                f"overwrite it with a {role}-role record. Run this with the role the record names."
+            )
+
     async def __call__(self, record: Any) -> None:
         as_dict = record.to_dict()
         prior = self._refuse_to_clobber_a_different_swap(as_dict)
+        self._keep_the_persisted_role(prior, as_dict)
         self._keep_a_persisted_reveal(prior, as_dict, self._path)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
         tmp = None

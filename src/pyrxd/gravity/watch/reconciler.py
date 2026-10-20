@@ -137,6 +137,18 @@ class Reconciler:
             delivered = await self._safe_handle(_STORE, decision)
             return [ReconcileResult(_STORE, decision, error=err, alert_delivered=delivered)]
         results: list[ReconcileResult] = []
+        # Each record the store could not read pages BY NAME (#850 PR 3). The store skips it so one
+        # bad file cannot blind the tower to the rest, but a skipped record is a swap nobody is
+        # watching: before this it paged only if EVERY record failed. A store without the attribute
+        # (any other RecordStore) reports none.
+        for swap_id, why in list(getattr(self._store, "unreadable", ()) or ()):
+            decision = Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=f"swap record {swap_id} is NOT being watched: {why}",
+                recommended_action="read the record with a pyrxd that can, and watch this swap manually until then",
+            )
+            delivered = await self._safe_handle(swap_id, decision)
+            results.append(ReconcileResult(swap_id, decision, error=why, alert_delivered=delivered))
         for swap_id, record in active:
             results.append(await self._reconcile_one(swap_id, record))
         return results
