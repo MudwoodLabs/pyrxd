@@ -105,6 +105,13 @@ _KNOWN_UNREACHED: dict[str, str] = {
     "src/pyrxd/script/consensus.py::is_valid_script_size": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/script/consensus.py::iter_script_ops": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
     "src/pyrxd/security/errors.py::UnsupportedScriptError": "EXPOSED 2026-08-31 by closing the __all__ hole; PRE-EXISTING, needs triage",
+    # -- landed ahead of its caller BY DESIGN (docs/plans/2026-10-09-counter-leg-disposition-
+    #    from-chain-design.md, the §8 behaviour table row for PRs 4 and 4a: "reader available,
+    #    unused").
+    #    PR 5a wires it into the coordinator; the stale-entry test then forces this out.
+    "src/pyrxd/eth_wallet/disposition.py::read_counter_disposition": (
+        "#850 PR 4: read-only reader landed before its caller; PR 5a (coordinator) wires it"
+    ),
     # -- flagged and REPORTED as findings when this scan landed (2026-08-27). Each is a shipped
     #    capability whose only callers are tests — the exact defect class this file exists to
     #    catch, found already present. They are allowlisted so the scan can land green, and left

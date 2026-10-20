@@ -1,0 +1,278 @@
+"""A fake EVM chain holding ONE ``EthHtlc`` contract, and endpoints that read it honestly or not.
+
+For the #850 disposition reader (``pyrxd.eth_wallet.disposition``). The chain models what the
+reader consumes: blocks (number, hash, timestamp), the contract's ``settled`` slot as of each block,
+receipts with their logs, and a ``finalized`` height. It enforces the contract's own rules when an
+honest transaction is added (claim only before the timeout, refund only at or after it, once), so a
+test that wants an impossible chain says so by calling :meth:`FakeEvmChain.force_receipt`.
+
+Endpoints read the chain with the misbehaviours the design names (§2.6, §7): lag, a forged
+``Refunded`` log, a hidden ``Claimed`` log, a forged receipt, a 429 on every log read, a block-range
+cap, and no historic state. Each endpoint is a distinct host (``tests._source_hosts``), so the
+production ``MultiSourceEthRpc`` accepts them as a quorum.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+from typing import Any
+
+from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.security.errors import NetworkError
+from tests._source_hosts import distinct_host
+
+GENESIS_TS = 1_800_000_000
+BLOCK_SECONDS = 12
+CHAIN_ID = 11155111
+CONTRACT = "0x" + "c0" * 20
+OTHER_CONTRACT = "0x" + "0d" * 20
+
+
+def _block_hash(number: int, fork: str = "") -> bytes:
+    return hashlib.sha256(f"{fork}block-{number}".encode()).digest()
+
+
+def _tx_hash(label: str) -> str:
+    return "0x" + hashlib.sha256(label.encode()).hexdigest()
+
+
+@dataclass
+class FakeEvmChain:
+    """One chain: blocks ``0..head``, the contract deployed at ``deploy_block``."""
+
+    preimage: bytes
+    timeout: int
+    head: int = 100
+    finalized: int = 64
+    deploy_block: int = 10
+    settled_at: int | None = None
+    receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.hashlock = hashlib.sha256(self.preimage).digest()
+        self.deploy_tx = _tx_hash("deploy")
+        self.receipts[self.deploy_tx] = self._receipt(self.deploy_block, logs=[], status=1)
+
+    # -- shape
+
+    def ts(self, number: int) -> int:
+        return GENESIS_TS + number * BLOCK_SECONDS
+
+    def first_block_at(self, ts: int) -> int:
+        """The lowest block whose timestamp is ``>= ts``."""
+        return max(0, -(-(ts - GENESIS_TS) // BLOCK_SECONDS))
+
+    def locator(self, *, deploy_tx_hash: str | None = None) -> EthHtlcLocator:
+        return EthHtlcLocator(
+            chain_id=CHAIN_ID,
+            contract_address=CONTRACT,
+            deploy_tx_hash=deploy_tx_hash or self.deploy_tx,
+            hashlock="0x" + self.hashlock.hex(),
+            claimant="0x" + "aa" * 20,
+            refundee="0x" + "bb" * 20,
+            timeout=self.timeout,
+            amount_wei=10**15,
+        )
+
+    def _receipt(
+        self, block: int, *, logs: list[dict[str, Any]], status: int, block_hash: bytes | None = None
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "blockNumber": block,
+            "blockHash": block_hash if block_hash is not None else _block_hash(block),
+            "logs": logs,
+        }
+
+    # -- honest transactions (the contract's own rules)
+
+    def claim(self, block: int, *, preimage: bytes | None = None, label: str = "claim") -> str:
+        p = self.preimage if preimage is None else preimage
+        if self.settled_at is not None or self.ts(block) >= self.timeout:
+            raise AssertionError("the contract would revert this claim; use force_receipt for an impossible chain")
+        if hashlib.sha256(p).digest() != self.hashlock:
+            raise AssertionError("the contract would revert a wrong preimage")
+        tx = _tx_hash(label)
+        log = {
+            "address": CONTRACT,
+            "topics": [CLAIMED_TOPIC0],
+            "data": "0x" + p.hex(),
+            "transactionHash": tx,
+            "blockNumber": block,
+        }
+        self.receipts[tx] = self._receipt(block, logs=[log], status=1)
+        self.settled_at = block
+        return tx
+
+    def refund(self, block: int, *, label: str = "refund") -> str:
+        if self.settled_at is not None or self.ts(block) < self.timeout:
+            raise AssertionError("the contract would revert this refund; use force_receipt for an impossible chain")
+        tx = _tx_hash(label)
+        log = {
+            "address": CONTRACT,
+            "topics": [REFUNDED_TOPIC0],
+            "data": "0x",
+            "transactionHash": tx,
+            "blockNumber": block,
+        }
+        self.receipts[tx] = self._receipt(block, logs=[log], status=1)
+        self.settled_at = block
+        return tx
+
+    def reverted(self, block: int, *, label: str = "reverted") -> str:
+        """A failed refund: mined, status 0, and (as on a real chain) no logs."""
+        tx = _tx_hash(label)
+        self.receipts[tx] = self._receipt(block, logs=[], status=0)
+        return tx
+
+    def force_receipt(
+        self,
+        block: int,
+        *,
+        topic0: str,
+        data: str = "0x",
+        address: str = CONTRACT,
+        label: str,
+        status: int = 1,
+        block_hash: bytes | None = None,
+        settles: bool = False,
+    ) -> str:
+        """A receipt the contract could not have produced (or one from another contract). For the
+        contradiction rules, which exist because real chains are read through endpoints that lie."""
+        tx = _tx_hash(label)
+        log = {"address": address, "topics": [topic0], "data": data, "transactionHash": tx, "blockNumber": block}
+        self.receipts[tx] = self._receipt(block, logs=[log], status=status, block_hash=block_hash)
+        if settles:
+            self.settled_at = block
+        return tx
+
+    def logs(self) -> list[dict[str, Any]]:
+        out = []
+        for r in self.receipts.values():
+            if r["status"] == 1:
+                out.extend(r["logs"])
+        return out
+
+
+class FakeEvmEndpoint:
+    """One endpoint's view of a :class:`FakeEvmChain`. Honest unless told otherwise."""
+
+    def __init__(
+        self,
+        chain: FakeEvmChain,
+        *,
+        lag: int = 0,
+        fork: str = "",
+        forge_refunded_tx: str | None = None,
+        forge_receipt: bool = False,
+        hide_claimed: bool = False,
+        logs_429: bool = False,
+        range_cap: int | None = None,
+        archive: bool = True,
+        claim_settled_at_tip: bool = False,
+        extra_logs: tuple[dict[str, Any], ...] = (),
+    ) -> None:
+        self.chain = chain
+        self.lag = lag
+        self.fork = fork
+        self.forge_refunded_tx = forge_refunded_tx
+        self.forge_receipt = forge_receipt
+        self.hide_claimed = hide_claimed
+        self.logs_429 = logs_429
+        self.range_cap = range_cap
+        self.archive = archive
+        self.claim_settled_at_tip = claim_settled_at_tip
+        self.extra_logs = extra_logs
+        self.source_key = distinct_host()
+        self.expected_chain_id = CHAIN_ID
+        self.log_requests: list[tuple[int, int | str]] = []
+
+    @property
+    def head(self) -> int:
+        return self.chain.head - self.lag
+
+    def _hash(self, number: int) -> bytes:
+        # A fork only diverges above the deploy block, so both sides agree on old history.
+        return _block_hash(number, self.fork if number > self.chain.deploy_block else "")
+
+    async def finalized_block_number(self) -> int:
+        return min(self.chain.finalized, self.head)
+
+    async def block_number(self) -> int:
+        return self.head
+
+    async def latest_block_timestamp(self) -> int:
+        return self.chain.ts(self.head)
+
+    async def block_hash_and_timestamp(self, number: int) -> tuple[bytes, int]:
+        if number > self.head:
+            raise NetworkError(f"block {number} not found")
+        return self._hash(number), self.chain.ts(number)
+
+    async def canonical_block_hash(self, number: int) -> bytes:
+        if number > self.head:
+            return b""
+        return self._hash(number)
+
+    async def get_storage_at(self, address: str, slot: int, block_identifier: str | int) -> bytes:
+        assert slot == 0
+        if block_identifier == "latest":
+            at = self.head
+            if self.claim_settled_at_tip:
+                return (1).to_bytes(32, "big")
+        else:
+            if not self.archive and int(block_identifier) < self.head - 128:
+                raise NetworkError("missing trie node (historic state unavailable)")
+            at = int(block_identifier)
+        if address.lower() != CONTRACT:
+            return bytes(32)
+        settled = self.chain.settled_at is not None and self.chain.settled_at <= at
+        return (1 if settled else 0).to_bytes(32, "big")
+
+    async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
+        if self.forge_receipt and tx_hash == self.forge_refunded_tx:
+            block = self.chain.finalized
+            return {
+                "status": 1,
+                "blockNumber": block,
+                "blockHash": self._hash(block),
+                "logs": [{"address": CONTRACT, "topics": [REFUNDED_TOPIC0], "data": "0x"}],
+            }
+        r = self.chain.receipts.get(tx_hash)
+        if r is None or r["blockNumber"] > self.head:
+            return None
+        return dict(r)
+
+    async def get_logs(
+        self, *, address: str, topics: Any = None, from_block: int | str = "earliest", to_block: int | str = "latest"
+    ) -> list[dict[str, Any]]:
+        self.log_requests.append((int(from_block), to_block))
+        if self.logs_429:
+            raise NetworkError("eth_getLogs failed: 429 Too Many Requests")
+        hi = self.head if to_block == "latest" else int(to_block)
+        lo = int(from_block)
+        if self.range_cap is not None and to_block != "latest" and hi - lo + 1 > self.range_cap:
+            raise NetworkError(f"eth_getLogs failed: query exceeds max block range {self.range_cap}")
+        out = []
+        for log in self.chain.logs():
+            if not (lo <= log["blockNumber"] <= min(hi, self.head)):
+                continue
+            if log["address"].lower() != address.lower():
+                continue
+            if self.hide_claimed and log["topics"][0] == CLAIMED_TOPIC0:
+                continue
+            out.append(dict(log))
+        out.extend(dict(log) for log in self.extra_logs if lo <= log["blockNumber"] <= hi)
+        if self.forge_refunded_tx is not None and lo <= self.chain.finalized <= hi:
+            out.append(
+                {
+                    "address": CONTRACT,
+                    "topics": [REFUNDED_TOPIC0],
+                    "data": "0x",
+                    "transactionHash": self.forge_refunded_tx,
+                    "blockNumber": self.chain.finalized,
+                }
+            )
+        return out

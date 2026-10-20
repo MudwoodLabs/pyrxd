@@ -46,11 +46,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..network.redaction import redact_endpoints_in
 from ..network.source_identity import require_distinct_sources
 from ..security.errors import NetworkError, ValidationError
+
+if TYPE_CHECKING:
+    from .disposition import LogUnion
 
 __all__ = ["MultiSourceEthRpc", "read_contract"]
 
@@ -442,6 +445,14 @@ class MultiSourceEthRpc:
         checked against the hashlock — so a lying endpoint cannot forge one, and a missing log is a
         liveness problem rather than a safety one."""
         return await self.primary.get_logs(*args, **kwargs)
+
+    async def get_logs_union(self, *, address: str, topics: list[Any], from_block: int, to_block: int) -> LogUnion:
+        """The #850 union log read: EVERY source is asked, unlike :meth:`get_logs` (primary only, for
+        the self-verifying preimage scrape). Returns the union and who answered; a source that fails
+        is recorded, never read as empty. For NOMINATION only: each log names a tx to verify."""
+        from .disposition import union_logs
+
+        return await union_logs(self, address=address, topics=topics, from_block=from_block, to_block=to_block)
 
     async def close(self) -> None:
         await asyncio.gather(*(s.close() for s in self._sources), return_exceptions=True)
