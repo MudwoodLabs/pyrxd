@@ -106,3 +106,46 @@ async def test_a_failed_reproof_still_records_the_lock_unpinned(tmp_path):
     record = await _crash_then_resume(tmp_path, break_reproof=True)
     assert record.state is SwapState.BTC_LOCKED
     assert record.radiant_covenant_outpoint is None
+
+
+# --------------------------------------------------------------------------- a value-bearing chain
+
+
+def _vb_coordinator(sink, base, terms):
+    view = T._ChainView(
+        pays=T._covenant(terms), value=terms.radiant_amount, confs=6, base=base, bits=T._HARD_BITS, tip_time=T._NOW
+    )
+    btc = R._Btc([])
+    coord, _ = T._btc_coord(
+        terms,
+        T._real_leg(view, network="bc"),
+        btc_view=btc,
+        persist=sink,
+        role=SwapRole.TAKER,
+        policy=T._vb_policy(),
+        accept_nondurable_seen=True,
+    )
+    return coord, btc
+
+
+async def test_on_a_value_bearing_chain_the_resumed_fund_is_pinned_too(tmp_path, monkeypatch):
+    """Mythos review of PR 1b (MEDIUM): the re-proof ran without the caller's clock, and on a
+    value-bearing chain the proof refuses without one, so the pin never happened where it matters.
+    The regtest tests above could not see it: there the clock is optional."""
+    base, _chain = T._value_bearing_chain(monkeypatch)
+    terms = T._vb_terms(400)
+    sink = JsonFileRecordSink(tmp_path / "swap1.json")
+    coord, btc = _vb_coordinator(sink, base, terms)
+    btc.read = "network"  # the broadcast lands; the readback fails
+    with pytest.raises(NetworkError):
+        await coord.taker_funds_btc(terms, now_unix_s=T._NOW)
+    fresh, _btc = _vb_coordinator(sink, base, terms)  # a new process
+    fresh.counter_leg = coord.counter_leg
+    btc.read = "ok"
+    await fresh.resume_interrupted_fund(terms, sink=sink, now_unix_s=T._NOW)
+    record = sink.load_record()
+    assert record.state is SwapState.BTC_LOCKED
+    assert record.radiant_covenant_outpoint is not None
+    decision = await _tower(tmp_path, record)
+    assert decision.autonomous_btc_refund is False
+    assert "maker never locked" not in decision.reason

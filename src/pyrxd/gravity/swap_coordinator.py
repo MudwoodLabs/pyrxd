@@ -2662,7 +2662,9 @@ class SwapCoordinator:
             f"{blocks_s} s at ε = {early.epsilon:.3g}, and the newest header may be up to {slack} s old",
         )
 
-    async def _try_pin_covenant_on_resume(self, terms: NegotiatedTerms) -> None:
+    async def _try_pin_covenant_on_resume(
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None, now_sampled_monotonic: float
+    ) -> None:
         """Best effort, on the resume path whose fund already landed: re-prove the maker's covenant so
         the record is pinned like a fresh fund's (#850 PR 1b, security review MEDIUM).
 
@@ -2674,7 +2676,11 @@ class SwapCoordinator:
         leaves the record unpinned, which is what it was before, and never stops the lock being
         recorded: the funds already moved."""
         try:
-            outpoint, _value, _upper = await self.taker_verify_asset_funding(terms)
+            # The CALLER's clock: on a value-bearing chain the proof refuses without one, so the pin
+            # silently never happened on mainnet (Mythos review of PR 1b, MEDIUM).
+            outpoint, _value, _upper = await self.taker_verify_asset_funding(
+                terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
+            )
             spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms)).hex()
         except Exception as exc:  # the lock is recorded regardless; say why it is unpinned
             logger.warning(
@@ -2903,7 +2909,9 @@ class SwapCoordinator:
                 # check run — recording an output already on chain sends nothing, and refusing would
                 # only leave the funds untracked (the stranding this path exists to end).
                 if getattr(self, "_fund_verified_covenant", None) is None:
-                    await self._try_pin_covenant_on_resume(terms)
+                    await self._try_pin_covenant_on_resume(
+                        terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
+                    )
                 rec = await self._record_counter_lock(terms, landed)
                 # Best effort: a seen-store that lost H (restored backup, rotated store) would accept a
                 # later swap under it. The lock is already recorded; a failing store must not undo that.
