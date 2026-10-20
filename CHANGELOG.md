@@ -84,7 +84,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (#850 design §2.9, deferred from PR 3 to land with these pages). The tower therefore reads the
     covenant's depth for a taker's `BTC_LOCKED` record every tick: a maker's BTC claim on such a
     record is now assessed (a claim page) instead of "finality un-assessable", and an RXD source set
-    below quorum pages "reconcile error" for it. A record resumed from a confirmed fund is not pinned.
+    below quorum pages "reconcile error" for it. A fund resumed after a crash whose BTC had already
+    landed re-proves the covenant to pin it. If that re-proof fails, the lock is still recorded,
+    unpinned. The ETH pages read the pin too.
   - `scripts/watchtower_dust_run.py` writes its record with `role: taker`.
 - **The BTC two-host runner's taker `--phase refund` and `--phase abort` refuse when the BTC HTLC
   is already spent (#850 PR 1c).** Before anything is sent they read the HTLC's funding outpoint.

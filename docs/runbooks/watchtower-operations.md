@@ -67,8 +67,10 @@ into the same app or receiver changes nothing.
   From 0.27 the tower arms an autonomous refund or claim only for a record that names the taker (or
   the single operator) as its writer, `"role": "taker"` or `"none"`. A record written before 0.27
   has no role and is paged but never acted on; it gains one the next time a 0.27 coordinator saves
-  it. The BTC refund is also never autonomous while the maker's covenant is observed, because the
-  maker can still claim until the refund confirms: the tower pages, and you refund and watch.
+  it. The BTC refund is also never autonomous while the maker's covenant is known (observed, or
+  pinned on the record), because the maker can still claim until the refund confirms: the tower
+  pages, and you refund and watch. A taker's coordinator pins the covenant its fund was verified
+  against, including on a resumed fund, so in practice a taker's BTC refund is paged, not sent.
 - **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,
   whether or not the maker's covenant is on chain. A maker's record is paged to refund its covenant
   at t_rxd, never to run the taker's `taker_refund_btc` or `mutual_refund`.
