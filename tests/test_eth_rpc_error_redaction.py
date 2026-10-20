@@ -80,6 +80,7 @@ _CALLS = {
     "get_transaction_count": lambda r: r.get_transaction_count("0x" + "11" * 20),
     "fee_fields": lambda r: r.fee_fields(),
     "preflight": lambda r: r.preflight({"from": "0x" + "11" * 20, "to": "0x" + "22" * 20, "data": "0x"}),
+    "estimate_gas": lambda r: r.estimate_gas({"from": "0x" + "11" * 20, "to": "0x" + "22" * 20, "data": "0x"}),
     "send_raw": lambda r: r.send_raw(b"\x02\x00"),
     "wait_receipt": lambda r: r.wait_receipt("0x" + "ab" * 32, timeout_s=2.0),
     "get_transaction": lambda r: r.get_transaction("0x" + "ab" * 32),

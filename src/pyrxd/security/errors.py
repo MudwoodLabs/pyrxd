@@ -48,6 +48,7 @@ __all__ = [
     "PoolTooSmallError",
     "PreRevealAbort",
     "PreRevealExpired",
+    "RefundGasAboveCeiling",
     "RpcMethodNotFound",
     "RxdSdkError",
     "ServerInconsistencyError",
@@ -367,6 +368,23 @@ class NothingToRefund(ValidationError):
     def __init__(self, message: str, *, contract_address: str | None = None) -> None:
         super().__init__(message)
         self.contract_address = contract_address
+
+
+class RefundGasAboveCeiling(ValidationError):
+    """An EVM refund was refused BEFORE signing because ``eth_estimateGas`` says it needs more gas
+    than the refund's fixed limit (#850 PR 4a).
+
+    A refund sent anyway would run out of gas, revert, and leave the contract unsettled while the
+    sender pays for the whole limit. The measured honest refund uses about 86k gas against a
+    150k limit, so an estimate above the limit means something about this contract or chain is
+    not what the swap was built for. Its own type so the operator is told that, not "would
+    revert" or "not yet mature". Nothing was signed or sent.
+    """
+
+    def __init__(self, message: str, *, estimate: int, ceiling: int) -> None:
+        super().__init__(message)
+        self.estimate = estimate
+        self.ceiling = ceiling
 
 
 class CounterLegClaimedByCounterparty(ValidationError):

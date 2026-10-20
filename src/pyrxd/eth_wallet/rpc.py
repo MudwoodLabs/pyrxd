@@ -406,8 +406,9 @@ class EthRpc:
 
         Fails fast (raises :class:`ValidationError`) instead of burning gas on a tx the
         node will mine-and-revert (e.g. a premature refund, a bad preimage, an
-        already-settled HTLC). A transport failure is a :class:`NetworkError`. Strips
-        gas/fee fields the node would reject in an eth_call.
+        already-settled HTLC). A transport failure is a :class:`NetworkError`. Strips the fee
+        fields, and KEEPS ``gas`` (#850 PR 4a): an eth_call without it runs with the node's own
+        large cap, so a call that would run out of gas at the signed limit passed here.
 
         CONSERVATIVE CLASSIFICATION (red-team): a definite revert is recognised ONLY from
         web3's TYPED contract-exception classes — an honest node raises ContractLogicError /
@@ -420,7 +421,7 @@ class EthRpc:
         safety gate, so under uncertainty we retry rather than permanently block the exit. A
         genuinely premature refund still reverts typed (NotYetExpired) on any honest node.
         """
-        call_tx = {k: v for k, v in tx.items() if k in ("from", "to", "value", "data", "input")}
+        call_tx = {k: v for k, v in tx.items() if k in ("from", "to", "value", "data", "input", "gas")}
         web3 = _require_web3()
         try:
             await self._w3.eth.call(call_tx)
@@ -433,6 +434,25 @@ class EthRpc:
             if contract_errors and isinstance(exc, contract_errors):
                 raise self._failed("tx would revert (preflight eth_call)", exc, kind=ValidationError)
             raise self._failed("preflight eth_call failed", exc)
+
+    async def estimate_gas(self, tx: dict[str, Any]) -> int:
+        """``eth_estimateGas`` for *tx*, with its ``gas`` and fee fields stripped so the node
+        estimates what the call NEEDS rather than whether it fits the limit already set. A typed
+        contract revert is a :class:`ValidationError`, classified as :meth:`preflight` does; any
+        other failure is a retryable :class:`NetworkError`."""
+        call_tx = {k: v for k, v in tx.items() if k in ("from", "to", "value", "data", "input")}
+        web3 = _require_web3()
+        try:
+            return int(await self._w3.eth.estimate_gas(call_tx))
+        except Exception as exc:
+            contract_errors = tuple(
+                getattr(web3.exceptions, n)
+                for n in ("ContractLogicError", "ContractCustomError", "ContractPanicError")
+                if hasattr(web3.exceptions, n)
+            )
+            if contract_errors and isinstance(exc, contract_errors):
+                raise self._failed("tx would revert (eth_estimateGas)", exc, kind=ValidationError)
+            raise self._failed("eth_estimateGas failed", exc)
 
     async def send_raw(self, raw_tx: bytes) -> str:
         try:

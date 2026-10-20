@@ -144,6 +144,9 @@ class _Rpc:
     async def preflight(self, tx):
         return None
 
+    async def estimate_gas(self, tx):
+        return 86_000  # the design's measured refund gasUsed (§3.4), under the 150k limit
+
     async def send_raw(self, raw):
         from eth_utils import keccak
 
@@ -214,7 +217,7 @@ async def test_a_refund_is_priced_at_the_nodes_own_fee(frozen_clock):
     await _leg(rpc).refund(_locator(timeout=_NOW))
     (base,) = rpc.built
     assert (base["maxFeePerGas"], base["maxPriorityFeePerGas"]) == (2_000_000_002, 2)
-    assert base["gas"] == 100_000  # a field of the signed refund
+    assert base["gas"] == 150_000  # a field of the signed refund (REFUND_GAS_LIMIT, #850 PR 4a)
 
 
 async def test_a_claim_quoted_a_fee_BELOW_its_tip_is_priced_at_the_tip(frozen_clock):

@@ -331,10 +331,10 @@ class EthLeg:
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
         return await self._leg.claim(locator, preimage)
 
-    async def refund(self, locator: EthHtlcLocator, timeout=None) -> str:
-        # The ETH timeout is the contract immutable carried by the locator; the relative
-        # Timelock the coordinator passes (BTC-shaped) is intentionally ignored.
-        return await self._leg.refund(locator)
+    async def refund(self, locator: EthHtlcLocator, timeout=None, *, on_signed=None) -> str:
+        # The ETH timeout is the locator's contract immutable; the coordinator's BTC-shaped Timelock
+        # is ignored. `on_signed` is forwarded (#850 PR 4a); no caller passes it until PR 5b.
+        return await self._leg.refund(locator, on_signed=on_signed)
 
     # -- what happened to the contract (#850: explaining a failed refund) --------------------
 

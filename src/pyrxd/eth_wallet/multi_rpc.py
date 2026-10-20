@@ -423,6 +423,12 @@ class MultiSourceEthRpc:
         """PRIMARY only — a fee estimate is advice about one endpoint's mempool, not a fact."""
         return await self.primary.fee_fields()
 
+    async def estimate_gas(self, tx: dict) -> int:
+        """Conservative MIN across the quorum. Only the refund's ceiling check reads this: an
+        endpoint inflating its estimate could otherwise refuse the honest refund, while one
+        deflating it can only let a refund run out of gas, which the receipt then shows."""
+        return await self.eth_call_quorum(lambda s: s.estimate_gas(tx), label="estimate_gas", combine=min)
+
     async def preflight(self, tx: dict) -> None:
         return await self.primary.preflight(tx)
 

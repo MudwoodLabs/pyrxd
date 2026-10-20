@@ -79,7 +79,7 @@ def rig(monkeypatch):
             raise answer
         return answer
 
-    async def _parent_refund(self, locator):
+    async def _parent_refund(self, locator, **_kw):
         state["parent_calls"] += 1
         return "0x" + "ee" * 32
 

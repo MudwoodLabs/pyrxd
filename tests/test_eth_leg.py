@@ -261,7 +261,7 @@ async def test_claim_refund_fetch_verdict_delegate(monkeypatch):
         seen["claim"] = (locator, preimage)
         return "0xclaim"
 
-    async def fake_refund(locator):
+    async def fake_refund(locator, **_kw):
         seen["refund"] = locator
         return "0xrefund"
 

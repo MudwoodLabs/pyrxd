@@ -470,7 +470,9 @@ class TestPreflight:
         client, node = _client(call=HexBytes(b""))  # an eth_call that returns nothing, as web3 does
         assert _run(client.preflight(_CLAIM_TX)) is None
         (args, _kwargs) = node.asked("call")[0]
-        assert args[0] == {k: _CLAIM_TX[k] for k in ("from", "to", "value", "data")}
+        # `gas` is KEPT (#850 PR 4a): without it the call runs at the node's own cap, so a tx that
+        # would run out of gas at its signed limit passed here.
+        assert args[0] == {k: _CLAIM_TX[k] for k in ("from", "to", "value", "data", "gas")}
 
     @pytest.mark.parametrize(
         "exc",

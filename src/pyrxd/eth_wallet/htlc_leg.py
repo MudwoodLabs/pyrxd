@@ -53,12 +53,13 @@ from pyrxd.security.errors import (
     NetworkError,
     PreRevealAbort,
     PreRevealExpired,
+    RefundGasAboveCeiling,
     ValidationError,
 )
 from pyrxd.security.reveal import mark_reveal_crossed, watching_for_reveal
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-__all__ = ["EthHtlcContractLeg", "create_address", "load_artifact"]
+__all__ = ["REFUND_GAS_LIMIT", "EthHtlcContractLeg", "create_address", "load_artifact", "refund_ran_out_of_gas"]
 
 #: ``immutableReferences`` and ``immutable_names`` are REQUIRED AT CONSTRUCTION, not merely at verify
 #: time. The exact runtime compare in :meth:`EthHtlcContractLeg._expected_runtime` cannot be built
@@ -343,6 +344,27 @@ _BLOCK_S: int = 12
 #: `p` in its calldata for anyone to scrape. Deriving the multiplier FROM the budget is what stops
 #: them drifting again: change the budget and the fee follows.
 CLAIM_BASEFEE_HEADROOM: float = 1.125 ** (CLAIM_INCLUSION_BUDGET_S / _BLOCK_S)
+
+#: The gas limit a refund is signed with (#850 PR 4a, design §3.4). The design measured refund
+#: gasUsed at 85.7k–86.3k (ETH and token HTLCs, anvil forks), against the 100k this replaced. The
+#: limit costs nothing extra (the sender pays gasUsed, not the limit), so the headroom is free. Every
+#: refund is also checked against it with ``eth_estimateGas`` before it is signed.
+REFUND_GAS_LIMIT: int = 150_000
+
+
+def refund_ran_out_of_gas(receipt: dict[str, Any], *, gas_limit: int) -> bool:
+    """Whether a mined refund failed by running out of gas: ``status == 0`` and ``gasUsed`` equal to
+    the limit it was signed with. An out-of-gas revert consumes the whole limit, and a contract
+    revert (``AlreadySettled``, ``TransferFailed``) does not, so the two are told apart here, which
+    ``eth_call`` cannot do (it reports an out-of-gas as an untyped error, read as transient).
+
+    Reads ``gasUsed`` from the receipt it is given, which a multi-source receipt read does not
+    corroborate. That is enough for what this decides, one re-send (#850 PR 5b): a wrong answer
+    costs one refund's gas, never funds."""
+    status = _int_or_none(receipt.get("status"))
+    used = _int_or_none(receipt.get("gasUsed"))
+    return status == 0 and used is not None and used >= int(gas_limit)
+
 
 #: How long the claim-confirmation read will wait for the OTHER endpoints to catch up with the
 #: primary's view of a mined transaction, and how often it re-asks. Only a multi-source RPC waits
@@ -1088,9 +1110,19 @@ class EthHtlcContractLeg:
             ) from exc
         return tx_hash
 
-    async def refund(self, locator: EthHtlcLocator) -> str:
+    async def refund(
+        self, locator: EthHtlcLocator, *, on_signed: Callable[[str], Awaitable[None]] | None = None
+    ) -> str:
         """Taker: call refund() after timeout; returns the tx hash. Taker-unilateral
         (no maker signature; the contract pays the immutable refundee).
+
+        ``on_signed`` is awaited with the tx hash after signing and before the broadcast, as for
+        ``fund`` (#502 item 2), so a caller can record the refund before it can be mined. Nothing
+        passes it yet; PR 5b of #850 records the pending refund through it.
+
+        Gas (#850 PR 4a): signed with :data:`REFUND_GAS_LIMIT`. After the preflight passes,
+        ``eth_estimateGas`` must come in at or under that limit, or this raises
+        :class:`RefundGasAboveCeiling` before signing.
 
         P3 maturity pre-check: the contract's ``refund()`` reverts until
         ``block.timestamp >= timeout``. We read the latest block timestamp and refuse a premature
@@ -1113,8 +1145,21 @@ class EthHtlcContractLeg:
                 "would revert (gas/clarity guard; the contract enforces the deadline regardless)."
             )
         c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-        built = await c.functions.refund().build_transaction(await self._base_tx(gas=100_000))
-        return await self._sign_and_send(built)
+        built = await c.functions.refund().build_transaction(await self._base_tx(gas=REFUND_GAS_LIMIT))
+        # Preflight first, so a contract revert is classified as one (premature, settled) before the
+        # estimate is read, then the ceiling check, then sign without a second preflight.
+        await self._rpc.preflight(built)
+        estimate = int(await self._rpc.estimate_gas(built))
+        if estimate > REFUND_GAS_LIMIT:
+            raise RefundGasAboveCeiling(
+                f"refund of {locator.contract_address} needs an estimated {estimate} gas, above the "
+                f"{REFUND_GAS_LIMIT} it would be signed with, so it would run out of gas and leave "
+                "the contract unsettled. Nothing was signed. Check the contract and the chain before "
+                "retrying.",
+                estimate=estimate,
+                ceiling=REFUND_GAS_LIMIT,
+            )
+        return await self._sign_and_send(built, preflight=False, on_signed=on_signed)
 
     async def fetch_claim_artifacts(self, tx_hash: str) -> list[bytes]:
         """Fetch the candidate byte blobs for recover_secret: the tx INPUT calldata + the
