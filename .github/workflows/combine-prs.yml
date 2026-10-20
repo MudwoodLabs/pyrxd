@@ -75,17 +75,28 @@ jobs:
           combined_branch="combined-prs/${GITHUB_RUN_ID}"
           git switch -c "$combined_branch" "origin/$BASE"
 
-          numbers=$(gh pr list --state open --base "$BASE" --author "$AUTHOR" \
+          pr_list=$(gh pr list --state open --base "$BASE" --author "$AUTHOR" \
             ${LABEL:+--label "$LABEL"} --json number --jq '.[].number')
+          # One PR number per line, read into an array rather than word-split, and each one
+          # checked to be digits before it reaches a command (#827).
+          numbers=()
+          while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+              echo "::error::gh pr list returned a PR number that is not all digits"
+              exit 1
+            fi
+            numbers+=("$n")
+          done <<< "$pr_list"
 
-          if [ -z "$numbers" ]; then
+          if [ "${#numbers[@]}" -eq 0 ]; then
             echo "No open PRs match author='$AUTHOR'${LABEL:+ label='$LABEL'} on base '$BASE'."
             exit 0
           fi
 
           combined=()
           skipped=()
-          for n in $numbers; do
+          for n in "${numbers[@]}"; do
             head=$(gh pr view "$n" --json headRefName --jq '.headRefName')
             title=$(gh pr view "$n" --json title --jq '.title')
 

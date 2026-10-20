@@ -114,11 +114,16 @@ class _ChainEthLeg(FakeEthLeg):
         return self.settled
 
 
-async def _eth_both_locked_on_disk(tmp_path, *, secret, h):
-    """Drive an ETH swap to BOTH_LOCKED through the real coordinator with a real sink."""
+async def _eth_both_locked_on_disk(tmp_path, *, secret, h, role=SwapRole.TAKER):
+    """Drive an ETH swap to BOTH_LOCKED through the real coordinator with a real sink, as *role*.
+
+    The record names the role that wrote it (#850 PR 3), and a coordinator of another role refuses
+    it, so the reload in each test must run as the role that drove the swap here."""
     terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
     rxd = FakeRadiantLeg()
-    coord = _eth_coord_full(terms=terms, eth_leg=FakeEthLeg(preimage=secret, verdict=_final()), radiant_leg=rxd)
+    coord = _eth_coord_full(
+        terms=terms, eth_leg=FakeEthLeg(preimage=secret, verdict=_final()), radiant_leg=rxd, role=role
+    )
     sink = JsonFileRecordSink(tmp_path / "swap.json")
     coord._persist = sink
     await coord.taker_funds_btc(terms, now_unix_s=_NOW)
@@ -472,10 +477,10 @@ async def test_the_shipped_eth_leg_leaves_an_unexplained_failure_alone(tmp_path)
 @pytest.mark.parametrize("role", [SwapRole.MAKER, None])
 async def test_a_maker_or_single_operator_eth_mutual_refund_still_does_both(tmp_path, role):
     """The honest half: the guard is scoped to the TAKER. A maker's covenant refund is its own
-    money, and a single operator (role None) owns both legs. The record here comes from the taker's
-    funding flow; mutual_refund reads only its state and locators, not how it got there."""
+    money, and a single operator (role None) owns both legs. The record is driven, and reloaded, as
+    that role."""
     secret, h = generate_secret()
-    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h)
+    sink = await _eth_both_locked_on_disk(tmp_path, secret=secret, h=h, role=role)
     eth, rxd = FakeEthLeg(preimage=secret, verdict=_final()), FakeRadiantLeg()
     coord = _eth_reloaded(sink, eth_leg=eth, radiant_leg=rxd, role=role)
 

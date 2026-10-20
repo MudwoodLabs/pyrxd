@@ -138,8 +138,56 @@ _LEGAL_EDGES = frozenset(
 )
 
 
+_S, _E = SwapState, SwapEvent
+
+#: The full (state, event, target) table, hand-transcribed from the mermaid diagram and kept
+#: SEPARATE from ``_TRANSITION_TABLE`` (#850 PR 2, design §3.2). ``_LEGAL_EDGES`` above pins only
+#: the (state, target) pairs, so an event moved to a different edge between the same states, or a
+#: second event added on an existing edge, passed it. #850 grows this table (14 -> 16 edges); each
+#: such PR changes this set and ``_LEGAL_EDGES`` together.
+_LEGAL_TRIPLES = frozenset(
+    {
+        (_S.NEGOTIATED, _E.TAKER_FUNDS_BTC, _S.BTC_LOCKED),
+        (_S.NEGOTIATED, _E.TAKER_NEVER_FUNDS, _S.ABORTED),
+        (_S.BTC_LOCKED, _E.MAKER_LOCKS_ASSET, _S.BOTH_LOCKED),
+        (_S.BTC_LOCKED, _E.MAKER_NEVER_LOCKS_BTC_TIMEOUT, _S.ABORTED),
+        (_S.BTC_LOCKED, _E.MAKER_LOCKS_WRONG_PARAMS, _S.PARAMS_MISMATCH),
+        (_S.PARAMS_MISMATCH, _E.TAKER_REFUNDS_BTC, _S.ABORTED),
+        (_S.BOTH_LOCKED, _E.MAKER_CLAIMS_BTC_REVEALS_P, _S.SECRET_REVEALED),
+        (_S.BOTH_LOCKED, _E.MAKER_STALL_DETECTED, _S.MAKER_STALLS),
+        (_S.BOTH_LOCKED, _E.BOTH_TIMEOUTS_ELAPSE, _S.MUTUAL_REFUND),
+        (_S.MAKER_STALLS, _E.TAKER_REFUNDS_ASSET_PROACTIVELY, _S.ASSET_REFUNDED_TAKER_ACTS),
+        (_S.SECRET_REVEALED, _E.TAKER_SCRAPES_P_CLAIMS_ASSET, _S.COMPLETED),
+        (_S.SECRET_REVEALED, _E.TAKER_OFFLINE_OR_PINNED, _S.ASSET_VULNERABLE),
+        (_S.ASSET_VULNERABLE, _E.MAKER_REFUNDS_ASSET_CSV, _S.ONE_SIDED_LOSS_TAKER),
+        (_S.ASSET_VULNERABLE, _E.TAKER_SCRAPES_P_CLAIMS_ASSET, _S.COMPLETED),
+    }
+)
+
+
 def test_transition_table_matches_diagram():
     assert TRANSITIONS == _LEGAL_EDGES
+
+
+def test_the_full_triple_table_matches_the_diagram():
+    """Every (state, event, target), not only the pairs: which event drives which edge is what
+    the coordinator and the published wire doc rely on."""
+    from pyrxd.gravity.swap_state import _TRANSITION_TABLE
+
+    assert _TRANSITION_TABLE == _LEGAL_TRIPLES
+    assert {(src, dst) for src, _event, dst in _LEGAL_TRIPLES} == _LEGAL_EDGES  # the two pins agree
+
+
+def test_each_state_event_pair_has_exactly_one_target():
+    """`advance` returns the FIRST match while iterating a frozenset, so a (state, event) pair with
+    two targets would make its result depend on hash order (design §3.2, B9)."""
+    from pyrxd.gravity.swap_state import _TRANSITION_TABLE
+
+    pairs = [(src, event) for src, event, _dst in _TRANSITION_TABLE]
+    assert pairs, "the transition table is empty; this check checked nothing"
+    assert len(pairs) == len(set(pairs)), sorted((s.name, e.name) for s, e in pairs if pairs.count((s, e)) > 1)
+    for src, event, dst in _TRANSITION_TABLE:
+        assert advance(src, event) is dst
 
 
 def test_transition_count():

@@ -64,8 +64,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
+          # The report quotes text derived from upstream files. While it is on stdout, workflow
+          # commands are off, so a line in it beginning `::` is printed, not obeyed (#827).
+          stop_token="$(python -c 'import secrets; print(secrets.token_hex(16))')"
+          echo "::stop-commands::${stop_token}"
           python scripts/check_photonic_drift.py | tee drift-report.txt
-          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          code=${PIPESTATUS[0]}
+          echo "::${stop_token}::"
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
 
       # Exit 2 means the check could not run — no citations found, a 404, a
       # network failure. That is a broken watcher, and it must never be
@@ -83,13 +89,19 @@ jobs:
         run: |
           TITLE="Photonic Wallet moved under a claim pyrxd makes"
           BODY_FILE=body.md
+          # A fence longer than any run of backticks in the report, so no line of it can close the
+          # code block early (#827).
+          longest=$(awk '{ while (match($0, /`+/)) { if (RLENGTH > m) m = RLENGTH; $0 = substr($0, RSTART + RLENGTH) } } END { print m + 0 }' drift-report.txt)
+          fence_len=$(( longest >= 3 ? longest + 1 : 3 ))
+          printf -v fence '%*s' "$fence_len" ''
+          fence=${fence// /\`}
           {
             echo "The weekly watcher found upstream changes in files pyrxd cites."
             echo "**This is a report, not a verdict** — read the diff and decide which case applies."
             echo
-            echo '```'
+            echo "$fence"
             cat drift-report.txt
-            echo '```'
+            echo "$fence"
             echo
             echo "When resolved, re-pin and say in the commit message which case it was:"
             echo
@@ -108,7 +120,7 @@ jobs:
             gh issue create --title "$TITLE" --body-file "$BODY_FILE"
           fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: photonic-drift-report
@@ -133,8 +145,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
+          # The report quotes text derived from upstream files. While it is on stdout, workflow
+          # commands are off, so a line in it beginning `::` is printed, not obeyed (#827).
+          stop_token="$(python -c 'import secrets; print(secrets.token_hex(16))')"
+          echo "::stop-commands::${stop_token}"
           python scripts/check_photonic_drift.py --target rxindexer | tee drift-report.txt
-          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          code=${PIPESTATUS[0]}
+          echo "::${stop_token}::"
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
 
       # Exit 2 is a broken watcher, never a clean result.
       - name: Fail loudly if the watcher could not run
@@ -150,14 +168,20 @@ jobs:
         run: |
           TITLE="RXinDexer moved under a WAVE rule pyrxd transcribes"
           BODY_FILE=body.md
+          # A fence longer than any run of backticks in the report, so no line of it can close the
+          # code block early (#827).
+          longest=$(awk '{ while (match($0, /`+/)) { if (RLENGTH > m) m = RLENGTH; $0 = substr($0, RSTART + RLENGTH) } } END { print m + 0 }' drift-report.txt)
+          fence_len=$(( longest >= 3 ? longest + 1 : 3 ))
+          printf -v fence '%*s' "$fence_len" ''
+          fence=${fence// /\`}
           {
             echo "The weekly watcher found upstream changes in RXinDexer files pyrxd cites."
             echo "pyrxd's WAVE claim rule (src/pyrxd/glyph/wave_rules.py) is transcribed from them."
             echo "**This is a report, not a verdict** — read the diff and decide which case applies."
             echo
-            echo '```'
+            echo "$fence"
             cat drift-report.txt
-            echo '```'
+            echo "$fence"
             echo
             echo "When resolved, re-pin and say in the commit message which case it was:"
             echo
@@ -176,7 +200,7 @@ jobs:
             gh issue create --title "$TITLE" --body-file "$BODY_FILE"
           fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: rxindexer-drift-report

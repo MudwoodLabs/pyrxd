@@ -388,3 +388,34 @@ class TestOutpointSpenderOnARealNode:
         assert found == refund
         with pytest.raises(ValidationError, match="hashlock"):
             t.scrape_secret(found, h)
+
+
+class TestTxBlockHeightOnARealNode:
+    """``BitcoinCoreRpcSource.get_tx_block_height`` against Bitcoin Core's real replies. It read a
+    ``blockheight`` key that Core's ``getrawtransaction`` does not send, so it raised "unconfirmed"
+    for every mined transaction; its unit fixtures had been written with that key."""
+
+    def test_a_mined_transaction_reports_its_block_height(self, btc):
+        import asyncio
+
+        from pyrxd.network.bitcoin import BitcoinCoreRpcSource
+        from pyrxd.security.errors import NetworkError
+
+        source = BitcoinCoreRpcSource("http://node.invalid:18443/", btc.user, btc.password)
+
+        async def _rpc(method: str, params: list) -> object:
+            args = [json.dumps(x) if not isinstance(x, str) else x for x in params]
+            try:
+                return await asyncio.to_thread(btc.cli, method, *args)
+            except RuntimeError as exc:
+                raise NetworkError(f"Bitcoin Core RPC error: {exc}") from None
+
+        source._rpc = _rpc  # type: ignore[method-assign]
+        txid = btc.cli("sendtoaddress", btc.cli("getnewaddress", wallet=True), "0.001", wallet=True)
+        with pytest.raises(NetworkError, match="unconfirmed"):
+            asyncio.run(source.get_tx_block_height(txid))  # still in the mempool
+        btc.mine(1)
+        tip = int(btc.cli("getblockcount"))
+        assert int(asyncio.run(source.get_tx_block_height(txid))) == tip
+        btc.mine(2)
+        assert int(asyncio.run(source.get_tx_block_height(txid))) == tip  # its block, not the tip

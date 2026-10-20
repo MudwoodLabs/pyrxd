@@ -765,13 +765,22 @@ class BitcoinCoreRpcSource(BtcDataSource):
         # audit B7, missed site: the height this returns picks the header the SPV proof is
         # verified against, so it must come from the transaction we asked about.
         _assert_tx_identity(data, txid)
-        block_height = data.get("blockheight")
-        if block_height is None:
-            raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed or blockheight missing")
+        # Core's getrawtransaction names the block by hash and reports no height (checked on a
+        # Core 24 regtest node: no `blockheight` key). This read a `blockheight` key, so against a
+        # real node it raised "unconfirmed" for every mined transaction. The height comes from
+        # the block's own header.
+        block_hash = data.get("blockhash")
+        if not isinstance(block_hash, str):
+            raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed (no blockhash)")
+        header = await self._rpc("getblockheader", [block_hash, True])
+        if not isinstance(header, dict) or header.get("hash") != block_hash:
+            raise NetworkError(
+                "getblockheader returned a header for another block than the tx's blockhash; fail-closed"
+            )
         try:
-            return BlockHeight(nonneg_int(block_height))
+            return BlockHeight(nonneg_int(header.get("height")))
         except (ValueError, ValidationError):
-            raise NetworkError("Invalid blockheight in getrawtransaction response")
+            raise NetworkError("Invalid height in getblockheader response")
 
     async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         if not isinstance(txid, Txid):
@@ -835,21 +844,16 @@ class BitcoinCoreRpcSource(BtcDataSource):
                     return self._spender_bytes(
                         await self._rpc("getrawtransaction", [spender, True]), Txid(spender), prevout
                     )
-        # The funding tx's height, from its block hash: Core's getrawtransaction reports
-        # `blockhash` and no height (checked on a Core 24 regtest node).
-        funding = await self._rpc("getrawtransaction", [str(txid), True])
-        _assert_tx_identity(funding, txid)
-        block_hash = funding.get("blockhash")
-        if not isinstance(block_hash, str):
-            raise NetworkError(
-                f"outpoint {str(txid)[:16]}…:{index} is not unspent, its funding tx is unconfirmed, and no "
-                "spender is in the mempool; fail-closed"
-            )
-        header = await self._rpc("getblockheader", [block_hash, True])
+        # The funding tx's height: get_tx_block_height reads it from the block header (Core's
+        # getrawtransaction names the block by hash and reports no height), and raises for an
+        # unknown or unconfirmed funding transaction.
         try:
-            funding_height = nonneg_int(header.get("height") if isinstance(header, dict) else None)
-        except ValueError as exc:
-            raise NetworkError("Invalid height in getblockheader response") from exc
+            funding_height = int(await self.get_tx_block_height(txid))
+        except NetworkError as exc:
+            raise NetworkError(
+                f"outpoint {str(txid)[:16]}…:{index} is not unspent, and its funding tx cannot be placed in a block "
+                f"({exc}); no spender is in the mempool; fail-closed"
+            ) from exc
         tip = int(await self.get_tip_height())
         if tip - funding_height + 1 > max_scan_blocks:  # the scan reads funding_height..tip inclusive
             raise NetworkError(
