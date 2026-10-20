@@ -216,9 +216,9 @@ def load_artifact(path: str | os.PathLike) -> dict:
     * ``immutable_names`` — ``{reference-id: name}`` naming the constructor term each id holds
       (``hashlock``/``claimant``/``refundee``/``timeout``, plus ``token``/``amount`` for
       ``Erc20Htlc``). A reference id is the AST node id of the immutable's
-      ``VariableDeclaration``, so build with ``forge build --ast`` and read, from the artifact's
-      ``ast``, each ``VariableDeclaration`` whose ``mutability`` is ``"immutable"``: its ``id``
-      is the key and its ``name`` the value. Ids are specific to one compilation, so derive the
+      ``VariableDeclaration``: read, from the compiler's AST, each ``VariableDeclaration`` whose
+      ``mutability`` is ``"immutable"``; its ``id`` is the key and its ``name`` the value
+      (``scripts/build_counter_leg_artifacts.py`` does this for the committed artifacts). Ids are specific to one compilation, so derive the
       map from the SAME build that produced ``immutableReferences``, never by hand.
     """
     with open(path) as f:

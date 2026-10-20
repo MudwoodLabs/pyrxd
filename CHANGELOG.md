@@ -42,8 +42,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A server whose header differs from the cached one is reported NOT VERIFIED, never CONTRADICTED,
     because the cache may be on a branch Radiant abandoned. `pyrxd verify` then falls back to the
     shipped checkpoint when the block is within its reach, keeping the floor the cached header set.
-  - The store is re-verified on every read, written atomically under an advisory lock, and
-    append-only. A missing, damaged or non-verifying store is treated as empty, and one left
+  - For a block at or below the newest shipped checkpoint, the depth above that checkpoint is
+    counted from the cache alone and the server is not asked about it, so a cache on an abandoned
+    branch is not detected there. The block's height still rests on the shipped checkpoint.
+  - The store is re-verified on every read, written atomically under an advisory lock (POSIX
+    only: on Windows no lock is taken, so two syncs at once can race), and append-only. A missing, damaged or non-verifying store is treated as empty, and one left
     behind by an upgrade is reported as stale. With no usable cache, `pyrxd verify` behaves
     exactly as before.
   - The browser pages do not use a cache yet.
@@ -100,9 +103,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on any difference. `EthHtlc` was previously built with the optimizer off, which looks
   accidental: its runtime is now 1,215 bytes (was 2,087). `Erc20Htlc` was already optimized: its
   runtime differs only in the trailing CBOR metadata, which no longer carries an IPFS hash, so its
-  creation code differs too. In the artifact, the `immutableReferences` ids were renumbered (the
-  offsets are unchanged) and the ABI entries are in solc's order rather than forge's (same
-  entries). **Contracts deployed from the previous artifacts are refused by
+  creation code differs too. In the artifact, the `immutableReferences` ids were renumbered and
+  the ABI entries are in solc's order rather than forge's (same entries); the revision below also
+  moves the immutables' offsets in both artifacts. **Contracts deployed from the previous artifacts are refused by
   this repo's swap runners and tests**, which verify a deployed contract byte for byte against
   these artifacts. The wheel ships no ETH artifact, so an application that injects its own is
   unaffected.
