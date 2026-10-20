@@ -62,17 +62,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **ETH and token counter-leg refunds are signed with a 150,000 gas limit, up from 100,000, and
-  checked with `eth_estimateGas` first (#850 PR 4a).** An estimate above the limit raises the new
-  `RefundGasAboveCeiling` before anything is signed. The preflight `eth_call` now keeps the `gas`
-  field, so it runs at the limit the refund is signed with rather than the node's own cap. The
-  design measured honest refunds at about 86k gas; a token refund on a mainnet USDC fork stays
-  under 100k on the pinned anvil. The limit costs nothing extra: the sender pays the gas used.
+- **ETH and token counter-leg refunds are signed with up to 150,000 gas, up from 100,000, after an
+  `eth_estimateGas` check (#850 PR 4a).** An estimate above 150,000 raises the new
+  `RefundGasAboveCeiling` before anything is signed.
+  - A node requires the sender to hold `limit x maxFeePerGas` up front, though only the gas
+    used is spent. A sender who cannot hold that for 150,000 is signed at the most it can
+    hold, never below the estimate. A sender who cannot hold even the estimate gets the new
+    `RefundFeeUnaffordable`, which names the shortfall, instead of a broadcast error retried
+    forever.
+  - The preflight `eth_call` now keeps the `gas` field, so it runs at the limit the refund is
+    signed with rather than the node's own cap.
+  - Measured gas used: about 51k for an ETH refund on anvil, and 85.7k to 86.3k for a token
+    refund on mainnet forks (from the design). A USDC fork run of the new fork test passed
+    locally. No workflow runs that test.
   - `refund(..., on_signed=...)` on `EthHtlcContractLeg`, `Erc20HtlcLeg` and the gravity
     `EthLeg` awaits a hook with the tx hash after signing and before broadcast, as `fund`
     already does. Nothing passes it yet.
-  - `pyrxd.eth_wallet.htlc_leg.refund_ran_out_of_gas(receipt, gas_limit=...)` tells an
-    out-of-gas refund (status 0, all gas used) from a contract revert. Nothing calls it yet.
+  - `pyrxd.eth_wallet.htlc_leg.refund_ran_out_of_gas(receipt, gas_limit=...)` tells a refund
+    that ran out of gas from one the contract reverted. Out of gas means status 0 with at least
+    63/64 of the limit used, which also covers a starved payout call. Nothing calls it yet.
   - `EthRpc.estimate_gas` and `MultiSourceEthRpc.estimate_gas` (the MIN across the quorum).
 
 - **The BTC two-host runner's taker `--phase refund` and `--phase abort` refuse when the BTC HTLC

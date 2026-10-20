@@ -349,6 +349,8 @@ _SAMPLE_ARGS: dict[str, object] = {
     "echoed": "ef" * 32,
     "estimate": 151_000,
     "ceiling": 150_000,
+    "need_wei": 10**15,
+    "have_wei": 10**14,
 }
 
 
