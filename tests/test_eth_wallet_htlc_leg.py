@@ -151,8 +151,17 @@ class _Rpc:
         return 10**18  # plenty: 1 ETH covers 150k gas at any fee in these fixtures
 
     async def send_raw(self, raw):
+        from eth_account.typed_transactions import TypedTransaction
         from eth_utils import keccak
+        from hexbytes import HexBytes
 
+        held = getattr(self, "balance_wei", None)
+        if held is not None:
+            # What a real node checks before it accepts a broadcast (security review L2: without it
+            # the HONEST balance tests passed with the balance ignored entirely).
+            tx = TypedTransaction.from_bytes(HexBytes(bytes(raw))).as_dict()
+            if int(tx["gas"]) * int(tx["maxFeePerGas"]) > held:
+                raise NetworkError("eth_sendRawTransaction failed: insufficient funds for gas * price + value")
         self.sent.append(bytes(raw))
         return self.echo if self.echo is not None else "0x" + keccak(bytes(raw)).hex()
 
@@ -922,6 +931,7 @@ def _balanced(rpc, wei):
         return wei
 
     rpc.get_balance = get_balance
+    rpc.balance_wei = wei  # the fake broadcast then refuses what a node would refuse
     return rpc
 
 

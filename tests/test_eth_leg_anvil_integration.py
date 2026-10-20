@@ -1172,8 +1172,9 @@ async def test_both_contracts_give_claim_errors_in_ONE_order(anvil_url, which):
 
 
 async def test_a_real_refund_is_signed_at_150k_and_uses_well_under_it(anvil_url):
-    """#850 PR 4a on a real node: the preflight with `gas` kept, the real eth_estimateGas against
-    the ceiling, and the gas the refund actually used."""
+    """#850 PR 4a on a real node: the real eth_estimateGas against the ceiling, the limit signed and
+    the gas the refund actually used. (That the preflight keeps `gas` is pinned by the unit test on
+    the call's arguments, not here: no honest refund here fails at the limit.)"""
     from pyrxd.eth_wallet.htlc_leg import REFUND_GAS_LIMIT, refund_ran_out_of_gas
 
     rpc, taker, _maker = _legs(anvil_url)
