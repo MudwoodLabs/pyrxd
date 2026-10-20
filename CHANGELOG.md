@@ -62,6 +62,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **ETH and token counter-leg refunds are signed with a 150,000 gas limit, up from 100,000, and
+  checked with `eth_estimateGas` first (#850 PR 4a).** An estimate above the limit raises the new
+  `RefundGasAboveCeiling` before anything is signed. The preflight `eth_call` now keeps the `gas`
+  field, so it runs at the limit the refund is signed with rather than the node's own cap. The
+  design measured honest refunds at about 86k gas; a token refund on a mainnet USDC fork stays
+  under 100k on the pinned anvil. The limit costs nothing extra: the sender pays the gas used.
+  - `refund(..., on_signed=...)` on `EthHtlcContractLeg`, `Erc20HtlcLeg` and the gravity
+    `EthLeg` awaits a hook with the tx hash after signing and before broadcast, as `fund`
+    already does. Nothing passes it yet.
+  - `pyrxd.eth_wallet.htlc_leg.refund_ran_out_of_gas(receipt, gas_limit=...)` tells an
+    out-of-gas refund (status 0, all gas used) from a contract revert. Nothing calls it yet.
+  - `EthRpc.estimate_gas` and `MultiSourceEthRpc.estimate_gas` (the MIN across the quorum).
+
 - **The BTC two-host runner's taker `--phase refund` and `--phase abort` refuse when the BTC HTLC
   is already spent (#850 PR 1c).** Before anything is sent they read the HTLC's funding outpoint.
   If the maker has claimed it (the spender's witness opens this swap's hashlock), the refusal says

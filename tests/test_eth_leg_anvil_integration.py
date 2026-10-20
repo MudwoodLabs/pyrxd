@@ -1169,3 +1169,35 @@ async def test_both_contracts_give_claim_errors_in_ONE_order(anvil_url, which):
             assert await _revert_selector(rpc, claim_call(empty.contract_address, p)) == _sel("Underfunded()")
     finally:
         await rpc.close()
+
+
+async def test_a_real_refund_is_signed_at_150k_and_uses_well_under_it(anvil_url):
+    """#850 PR 4a on a real node: the preflight with `gas` kept, the real eth_estimateGas against
+    the ceiling, and the gas the refund actually used."""
+    from pyrxd.eth_wallet.htlc_leg import REFUND_GAS_LIMIT, refund_ran_out_of_gas
+
+    rpc, taker, _maker = _legs(anvil_url)
+    try:
+        _p, h = _secret()
+        locator = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 100),
+            amount_wei=_AMOUNT_WEI,
+        )
+        await _advance_time(rpc, 200)
+        seen: list[str] = []
+
+        async def on_signed(tx_hash: str) -> None:
+            seen.append(tx_hash)
+
+        tx = await taker.refund(locator, on_signed=on_signed)
+        receipt = dict(await rpc.wait_receipt(tx))
+        sent = await rpc.get_transaction(tx)
+        assert seen == [tx]
+        assert int(sent["gas"]) == REFUND_GAS_LIMIT
+        assert receipt["status"] == 1 and int(receipt["gasUsed"]) < REFUND_GAS_LIMIT * 2 // 3
+        assert refund_ran_out_of_gas(receipt, gas_limit=REFUND_GAS_LIMIT) is False
+    finally:
+        await rpc.close()

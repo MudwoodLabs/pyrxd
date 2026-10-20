@@ -79,8 +79,9 @@ def rig(monkeypatch):
             raise answer
         return answer
 
-    async def _parent_refund(self, locator, **_kw):
+    async def _parent_refund(self, locator, **kw):
         state["parent_calls"] += 1
+        state["parent_kw"] = kw
         return "0x" + "ee" * 32
 
     monkeypatch.setattr(Erc20HtlcLeg, "_settled_word", _settled_word)
@@ -186,3 +187,16 @@ async def test_the_real_parent_reports_not_yet_mature_as_a_NetworkError(monkeypa
     )
     with pytest.raises(NetworkError, match="not yet mature"):
         await leg.refund(_locator())
+
+
+async def test_on_signed_is_forwarded_to_the_parent_refund(rig) -> None:
+    """#850 PR 4a: the token leg passes the signed-hash hook through, unchanged."""
+    _run, state = rig
+
+    async def hook(_h):
+        return None
+
+    state.update(now=_TIMEOUT, settled=False, balance=5)
+    state["leg"]._rpc.now = _TIMEOUT
+    await state["leg"].refund(_locator(), on_signed=hook)
+    assert state["parent_kw"] == {"on_signed": hook}

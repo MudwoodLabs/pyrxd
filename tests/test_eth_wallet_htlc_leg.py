@@ -852,3 +852,94 @@ async def test_fund_refuses_a_receipt_naming_ANY_other_address(lie):
     leg, _, _, _ = _funding_leg(lie=lie)
     with pytest.raises(ValidationError, match="deploy receipt names contract"):
         await leg.fund(amount_wei=10**15, **_FUND_ARGS)
+
+
+# ── refund plumbing (#850 PR 4a): the gas ceiling, the estimate check, the signed-hash hook ──────
+
+
+def _estimating(rpc, estimate, calls=None):
+    async def estimate_gas(tx):
+        if calls is not None:
+            calls.append(("estimate", tx))
+        return estimate
+
+    rpc.estimate_gas = estimate_gas
+    return rpc
+
+
+async def test_a_refund_estimated_above_the_ceiling_is_refused_before_signing(frozen_clock):
+    from pyrxd.security.errors import RefundGasAboveCeiling
+
+    rpc = _estimating(_Rpc(head_ts=_NOW), hl.REFUND_GAS_LIMIT + 1)
+    with pytest.raises(RefundGasAboveCeiling) as ei:
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert (ei.value.estimate, ei.value.ceiling) == (hl.REFUND_GAS_LIMIT + 1, hl.REFUND_GAS_LIMIT)
+    assert rpc.sent == []
+
+
+async def test_HONEST_a_refund_estimated_at_exactly_the_ceiling_is_sent(frozen_clock):
+    rpc = _estimating(_Rpc(head_ts=_NOW), hl.REFUND_GAS_LIMIT)
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert len(rpc.sent) == 1
+
+
+async def test_the_preflight_runs_before_the_estimate_and_only_once(frozen_clock):
+    calls: list = []
+    rpc = _estimating(_Rpc(head_ts=_NOW), 86_000, calls)
+
+    async def preflight(tx):
+        calls.append(("preflight", tx))
+
+    rpc.preflight = preflight
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert [c for c, _ in calls] == ["preflight", "estimate"]
+    assert calls[0][1]["gas"] == hl.REFUND_GAS_LIMIT  # the preflight sees the signed limit
+
+
+async def test_a_preflight_revert_stops_the_refund_before_any_estimate(frozen_clock):
+    calls: list = []
+    rpc = _estimating(_Rpc(head_ts=_NOW), 86_000, calls)
+
+    async def preflight(tx):
+        raise ValidationError("tx would revert (preflight eth_call)")
+
+    rpc.preflight = preflight
+    with pytest.raises(ValidationError, match="would revert"):
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert calls == [] and rpc.sent == []
+
+
+async def test_on_signed_sees_the_hash_before_the_broadcast(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW)
+    seen: list = []
+
+    async def on_signed(tx_hash):
+        seen.append((tx_hash, len(rpc.sent)))
+
+    sent_hash = await _leg(rpc).refund(_locator(timeout=_NOW), on_signed=on_signed)
+    assert seen == [(sent_hash, 0)] and len(rpc.sent) == 1
+
+
+async def test_a_failing_on_signed_means_nothing_is_broadcast(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW)
+
+    async def on_signed(_tx_hash):
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        await _leg(rpc).refund(_locator(timeout=_NOW), on_signed=on_signed)
+    assert rpc.sent == []
+
+
+@pytest.mark.parametrize(
+    ("receipt", "out_of_gas"),
+    [
+        ({"status": 0, "gasUsed": 150_000}, True),
+        ({"status": "0x0", "gasUsed": "0x249f0"}, True),  # the same receipt as hex strings
+        ({"status": 0, "gasUsed": 31_337}, False),  # a contract revert: AlreadySettled, say
+        ({"status": 1, "gasUsed": 150_000}, False),  # succeeded using all of it
+        ({"status": 0}, False),  # gasUsed missing: not proven out of gas
+    ],
+)
+def test_out_of_gas_is_status_zero_with_the_whole_limit_used(receipt, out_of_gas):
+    assert hl.refund_ran_out_of_gas(receipt, gas_limit=150_000) is out_of_gas

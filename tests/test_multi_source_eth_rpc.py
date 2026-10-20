@@ -914,3 +914,16 @@ def test_a_below_quorum_error_never_carries_an_endpoints_key(read: str) -> None:
     assert re.search(r"https://eth-mainnet\.alpha-example\.com(:443)?\b", msg), msg
     assert re.search(r"https://rpc\.beta-example\.org(:443)?\b", msg), msg
     assert "only 0 of 2 endpoints" in msg, msg
+
+
+def test_the_refund_gas_estimate_is_the_MIN_across_the_quorum() -> None:
+    """#850 PR 4a. An endpoint inflating its estimate must not refuse the honest refund; one
+    deflating it can only let a refund run out of gas, which its receipt then shows."""
+    a, b, c = _Source(), _Source(), _Source()
+    for src, est in ((a, 86_000), (b, 400_000), (c, 85_900)):
+
+        async def estimate_gas(tx, _v=est):
+            return _v
+
+        src.estimate_gas = estimate_gas
+    assert _run(MultiSourceEthRpc([a, b, c]).estimate_gas({"to": "0x" + "11" * 20})) == 85_900

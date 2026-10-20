@@ -145,6 +145,9 @@ class _Eth:
     async def get_logs(self, *a, **k):
         return self._node.answer("get_logs", *a, **k)
 
+    async def estimate_gas(self, *a, **k):
+        return self._node.answer("estimate_gas", *a, **k)
+
 
 def _client(*, expected_chain_id: int = 1, **answers: Any) -> tuple[EthRpc, _Node]:
     """A real ``EthRpc`` (so the constructor's own validation runs) wired to a fake node."""
@@ -909,3 +912,21 @@ class TestResponseBounds:
         # Four orders of magnitude above the handful a per-contract query returns, so it cannot
         # refuse honest work, and small enough to bound the allocation.
         assert rpc_mod._MAX_LOG_ENTRIES == 10_000
+
+
+class TestEstimateGas:
+    def test_the_estimate_is_asked_without_the_gas_or_fee_fields(self) -> None:
+        client, node = _client(estimate_gas=85_712)
+        assert _run(client.estimate_gas(_CLAIM_TX)) == 85_712
+        (args, _kwargs) = node.asked("estimate_gas")[0]
+        assert args[0] == {k: _CLAIM_TX[k] for k in ("from", "to", "value", "data")}
+
+    def test_a_TYPED_revert_is_permanent(self) -> None:
+        client, _ = _client(estimate_gas=web3.exceptions.ContractCustomError("0x59912c06"))
+        with pytest.raises(ValidationError):
+            _run(client.estimate_gas(_CLAIM_TX))
+
+    def test_an_UNTYPED_failure_is_retryable(self) -> None:
+        client, _ = _client(estimate_gas=ValueError("execution reverted: out of gas"))
+        with pytest.raises(NetworkError):
+            _run(client.estimate_gas(_CLAIM_TX))
