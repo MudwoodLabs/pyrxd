@@ -2662,6 +2662,29 @@ class SwapCoordinator:
             f"{blocks_s} s at ε = {early.epsilon:.3g}, and the newest header may be up to {slack} s old",
         )
 
+    async def _try_pin_covenant_on_resume(self, terms: NegotiatedTerms) -> None:
+        """Best effort, on the resume path whose fund already landed: re-prove the maker's covenant so
+        the record is pinned like a fresh fund's (#850 PR 1b, security review MEDIUM).
+
+        A fresh process resuming a landed fund has no lock-time re-run to pin from, and an unpinned
+        taker record at BTC_LOCKED arms the tower's autonomous BTC refund (with "maker never locked"
+        text) while the covenant is on chain: the case PR 1b exists to stop. The fund itself was
+        gated before its broadcast, so the covenant was proved once; this re-proves it with the same
+        fail-closed funnel. Reads only. Any failure (the covenant since spent, a read that fails)
+        leaves the record unpinned, which is what it was before, and never stops the lock being
+        recorded: the funds already moved."""
+        try:
+            outpoint, _value, _upper = await self.taker_verify_asset_funding(terms)
+            spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms)).hex()
+        except Exception as exc:  # the lock is recorded regardless; say why it is unpinned
+            logger.warning(
+                "recorded a resumed BTC lock without pinning the maker's covenant (%s); the watchtower will "
+                "treat the covenant as unknown for this record",
+                exc,
+            )
+            return
+        self._fund_verified_covenant = (outpoint, spk)
+
     async def taker_verify_asset_funding(
         self, terms: NegotiatedTerms, *, now_unix_s: int | None = None, now_sampled_monotonic: float | None = None
     ) -> tuple[str, int, int]:
@@ -2879,6 +2902,8 @@ class SwapCoordinator:
                 # The interrupted fund already landed: record the truth. No gate and no reservation
                 # check run — recording an output already on chain sends nothing, and refusing would
                 # only leave the funds untracked (the stranding this path exists to end).
+                if getattr(self, "_fund_verified_covenant", None) is None:
+                    await self._try_pin_covenant_on_resume(terms)
                 rec = await self._record_counter_lock(terms, landed)
                 # Best effort: a seen-store that lost H (restored backup, rotated store) would accept a
                 # later swap under it. The lock is already recorded; a failing store must not undo that.

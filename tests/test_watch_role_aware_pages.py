@@ -110,6 +110,17 @@ def test_eth_maker_records_are_told_to_refund_their_covenant() -> None:
     assert d.intent is Intent.PAGE_REFUND and _MAKER_PAGE in d.recommended_action
 
 
+def test_an_eth_taker_records_pin_is_proof_the_maker_locked_when_the_depth_read_fails() -> None:
+    """Security review LOW: the ETH branch read only the observation, so a pinned taker record
+    whose depth read failed was paged "maker never locked"."""
+    rec = dataclasses.replace(
+        _eth(SwapState.BTC_LOCKED), role=RecordRole.TAKER, radiant_covenant_outpoint="ab" * 32 + ":0"
+    )
+    d = _decide_e(rec, _eth_btc_locked_obs(now_unix_s=4_000_000_001, lock=None))
+    assert d.intent is Intent.PAGE_REFUND
+    assert "maker never locked" not in d.reason and "maker locked the covenant" in d.reason
+
+
 def test_an_eth_taker_record_with_the_covenant_observed_pages_past_the_deadline() -> None:
     rec = dataclasses.replace(_eth(SwapState.BTC_LOCKED), role=RecordRole.TAKER)
     d = _decide_e(rec, _eth_btc_locked_obs(now_unix_s=4_000_000_001, lock=LOCK))
@@ -128,6 +139,8 @@ def test_the_autonomous_claim_is_armed_only_for_the_takers_record(role, armed) -
     d = _decide(_btc(SwapState.SECRET_REVEALED, role), obs)
     assert d.intent is Intent.PAGE_CLAIM
     assert d.autonomous_asset_claim is armed
+    # A claim race that is NOT armed says why (security review LOW: the round-1 note skipped it).
+    assert ("Not autonomous" in d.reason) is (not armed)
 
 
 # --------------------------------------------------------------------------- the coordinator

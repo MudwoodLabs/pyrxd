@@ -532,7 +532,10 @@ def decide(
         if finality is ClaimFinality.SAFE:
             return Decision(
                 Intent.PAGE_CLAIM,
-                reason=f"maker revealed p; BTC claim reorg-safe ({obs.btc_claim_confirmations} conf) and burial fits the window",
+                reason=(
+                    f"maker revealed p; BTC claim reorg-safe ({obs.btc_claim_confirmations} conf) and burial fits "
+                    "the window" + ("" if _autonomy_allowed(record) else "." + _no_autonomy_note(record))
+                ),
                 recommended_action=_claim_action(state),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
@@ -955,7 +958,9 @@ def _decide_eth(
         # "asset lock observed → WATCH" rule left a taker unpaged past the ETH deadline for good
         # (#850 item 6). Past eth_timeout_unix_s the contract refuses a claim, so the refund is due.
         refused = record.fund_refusal
-        covenant_seen = obs.asset_locked_at_height is not None
+        # Pin-aware, as in the BTC branch: a taker's pinned record is proof the maker locked, and a
+        # failed depth read must not turn that into "maker never locked" (security review, LOW).
+        covenant_seen = _covenant_known(record, obs)
         deadline_s = terms.eth_timeout_unix_s
         past_deadline = obs.now_unix_s is not None and deadline_s is not None and obs.now_unix_s >= deadline_s
         if record.role is RecordRole.MAKER:
