@@ -68,7 +68,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **A token-fund resume can now replace its own stuck push.** With the hash on the record, a
     resume that finds its push still pending at the pinned nonce reads it back and sends a
     fee-bumped replacement at that nonce (`Erc20HtlcLeg`'s replace-own-push path), where before it
-    refused with "still in flight". This is the first time that path runs in production.
+    refused with "still in flight". This is the first time that path runs in production. When the
+    recorded hash cannot be read back (a replacement whose broadcast failed while the original is
+    still pending, or another transaction in the slot) it refuses, naming the hash and the nonce,
+    and sends nothing.
   - `SWAP_RECORD_SCHEMA_VERSION` is 3. A record carrying `role`, or a push without a pending deploy,
     writes it, a BTC record included; a record with neither serialises exactly as before.
     `SwapRecord.from_dict` now reads the version and refuses one above its own with

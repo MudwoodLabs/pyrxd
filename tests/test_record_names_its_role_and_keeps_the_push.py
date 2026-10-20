@@ -424,3 +424,38 @@ async def test_the_sink_keeps_a_persisted_role_and_refuses_another(tmp_path) -> 
         await sink(SwapRecord(state=SwapState.BTC_LOCKED, terms=terms, role=RecordRole.MAKER))
     await sink(SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms, role=RecordRole.TAKER))  # honest path
     assert sink.load_record().state is SwapState.BOTH_LOCKED
+
+
+# --------------------------------------------------------------------------- Mythos review round
+
+
+async def test_the_sink_keeps_a_hand_edited_role_that_has_no_schema_version(tmp_path) -> None:
+    """A record naming a role but no version was only possible by hand, and crashed the sink with a
+    bare KeyError on the next role-less write (Mythos L1)."""
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    terms = _terms()
+    await sink(SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER))
+    raw = json.loads((tmp_path / "swap.json").read_text())
+    del raw["schema_version"]
+    (tmp_path / "swap.json").write_text(json.dumps(raw))
+    await sink(SwapRecord(state=SwapState.BTC_LOCKED, terms=terms))
+    on_disk = json.loads((tmp_path / "swap.json").read_text())
+    assert on_disk["role"] == "taker" and on_disk["schema_version"] == SWAP_RECORD_SCHEMA_VERSION
+
+
+def test_a_single_operator_record_refused_by_a_two_host_runner_names_the_runner_to_use() -> None:
+    """The two-host runners accept only --role maker|taker, so "run it with --role none" could not be
+    followed (Mythos L2)."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from _dust_swap_shared import _refuse_another_roles_record
+
+    record = SwapRecord(state=SwapState.BTC_LOCKED, terms=_terms(), role=RecordRole.NONE)
+    with pytest.raises(SystemExit) as raised:
+        _refuse_another_roles_record(record, role="taker", path="swap.json")
+    msg = str(raised.value)
+    assert "single-operator run" in msg and "--role none" not in msg, msg
+    with pytest.raises(SystemExit, match="Run it with --role maker"):
+        _refuse_another_roles_record(dataclasses.replace(record, role=RecordRole.MAKER), role="taker", path="swap.json")

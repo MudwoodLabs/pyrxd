@@ -428,10 +428,15 @@ def _refuse_another_roles_record(persisted: Any, *, role: str, path: Any) -> Non
     here as well as in the coordinator. A record from before 0.27 names no role and passes."""
     written = getattr(persisted, "role", None)
     if written is not None and written.value != role:
+        fix = (
+            f"Run it with --role {written.value}"
+            if written.value != "none"
+            else "It was written by a single-operator run (eth_swap_run, dust_swap_run, eth_swap_grief_run, "
+            "dust_swap_resume), which drives both legs: recover it with that runner"
+        )
         raise SystemExit(
             f"REFUSING: the swap record at {path} was written by the {written.value} side, and this phase "
-            f"runs as {role}. Nothing was sent. Run it with --role {written.value}, or check you have the "
-            "right record."
+            f"runs as {role}. Nothing was sent. {fix}, or check you have the right record."
         )
 
 

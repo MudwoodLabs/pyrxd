@@ -126,7 +126,14 @@ class JsonFileRecordSink:
         role = incoming.get("role")
         if role is None:
             incoming["role"] = prior["role"]
-            incoming["schema_version"] = max(int(incoming.get("schema_version") or 0), int(prior["schema_version"]))
+            # A hand-edited prior may name a role without a version; this pyrxd's own is the floor.
+            from pyrxd.gravity.swap_state import SWAP_RECORD_SCHEMA_VERSION
+
+            incoming["schema_version"] = max(
+                int(incoming.get("schema_version") or 0),
+                int(prior.get("schema_version") or 0),
+                SWAP_RECORD_SCHEMA_VERSION,
+            )
         elif role != prior["role"]:
             raise ValidationError(
                 f"the swap record at {self._path} was written by the {prior['role']} side; refusing to "

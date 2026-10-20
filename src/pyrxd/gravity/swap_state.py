@@ -810,8 +810,10 @@ class SwapRecord:
         KEEPS the token push's nonce and hash (#850 PR 3). They are not a pending handle: the nonce
         is the slot every push for this swap used, which is what later proves no other push can land
         (design §2.7, closing the push nonce). The hash is the LAST push signed at that slot, which
-        need not be the one that mined (a replacement can lose to the original), so it is read back
-        against a receipt before anything relies on it. Keeps ``role``: it is not about the fund.
+        need not be the one that mined (a replacement can lose to the original, or fail to
+        broadcast). Today only a resume reads it, for the pending push's fees, and refuses when it
+        cannot be read back; anything that later relies on it as THE push must check it against a
+        receipt first. Keeps ``role``: it is not about the fund.
         """
         return dataclasses.replace(
             self,

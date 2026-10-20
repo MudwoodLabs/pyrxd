@@ -41,7 +41,7 @@ re-derive from it.
 |---|---|
 | The negotiated-terms object and its JSON wire form | `src/pyrxd/gravity/swap_state.py:339-575` (`NegotiatedTerms`) |
 | The state machine every message drives | `src/pyrxd/gravity/swap_state.py:74-300` (13 states, 14 edges, `advance`) |
-| The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:584-931` (`SwapRecord`), `src/pyrxd/gravity/swap_state.py:47` (`SWAP_RECORD_SCHEMA_VERSION`) |
+| The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:584-933` (`SwapRecord`), `src/pyrxd/gravity/swap_state.py:47` (`SWAP_RECORD_SCHEMA_VERSION`) |
 | Role invariant + timelock-margin rule | `src/pyrxd/gravity/swap_coordinator.py:154-174` (`MAKER_SECRET_TAKER_LOCKS_BTC_FIRST`), `src/pyrxd/gravity/swap_coordinator.py:844-1006` (`assert_timelock_margin`) |
 | Pre-fund validation gate (what a taker checks before locking) | `src/pyrxd/gravity/swap_coordinator.py:1957-2139` (`pre_btc_lock_check`) |
 | Post-asset-lock revalidation (what a taker checks after the maker locks) | `src/pyrxd/gravity/swap_coordinator.py:3321-3388` (`post_asset_lock_revalidate`) |
@@ -241,7 +241,7 @@ The canonical wire form of `NegotiatedTerms`, produced by `NegotiatedTerms.to_di
 
 | Key | Type | Req. | Constraint | Source |
 |---|---|---|---|---|
-| `hashlock` | 64-hex | **yes** | Exactly 32 bytes. `H = SHA256(p)`, **single** SHA256. | `swap_state.py:361`; `_b32` (`swap_state.py:948-954`) |
+| `hashlock` | 64-hex | **yes** | Exactly 32 bytes. `H = SHA256(p)`, **single** SHA256. | `swap_state.py:361`; `_b32` (`swap_state.py:950-956`) |
 | `btc_sats` | int | **yes** | `> 0`. The counter-leg amount for a BTC swap. Vestigial but still required on an ETH swap. | `swap_state.py:362, 405-406` |
 | `radiant_amount` | int | **yes** | `> 0`. Photons (`rxd`), token units (`ft`), or carrier sats (`nft`). | `swap_state.py:369, 407-408` |
 | `t_btc` | `{value:int, unit:"blocks"\|"seconds"}` | **yes** | Counter-leg relative refund timelock. **Advisory on an ETH swap** — see **HZ-4**. | `swap_state.py:370, 450-451` |
@@ -604,8 +604,8 @@ each pair is the offline self-check fixture). No code path reads or validates th
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only `SWAP_RECORD_SCHEMA_VERSION` (`swap_state.py:47`) versions the *durable
 record*. It is emitted when the counter leg is ETH or the record carries a field added after v2,
-such as the record's role (written at `:849-856`), and since 0.27 the record's own reader refuses a
-version above its own (`:892`). That protects the durable record only, not these messages.
+such as the record's role (written at `:851-858`), and since 0.27 the record's own reader refuses a
+version above its own (`:894`). That protects the durable record only, not these messages.
 
 Compounding it: `NegotiatedTerms.from_dict` reads named keys and **silently ignores anything else**
 (`swap_state.py:556-575`; verified by `test_from_dict_silently_ignores_unknown_keys`). Combined with
