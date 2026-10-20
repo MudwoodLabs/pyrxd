@@ -933,7 +933,8 @@ def test_the_refund_gas_estimate_is_the_MIN_across_the_quorum() -> None:
     ("answers", "expect"),
     [
         (["revert", "revert", "revert"], ValidationError),  # every endpoint: it will never succeed
-        (["revert", "down", "revert"], NetworkError),  # not unanimous: below quorum, retry
+        (["revert", "down", "revert"], ValidationError),  # a quorum of reverts, no estimate
+        (["revert", "down", "down"], NetworkError),  # one revert is not a quorum: retry
         (["down", "down", 86_000], NetworkError),
         ([86_000, "revert", 85_000], 85_000),  # quorum of answers: MIN of them
     ],

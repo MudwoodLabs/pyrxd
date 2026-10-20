@@ -366,6 +366,9 @@ def refund_ran_out_of_gas(receipt: dict[str, Any], *, gas_limit: int) -> bool:
     A refundee that burns everything it is forwarded and then reverts reads the same as one that
     was starved; more gas may not help it, and one re-send is the most this drives.
 
+    ``gas_limit`` is the limit the transaction was SIGNED with, read from the transaction, not
+    :data:`REFUND_GAS_LIMIT`: a short-funded sender's refund is signed lower.
+
     Reads ``gasUsed`` from the receipt it is given, which a multi-source receipt read does not
     corroborate. That is enough for what this decides, one re-send (#850 PR 5b): a wrong answer
     costs one refund's gas, never funds."""
@@ -1128,9 +1131,12 @@ class EthHtlcContractLeg:
         ``fund`` (#502 item 2), so a caller can record the refund before it can be mined. Nothing
         passes it yet; PR 5b of #850 records the pending refund through it.
 
-        Gas (#850 PR 4a): signed with :data:`REFUND_GAS_LIMIT`. After the preflight passes,
-        ``eth_estimateGas`` must come in at or under that limit, or this raises
-        :class:`RefundGasAboveCeiling` before signing.
+        Gas (#850 PR 4a): ``eth_estimateGas`` runs first and must come in at or under
+        :data:`REFUND_GAS_LIMIT`, or this raises :class:`RefundGasAboveCeiling`. The refund is signed
+        at that limit, or at the most the sender can hold up front if less, never below the
+        estimate (:class:`RefundFeeUnaffordable` otherwise). The preflight then runs at the limit
+        signed. The limit is in the signed transaction (``get_transaction(hash)["gas"]``), which is
+        the value :func:`refund_ran_out_of_gas` must be given.
 
         P3 maturity pre-check: the contract's ``refund()`` reverts until
         ``block.timestamp >= timeout``. We read the latest block timestamp and refuse a premature
