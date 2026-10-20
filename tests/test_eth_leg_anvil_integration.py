@@ -1169,3 +1169,83 @@ async def test_both_contracts_give_claim_errors_in_ONE_order(anvil_url, which):
             assert await _revert_selector(rpc, claim_call(empty.contract_address, p)) == _sel("Underfunded()")
     finally:
         await rpc.close()
+
+
+# --------------------------------------------------------------------------------------------
+# #850 PR 4: the disposition reader against a REAL node. The fake chain in the unit tests was
+# shown wrong once (it answered a log range past the head with [], where anvil refuses it), so
+# the reader's terminal answers are also pinned here, through a real EthRpc.
+# --------------------------------------------------------------------------------------------
+
+
+async def _finalize_past(rpc, blocks: int = 6) -> None:
+    for _ in range(blocks):
+        await rpc.w3.provider.make_request("evm_mine", [])
+
+
+async def test_disposition_reads_a_real_refund_as_REFUNDED(anvil_url_fast_finality):
+    from pyrxd.eth_wallet.disposition import DispositionKind, read_counter_disposition
+
+    rpc, taker, _maker = _legs(anvil_url_fast_finality)
+    try:
+        _p, h = _secret()
+        locator = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 100),
+            amount_wei=_AMOUNT_WEI,
+        )
+        await _advance_time(rpc, 200)
+        tx = await taker.refund(locator)
+        await rpc.wait_receipt(tx)
+        await _finalize_past(rpc)
+        d = await read_counter_disposition(rpc, locator)
+        assert d.kind is DispositionKind.REFUNDED, (d.reason, d.logs_failed)
+        assert d.evidence.tx_hash == tx.lower() and d.single_source is True
+        assert d.logs_failed == {}
+    finally:
+        await rpc.close()
+
+
+async def test_disposition_reads_a_real_claim_before_the_timeout_as_CLAIMED(anvil_url_fast_finality):
+    from pyrxd.eth_wallet.disposition import DispositionKind, read_counter_disposition
+
+    rpc, taker, maker = _legs(anvil_url_fast_finality)
+    try:
+        p, h = _secret()
+        locator = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 10_000),
+            amount_wei=_AMOUNT_WEI,
+        )
+        tx = await maker.claim(locator, p)
+        await rpc.wait_receipt(tx)
+        await _finalize_past(rpc)
+        d = await read_counter_disposition(rpc, locator)
+        assert d.kind is DispositionKind.CLAIMED, (d.reason, d.logs_failed)
+        assert [(c.tx_hash, c.verified) for c in d.claims_seen] == [(tx.lower(), True)]
+    finally:
+        await rpc.close()
+
+
+async def test_disposition_reads_an_open_contract_as_OPEN(anvil_url_fast_finality):
+    from pyrxd.eth_wallet.disposition import DispositionKind, read_counter_disposition
+
+    rpc, taker, _maker = _legs(anvil_url_fast_finality)
+    try:
+        _p, h = _secret()
+        locator = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 10_000),
+            amount_wei=_AMOUNT_WEI,
+        )
+        await _finalize_past(rpc)
+        d = await read_counter_disposition(rpc, locator)
+        assert d.kind is DispositionKind.OPEN, (d.reason, d.logs_failed)
+    finally:
+        await rpc.close()

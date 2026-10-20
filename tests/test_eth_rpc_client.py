@@ -962,14 +962,13 @@ class TestGetStorageAt:
 
 class TestGetLogsUnion:
     def test_one_endpoint_union_records_that_it_answered(self) -> None:
-        client, node = _client(get_logs=[])
+        client, node = _client(get_logs=[], block_number=12)
         u = _run(client.get_logs_union(address=_ADDR, topics=[], from_block=5, to_block=9))
         assert u.logs == () and u.answered == frozenset({str(client.source_key)}) and u.failed == {}
-        # the chunked range, then the tail to latest
-        assert [a[0]["fromBlock"] for a, _ in node.asked("get_logs")] == [5, 10]
-        assert node.asked("get_logs")[-1][0][0]["toBlock"] == "latest"
+        # One request, to this endpoint's own head (12), never past it and never an open "latest".
+        assert [(a[0]["fromBlock"], a[0]["toBlock"]) for a, _ in node.asked("get_logs")] == [(5, 12)]
 
     def test_a_failed_log_read_is_recorded_never_empty(self) -> None:
-        client, _ = _client(get_logs=ConnectionError("429 Too Many Requests"))
+        client, _ = _client(get_logs=ConnectionError("429 Too Many Requests"), block_number=9)
         u = _run(client.get_logs_union(address=_ADDR, topics=[], from_block=5, to_block=9))
         assert u.answered == frozenset() and set(u.failed) == {str(client.source_key)}

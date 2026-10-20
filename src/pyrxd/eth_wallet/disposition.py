@@ -14,7 +14,13 @@ Three kinds of read, each allowed to decide only what it can prove (§2.1):
   ``status == 1``, sits at a block ``<= F``, its block hash is the canonical hash at that height (also
   agreed), and it carries ``Refunded()`` (or ``Claimed(p)`` with ``sha256(p) == H``) from OUR contract.
 * **Invariant at F**: ``settled`` (storage slot 0) and the block timestamp, read at the one pinned
-  block ``F`` (the quorum MIN of ``finalized``), whose hash every endpoint agrees on.
+  block ``F`` (the quorum MIN of ``finalized``), whose hash and timestamp every answering endpoint
+  agrees on.
+
+"Agreed" throughout means what ``MultiSourceEthRpc`` means by it: at least ``min_agreeing`` endpoints
+answered, and every one that answered gave the same value. A disagreement is UNKNOWN, never a vote.
+The storage read "at F" is pinned by block NUMBER, so the binding of that read to ``F``'s hash rests
+on that agreement, not on an EIP-1898 block-hash pin.
 
 Precedence when evidence contradicts (§2.4): invariants at ``F`` outrank receipts, and receipts
 outrank nominations. A verified refund and a verified claim together, a verified refund beside "Gap B"
@@ -61,9 +67,17 @@ __all__ = [
 #: cap: a range-limit refusal halves the chunk for that endpoint, down to one block.
 LOG_CHUNK_BLOCKS = 10_000
 
+#: How far past the agreed head one endpoint's log scan follows its OWN head. CHOSEN, not measured.
+#: Bounded so an endpoint reporting an absurd head cannot make its own scan endless; a log beyond it
+#: is above every finalized block anyway, so it could only have been a liveness nomination.
+LOG_TAIL_BLOCKS = LOG_CHUNK_BLOCKS
+
 #: Error text that means "this range is too large for me", as providers word it. Matched lower-cased.
 #: A miss here only costs the halving: the request is then recorded as a failure, never as "no logs".
-_RANGE_LIMIT_MARKERS = ("range", "limit", "too many", "exceed", "query returned more than", "-32005", "10000")
+_RANGE_LIMIT_MARKERS = ("block range", "range limit", "range too", "exceeds max", "query returned more than")
+#: ...and text that means "slow down", which must NOT be retried as a smaller range: halving on a 429
+#: sends a rate-limited endpoint a dozen more requests before it is recorded as failed.
+_RATE_LIMIT_MARKERS = ("429", "too many requests", "rate limit", "rate-limit", "ratelimit")
 
 
 class DispositionKind(Enum):
@@ -86,7 +100,7 @@ class DispositionEvidence:
     block_number: int
     block_hash: str
     tx_hash: str | None  # None for Gap B (CLAIMED proven by the invariants alone)
-    sources: tuple[str, ...]
+    sources: tuple[str, ...]  # every endpoint the reader was given, not only those that answered
     single_source: bool
 
 
@@ -105,8 +119,8 @@ class ClaimSeen:
 @dataclass(frozen=True)
 class LogUnion:
     """The union of one log query across endpoints, and what answered (§2.6). ``from_block`` to
-    ``to_block`` is the chunked range every answering endpoint covered; each one was then also
-    asked from ``to_block + 1`` to its own ``latest``."""
+    ``to_block`` is the range every answering endpoint covered; each one also went on to its own
+    head, at most :data:`LOG_TAIL_BLOCKS` further."""
 
     logs: tuple[dict[str, Any], ...]
     answered: frozenset[str]
@@ -161,7 +175,12 @@ class _BelowQuorum(Exception):
 
 
 async def _ask_all(sources: Sequence[Any], call: Callable[[Any], Awaitable[Any]]) -> list[tuple[Any, Any]]:
-    results = await asyncio.gather(*(call(s) for s in sources), return_exceptions=True)
+    async def one(s: Any) -> Any:
+        # Inside a coroutine, so a source that cannot even START the call (a missing method)
+        # fails as that source, not as the whole read.
+        return await call(s)
+
+    results = await asyncio.gather(*(one(s) for s in sources), return_exceptions=True)
     return list(zip(sources, results, strict=True))
 
 
@@ -192,21 +211,28 @@ async def _magnitude(
 
 def _is_range_limit(exc: BaseException) -> bool:
     text = str(exc).lower()
+    if any(marker in text for marker in _RATE_LIMIT_MARKERS):
+        return False
     return any(marker in text for marker in _RANGE_LIMIT_MARKERS)
 
 
 async def _logs_from_one(
     source: Any, address: str, topics: list[Any], from_block: int, to_block: int
 ) -> list[tuple[Any, ...]]:
-    """Every log in ``[from_block, to_block]`` from ONE endpoint, chunked, then one last request
-    from ``to_block + 1`` to ``"latest"`` so a log newer than the agreed head is still nominated. A
-    range-limit refusal halves the chunk. Any other failure (a 429, a timeout, a pruned range, a
-    malformed field) raises: it is never "no logs". Returned normalised, so a malformed answer
-    fails THIS endpoint rather than the whole read."""
+    """Every log in ``[from_block, to_block]`` from ONE endpoint, then on to that endpoint's OWN head
+    (at most :data:`LOG_TAIL_BLOCKS` further), so a log newer than the agreed head is still nominated.
+
+    Every request names integer blocks the endpoint has reached. Asking past its head is refused
+    by real nodes (anvil: ``BlockOutOfRangeError``), and an open ``"latest"`` tail would dodge the
+    chunking. A range-limit refusal halves the chunk. Any other failure (a 429, a timeout, a pruned
+    range, a malformed field) raises: it is never "no logs". Returned normalised, so a malformed
+    answer fails THIS endpoint rather than the whole read."""
+    own_head = int(await source.block_number())
+    end_at = min(own_head, to_block + LOG_TAIL_BLOCKS)
     raw: list[dict[str, Any]] = []
     start, chunk = from_block, LOG_CHUNK_BLOCKS
-    while start <= to_block:
-        end = min(to_block, start + chunk - 1)
+    while start <= end_at:
+        end = min(end_at, start + chunk - 1)
         try:
             raw.extend(await source.get_logs(address=address, topics=topics, from_block=start, to_block=end))
         except Exception as exc:
@@ -215,7 +241,6 @@ async def _logs_from_one(
                 continue
             raise
         start = end + 1
-    raw.extend(await source.get_logs(address=address, topics=topics, from_block=to_block + 1, to_block="latest"))
     return [(_log_key(log), log) for log in raw]
 
 
@@ -339,9 +364,10 @@ async def read_counter_disposition(
     transaction's receipt, which needs a real ``locator.deploy_tx_hash``. ``recorded_refund_hashes``
     are refund transactions we sent ourselves, nominated alongside the logs and verified like them.
 
-    A LIVENESS LIMIT, by design: one endpoint that nominates a transaction (a forged log) and then
+    LIVENESS LIMITS, by design. One endpoint that nominates a transaction (a forged log) and then
     disagrees with the others about its receipt makes every answer for a SETTLED contract UNKNOWN for
-    as long as it keeps doing so. UNKNOWN pages and moves nothing, so this costs time, never funds; the
+    as long as it keeps doing so. So does one endpoint that has pruned an old receipt (geth's
+    transaction-history limit, say) beside one that has not. UNKNOWN pages and moves nothing, so this costs time, never funds; the
     alternative, letting a majority overrule a disagreeing endpoint, is a majority read the design
     forbids for identity facts (§2.2).
     """
@@ -350,7 +376,7 @@ async def read_counter_disposition(
     if from_block is not None and (not isinstance(from_block, int) or isinstance(from_block, bool) or from_block < 0):
         raise ValidationError("from_block must be a non-negative int")
     for h in recorded_refund_hashes:
-        if not isinstance(h, str) or not h.startswith("0x") or len(h) != 66:
+        if not isinstance(h, str) or not h.startswith("0x") or len(h) != 66 or not _is_hex(h[2:]):
             raise ValidationError("recorded_refund_hashes must be 0x-prefixed 32-byte hex hashes")
     panel = _panel_of(rpc)
     single = len(panel.sources) == 1
@@ -372,17 +398,6 @@ async def read_counter_disposition(
                 f"settled at {finalized}",
             )
         )
-        # Any endpoint seeing it settled at its tip is enough to WAIT: the cost of believing a
-        # liar here is a delay, and the cost of disbelieving an honest one is a refund that reverts.
-        settled_tip = any(
-            await _magnitude(
-                panel,
-                lambda s: s.get_storage_at(locator.contract_address, SETTLED_SLOT, "latest"),
-                "settled at tip",
-                lambda words: max(words, key=any),
-            )
-        )
-        tip_ts = await _magnitude(panel, lambda s: s.latest_block_timestamp(), "tip timestamp", min)
         head = await _magnitude(panel, lambda s: s.block_number(), "head", min)
         if from_block is None:
             if str(locator.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH:
@@ -499,6 +514,22 @@ async def read_counter_disposition(
             finalized,
             **common,
         )
+    # The tip reads are inputs only to these non-terminal answers, so they are made only here: a
+    # failed tip read must not turn a verified REFUNDED or CLAIMED into UNKNOWN (rule 7's scope).
+    try:
+        # Any endpoint seeing it settled at its tip is enough to WAIT: the cost of believing a
+        # liar here is a delay, and the cost of disbelieving an honest one is a refund that reverts.
+        settled_tip = any(
+            await _magnitude(
+                panel,
+                lambda s: s.get_storage_at(locator.contract_address, SETTLED_SLOT, "latest"),
+                "settled at tip",
+                lambda words: max(words, key=any),
+            )
+        )
+        tip_ts = await _magnitude(panel, lambda s: s.latest_block_timestamp(), "tip timestamp", min)
+    except _BelowQuorum as exc:
+        return unknown(f"a required read failed: {exc}", finalized, **common)
     if settled_tip:
         return done(DispositionKind.SETTLED_UNFINAL, "settled at the tip, not yet at the finalized block")
     if f_ts >= timeout:
@@ -506,6 +537,14 @@ async def read_counter_disposition(
     if tip_ts >= timeout:
         return done(DispositionKind.TIP_EXPIRED, "not settled, and the tip is at or past the timeout")
     return done(DispositionKind.OPEN, "not settled, and before the timeout")
+
+
+def _is_hex(text: str) -> bool:
+    try:
+        bytes.fromhex(text)
+    except ValueError:
+        return False
+    return True
 
 
 async def _deploy_block(source: Any, deploy_tx_hash: str) -> int | None:

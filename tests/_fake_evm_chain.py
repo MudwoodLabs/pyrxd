@@ -8,7 +8,7 @@ test that wants an impossible chain says so by calling :meth:`FakeEvmChain.force
 
 Endpoints read the chain with the misbehaviours the design names (§2.6, §7): lag, a forged
 ``Refunded`` log, a hidden ``Claimed`` log, a forged receipt, a 429 on every log read, a block-range
-cap, and no historic state. Each endpoint is a distinct host (``tests._source_hosts``), so the
+cap, and no historic state. A log range past the endpoint's head is refused, as anvil refuses it. Each endpoint is a distinct host (``tests._source_hosts``), so the
 production ``MultiSourceEthRpc`` accepts them as a quorum.
 """
 
@@ -173,6 +173,7 @@ class FakeEvmEndpoint:
         archive: bool = True,
         claim_settled_at_tip: bool = False,
         extra_logs: tuple[dict[str, Any], ...] = (),
+        tip_reads_fail: bool = False,
     ) -> None:
         self.chain = chain
         self.lag = lag
@@ -185,6 +186,7 @@ class FakeEvmEndpoint:
         self.archive = archive
         self.claim_settled_at_tip = claim_settled_at_tip
         self.extra_logs = extra_logs
+        self.tip_reads_fail = tip_reads_fail
         self.source_key = distinct_host()
         self.expected_chain_id = CHAIN_ID
         self.log_requests: list[tuple[int, int | str]] = []
@@ -204,6 +206,8 @@ class FakeEvmEndpoint:
         return self.head
 
     async def latest_block_timestamp(self) -> int:
+        if self.tip_reads_fail:
+            raise NetworkError("eth_getBlockByNumber(latest) failed")
         return self.chain.ts(self.head)
 
     async def block_hash_and_timestamp(self, number: int) -> tuple[bytes, int]:
@@ -253,7 +257,13 @@ class FakeEvmEndpoint:
             raise NetworkError("eth_getLogs failed: 429 Too Many Requests")
         hi = self.head if to_block == "latest" else int(to_block)
         lo = int(from_block)
-        if self.range_cap is not None and to_block != "latest" and hi - lo + 1 > self.range_cap:
+        if lo > self.head or hi > self.head:
+            # What anvil 1.7.1 answers (measured in the PR 4 review): a range past the head is an
+            # error, not an empty list.
+            raise NetworkError(
+                f"eth_getLogs failed: BlockOutOfRangeError: block height is {self.head} but requested was {max(lo, hi)}"
+            )
+        if self.range_cap is not None and hi - lo + 1 > self.range_cap:
             raise NetworkError(f"eth_getLogs failed: query exceeds max block range {self.range_cap}")
         out = []
         for log in self.chain.logs():

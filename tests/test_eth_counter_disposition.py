@@ -262,8 +262,10 @@ async def test_rule_3_a_verified_refund_beside_gap_b_is_unknown():
 
 
 async def test_rule_4_a_verified_refund_beside_an_unverified_claim_seen_is_refunded():
-    """A dropped claim carries ``p`` (the claim reverted or never mined), one endpoint still
-    returns its log, and the refund verifies. REFUNDED, with the claim kept as liveness."""
+    """``p`` is public (a dropped claim carried it), and one lying endpoint nominates a
+    ``Claimed(p)`` log for a transaction no endpoint has a receipt for. No honest node returns a log
+    for an unmined transaction, so this IS a liar, a polite one: its receipt agrees with the others.
+    The refund verifies, so REFUNDED, with the claim kept as liveness."""
     chain = _chain(finalized=90)
     refund_tx = chain.refund(85)
     dropped = {
@@ -377,6 +379,7 @@ async def test_an_unknown_deploy_hash_without_from_block_is_unknown():
         {"from_block": True},
         {"recorded_refund_hashes": ["0x12"]},
         {"recorded_refund_hashes": [b"\x00" * 32]},
+        {"recorded_refund_hashes": ["0x" + "zz" * 32]},
     ],
 )
 async def test_bad_inputs_are_refused(kw):
@@ -426,3 +429,76 @@ async def test_a_failed_receipt_does_not_verify_even_if_it_carries_the_event():
     tx = chain.force_receipt(85, topic0=REFUNDED_TOPIC0, label="status-0", status=0)
     d = await _read(_quorum(chain), chain, recorded_refund_hashes=[tx])
     assert d.kind is DispositionKind.F_EXPIRED
+
+
+async def test_rule_4_with_a_liar_that_also_forges_the_claim_receipt_is_unknown():
+    """The impolite liar of rule 4: it also forges a receipt for the claim, so the claim cannot be
+    checked, and the settled answer is UNKNOWN (the reader's documented liveness limit)."""
+    chain = _chain(finalized=90)
+    chain.refund(85)
+    claim_tx = "0x" + "dd" * 32
+    liar = FakeEvmEndpoint(
+        chain,
+        extra_logs=(
+            {
+                "address": "0x" + "c0" * 20,
+                "topics": [CLAIMED_TOPIC0],
+                "data": "0x" + chain.preimage.hex(),
+                "transactionHash": claim_tx,
+                "blockNumber": 78,
+            },
+        ),
+        forge_refunded_tx=None,
+    )
+
+    async def forged_receipt(tx_hash, _orig=liar.get_transaction_receipt):
+        if tx_hash == claim_tx:
+            return {"status": 1, "blockNumber": 78, "blockHash": liar._hash(78), "logs": []}
+        return await _orig(tx_hash)
+
+    liar.get_transaction_receipt = forged_receipt
+    d = await _read(_quorum(chain, liar), chain)
+    assert d.kind is DispositionKind.UNKNOWN and "could not be checked" in d.reason
+
+
+async def test_a_failed_tip_read_does_not_block_a_verified_refund():
+    """The tip reads are inputs only to the non-terminal answers (rule 7's scope)."""
+    chain = _chain(finalized=90)
+    tx = chain.refund(85)
+    eps = [FakeEvmEndpoint(chain, tip_reads_fail=True) for _ in range(3)]
+    d = await _read(MultiSourceEthRpc(eps), chain)
+    assert d.kind is DispositionKind.REFUNDED and d.evidence.tx_hash == tx
+
+
+async def test_a_failed_tip_read_makes_an_unsettled_answer_unknown():
+    chain = _chain(finalized=60)
+    eps = [FakeEvmEndpoint(chain, tip_reads_fail=True) for _ in range(3)]
+    d = await _read(MultiSourceEthRpc(eps), chain)
+    assert d.kind is DispositionKind.UNKNOWN
+
+
+async def test_a_429_is_not_retried_as_a_smaller_range():
+    chain = _chain(finalized=90)
+    throttled = FakeEvmEndpoint(chain, logs_429=True)
+    u = await union_logs(throttled, address=chain.locator().contract_address, topics=[], from_block=0, to_block=100)
+    assert set(u.failed) == {str(throttled.source_key)}
+    assert len(throttled.log_requests) == 1
+
+
+async def test_a_source_missing_a_method_fails_as_that_source_only():
+    chain = _chain(finalized=90)
+    tx = chain.refund(85)
+
+    class _Old(FakeEvmEndpoint):
+        block_hash_and_timestamp = None  # an older client without the new read
+
+    d = await _read(_quorum(chain, _Old(chain)), chain)
+    assert d.kind is DispositionKind.REFUNDED and d.evidence.tx_hash == tx
+
+
+async def test_the_scan_never_asks_past_an_endpoints_own_head():
+    chain = _chain(finalized=90)
+    eps = [FakeEvmEndpoint(chain), FakeEvmEndpoint(chain, lag=3), FakeEvmEndpoint(chain, lag=7)]
+    await _read(MultiSourceEthRpc(eps), chain)
+    for ep in eps:
+        assert ep.log_requests and all(isinstance(t, int) and t <= ep.head for _f, t in ep.log_requests)
