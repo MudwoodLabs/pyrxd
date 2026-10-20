@@ -83,7 +83,7 @@ or substantially changed since this brief's previous revision (2026-06-20) — d
 | **Key material** | `src/pyrxd/hd/` (`wallet.py`, `bip32.py`, `bip39.py`, **(0.14)** `descriptor.py`), `src/pyrxd/security/` (`secrets.py`, `types.py`, `errors.py`), `src/pyrxd/keys.py`, `src/pyrxd/base58.py` | AES-256-GCM + scrypt wallet; `SecretBytes`; the agent's transient-xprv re-derivation; the persisted-coin-type pin (`hd/wallet.py:707-744`); NFKD seed normalization + the `normalize=False` recovery escape (0.12.0); descriptor export (an xpub is a whole-history disclosure — the module says so); the static-message base58/WIF error path (0.14.0 — this is where a key-echo bug lived, §7). |
 | **Signing agent** | `src/pyrxd/agent/` — `signer.py`, `confirm.py`, `daemon.py`, `hygiene.py` | The unlocked-wallet daemon (A11) on a `0600` socket; per-spend `/dev/tty` confirmation; prevout authenticity. |
 | **Glyph / metadata / dMint** | `src/pyrxd/glyph/` — `script.py` (the consensus ref-opcode walker, `REF_OPCODES` at `glyph/script.py:1099`), `payload.py`, `types.py`, `scanner.py`, `creator.py`, `credential_binding.py`, `soulbound_covenant.py`, `soulbound_detect.py`, **(0.12–0.14)** `mint.py` (two-phase minter + `PendingStore` — losing the CBOR between commit and reveal strands the output permanently), `fees.py`, `ft.py` (airdrop + transfer — where a whole-balance fund-loss bug lived, §7), `royalty.py`, `dmint/` (`builders.py` incl. deploy-with-premine, `chain.py`, `miner.py`) | Attacker-facing parser surface + the token-issuance paths. Consensus parity of the ref walkers is load-bearing for **fee-input selection** (a token misclassified as plain funding is silently burned as fees) and for the credential gate. Normative spec: [`reference/glyph-token-protocol-spec.md`](reference/glyph-token-protocol-spec.md). |
-| **Lying-server defenses** | `src/pyrxd/network/` — `electrumx.py`, `bitcoin.py`, **(0.14)** `registry.py`, `failover.py`, `tls_pin.py`, `confirm.py`, `rxindexer.py` | `wss`-only, response caps, per-id correlation, the multi-source BTC quorum; new in 0.14.0: the endpoint registry with genesis-hash chain binding (`assert_chain` — a chain mismatch is *not* failover-able), request-level failover with read-back-corroborated "already known" handling (`failover.py:397 _holds_tx`), and opt-in SPKI pinning (`tls_pin.py`, off by default deliberately). |
+| **Lying-server defenses** | `src/pyrxd/network/` — `electrumx.py`, `bitcoin.py`, **(0.14)** `registry.py`, `failover.py`, `tls_pin.py`, `confirm.py`, `rxindexer.py` | `wss`-only, response caps, per-id correlation, the multi-source BTC quorum; new in 0.14.0: the endpoint registry with genesis-hash chain binding (`assert_chain` — a chain mismatch is *not* failover-able), request-level failover with read-back-corroborated "already known" handling (`failover.py:409 _holds_tx`), and opt-in SPKI pinning (`tls_pin.py`, off by default deliberately). |
 
 `SECURITY.md` lists the in-scope packages for *reports* (`pyrxd.curve|security|aes_cbc|crypto`,
 `pyrxd.hd`, `pyrxd.transaction|script`, `pyrxd.glyph`, `pyrxd.gravity`, `pyrxd.network` —
@@ -261,7 +261,7 @@ this commit, not against a plan:
    They have since been reordered so the maker's covenant is mined before the taker funds (for
    example `test_xchain_swap_regtest_e2e.py:697-711`); see HZ-1 in
    [`htlc-handshake-wire-format.md`](htlc-handshake-wire-format.md). They remain opt-in
-   (env-gated) and deselected from `task ci` (`pyproject.toml:669`, `-m 'not integration'`).
+   (env-gated) and deselected from `task ci` (`pyproject.toml:677`, `-m 'not integration'`).
 2. **A CONTAINER output with a child ref was mintable, unroutable, and worse — CLOSED after
    0.14.0.** `prepare_container_reveal(child_ref=...)` built a 100-byte script no classifier
    matched. Investigated against a regtest node rather than routed: the output was
@@ -434,7 +434,7 @@ The pre-existing numbering has collisions the auditor will otherwise trip on:
 - **Local CI:** `task ci` (ruff lint + bandit, format check, full pytest, 100% security-pkg +
   85% overall coverage, mypy on `pyrxd.security`, private-link check — `pyproject.toml`
   `[tool.taskipy.tasks]`). The default pytest run deselects `-m integration`
-  (`pyproject.toml:669`).
+  (`pyproject.toml:677`).
 - **Swap consensus on a real node** (opt-in, skips without docker/image):
   `RADIANT_REGTEST=1 pytest tests/test_htlc_regtest_e2e.py -m integration` (Radiant HTLC: claim,
   wrong-preimage, premature/matured CSV refund, the `R1` fake-singleton acceptance);

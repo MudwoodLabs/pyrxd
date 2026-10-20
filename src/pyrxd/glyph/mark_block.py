@@ -90,8 +90,13 @@ checkpoint; ``cached_anchor_height`` names ``A``, and the claim says which ancho
 served header at ``A`` that is not the cached one is NOT VERIFIED, never CONTRADICTED: it
 disagrees with the local cache (which may be on a branch Radiant abandoned), not with anything
 shipped or with the mark's proof; ``cache_disagreement`` says so, and :func:`verify_with_fetched`
-then falls back to the shipped checkpoint when the block is within its reach. With no cache,
-nothing here changes.
+then falls back to the shipped checkpoint when the block is within its reach. One case asks the
+server nothing about the cache: a block at or below the newest SHIPPED checkpoint, with the cache
+reaching the required depth. Only the headers from the block up to that checkpoint are fetched, so
+the depth above it is counted from the cache alone, no served header is compared with ``A``, and a
+cache on an abandoned branch goes unnoticed (``cache_disagreement`` stays ``None``). The block's
+height still rests on the shipped checkpoint, and the claim says the depth is counted through the
+cache. With no cache, nothing here changes.
 
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
 nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
