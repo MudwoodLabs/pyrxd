@@ -22,12 +22,12 @@ _GOOD = "0x" + "ab" * 32
 
 @pytest.fixture
 def erc20_record() -> SwapRecord:
-    """A record with a PENDING DEPLOY, because that is the only state a pending push exists in.
+    """A record with a PENDING DEPLOY: the state a push is first recorded in.
 
-    The push fields are serialised inside `if self.pending_counter_contract:` — deliberately, so a
-    BTC record stays byte-identical to the v1 wire form. A fixture with a push nonce and no pending
-    contract is a state the system never produces, and a round-trip assertion against it tests
-    nothing.
+    Until #850 PR 3 the push fields were serialised only inside `if self.pending_counter_contract:`,
+    and attaching the locator cleared them, so a push could exist only beside a pending deploy. They
+    now survive the fund (a funded record keeps the nonce and hash, design §2.7), and are written
+    whenever set; `tests/test_record_names_its_role_and_keeps_the_push.py` pins that half.
     """
     return SwapRecord(
         state=SwapState.NEGOTIATED,
@@ -58,8 +58,8 @@ class TestTheRecordHoldsIt:
         assert "pending_push_tx_hash" not in erc20_record.to_dict()
 
     def test_a_record_with_NO_pending_deploy_never_grows_the_field(self) -> None:
-        """The v1-wire-form guarantee. Push fields live inside the pending-deploy branch, so a BTC
-        or fresh record stays byte-identical to what a pre-ETH binary wrote."""
+        """The v1-wire-form guarantee. Push fields are written only when set, so a record that
+        never had a push stays byte-identical to what an older binary wrote."""
         bare = SwapRecord(state=SwapState.NEGOTIATED, terms=_token_terms(), counterchain_locator=_erc20_locator())
         d = bare.to_dict()
         assert "pending_push_tx_hash" not in d and "pending_push_nonce" not in d
@@ -85,7 +85,11 @@ class TestTheRecordHoldsIt:
 
 
 class TestTheLegRecordsItBeforeSending:
-    """Reachability: a field nothing writes is not a durable handle."""
+    """Reachability, the LEG half: a field nothing writes is not a durable handle.
+
+    These read the token leg's source, which proves the hook exists, not that anything calls it, and
+    nothing did: `EthLeg.fund` did not pass `on_push_hash` until #850 PR 3. The caller half, through
+    the shipped `EthLeg` and the coordinator, is in `tests/test_record_names_its_role_and_keeps_the_push.py`."""
 
     def test_the_push_threads_an_on_push_hash_hook(self) -> None:
         import inspect

@@ -80,6 +80,8 @@ class CounterChainLeg(ABC):
         resume_from: Any = None,
         push_nonce: Any = None,
         on_push_nonce: Any = None,
+        push_tx_hash: Any = None,
+        on_push_hash: Any = None,
     ) -> Any:
         """Lock the counter-chain value into a fresh HTLC; return its durable locator.
 
@@ -110,6 +112,12 @@ class CounterChainLeg(ABC):
         whose chain gives exclusive, replace-not-add semantics per nonce gets idempotent funding
         from this: a retry at the same pin delivers the value exactly once, no matter how many
         processes or hosts attempt it. A leg on a chain without that property may ignore both.
+
+        ``push_tx_hash`` / ``on_push_hash`` are the same for the pushed transaction's HASH:
+        ``on_push_hash(nonce, tx_hash)`` is awaited between signing and sending, so the caller can
+        persist the hash before the broadcast, and ``push_tx_hash`` hands it back on a resume so
+        the leg can read the pending push and price a replacement. Legs without a push accept and
+        ignore both.
         """
 
     @abstractmethod

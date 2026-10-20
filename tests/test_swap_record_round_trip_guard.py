@@ -11,11 +11,9 @@ Each sample sets its field to a non-default value on a valid base record, with o
 nonce), and the record must come back equal after a JSON round trip, the transport the record
 sink uses.
 
-One gap is known and pinned ``xfail(strict=True)``: the push nonce and hash are serialised only
-inside the pending-deploy block (``swap_state.py``, ``if self.pending_counter_contract:``), so a
-push recorded without a pending deploy is lost. #850 PR 3 records the push for every token fund
-and moves them out of that block; that PR turns these into passes, which fails the build until
-the markers are deleted.
+The push nonce and hash recorded without a pending deploy were lost until #850 PR 3, which writes
+them whenever set; their samples were pinned ``xfail(strict=True)`` until then, and that PR's
+passes are what removed the markers.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ from collections.abc import Callable
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
-from pyrxd.gravity.swap_state import SwapRecord, SwapState
+from pyrxd.gravity.swap_state import RecordRole, SwapRecord, SwapState
 from tests.test_swap_record_erc20_migration import _erc20_locator, _token_terms
 from tests.test_swap_state import _eth_locator, _eth_terms, _locator, _terms
 
@@ -59,11 +57,6 @@ def _raw_btc_tx() -> str:
 def _with(base: Callable[[], SwapRecord], **fields) -> Callable[[], SwapRecord]:
     return lambda: dataclasses.replace(base(), **fields)
 
-
-_PUSH_GAP = pytest.mark.xfail(
-    strict=True,
-    reason="#850 PR 3: the push nonce and hash are serialised only inside the pending-deploy block",
-)
 
 #: field name -> [(label, builder, marks)]. Builders return a record with that field set.
 SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
@@ -109,7 +102,7 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
             ),
             (),
         ),
-        ("push-nonce-alone", _with(_token_base, pending_push_nonce=7), (_PUSH_GAP,)),
+        ("push-nonce-alone", _with(_token_base, pending_push_nonce=7), ()),
     ],
     "pending_push_tx_hash": [
         (
@@ -126,11 +119,12 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
         (
             "push-hash-and-nonce-alone",
             _with(_token_base, pending_push_nonce=7, pending_push_tx_hash="0x" + "ef" * 32),
-            (_PUSH_GAP,),
+            (),
         ),
     ],
     "single_operator_override": [("override", _with(_btc_base, single_operator_override="operator said so"), ())],
     "fund_refusal": [("fund-refusal", _with(_btc_base, fund_refusal="refused: gate"), ())],
+    "role": [(f"role-{r.value}", _with(_btc_base, role=r), ()) for r in RecordRole],
     "pending_btc_funding_tx": [
         ("pending-btc-fund", lambda: dataclasses.replace(_btc_base(), pending_btc_funding_tx=_raw_btc_tx()), ())
     ],

@@ -805,10 +805,15 @@ class EthHtlcContractLeg:
         resume_from: Any = None,
         push_nonce: Any = None,
         on_push_nonce: Any = None,
+        push_tx_hash: Any = None,
+        on_push_hash: Any = None,
     ) -> EthHtlcLocator:
         """Deploy + fund the HTLC (payable constructor). Returns the locator ONLY after
         the deploy tx confirms with status==1 (a reverted/dropped deploy never yields a
-        'funded' locator). The TAKER calls this; claimant=maker, refundee=taker."""
+        'funded' locator). The TAKER calls this; claimant=maker, refundee=taker.
+
+        ``push_nonce``, ``on_push_nonce``, ``push_tx_hash`` and ``on_push_hash`` are accepted and
+        ignored: a native fund is one transaction, with no separate push to pin."""
         if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
             raise ValidationError("hashlock must be 32 bytes")
         if amount_wei <= 0:

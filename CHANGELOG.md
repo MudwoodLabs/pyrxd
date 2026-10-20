@@ -53,6 +53,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The swap record names the side that wrote it, keeps the token push after the fund, and is
+  versioned on read (#850 PR 3) [Changed (breaking)].**
+  - `SwapRecord.role` (`RecordRole`: `maker`, `taker` or `none` for one operator driving both legs)
+    is stamped by the coordinator from `CoordinatorConfig.role` and persisted. A coordinator whose
+    configured role differs from the record's refuses it (at construction and in
+    `resume_interrupted_fund`), `JsonFileRecordSink` refuses a write naming another role and keeps
+    the persisted role on a write naming none, and the two-host runners refuse a phase run as the
+    other side. A record from before this release has no role, and is stamped with the role of the
+    first coordinator that loads it.
+  - The token push's nonce and transaction hash are now kept when the funded locator is attached,
+    and written whenever set rather than only beside a pending deploy. The hash now reaches the
+    record in production: `EthLeg.fund` passes the token leg's `on_push_hash`, which it did not, so
+    `pending_push_tx_hash` was never written outside tests. `CounterChainLeg.fund` gains
+    `push_tx_hash` and `on_push_hash`; the coordinator passes them only to a leg whose `fund` accepts
+    them, so a custom leg written against the old signature still funds.
+  - **A token-fund resume can now replace its own stuck push.** With the hash on the record, a
+    resume that finds its push still pending at the pinned nonce reads it back and sends a
+    fee-bumped replacement at that nonce (`Erc20HtlcLeg`'s replace-own-push path), where before it
+    refused with "still in flight". This is the first time that path runs in production. When the
+    recorded hash cannot be read back (a replacement whose broadcast failed while the original is
+    still pending, or another transaction in the slot) it refuses, naming the hash and the nonce,
+    and sends nothing.
+  - `SWAP_RECORD_SCHEMA_VERSION` is 3. A record carrying `role`, or a push without a pending deploy,
+    writes it, a BTC record included; a record with neither serialises exactly as before.
+    `SwapRecord.from_dict` now reads the version and refuses one above its own with
+    `RecordFromNewerPyrxd`, instead of reading the record and dropping the fields it does not know.
+  - The watchtower pages each record it cannot read, by swap id, with the reason (a record from a
+    newer pyrxd says so). Before, an unreadable record was logged and skipped, and paged only when
+    every record failed.
+  - **Do not drive one record from mixed versions.** A 0.26 reader ignores `role` and the kept push
+    fields, and re-persisting the record drops them. Upgrade the runners and the watchtower together.
 - `pyrxd glyph list` now says that a listed token output being unspent is the ElectrumX server's
   word, not verified (refs #788). Each token's owner and amount are checked against its own
   transaction, but nothing checks that the output has not been spent since, so a server can

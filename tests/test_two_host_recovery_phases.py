@@ -1467,7 +1467,14 @@ class TestEveryPhaseKeepsThePersistedRecord:
             await _run_phase(name, args, monkeypatch, role=role, phase=phase, counter_leg=leg, stop_at=stop_at)
             after = _read_back(args)
             assert after.state is lands_in, f"run {run}: the phase did not persist ({after.state.value})"
-            assert _kept_fields(after) == before, f"run {run}: the phase dropped persisted fields"
+            # The one field a phase adds: the coordinator stamps the role it ran as (#850 PR 3), which
+            # takes the record to schema v3. Everything the record held must survive unchanged.
+            kept = _kept_fields(after)
+            assert kept.pop("role") == role, f"run {run}: the record does not name the {role} role"
+            assert kept.pop("schema_version") == 3
+            assert kept == {k: v for k, v in before.items() if k != "schema_version"}, (
+                f"run {run}: the phase dropped persisted fields"
+            )
 
     async def test_the_outpoint_one_phase_persisted_is_the_one_the_next_phase_spends(self, tmp_path, monkeypatch):
         """The maker's lock-claim pins the covenant outpoint it verified; its later --phase refund must
@@ -2411,7 +2418,10 @@ async def test_a_filled_locator_clears_the_pending_handles_and_the_fund_refusal(
     assert after.state is SwapState.ABORTED
     assert after.counterchain_locator.to_dict() == loc.to_dict()
     assert after.pending_counter_contract is None and after.pending_counter_deploy_tx is None
-    assert after.pending_push_nonce is None and after.fund_refusal is None
+    assert after.fund_refusal is None
+    # Not cleared since #850 PR 3: the push nonce says which transaction moved the tokens, and it is
+    # what later proves no other push can land (design §2.7). Only the pending deploy handle goes.
+    assert after.pending_push_nonce == 4
     assert after.single_operator_override == _OVERRIDE_STATEMENT, "only what the locator supersedes is cleared"
 
 
@@ -2580,3 +2590,21 @@ class TestDustSwapResumeMergesThroughTheScript:
         with pytest.raises(SystemExit, match="disagree on terms"):
             await mod.resume(args)
         assert seen == [], "the coordinator was built on a record that disagrees with the rebuild"
+
+
+@pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+async def test_a_phase_refuses_a_record_written_by_the_other_side(name, tmp_path, monkeypatch):
+    """#850 PR 3: the record names the side that wrote it, and a phase run as the other side refuses
+    at the top, before any chain read (``refuse_by_persisted_state``), so the phases that build no
+    coordinator are covered too. The honest path is every other test here: a record that names
+    the same side, or none."""
+    from pyrxd.gravity.swap_state import RecordRole, SwapRecord
+
+    mod = _load(name)
+    scenario = _eth_scenario if name == "eth_swap_two_host" else _btc_scenario
+    args, terms, _io = scenario(mod, tmp_path, role="taker", with_funding=True)
+    await _seed(args, SwapRecord(state=SwapState.BTC_LOCKED, terms=terms, role=RecordRole.MAKER))
+    built = (_wire_eth if name == "eth_swap_two_host" else _wire_btc)(mod, monkeypatch)
+    with pytest.raises(SystemExit, match="written by the maker side, and this phase runs as taker"):
+        await mod.taker_phase_abort(_with_fee(args))
+    assert built.get("counter") is None or built["counter"].refund_calls == []
