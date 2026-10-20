@@ -36,6 +36,7 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import inspect
 import logging
 import math
 import os
@@ -87,12 +88,31 @@ from .funding_spv import (
 from .ref_authenticity import verify_ref_authenticity
 from .swap_state import (
     NegotiatedTerms,
+    RecordRole,
     SwapEvent,
     SwapRecord,
     SwapRole,
     SwapState,
     advance,
 )
+
+
+def _accepted_kwargs(fn: Callable[..., Any], **kwargs: Any) -> dict[str, Any]:
+    """The *kwargs* that *fn* accepts by name (all of them when it takes ``**kwargs``).
+
+    For keyword arguments added to :meth:`CounterChainLeg.fund` after legs outside pyrxd were
+    written against it (``push_tx_hash`` / ``on_push_hash``, #850 PR 3): a leg that predates them
+    has no push hash to report, and passing them anyway would turn an upgrade into a ``TypeError``
+    at funding time.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
 
 # A durable-persist hook: ``await persist(record)`` writes the record so a crash
 # between an awaited broadcast and the in-memory state advance cannot strand
@@ -1850,12 +1870,18 @@ class SwapCoordinator:
         # steps (see @_serialized_step) so a future concurrent driver cannot interleave
         # a check-then-advance across an await on a single instance.
         self._step_lock = asyncio.Lock()
-        self.record = record
+        # THE ROLE ON THE RECORD (#850 PR 3, design §2.9). The configured role is not persisted, so
+        # a record written by one side could be driven by a coordinator configured as the other,
+        # and role-scoped steps (mutual_refund's TAKER branch, maybe_refund_asset_on_maker_stall's
+        # guard) would act for the wrong party. A record that names a role binds it; a record from
+        # before 0.27 names none and is stamped here, in memory, so every record this coordinator
+        # persists carries it.
+        self.config = config
+        self.record = self._adopted(record)
         self.counter_leg = leg
         self.radiant_leg = radiant_leg
         self.indexer = indexer
         self.seen_store = seen_store
-        self.config = config
         self._persist = persist
         # Optional credential-gating resolver (duck-typed CredentialResolver). Required
         # only when a swap sets terms.credential_ref; its absence then fails closed.
@@ -1888,6 +1914,21 @@ class SwapCoordinator:
         """Transitional alias for ``counter_leg`` (the chain-neutral counter leg)."""
         return self.counter_leg
 
+    def _adopted(self, record: SwapRecord) -> SwapRecord:
+        """*record* as this coordinator may drive it: refused when it names another role, stamped
+        with this coordinator's role when it names none (a record from before 0.27).
+
+        Every place a coordinator takes a record in goes through here, the constructor and
+        :meth:`resume_interrupted_fund`; the record sink keeps a persisted role as well."""
+        configured = RecordRole.of(self.config.role)
+        if record.role is not None and record.role is not configured:
+            raise ValidationError(
+                f"this swap record was written by a {record.role.value}-role coordinator, but this "
+                f"coordinator is configured as {configured.value}: driving it would apply the other "
+                "party's role-scoped steps. Run it with the role the record names (the runners' --role)."
+            )
+        return record if record.role is not None else dataclasses.replace(record, role=configured)
+
     # -- internal: advance + persist-shape ----------------------------------
     def _advance(self, event: SwapEvent) -> SwapState:
         """Validate the transition via the pure FSM and update ``self.record`` (pure)."""
@@ -1905,6 +1946,8 @@ class SwapCoordinator:
         """
         if self._persist is None:
             return
+        if record.role is None:  # a record built outside self.record: still say whose it is
+            record = dataclasses.replace(record, role=self.record.role)
         if shield:
             await asyncio.shield(self._persist(record))
         else:
@@ -2986,6 +3029,15 @@ class SwapCoordinator:
             self.record = dataclasses.replace(self.record, pending_push_nonce=int(nonce))
             await self._persist_record(self.record, shield=True)
 
+        async def _remember_push_hash(nonce: int, tx_hash: str) -> None:
+            # Durable BEFORE the push is sent (the leg calls this between signing and sending, #515).
+            # It had no production caller until #850 PR 3: `EthLeg.fund` never passed it, so the
+            # field was written only by tests and a resume could not read its own pending push back.
+            # Adopted only once the write returns, like the BTC funding bytes below.
+            staged = dataclasses.replace(self.record, pending_push_nonce=int(nonce), pending_push_tx_hash=tx_hash)
+            await self._persist_record(staged, shield=True)
+            self.record = staged
+
         async def _remember_deploy(address: str, deploy_tx_hash: str) -> None:
             self.record = dataclasses.replace(
                 self.record,
@@ -3005,6 +3057,11 @@ class SwapCoordinator:
                     resume_from=resume_from,
                     push_nonce=self.record.pending_push_nonce,
                     on_push_nonce=_remember_push_nonce,
+                    **_accepted_kwargs(
+                        self.counter_leg.fund,
+                        push_tx_hash=self.record.pending_push_tx_hash,
+                        on_push_hash=_remember_push_hash,
+                    ),
                 )
         else:
 
@@ -3710,7 +3767,7 @@ class SwapCoordinator:
         # the supplied terms match field-for-field refused legitimate resumes; acting on the supplied
         # ones instead would complete one fund under parameters the record does not describe.
         terms = rec.terms
-        self.record = rec
+        self.record = self._adopted(rec)
         try:
             return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:

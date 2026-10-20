@@ -216,9 +216,9 @@ def load_artifact(path: str | os.PathLike) -> dict:
     * ``immutable_names`` — ``{reference-id: name}`` naming the constructor term each id holds
       (``hashlock``/``claimant``/``refundee``/``timeout``, plus ``token``/``amount`` for
       ``Erc20Htlc``). A reference id is the AST node id of the immutable's
-      ``VariableDeclaration``, so build with ``forge build --ast`` and read, from the artifact's
-      ``ast``, each ``VariableDeclaration`` whose ``mutability`` is ``"immutable"``: its ``id``
-      is the key and its ``name`` the value. Ids are specific to one compilation, so derive the
+      ``VariableDeclaration``: read, from the compiler's AST, each ``VariableDeclaration`` whose
+      ``mutability`` is ``"immutable"``; its ``id`` is the key and its ``name`` the value
+      (``scripts/build_counter_leg_artifacts.py`` does this for the committed artifacts). Ids are specific to one compilation, so derive the
       map from the SAME build that produced ``immutableReferences``, never by hand.
     """
     with open(path) as f:
@@ -805,10 +805,15 @@ class EthHtlcContractLeg:
         resume_from: Any = None,
         push_nonce: Any = None,
         on_push_nonce: Any = None,
+        push_tx_hash: Any = None,
+        on_push_hash: Any = None,
     ) -> EthHtlcLocator:
         """Deploy + fund the HTLC (payable constructor). Returns the locator ONLY after
         the deploy tx confirms with status==1 (a reverted/dropped deploy never yields a
-        'funded' locator). The TAKER calls this; claimant=maker, refundee=taker."""
+        'funded' locator). The TAKER calls this; claimant=maker, refundee=taker.
+
+        ``push_nonce``, ``on_push_nonce``, ``push_tx_hash`` and ``on_push_hash`` are accepted and
+        ignored: a native fund is one transaction, with no separate push to pin."""
         if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
             raise ValidationError("hashlock must be 32 bytes")
         if amount_wei <= 0:

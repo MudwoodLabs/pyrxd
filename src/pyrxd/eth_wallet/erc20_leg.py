@@ -495,7 +495,23 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                     # — not past a fresh estimate. When fees have fallen since, an estimate-based
                     # bump comes out BELOW what is pending and the node rejects it while this code
                     # believes it raised the price.
-                    pending_tx = await self._rpc.get_transaction(str(push_tx_hash))
+                    try:
+                        pending_tx = await self._rpc.get_transaction(str(push_tx_hash))
+                    except NetworkError as exc:
+                        # The recorded hash is persisted BEFORE its broadcast, so it can name a
+                        # replacement whose send then failed (underpriced, a dropped connection),
+                        # while the push it was meant to replace still occupies the slot; or the
+                        # slot holds a transaction that is not ours at all. Neither can be priced,
+                        # and guessing is how a resume funds twice, so this is the in-flight
+                        # refusal, saying which case to look for (Mythos review of #850 PR 3).
+                        raise NetworkError(
+                            f"a transaction from {sender} still occupies the pinned push nonce {push_nonce} "
+                            f"(nonce pending={pending_nonce}, latest={latest_nonce}), but the push recorded for "
+                            f"it, {push_tx_hash}, cannot be read back ({str(exc)[:120]}). The recorded hash may "
+                            "be a replacement whose broadcast failed while the earlier push is still pending, "
+                            "or the slot holds another transaction. Nothing was sent. Wait for the pending "
+                            "transaction at that nonce to mine or drop, then resume."
+                        ) from exc
                     push_tx = {**push_tx, **bump_replacement_fees(_fee_fields_of(pending_tx))}
             elif on_push_nonce is not None:
                 await on_push_nonce(int(push_tx["nonce"]))

@@ -29,7 +29,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from pyrxd.gravity.swap_state import SwapRecord, is_terminal
+from pyrxd.gravity.swap_state import RecordFromNewerPyrxd, SwapRecord, is_terminal
 from pyrxd.gravity.watch.alerts import Page, Severity
 from pyrxd.gravity.watch.quorum import BtcClaimStatus
 from pyrxd.network.source_identity import SourceKey, require_distinct_sources
@@ -81,6 +81,10 @@ class JsonDirRecordStore:
 
     def __init__(self, records_dir: str | Path) -> None:
         self._dir = Path(records_dir)
+        #: ``(swap_id, reason)`` for every record the last :meth:`list_active` could not read. The
+        #: reconciler pages each one by name (#850 PR 3): a skipped record is a swap the tower is not
+        #: watching, and a log line alone left that silent unless EVERY record failed.
+        self.unreadable: list[tuple[str, str]] = []
 
     async def list_active(self) -> list[tuple[str, SwapRecord]]:
         if not self._dir.is_dir():
@@ -97,12 +101,22 @@ class JsonDirRecordStore:
         _SIDECARS = (".refund.json", ".claim.json")
         paths = [p for p in sorted(self._dir.glob("*.json")) if not p.name.endswith(_SIDECARS)]
         failed = 0
+        unreadable: list[tuple[str, str]] = []
+        self.unreadable = unreadable
         for path in paths:
             try:
                 rec = SwapRecord.from_dict(json.loads(path.read_text()))
-            except Exception:
+            except RecordFromNewerPyrxd as exc:
+                failed += 1
+                logger.warning("swap record %s is from a newer pyrxd: %s", path, exc)
+                unreadable.append(
+                    (path.stem, f"written by a newer pyrxd than this watchtower reads ({exc}); upgrade the tower")
+                )
+                continue
+            except Exception as exc:
                 failed += 1
                 logger.warning("skipping unreadable swap record %s", path, exc_info=True)
+                unreadable.append((path.stem, f"unreadable ({type(exc).__name__}: {str(exc)[:160]})"))
                 continue
             if is_terminal(rec.state):
                 continue

@@ -84,6 +84,10 @@ maker's advertised `covenant_spk_hex`.
   never written into an exchange file.
 - A shared **io directory** (`--io`). On two real hosts this is a *per-host* directory; you
   copy the four files between them in the order below.
+- **One pyrxd version per swap record.** From 0.27 the record names the role that wrote it and is
+  versioned (schema 3): a coordinator run with the other `--role` refuses it, and an older pyrxd
+  reading it would drop the fields it does not know when it re-persists. Do not drive one record
+  from two versions, and upgrade the watchtower with the runners.
 
 ## Validate the seam first (no chain)
 

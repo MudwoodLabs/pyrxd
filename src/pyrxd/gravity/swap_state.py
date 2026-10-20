@@ -40,7 +40,12 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # SwapRecord wire schema version. v1 (absent) is the BTC-only form (bare ``btc_locator``);
 # v2 adds the chain-tagged ``counterchain_locator`` for an ETH counter leg. A BTC swap still
 # serialises in the v1 form (byte-identical), so the bump only appears for ETH swaps.
-SWAP_RECORD_SCHEMA_VERSION = 2
+# v3 (#850 PR 3) adds ``role`` and keeps the token push's nonce and hash after the fund. A record
+# carrying any post-v2 field writes the current maximum, a BTC record included; a record with none
+# of them serialises exactly as before (v2 for ETH, no key for BTC). ``from_dict`` refuses a version
+# above its own (:class:`RecordFromNewerPyrxd`). Each PR that adds a persisted field bumps this.
+SWAP_RECORD_SCHEMA_VERSION = 3
+_PRE_ROLE_ETH_SCHEMA_VERSION = 2
 
 __all__ = [
     "ASSET_VARIANTS",
@@ -48,6 +53,8 @@ __all__ = [
     "TERMINAL_STATES",
     "TRANSITIONS",
     "NegotiatedTerms",
+    "RecordFromNewerPyrxd",
+    "RecordRole",
     "SwapEvent",
     "SwapRecord",
     "SwapState",
@@ -102,6 +109,38 @@ class SwapRole(Enum):
 
     MAKER = "maker"
     TAKER = "taker"
+
+
+class RecordRole(Enum):
+    """Which side wrote a :class:`SwapRecord` (#850 PR 3, design §2.9).
+
+    The coordinator's role lives on ``CoordinatorConfig.role``, which is not persisted, so a
+    restarted process could not tell which side a record belongs to. ``NONE`` is the single-operator
+    deployment that drives both legs (``config.role is None``). A record whose ``role`` is unset was
+    written before 0.27 and is read as "unknown": nothing infers a role for it.
+    """
+
+    MAKER = "maker"
+    TAKER = "taker"
+    NONE = "none"
+
+    @classmethod
+    def of(cls, role: SwapRole | None) -> RecordRole:
+        """The record role for a coordinator configured with *role*."""
+        if role is None:
+            return cls.NONE
+        if not isinstance(role, SwapRole):
+            raise ValidationError("role must be a SwapRole or None")
+        return cls(role.value)
+
+
+class RecordFromNewerPyrxd(ValidationError):
+    """A persisted :class:`SwapRecord` declares a ``schema_version`` above this pyrxd's.
+
+    Its fields may carry meaning this version does not know, and re-persisting it would drop them
+    (#850 design §4.4: a 0.26.x refund step on a record with a pending refund re-broadcasts and
+    overwrites the hash). So it is refused rather than read. Upgrade pyrxd to read it.
+    """
 
 
 # The diagram's ``--> [*]`` sinks. No transition may leave a terminal state.
@@ -628,6 +667,12 @@ class SwapRecord:
     #: transaction spends one specific UTXO. The txid is derived from these bytes, never stored
     #: beside them, so the two cannot disagree. Serialised only when set.
     pending_btc_funding_tx: str | None = None
+    #: Which side wrote this record (:class:`RecordRole`). The coordinator stamps it in memory when it
+    #: takes a record in (its constructor, ``resume_interrupted_fund``) and refuses a record naming
+    #: another role; ``JsonFileRecordSink`` keeps a persisted role and refuses a write naming another;
+    #: the two-host runners refuse a phase run as the other side. ``None`` on a record from before
+    #: 0.27 ("unknown"). Serialised only when set.
+    role: RecordRole | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -717,6 +762,8 @@ class SwapRecord:
             raise ValidationError("single_operator_override must be a str or None")
         if self.fund_refusal is not None and not isinstance(self.fund_refusal, str):
             raise ValidationError("fund_refusal must be a str or None")
+        if self.role is not None and not isinstance(self.role, RecordRole):
+            raise ValidationError("SwapRecord.role must be a RecordRole or None")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -759,6 +806,14 @@ class SwapRecord:
         that may hold value but is not yet an accepted locator, and once the locator is attached it
         carries the address itself. Leaving a stale "pending" handle behind would point recovery at
         a swap that no longer needs it.
+
+        KEEPS the token push's nonce and hash (#850 PR 3). They are not a pending handle: the nonce
+        is the slot every push for this swap used, which is what later proves no other push can land
+        (design §2.7, closing the push nonce). The hash is the LAST push signed at that slot, which
+        need not be the one that mined (a replacement can lose to the original, or fail to
+        broadcast). Today only a resume reads it, for the pending push's fees, and refuses when it
+        cannot be read back; anything that later relies on it as THE push must check it against a
+        receipt first. Keeps ``role``: it is not about the fund.
         """
         return dataclasses.replace(
             self,
@@ -767,8 +822,6 @@ class SwapRecord:
             fund_refusal=None,
             pending_counter_contract=None,
             pending_counter_deploy_tx=None,
-            pending_push_nonce=None,
-            pending_push_tx_hash=None,
             pending_btc_funding_tx=None,
         )
 
@@ -794,8 +847,15 @@ class SwapRecord:
             "radiant_covenant_spk_hex": self.radiant_covenant_spk_hex,
         }
         loc = self.counterchain_locator
-        if isinstance(loc, EthHtlcLocator):
+        # Any post-v2 field writes the current maximum; without one, the pre-0.27 form exactly.
+        post_v2 = self.role is not None or (
+            not self.pending_counter_contract
+            and (self.pending_push_nonce is not None or self.pending_push_tx_hash is not None)
+        )
+        if post_v2:
             d["schema_version"] = SWAP_RECORD_SCHEMA_VERSION
+        if isinstance(loc, EthHtlcLocator):
+            d.setdefault("schema_version", _PRE_ROLE_ETH_SCHEMA_VERSION)
             # The tag comes from the LOCATOR, not from a branch here. `Erc20HtlcLocator` subclasses
             # `EthHtlcLocator`, so an isinstance branch would have written `chain: "eth"` for a token
             # swap and an older reader would have taken its 6-decimal amount for wei — a 10^12 error
@@ -810,27 +870,41 @@ class SwapRecord:
         if self.pending_counter_contract:
             d["pending_counter_contract"] = self.pending_counter_contract
             d["pending_counter_deploy_tx"] = self.pending_counter_deploy_tx
-            if self.pending_push_nonce is not None:
-                d["pending_push_nonce"] = self.pending_push_nonce
-            if self.pending_push_tx_hash is not None:
-                d["pending_push_tx_hash"] = self.pending_push_tx_hash
+        # Outside the pending-deploy block since #850 PR 3: the push outlives the deploy handle.
+        if self.pending_push_nonce is not None:
+            d["pending_push_nonce"] = self.pending_push_nonce
+        if self.pending_push_tx_hash is not None:
+            d["pending_push_tx_hash"] = self.pending_push_tx_hash
         if self.single_operator_override is not None:
             d["single_operator_override"] = self.single_operator_override
         if self.fund_refusal is not None:
             d["fund_refusal"] = self.fund_refusal
         if self.pending_btc_funding_tx is not None:
             d["pending_btc_funding_tx"] = self.pending_btc_funding_tx
+        if self.role is not None:
+            d["role"] = self.role.value
         return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SwapRecord:
+        version = d.get("schema_version")
+        if version is not None:
+            if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+                raise ValidationError(f"schema_version must be a positive int, got {version!r}")
+            if version > SWAP_RECORD_SCHEMA_VERSION:
+                raise RecordFromNewerPyrxd(
+                    f"this swap record declares schema_version {version}, newer than this pyrxd reads "
+                    f"({SWAP_RECORD_SCHEMA_VERSION}); refusing it rather than dropping fields it does not "
+                    "know. Upgrade pyrxd to read it, and do not drive one record from mixed versions."
+                )
+        role = d.get("role")
         if "counterchain_locator" in d:  # v2 chain-tagged form
             cc = d["counterchain_locator"]
             chain, locd = cc.get("chain"), cc.get("locator")
-            # This dispatch IS the backward-compatibility defence, and the only one: the
-            # `schema_version` written above is never read back by anything. A binary that predates
-            # a tag lands in the else and REFUSES, rather than silently decoding a record whose
-            # amount is denominated in a unit it does not know about.
+            # This dispatch is the backward-compatibility defence for the locator: a binary that
+            # predates a tag lands in the else and REFUSES, rather than silently decoding a record
+            # whose amount is denominated in a unit it does not know about. (`schema_version` is
+            # read above since #850 PR 3, so a record from a newer pyrxd is refused before this.)
             if chain == "eth":
                 loc: BtcHtlcLocator | EthHtlcLocator | None = EthHtlcLocator.from_dict(locd)
             elif chain == Erc20HtlcLocator.CHAIN_TAG:
@@ -855,12 +929,22 @@ class SwapRecord:
             single_operator_override=d.get("single_operator_override"),
             fund_refusal=d.get("fund_refusal"),
             pending_btc_funding_tx=d.get("pending_btc_funding_tx"),
+            role=_record_role(role),
         )
 
 
 # ---------------------------------------------------------------------------
 # Small boundary helpers (kept local; mirror taproot._as_bytes discipline)
 # ---------------------------------------------------------------------------
+
+
+def _record_role(value: object) -> RecordRole | None:
+    if value is None:
+        return None
+    try:
+        return RecordRole(value)
+    except ValueError:
+        raise ValidationError(f"unknown swap record role {value!r}") from None
 
 
 def _b32(value: object, name: str) -> bytes:

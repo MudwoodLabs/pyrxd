@@ -15,9 +15,11 @@ offset — how legacy codegen reads an immutable). A public immutable's getter l
 id and no other, so the getter's name names that id.
 
 The committed fixtures carry no AST, so the compiler's own id -> declaration table is not
-available here. As a one-off cross-check (2026-09-29, not re-run by this test), both fixtures'
-maps were also confirmed from a fresh ``forge build --ast`` of the contract sources: the name ->
-offsets pairing matched for ``Erc20Htlc`` (optimizer on, 200 runs) and ``EthHtlc`` (optimizer off).
+available here. The build script (``scripts/build_counter_leg_artifacts.py``) reads the names from
+the same solc compilation's AST and fails unless they cover exactly the ids in
+``immutableReferences``; this test re-derives the map independently. (A one-off ``forge build
+--ast`` cross-check on 2026-09-29 covered the earlier forge-built artifacts, which have since been
+replaced.)
 The ``@integration`` Anvil test ``test_immutable_names_match_what_each_getter_RETURNS`` checks the
 same map by EXECUTING each getter against sentinel values.
 """

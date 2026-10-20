@@ -641,7 +641,7 @@ def test_a_disagreement_with_no_majority_says_so_and_lists_the_groups() -> None:
 
 def test_a_strict_minority_low_tip_holding_the_sync_back_is_named_and_not_up_to_date(monkeypatch, tmp_path) -> None:
     """The depth rule counts from the LOWEST tip, so a low tip holds every sync back. When the
-    operators at it are a STRICT MINORITY of the configured ones and it is the reason nothing was
+    operators at it are a STRICT MINORITY of the operators that answered and it is the reason nothing was
     added, the sync names them and exits 7, not "up to date" with 0."""
     _patch_table(monkeypatch, START)
     low = START + 100
@@ -654,6 +654,7 @@ def test_a_strict_minority_low_tip_holding_the_sync_back_is_named_and_not_up_to_
     assert out["state"] == "held back" and out["added"] == 0 and out["held_back_by"] == ["operator:b"]
     assert out["tips"] == {"operator:a": DEEP + 50, "operator:b": low, "operator:c": DEEP + 50}
     assert f"operator:b reported tip {low}" in out["reason"] and f"({DEEP + 50})" in out["reason"]
+    assert "does not show which operator is off the live chain" in _flat(out["reason"])
     assert _cached(START) is None
     r, _ = _sync(monkeypatch, tmp_path, ops3(low, DEEP + 50), json_out=False)
     assert r.exit_code == 7 and "HELD BACK" in r.output and "operator:b reported tip" in _flat(r.output)
@@ -691,7 +692,7 @@ def test_one_high_tip_does_not_blame_the_honest_majority(monkeypatch, tmp_path) 
     assert "operators' tips differ" in out["reason"]
     assert f"tip {t + 100_000}: operator:d (1 of 4 answering, 4 configured)" in out["reason"]
     assert f"tip {t}: operator:a, operator:b, operator:c (3 of 4 answering, 4 configured)" in out["reason"]
-    assert "follows the live chain" not in out["reason"]
+    assert "live chain" not in out["reason"] and "catches up" not in out["reason"]
     r, _ = _sync(monkeypatch, tmp_path, ops(), json_out=False)
     assert r.exit_code == 0 and "HELD BACK" not in r.output and "tips:" in r.output
 

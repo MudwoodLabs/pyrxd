@@ -119,7 +119,15 @@ class EthLeg:
     # -- fund / claim / refund -----------------------------------------------------------
 
     async def fund(
-        self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None
+        self,
+        terms,
+        *,
+        on_deploy=None,
+        resume_from=None,
+        push_nonce=None,
+        on_push_nonce=None,
+        push_tx_hash=None,
+        on_push_hash=None,
     ) -> EthHtlcLocator:
         """Deploy + fund the ETH HTLC from the negotiated terms, then run the post-deploy
         binding gate (verify_funded) BEFORE returning — so the coordinator never tells the
@@ -179,11 +187,19 @@ class EthLeg:
         locator = await self._leg.fund(
             on_deploy=_stash_then_persist,
             resume_from=resume_from,
-            **(
-                {}
-                if push_nonce is None and on_push_nonce is None
-                else {"push_nonce": push_nonce, "on_push_nonce": on_push_nonce}
-            ),
+            # The push pin AND its hash (#850 PR 3): the hash hook went unpassed here, so the token
+            # leg's `on_push_hash` had no production caller and `pending_push_tx_hash` was never
+            # written outside tests. A native leg has no push and accepts and ignores all four.
+            **{
+                k: v
+                for k, v in {
+                    "push_nonce": push_nonce,
+                    "on_push_nonce": on_push_nonce,
+                    "push_tx_hash": push_tx_hash,
+                    "on_push_hash": on_push_hash,
+                }.items()
+                if v is not None
+            },
             hashlock=bytes(terms.hashlock),
             claimant=self._claim_to,
             refundee=self._refund_to,

@@ -310,8 +310,9 @@ async def sync_headers(
             held_back = (
                 f"{', '.join(low_group)} reported tip {lowest}, below the next-lowest tip ({higher}) [{counts}]; "
                 f"headers are cached only {min_depth} blocks below the lowest tip, so the cache reaches block "
-                f"{chain.top} instead of {higher - min_depth}. Re-run once {', '.join(low_group)} catches up, or "
-                f"check that it follows the live chain"
+                f"{chain.top} instead of {higher - min_depth}. Re-run once {', '.join(low_group)} catches up. A tip "
+                "height is not authenticated, so a lower tip than the others does not show which operator is "
+                "off the live chain"
             )
         else:
             held_back = (
@@ -509,7 +510,7 @@ def _sync_lines(r: dict[str, Any]) -> list[str]:
     lines = [
         f"header cache ({r['network']}): {r['state'].upper()} — added {r['added']} header(s); now {span}",
         f"  linked to:   pyrxd checkpoint {r['checkpoint_height']} (shipped with this release)",
-        f"  agreed by:   {len(r['operators'])} operators ({', '.join(r['operators'])})",
+        f"  answered:    {len(r['operators'])} operators ({', '.join(r['operators'])})",
         f"  depth rule:  cached only up to the lowest tip reported ({r['lowest_tip']}) minus {r['min_depth']}",
     ]
     if r.get("held_back_by") or len(set(r.get("tips", {}).values())) > 1:
