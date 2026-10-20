@@ -254,20 +254,43 @@ class TestBitcoinCoreRpcSource:
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_happy(self):
+        """Core's real shape: getrawtransaction names the block by hash (no height), and the
+        height comes from getblockheader."""
         src = self._src()
-        data = {"txid": "ab" * 32, "blockheight": 750000}
-        session = _make_session(_rpc_resp(data))
+        block = "00" * 28 + "0b71ce00"
+        data = {"txid": "ab" * 32, "blockhash": block, "confirmations": 5}
+        session = _make_session(_rpc_resp(data), _rpc_resp({"hash": block, "height": 750000}))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
             result = await src.get_tx_block_height(Txid("ab" * 32))
         assert int(result) == 750000
 
     @pytest.mark.asyncio
-    async def test_get_tx_block_height_missing_blockheight_raises(self):
+    async def test_get_tx_block_height_ignores_a_blockheight_key_core_does_not_send(self):
+        """The old reader trusted `blockheight`; Core never sends it, and a source that does is not
+        describing a block the node vouches for."""
         src = self._src()
-        data = {"txid": "ab" * 32, "confirmations": 5}  # no blockheight field
+        data = {"txid": "ab" * 32, "blockheight": 750000}  # no blockhash: not mined, as far as Core says
         session = _make_session(_rpc_resp(data))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
             with pytest.raises(NetworkError, match="unconfirmed"):
+                await src.get_tx_block_height(Txid("ab" * 32))
+
+    @pytest.mark.asyncio
+    async def test_get_tx_block_height_missing_blockhash_raises(self):
+        src = self._src()
+        data = {"txid": "ab" * 32, "confirmations": 0}  # a mempool tx: no blockhash
+        session = _make_session(_rpc_resp(data))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
+            with pytest.raises(NetworkError, match="unconfirmed"):
+                await src.get_tx_block_height(Txid("ab" * 32))
+
+    @pytest.mark.asyncio
+    async def test_get_tx_block_height_refuses_a_header_for_another_block(self):
+        src = self._src()
+        data = {"txid": "ab" * 32, "blockhash": "11" * 32}
+        session = _make_session(_rpc_resp(data), _rpc_resp({"hash": "22" * 32, "height": 5}))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
+            with pytest.raises(NetworkError, match="header for another block"):
                 await src.get_tx_block_height(Txid("ab" * 32))
 
     @pytest.mark.asyncio
@@ -280,8 +303,8 @@ class TestBitcoinCoreRpcSource:
     @pytest.mark.asyncio
     async def test_get_tx_block_height_coerces_str_txid(self):
         src = self._src()
-        data = {"txid": "ab" * 32, "blockheight": 123456}
-        session = _make_session(_rpc_resp(data))
+        data = {"txid": "ab" * 32, "blockhash": "33" * 32}
+        session = _make_session(_rpc_resp(data), _rpc_resp({"hash": "33" * 32, "height": 123456}))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
             result = await src.get_tx_block_height("ab" * 32)  # str, not Txid
         assert int(result) == 123456

@@ -158,6 +158,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`BitcoinCoreRpcSource.get_tx_block_height` failed for every mined transaction on a real
+  Bitcoin Core node.** It read a `blockheight` key that Core's `getrawtransaction` does not send,
+  so it raised "unconfirmed" whenever the transaction was mined. It now reads the transaction's
+  `blockhash` and takes the height from that block's header. Its unit fixtures had included the key;
+  they now use Core's real shape, and a regtest test asks a real Core 24 node. Its shipped caller
+  is the deprecated SPV trade path (`pyrxd.gravity.trade`), when no height is passed in.
 - **`pyrxd verify <txid>:<n>` follow-ups (#778).**
   - `--json` now says whether its record count is final: `verdict_record` gains `unread_vouts`
     (outputs the classifier could not read) and `records_in_tx_is_final`. `records_in_tx` counts
