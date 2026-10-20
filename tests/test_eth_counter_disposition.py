@@ -403,3 +403,26 @@ async def test_multi_source_get_logs_union_asks_every_source():
     assert [log["transactionHash"] for log in u.logs] == [tx]
     assert len(u.answered) == 2 and set(u.failed) == {str(throttled.source_key)}
     assert all(ep.log_requests for ep in rpc.sources)
+
+
+async def test_f_is_the_lowest_finalized_block_any_endpoint_vouches_for():
+    chain = _chain(finalized=90)
+    tx = chain.refund(85)
+    d = await _read(_quorum(chain, FakeEvmEndpoint(chain, lag=12)), chain)
+    assert d.kind is DispositionKind.REFUNDED and d.evidence.tx_hash == tx
+    assert d.finalized_block == 88 and d.evidence.block_number == 88
+
+
+async def test_a_recorded_hash_whose_refunded_event_comes_from_another_contract_does_not_verify():
+    chain = _chain(finalized=90)
+    tx = chain.force_receipt(85, topic0=REFUNDED_TOPIC0, address=OTHER_CONTRACT, label="other-recorded")
+    d = await _read(_quorum(chain), chain, recorded_refund_hashes=[tx])
+    assert d.kind is DispositionKind.F_EXPIRED
+
+
+async def test_a_failed_receipt_does_not_verify_even_if_it_carries_the_event():
+    # A real chain drops a reverted transaction's logs; an endpoint is not obliged to.
+    chain = _chain(finalized=90)
+    tx = chain.force_receipt(85, topic0=REFUNDED_TOPIC0, label="status-0", status=0)
+    d = await _read(_quorum(chain), chain, recorded_refund_hashes=[tx])
+    assert d.kind is DispositionKind.F_EXPIRED
