@@ -380,6 +380,7 @@ async def test_an_unknown_deploy_hash_without_from_block_is_unknown():
         {"recorded_refund_hashes": ["0x12"]},
         {"recorded_refund_hashes": [b"\x00" * 32]},
         {"recorded_refund_hashes": ["0x" + "zz" * 32]},
+        {"recorded_refund_hashes": ["0x" + "ab " * 16 + "0" * 16]},
     ],
 )
 async def test_bad_inputs_are_refused(kw):
@@ -499,6 +500,56 @@ async def test_a_source_missing_a_method_fails_as_that_source_only():
 async def test_the_scan_never_asks_past_an_endpoints_own_head():
     chain = _chain(finalized=90)
     eps = [FakeEvmEndpoint(chain), FakeEvmEndpoint(chain, lag=3), FakeEvmEndpoint(chain, lag=7)]
-    await _read(MultiSourceEthRpc(eps), chain)
+    d = await _read(MultiSourceEthRpc(eps), chain)
     for ep in eps:
-        assert ep.log_requests and all(isinstance(t, int) and t <= ep.head for _f, t in ep.log_requests)
+        assert all(isinstance(t, int) and t <= ep.head for _f, t in ep.log_requests)
+    # The agreed head is the 2nd highest (quorum 2 of 3): the endpoint 7 blocks behind cannot
+    # cover it, so it is recorded as failed rather than as answering a shorter range.
+    assert eps[2].log_requests == [] and str(eps[2].source_key) in d.logs_failed
+    assert len(d.logs_answered) == 2
+
+
+class _TinyHead(FakeEvmEndpoint):
+    """Honest except that it reports the deploy block as its head."""
+
+    async def block_number(self) -> int:
+        return self.chain.deploy_block
+
+
+async def test_one_endpoint_reporting_a_tiny_head_does_not_blind_the_others():
+    """Review round 2: with the MIN head, this one endpoint capped every scan near the deploy
+    block, so a later claim was never nominated."""
+    chain = _chain(head=30_000, finalized=29_000)
+    chain.timeout = chain.ts(20_000)
+    tx = chain.claim(15_000)
+    liar = _TinyHead(chain)
+    d = await _read(_quorum(chain, liar), chain)
+    assert d.kind is DispositionKind.CLAIMED and d.evidence.tx_hash == tx
+    assert [c.tx_hash for c in d.claims_seen] == [tx]
+    assert str(liar.source_key) in d.logs_failed
+
+
+async def test_a_single_endpoint_whose_head_drops_below_the_range_has_not_answered():
+    chain = _chain(finalized=90)
+    chain.refund(85)
+    ep = FakeEvmEndpoint(chain)
+    u = await union_logs(ep, address=chain.locator().contract_address, topics=[], from_block=0, to_block=150)
+    assert u.answered == frozenset() and set(u.failed) == {str(ep.source_key)}
+
+
+@pytest.mark.parametrize(
+    ("text", "halves"),
+    [
+        ("query returned more than 10000 results. Try with this block range [0x1429ab, 0x1450c0].", True),
+        ("query exceeds max block range 3000, requested 14290000-14299999", True),
+        ("eth_getLogs is limited to a 10,000 range", True),
+        ("range is too large, max is 1k blocks", True),
+        ("429 Too Many Requests", False),
+        ("rate limit reached for this key", False),
+        ("connection reset by peer", False),
+    ],
+)
+def test_which_refusals_halve_the_range(text, halves):
+    from pyrxd.eth_wallet.disposition import _is_range_limit
+
+    assert _is_range_limit(Exception(text)) is halves

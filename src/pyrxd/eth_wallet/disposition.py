@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -74,10 +75,13 @@ LOG_TAIL_BLOCKS = LOG_CHUNK_BLOCKS
 
 #: Error text that means "this range is too large for me", as providers word it. Matched lower-cased.
 #: A miss here only costs the halving: the request is then recorded as a failure, never as "no logs".
-_RANGE_LIMIT_MARKERS = ("block range", "range limit", "range too", "exceeds max", "query returned more than")
+#: Not measured against live providers; the wording is from their documentation and error reports.
+#: A bare "limit exceeded" is left out on purpose: Infura words its RATE limit that way.
+_RANGE_LIMIT_MARKERS = ("range", "query returned more than", "too large", "too wide")
 #: ...and text that means "slow down", which must NOT be retried as a smaller range: halving on a 429
 #: sends a rate-limited endpoint a dozen more requests before it is recorded as failed.
-_RATE_LIMIT_MARKERS = ("429", "too many requests", "rate limit", "rate-limit", "ratelimit")
+#: A regex, not substrings: a bare "429" matched inside block numbers such as 0x1429ab.
+_RATE_LIMIT = re.compile(r"\b429\b|too many requests|rate[ -]?limit")
 
 
 class DispositionKind(Enum):
@@ -209,9 +213,13 @@ async def _magnitude(
 # --------------------------------------------------------------------------- the union log read
 
 
+class _ShortScan(Exception):
+    """An endpoint that could not cover the range it was asked for."""
+
+
 def _is_range_limit(exc: BaseException) -> bool:
     text = str(exc).lower()
-    if any(marker in text for marker in _RATE_LIMIT_MARKERS):
+    if _RATE_LIMIT.search(text):
         return False
     return any(marker in text for marker in _RANGE_LIMIT_MARKERS)
 
@@ -220,7 +228,9 @@ async def _logs_from_one(
     source: Any, address: str, topics: list[Any], from_block: int, to_block: int
 ) -> list[tuple[Any, ...]]:
     """Every log in ``[from_block, to_block]`` from ONE endpoint, then on to that endpoint's OWN head
-    (at most :data:`LOG_TAIL_BLOCKS` further), so a log newer than the agreed head is still nominated.
+    (at most :data:`LOG_TAIL_BLOCKS` past ``to_block``), so a log newer than the agreed head is still
+    nominated. An endpoint whose own head is below ``to_block`` has not covered the range and FAILS:
+    counting it as answered would let a short scan pass for a complete one.
 
     Every request names integer blocks the endpoint has reached. Asking past its head is refused
     by real nodes (anvil: ``BlockOutOfRangeError``), and an open ``"latest"`` tail would dodge the
@@ -228,6 +238,8 @@ async def _logs_from_one(
     range, a malformed field) raises: it is never "no logs". Returned normalised, so a malformed
     answer fails THIS endpoint rather than the whole read."""
     own_head = int(await source.block_number())
+    if own_head < to_block:
+        raise _ShortScan(f"its head {own_head} is below the agreed head {to_block}, so it cannot cover the range")
     end_at = min(own_head, to_block + LOG_TAIL_BLOCKS)
     raw: list[dict[str, Any]] = []
     start, chunk = from_block, LOG_CHUNK_BLOCKS
@@ -398,7 +410,12 @@ async def read_counter_disposition(
                 f"settled at {finalized}",
             )
         )
-        head = await _magnitude(panel, lambda s: s.block_number(), "head", min)
+        # The QUORUM-th highest head, not the MIN: the scan's agreed range ends here, and one endpoint
+        # reporting a tiny head must not cap every honest endpoint's scan (review round 2). At least
+        # `need` endpoints vouch for a head this high; one that is below it fails its own scan.
+        head = await _magnitude(
+            panel, lambda s: s.block_number(), "head", lambda hs: sorted(hs, reverse=True)[panel.need - 1]
+        )
         if from_block is None:
             if str(locator.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH:
                 return unknown("no deploy transaction is known, so the log scan has no start; pass from_block")
@@ -540,11 +557,7 @@ async def read_counter_disposition(
 
 
 def _is_hex(text: str) -> bool:
-    try:
-        bytes.fromhex(text)
-    except ValueError:
-        return False
-    return True
+    return re.fullmatch(r"[0-9a-fA-F]+", text) is not None
 
 
 async def _deploy_block(source: Any, deploy_tx_hash: str) -> int | None:
