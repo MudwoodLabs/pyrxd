@@ -927,3 +927,37 @@ def test_the_refund_gas_estimate_is_the_MIN_across_the_quorum() -> None:
 
         src.estimate_gas = estimate_gas
     assert _run(MultiSourceEthRpc([a, b, c]).estimate_gas({"to": "0x" + "11" * 20})) == 85_900
+
+
+@pytest.mark.parametrize(
+    ("answers", "expect"),
+    [
+        (["revert", "revert", "revert"], ValidationError),  # every endpoint: it will never succeed
+        (["revert", "down", "revert"], NetworkError),  # not unanimous: below quorum, retry
+        (["down", "down", 86_000], NetworkError),
+        ([86_000, "revert", 85_000], 85_000),  # quorum of answers: MIN of them
+    ],
+)
+def test_a_unanimous_typed_revert_at_the_estimate_is_permanent_not_an_outage(answers, expect) -> None:
+    """#850 PR 4a review round 2: the estimate now runs before the preflight, and a multi-source
+    read that dropped every typed revert told the operator to retry a refund that cannot succeed."""
+    sources = []
+    for a in answers:
+        src = _Source()
+
+        async def estimate_gas(tx, _a=a):
+            if _a == "revert":
+                raise ValidationError("tx would revert (eth_estimateGas)")
+            if _a == "down":
+                raise NetworkError("endpoint down")
+            return _a
+
+        src.estimate_gas = estimate_gas
+        sources.append(src)
+    rpc = MultiSourceEthRpc(sources)
+    if isinstance(expect, int):
+        assert _run(rpc.estimate_gas({})) == expect
+    else:
+        with pytest.raises(expect) as ei:
+            _run(rpc.estimate_gas({}))
+        assert type(ei.value) is expect

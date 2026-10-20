@@ -426,8 +426,21 @@ class MultiSourceEthRpc:
     async def estimate_gas(self, tx: dict) -> int:
         """Conservative MIN across the quorum. Only the refund's ceiling check reads this: an
         endpoint inflating its estimate could otherwise refuse the honest refund, while one
-        deflating it can only let a refund run out of gas, which the receipt then shows."""
-        return await self.eth_call_quorum(lambda s: s.estimate_gas(tx), label="estimate_gas", combine=min)
+        deflating it can only let a refund run out of gas, which the receipt then shows.
+
+        When EVERY source raises a typed revert (:class:`ValidationError`), that is re-raised: the
+        refund will never succeed, and reporting it as "too few endpoints answered" would tell the
+        operator to retry (review of #850 PR 4a, round 2)."""
+        results = await asyncio.gather(*(s.estimate_gas(tx) for s in self._sources), return_exceptions=True)
+        if all(isinstance(r, ValidationError) for r in results):
+            raise results[0]
+        ok = [r for r in results if not isinstance(r, BaseException)]
+        if len(ok) < self._min:
+            raise NetworkError(
+                f"estimate_gas: only {len(ok)} of {len(self._sources)} endpoints answered, quorum is "
+                f"{self._min} [{self._failures(results)}]"
+            )
+        return min(ok)
 
     async def preflight(self, tx: dict) -> None:
         return await self.primary.preflight(tx)

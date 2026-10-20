@@ -1192,8 +1192,8 @@ class EthHtlcContractLeg:
         if affordable < estimate:
             raise RefundFeeUnaffordable(
                 f"refund of {contract} needs an estimated {estimate} gas at up to {max_fee} wei per gas, "
-                f"so the sender {built['from']} must hold at least {estimate * max_fee} wei; it holds "
-                f"{balance}. Nothing was signed. Add ETH to that account, then retry the refund.",
+                f"so the sender {built['from']} must hold at least {estimate * max_fee} wei; the "
+                f"broadcasting endpoint reports {balance}. Nothing was signed. Add ETH to that account, then retry the refund.",
                 need_wei=estimate * max_fee,
                 have_wei=balance,
             )
