@@ -174,6 +174,9 @@ class FakeEvmEndpoint:
         claim_settled_at_tip: bool = False,
         extra_logs: tuple[dict[str, Any], ...] = (),
         tip_reads_fail: bool = False,
+        lie_settled_at_blocks: bool = False,
+        lie_canonical: bool = False,
+        hide_all_logs: bool = False,
     ) -> None:
         self.chain = chain
         self.lag = lag
@@ -187,6 +190,9 @@ class FakeEvmEndpoint:
         self.claim_settled_at_tip = claim_settled_at_tip
         self.extra_logs = extra_logs
         self.tip_reads_fail = tip_reads_fail
+        self.lie_settled_at_blocks = lie_settled_at_blocks
+        self.lie_canonical = lie_canonical
+        self.hide_all_logs = hide_all_logs
         self.source_key = distinct_host()
         self.expected_chain_id = CHAIN_ID
         self.log_requests: list[tuple[int, int | str]] = []
@@ -218,6 +224,8 @@ class FakeEvmEndpoint:
     async def canonical_block_hash(self, number: int) -> bytes:
         if number > self.head:
             return b""
+        if self.lie_canonical:
+            return _block_hash(number, "lie")
         return self._hash(number)
 
     async def get_storage_at(self, address: str, slot: int, block_identifier: str | int) -> bytes:
@@ -230,6 +238,8 @@ class FakeEvmEndpoint:
             if not self.archive and int(block_identifier) < self.head - 128:
                 raise NetworkError("missing trie node (historic state unavailable)")
             at = int(block_identifier)
+            if self.lie_settled_at_blocks:
+                return (1).to_bytes(32, "big")
         if address.lower() != CONTRACT:
             return bytes(32)
         settled = self.chain.settled_at is not None and self.chain.settled_at <= at
@@ -272,6 +282,8 @@ class FakeEvmEndpoint:
             if log["address"].lower() != address.lower():
                 continue
             if self.hide_claimed and log["topics"][0] == CLAIMED_TOPIC0:
+                continue
+            if self.hide_all_logs:
                 continue
             out.append(dict(log))
         out.extend(dict(log) for log in self.extra_logs if lo <= log["blockNumber"] <= hi)

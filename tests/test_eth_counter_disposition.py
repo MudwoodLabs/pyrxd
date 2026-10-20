@@ -290,11 +290,79 @@ async def test_rule_5_a_verified_receipt_while_not_settled_at_f_is_unknown():
 # --------------------------------------------------------------------------- failed reads
 
 
-async def test_endpoints_disagreeing_on_the_finalized_block_hash_is_unknown():
+def _with_liar(chain, liar, *, first: bool):
+    honest = [FakeEvmEndpoint(chain), FakeEvmEndpoint(chain)]
+    return MultiSourceEthRpc([liar, *honest] if first else [*honest, liar])
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["liar-first", "liar-last"])
+async def test_endpoints_disagreeing_on_the_finalized_block_hash_is_unknown(first):
+    """Security review: with the liar FIRST only, this passed with the agreement check removed
+    (another check happened to refuse); the reason now pins which check refused."""
     chain = _chain(finalized=90)
     chain.refund(85)
-    d = await _read(_quorum(chain, FakeEvmEndpoint(chain, fork="b")), chain)
+    d = await _read(_with_liar(chain, FakeEvmEndpoint(chain, fork="b"), first=first), chain)
+    assert d.kind is DispositionKind.UNKNOWN and "block(90): endpoints disagree" in d.reason
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["liar-first", "liar-last"])
+async def test_one_endpoint_lying_that_the_contract_is_settled_at_f_cannot_make_it_claimed(first):
+    """Security review MEDIUM: nothing pinned that the endpoints must AGREE on ``settled`` at F.
+    Taking one answer let one liar turn an OPEN contract into a terminal CLAIMED via Gap B."""
+    chain = _chain()
+    d = await _read(_with_liar(chain, FakeEvmEndpoint(chain, lie_settled_at_blocks=True), first=first), chain)
+    assert d.kind is DispositionKind.UNKNOWN and "endpoints disagree" in d.reason
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["liar-first", "liar-last"])
+async def test_one_endpoint_lying_about_the_canonical_hash_stops_the_refund_verifying(first):
+    chain = _chain(finalized=90)
+    chain.refund(85)
+    d = await _read(_with_liar(chain, FakeEvmEndpoint(chain, lie_canonical=True), first=first), chain)
+    assert d.kind is DispositionKind.UNKNOWN and "canonical_block_hash" in d.reason
+
+
+# --------------------------------------------------------------------------- exact boundaries
+
+
+async def test_a_refund_mined_at_the_timeout_block_with_f_there_is_refunded():
+    chain = _chain(finalized=TIMEOUT_BLOCK)
+    tx = chain.refund(TIMEOUT_BLOCK)
+    d = await _read(_quorum(chain), chain)
+    assert d.kind is DispositionKind.REFUNDED and d.evidence.tx_hash == tx
+
+
+async def test_settled_at_f_exactly_at_the_timeout_with_no_logs_is_unknown_not_gap_b():
+    """``timestamp(F) == timeout``: a refund was already possible, so Gap B must not call it a
+    claim. With ``<=`` in place of ``<`` this became a terminal CLAIMED."""
+    chain = _chain(finalized=TIMEOUT_BLOCK)
+    chain.refund(TIMEOUT_BLOCK)
+    eps = [FakeEvmEndpoint(chain, hide_all_logs=True) for _ in range(3)]
+    d = await _read(MultiSourceEthRpc(eps), chain)
     assert d.kind is DispositionKind.UNKNOWN
+
+
+async def test_settled_at_f_one_block_before_the_timeout_with_no_logs_is_gap_b():
+    chain = _chain(finalized=TIMEOUT_BLOCK - 1)
+    chain.claim(TIMEOUT_BLOCK - 1)
+    eps = [FakeEvmEndpoint(chain, hide_all_logs=True) for _ in range(3)]
+    d = await _read(MultiSourceEthRpc(eps), chain)
+    assert d.kind is DispositionKind.CLAIMED and d.evidence.tx_hash is None
+
+
+async def test_unsettled_with_f_exactly_at_the_timeout_is_f_expired():
+    chain = _chain(finalized=TIMEOUT_BLOCK)
+    assert (await _read(_quorum(chain), chain)).kind is DispositionKind.F_EXPIRED
+
+
+async def test_unsettled_with_the_tip_exactly_at_the_timeout_is_tip_expired():
+    chain = _chain(head=TIMEOUT_BLOCK, finalized=60)
+    assert (await _read(_quorum(chain), chain)).kind is DispositionKind.TIP_EXPIRED
+
+
+async def test_unsettled_with_the_tip_one_block_before_the_timeout_is_open():
+    chain = _chain(head=TIMEOUT_BLOCK - 1, finalized=60)
+    assert (await _read(_quorum(chain), chain)).kind is DispositionKind.OPEN
 
 
 async def test_a_non_archive_single_source_is_unknown_not_unsettled():
@@ -333,12 +401,15 @@ async def test_a_range_capped_endpoint_halves_until_it_answers():
 
 
 async def test_logs_newer_than_the_agreed_head_are_still_nominated():
-    """The agreed head is the MIN; a log in a block only the fresher endpoints have reached is
-    still nominated, through the final request to ``latest``."""
+    """The agreed head is the quorum-th highest (here 2 of 3, both 2 blocks behind); a log in a
+    block only the freshest endpoint has reached is still nominated, by its scan past the agreed
+    head to its own."""
     chain = _chain(head=79, finalized=60)
     tx = chain.claim(79)
-    d = await _read(_quorum(chain, FakeEvmEndpoint(chain, lag=2)), chain)
+    eps = [FakeEvmEndpoint(chain), FakeEvmEndpoint(chain, lag=2), FakeEvmEndpoint(chain, lag=2)]
+    d = await _read(MultiSourceEthRpc(eps), chain)
     assert [c.tx_hash for c in d.claims_seen] == [tx]
+    assert d.claims_seen[0].nominated_by == (str(eps[0].source_key),)
 
 
 async def test_single_source_answers_are_marked_single_source():
