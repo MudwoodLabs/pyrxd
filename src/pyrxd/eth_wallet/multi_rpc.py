@@ -350,6 +350,20 @@ class MultiSourceEthRpc:
             lambda s: s.canonical_block_hash(block_number), label=f"canonical_block_hash({block_number})"
         )
 
+    async def block_hash_and_timestamp(self, block_number: int) -> tuple[bytes, int]:
+        """An IDENTITY read: every answering source must give the same hash and timestamp."""
+        return await self.eth_call_quorum(
+            lambda s: s.block_hash_and_timestamp(block_number), label=f"block_hash_and_timestamp({block_number})"
+        )
+
+    async def get_storage_at(self, address: str, slot: int, block_identifier: str | int) -> bytes:
+        """An IDENTITY read, like ``get_code``. At ``"latest"`` two honest endpoints one block apart
+        can disagree, and this refuses: pin an integer block for a decision."""
+        return await self.eth_call_quorum(
+            lambda s: s.get_storage_at(address, slot, block_identifier),
+            label=f"get_storage_at({slot}, {block_identifier!r})",
+        )
+
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         """Quorum on the two fields a swap decision turns on — did it succeed, and in which block.
 

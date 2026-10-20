@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from ..network.source_identity import require_distinct_sources
 from ..security.errors import ValidationError
 from .events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from .htlc_leg import SETTLED_SLOT, _addr, _b, _int_or_none, _receipt_facts
@@ -129,12 +130,26 @@ class CounterDisposition:
 # --------------------------------------------------------------------------- fan-out helpers
 
 
-def _sources_of(rpc: Any) -> tuple[list[Any], int]:
-    """The endpoints behind *rpc* and how many must agree: a multi-source rpc's own quorum, or one."""
+@dataclass(frozen=True)
+class _Panel:
+    """The endpoints a read is asked of, and how many must answer. Built only by :func:`_panel_of`,
+    so every count in this module is a count over a set already held to one source per operator."""
+
+    sources: tuple[Any, ...]
+    need: int
+
+
+def _panel_of(rpc: Any) -> _Panel:
+    """The endpoints behind *rpc* and how many must answer: a multi-source rpc's own sources and
+    ``min_agreeing``, or the one endpoint. Two sources of one operator are refused here even though
+    ``MultiSourceEthRpc`` already refuses them, because this module counts the answers itself."""
     sources = getattr(rpc, "sources", None)
-    if isinstance(sources, list) and sources:
-        return list(sources), int(getattr(rpc, "min_agreeing", 2))
-    return [rpc], 1
+    if isinstance(sources, list) and len(sources) > 1:
+        require_distinct_sources(sources, what="the counter-leg disposition reader")
+        return _Panel(tuple(sources), int(rpc.min_agreeing))
+    if isinstance(sources, list) and len(sources) == 1:
+        return _Panel((sources[0],), 1)
+    return _Panel((rpc,), 1)
 
 
 def _key(source: Any) -> str:
@@ -145,31 +160,30 @@ class _BelowQuorum(Exception):
     """A read the decision needs could not be made with enough sources, or they disagreed."""
 
 
-async def _ask_all(sources: list[Any], call: Callable[[Any], Awaitable[Any]]) -> list[tuple[Any, Any]]:
+async def _ask_all(sources: Sequence[Any], call: Callable[[Any], Awaitable[Any]]) -> list[tuple[Any, Any]]:
     results = await asyncio.gather(*(call(s) for s in sources), return_exceptions=True)
     return list(zip(sources, results, strict=True))
 
 
-async def _identity(sources: list[Any], quorum: int, call: Callable[[Any], Awaitable[Any]], what: str) -> Any:
-    """Every answering source must say the same, and at least *quorum* must answer."""
-    answers = [r for _s, r in await _ask_all(sources, call) if not isinstance(r, BaseException)]
-    if len(answers) < quorum:
-        raise _BelowQuorum(f"{what}: {len(answers)} of {len(sources)} endpoints answered, quorum {quorum}")
+async def _identity(panel: _Panel, call: Callable[[Any], Awaitable[Any]], what: str) -> Any:
+    """Every answering source must say the same, and at least ``panel.need`` must answer."""
+    answers = [r for _s, r in await _ask_all(panel.sources, call) if not isinstance(r, BaseException)]
+    if len(answers) < panel.need:
+        raise _BelowQuorum(f"{what}: {len(answers)} of {len(panel.sources)} endpoints answered, need {panel.need}")
     if any(a != answers[0] for a in answers[1:]):
         raise _BelowQuorum(f"{what}: endpoints disagree")
     return answers[0]
 
 
 async def _magnitude(
-    sources: list[Any],
-    quorum: int,
+    panel: _Panel,
     call: Callable[[Any], Awaitable[Any]],
     what: str,
     combine: Callable[[list[Any]], Any],
 ) -> Any:
-    answers = [r for _s, r in await _ask_all(sources, call) if not isinstance(r, BaseException)]
-    if len(answers) < quorum:
-        raise _BelowQuorum(f"{what}: {len(answers)} of {len(sources)} endpoints answered, quorum {quorum}")
+    answers = [r for _s, r in await _ask_all(panel.sources, call) if not isinstance(r, BaseException)]
+    if len(answers) < panel.need:
+        raise _BelowQuorum(f"{what}: {len(answers)} of {len(panel.sources)} endpoints answered, need {panel.need}")
     return combine(answers)
 
 
@@ -225,8 +239,7 @@ async def union_logs(rpc: Any, *, address: str, topics: list[Any], from_block: i
     block number and block hash, with a ``nominated_by`` tuple of the endpoints that returned it.
     ``EthRpc.get_logs_union`` and ``MultiSourceEthRpc.get_logs_union`` are this, as methods.
     """
-    sources, _quorum = _sources_of(rpc)
-    results = await _ask_all(sources, lambda s: _logs_from_one(s, address, topics, from_block, to_block))
+    results = await _ask_all(_panel_of(rpc).sources, lambda s: _logs_from_one(s, address, topics, from_block, to_block))
     nominated_by: dict[tuple[Any, ...], set[str]] = {}
     answered: set[str] = set()
     failed: dict[str, str] = {}
@@ -275,8 +288,7 @@ def _opens(data: bytes, hashlock: bytes) -> bool:
 
 
 async def _verify(
-    sources: list[Any],
-    quorum: int,
+    panel: _Panel,
     tx_hash: str,
     *,
     contract: str,
@@ -290,7 +302,7 @@ async def _verify(
     async def _facts(s: Any) -> Any:
         return _receipt_facts(await s.get_transaction_receipt(tx_hash))
 
-    facts = await _identity(sources, quorum, _facts, f"receipt({tx_hash})")
+    facts = await _identity(panel, _facts, f"receipt({tx_hash})")
     if facts is None:
         return False, None, "not mined"
     status, block_hash, block_number, _logs = facts
@@ -299,7 +311,7 @@ async def _verify(
     if block_number is None or block_number > finalized:
         return False, block_number, "not at or below the finalized block"
     canonical = await _identity(
-        sources, quorum, lambda s: s.canonical_block_hash(block_number), f"canonical_block_hash({block_number})"
+        panel, lambda s: s.canonical_block_hash(block_number), f"canonical_block_hash({block_number})"
     )
     if bytes(canonical) != block_hash:
         return False, block_number, "its block is not canonical"
@@ -340,9 +352,9 @@ async def read_counter_disposition(
     for h in recorded_refund_hashes:
         if not isinstance(h, str) or not h.startswith("0x") or len(h) != 66:
             raise ValidationError("recorded_refund_hashes must be 0x-prefixed 32-byte hex hashes")
-    sources, quorum = _sources_of(rpc)
-    single = len(sources) == 1
-    keys = tuple(sorted(_key(s) for s in sources))
+    panel = _panel_of(rpc)
+    single = len(panel.sources) == 1
+    keys = tuple(sorted(_key(s) for s in panel.sources))
     contract = _addr(locator.contract_address)
     hashlock = locator.hashlock_bytes
     timeout = int(locator.timeout)
@@ -351,14 +363,11 @@ async def read_counter_disposition(
         return CounterDisposition(DispositionKind.UNKNOWN, why, finalized, single_source=single, **kw)
 
     try:
-        finalized = await _magnitude(sources, quorum, lambda s: s.finalized_block_number(), "finalized", min)
-        f_hash, f_ts = await _identity(
-            sources, quorum, lambda s: s.block_hash_and_timestamp(finalized), f"block({finalized})"
-        )
+        finalized = await _magnitude(panel, lambda s: s.finalized_block_number(), "finalized", min)
+        f_hash, f_ts = await _identity(panel, lambda s: s.block_hash_and_timestamp(finalized), f"block({finalized})")
         settled_f = any(
             await _identity(
-                sources,
-                quorum,
+                panel,
                 lambda s: s.get_storage_at(locator.contract_address, SETTLED_SLOT, finalized),
                 f"settled at {finalized}",
             )
@@ -367,21 +376,18 @@ async def read_counter_disposition(
         # liar here is a delay, and the cost of disbelieving an honest one is a refund that reverts.
         settled_tip = any(
             await _magnitude(
-                sources,
-                quorum,
+                panel,
                 lambda s: s.get_storage_at(locator.contract_address, SETTLED_SLOT, "latest"),
                 "settled at tip",
                 lambda words: max(words, key=any),
             )
         )
-        tip_ts = await _magnitude(sources, quorum, lambda s: s.latest_block_timestamp(), "tip timestamp", min)
-        head = await _magnitude(sources, quorum, lambda s: s.block_number(), "head", min)
+        tip_ts = await _magnitude(panel, lambda s: s.latest_block_timestamp(), "tip timestamp", min)
+        head = await _magnitude(panel, lambda s: s.block_number(), "head", min)
         if from_block is None:
             if str(locator.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH:
                 return unknown("no deploy transaction is known, so the log scan has no start; pass from_block")
-            deploy = await _identity(
-                sources, quorum, lambda s: _deploy_block(s, locator.deploy_tx_hash), "deploy receipt"
-            )
+            deploy = await _identity(panel, lambda s: _deploy_block(s, locator.deploy_tx_hash), "deploy receipt")
             if deploy is None:
                 return unknown("the deploy transaction's receipt is not available", finalized)
             from_block = deploy
@@ -421,7 +427,7 @@ async def read_counter_disposition(
     for tx in sorted(refunds):
         try:
             ok, _bn, _why = await _verify(
-                sources, quorum, tx, contract=contract, topic0=refunded_topic, hashlock=None, finalized=finalized
+                panel, tx, contract=contract, topic0=refunded_topic, hashlock=None, finalized=finalized
             )
         except _BelowQuorum as exc:
             incomplete.append(f"refund {tx}: {exc}")
@@ -434,7 +440,7 @@ async def read_counter_disposition(
         ok, bn = False, log["blockNumber"]
         try:
             ok, vbn, _why = await _verify(
-                sources, quorum, tx, contract=contract, topic0=claimed_topic, hashlock=hashlock, finalized=finalized
+                panel, tx, contract=contract, topic0=claimed_topic, hashlock=hashlock, finalized=finalized
             )
             bn = vbn if vbn is not None else bn
         except _BelowQuorum as exc:
