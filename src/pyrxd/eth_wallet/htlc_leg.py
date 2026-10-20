@@ -1176,7 +1176,19 @@ class EthHtlcContractLeg:
             )
         built["gas"] = await self._affordable_refund_gas(built, estimate=estimate, contract=locator.contract_address)
         # Then the preflight at the limit actually signed, then sign without a second preflight.
-        await self._rpc.preflight(built)
+        try:
+            await self._rpc.preflight(built)
+        except ValidationError as exc:
+            if int(built["gas"]) >= REFUND_GAS_LIMIT:
+                raise
+            # Signed below the limit because the sender is short: some nodes report an out-of-gas at
+            # that limit as a typed revert, which would read as "can never succeed" (Mythos review of
+            # PR 4a, LOW). Say what else it may be, keeping the type a driver stops on.
+            raise ValidationError(
+                f"{exc}. This refund was sized at {built['gas']} gas, below the {REFUND_GAS_LIMIT} limit, "
+                "because the sender could not hold more at the quoted fee; at that limit the call may simply "
+                "have run out of gas. Add ETH to the sender and retry before concluding the refund cannot succeed."
+            ) from exc
         return await self._sign_and_send(built, preflight=False, on_signed=on_signed)
 
     async def _affordable_refund_gas(self, built: dict[str, Any], *, estimate: int, contract: str) -> int:

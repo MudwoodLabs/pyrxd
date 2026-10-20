@@ -1019,3 +1019,29 @@ async def test_a_failing_on_signed_means_nothing_is_broadcast(frozen_clock):
 )
 def test_out_of_gas_is_status_zero_with_the_whole_limit_used(receipt, out_of_gas):
     assert hl.refund_ran_out_of_gas(receipt, gas_limit=150_000) is out_of_gas
+
+
+async def test_a_typed_preflight_failure_at_a_lowered_limit_says_it_may_be_gas(frozen_clock):
+    """Mythos review of PR 4a (LOW): a node that types an out-of-gas as a revert made a short-funded
+    refund read as "can never succeed". The type stays ValidationError; the message names the cause."""
+    rpc = _balanced(_Rpc(head_ts=_NOW, max_fee=1_000, tip=1), 100_000 * 1_000)
+
+    async def preflight(tx):
+        raise ValidationError("tx would revert (preflight eth_call): execution reverted")
+
+    rpc.preflight = preflight
+    with pytest.raises(ValidationError, match="may simply have run out of gas") as ei:
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert "sized at 100000 gas" in str(ei.value) and rpc.sent == []
+
+
+async def test_HONEST_a_typed_preflight_failure_at_the_full_limit_is_unchanged(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW)
+
+    async def preflight(tx):
+        raise ValidationError("tx would revert (preflight eth_call): AlreadySettled")
+
+    rpc.preflight = preflight
+    with pytest.raises(ValidationError) as ei:
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert "run out of gas" not in str(ei.value)
