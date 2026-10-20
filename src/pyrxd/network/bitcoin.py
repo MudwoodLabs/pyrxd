@@ -802,9 +802,12 @@ class BitcoinCoreRpcSource(BtcDataSource):
 
         Fails closed: ``NetworkError`` when the node does not hold the outpoint unspent and no
         spender is found. That covers a funding transaction the node does not know, one that is
-        unconfirmed with no spender in the mempool, and a confirmed span longer than
-        ``max_scan_blocks``. A spender is returned at whatever depth it has, mempool included;
-        the caller decides what depth it needs before acting on it.
+        unconfirmed with no spender in the mempool, and a span of more than ``max_scan_blocks``
+        blocks. On a node older than Core 24 a spender that is only in the mempool cannot be seen,
+        so it raises too, saying so. Reading the funding transaction's block needs ``-txindex``
+        (or a wallet that holds the transaction), as the rest of this class's confirmed-transaction
+        reads do. A spender is returned at whatever depth it has, mempool included; the caller
+        decides what depth it needs before acting on it.
 
         It trusts this one node. A node that lags the chain (still syncing, or partitioned) answers
         from stale state, so "unspent" means unspent at that node's tip. The txid check covers the
@@ -819,10 +822,12 @@ class BitcoinCoreRpcSource(BtcDataSource):
             if not isinstance(utxo, dict):
                 raise NetworkError("Unexpected gettxout response from Bitcoin Core")
             return None
+        mempool_readable = True
         try:
             mempool = await self._rpc("gettxspendingprevout", [[{"txid": str(txid), "vout": index}]])
         except NetworkError:
             mempool = None  # a node without the RPC: only the block scan below can find the spender
+            mempool_readable = False
         if isinstance(mempool, list):
             for entry in mempool:
                 spender = entry.get("spendingtxid") if isinstance(entry, dict) else None
@@ -846,7 +851,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
         except ValueError as exc:
             raise NetworkError("Invalid height in getblockheader response") from exc
         tip = int(await self.get_tip_height())
-        if tip - funding_height > max_scan_blocks:
+        if tip - funding_height + 1 > max_scan_blocks:  # the scan reads funding_height..tip inclusive
             raise NetworkError(
                 f"outpoint {str(txid)[:16]}…:{index} is spent and its spender is not in the mempool; it lies in "
                 f"{tip - funding_height + 1} blocks, more than this search reads ({max_scan_blocks}); fail-closed"
@@ -865,7 +870,13 @@ class BitcoinCoreRpcSource(BtcDataSource):
                     return self._spender_bytes(tx, Txid(str(tx.get("txid"))), prevout)
         raise NetworkError(
             f"outpoint {str(txid)[:16]}…:{index} is not unspent at this node, and no transaction spending it was "
-            "found in the mempool or the blocks since it was mined; fail-closed"
+            + (
+                "found in the mempool or the blocks since it was mined; fail-closed"
+                if mempool_readable
+                else "found in the blocks since it was mined. This node cannot list mempool spenders "
+                "(no gettxspendingprevout: Bitcoin Core before 24), so the spender may be unconfirmed: "
+                "retry once it confirms, or use a Core 24+ node; fail-closed"
+            )
         )
 
     @staticmethod

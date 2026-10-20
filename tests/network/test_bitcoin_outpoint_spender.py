@@ -185,3 +185,30 @@ async def test_a_block_entry_whose_vin_claims_the_outpoint_but_whose_bytes_do_no
     node.blocks[101] = [entry]
     with pytest.raises(NetworkError, match="does not spend the outpoint"):
         await _spender(node)
+
+
+async def test_an_old_node_with_a_mempool_only_spender_says_why_it_cannot_tell() -> None:
+    """Mythos P1: without gettxspendingprevout a mempool-only spender cannot be seen, and the refusal
+    used to read like a node fault ("retry"). It still fails closed, and now names the cause."""
+    node = FakeCore()
+    node.has_spending_rpc = False
+    with pytest.raises(NetworkError, match="before 24.*may be unconfirmed"):
+        await _spender(node)
+
+
+async def test_a_node_with_the_mempool_rpc_gets_the_plain_message() -> None:
+    node = FakeCore()
+    with pytest.raises(NetworkError) as raised:
+        await _spender(node)
+    assert "before 24" not in str(raised.value)
+
+
+async def test_the_scan_reads_at_most_max_scan_blocks_blocks() -> None:
+    """Mythos P3: the bound let max_scan_blocks + 1 blocks through. Funding at 100, tip 103 is four
+    blocks: refused at a bound of 3, scanned at a bound of 4."""
+    node = FakeCore()
+    raw = _spend(FUNDING, b"at-tip")
+    node.blocks[103] = [_entry(raw)]
+    with pytest.raises(NetworkError, match="more than this search reads"):
+        await _spender(node, max_scan_blocks=3)
+    assert bytes(await _spender(node, max_scan_blocks=4)) == raw

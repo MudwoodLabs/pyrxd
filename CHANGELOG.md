@@ -51,7 +51,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outpoint, as one Bitcoin Core node sees it (#850 PR 1c).** It returns `None` while the node holds
   the outpoint unspent. Otherwise it looks in the mempool (`gettxspendingprevout`, Core 24+) and
   then in the blocks from the funding transaction's block to the tip, at most `max_scan_blocks`
-  (2016 by default). Each spender's bytes are re-hashed against its txid (which does not cover the
+  of them (2016 by default). Reading the funding block needs `-txindex`; a node older than Core 24
+  cannot see a mempool spender and says so. Each spender's bytes are re-hashed against its txid (which does not cover the
   witness) and must spend the outpoint. It trusts the one node it asks. Anything it cannot tell (an unknown or unconfirmed funding transaction with no mempool
   spender, a longer span, a spender not found) raises `NetworkError`; it never answers "unspent"
   by default.

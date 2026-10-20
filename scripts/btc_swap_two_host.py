@@ -1047,7 +1047,8 @@ async def _refuse_if_btc_leg_spent(args, source, loc, terms, *, phase: str) -> N
     concludes, and the coordinator is unchanged.
 
     Refuses when the BTC HTLC's funding outpoint is already spent, as the ``--btc-rpc-url`` node
-    sees it (mempool included). A spender whose witness opens this swap's hashlock is the maker's
+    sees it (its mempool included on Bitcoin Core 24 or later; an older node sees confirmed
+    spenders only, and says so in the refusal). A spender whose witness opens this swap's hashlock is the maker's
     claim: ``p`` is public, and the taker's move is ``--phase claim`` on the covenant, not a refund
     (a refund could at best race the claim, and ``--phase refund`` would also push the covenant
     refund to the maker). Any other spender is most likely the taker's own refund, and the taker is
