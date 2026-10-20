@@ -47,7 +47,7 @@ import coincurve
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import DUST_LIMIT
-from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
+from pyrxd.gravity.swap_state import NegotiatedTerms, RecordRole, SwapRecord, SwapState
 from pyrxd.security.errors import ValidationError
 
 # A placeholder outpoint for the setup-time self-test: 32 zero bytes is valid 64-char hex. The refund
@@ -213,7 +213,9 @@ def build_record(state: dict, outpoint: bt.BtcOutpoint) -> SwapRecord:
         btc_refund_pubkey_xonly=_xonly(refund_priv),
         counter_chain="btc",
     )
-    return SwapRecord(state=SwapState.BTC_LOCKED, terms=terms, counterchain_locator=locator)
+    # The taker's record: the tower arms an autonomous refund only for a record that names the taker
+    # (or the single operator) as its writer (#850 PR 1b).
+    return SwapRecord(state=SwapState.BTC_LOCKED, terms=terms, counterchain_locator=locator, role=RecordRole.TAKER)
 
 
 # --------------------------------------------------------------------------------------------------

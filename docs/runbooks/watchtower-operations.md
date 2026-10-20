@@ -64,6 +64,14 @@ into the same app or receiver changes nothing.
   quieten a page: the reserve is compared against the room left before the maker's refund opens, so
   a smaller window makes the gate say WAIT with less margin than the chain actually needs.
 - For the v2 *autonomous refund*: a `<swap_id>.refund.json` sidecar per swap (see Key rotation below).
+  From 0.27 the tower arms an autonomous refund or claim only for a record that names the taker (or
+  the single operator) as its writer, `"role": "taker"` or `"none"`. A record written before 0.27
+  has no role and is paged but never acted on; it gains one the next time a 0.27 coordinator saves
+  it. The BTC refund is also never autonomous while the maker's covenant is observed, because the
+  maker can still claim until the refund confirms: the tower pages, and you refund and watch.
+- **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,
+  whether or not the maker's covenant is on chain. A maker's record is paged to refund its covenant
+  at t_rxd, never to run the taker's `taker_refund_btc` or `mutual_refund`.
 
 ## Running
 

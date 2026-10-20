@@ -9,6 +9,7 @@ emits the same ``taker_refund_btc`` display string must NOT arm the BTC executor
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ from hypothesis import strategies as st
 
 from pyrxd.btc_wallet import taproot as t
 from pyrxd.gravity.fee_policy import DeadlineFeePolicy
-from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
+from pyrxd.gravity.swap_state import NegotiatedTerms, RecordRole, SwapRecord, SwapState
 from pyrxd.gravity.watch import (
     Decision,
     ExecOutcome,
@@ -122,7 +123,10 @@ def _swap(
         state=state,
         terms=_terms(btc_sats=btc_sats, t_btc=timeout),
         counterchain_locator=loc,
-        radiant_covenant_outpoint=_COV,
+        # No covenant pin: the record the autonomous refund is FOR is one whose covenant is not known
+        # to exist. A pin is proof the maker locked, and with one the tower only pages (#850 PR 1b).
+        radiant_covenant_outpoint=None,
+        role=RecordRole.TAKER,  # autonomy is armed only for the taker's (or single operator's) record
     )
     return rec, PresignedRefund(raw_tx=raw, swap_id="swap1")
 
@@ -379,12 +383,13 @@ def _obs(**kw):
     return Observations(**base)
 
 
-def _btc_rec(state=SwapState.BTC_LOCKED, *, t_btc=None):
+def _btc_rec(state=SwapState.BTC_LOCKED, *, t_btc=None, role=RecordRole.TAKER):
     return SwapRecord(
         state=state,
         terms=_terms(t_btc=t_btc),
         counterchain_locator=None,
         radiant_covenant_outpoint=None,
+        role=role,
     )
 
 
@@ -404,10 +409,24 @@ def test_btc_locked_refunds_only_when_funding_matured():
     assert d.recommended_action == "taker_refund_btc" and d.autonomous_btc_refund is True
 
 
-def test_btc_locked_never_refunds_when_asset_is_locked():
+def test_btc_locked_never_AUTO_refunds_when_asset_is_locked():
+    """#850 PR 1b: the maker locked and never claimed. The refund is due and is paged (this was a
+    silent WATCH, item 6), but never autonomously: the maker can still claim while it is unconfirmed."""
     rec = _btc_rec()
     d = _decide(rec, _obs(btc_funding_confirmations=999, asset_locked_at_height=100))
-    assert d.intent is Intent.WATCH  # maker DID lock → not refunding even though funding matured
+    assert d.intent is Intent.PAGE_REFUND and d.recommended_action == "taker_refund_btc"
+    assert d.autonomous_btc_refund is False
+    assert "maker can still claim" in d.reason
+
+
+@pytest.mark.parametrize("role", [None, RecordRole.MAKER])
+def test_no_autonomy_for_a_record_that_is_not_the_takers(role):
+    """A record with no role (written before 0.27), or a maker's, never arms a broadcast (§5.1)."""
+    rec = _btc_rec(role=role)
+    d = _decide(rec, _obs(btc_funding_confirmations=999))
+    assert d.intent is Intent.PAGE_REFUND and d.autonomous_btc_refund is False
+    mismatch = _decide(_btc_rec(state=SwapState.PARAMS_MISMATCH, role=role), _obs(btc_funding_confirmations=999))
+    assert mismatch.autonomous_btc_refund is False
 
 
 def test_seconds_unit_t_btc_never_auto_refunds():
@@ -757,3 +776,13 @@ async def test_the_floor_tracks_the_injected_rate(tmp_path):
     )
     assert await ex.execute("swap1", rec, _refund_decision()) is ExecOutcome.DECLINED
     assert b.calls == []
+
+
+def test_a_pinned_covenant_disarms_autonomy_even_when_its_depth_read_fails():
+    """#850 PR 1b review M1: the tower's covenant read returns "absent" on a read that RAISED, so a
+    gate keyed on that read alone armed the refund, saying "maker never locked", the moment the read
+    failed. A pin is set only when the taker's fund verified the covenant, so it decides."""
+    rec = dataclasses.replace(_btc_rec(), radiant_covenant_outpoint=_COV)
+    d = _decide(rec, _obs(btc_funding_confirmations=999, asset_locked_at_height=None))
+    assert d.intent is Intent.PAGE_REFUND and d.autonomous_btc_refund is False
+    assert "maker never locked" not in d.reason and "could not be read" in d.reason

@@ -41,7 +41,7 @@ from pyrxd.gravity.swap_coordinator import (
     assess_claim_finality,
     taker_refund_window_open,
 )
-from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState, is_terminal
+from pyrxd.gravity.swap_state import NegotiatedTerms, RecordRole, SwapRecord, SwapState, is_terminal
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.units import BlockSpan, ChainHeight, Confirmations, PhotonValue, Seconds
 
@@ -352,6 +352,55 @@ _BOTH_LOCKED_REFUND_REASON_ETH = _BOTH_LOCKED_REFUND_COMMON + (
     "verified claim, check the contract's events on another source before the covenant's CSV refund opens."
 )
 
+# -- the record's role (#850 PR 1b, design §5.1) ------------------------------------------------
+#
+# A MAKER's record does not need its counter leg refunded: the counter leg is the TAKER's money. When
+# the maker has not claimed by the counter deadline, what the maker is owed is its own covenant back
+# by the CSV refund at t_rxd. Paging a maker "taker_refund_btc" or "mutual_refund" named the other
+# party's step. A record with no role (written before 0.27) is paged as before, as the TAKER or
+# single-operator row, but it never arms an autonomous broadcast: the tower cannot tell whose
+# money the step would move.
+_MAKER_COVENANT_REFUND_ACTION = (
+    "refund your covenant by its CSV leg once t_rxd matures: it is the maker's to send and pays the "
+    "maker (two-host runners: maker --phase abort if the taker never funded, --phase refund otherwise)"
+)
+
+
+def _maker_covenant_refund(why: str, *, deadline: ChainHeight | None, corr: bool) -> Decision:
+    return Decision(
+        Intent.PAGE_REFUND,
+        reason=f"{why}; your covenant is refundable to you at t_rxd (the deadline shown, when known)",
+        recommended_action=_MAKER_COVENANT_REFUND_ACTION,
+        deadline_rxd_height=deadline,
+        low_corroboration=corr,
+    )
+
+
+def _covenant_known(record: SwapRecord, obs: Observations) -> bool:
+    """Whether the maker's covenant is known to exist: observed this tick, OR pinned on the record.
+
+    The pin is set when a taker's fund verifies the covenant (the gate cannot pass without it), so it
+    is proof the maker locked. An empty or failed depth read is not evidence otherwise: the tower's
+    sources return "absent" on a read that raised, and a gate keyed on the read alone armed the
+    autonomous refund, with "maker never locked" text, the moment the read failed (review M1)."""
+    return obs.asset_locked_at_height is not None or record.radiant_covenant_outpoint is not None
+
+
+def _no_autonomy_note(record: SwapRecord) -> str:
+    """Said on a page that would have been autonomous, when the record's role is what stops it."""
+    if record.role is None:
+        return " Not autonomous: the record names no role (written before 0.27), so the tower only pages."
+    if record.role is RecordRole.MAKER:
+        return " Not autonomous: this is the maker's record."
+    return ""
+
+
+def _autonomy_allowed(record: SwapRecord) -> bool:
+    """An autonomous broadcast acts for the TAKER (or the single operator who is both). Never for a
+    MAKER's record, and never for a record that does not say whose it is."""
+    return record.role in (RecordRole.TAKER, RecordRole.NONE)
+
+
 #: Coordinator steps, IN ORDER, that carry a record at this state to a claimed asset. A state
 #: absent here has NO valid claim step and is paged "investigate" rather than a name that raises.
 #: Cross-checked against the coordinator's own ``record.state is not …`` / ``state not in (…)``
@@ -489,7 +538,8 @@ def decide(
                 low_corroboration=corr,
                 # BTC↔RXD SAFE claim race → arm the autonomous ClaimExecutor (BTC branch ONLY; the ETH
                 # SAFE branch below must NOT set this). The executor re-asserts SAFE fresh before firing.
-                autonomous_asset_claim=True,
+                # Only for a record that says it is the taker's (or the single operator's) (#850 PR 1b).
+                autonomous_asset_claim=_autonomy_allowed(record),
             )
         if finality is ClaimFinality.WAIT:
             return Decision(
@@ -520,11 +570,23 @@ def decide(
     #     out (the swap is definitively broken); autonomous IFF the CSV refund has matured (else the
     #     operator refunds manually once it does — never an autonomous broadcast of an immature refund).
     if state is SwapState.PARAMS_MISMATCH:
+        if record.role is RecordRole.MAKER:
+            # PARAMS_MISMATCH arises in the MAKER's process (post_asset_lock_revalidate), so this is
+            # the common case for it: the counter leg is the taker's to refund (review M2).
+            return _maker_covenant_refund(
+                "covenant params mismatch: the swap will not complete and the taker refunds its BTC",
+                deadline=None
+                if obs.asset_locked_at_height is None
+                else _refund_opens_at(policy, terms, obs.asset_locked_at_height),
+                corr=corr,
+            )
+        matured = _btc_refund_matured(terms, obs)
         return Decision(
             Intent.PAGE_REFUND,
-            reason="covenant params mismatch — refund the BTC counter-leg via the timelock leg",
+            reason="covenant params mismatch — refund the BTC counter-leg via the timelock leg"
+            + (_no_autonomy_note(record) if matured else ""),
             recommended_action="taker_refund_btc",
-            autonomous_btc_refund=_btc_refund_matured(terms, obs),
+            autonomous_btc_refund=matured and _autonomy_allowed(record),
             low_corroboration=corr,
         )
     # 3c. Maker stall (FSM finding #2, 2026-06-09). Recovery is mutual_refund, NOT the asset-only
@@ -563,12 +625,24 @@ def decide(
             )
         except ValidationError as exc:
             # Un-evaluable heights → fail-closed toward paging the refund (don't sit silently).
+            if record.role is RecordRole.MAKER:
+                return _maker_covenant_refund(
+                    f"maker-stall predicate un-evaluable, fail-closed to a refund page: {exc}",
+                    deadline=deadline,
+                    corr=corr,
+                )
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=f"maker-stall predicate un-evaluable, fail-closed to refund page: {exc}",
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+            )
+        if refund_due and record.role is RecordRole.MAKER:
+            return _maker_covenant_refund(
+                "you have not claimed the BTC counter leg and t_rxd is near; the taker refunds its BTC",
+                deadline=deadline,
+                corr=corr,
             )
         if refund_due:
             return Decision(
@@ -588,29 +662,93 @@ def decide(
     # 3d. Maker never locks the asset → the taker's stranded BTC becomes refundable once the BTC
     #     funding buries past t_btc (the relative-CSV refund leaf opens). We only page (and only then
     #     auto-act) once the refund is actually DUE — until then the maker may still lock, so we watch.
-    #     Fail-closed: never refund when the asset IS observed locked on-chain (a stale BTC_LOCKED
-    #     record → the maker did lock), and never auto-act on an unread/seconds-unit maturity.
+    #     Fail-closed: never auto-act while the covenant is known to exist, and never on an
+    #     unread/seconds-unit maturity.
+    #     #850 PR 1b: an OBSERVED covenant no longer silences the refund page. The maker locks first,
+    #     so a taker's own record sits at BTC_LOCKED with the covenant on chain for the whole swap,
+    #     and the old "asset lock observed → WATCH" rule meant a maker who locked and then never
+    #     claimed left the taker unpaged past t_btc, forever (#850 item 6). The page now goes out;
+    #     what the observed covenant changes is the autonomy (off: the maker can still claim while
+    #     the refund is unconfirmed, the claim leaf has no timelock) and the text.
     if state is SwapState.BTC_LOCKED:
-        if obs.asset_locked_at_height is not None:
+        matured = _btc_refund_matured(terms, obs)
+        covenant_seen = _covenant_known(record, obs)
+        if record.role is RecordRole.MAKER:
+            if obs.asset_locked_at_height is not None and obs.now_rxd_height >= _refund_opens_at(
+                policy, terms, obs.asset_locked_at_height
+            ):
+                # The funding depth may be unreadable; t_rxd from the covenant decides alone (review L3).
+                return _maker_covenant_refund(
+                    "t_rxd has matured and you have not claimed",
+                    deadline=_refund_opens_at(policy, terms, obs.asset_locked_at_height),
+                    corr=corr,
+                )
+            if matured:
+                return _maker_covenant_refund(
+                    f"the taker's BTC funding is buried {obs.btc_funding_confirmations} >= t_btc "
+                    f"{terms.t_btc.value} blocks and you have not claimed it, so the taker refunds",
+                    deadline=(
+                        None
+                        if obs.asset_locked_at_height is None
+                        else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
+                    ),
+                    corr=corr,
+                )
             return Decision(
                 Intent.WATCH,
-                reason="asset lock observed on-chain despite a BTC_LOCKED record — the maker locked; not refunding",
+                reason=(
+                    "BTC_LOCKED (maker); the taker's BTC funding depth could not be read"
+                    if obs.btc_funding_confirmations is None
+                    else f"BTC_LOCKED (maker); the taker's refund is not due yet (funding {obs.btc_funding_confirmations} conf)"
+                ),
                 low_corroboration=corr,
             )
-        if _btc_refund_matured(terms, obs):
+        if matured and covenant_seen:
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=(
-                    f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
-                    f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg"
+                    f"the maker locked the covenant but has not claimed; BTC funding buried "
+                    f"{obs.btc_funding_confirmations} >= t_btc {terms.t_btc.value} blocks — refund the BTC "
+                    "counter leg, then watch until the refund is buried: the maker can still claim (the claim "
+                    "leaf has no timelock), and a claim makes p public, so check whether the covenant is "
+                    "still yours to claim before the maker's CSV refund at t_rxd"
+                    + ("" if obs.asset_locked_at_height is not None else " (its depth could not be read this tick)")
                 ),
                 recommended_action="taker_refund_btc",
-                autonomous_btc_refund=True,
+                # Not autonomous while the covenant is observed (design §5.1, H3): the pre-signed refund
+                # could lose to a claim, and only the operator then knows to claim the covenant.
                 low_corroboration=corr,
+            )
+        if matured:
+            return (
+                Decision(
+                    Intent.PAGE_REFUND,
+                    reason=(
+                        f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
+                        f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg"
+                    ),
+                    recommended_action="taker_refund_btc",
+                    autonomous_btc_refund=_autonomy_allowed(record),
+                    low_corroboration=corr,
+                )
+                if _autonomy_allowed(record)
+                else Decision(
+                    Intent.PAGE_REFUND,
+                    reason=(
+                        f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
+                        f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg."
+                        + _no_autonomy_note(record)
+                    ),
+                    recommended_action="taker_refund_btc",
+                    low_corroboration=corr,
+                )
             )
         return Decision(
             Intent.WATCH,
-            reason=f"BTC_LOCKED; awaiting t_btc maturity (funding {obs.btc_funding_confirmations} conf) or an asset lock",
+            reason=(
+                f"BTC_LOCKED; awaiting t_btc maturity (funding {obs.btc_funding_confirmations} conf)"
+                + ("; the maker's covenant is observed" if covenant_seen else " or an asset lock")
+            ),
             low_corroboration=corr,
         )
 
@@ -720,6 +858,14 @@ def _decide_eth(
         # `taker_refund_btc` is the state-valid step (coordinator allows it from PARAMS_MISMATCH and it
         # services the counter-leg refund — the ETH HTLC here); `mutual_refund` is BOTH_LOCKED-only and
         # would also touch the maker's covenant. Mirror the BTC branch's action.
+        if record.role is RecordRole.MAKER:
+            return _maker_covenant_refund(
+                "covenant params mismatch on the ETH swap: it will not complete and the taker refunds its ETH",
+                deadline=None
+                if obs.asset_locked_at_height is None
+                else _refund_opens_at(policy, terms, obs.asset_locked_at_height),
+                corr=corr,
+            )
         return Decision(
             Intent.PAGE_REFUND,
             reason="covenant params mismatch on the ETH swap — refund the ETH counter-leg HTLC (taker_refund_btc)",
@@ -752,12 +898,24 @@ def _decide_eth(
                 block_interval_s=policy.block_interval_s,
             )
         except ValidationError as exc:
+            if record.role is RecordRole.MAKER:
+                return _maker_covenant_refund(
+                    f"maker-stall predicate un-evaluable, fail-closed to a refund page: {exc}",
+                    deadline=deadline,
+                    corr=corr,
+                )
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=f"maker-stall predicate un-evaluable, fail-closed to refund page: {exc}",
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+            )
+        if refund_due and record.role is RecordRole.MAKER:
+            return _maker_covenant_refund(
+                "you have not claimed the ETH counter leg and t_rxd is near; the taker refunds its ETH",
+                deadline=deadline,
+                corr=corr,
             )
         if refund_due:
             return Decision(
@@ -791,25 +949,55 @@ def _decide_eth(
         # this swap will not go on to BOTH_LOCKED, and the counter-leg contract it had already
         # deployed is refunded at its deadline whether or not the maker locked — the maker can still
         # claim it with p before then, which the claim race above pages.
+        #
+        # #850 PR 1b: the page past the deadline goes out WHETHER OR NOT the covenant is observed. The
+        # maker locks first, so a taker's BTC_LOCKED record normally has it on chain, and the old
+        # "asset lock observed → WATCH" rule left a taker unpaged past the ETH deadline for good
+        # (#850 item 6). Past eth_timeout_unix_s the contract refuses a claim, so the refund is due.
         refused = record.fund_refusal
-        if obs.asset_locked_at_height is not None and refused is None:
+        covenant_seen = obs.asset_locked_at_height is not None
+        deadline_s = terms.eth_timeout_unix_s
+        past_deadline = obs.now_unix_s is not None and deadline_s is not None and obs.now_unix_s >= deadline_s
+        if record.role is RecordRole.MAKER:
+            if past_deadline:
+                return _maker_covenant_refund(
+                    f"the ETH HTLC timeout {deadline_s} has passed (now {obs.now_unix_s}) without your claim, so "
+                    "the taker refunds",
+                    deadline=(
+                        None
+                        if obs.asset_locked_at_height is None
+                        else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
+                    ),
+                    corr=corr,
+                )
             return Decision(
                 Intent.WATCH,
-                reason="asset lock observed on-chain despite a BTC_LOCKED record — the maker locked; not refunding",
+                reason=f"BTC_LOCKED (maker) on an ETH swap; the ETH deadline ({deadline_s}) has not passed",
                 low_corroboration=corr,
             )
-        deadline_s = terms.eth_timeout_unix_s
-        if obs.now_unix_s is not None and deadline_s is not None and obs.now_unix_s >= deadline_s:
+        if past_deadline:
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=(
                     f"the taker refused to complete the fund ({refused}); the ETH HTLC timeout {deadline_s} has "
                     f"passed (now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"
                     if refused is not None
+                    else f"the maker locked the covenant but never claimed; the ETH HTLC timeout {deadline_s} has "
+                    f"passed (now {obs.now_unix_s}), so the contract refuses a claim — refund the ETH counter-leg HTLC"
+                    if covenant_seen
                     else f"maker never locked the asset; the ETH HTLC timeout {deadline_s} has passed "
                     f"(now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"
                 ),
                 recommended_action="taker_refund_btc",
+                low_corroboration=corr,
+            )
+        if covenant_seen and refused is None:
+            return Decision(
+                Intent.WATCH,
+                reason=(
+                    f"BTC_LOCKED on an ETH swap; the maker's covenant is observed; awaiting the maker's claim or the "
+                    f"eth_timeout_unix_s deadline ({deadline_s}) (clock read: {obs.now_unix_s})"
+                ),
                 low_corroboration=corr,
             )
         if refused is not None:

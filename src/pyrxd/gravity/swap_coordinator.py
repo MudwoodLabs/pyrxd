@@ -2915,6 +2915,15 @@ class SwapCoordinator:
         _rerun_outpoint, _rerun_value, rerun_upper = await self.taker_verify_asset_funding(
             terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
         )
+        # The covenant this fund was judged against, PINNED on the record when the lock is recorded
+        # (#850 design §2.9; landed with PR 1b, whose tower pages a taker's record with an observed
+        # covenant instead of watching it for good). Later reads (the claim, the tower's depth) then
+        # follow THIS outpoint rather than re-discovering by script, which a second payment to the
+        # same covenant address would make ambiguous.
+        self._fund_verified_covenant = (
+            _rerun_outpoint,
+            bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms)).hex(),
+        )
         # ...AND JUDGE THE TIMELOCKS ON THE RE-RUN'S OWN BOUND. The re-run reads the chain later than
         # the gate did, so its elapsed-depth upper bound can be larger (more blocks, or a slow read
         # pushing `now` further from the reference time); steps 6 and 7 held on the gate's bound,
@@ -3184,6 +3193,9 @@ class SwapCoordinator:
             )
         # (H was already reserved atomically pre-broadcast above — no post-fund mark.)
         self.record = self.record.with_counter_lock(locator)
+        verified = getattr(self, "_fund_verified_covenant", None)
+        if verified is not None and self.record.radiant_covenant_outpoint is None:
+            self.record = self.record.with_radiant_lock(*verified)
         self._advance(SwapEvent.TAKER_FUNDS_BTC)
         # Shielded: the BTC is locked on-chain now; losing this write would
         # double-fund on retry, so it must complete even under cancellation.

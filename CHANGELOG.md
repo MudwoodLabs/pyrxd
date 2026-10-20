@@ -62,6 +62,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The watchtower reads the record's role, and an observed covenant no longer silences a due refund
+  (#850 PR 1b) [Changed (breaking)].**
+  - A taker's (or single operator's) `BTC_LOCKED` record is paged `taker_refund_btc` once the counter
+    leg's deadline passes (BTC: funding buried `>= t_btc`; ETH: past `eth_timeout_unix_s`), whether or
+    not the maker's covenant is observed. Before, an observed covenant made the tower WATCH for good,
+    and the maker locks first, so a maker who locked and never claimed left the taker unpaged (#850
+    item 6).
+  - The BTC refund is not autonomous while the covenant is known to exist, observed this tick or
+    pinned on the record: the maker can still claim (the claim leaf has no timelock) until the refund
+    confirms. The page says to refund and watch. A pinned covenant whose depth read fails no longer
+    reads as "maker never locked".
+  - A maker's record (`role: maker`) at `BTC_LOCKED`, `BOTH_LOCKED` or `PARAMS_MISMATCH` is paged to
+    refund its covenant at t_rxd (the page's deadline is when that refund opens), instead of the
+    taker's `taker_refund_btc` or `mutual_refund`.
+  - Autonomy (the pre-signed BTC refund and the autonomous covenant claim) is armed only for a record
+    whose `role` is `taker` or `none`. A record written before 0.27 has no role, so the tower pages it
+    but does not act on it until a 0.27 coordinator saves it again.
+  - A taker's fund now pins the covenant outpoint it was verified against on the record
+    (`radiant_covenant_outpoint`), so the claim and the tower's depth read follow that outpoint
+    (#850 design §2.9, deferred from PR 3 to land with these pages). The tower therefore reads the
+    covenant's depth for a taker's `BTC_LOCKED` record every tick: a maker's BTC claim on such a
+    record is now assessed (a claim page) instead of "finality un-assessable", and an RXD source set
+    below quorum pages "reconcile error" for it. A record resumed from a confirmed fund is not pinned.
+  - `scripts/watchtower_dust_run.py` writes its record with `role: taker`.
 - **The BTC two-host runner's taker `--phase refund` and `--phase abort` refuse when the BTC HTLC
   is already spent (#850 PR 1c).** Before anything is sent they read the HTLC's funding outpoint.
   If the maker has claimed it (the spender's witness opens this swap's hashlock), the refusal says
