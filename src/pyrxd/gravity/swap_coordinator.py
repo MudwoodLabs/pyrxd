@@ -2662,6 +2662,35 @@ class SwapCoordinator:
             f"{blocks_s} s at ε = {early.epsilon:.3g}, and the newest header may be up to {slack} s old",
         )
 
+    async def _try_pin_covenant_on_resume(
+        self, terms: NegotiatedTerms, *, now_unix_s: int | None, now_sampled_monotonic: float
+    ) -> None:
+        """Best effort, on the resume path whose fund already landed: re-prove the maker's covenant so
+        the record is pinned like a fresh fund's (#850 PR 1b, security review MEDIUM).
+
+        A fresh process resuming a landed fund has no lock-time re-run to pin from, and an unpinned
+        taker record at BTC_LOCKED arms the tower's autonomous BTC refund (with "maker never locked"
+        text) while the covenant is on chain: the case PR 1b exists to stop. The fund itself was
+        gated before its broadcast, so the covenant was proved once; this re-proves it with the same
+        fail-closed funnel. Reads only. Any failure (the covenant since spent, a read that fails)
+        leaves the record unpinned, which is what it was before, and never stops the lock being
+        recorded: the funds already moved."""
+        try:
+            # The CALLER's clock: on a value-bearing chain the proof refuses without one, so the pin
+            # silently never happened on mainnet (Mythos review of PR 1b, MEDIUM).
+            outpoint, _value, _upper = await self.taker_verify_asset_funding(
+                terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
+            )
+            spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms)).hex()
+        except Exception as exc:  # the lock is recorded regardless; say why it is unpinned
+            logger.warning(
+                "recorded a resumed BTC lock without pinning the maker's covenant (%s); the watchtower will "
+                "treat the covenant as unknown for this record",
+                exc,
+            )
+            return
+        self._fund_verified_covenant = (outpoint, spk)
+
     async def taker_verify_asset_funding(
         self, terms: NegotiatedTerms, *, now_unix_s: int | None = None, now_sampled_monotonic: float | None = None
     ) -> tuple[str, int, int]:
@@ -2879,6 +2908,10 @@ class SwapCoordinator:
                 # The interrupted fund already landed: record the truth. No gate and no reservation
                 # check run — recording an output already on chain sends nothing, and refusing would
                 # only leave the funds untracked (the stranding this path exists to end).
+                if getattr(self, "_fund_verified_covenant", None) is None:
+                    await self._try_pin_covenant_on_resume(
+                        terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
+                    )
                 rec = await self._record_counter_lock(terms, landed)
                 # Best effort: a seen-store that lost H (restored backup, rotated store) would accept a
                 # later swap under it. The lock is already recorded; a failing store must not undo that.
@@ -2914,6 +2947,15 @@ class SwapCoordinator:
         # and nothing is broadcast.
         _rerun_outpoint, _rerun_value, rerun_upper = await self.taker_verify_asset_funding(
             terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
+        )
+        # The covenant this fund was judged against, PINNED on the record when the lock is recorded
+        # (#850 design §2.9; landed with PR 1b, whose tower pages a taker's record with an observed
+        # covenant instead of watching it for good). Later reads (the claim, the tower's depth) then
+        # follow THIS outpoint rather than re-discovering by script, which a second payment to the
+        # same covenant address would make ambiguous.
+        self._fund_verified_covenant = (
+            _rerun_outpoint,
+            bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms)).hex(),
         )
         # ...AND JUDGE THE TIMELOCKS ON THE RE-RUN'S OWN BOUND. The re-run reads the chain later than
         # the gate did, so its elapsed-depth upper bound can be larger (more blocks, or a slow read
@@ -3184,6 +3226,9 @@ class SwapCoordinator:
             )
         # (H was already reserved atomically pre-broadcast above — no post-fund mark.)
         self.record = self.record.with_counter_lock(locator)
+        verified = getattr(self, "_fund_verified_covenant", None)
+        if verified is not None and self.record.radiant_covenant_outpoint is None:
+            self.record = self.record.with_radiant_lock(*verified)
         self._advance(SwapEvent.TAKER_FUNDS_BTC)
         # Shielded: the BTC is locked on-chain now; losing this write would
         # double-fund on retry, so it must complete even under cancellation.

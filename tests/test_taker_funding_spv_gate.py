@@ -1870,9 +1870,11 @@ async def test_a_definitively_refused_native_resume_leaves_a_record_the_watchtow
     assert before.intent.name == "WATCH" and "refused fund" in before.reason
     after = _eth_decide(rec, asset_locked_at_height=900, now_unix_s=deadline)
     assert after.intent.name == "PAGE_REFUND" and after.recommended_action == "taker_refund_btc", after
-    # Control, the other branch: an ordinary BTC_LOCKED record with the asset locked still WATCHes.
+    # The other branch: an ordinary BTC_LOCKED record with the asset locked watches until the deadline
+    # and pages the refund at it (#850 PR 1b; it used to watch for good).
     plain = dataclasses.replace(rec, fund_refusal=None)
-    assert _eth_decide(plain, asset_locked_at_height=900, now_unix_s=deadline).intent.name == "WATCH"
+    assert _eth_decide(plain, asset_locked_at_height=900, now_unix_s=deadline - 1).intent.name == "WATCH"
+    assert _eth_decide(plain, asset_locked_at_height=900, now_unix_s=deadline).intent.name == "PAGE_REFUND"
 
 
 async def test_a_resume_refused_while_the_covenant_cannot_be_read_stays_retryable():
