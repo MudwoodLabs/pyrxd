@@ -4055,6 +4055,70 @@ async def test_mutual_refund_attempts_BOTH_legs_even_when_the_first_fails():
     assert coord.record.state is SwapState.BOTH_LOCKED, "state must not advance on a partial refund"
 
 
+@pytest.mark.parametrize("refusal", ["unaffordable", "above-ceiling", "nothing-to-refund"])
+async def test_mutual_refund_names_a_refusal_a_retry_cannot_pass(refusal):
+    """Security review of #890 (LOW): on the attempt-both path every counter-leg failure was wrapped
+    in "retry re-attempts both", so "add ETH" read as "retry". Still a NetworkError (the other leg's
+    failure may be transient), but the blocking refusal is named and chained as the cause."""
+    terms = _terms()
+    btc, rxd = FakeBtcLeg(), FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    from pyrxd.security.errors import NothingToRefund, RefundFeeUnaffordable, RefundGasAboveCeiling
+
+    error = {
+        "unaffordable": RefundFeeUnaffordable("needs 1 wei more. Add ETH", need_wei=2, have_wei=1),
+        "above-ceiling": RefundGasAboveCeiling("needs 200000 gas", estimate=200_000, ceiling=150_000),
+        "nothing-to-refund": NothingToRefund("holds 0"),
+    }[refusal]
+
+    async def _refuse(*_a, **_k):
+        raise error
+
+    async def _radiant_refund(*_a, **_k):
+        return "rxd-refund-txid"
+
+    coord.counter_leg.refund = _refuse
+    coord.radiant_leg.refund_asset = _radiant_refund
+    with pytest.raises(NetworkError, match="A retry will NOT complete counter leg until you act on") as ei:
+        await coord.mutual_refund()
+    assert ei.value.__cause__ is error and type(error).__name__ in str(ei.value)
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+
+async def test_HONEST_a_transient_failure_is_still_just_retryable():
+    terms = _terms()
+    btc, rxd = FakeBtcLeg(), FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+
+    async def _down(*_a, **_k):
+        raise NetworkError("endpoint down")
+
+    async def _radiant_refund(*_a, **_k):
+        return "rxd-refund-txid"
+
+    coord.counter_leg.refund = _down
+    coord.radiant_leg.refund_asset = _radiant_refund
+    with pytest.raises(NetworkError) as ei:
+        await coord.mutual_refund()
+    assert "will NOT complete" not in str(ei.value) and ei.value.__cause__ is None
+
+
+def test_the_refusals_that_need_operator_action_are_exactly_these():
+    """Reviewed, not derived (nothing in the types marks "refused before signing; needs the
+    operator"). Pinned so adding or removing one forces a reader to look at mutual_refund."""
+    from pyrxd.gravity import swap_coordinator as sc
+
+    assert {t.__name__ for t in sc._NEEDS_OPERATOR_ACTION} == {
+        "NothingToRefund",
+        "RefundFeeUnaffordable",
+        "RefundGasAboveCeiling",
+    }
+
+
 @pytest.mark.asyncio
 async def test_mutual_refund_still_reports_when_the_SECOND_leg_fails():
     """The mirror case, so the change cannot be read as 'swallow errors'. The first leg refunds,
