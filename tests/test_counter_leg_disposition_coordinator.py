@@ -279,3 +279,11 @@ async def test_a_maker_coordinator_may_not_send_the_takers_refund():
 
 def test_the_record_role_constant_is_what_the_coordinator_stamps():
     assert RecordRole.of(SwapRole.TAKER) is RecordRole.TAKER
+
+
+async def test_a_held_observed_refund_sends_nothing_either():
+    """Refunded already (by anyone) and held by a seen claim: there is nothing left to send."""
+    coord, chain, leg = _setup(endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90}, confs=1)
+    chain.refund(85)
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.BTC_LOCKED and leg.refunds == 0
