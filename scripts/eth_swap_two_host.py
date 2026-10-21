@@ -1083,8 +1083,17 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
         resend_once = [bool(getattr(args, "resend_reverted_refund", False))]
 
         async def step():
-            resend, resend_once[0] = resend_once[0], False
-            return await coord.taker_refund_btc(resend_reverted_refund=resend)
+            from pyrxd.security.errors import NetworkError
+
+            try:
+                rec = await coord.taker_refund_btc(resend_reverted_refund=resend_once[0])
+            except NetworkError:
+                raise  # a failed read decided nothing: the flag stays for the next pass
+            except Exception:
+                resend_once[0] = False
+                raise
+            resend_once[0] = False
+            return rec
 
         rec = await _poll_taker_refund_to_terminal(args, coord, loc, step)
         if rec.state is SwapState.SECRET_REVEALED:
@@ -1172,8 +1181,8 @@ async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step)
                     if sent
                     else "the ETH HTLC is settled at the chain tip but not yet final, and nothing was sent. "
                 )
-                + "Run --phase abort again to keep following it (it never sends a second refund while one is "
-                "recorded and pending)."
+                + "Run --phase abort again to keep following it (it reads the recorded refund before it sends "
+                "anything)."
             )
         await asyncio.sleep(float(args.poll_interval_s))
 

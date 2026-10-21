@@ -4630,7 +4630,7 @@ class SwapCoordinator:
         first, and the record moves only on that. Our own refund is RECORDED (hash and nonce, before
         the broadcast) and the record stays where it is until the chain shows the contract refunded
         at the finalized block; call this again (the runner polls) to follow it. A recorded refund
-        is never sent twice: a retry reads what happened to it and re-sends only when it was dropped,
+        is not re-sent blindly: a retry reads what happened to it and re-sends only when it was dropped,
         its nonce went to another transaction, or it ran out of gas with less than the current
         estimate. A pending one is replaced at the same nonce after :data:`REFUND_REPLACE_AFTER_S`.
         A mined refund that reverted is not re-sent: :class:`CounterLegPayoutReverts` when the
@@ -4653,6 +4653,13 @@ class SwapCoordinator:
             outcome = await self._apply_counter_disposition(disposition)
             if outcome in ("claimed", "refunded", "held"):
                 return self.record  # observed: nothing to send (claimed: SECRET_REVEALED; refunded: done)
+            if outcome == "single_source":
+                # Settled at F, read from ONE endpoint on a chain that carries value (D4). A refund would
+                # revert, and with ours recorded the follow path would wait for ever (review of 5b).
+                raise NetworkError(
+                    f"the counter leg reads {disposition.kind.value} from ONE endpoint, on a chain that carries "
+                    "value; nothing changes and nothing is sent until a multi-source rpc agrees (design §2.5)"
+                )
             if disposition.kind is DispositionKind.SETTLED_UNFINAL:
                 return self.record  # settled at the tip, not yet final: wait, send nothing
             # 5b: never advance on our own broadcast. The record moves when the chain shows it.
@@ -4680,12 +4687,28 @@ class SwapCoordinator:
             if kind == "pending":
                 since = self._refund_pending_since.setdefault(recorded, _monotonic())
                 waited = _monotonic() - since
-                if waited < REFUND_REPLACE_AFTER_S or progress.fee_fields is None:
+                if waited < REFUND_REPLACE_AFTER_S:
                     logger.info("our counter-leg refund %s is pending (%.0fs seen); waiting", recorded, waited)
                     return self.record
                 from pyrxd.eth_wallet.htlc_leg import RefundReplacement
 
-                replace = RefundReplacement(nonce=nonce, previous_fees=dict(progress.fee_fields))
+                if progress.fee_fields is None:
+                    # The transaction holding the nonce cannot be read back by the recorded hash: an
+                    # earlier refund of ours that a replacement never displaced, say (review of 5b).
+                    # Waiting would wait for ever, and its fees are unknown, so the operator decides.
+                    if not resend_reverted_refund:
+                        raise CounterLegRefundNeedsOperator(
+                            f"our counter-leg refund {recorded} is recorded at nonce {nonce}, and a transaction is "
+                            f"still pending at that nonce after {waited:.0f}s, but the endpoint does not return it "
+                            "by that hash (an earlier refund of ours may hold the nonce, or the recorded one never "
+                            "reached the node), so its fees are unknown and it cannot be priced to replace. "
+                            "Nothing was sent. taker_refund_btc(resend_reverted_refund=True) replaces it at that "
+                            "nonce priced 13% above the current quote; a node refuses that if the pending one pays more.",
+                            tx_hash=recorded,
+                        )
+                    replace = RefundReplacement(nonce=nonce, previous_fees=None)
+                else:
+                    replace = RefundReplacement(nonce=nonce, previous_fees=dict(progress.fee_fields))
                 logger.warning("our counter-leg refund %s is still pending; replacing it at nonce %d", recorded, nonce)
             elif kind == "out_of_gas":
                 estimate = int(await self.counter_leg.refund_estimate(locator))
@@ -4735,9 +4758,19 @@ class SwapCoordinator:
             await self._persist_record(pending, shield=True)
             self.record = pending
 
-        sent = await self.counter_leg.refund(
-            locator, self.record.terms.t_btc, on_signed=_record_before_broadcast, replace=replace
-        )
+        before = self.record
+        try:
+            sent = await self.counter_leg.refund(
+                locator, self.record.terms.t_btc, on_signed=_record_before_broadcast, replace=replace
+            )
+        except Exception:
+            if replace is not None and self.record.counter_refund_tx_hash != before.counter_refund_tx_hash:
+                # A replacement whose broadcast failed: the transaction holding the nonce is most likely
+                # still the one recorded before, so put that back; recording a hash the node never took
+                # left every later pass unable to read the pending one's fees (review of 5b, MEDIUM).
+                await self._persist_record(before, shield=True)
+                self.record = before
+            raise
         logger.info(
             "counter-leg refund %s sent; the record stays %s until the chain shows it refunded at the "
             "finalized block. Call taker_refund_btc again to follow it.",

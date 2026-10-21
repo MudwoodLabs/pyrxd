@@ -89,18 +89,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   goes to `ABORTED` on broadcast (#850 PR 9a).
   - Our refund's hash and nonce are written to the record between signing and broadcasting, as
     `counter_refund_tx_hash` and `counter_refund_nonce`. If that write fails, nothing is sent.
-  - A retry never sends a second refund while one is recorded. It reads what happened to the
-    recorded one first. A refund that was dropped, or whose nonce another transaction used, is sent
-    again. A refund still pending after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not measured) is
+  - A retry reads what happened to the recorded refund before it sends anything. A refund that
+    was dropped, or whose nonce another transaction used, is sent again. A refund still pending after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not measured) is
     replaced at the same nonce, with both fee fields raised from the pending transaction's own. A
     refund that ran out of gas is sent once more, and only when the current estimate is above the
-    limit it was signed with.
+    limit it was signed with. A refund still pending whose transaction the endpoint cannot return by
+    the recorded hash cannot be priced for a replacement: that raises `CounterLegRefundNeedsOperator`,
+    and with the flag below it is replaced at 13% over the current quote. A replacement whose
+    broadcast fails puts the previously recorded refund back on the record.
   - A mined refund that reverted is not sent again. The new `CounterLegPayoutReverts` is raised
     when a refund now would revert `TransferFailed` or `SendFailed`, meaning the payout itself
     fails. The new `CounterLegRefundNeedsOperator` is raised for any other revert, and for an
     out-of-gas refund the estimate does not exceed. After checking,
     `taker_refund_btc(resend_reverted_refund=True)` sends one more refund. That flag does not
     override `CounterLegPayoutReverts`. Both errors are `ValidationError`s.
+  - A terminal answer read from one endpoint on a chain that carries value now raises
+    `NetworkError` from `taker_refund_btc`, as `reconcile_counter_leg` does, and sends nothing.
   - The expiry anchor. The first quorum read that finds the contract unsettled at a finalized
     block that is at or past the timeout records that block as `counter_expiry_anchor`. After that
     block no claim can succeed, so once the contract is settled at a later finalized block, the

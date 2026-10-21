@@ -94,7 +94,8 @@ async def test_a_pending_refund_is_not_sent_again_and_is_replaced_only_after_the
     assert rec.counter_refund_tx_hash == replaced_tx != first and rec.counter_refund_nonce == nonce
 
 
-async def test_a_pending_refund_whose_fees_cannot_be_read_is_never_replaced(monkeypatch):
+async def test_a_pending_refund_whose_fees_cannot_be_read_asks_the_operator_after_the_wait(monkeypatch):
+    """Review of 5b (MEDIUM): waiting for fees that can never be read waited for ever, silently."""
     from pyrxd.eth_wallet.htlc_leg import RefundProgress
 
     clock = [0.0]
@@ -106,10 +107,39 @@ async def test_a_pending_refund_whose_fees_cannot_be_read_is_never_replaced(monk
         return RefundProgress("pending", fee_fields=None)
 
     leg.refund_progress = unreadable
-    await coord.taker_refund_btc()
-    clock[0] += 10 * REFUND_REPLACE_AFTER_S
-    await coord.taker_refund_btc()
+    await coord.taker_refund_btc()  # starts the clock: waits
+    clock[0] += REFUND_REPLACE_AFTER_S
+    with pytest.raises(CounterLegRefundNeedsOperator, match="cannot be priced"):
+        await coord.taker_refund_btc()
     assert leg.refunds == 1
+    await coord.taker_refund_btc(resend_reverted_refund=True)
+    _tx, replaced_nonce, replace = leg.signed[1]
+    assert replace.previous_fees is None and replace.nonce == replaced_nonce == leg.signed[0][1]
+
+
+async def test_a_replacement_whose_broadcast_fails_puts_the_previous_refund_back(monkeypatch):
+    """Review of 5b (MEDIUM): the replacement's hash was recorded before a broadcast that failed, so
+    every later pass read a hash the node never took and could not price the pending one."""
+    from pyrxd.security.errors import NetworkError
+
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord, _chain, leg = _setup(chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+    first = coord.record.counter_refund_tx_hash
+    await coord.taker_refund_btc()
+    clock[0] += REFUND_REPLACE_AFTER_S
+    real = leg.refund
+
+    async def rejected(*a, **k):
+        await real(*a, **k)  # signs and records through on_signed...
+        raise NetworkError("replacement transaction underpriced")  # ...then the node refuses it
+
+    leg.refund = rejected
+    with pytest.raises(NetworkError, match="underpriced"):
+        await coord.taker_refund_btc()
+    assert coord.record.counter_refund_tx_hash == first
+    assert coord.persisted[-1].counter_refund_tx_hash == first  # durable, not only in memory
 
 
 async def test_a_mined_refund_is_followed_not_resent():

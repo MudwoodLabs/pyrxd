@@ -444,15 +444,17 @@ async def test_a_recorded_seen_claim_is_not_overwritten_by_a_later_seen_one():
     assert rec.counter_claim_tx == "0x" + "aa" * 32
 
 
-async def test_one_endpoint_on_a_value_bearing_chain_falls_through_to_the_send_in_the_refund(monkeypatch):
-    """D4 in taker_refund_btc: a single-source terminal answer changes no state; the refund path
-    then behaves as on an unknown answer (the leg's own checks decide; a settled contract reverts)."""
+async def test_one_endpoint_on_a_value_bearing_chain_raises_in_the_refund_and_sends_nothing(monkeypatch):
+    """D4 in taker_refund_btc: a single-source terminal answer changes no state and sends nothing. 5a
+    fell through to a send (which reverts on a settled contract); with 5b's follow path a recorded
+    refund then waited for a quorum one endpoint can never give, silently (review of 5b, MEDIUM)."""
     coord, chain, leg = _setup(chain_kw={"finalized": 90})
     chain.refund(85)
     leg._rpc = FakeEvmEndpoint(chain)
     monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
-    await coord.taker_refund_btc()
-    assert leg.refunds == 1 and coord.record.counter_disposition is None
+    with pytest.raises(NetworkError, match="ONE endpoint"):
+        await coord.taker_refund_btc()
+    assert leg.refunds == 0 and coord.record.counter_disposition is None
 
 
 async def test_a_makers_mutual_refund_refuses_to_refund_the_covenant_after_a_verified_claim():

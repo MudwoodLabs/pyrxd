@@ -261,7 +261,7 @@ does not refuse, because a claim that landed would have settled it.
 `aborted` when the refund is broadcast. It goes there when the chain shows the HTLC refunded at
 the finalized block, so the phase keeps polling until then, for up to `--abort-poll-timeout-s`
 (7200 s by default). The refund's hash is saved in the record before it is sent, and polling
-never sends a second refund while one is pending. It re-sends only when the first was dropped or
+reads that refund before it sends anything. It re-sends only when the first was dropped or
 its nonce was used by another transaction. It replaces a refund still pending after 600 s at the
 same nonce, and re-sends once after an out-of-gas refund. If the run times out, run `--phase
 abort` again; it follows the saved refund and skips the up-front settled check, which our own

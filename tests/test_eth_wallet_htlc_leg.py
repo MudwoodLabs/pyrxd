@@ -1156,3 +1156,10 @@ async def test_refund_revert_reason_names_the_contract_error_by_selector(frozen_
     rpc.estimate_gas = opaque
     assert (await _leg(rpc).refund_revert_reason(_locator(timeout=_NOW))).startswith("unrecognised")
     assert await _leg(_Rpc(head_ts=_NOW)).refund_revert_reason(_locator(timeout=_NOW)) is None
+
+
+async def test_a_replacement_with_unknown_previous_fees_is_priced_over_the_current_quote(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW, max_fee=1_000, tip=10)
+    await _leg(rpc).refund(_locator(timeout=_NOW), replace=hl.RefundReplacement(nonce=3, previous_fees=None))
+    tx = _sent_tx(rpc)
+    assert tx["nonce"] == 3 and (tx["maxFeePerGas"], tx["maxPriorityFeePerGas"]) == (1_130, 12)

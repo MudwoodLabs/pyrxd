@@ -995,7 +995,7 @@ def _decide_eth(
                 )
                 + (
                     f". Our refund {record.counter_refund_tx_hash} is recorded and not yet final: run "
-                    "taker_refund_btc again to follow it (it is not sent twice)"
+                    "taker_refund_btc again to follow it (a retry reads it before sending anything)"
                     if record.counter_refund_tx_hash is not None
                     else ""
                 ),

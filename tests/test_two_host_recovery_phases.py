@@ -2914,3 +2914,31 @@ class TestTakerEthAbortRetriesAFailedReadWhileFollowing:
         leg.refund = refund_then_flake
         await eth_mod.taker_phase_abort(args)
         assert _read_back(args).state is SwapState.ABORTED and len(leg.refund_calls) == 1
+
+
+class _FlakyRevertedLeg(_RevertedRefundLeg):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_reads = 0
+
+    async def counter_disposition(self, locator, **kw):
+        if self.fail_reads:
+            self.fail_reads -= 1
+            raise NetworkError("endpoint down")
+        return await super().counter_disposition(locator, **kw)
+
+
+async def test_the_resend_flag_survives_a_pass_whose_read_failed(eth_mod, tmp_path, monkeypatch):
+    """Review of 5b (LOW): the one-shot flag was spent by a pass that decided nothing."""
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    leg = _FlakyRevertedLeg()
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="--resend-reverted-refund"):
+        await eth_mod.taker_phase_abort(args)
+    args.resend_reverted_refund = True
+    leg.fail_reads = 1  # the first pass of the operator's retry reads nothing
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="--resend-reverted-refund"):
+        await eth_mod.taker_phase_abort(args)
+    assert len(leg.refund_calls) == 2  # the flag still sent its one refund

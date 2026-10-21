@@ -398,7 +398,9 @@ class RefundReplacement:
     (:func:`pyrxd.eth_wallet.replacement.bump_replacement_fees`)."""
 
     nonce: int
-    previous_fees: dict[str, int]
+    #: ``None`` when the pending transaction cannot be read back: priced from the current quote, raised
+    #: the same 13%. A node refuses that replacement if the pending one pays more.
+    previous_fees: dict[str, int] | None
 
 
 @dataclass(frozen=True)
@@ -1221,7 +1223,10 @@ class EthHtlcContractLeg:
             nonce = replace.nonce
             if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
                 raise ValidationError("replace.nonce must be a non-negative int")
-            bumped = bump_replacement_fees(dict(replace.previous_fees))
+            basis = replace.previous_fees
+            if basis is None:
+                basis = {k: int(built[k]) for k in ("maxFeePerGas", "maxPriorityFeePerGas")}
+            bumped = bump_replacement_fees(dict(basis))
             built["nonce"] = nonce
             for fee in ("maxFeePerGas", "maxPriorityFeePerGas"):
                 built[fee] = max(int(bumped[fee]), int(built[fee]))
