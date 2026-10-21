@@ -226,6 +226,8 @@ _UNDERIVED_SITES = frozenset(
         "pyrxd.glyph.wave_identity:judge_name_at_mark",
         "pyrxd.glyph.mutable_chain:walk_mutable_chain",
         "scripts.swap_run_verify:_MultiEthFetcher.__init__",
+        # The #850 disposition reader counts ANSWERS itself over the panel this builds.
+        "pyrxd.eth_wallet.disposition:_panel_of",
     }
 )
 
@@ -584,6 +586,24 @@ def _plant_eth_quorum(a: str, b: str, _mp) -> int:
     return _refused_as_one_host(build)
 
 
+def _plant_disposition_panel(a: str, b: str, _mp) -> int:
+    """The disposition reader's panel, built from a duck-typed multi-source rpc (the real
+    ``MultiSourceEthRpc`` refuses one host first, so it cannot reach this check)."""
+    pytest.importorskip("web3")
+    from types import SimpleNamespace
+
+    from pyrxd.eth_wallet import disposition
+    from pyrxd.eth_wallet.rpc import EthRpc
+
+    def build() -> int:
+        rpc = SimpleNamespace(
+            sources=[EthRpc(_https(a), expected_chain_id=1), EthRpc(_https(b), expected_chain_id=1)], min_agreeing=2
+        )
+        return len(disposition._panel_of(rpc).sources)
+
+    return _refused_as_one_host(build)
+
+
 def _plant_build_funding_reader(a: str, b: str, _mp) -> int:
     from pyrxd.gravity.watch import run
 
@@ -785,6 +805,7 @@ PLANTERS: dict[str, Callable] = {
     "pyrxd.glyph.mutable_chain:walk_mutable_chain": _plant_walker,
     "scripts.eth_swap_run:_eth_rpc": _plant_eth_swap_run_rpc,
     "scripts.swap_run_verify:_MultiEthFetcher.__init__": _plant_verify_eth_fetcher,
+    "pyrxd.eth_wallet.disposition:_panel_of": _plant_disposition_panel,
 }
 
 

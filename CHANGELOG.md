@@ -8,6 +8,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd.eth_wallet.disposition.read_counter_disposition`: what the chain says about an ETH
+  counter-leg HTLC, read from the chain rather than from what we broadcast (#850 PR 4).** It
+  reports `OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `SETTLED_UNFINAL`, `REFUNDED`, `CLAIMED` or
+  `UNKNOWN` with a reason, plus every `Claimed` log that opens the hashlock as liveness. Nothing
+  calls it yet; the coordinator starts using it in a later PR.
+  - Terminal answers rest on the contract's `settled` slot and the block timestamp read at the
+    quorum-MIN finalized block, whose hash every endpoint must agree on, and on a refund or claim
+    receipt that every endpoint agrees on, at or below that block, in a canonical block, carrying
+    the event from this contract. A settlement at a finalized block before the timeout is a claim
+    whether or not any endpoint returns its log.
+  - Contradictions are `UNKNOWN`: a verified refund and a verified claim together, a verified
+    refund beside a settlement before the timeout, or a verified receipt beside an unsettled
+    contract. So is any failed, below-quorum or disagreeing read the answer depends on, and a log
+    scan that no endpoint answered.
+  - New reads: `get_logs_union` on `EthRpc` and `MultiSourceEthRpc` asks every endpoint, chunks
+    the range and halves it on a range-limit refusal, and records a 429 or timeout as a failure,
+    never as "no logs". `get_logs` is unchanged. `EthRpc` also gains `block_hash_and_timestamp`
+    and `get_storage_at`.
+  - With one endpoint, every answer is marked `single_source`.
+
 - **`pyrxd headers sync` and `pyrxd headers status`: a local cache of verified block headers, so
   `pyrxd verify` keeps verifying new marks between releases (#826, phase 1).** `pyrxd verify`
   links a mark's block at most 4,032 headers past its anchor, and until now that anchor was the
