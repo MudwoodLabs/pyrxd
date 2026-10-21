@@ -287,3 +287,60 @@ async def test_a_held_observed_refund_sends_nothing_either():
     chain.refund(85)
     rec = await coord.taker_refund_btc()
     assert rec.state is SwapState.BTC_LOCKED and leg.refunds == 0
+
+
+# --------------------------------------------------------------------------- mutual_refund retries complete
+
+
+def _count_asset_refunds(coord):
+    calls = []
+
+    async def refund_asset(_record):
+        calls.append(1)
+        return "ab" * 32
+
+    coord.radiant_leg.refund_asset = refund_asset
+    return calls
+
+
+async def test_a_retry_after_the_counter_leg_refunded_completes_without_resending_it():
+    """Folded into 5a: a retry after one leg had refunded never completed (the re-send of that leg
+    failed, and any failure kept the record at BOTH_LOCKED). The counter leg is read from the chain."""
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)  # the first attempt's counter refund, now final
+    asset = _count_asset_refunds(coord)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and leg.refunds == 0 and asset == [1]
+
+
+async def test_a_retry_after_the_covenant_refunded_completes_without_resending_it():
+    coord, _chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    asset = _count_asset_refunds(coord)
+
+    async def counter_down(*_a, **_k):
+        raise NetworkError("endpoint down")
+
+    real_refund = leg.refund
+    leg.refund = counter_down
+    with pytest.raises(NetworkError, match="mutual refund incomplete"):
+        await coord.mutual_refund()
+    assert coord.record.asset_refund_txid == "ab" * 32 and asset == [1]
+    assert coord.persisted[-1].asset_refund_txid == "ab" * 32  # durable before the retry
+    leg.refund = real_refund
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and asset == [1] and leg.refunds == 1
+
+
+async def test_a_verified_claim_stops_mutual_refund_before_the_covenant_is_refunded():
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.claim(70)
+    asset = _count_asset_refunds(coord)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.SECRET_REVEALED and leg.refunds == 0 and asset == []
+
+
+async def test_HONEST_a_first_mutual_refund_sends_both_as_before():
+    coord, _chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    asset = _count_asset_refunds(coord)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and leg.refunds == 1 and asset == [1]

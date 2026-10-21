@@ -44,7 +44,8 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # carrying any post-v2 field writes the current maximum, a BTC record included; a record with none
 # of them serialises exactly as before (v2 for ETH, no key for BTC). ``from_dict`` refuses a version
 # above its own (:class:`RecordFromNewerPyrxd`). Each PR that adds a persisted field bumps this.
-# v4 (#850 PR 5a) adds ``counter_claim_tx``, ``counter_disposition`` and ``abort_reason``.
+# v4 (#850 PR 5a) adds ``counter_claim_tx``, ``counter_disposition``, ``abort_reason`` and
+# ``asset_refund_txid``.
 SWAP_RECORD_SCHEMA_VERSION = 4
 _PRE_ROLE_ETH_SCHEMA_VERSION = 2
 
@@ -764,6 +765,10 @@ class SwapRecord:
     counter_disposition: CounterDispositionRecord | None = None
     #: Why the record went to ABORTED when no broadcast of ours took it there (:class:`AbortReason`).
     abort_reason: AbortReason | None = None
+    #: The covenant's CSV refund this process broadcast in ``mutual_refund`` (Radiant txid hex),
+    #: written the moment the broadcast returns. A retry does not send it again: the covenant is
+    #: spent, so re-sending fails, and the retry never completed (#850 PR 5a).
+    asset_refund_txid: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -866,6 +871,10 @@ class SwapRecord:
                 raise ValidationError("counter_disposition is an ETH counter-leg field")
         if self.abort_reason is not None and not isinstance(self.abort_reason, AbortReason):
             raise ValidationError("abort_reason must be an AbortReason or None")
+        if self.asset_refund_txid is not None:
+            txid = self.asset_refund_txid
+            if not isinstance(txid, str) or len(txid) != 64 or any(c not in "0123456789abcdef" for c in txid):
+                raise ValidationError("asset_refund_txid must be 64 lower-case hex characters")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -955,6 +964,7 @@ class SwapRecord:
             or self.counter_claim_tx is not None
             or self.counter_disposition is not None
             or self.abort_reason is not None
+            or self.asset_refund_txid is not None
             or (
                 not self.pending_counter_contract
                 and (self.pending_push_nonce is not None or self.pending_push_tx_hash is not None)
@@ -997,6 +1007,8 @@ class SwapRecord:
             d["counter_disposition"] = self.counter_disposition.to_dict()
         if self.abort_reason is not None:
             d["abort_reason"] = self.abort_reason.value
+        if self.asset_refund_txid is not None:
+            d["asset_refund_txid"] = self.asset_refund_txid
         return d
 
     @classmethod
@@ -1051,6 +1063,7 @@ class SwapRecord:
                 else None
             ),
             abort_reason=_abort_reason(d.get("abort_reason")),
+            asset_refund_txid=d.get("asset_refund_txid"),
         )
 
 

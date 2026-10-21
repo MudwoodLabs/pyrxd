@@ -147,6 +147,7 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
     "abort_reason": [
         (f"abort-reason-{r.value}", _with(_btc_base, state=SwapState.ABORTED, abort_reason=r), ()) for r in AbortReason
     ],
+    "asset_refund_txid": [("asset-refund-txid", _with(_eth_base, asset_refund_txid="ab" * 32), ())],
     "pending_btc_funding_tx": [
         ("pending-btc-fund", lambda: dataclasses.replace(_btc_base(), pending_btc_funding_tx=_raw_btc_tx()), ())
     ],

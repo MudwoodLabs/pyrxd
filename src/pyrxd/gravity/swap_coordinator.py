@@ -4726,15 +4726,42 @@ class SwapCoordinator:
         # preflight reverts against the settled contract and raises BEFORE the Radiant refund ever
         # runs. The leg that still holds value could then never be refunded in-band, which is the
         # opposite of what "the guaranteed-safe failure" promises.
+        #
+        # A RETRY must not re-send a leg that already refunded (#850 PR 5a): the re-send fails, and
+        # before this any failure kept the record at BOTH_LOCKED, so a retry after one leg had
+        # refunded could never complete. The ETH counter leg is read from the chain; the covenant
+        # refund is recorded on the record when its broadcast returns.
+        counter_done = False
+        disposition = await self._read_counter_disposition()
+        if disposition is not None:
+            from pyrxd.eth_wallet.disposition import DispositionKind
+
+            outcome = await self._apply_counter_disposition(disposition)
+            if outcome == "claimed":
+                # Verified claim: p is public and the record is SECRET_REVEALED. The covenant is
+                # claimable with p, so it is not refunded here.
+                return self.record
+            counter_done = disposition.kind is DispositionKind.REFUNDED and outcome == "recorded"
         failures: list[tuple[str, Exception]] = []
-        try:
-            await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-        except Exception as exc:
-            failures.append(("counter leg", exc))
-        try:
-            await self.radiant_leg.refund_asset(self.record)
-        except Exception as exc:
-            failures.append(("radiant leg", exc))
+        if not counter_done:
+            try:
+                await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
+            except Exception as exc:
+                failures.append(("counter leg", exc))
+        if self.record.asset_refund_txid is None:
+            try:
+                txid = await self.radiant_leg.refund_asset(self.record)
+            except Exception as exc:
+                failures.append(("radiant leg", exc))
+            else:
+                try:
+                    recorded = dataclasses.replace(self.record, asset_refund_txid=str(txid).lower())
+                except ValidationError:
+                    # The broadcast happened; a leg that returns no txid only costs the retry skip.
+                    logger.warning("the covenant refund returned %r, not a txid; not recorded", txid)
+                else:
+                    self.record = recorded
+                    await self._persist_record(self.record, shield=True)
         if failures:
             # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts both. A
             # leg that already refunded fails harmlessly the second time; a leg that did not gets
