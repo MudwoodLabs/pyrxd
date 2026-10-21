@@ -423,6 +423,9 @@ class RefundProgress:
     kind: str
     gas_limit: int | None = None
     fee_fields: dict[str, int] | None = None
+    #: Which of our hashes this is about: the one that MINED (``mined``, ``out_of_gas``,
+    #: ``reverted``) or the one the node HOLDS (``pending`` with fees). ``None`` otherwise.
+    tx_hash: str | None = None
 
 
 #: How long the claim-confirmation read will wait for the OTHER endpoints to catch up with the
@@ -1285,22 +1288,33 @@ class EthHtlcContractLeg:
             pending = int(await self._rpc.get_transaction_count(addr, "pending"))
             if pending <= nonce:
                 return RefundProgress("dropped")
+            find = getattr(self._rpc, "find_transaction", None)
             for h in hashes:
-                try:
-                    tx = await self._rpc.get_transaction(h)
+                if find is not None:
+                    # "Not held" is an ANSWER (None); a failed read raises and decides nothing. Read as
+                    # one, a 429 made our own pending refund look like a transaction we did not sign
+                    # (review round 3 of #850 PR 5b).
+                    tx = await find(h)
+                else:  # a duck-typed rpc without it: any failure reads as "not held"
+                    try:
+                        tx = await self._rpc.get_transaction(h)
+                    except Exception as exc:
+                        _LOG.info("refund %s could not be read back by hash: %s", h, exc)
+                        tx = None
+                if tx is not None:
                     return RefundProgress(
-                        "pending", fee_fields={k: int(tx[k]) for k in ("maxFeePerGas", "maxPriorityFeePerGas")}
+                        "pending",
+                        fee_fields={k: int(tx[k]) for k in ("maxFeePerGas", "maxPriorityFeePerGas")},
+                        tx_hash=h,
                     )
-                except Exception as exc:  # replaced, never delivered, or not held by this endpoint
-                    _LOG.info("refund %s could not be read back by hash: %s", h, exc)
             return RefundProgress("pending", fee_fields=None)
         status = _int_or_none(receipt.get("status"))
         if status == 1:
-            return RefundProgress("mined")
+            return RefundProgress("mined", tx_hash=mined_hash)
         gas_limit = int((await self._rpc.get_transaction(mined_hash))["gas"])
         if refund_ran_out_of_gas(receipt, gas_limit=gas_limit):
-            return RefundProgress("out_of_gas", gas_limit=gas_limit)
-        return RefundProgress("reverted", gas_limit=gas_limit)
+            return RefundProgress("out_of_gas", gas_limit=gas_limit, tx_hash=mined_hash)
+        return RefundProgress("reverted", gas_limit=gas_limit, tx_hash=mined_hash)
 
     async def refund_estimate(self, locator: EthHtlcLocator) -> int:
         """``eth_estimateGas`` for a refund of *locator* now. A typed revert raises

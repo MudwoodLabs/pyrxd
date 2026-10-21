@@ -348,3 +348,42 @@ def chain_block_hash(chain, number):
     from tests._fake_evm_chain import _block_hash
 
     return _block_hash(number).hex()
+
+
+async def test_the_earlier_hashes_keep_the_oldest_when_they_are_trimmed(monkeypatch):
+    """Review round 3 of 5b: trimming to the newest 16 dropped the original refund, the one the node
+    still held when no replacement reached it, and it then read as "none of ours"."""
+    from pyrxd.gravity.swap_state import MAX_REPLACED_REFUNDS
+    from pyrxd.security.errors import NetworkError
+
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord, _chain, leg = _setup(chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+    first = leg.signed[0][0]
+    leg.fail_broadcast = True
+    for _ in range(MAX_REPLACED_REFUNDS + 2):
+        await coord.taker_refund_btc()  # starts this hash's clock
+        clock[0] += REFUND_REPLACE_AFTER_S
+        with pytest.raises(NetworkError):
+            await coord.taker_refund_btc()  # a replacement priced over `first`, never delivered
+    replaced = coord.record.counter_refund_replaced_tx_hashes
+    assert len(replaced) == MAX_REPLACED_REFUNDS and replaced[-1] == first
+    assert all(r[2].previous_fees == leg.fees[first] for r in leg.signed[1:])  # always over the held one
+
+
+async def test_an_error_about_an_earlier_refund_names_that_refund():
+    from pyrxd.eth_wallet.htlc_leg import RefundProgress
+
+    coord, _chain, leg = _setup(chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+    earlier = "0x" + "e0" * 32
+
+    async def earlier_reverted(_h, _n, **_k):
+        return RefundProgress("reverted", gas_limit=150_000, tx_hash=earlier)
+
+    leg.refund_progress = earlier_reverted
+    leg.revert_reason = "unrecognised: 0xdeadbeef"
+    with pytest.raises(CounterLegRefundNeedsOperator) as info:
+        await coord.taker_refund_btc()
+    assert info.value.tx_hash == earlier and earlier in str(info.value)

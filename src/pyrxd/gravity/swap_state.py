@@ -50,8 +50,8 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # ``counter_refund_replaced_tx_hashes`` and ``counter_expiry_anchor``.
 SWAP_RECORD_SCHEMA_VERSION = 5
 #: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
-#: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours; the oldest are the
-#: lowest-priced, so dropping them loses only a fee basis a newer one already beats.
+#: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours. The coordinator keeps
+#: the oldest and the newest: when replacements never reach the node, the oldest is the one it holds.
 MAX_REPLACED_REFUNDS = 16
 _PRE_ROLE_ETH_SCHEMA_VERSION = 2
 

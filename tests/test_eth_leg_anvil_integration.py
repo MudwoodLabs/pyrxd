@@ -1319,6 +1319,9 @@ async def test_a_real_pending_refund_reads_pending_then_dropped_then_replaced_an
         )
         assert second != first and signed[1] == (second, nonce)
         assert (await taker.refund_progress(second, nonce)).kind == "pending"
+        # #850 PR 5b review round 3: a node that does not hold a hash ANSWERS that (None); it is not a
+        # failed read. The first refund was displaced by the replacement.
+        assert await rpc.find_transaction(first) is None
         await rpc.w3.provider.make_request("anvil_dropTransaction", [second])
         assert (await taker.refund_progress(second, nonce)).kind == "dropped"
         third = await taker.refund(locator, on_signed=on_signed)

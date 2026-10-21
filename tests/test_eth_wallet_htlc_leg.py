@@ -1181,3 +1181,28 @@ async def test_refund_progress_reads_the_earlier_refunds_at_the_same_nonce():
     mined.get_transaction_receipt = receipt
     assert (await _leg(mined).refund_progress(_OURS, 7, earlier=("0x" + "e0" * 32,))).kind == "mined"
     assert (await _leg(mined).refund_progress(_OURS, 7)).kind == "nonce_taken"
+
+
+async def test_a_failed_read_of_our_pending_refund_raises_and_is_not_read_as_not_ours():
+    """Review round 3 of 5b: a 429 on eth_getTransactionByHash read as "not held", which made our own
+    pending refund look like a transaction we did not sign. Only a not-found answer means not held."""
+    rpc = _progress_rpc(latest=7, pending=8)
+
+    async def find_transaction(_h):
+        raise NetworkError("eth_getTransactionByHash failed: 429 Too Many Requests")
+
+    rpc.find_transaction = find_transaction
+    with pytest.raises(NetworkError, match="429"):
+        await _leg(rpc).refund_progress(_OURS, 7)
+
+
+async def test_HONEST_a_not_found_answer_reads_as_not_held_and_the_held_one_is_named():
+    rpc = _progress_rpc(latest=7, pending=8)
+    earlier = "0x" + "e0" * 32
+
+    async def find_transaction(h):
+        return None if h == _OURS else {"maxFeePerGas": 50, "maxPriorityFeePerGas": 3}
+
+    rpc.find_transaction = find_transaction
+    progress = await _leg(rpc).refund_progress(_OURS, 7, earlier=(earlier,))
+    assert progress.kind == "pending" and progress.tx_hash == earlier

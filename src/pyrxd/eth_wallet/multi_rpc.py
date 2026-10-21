@@ -475,6 +475,11 @@ class MultiSourceEthRpc:
     async def get_transaction(self, tx_hash: str) -> dict:
         return await self.primary.get_transaction(tx_hash)
 
+    async def find_transaction(self, tx_hash: str) -> dict | None:
+        """PRIMARY only, like :meth:`get_transaction`: the broadcasting endpoint's mempool is the one
+        asked whether it holds a refund we sent it."""
+        return await self.primary.find_transaction(tx_hash)
+
     async def get_logs(self, *args: Any, **kwargs: Any) -> Any:
         """PRIMARY only, deliberately. This scrapes the preimage out of a claim, and the result is
         checked against the hashlock — so a lying endpoint cannot forge one, and a missing log is a

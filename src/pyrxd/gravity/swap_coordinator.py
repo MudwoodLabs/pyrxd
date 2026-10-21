@@ -4690,9 +4690,11 @@ class SwapCoordinator:
                 if earlier
                 else await self.counter_leg.refund_progress(recorded, nonce)
             )
+            # The refund this is about: the one that mined, or the one the node holds (an earlier hash).
+            subject = getattr(progress, "tx_hash", None) or recorded
             kind = progress.kind
             if kind == "mined":
-                logger.info("our counter-leg refund %s is mined; waiting for the finalized block", recorded)
+                logger.info("our counter-leg refund %s is mined; waiting for the finalized block", subject)
                 return self.record
             if kind == "pending":
                 since = self._refund_pending_since.setdefault(recorded, _monotonic())
@@ -4721,15 +4723,15 @@ class SwapCoordinator:
                 estimate = int(await self.counter_leg.refund_estimate(locator))
                 if progress.gas_limit is not None and estimate <= progress.gas_limit and not resend_reverted_refund:
                     raise CounterLegRefundNeedsOperator(
-                        f"our counter-leg refund {recorded} ran out of gas at a limit of {progress.gas_limit}, "
+                        f"our counter-leg refund {subject} ran out of gas at a limit of {progress.gas_limit}, "
                         f"at or above the current estimate of {estimate}, so a re-send at the estimate would "
                         "likely fail the same way. Nothing was sent. Check the refundee and the contract; "
                         "taker_refund_btc(resend_reverted_refund=True) sends one more refund.",
-                        tx_hash=recorded,
+                        tx_hash=subject,
                     )
                 logger.warning(
                     "our counter-leg refund %s ran out of gas (limit %s); re-sending once at the estimate %d",
-                    recorded,
+                    subject,
                     progress.gas_limit,
                     estimate,
                 )
@@ -4737,7 +4739,7 @@ class SwapCoordinator:
                 reason = await self.counter_leg.refund_revert_reason(locator)
                 if reason in ("TransferFailed", "SendFailed"):
                     raise CounterLegPayoutReverts(
-                        f"our counter-leg refund {recorded} reverted, and a refund now reverts {reason}: the "
+                        f"our counter-leg refund {subject} reverted, and a refund now reverts {reason}: the "
                         "payout itself fails (a frozen token address, or a refundee that refuses ETH). Nothing "
                         "was re-sent. The contract is still unsettled and refundable once that changes; then "
                         "run taker_refund_btc(resend_reverted_refund=True).",
@@ -4748,11 +4750,11 @@ class SwapCoordinator:
                     return self.record
                 if not resend_reverted_refund:
                     raise CounterLegRefundNeedsOperator(
-                        f"our counter-leg refund {recorded} was mined and reverted"
+                        f"our counter-leg refund {subject} was mined and reverted"
                         + (f"; a refund now would revert {reason}" if reason else "; a refund now would not revert")
                         + ". It is not re-sent automatically (design §3.4). Check the transaction, then run "
                         "taker_refund_btc(resend_reverted_refund=True) to send one more refund.",
-                        tx_hash=recorded,
+                        tx_hash=subject,
                     )
             # "dropped" and "nonce_taken": ours never mined and cannot now; build a new one.
 
@@ -4767,7 +4769,11 @@ class SwapCoordinator:
                 # Same nonce: a replacement, or a re-send of a dropped one. Keep what we signed there
                 # before, newest first; whichever the node still holds is what the next one must beat.
                 kept = (old.counter_refund_tx_hash, *old.counter_refund_replaced_tx_hashes)
-                replaced = tuple(h for h in dict.fromkeys(kept) if h != new_hash)[:MAX_REPLACED_REFUNDS]
+                replaced = tuple(h for h in dict.fromkeys(kept) if h != new_hash)
+                if len(replaced) > MAX_REPLACED_REFUNDS:
+                    # Keep the OLDEST with the newest: when the replacements never reached the node, the
+                    # first refund is the one it holds (review round 3 of 5b).
+                    replaced = (*replaced[: MAX_REPLACED_REFUNDS - 1], replaced[-1])
             pending = dataclasses.replace(
                 old,
                 counter_refund_tx_hash=new_hash,

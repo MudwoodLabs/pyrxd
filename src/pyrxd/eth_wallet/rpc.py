@@ -477,6 +477,18 @@ class EthRpc:
         except Exception as exc:
             raise self._failed("eth_getTransactionByHash failed", exc)
 
+    async def find_transaction(self, tx_hash: str) -> dict | None:
+        """``eth_getTransactionByHash``, with "this node does not have it" as ``None`` and every other
+        failure (a 429, a timeout) as a :class:`NetworkError`, so a caller can tell an ANSWER that a
+        transaction is absent from a read that failed (review of #850 PR 5b)."""
+        web3 = _require_web3()
+        try:
+            return dict(await self._w3.eth.get_transaction(tx_hash))
+        except Exception as exc:
+            if isinstance(exc, web3.exceptions.TransactionNotFound):
+                return None
+            raise self._failed("eth_getTransactionByHash failed", exc)
+
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         """A single NON-BLOCKING receipt fetch (`eth_getTransactionReceipt`). Returns ``None`` when
         the tx is not currently mined — pending, or reorg-orphaned back to the mempool — instead of

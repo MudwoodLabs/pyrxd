@@ -84,6 +84,7 @@ _CALLS = {
     "send_raw": lambda r: r.send_raw(b"\x02\x00"),
     "wait_receipt": lambda r: r.wait_receipt("0x" + "ab" * 32, timeout_s=2.0),
     "get_transaction": lambda r: r.get_transaction("0x" + "ab" * 32),
+    "find_transaction": lambda r: r.find_transaction("0x" + "ab" * 32),
     "get_transaction_receipt": lambda r: r.get_transaction_receipt("0x" + "ab" * 32),
     "finalized_block_number": lambda r: r.finalized_block_number(),
     "block_number": lambda r: r.block_number(),

@@ -419,11 +419,15 @@ class CounterLegPayoutReverts(ValidationError):
 
 
 class CounterLegRefundNeedsOperator(ValidationError):
-    """Our mined refund of the ETH counter leg failed in a way an automatic re-send may not fix
-    (#850 PR 5b, design §3.4): it ran out of gas although it was signed at or above the current
-    estimate, or it reverted for a reason this does not recognise. Nothing more is sent until the
-    operator has looked; ``taker_refund_btc(resend_reverted_refund=True)`` sends one more refund.
-    ``tx_hash`` is the refund that failed."""
+    """Our ETH counter-leg refund is in a state an automatic step may not fix (#850 PR 5b, design
+    §3.4), and nothing more is sent until the operator has looked:
+
+    * it MINED and failed: ran out of gas although signed at or above the current estimate, or
+      reverted for a reason this does not recognise. ``taker_refund_btc(resend_reverted_refund=True)``
+      sends one more refund. ``tx_hash`` is the refund that mined.
+    * a transaction is pending at its nonce that is none of the refunds the record signed there (it
+      may be another transaction from the same key). It is never replaced, and the flag does not
+      change that. ``tx_hash`` is the newest refund recorded."""
 
     def __init__(self, message: str, *, tx_hash: str) -> None:
         super().__init__(message)
