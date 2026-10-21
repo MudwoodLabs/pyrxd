@@ -538,8 +538,10 @@ The harness states its own reason (`scripts/btc_swap_two_host.py:654-658`): *"a 
 our BTC HTLC and claim it with p → one-sided taker loss."* That is a correct reading of the scripts
 — the BTC claim leaf is `<H> … <makerClaimPk> OP_CHECKSIG` with no precondition that the asset was
 ever locked, and the maker holds both `p` and the claim key from the moment the envelope is
-published. Consensus permits the claim; the FSM simply has no edge for it (from `BTC_LOCKED` the
-only exits are `BOTH_LOCKED`, `ABORTED`, `PARAMS_MISMATCH` — `swap_state.py:283-287`), and
+published. Consensus permits the claim, and on a BTC swap the FSM has no edge for it (from
+`BTC_LOCKED` the BTC exits are `BOTH_LOCKED`, `ABORTED`, `PARAMS_MISMATCH` — `swap_state.py:283-287`;
+the `SECRET_REVEALED` edge added in #850 PR 5a is taken only on an ETH counter-leg claim observed at a
+finalized block), and
 `maker_claims_btc` refuses it only for an *honest* maker driving its own coordinator
 (`swap_coordinator.py:3738-3739`). A hostile maker does not use a coordinator.
 

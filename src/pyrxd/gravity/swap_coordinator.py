@@ -4403,6 +4403,23 @@ class SwapCoordinator:
         except ValidationError:
             return False
 
+    async def _covenant_age_blocks(self) -> int:
+        """Blocks since the covenant was MINED, read from its pinned funding transaction.
+
+        Not :meth:`_covenant_elapsed_blocks`: that one finds the covenant as an UNSPENT output and
+        raises once it is spent, so a hold that read it could never lift after the maker's CSV
+        refund, the very moment it should (review of #850 PR 5a). The funding transaction's depth
+        stays readable after the covenant is spent. One Radiant server's reported depth, like every
+        other depth on this path. Falls back to the unspent read without a pin or a chain reader."""
+        outpoint = self.record.radiant_covenant_outpoint
+        chain_io = getattr(self.radiant_leg, "chain_io", None)
+        if outpoint is None or chain_io is None:
+            return await self._covenant_elapsed_blocks()
+        confs = await chain_io.confirmations(outpoint.split(":")[0])
+        if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
+            raise ValidationError(f"the covenant funding depth {confs!r} is not a non-negative int; fail-closed")
+        return int(confs)
+
     async def _claim_seen_holds_the_terminal(self) -> bool:
         """D14 / N1: with an unverified ``Claimed(p)`` on record, ``p`` is public, so a refunded
         counter leg must not take the record terminal before the covenant's ``t_rxd`` matures: the
@@ -4410,7 +4427,7 @@ class SwapCoordinator:
         if self.record.counter_claim_tx is None:
             return False
         try:
-            elapsed = await self._covenant_elapsed_blocks()
+            elapsed = await self._covenant_age_blocks()
         except Exception as exc:  # unreadable: hold, and say why
             logger.warning("covenant depth unreadable while a counter-leg claim is on record (%s); holding", exc)
             return True
@@ -4460,7 +4477,7 @@ class SwapCoordinator:
                     kind.value,
                     locator.chain_id,
                 )
-                outcome = "unknown"
+                outcome = "single_source"
             else:
                 record_evidence = CounterDispositionRecord(
                     kind=kind.value,
@@ -4519,8 +4536,14 @@ class SwapCoordinator:
         disposition = await self._read_counter_disposition()
         if disposition is None:
             raise ValidationError("reconcile_counter_leg needs an ETH counter leg that reads its disposition")
-        if await self._apply_counter_disposition(disposition) == "unknown":
+        outcome = await self._apply_counter_disposition(disposition)
+        if outcome == "unknown":
             raise NetworkError(f"the counter leg's disposition is unknown: {disposition.reason}")
+        if outcome == "single_source":
+            raise NetworkError(
+                f"the counter leg reads {disposition.kind.value} from ONE endpoint, on a chain that carries "
+                "value; nothing changes until a multi-source rpc agrees (design §2.5)"
+            )
         return self.record
 
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)

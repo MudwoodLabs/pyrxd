@@ -206,7 +206,7 @@ async def test_one_endpoint_on_a_value_bearing_chain_changes_nothing(monkeypatch
     chain.refund(85)
     leg._rpc = FakeEvmEndpoint(chain)  # single source
     monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
-    with pytest.raises(NetworkError, match="unknown"):
+    with pytest.raises(NetworkError, match="from ONE endpoint, on a chain that carries value"):
         await coord.reconcile_counter_leg()
     assert coord.record.state is SwapState.BTC_LOCKED and coord.record.counter_disposition is None
 
@@ -344,3 +344,30 @@ async def test_HONEST_a_first_mutual_refund_sends_both_as_before():
     asset = _count_asset_refunds(coord)
     rec = await coord.mutual_refund()
     assert rec.state is SwapState.MUTUAL_REFUND and leg.refunds == 1 and asset == [1]
+
+
+class _ChainIO:
+    """The Radiant chain reader: the covenant's funding tx depth, readable after it is spent."""
+
+    def __init__(self, confs):
+        self.confs = confs
+
+    async def confirmations(self, txid):
+        return self.confs
+
+
+async def test_the_hold_lifts_once_t_rxd_matures_even_after_the_covenant_is_spent():
+    """Review of 5a (MEDIUM-LOW): the hold read the covenant as an UNSPENT output, which raises
+    once the maker CSV-refunds it, and an unreadable depth holds, so the hold never lifted."""
+    coord, chain, _leg = _setup(endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90})
+    coord.radiant_leg.asset_funded = False  # the covenant is spent: the unspent read raises
+    coord.radiant_leg.chain_io = _ChainIO(int(coord.record.terms.t_rxd.value))
+    chain.refund(85)
+    assert (await coord.reconcile_counter_leg()).state is SwapState.ABORTED
+
+
+async def test_HONEST_the_hold_stays_before_t_rxd_by_the_funding_depth():
+    coord, chain, _leg = _setup(endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90})
+    coord.radiant_leg.chain_io = _ChainIO(int(coord.record.terms.t_rxd.value) - 1)
+    chain.refund(85)
+    assert (await coord.reconcile_counter_leg()).state is SwapState.BTC_LOCKED

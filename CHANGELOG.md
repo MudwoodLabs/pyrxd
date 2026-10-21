@@ -85,7 +85,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **On an ETH swap, the coordinator now acts on what the chain shows about the counter leg, not
   only on what it broadcast (#850 PR 5a) [Changed (breaking)].** The disposition is read with
   `pyrxd.eth_wallet.disposition` at the quorum-minimum finalized block.
-  - `taker_refund_btc` reads it first. A claim verified on chain moves the record to
+  - `taker_refund_btc` reads it first. A claim proven on chain (a verified claim transaction, or
+    the contract settled at a finalized block before the timeout) moves the record to
     `SECRET_REVEALED` (a new edge from `BTC_LOCKED`; `p` is public, claim the covenant). A refund
     verified on chain, whoever sent it, moves it to `ABORTED` with `abort_reason:
     counter_leg_refunded`. In both cases nothing is sent. Settled at the tip but not yet final:
@@ -93,14 +94,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     still goes to `ABORTED` on our broadcast (that changes in PR 5b). A `MAKER`-role coordinator
     is refused.
   - New `SwapCoordinator.reconcile_counter_leg()`: the same read and the same edges, with no
-    broadcast. An unreadable, below-quorum or contradictory chain changes nothing and raises
-    `NetworkError`. From `PARAMS_MISMATCH` a verified claim has deliberately no edge: the evidence
+    broadcast. An unreadable, below-quorum or contradictory chain changes no state and raises
+    `NetworkError` (a seen claim is still recorded); so does a terminal answer from one endpoint
+    on a chain that carries value, with its own message. From `PARAMS_MISMATCH` a verified claim has deliberately no edge: the evidence
     is recorded and it raises. A maker's record records the evidence and stays. Nothing in pyrxd
     calls it yet; the runners and the watchtower use it in later #850 PRs.
   - A `Claimed` log that opens the hashlock but does not verify is recorded as
     `counter_claim_tx`. While one is recorded and the covenant's `t_rxd` has not matured, a
     refunded counter leg does not take the record terminal, and neither does our own refund: the
-    covenant claim comes first. An unreadable covenant depth holds too.
+    covenant claim comes first. An unreadable covenant depth holds too. The covenant's age is read
+    from its pinned funding transaction, so the hold lifts once `t_rxd` matures even after the
+    covenant is spent.
   - A terminal answer read from a single endpoint changes nothing on a chain that carries value.
     It does on a known testnet or anvil, and is recorded as single-source.
   - `mutual_refund` on its attempt-both path (role `none` or `maker`): a retry after one leg had
