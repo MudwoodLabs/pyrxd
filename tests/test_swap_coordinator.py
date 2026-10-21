@@ -3542,6 +3542,55 @@ async def test_an_eth_resume_pins_the_covenant_ITS_OWN_proof_found(tmp_path):
     assert rec.radiant_covenant_outpoint == second != first
 
 
+async def test_an_eth_resume_that_pushes_writes_its_own_proof_before_the_push(tmp_path):
+    """Review of the write-ahead, round 2: a token resume whose re-run found P2 pushes against P2. If
+    it then crashes, the record on disk must already say P2, not the deploy-time P1."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    class _CrashAfterDeploy(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            raise NetworkError("process died mid-fund")
+
+    class _CrashAfterPushNonce(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_push_nonce(7)
+            raise NetworkError("process died after the push")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(
+        terms=terms, eth_leg=_CrashAfterDeploy(preimage=secret, verdict=_final()), seen_store=seen
+    )
+    crashed._persist = sink
+    with pytest.raises(NetworkError):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+    first = sink.load_record().radiant_covenant_outpoint
+
+    resumed = _eth_coord_full(
+        terms=terms,
+        eth_leg=_CrashAfterPushNonce(preimage=secret, verdict=_final()),
+        seen_store=seen,
+        fund_lock=_MemLock(),
+    )
+    resumed._persist = sink
+    real = resumed.taker_verify_asset_funding
+    second = "ff" * 32 + ":1"
+
+    async def _elsewhere(*a, **k):
+        _o, value, upper = await real(*a, **k)
+        return second, value, upper
+
+    resumed.taker_verify_asset_funding = _elsewhere
+    with pytest.raises(NetworkError):
+        await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    on_disk = sink.load_record()
+    assert on_disk.pending_push_nonce == 7 and on_disk.radiant_covenant_outpoint == second != first
+
+
 @pytest.mark.parametrize("held", ["pending_contract", "funded_locator"])
 async def test_a_FRESH_fund_never_overwrites_a_record_that_holds_this_swaps_counter_leg(tmp_path, held):
     """A coordinator built on a fresh NEGOTIATED record (a runner re-run that did not load the file)

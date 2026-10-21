@@ -186,3 +186,20 @@ async def test_on_a_value_bearing_chain_the_resumed_fund_is_pinned_too(tmp_path,
     decision = await _tower(tmp_path, record)
     assert decision.autonomous_btc_refund is False
     assert "maker never locked" not in decision.reason
+
+
+async def test_a_reused_coordinators_stale_proof_never_replaces_the_pin_on_disk(tmp_path):
+    """Review of the write-ahead, round 2: the lock record now always applies this call's proof, so a
+    proof left on the coordinator object by an EARLIER fund must not survive into this one."""
+    sink = JsonFileRecordSink(tmp_path / "swap1.json")
+    coord, btc, terms, _view = _coordinator(sink)
+    btc.read = "network"
+    with pytest.raises(NetworkError):
+        await coord.taker_funds_btc(terms)
+    pinned = sink.load_record().radiant_covenant_outpoint
+    fresh, _b, _t, _v = _coordinator(sink, terms=terms)
+    fresh.counter_leg = coord.counter_leg
+    fresh._fund_verified_covenant = ("aa" * 32 + ":5", "51")  # another swap's proof, left behind
+    btc.read = "ok"
+    await fresh.resume_interrupted_fund(terms, sink=sink, now_unix_s=None)
+    assert sink.load_record().radiant_covenant_outpoint == pinned
