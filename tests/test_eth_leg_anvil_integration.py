@@ -1268,18 +1268,68 @@ async def test_a_real_refund_is_signed_at_150k_and_uses_well_under_it(anvil_url)
             amount_wei=_AMOUNT_WEI,
         )
         await _advance_time(rpc, 200)
-        seen: list[str] = []
+        seen: list[tuple[str, int]] = []
 
-        async def on_signed(tx_hash: str) -> None:
-            seen.append(tx_hash)
+        async def on_signed(tx_hash: str, nonce: int) -> None:
+            seen.append((tx_hash, nonce))
 
         tx = await taker.refund(locator, on_signed=on_signed)
         receipt = dict(await rpc.wait_receipt(tx))
         sent = await rpc.get_transaction(tx)
-        assert seen == [tx]
+        assert seen == [(tx, int(sent["nonce"]))]
         assert int(sent["gas"]) == REFUND_GAS_LIMIT
+        # #850 PR 5b: the progress read sees the mined refund as mined.
+        assert (await taker.refund_progress(tx, int(sent["nonce"]))).kind == "mined"
         assert receipt["status"] == 1 and int(receipt["gasUsed"]) < REFUND_GAS_LIMIT * 2 // 3
         assert refund_ran_out_of_gas(receipt, gas_limit=REFUND_GAS_LIMIT) is False
+    finally:
+        await rpc.close()
+
+
+async def test_a_real_pending_refund_reads_pending_then_dropped_then_replaced_and_mined(anvil_url):
+    """#850 PR 5b against a real mempool (design §7.3): with automine off, our signed refund reads
+    "pending"; ``anvil_dropTransaction`` removes it and it reads "dropped"; a replacement at the
+    same nonce is accepted by the node, mines, and reads "mined"."""
+    from pyrxd.eth_wallet.htlc_leg import RefundReplacement
+
+    rpc, taker, _maker = _legs(anvil_url)
+    try:
+        _p, h = _secret()
+        locator = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 100),
+            amount_wei=_AMOUNT_WEI,
+        )
+        await _advance_time(rpc, 200)
+        await rpc.w3.provider.make_request("evm_setAutomine", [False])
+        signed: list[tuple[str, int]] = []
+
+        async def on_signed(tx_hash: str, nonce: int) -> None:
+            signed.append((tx_hash, nonce))
+
+        first = await taker.refund(locator, on_signed=on_signed)
+        nonce = signed[0][1]
+        pending = await taker.refund_progress(first, nonce)
+        assert pending.kind == "pending" and pending.fee_fields is not None
+        # Replace it at the same nonce: the node accepts the bumped fees as a replacement.
+        second = await taker.refund(
+            locator, on_signed=on_signed, replace=RefundReplacement(nonce=nonce, previous_fees=pending.fee_fields)
+        )
+        assert second != first and signed[1] == (second, nonce)
+        assert (await taker.refund_progress(second, nonce)).kind == "pending"
+        await rpc.w3.provider.make_request("anvil_dropTransaction", [second])
+        assert (await taker.refund_progress(second, nonce)).kind == "dropped"
+        third = await taker.refund(locator, on_signed=on_signed)
+        assert signed[2] == (third, nonce)  # a fresh build lands on the freed nonce
+        assert third == first  # same nonce, same quote: the same bytes (see below)
+        await rpc.w3.provider.make_request("evm_mine", [])
+        assert (await taker.refund_progress(third, nonce)).kind == "mined"
+        # The dropped replacement never mined, and its nonce is now used: "nonce_taken". (The
+        # third refund was built at the same nonce and the same quote as the first, so on this
+        # node it is byte-identical to it and shares its hash; measured, not assumed.)
+        assert (await taker.refund_progress(second, nonce)).kind == "nonce_taken"
     finally:
         await rpc.close()
 

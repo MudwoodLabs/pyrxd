@@ -331,10 +331,23 @@ class EthLeg:
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
         return await self._leg.claim(locator, preimage)
 
-    async def refund(self, locator: EthHtlcLocator, timeout=None, *, on_signed=None) -> str:
+    async def refund(self, locator: EthHtlcLocator, timeout=None, *, on_signed=None, replace=None) -> str:
         # The ETH timeout is the locator's contract immutable; the coordinator's BTC-shaped Timelock
-        # is ignored. `on_signed` is forwarded (#850 PR 4a); no caller passes it until PR 5b.
-        return await self._leg.refund(locator, on_signed=on_signed)
+        # is ignored. `on_signed` (awaited with the hash and nonce before the broadcast) and `replace`
+        # are forwarded unchanged; the coordinator records its pending refund through them (#850 PR 5b).
+        return await self._leg.refund(locator, on_signed=on_signed, replace=replace)
+
+    async def refund_progress(self, tx_hash: str, nonce: int):
+        """What happened to our refund ``tx_hash`` at ``nonce`` (``RefundProgress``). Read-only."""
+        return await self._leg.refund_progress(tx_hash, nonce)
+
+    async def refund_estimate(self, locator: EthHtlcLocator) -> int:
+        """``eth_estimateGas`` for a refund of *locator* now. Read-only."""
+        return await self._leg.refund_estimate(locator)
+
+    async def refund_revert_reason(self, locator: EthHtlcLocator) -> str | None:
+        """The contract error a refund of *locator* would revert with now, or ``None``. Read-only."""
+        return await self._leg.refund_revert_reason(locator)
 
     # -- what happened to the contract (#850: explaining a failed refund) --------------------
 
@@ -360,13 +373,21 @@ class EthLeg:
         (:meth:`EthHtlcContractLeg._settled_word`)."""
         return any(await self._leg._settled_word(locator, None))
 
-    async def counter_disposition(self, locator: EthHtlcLocator):
+    async def counter_disposition(
+        self,
+        locator: EthHtlcLocator,
+        *,
+        recorded_refund_hashes: tuple[str, ...] = (),
+        expiry_anchor: tuple[int, str] | None = None,
+    ):
         """What the chain says about this swap's HTLC, read and verified at the finalized block
         (:func:`pyrxd.eth_wallet.disposition.read_counter_disposition`, #850 PR 5a). Read-only; never
         raises for a chain read (an unreadable chain is ``UNKNOWN``)."""
         from pyrxd.eth_wallet.disposition import read_counter_disposition
 
-        return await read_counter_disposition(self._leg._rpc, locator)
+        return await read_counter_disposition(
+            self._leg._rpc, locator, recorded_refund_hashes=recorded_refund_hashes, expiry_anchor=expiry_anchor
+        )
 
     # -- secret recovery + finality ------------------------------------------------------
 

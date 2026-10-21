@@ -257,6 +257,17 @@ For a settled contract with no claim found, check the contract's events elsewher
 unreadable settled flag refuses too. An unreadable log history on a contract that is not settled
 does not refuse, because a claim that landed would have settled it.
 
+**ETH taker `abort` follows its refund to the end (#850 PR 5b).** The record no longer goes to
+`aborted` when the refund is broadcast. It goes there when the chain shows the HTLC refunded at
+the finalized block, so the phase keeps polling until then, for up to `--abort-poll-timeout-s`
+(7200 s by default). The refund's hash is saved in the record before it is sent, and polling
+never sends a second refund while one is pending. It re-sends only when the first was dropped or
+its nonce was used by another transaction. It replaces a refund still pending after 600 s at the
+same nonce, and re-sends once after an out-of-gas refund. If the run times out, run `--phase
+abort` again; it follows the saved refund and skips the up-front settled check, which our own
+mined refund would otherwise trip. A mined refund that reverted is not re-sent. The phase stops
+and names the revert.
+
 **The swap record carries across phases.** Each phase rebuilds its record from the exchange
 files, and then merges it with the record this host saved (`<--local-out>.swaprec.json`). Fields
 the record already holds are kept, such as the covenant outpoint pinned by an earlier phase and
@@ -301,7 +312,7 @@ first, which is tracked in #850.
 
 | Role + phase | Coordinator entry point | FSM |
 |---|---|---|
-| taker `abort` | `SwapCoordinator.taker_refund_btc()` | `btc_locked → aborted` |
+| taker `abort` | `SwapCoordinator.taker_refund_btc()`, polled (ETH) | `btc_locked → aborted` (ETH: once the refund is final at the finalized block) |
 | taker `refund` (ETH) | `SwapCoordinator.mutual_refund()` on a taker-role coordinator | `both_locked` (no advance) |
 | taker `refund` (BTC) | `SwapCoordinator.mutual_refund()` | `both_locked → mutual_refund` |
 | maker `refund` | `SwapCoordinator.maybe_refund_asset_on_maker_stall()` | `both_locked → asset_refunded_taker_acts` |

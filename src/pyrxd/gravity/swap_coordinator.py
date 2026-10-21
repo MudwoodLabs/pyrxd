@@ -60,6 +60,8 @@ from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbo
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
 from pyrxd.security.errors import (
+    CounterLegPayoutReverts,
+    CounterLegRefundNeedsOperator,
     NetworkError,
     NothingToRefund,
     PreRevealAbort,
@@ -1560,6 +1562,11 @@ class _Refusal(str):
 #: (add ETH, push the tokens, or look at the contract). Raised before anything is signed.
 _NEEDS_OPERATOR_ACTION: tuple[type[Exception], ...] = (NothingToRefund, RefundFeeUnaffordable, RefundGasAboveCeiling)
 
+#: Seconds our ETH counter-leg refund may sit pending before it is replaced at the same nonce with
+#: raised fees (#850 PR 5b, design §3.4). CHOSEN, not measured. Counted from when THIS coordinator
+#: first saw it pending, so a restart only delays a replacement, never hastens one.
+REFUND_REPLACE_AFTER_S: float = 600.0
+
 
 class DefinitiveFundRefusal(ValidationError):
     """The taker gate refused funding for a reason a retry cannot change (``PreBtcLockGate.definitive``)."""
@@ -1882,6 +1889,9 @@ class SwapCoordinator:
         # steps (see @_serialized_step) so a future concurrent driver cannot interleave
         # a check-then-advance across an await on a single instance.
         self._step_lock = asyncio.Lock()
+        # When this instance first saw each recorded counter-leg refund pending (#850 PR 5b): the
+        # clock REFUND_REPLACE_AFTER_S is measured on. In memory on purpose; see that constant.
+        self._refund_pending_since: dict[str, float] = {}
         # THE ROLE ON THE RECORD (#850 PR 3, design §2.9). The configured role is not persisted, so
         # a record written by one side could be driven by a coordinator configured as the other,
         # and role-scoped steps (mutual_refund's TAKER branch, maybe_refund_asset_on_maker_stall's
@@ -4399,7 +4409,16 @@ class SwapCoordinator:
         locator = self.record.counterchain_locator
         if read is None or self.record.terms.counter_chain != "eth" or not isinstance(locator, EthHtlcLocator):
             return None
-        return await read(locator)
+        # Our own recorded refund is nominated alongside the logs, and the expiry anchor offered as
+        # a proof of refund (#850 PR 5b). Passed only when set, so a leg without them still reads.
+        kwargs: dict[str, Any] = {}
+        if self.record.counter_refund_tx_hash is not None:
+            kwargs["recorded_refund_hashes"] = (self.record.counter_refund_tx_hash,)
+        if self.record.counter_expiry_anchor is not None:
+            from .swap_state import parse_expiry_anchor
+
+            kwargs["expiry_anchor"] = parse_expiry_anchor(self.record.counter_expiry_anchor)
+        return await read(locator, **kwargs)
 
     @staticmethod
     def _single_source_may_decide(chain_id: int) -> bool:
@@ -4505,6 +4524,20 @@ class SwapCoordinator:
         kind = disposition.kind
         outcome = "unknown" if kind is DispositionKind.UNKNOWN else "none"
         evidence = disposition.evidence
+        anchor = getattr(disposition, "expiry_anchor", None)
+        # §2.3 (a), from a quorum read only (D4): one endpoint on a chain that carries value must not
+        # write a proof a later answer will rest on.
+        if (
+            kind is DispositionKind.F_EXPIRED
+            and anchor is not None
+            and self.record.counter_expiry_anchor is None
+            and (
+                not disposition.single_source
+                or self._single_source_may_decide(int(self.record.counterchain_locator.chain_id))
+            )
+        ):
+            self.record = dataclasses.replace(self.record, counter_expiry_anchor=f"{anchor[0]}:{anchor[1].lower()}")
+            changed = True
         if kind in (DispositionKind.CLAIMED, DispositionKind.REFUNDED) and evidence is not None:
             locator = self.record.counterchain_locator
             if disposition.single_source and not self._single_source_may_decide(int(locator.chain_id)):
@@ -4585,13 +4618,24 @@ class SwapCoordinator:
 
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)
     @_serialized_step
-    async def taker_refund_btc(self) -> SwapRecord:
+    async def taker_refund_btc(self, *, resend_reverted_refund: bool = False) -> SwapRecord:
         """Refund the BTC via the timelock leg, ending in ABORTED.
 
         Valid from BTC_LOCKED (maker never locked, t_btc elapsed) or PARAMS_MISMATCH
         (maker locked the wrong covenant). The refund needs the FULL locator
         (Tapscript tree + control block) — recovered from the durable record. Async
         because the refund broadcasts the BTC timelock spend.
+
+        **ETH counter leg** (#850 PRs 5a and 5b, design §3.3, §3.4): what the chain shows is read
+        first, and the record moves only on that. Our own refund is RECORDED (hash and nonce, before
+        the broadcast) and the record stays where it is until the chain shows the contract refunded
+        at the finalized block; call this again (the runner polls) to follow it. A recorded refund
+        is never sent twice: a retry reads what happened to it and re-sends only when it was dropped,
+        its nonce went to another transaction, or it ran out of gas with less than the current
+        estimate. A pending one is replaced at the same nonce after :data:`REFUND_REPLACE_AFTER_S`.
+        A mined refund that reverted is not re-sent: :class:`CounterLegPayoutReverts` when the
+        payout is what fails, else :class:`CounterLegRefundNeedsOperator`; after looking, the
+        operator passes ``resend_reverted_refund=True`` to send one more.
         """
         state = self.record.state
         if state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
@@ -4611,17 +4655,95 @@ class SwapCoordinator:
                 return self.record  # observed: nothing to send (claimed: SECRET_REVEALED; refunded: done)
             if disposition.kind is DispositionKind.SETTLED_UNFINAL:
                 return self.record  # settled at the tip, not yet final: wait, send nothing
+            # 5b: never advance on our own broadcast. The record moves when the chain shows it.
+            return await self._send_or_follow_counter_refund(resend_reverted_refund=resend_reverted_refund)
         await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-        if disposition is not None and await self._claim_seen_holds_the_terminal():
-            # Our refund is sent, but a claim with p is on record and t_rxd has not matured: the
-            # record stays where the covenant-claim page can still find it (D14).
-            await self._persist_record(self.record, shield=True)
-            return self.record
         if state is SwapState.BTC_LOCKED:
             self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
         else:
             self._advance(SwapEvent.TAKER_REFUNDS_BTC)
         await self._persist_record(self.record, shield=True)
+        return self.record
+
+    async def _send_or_follow_counter_refund(self, *, resend_reverted_refund: bool) -> SwapRecord:
+        """The re-send rules for our own ETH counter-leg refund (design §3.4), once the contract
+        reads unsettled at the tip. Never advances the record. See :meth:`taker_refund_btc`."""
+        locator = self.record.counterchain_locator
+        recorded, nonce = self.record.counter_refund_tx_hash, self.record.counter_refund_nonce
+        replace = None
+        if recorded is not None and nonce is not None:
+            progress = await self.counter_leg.refund_progress(recorded, nonce)
+            kind = progress.kind
+            if kind == "mined":
+                logger.info("our counter-leg refund %s is mined; waiting for the finalized block", recorded)
+                return self.record
+            if kind == "pending":
+                since = self._refund_pending_since.setdefault(recorded, _monotonic())
+                waited = _monotonic() - since
+                if waited < REFUND_REPLACE_AFTER_S or progress.fee_fields is None:
+                    logger.info("our counter-leg refund %s is pending (%.0fs seen); waiting", recorded, waited)
+                    return self.record
+                from pyrxd.eth_wallet.htlc_leg import RefundReplacement
+
+                replace = RefundReplacement(nonce=nonce, previous_fees=dict(progress.fee_fields))
+                logger.warning("our counter-leg refund %s is still pending; replacing it at nonce %d", recorded, nonce)
+            elif kind == "out_of_gas":
+                estimate = int(await self.counter_leg.refund_estimate(locator))
+                if progress.gas_limit is not None and estimate <= progress.gas_limit and not resend_reverted_refund:
+                    raise CounterLegRefundNeedsOperator(
+                        f"our counter-leg refund {recorded} ran out of gas at a limit of {progress.gas_limit}, "
+                        f"at or above the current estimate of {estimate}, so a re-send at the estimate would "
+                        "likely fail the same way. Nothing was sent. Check the refundee and the contract; "
+                        "taker_refund_btc(resend_reverted_refund=True) sends one more refund.",
+                        tx_hash=recorded,
+                    )
+                logger.warning(
+                    "our counter-leg refund %s ran out of gas (limit %s); re-sending once at the estimate %d",
+                    recorded,
+                    progress.gas_limit,
+                    estimate,
+                )
+            elif kind == "reverted":
+                reason = await self.counter_leg.refund_revert_reason(locator)
+                if reason in ("TransferFailed", "SendFailed"):
+                    raise CounterLegPayoutReverts(
+                        f"our counter-leg refund {recorded} reverted, and a refund now reverts {reason}: the "
+                        "payout itself fails (a frozen token address, or a refundee that refuses ETH). Nothing "
+                        "was re-sent. The contract is still unsettled and refundable once that changes; then "
+                        "run taker_refund_btc(resend_reverted_refund=True).",
+                        reason=reason,
+                    )
+                if reason == "AlreadySettled":
+                    logger.info("the counter-leg contract settled after it was read; waiting for the chain")
+                    return self.record
+                if not resend_reverted_refund:
+                    raise CounterLegRefundNeedsOperator(
+                        f"our counter-leg refund {recorded} was mined and reverted"
+                        + (f"; a refund now would revert {reason}" if reason else "; a refund now would not revert")
+                        + ". It is not re-sent automatically (design §3.4). Check the transaction, then run "
+                        "taker_refund_btc(resend_reverted_refund=True) to send one more refund.",
+                        tx_hash=recorded,
+                    )
+            # "dropped" and "nonce_taken": ours never mined and cannot now; build a new one.
+
+        async def _record_before_broadcast(tx_hash: str, signed_nonce: int) -> None:
+            # Persisted BEFORE the broadcast (design §2.8), and adopted only once the write returns:
+            # a write that fails stops the send, so a refund can never be in flight unrecorded.
+            pending = dataclasses.replace(
+                self.record, counter_refund_tx_hash=str(tx_hash).lower(), counter_refund_nonce=int(signed_nonce)
+            )
+            await self._persist_record(pending, shield=True)
+            self.record = pending
+
+        sent = await self.counter_leg.refund(
+            locator, self.record.terms.t_btc, on_signed=_record_before_broadcast, replace=replace
+        )
+        logger.info(
+            "counter-leg refund %s sent; the record stays %s until the chain shows it refunded at the "
+            "finalized block. Call taker_refund_btc again to follow it.",
+            sent,
+            self.record.state.name,
+        )
         return self.record
 
     async def _explain_failed_taker_eth_refund(self, locator: Any, refund_error: Exception) -> None:

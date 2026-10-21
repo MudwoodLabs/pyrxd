@@ -1,6 +1,6 @@
-"""The #850 PR 5a record fields: each validator refuses what it should, and each field alone makes
-the record write a schema version (review of 5a: none of this was pinned, and a record whose only
-new field was one of these serialised as v2, which an older pyrxd reads by silently dropping it)."""
+"""The #850 PR 5a and 5b record fields: each validator refuses what it should, and each field alone
+makes the record write a schema version (review of 5a: none of this was pinned, and a record whose
+only new field was one of these serialised as v2, which an older pyrxd reads by silently dropping it)."""
 
 from __future__ import annotations
 
@@ -66,6 +66,24 @@ def test_from_dict_does_not_coerce_single_source():
         (_eth_base, {"abort_reason": "counter_leg_refunded"}),
         (_eth_base, {"asset_refund_txid": "AB" * 32}),
         (_eth_base, {"asset_refund_txid": "ab" * 31}),
+        # 5b: our refund's hash and nonce, together, ETH only, well-formed
+        (_btc_base, {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": 3}),
+        (_eth_base, {"counter_refund_tx_hash": "0x" + "e1" * 32}),
+        (_eth_base, {"counter_refund_nonce": 3}),
+        (_eth_base, {"counter_refund_tx_hash": "0x" + "E1" * 32, "counter_refund_nonce": 3}),
+        (_eth_base, {"counter_refund_tx_hash": "0x12", "counter_refund_nonce": 3}),
+        (_eth_base, {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": -1}),
+        (_eth_base, {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": True}),
+        (_eth_base, {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": "3"}),
+        # 5b: the expiry anchor
+        (_btc_base, {"counter_expiry_anchor": "90:0x" + "b1" * 32}),
+        (_eth_base, {"counter_expiry_anchor": "0x" + "b1" * 32}),
+        (_eth_base, {"counter_expiry_anchor": "-1:0x" + "b1" * 32}),
+        (_eth_base, {"counter_expiry_anchor": "090:0x" + "b1" * 32}),
+        (_eth_base, {"counter_expiry_anchor": "90:0x" + "B1" * 32}),
+        (_eth_base, {"counter_expiry_anchor": "90:0x" + "b1" * 31}),
+        (_eth_base, {"counter_expiry_anchor": "٩٠:0x" + "b1" * 32}),
+        (_eth_base, {"counter_expiry_anchor": 90}),
     ],
 )
 def test_a_bad_record_field_is_refused(base, fields):
@@ -80,12 +98,14 @@ def test_a_bad_record_field_is_refused(base, fields):
         {"counter_disposition": CounterDispositionRecord(**_GOOD)},
         {"abort_reason": AbortReason.COUNTER_LEG_REFUNDED, "state": SwapState.ABORTED},
         {"asset_refund_txid": "ab" * 32},
+        {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": 0},
+        {"counter_expiry_anchor": "0:0x" + "b1" * 32},
     ],
 )
 def test_each_new_field_alone_writes_the_current_schema_version(fields):
     record = dataclasses.replace(_eth_base(), **fields)
     d = record.to_dict()
-    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 4
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 5
     assert SwapRecord.from_dict(d) == record
 
 

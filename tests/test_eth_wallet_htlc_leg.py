@@ -983,21 +983,21 @@ async def test_the_balance_is_read_from_the_broadcasting_endpoint(frozen_clock):
     assert len(rpc.sent) == 1
 
 
-async def test_on_signed_sees_the_hash_before_the_broadcast(frozen_clock):
+async def test_on_signed_sees_the_hash_and_nonce_before_the_broadcast(frozen_clock):
     rpc = _Rpc(head_ts=_NOW)
     seen: list = []
 
-    async def on_signed(tx_hash):
-        seen.append((tx_hash, len(rpc.sent)))
+    async def on_signed(tx_hash, nonce):
+        seen.append((tx_hash, nonce, len(rpc.sent)))
 
     sent_hash = await _leg(rpc).refund(_locator(timeout=_NOW), on_signed=on_signed)
-    assert seen == [(sent_hash, 0)] and len(rpc.sent) == 1
+    assert seen == [(sent_hash, 7, 0)] and len(rpc.sent) == 1
 
 
 async def test_a_failing_on_signed_means_nothing_is_broadcast(frozen_clock):
     rpc = _Rpc(head_ts=_NOW)
 
-    async def on_signed(_tx_hash):
+    async def on_signed(_tx_hash, _nonce):
         raise OSError("disk full")
 
     with pytest.raises(OSError):
@@ -1045,3 +1045,114 @@ async def test_HONEST_a_typed_preflight_failure_at_the_full_limit_is_unchanged(f
     with pytest.raises(ValidationError) as ei:
         await _leg(rpc).refund(_locator(timeout=_NOW))
     assert "run out of gas" not in str(ei.value)
+
+
+# ── #850 PR 5b: replacing a pending refund, and reading what happened to one ─────────────────────
+
+
+def _sent_tx(rpc):
+    from eth_account.typed_transactions import TypedTransaction
+    from hexbytes import HexBytes
+
+    return TypedTransaction.from_bytes(HexBytes(rpc.sent[-1])).as_dict()
+
+
+async def test_a_replacement_is_signed_at_the_pending_nonce_with_both_fees_raised(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW, max_fee=100, tip=2)  # the current quote: below the bumped pending fees
+    seen: list = []
+
+    async def on_signed(tx_hash, nonce):
+        seen.append(nonce)
+
+    replace = hl.RefundReplacement(nonce=3, previous_fees={"maxFeePerGas": 1_000, "maxPriorityFeePerGas": 10})
+    await _leg(rpc).refund(_locator(timeout=_NOW), on_signed=on_signed, replace=replace)
+    tx = _sent_tx(rpc)
+    assert tx["nonce"] == 3 and seen == [3]  # not the pending count (7): the same slot
+    assert (tx["maxFeePerGas"], tx["maxPriorityFeePerGas"]) == (1_130, 12)  # +13%, rounded up
+
+
+async def test_a_replacement_never_goes_below_the_current_quote(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW, max_fee=5_000, tip=50)
+    replace = hl.RefundReplacement(nonce=3, previous_fees={"maxFeePerGas": 1_000, "maxPriorityFeePerGas": 10})
+    await _leg(rpc).refund(_locator(timeout=_NOW), replace=replace)
+    tx = _sent_tx(rpc)
+    assert (tx["maxFeePerGas"], tx["maxPriorityFeePerGas"]) == (5_000, 50)
+
+
+async def test_HONEST_without_a_replacement_the_refund_takes_the_pending_nonce(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW, max_fee=100, tip=2)
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    tx = _sent_tx(rpc)
+    assert tx["nonce"] == 7 and (tx["maxFeePerGas"], tx["maxPriorityFeePerGas"]) == (100, 2)
+
+
+def _progress_rpc(*, receipt=None, latest=7, pending=7, tx=None, tx_error=None):
+    rpc = _Rpc()
+
+    async def get_transaction_receipt(_h):
+        return receipt
+
+    async def get_transaction_count(_addr, block="pending"):
+        return {"latest": latest, "pending": pending}[block]
+
+    async def get_transaction(_h):
+        if tx_error is not None:
+            raise tx_error
+        return tx
+
+    rpc.get_transaction_receipt = get_transaction_receipt
+    rpc.get_transaction_count = get_transaction_count
+    rpc.get_transaction = get_transaction
+    return rpc
+
+
+_OURS = "0x" + "e1" * 32
+
+
+@pytest.mark.parametrize(
+    ("kw", "kind"),
+    [
+        ({"latest": 7, "pending": 8, "tx": {"maxFeePerGas": 9, "maxPriorityFeePerGas": 1}}, "pending"),
+        ({"latest": 7, "pending": 7}, "dropped"),
+        ({"latest": 8, "pending": 8}, "nonce_taken"),
+        ({"receipt": {"status": 1, "gasUsed": 51_000}}, "mined"),
+        ({"receipt": {"status": 0, "gasUsed": 150_000}, "tx": {"gas": 150_000}}, "out_of_gas"),
+        ({"receipt": {"status": 0, "gasUsed": 30_000}, "tx": {"gas": 150_000}}, "reverted"),
+        # out of gas is judged against the limit SIGNED, not the constant
+        ({"receipt": {"status": 0, "gasUsed": 100_000}, "tx": {"gas": 100_000}}, "out_of_gas"),
+    ],
+)
+async def test_refund_progress_reads_what_happened_to_our_refund(kw, kind):
+    progress = await _leg(_progress_rpc(**kw)).refund_progress(_OURS, 7)
+    assert progress.kind == kind
+    if kind == "pending":
+        assert progress.fee_fields == {"maxFeePerGas": 9, "maxPriorityFeePerGas": 1}
+    if kind in ("out_of_gas", "reverted"):
+        assert progress.gas_limit == kw["tx"]["gas"]
+
+
+async def test_a_pending_refund_the_endpoint_cannot_return_has_no_fees_to_replace_from():
+    rpc = _progress_rpc(latest=7, pending=8, tx_error=NetworkError("not found"))
+    progress = await _leg(rpc).refund_progress(_OURS, 7)
+    assert progress.kind == "pending" and progress.fee_fields is None
+
+
+async def test_refund_revert_reason_names_the_contract_error_by_selector(frozen_clock):
+    from pyrxd.eth_wallet.events import function_selector
+
+    for name in ("TransferFailed", "SendFailed", "AlreadySettled"):
+        rpc = _Rpc(head_ts=_NOW)
+
+        async def estimate_gas(_tx, name=name):
+            raise ValidationError(f"tx would revert (eth_estimateGas): 0x{function_selector(name + '()').hex()}")
+
+        rpc.estimate_gas = estimate_gas
+        assert await _leg(rpc).refund_revert_reason(_locator(timeout=_NOW)) == name
+    rpc = _Rpc(head_ts=_NOW)
+
+    async def opaque(_tx):
+        raise ValidationError("tx would revert (eth_estimateGas): execution reverted")
+
+    rpc.estimate_gas = opaque
+    assert (await _leg(rpc).refund_revert_reason(_locator(timeout=_NOW))).startswith("unrecognised")
+    assert await _leg(_Rpc(head_ts=_NOW)).refund_revert_reason(_locator(timeout=_NOW)) is None

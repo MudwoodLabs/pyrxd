@@ -992,6 +992,12 @@ def _decide_eth(
                     if covenant_seen
                     else f"maker never locked the asset; the ETH HTLC timeout {deadline_s} has passed "
                     f"(now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"
+                )
+                + (
+                    f". Our refund {record.counter_refund_tx_hash} is recorded and not yet final: run "
+                    "taker_refund_btc again to follow it (it is not sent twice)"
+                    if record.counter_refund_tx_hash is not None
+                    else ""
                 ),
                 recommended_action="taker_refund_btc",
                 low_corroboration=corr,

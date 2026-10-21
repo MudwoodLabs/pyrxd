@@ -148,6 +148,21 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
         (f"abort-reason-{r.value}", _with(_btc_base, state=SwapState.ABORTED, abort_reason=r), ()) for r in AbortReason
     ],
     "asset_refund_txid": [("asset-refund-txid", _with(_eth_base, asset_refund_txid="ab" * 32), ())],
+    "counter_refund_tx_hash": [
+        (
+            "counter-refund",
+            _with(_eth_base, counter_refund_tx_hash="0x" + "e1" * 32, counter_refund_nonce=4),
+            (),
+        )
+    ],
+    "counter_refund_nonce": [
+        (
+            "counter-refund-nonce-zero",
+            _with(_eth_base, counter_refund_tx_hash="0x" + "e1" * 32, counter_refund_nonce=0),
+            (),
+        )
+    ],
+    "counter_expiry_anchor": [("expiry-anchor", _with(_eth_base, counter_expiry_anchor="90:0x" + "b1" * 32), ())],
     "pending_btc_funding_tx": [
         ("pending-btc-fund", lambda: dataclasses.replace(_btc_base(), pending_btc_funding_tx=_raw_btc_tx()), ())
     ],

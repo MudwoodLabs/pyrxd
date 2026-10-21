@@ -33,6 +33,8 @@ __all__ = [
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
     "CounterLegClaimedByCounterparty",
+    "CounterLegPayoutReverts",
+    "CounterLegRefundNeedsOperator",
     "CounterLegSettledUnverified",
     "CovenantError",
     "DmintError",
@@ -400,6 +402,31 @@ class RefundFeeUnaffordable(ValidationError):
         super().__init__(message)
         self.need_wei = need_wei
         self.have_wei = have_wei
+
+
+class CounterLegPayoutReverts(ValidationError):
+    """Our mined refund of the ETH counter leg reverted, and a refund now would revert the same way
+    because the PAYOUT fails: ``TransferFailed`` (the token refused to move, for example a frozen
+    address) or ``SendFailed`` (the refundee refused the ETH) (#850 PR 5b, design §2.3
+    ``PAYOUT_REVERTS``). Re-sending only burns gas until that changes, so nothing is re-sent
+    automatically. The contract stays unsettled and still refundable. ``reason`` is the contract
+    error's name, read from one endpoint's error text."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class CounterLegRefundNeedsOperator(ValidationError):
+    """Our mined refund of the ETH counter leg failed in a way an automatic re-send may not fix
+    (#850 PR 5b, design §3.4): it ran out of gas although it was signed at or above the current
+    estimate, or it reverted for a reason this does not recognise. Nothing more is sent until the
+    operator has looked; ``taker_refund_btc(resend_reverted_refund=True)`` sends one more refund.
+    ``tx_hash`` is the refund that failed."""
+
+    def __init__(self, message: str, *, tx_hash: str) -> None:
+        super().__init__(message)
+        self.tx_hash = tx_hash
 
 
 class CounterLegClaimedByCounterparty(ValidationError):
