@@ -124,6 +124,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `asset_refund_txid`;
     `SWAP_RECORD_SCHEMA_VERSION` is 4. A record carrying any post-v2 field, `role` included, now
     writes 4, so a pyrxd that reads only up to 3 refuses it. The FSM has 15 edges.
+- **`mutual_refund` names a counter-leg refusal a retry cannot pass.** On the attempt-both path
+  (role `none` or `maker`), a `RefundFeeUnaffordable`, `RefundGasAboveCeiling` or `NothingToRefund`
+  from the counter leg is still reported inside the retryable "mutual refund incomplete"
+  `NetworkError`, because the other leg's failure may be transient. The message now says a retry
+  will not complete that leg until the operator acts, and the refusal is chained as the cause.
 - **ETH and token counter-leg refunds are signed with up to 150,000 gas, up from 100,000, after an
   `eth_estimateGas` check (#850 PR 4a).** An estimate above 150,000 raises the new
   `RefundGasAboveCeiling` before anything is signed.

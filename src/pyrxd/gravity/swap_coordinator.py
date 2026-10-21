@@ -59,7 +59,14 @@ from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
-from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
+from pyrxd.security.errors import (
+    NetworkError,
+    NothingToRefund,
+    PreRevealAbort,
+    RefundFeeUnaffordable,
+    RefundGasAboveCeiling,
+    ValidationError,
+)
 from pyrxd.security.reveal import reveal_boundary
 from pyrxd.security.secrets import SecretBytes
 
@@ -1547,6 +1554,11 @@ class _Refusal(str):
         made = super().__new__(cls, text)
         made.definitive = definitive
         return made
+
+
+#: Refusals a retry of :meth:`SwapCoordinator.mutual_refund` cannot pass until the operator acts
+#: (add ETH, push the tokens, or look at the contract). Raised before anything is signed.
+_NEEDS_OPERATOR_ACTION: tuple[type[Exception], ...] = (NothingToRefund, RefundFeeUnaffordable, RefundGasAboveCeiling)
 
 
 class DefinitiveFundRefusal(ValidationError):
@@ -4838,13 +4850,29 @@ class SwapCoordinator:
             # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts both. A
             # leg that already refunded fails harmlessly the second time; a leg that did not gets
             # its chance.
-            raise NetworkError(
+            #
+            # Retryable as a whole (the other leg's failure may be transient), but a refusal that
+            # a retry cannot pass until the operator acts is NAMED as such and chained as the
+            # cause: wrapped in this NetworkError, "add ETH" and "nothing to refund" read as
+            # "retry" (security review of #890, LOW).
+            blocked = [(leg, exc) for leg, exc in failures if isinstance(exc, _NEEDS_OPERATOR_ACTION)]
+            message = (
                 "mutual refund incomplete — "
                 + "; ".join(f"{leg}: {exc}" for leg, exc in failures)
                 + ". The other leg was attempted regardless. The swap stays BOTH_LOCKED so a "
                 "retry re-attempts both; refunds are independent and re-attempting a settled leg "
                 "is harmless."
             )
+            if blocked:
+                message += (
+                    " A retry will NOT complete "
+                    + " or ".join(leg for leg, _exc in blocked)
+                    + " until you act on: "
+                    + "; ".join(f"{type(exc).__name__}" for _leg, exc in blocked)
+                    + " (see above)."
+                )
+                raise NetworkError(message) from blocked[0][1]
+            raise NetworkError(message)
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)
         return self.record
