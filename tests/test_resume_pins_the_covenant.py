@@ -12,6 +12,7 @@ second coordinator instance resuming from the file, and the production ``Reconci
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -60,12 +61,16 @@ def _coordinator(sink, terms=None):
     return coord, btc, terms, view
 
 
-async def _crash_then_resume(tmp_path: Path, *, break_reproof: bool = False):
+async def _crash_then_resume(tmp_path: Path, *, break_reproof: bool = False, older_record: bool = False):
     sink = JsonFileRecordSink(tmp_path / "swap1.json")
     coord, btc, terms, _view = _coordinator(sink)
     btc.read = "network"  # the broadcast lands; the readback fails
     with pytest.raises(NetworkError):
         await coord.taker_funds_btc(terms)
+    if older_record:
+        # What a version that did not write the pin ahead left on disk at the same moment.
+        crashed = sink.load_record()
+        await sink(dataclasses.replace(crashed, radiant_covenant_outpoint=None, radiant_covenant_spk_hex=None))
     fresh, _b, _t, _v = _coordinator(sink, terms=terms)  # a new process
     fresh.counter_leg = coord.counter_leg  # the same chain view, so the landed tx is found
     btc.read = "ok"
@@ -101,11 +106,32 @@ async def test_a_resumed_landed_fund_is_pinned_and_the_tower_does_not_arm_autono
     assert "maker never locked" not in decision.reason
 
 
-async def test_a_failed_reproof_still_records_the_lock_unpinned(tmp_path):
+async def test_the_pin_is_on_disk_before_the_broadcast_so_a_resume_needs_no_reproof(tmp_path):
+    """The rare leftover of PR 1b: a resume whose re-proof failed stayed unpinned. The proof is now
+    written ahead with the funding bytes, so the crashed record already carries it."""
+    sink = JsonFileRecordSink(tmp_path / "swap1.json")
+    coord, btc, terms, _view = _coordinator(sink)
+    btc.read = "network"
+    with pytest.raises(NetworkError):
+        await coord.taker_funds_btc(terms)
+    crashed = sink.load_record()
+    assert crashed.state is SwapState.NEGOTIATED and crashed.pending_btc_funding_tx is not None
+    assert crashed.radiant_covenant_outpoint is not None
+    (tmp_path / "again").mkdir()
+    record = await _crash_then_resume(tmp_path / "again", break_reproof=True)
+    assert record.state is SwapState.BTC_LOCKED and record.radiant_covenant_outpoint is not None
+
+
+async def test_an_older_record_whose_reproof_fails_still_records_the_lock_unpinned(tmp_path):
     """Recording the landed lock never depends on the re-proof: the funds already moved."""
-    record = await _crash_then_resume(tmp_path, break_reproof=True)
+    record = await _crash_then_resume(tmp_path, break_reproof=True, older_record=True)
     assert record.state is SwapState.BTC_LOCKED
     assert record.radiant_covenant_outpoint is None
+
+
+async def test_an_older_record_is_pinned_by_the_reproof(tmp_path):
+    record = await _crash_then_resume(tmp_path, older_record=True)
+    assert record.radiant_covenant_outpoint is not None
 
 
 # --------------------------------------------------------------------------- a value-bearing chain

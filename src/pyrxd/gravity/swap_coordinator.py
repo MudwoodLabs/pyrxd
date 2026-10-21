@@ -2662,6 +2662,19 @@ class SwapCoordinator:
             f"{blocks_s} s at ε = {early.epsilon:.3g}, and the newest header may be up to {slack} s old",
         )
 
+    def _pinned_to_the_verified_covenant(self, record: SwapRecord) -> SwapRecord:
+        """*record* carrying the covenant this fund was just proved against, for the write that
+        happens BEFORE the counter leg is broadcast (#850 PR 1b follow-up).
+
+        The proof (the lock-time re-run) is in memory until the lock is recorded, and a crash between
+        the broadcast and that record lost it: a resume then had to re-prove the covenant, and when
+        that re-proof failed the record stayed unpinned. Written ahead with the bytes it justifies, it
+        survives the crash, and :meth:`_try_pin_covenant_on_resume` is left only for a record written
+        by an older version mid-fund. Overwrites any earlier pin: this broadcast was judged against
+        THIS proof."""
+        verified = getattr(self, "_fund_verified_covenant", None)
+        return record if verified is None else record.with_radiant_lock(*verified)
+
     async def _try_pin_covenant_on_resume(
         self, terms: NegotiatedTerms, *, now_unix_s: int | None, now_sampled_monotonic: float
     ) -> None:
@@ -3081,10 +3094,12 @@ class SwapCoordinator:
             self.record = staged
 
         async def _remember_deploy(address: str, deploy_tx_hash: str) -> None:
-            self.record = dataclasses.replace(
-                self.record,
-                pending_counter_contract=address,
-                pending_counter_deploy_tx=deploy_tx_hash,
+            self.record = self._pinned_to_the_verified_covenant(
+                dataclasses.replace(
+                    self.record,
+                    pending_counter_contract=address,
+                    pending_counter_deploy_tx=deploy_tx_hash,
+                )
             )
             await self._persist_record(self.record, shield=True)
 
@@ -3111,7 +3126,9 @@ class SwapCoordinator:
                 # Durable BEFORE the broadcast: the only moment the bytes are certain to be ours
                 # and not yet on chain. Shielded so a cancellation cannot drop the one write that
                 # makes the broadcast after it recoverable.
-                staged = dataclasses.replace(self.record, pending_btc_funding_tx=raw_tx_hex)
+                staged = self._pinned_to_the_verified_covenant(
+                    dataclasses.replace(self.record, pending_btc_funding_tx=raw_tx_hex)
+                )
                 # Adopted only once the write returns: if it raises, the leg never broadcasts, and the
                 # in-memory record must not claim the transaction. (A hook that writes and THEN raises
                 # leaves it on disk only; a resume from disk recovers that — nothing was sent.)
