@@ -4378,6 +4378,151 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
+    # -- the counter leg's disposition, read from the chain (#850 PR 5a) --------------------
+
+    async def _read_counter_disposition(self) -> Any:
+        """The ETH counter leg's disposition from the chain (``CounterDisposition``), or ``None``
+        when the leg cannot read one (a BTC leg, or a leg written before 0.27)."""
+        read = getattr(self.counter_leg, "counter_disposition", None)
+        locator = self.record.counterchain_locator
+        if read is None or self.record.terms.counter_chain != "eth" or not isinstance(locator, EthHtlcLocator):
+            return None
+        return await read(locator)
+
+    @staticmethod
+    def _single_source_may_decide(chain_id: int) -> bool:
+        """Design §2.5 / D4: one endpoint's answer never changes a record's state on a chain that
+        carries value. A known testnet, or anvil's default chain, may decide on one endpoint (the
+        answer is recorded as single-source either way); an unknown chain id may not."""
+        if chain_id == 31337:  # anvil
+            return True
+        from pyrxd.eth_wallet.chains import evm_chain_by_id
+
+        try:
+            return bool(evm_chain_by_id(chain_id).is_testnet)
+        except ValidationError:
+            return False
+
+    async def _claim_seen_holds_the_terminal(self) -> bool:
+        """D14 / N1: with an unverified ``Claimed(p)`` on record, ``p`` is public, so a refunded
+        counter leg must not take the record terminal before the covenant's ``t_rxd`` matures: the
+        covenant claim comes first. An unreadable covenant depth holds (fail-safe)."""
+        if self.record.counter_claim_tx is None:
+            return False
+        try:
+            elapsed = await self._covenant_elapsed_blocks()
+        except Exception as exc:  # unreadable: hold, and say why
+            logger.warning("covenant depth unreadable while a counter-leg claim is on record (%s); holding", exc)
+            return True
+        return elapsed < int(self.record.terms.t_rxd.value)
+
+    async def _apply_counter_disposition(self, disposition: Any) -> str:
+        """Apply what the chain shows to the record (design §3.2). No broadcast. Returns one of
+        ``"claimed"``, ``"refunded"``, ``"held"``, ``"recorded"``, ``"unknown"``, ``"none"``, and
+        persists, shielded, whenever the record changed.
+
+        * A ``Claimed(p)`` seen but not verified is kept as ``counter_claim_tx`` (liveness: the
+          covenant claim is due) whatever else the answer is.
+        * ``CLAIMED`` (verified, or Gap B): a taker's or single operator's record at BTC_LOCKED or
+          BOTH_LOCKED goes to SECRET_REVEALED. At PARAMS_MISMATCH there is deliberately no edge (B2):
+          the evidence is recorded and this raises. A maker's record records the evidence and stays.
+        * ``REFUNDED``: a taker's or single operator's record at BTC_LOCKED or PARAMS_MISMATCH goes to
+          ABORTED (``abort_reason``), unless a recorded claim holds it (D14). BOTH_LOCKED is PR 6's;
+          a maker's record records the evidence and stays.
+        * A terminal answer from one endpoint on a chain that carries value changes nothing (D4).
+        """
+        from .swap_state import AbortReason, CounterDispositionRecord
+
+        if disposition is None:
+            return "none"
+        from pyrxd.eth_wallet.disposition import DispositionKind
+
+        changed = False
+        if self.record.counter_claim_tx is None and disposition.claims_seen:
+            claim = disposition.claims_seen[0]
+            self.record = dataclasses.replace(self.record, counter_claim_tx=claim.tx_hash)
+            changed = True
+            logger.warning(
+                "a Claimed(p) log on the counter-leg contract opens this swap's hashlock (tx %s, %s): p is "
+                "public, so claim the covenant before its CSV refund to the maker opens at t_rxd",
+                claim.tx_hash,
+                "verified" if claim.verified else "not verified",
+            )
+        kind = disposition.kind
+        outcome = "unknown" if kind is DispositionKind.UNKNOWN else "none"
+        evidence = disposition.evidence
+        if kind in (DispositionKind.CLAIMED, DispositionKind.REFUNDED) and evidence is not None:
+            locator = self.record.counterchain_locator
+            if disposition.single_source and not self._single_source_may_decide(int(locator.chain_id)):
+                logger.warning(
+                    "the counter leg reads %s, but from ONE endpoint on chain %s, which carries value; "
+                    "nothing changes until a multi-source rpc agrees (design §2.5)",
+                    kind.value,
+                    locator.chain_id,
+                )
+                outcome = "unknown"
+            else:
+                record_evidence = CounterDispositionRecord(
+                    kind=kind.value,
+                    block_number=evidence.block_number,
+                    block_hash=evidence.block_hash,
+                    tx_hash=evidence.tx_hash,
+                    sources=tuple(evidence.sources),
+                    single_source=evidence.single_source,
+                )
+                self.record = dataclasses.replace(self.record, counter_disposition=record_evidence)
+                changed = True
+                outcome = "recorded"
+                state = self.record.state
+                acts = self.config.role is not SwapRole.MAKER
+                if kind is DispositionKind.CLAIMED:
+                    if evidence.tx_hash is not None:
+                        self.record = dataclasses.replace(self.record, counter_claim_tx=evidence.tx_hash)
+                    if acts and state is SwapState.PARAMS_MISMATCH:
+                        await self._persist_record(self.record, shield=True)
+                        raise ValidationError(
+                            "the counter leg was CLAIMED (verified at the finalized block) after a params "
+                            "mismatch. There is deliberately no path into the taker's claim flow from here: "
+                            "refund your covenant by its CSV leg at t_rxd. The evidence is on the record."
+                        )
+                    if acts and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED):
+                        if self.record.radiant_covenant_outpoint is None:
+                            await self._persist_record(self.record, shield=True)
+                            raise ValidationError(
+                                "the counter leg was CLAIMED (verified), so p is public, but this record names "
+                                "no covenant outpoint to claim. Find the covenant (pyrxd swap status) and claim "
+                                "it with p before t_rxd. The evidence is on the record."
+                            )
+                        self._advance(SwapEvent.COUNTER_LEG_CLAIMED_OBSERVED)
+                        outcome = "claimed"
+                elif acts and state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
+                    if await self._claim_seen_holds_the_terminal():
+                        outcome = "held"
+                    else:
+                        self.record = dataclasses.replace(self.record, abort_reason=AbortReason.COUNTER_LEG_REFUNDED)
+                        self._advance(SwapEvent.COUNTER_LEG_REFUNDED_OBSERVED)
+                        outcome = "refunded"
+        if changed:
+            await self._persist_record(self.record, shield=True)
+        return outcome
+
+    @_serialized_step
+    async def reconcile_counter_leg(self) -> SwapRecord:
+        """Bring the record up to what the chain shows about the ETH counter leg (#850 PR 5a,
+        design §3.3). No broadcast. Valid from BTC_LOCKED, PARAMS_MISMATCH and BOTH_LOCKED.
+
+        An unreadable, below-quorum or contradictory chain changes nothing and raises
+        :class:`NetworkError` with the reason; see :meth:`_apply_counter_disposition` for the rest.
+        """
+        if self.record.state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
+            raise ValidationError(f"reconcile_counter_leg not valid from {self.record.state.value}")
+        disposition = await self._read_counter_disposition()
+        if disposition is None:
+            raise ValidationError("reconcile_counter_leg needs an ETH counter leg that reads its disposition")
+        if await self._apply_counter_disposition(disposition) == "unknown":
+            raise NetworkError(f"the counter leg's disposition is unknown: {disposition.reason}")
+        return self.record
+
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)
     @_serialized_step
     async def taker_refund_btc(self) -> SwapRecord:
@@ -4393,7 +4538,25 @@ class SwapCoordinator:
             raise ValidationError(f"taker_refund_btc not valid from {state.value}")
         if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot refund (state was lost)")
+        disposition = await self._read_counter_disposition()
+        if disposition is not None:
+            # ETH (#850 PR 5a, design §3.3): read what the chain shows FIRST. The refund is the
+            # taker's; a maker's process has no business sending it.
+            if self.config.role is SwapRole.MAKER:
+                raise ValidationError("taker_refund_btc is the taker's step; refused for a MAKER-role coordinator")
+            from pyrxd.eth_wallet.disposition import DispositionKind
+
+            outcome = await self._apply_counter_disposition(disposition)
+            if outcome in ("claimed", "refunded", "held"):
+                return self.record  # observed: nothing to send (claimed: SECRET_REVEALED; refunded: done)
+            if disposition.kind is DispositionKind.SETTLED_UNFINAL:
+                return self.record  # settled at the tip, not yet final: wait, send nothing
         await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
+        if disposition is not None and await self._claim_seen_holds_the_terminal():
+            # Our refund is sent, but a claim with p is on record and t_rxd has not matured: the
+            # record stays where the covenant-claim page can still find it (D14).
+            await self._persist_record(self.record, shield=True)
+            return self.record
         if state is SwapState.BTC_LOCKED:
             self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
         else:

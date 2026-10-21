@@ -360,6 +360,14 @@ class EthLeg:
         (:meth:`EthHtlcContractLeg._settled_word`)."""
         return any(await self._leg._settled_word(locator, None))
 
+    async def counter_disposition(self, locator: EthHtlcLocator):
+        """What the chain says about this swap's HTLC, read and verified at the finalized block
+        (:func:`pyrxd.eth_wallet.disposition.read_counter_disposition`, #850 PR 5a). Read-only; never
+        raises for a chain read (an unreadable chain is ``UNKNOWN``)."""
+        from pyrxd.eth_wallet.disposition import read_counter_disposition
+
+        return await read_counter_disposition(self._leg._rpc, locator)
+
     # -- secret recovery + finality ------------------------------------------------------
 
     def scrape_secret(self, claim_artifacts: list[bytes], hashlock: bytes) -> bytes:

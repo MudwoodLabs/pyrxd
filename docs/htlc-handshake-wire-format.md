@@ -40,7 +40,7 @@ re-derive from it.
 | Concern | Authoritative source |
 |---|---|
 | The negotiated-terms object and its JSON wire form | `src/pyrxd/gravity/swap_state.py:339-575` (`NegotiatedTerms`) |
-| The state machine every message drives | `src/pyrxd/gravity/swap_state.py:74-300` (13 states, 14 edges, `advance`) |
+| The state machine every message drives | `src/pyrxd/gravity/swap_state.py:74-300` (13 states, 15 edges, `advance`) |
 | The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:584-933` (`SwapRecord`), `src/pyrxd/gravity/swap_state.py:47` (`SWAP_RECORD_SCHEMA_VERSION`) |
 | Role invariant + timelock-margin rule | `src/pyrxd/gravity/swap_coordinator.py:154-174` (`MAKER_SECRET_TAKER_LOCKS_BTC_FIRST`), `src/pyrxd/gravity/swap_coordinator.py:844-1006` (`assert_timelock_margin`) |
 | Pre-fund validation gate (what a taker checks before locking) | `src/pyrxd/gravity/swap_coordinator.py:1957-2139` (`pre_btc_lock_check`) |
@@ -775,7 +775,7 @@ after the taker has locked strands the taker's counter leg.
 
 ## The state machine
 
-The FSM is the pure, exhaustively-tested core: 13 states, 14 edges, in `swap_state.py:74-238`.
+The FSM is the pure, exhaustively-tested core: 13 states, 15 edges, in `swap_state.py:74-238`.
 `advance(state, event)` raises on any undefined `(state, event)` pair and on any transition out of
 a terminal state — an undefined edge is a bug, never a no-op (`:285-300`).
 
@@ -795,6 +795,19 @@ a terminal state — an undefined edge is a bug, never a no-op (`:285-300`).
 | `SECRET_REVEALED` | `TAKER_OFFLINE_OR_PINNED` | `ASSET_VULNERABLE` | reorg gate `SQUEEZED` |
 | `ASSET_VULNERABLE` | `TAKER_SCRAPES_P_CLAIMS_ASSET` | `COMPLETED` *(terminal)* | deliberate winner-take-all |
 | `ASSET_VULNERABLE` | `MAKER_REFUNDS_ASSET_CSV` | `ONE_SIDED_LOSS_TAKER` *(terminal)* | the R1 residual |
+| `BTC_LOCKED` | `COUNTER_LEG_REFUNDED_OBSERVED` | `ABORTED` *(terminal)* | ETH counter leg refunded, verified at a finalized block |
+| `PARAMS_MISMATCH` | `COUNTER_LEG_REFUNDED_OBSERVED` | `ABORTED` *(terminal)* | the same, after a params mismatch |
+| `BTC_LOCKED` | `COUNTER_LEG_CLAIMED_OBSERVED` | `SECRET_REVEALED` | ETH counter leg claimed, verified at a finalized block |
+| `BOTH_LOCKED` | `COUNTER_LEG_CLAIMED_OBSERVED` | `SECRET_REVEALED` | the same, from `BOTH_LOCKED` |
+
+The four `COUNTER_LEG_*_OBSERVED` rows (#850, PR 5a) are taken on what the chain shows at the
+quorum-minimum finalized block (`pyrxd.eth_wallet.disposition`), not on a broadcast of ours. Only
+a taker's or a single operator's record takes them; a maker's records the evidence and stays. An
+observed refund does not take a record terminal while a `Claimed` log that opens the hashlock is
+recorded (`counter_claim_tx`) and the covenant's `t_rxd` has not matured: `p` is public, and the
+covenant claim comes first. The record carries the evidence (`counter_disposition`) and, on an
+observed refund, `abort_reason`. Only the ETH counter leg is read this way so far; a BTC record's
+transitions are unchanged.
 
 Terminal states: `COMPLETED`, `MUTUAL_REFUND`, `ABORTED`, `ASSET_REFUNDED_TAKER_ACTS`,
 `ONE_SIDED_LOSS_TAKER` (`swap_state.py:147-155`).
