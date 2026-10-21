@@ -2069,12 +2069,13 @@ class FakeEthLeg:
         # Mirror the real leg: report the nonce the push is pinned to BEFORE broadcasting, so the
         # caller can make it durable. A fake that skipped this would hide a coordinator that never
         # records the pin — and an unrecorded pin is no pin at all on the retry that needs it.
+        # Mirror the real legs' ORDER (Mythos review of #891, F4): the deploy is reported first, then
+        # the push nonce. Reversed, a test of the deploy write was satisfied by the nonce write.
+        # The real legs do not re-report a resumed deploy.
+        if on_deploy is not None and resume_from is None:
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
         if on_push_nonce is not None and push_nonce is None:
             await on_push_nonce(7)
-        # Mirror the real leg: report the deployed address before returning a locator, so a
-        # coordinator test can observe what the record holds mid-fund.
-        if on_deploy is not None and resume_from is None:  # the real legs do not re-report a resumed deploy
-            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
         loc = EthHtlcLocator(
             chain_id=11155111,
             contract_address="0x" + "ab" * 20,
@@ -3540,6 +3541,67 @@ async def test_an_eth_resume_pins_the_covenant_ITS_OWN_proof_found(tmp_path):
     rec = await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
     assert rec.state is SwapState.BTC_LOCKED
     assert rec.radiant_covenant_outpoint == second != first
+
+
+async def test_a_token_resume_with_a_recorded_nonce_writes_its_proof_with_the_push_hash(tmp_path):
+    """Mythos review of #891, F2: with the push nonce already recorded the real ERC-20 leg skips
+    `on_push_nonce`, so the ONLY write before the re-sent push is `on_push_hash`. That hook carried the
+    pin, but no test reached it: the fake leg did not accept it and `_accepted_kwargs` dropped it."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    class _CrashAfterNonce(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            await on_push_nonce(7)
+            raise NetworkError("process died before the push was sent")
+
+    class _ResumeSendsThePush(FakeEthLeg):
+        async def fund(
+            self,
+            terms,
+            *,
+            on_deploy=None,
+            resume_from=None,
+            push_nonce=None,
+            on_push_nonce=None,
+            push_tx_hash=None,
+            on_push_hash=None,
+        ):
+            assert push_nonce == 7 and resume_from is not None  # as the real leg: no on_push_nonce
+            await on_push_hash(7, "0x" + "ee" * 32)
+            raise NetworkError("process died after the push was sent")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(terms=terms, eth_leg=_CrashAfterNonce(preimage=secret, verdict=_final()), seen_store=seen)
+    crashed._persist = sink
+    with pytest.raises(NetworkError):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+    first = sink.load_record().radiant_covenant_outpoint
+
+    resumed = _eth_coord_full(
+        terms=terms,
+        eth_leg=_ResumeSendsThePush(preimage=secret, verdict=_final()),
+        seen_store=seen,
+        fund_lock=_MemLock(),
+    )
+    resumed._persist = sink
+    real = resumed.taker_verify_asset_funding
+    second = "ff" * 32 + ":1"
+
+    async def _elsewhere(*a, **k):
+        _o, value, upper = await real(*a, **k)
+        return second, value, upper
+
+    resumed.taker_verify_asset_funding = _elsewhere
+    with pytest.raises(NetworkError):
+        await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    on_disk = sink.load_record()
+    assert on_disk.pending_push_tx_hash == "0x" + "ee" * 32
+    assert on_disk.radiant_covenant_outpoint == second != first
 
 
 async def test_an_eth_resume_that_pushes_writes_its_own_proof_before_the_push(tmp_path):

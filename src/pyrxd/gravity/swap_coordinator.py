@@ -2924,10 +2924,9 @@ class SwapCoordinator:
                 # The interrupted fund already landed: record the truth. No gate and no reservation
                 # check run — recording an output already on chain sends nothing, and refusing would
                 # only leave the funds untracked (the stranding this path exists to end).
-                if (
-                    getattr(self, "_fund_verified_covenant", None) is None
-                    and self.record.radiant_covenant_outpoint is None
-                ):
+                # Only a record that is not pinned yet (written mid-fund by an older version) needs
+                # the covenant proved again; the proof was reset above, so this call has none.
+                if self.record.radiant_covenant_outpoint is None:
                     await self._try_pin_covenant_on_resume(
                         terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
                     )

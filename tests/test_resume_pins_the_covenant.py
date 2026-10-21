@@ -203,3 +203,44 @@ async def test_a_reused_coordinators_stale_proof_never_replaces_the_pin_on_disk(
     btc.read = "ok"
     await fresh.resume_interrupted_fund(terms, sink=sink, now_unix_s=None)
     assert sink.load_record().radiant_covenant_outpoint == pinned
+
+
+async def test_on_a_value_bearing_chain_an_older_records_reproof_uses_the_clock(tmp_path, monkeypatch):
+    """Mythos review of #891, F1: with the write-ahead the value-bearing test above takes the
+    "already pinned" branch, so it no longer guarded the #888 fix (the re-proof's clock). A record
+    from an older version, with no pin, still needs that re-proof on mainnet."""
+    base, _chain = T._value_bearing_chain(monkeypatch)
+    terms = T._vb_terms(400)
+    sink = JsonFileRecordSink(tmp_path / "swap1.json")
+    coord, btc = _vb_coordinator(sink, base, terms)
+    btc.read = "network"
+    with pytest.raises(NetworkError):
+        await coord.taker_funds_btc(terms, now_unix_s=T._NOW)
+    crashed = sink.load_record()
+    await sink(dataclasses.replace(crashed, radiant_covenant_outpoint=None, radiant_covenant_spk_hex=None))
+    fresh, _btc = _vb_coordinator(sink, base, terms)
+    fresh.counter_leg = coord.counter_leg
+    btc.read = "ok"
+    await fresh.resume_interrupted_fund(terms, sink=sink, now_unix_s=T._NOW)
+    record = sink.load_record()
+    assert record.state is SwapState.BTC_LOCKED and record.radiant_covenant_outpoint is not None
+
+
+async def test_the_tower_does_not_read_the_covenant_of_a_negotiated_record(tmp_path):
+    """Mythos review of #891, F3: a crash now leaves a NEGOTIATED record pinned. Reading its covenant
+    gained nothing (decide() only watches NEGOTIATED) and paged "reconcile error" every tick when the
+    RXD source was below quorum."""
+    sink = JsonFileRecordSink(tmp_path / "swap1.json")
+    coord, btc, terms, _view = _coordinator(sink)
+    btc.read = "network"
+    with pytest.raises(NetworkError):
+        await coord.taker_funds_btc(terms)
+    record = sink.load_record()
+    assert record.state is SwapState.NEGOTIATED and record.radiant_covenant_outpoint is not None
+
+    class _BelowQuorum(FakeRxd):
+        async def covenant_confirmations(self, outpoint):
+            raise NetworkError("covenant_confirmations: below quorum")
+
+    obs = await ChainObserver(rxd=_BelowQuorum(tip=1000, cov_confs=50), btc=_Btc(0)).observe("swap1", record)
+    assert obs.asset_locked_at_height is None
