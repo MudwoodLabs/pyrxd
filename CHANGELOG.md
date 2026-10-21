@@ -111,8 +111,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     refunded never completed, because re-sending that leg failed and any failure kept the record
     at `BOTH_LOCKED`. Now an ETH counter leg verified refunded at the finalized block is not sent
     again, and the covenant refund is recorded as `asset_refund_txid` when its broadcast returns
-    and not sent again on a retry once it has a confirmation (a recorded refund that was dropped
-    is sent again). A verified claim stops `mutual_refund` before the covenant is refunded: a
+    and not sent again on a retry once it has a confirmation. A recorded refund that is not
+    confirmed is judged by the covenant itself: still unspent means it never landed, and it is sent
+    again (a node that has forgotten the refund answers like an outage, so its own depth cannot
+    decide). The covenant refund also waits while the counter leg may have been claimed: settled at
+    the tip but not yet final, or a `Claimed` log on record before t_rxd. A verified claim stops `mutual_refund` before the covenant is refunded: a
     single operator's record moves to `SECRET_REVEALED`, and a maker's raises, because the
     covenant is then the taker's to claim. A BTC counter leg is still re-sent on a retry (#850
     PR 9), and so is an ETH counter leg read refunded from one endpoint on a chain that carries
