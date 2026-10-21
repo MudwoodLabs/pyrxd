@@ -713,15 +713,16 @@ def test_eth_maker_never_locks_watches_when_the_clock_is_unread():
     assert d.intent is Intent.WATCH
 
 
-def test_eth_stale_btc_locked_record_with_an_observed_asset_lock_does_not_page_refund():
-    """Mirrors the BTC arm's fail-closed: an asset lock seen on-chain means the maker DID lock, so a
-    stale BTC_LOCKED record must not be turned into a refund recommendation."""
-    d = _decide_e(
-        _eth(SwapState.BTC_LOCKED),
-        _eth_btc_locked_obs(now_unix_s=4_000_000_001, lock=LOCK),
-    )
-    assert d.intent is Intent.WATCH
-    assert "maker locked" in d.reason
+def test_eth_btc_locked_with_an_observed_covenant_pages_the_refund_past_the_deadline():
+    """#850 PR 1b (item 6). This test used to pin the defect: an observed covenant made a BTC_LOCKED
+    record WATCH for good. The maker locks first, so that is the TAKER's normal record, and a maker
+    who locked and never claimed left the taker unpaged past the ETH deadline. Past it the contract
+    refuses a claim, so the refund is due. Before it, the tower still watches."""
+    after = _decide_e(_eth(SwapState.BTC_LOCKED), _eth_btc_locked_obs(now_unix_s=4_000_000_001, lock=LOCK))
+    assert after.intent is Intent.PAGE_REFUND and after.recommended_action == "taker_refund_btc"
+    assert "never claimed" in after.reason
+    before = _decide_e(_eth(SwapState.BTC_LOCKED), _eth_btc_locked_obs(now_unix_s=1, lock=LOCK))
+    assert before.intent is Intent.WATCH and "covenant is observed" in before.reason
 
 
 def test_observations_rejects_a_negative_clock():

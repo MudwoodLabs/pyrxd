@@ -89,7 +89,20 @@ _CALLS = {
     "block_number": lambda r: r.block_number(),
     "canonical_block_hash": lambda r: r.canonical_block_hash(1),
     "get_logs": lambda r: r.get_logs(address="0x" + "11" * 20),
+    "block_hash_and_timestamp": lambda r: r.block_hash_and_timestamp(1),
+    "get_storage_at": lambda r: r.get_storage_at("0x" + "11" * 20, 0, 1),
+    # Records failures instead of raising, so the RECORDED text is what is checked: it is what a
+    # page or a log line would show.
+    "get_logs_union": lambda r: _union_failure_raised(r),
 }
+
+
+async def _union_failure_raised(r):
+    u = await r.get_logs_union(address="0x" + "11" * 20, topics=[], from_block=0, to_block=0)
+    assert u.failed, "the union recorded no failure, so this proved nothing"
+    raise RuntimeError("; ".join(u.failed.values()))
+
+
 _NOT_A_READ = {"close"}  # tears the session down; raises nothing by design
 
 

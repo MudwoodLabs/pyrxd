@@ -228,7 +228,11 @@ class ChainObserver(Observer):
         # unit-tagging exists for: `Confirmations` in, `ChainHeight` out, with the arithmetic
         # that justifies the re-tag visible on one line.
         asset_locked: ChainHeight | None = None
-        if record.radiant_covenant_outpoint is not None:
+        # Not for a NEGOTIATED record: a taker's fund now writes the pin before its broadcast, so a
+        # crash leaves a NEGOTIATED record pinned, and decide() only WATCHes that state. Reading the
+        # covenant there turned an RXD source below quorum into a "reconcile error" page every tick
+        # for nothing it could use (Mythos review of #891, F3).
+        if record.radiant_covenant_outpoint is not None and record.state is not SwapState.NEGOTIATED:
             cov_confs = await self._rxd.covenant_confirmations(record.radiant_covenant_outpoint)
             if cov_confs is not None and cov_confs >= 1:
                 candidate = ChainHeight(int(tip) - int(cov_confs) + 1)

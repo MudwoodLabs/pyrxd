@@ -46,11 +46,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..network.redaction import redact_endpoints_in
 from ..network.source_identity import require_distinct_sources
 from ..security.errors import NetworkError, ValidationError
+
+if TYPE_CHECKING:
+    from .disposition import LogUnion
 
 __all__ = ["MultiSourceEthRpc", "read_contract"]
 
@@ -347,6 +350,20 @@ class MultiSourceEthRpc:
             lambda s: s.canonical_block_hash(block_number), label=f"canonical_block_hash({block_number})"
         )
 
+    async def block_hash_and_timestamp(self, block_number: int) -> tuple[bytes, int]:
+        """An IDENTITY read: every answering source must give the same hash and timestamp."""
+        return await self.eth_call_quorum(
+            lambda s: s.block_hash_and_timestamp(block_number), label=f"block_hash_and_timestamp({block_number})"
+        )
+
+    async def get_storage_at(self, address: str, slot: int, block_identifier: str | int) -> bytes:
+        """An IDENTITY read, like ``get_code``. At ``"latest"`` two honest endpoints one block apart
+        can disagree, and this refuses: pin an integer block for a decision."""
+        return await self.eth_call_quorum(
+            lambda s: s.get_storage_at(address, slot, block_identifier),
+            label=f"get_storage_at({slot}, {block_identifier!r})",
+        )
+
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         """Quorum on the two fields a swap decision turns on — did it succeed, and in which block.
 
@@ -463,6 +480,14 @@ class MultiSourceEthRpc:
         checked against the hashlock — so a lying endpoint cannot forge one, and a missing log is a
         liveness problem rather than a safety one."""
         return await self.primary.get_logs(*args, **kwargs)
+
+    async def get_logs_union(self, *, address: str, topics: list[Any], from_block: int, to_block: int) -> LogUnion:
+        """The #850 union log read: EVERY source is asked, unlike :meth:`get_logs` (primary only, for
+        the self-verifying preimage scrape). Returns the union and who answered; a source that fails
+        is recorded, never read as empty. For NOMINATION only: each log names a tx to verify."""
+        from .disposition import union_logs
+
+        return await union_logs(self, address=address, topics=topics, from_block=from_block, to_block=to_block)
 
     async def close(self) -> None:
         await asyncio.gather(*(s.close() for s in self._sources), return_exceptions=True)

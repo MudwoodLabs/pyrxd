@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pyrxd.network.redaction import redact_endpoint_secrets, redact_endpoints_in
 from pyrxd.network.source_identity import source_key
 from pyrxd.security.errors import NetworkError, RxdSdkError, ValidationError
+
+if TYPE_CHECKING:
+    from .disposition import LogUnion
 
 __all__ = ["EthRpc"]
 
@@ -529,6 +532,31 @@ class EthRpc:
         h = blk.get("hash")
         return bytes(h) if h is not None else b""
 
+    async def block_hash_and_timestamp(self, block_number: int) -> tuple[bytes, int]:
+        """``(hash, timestamp)`` of the canonical block at ``block_number``, from ONE block read, so
+        the timestamp is bound to the hash it came with (#850 disposition reader: ``timestamp(F)``
+        decides expiry and must be the timestamp of the block whose hash was agreed)."""
+        if not isinstance(block_number, int) or isinstance(block_number, bool) or block_number < 0:
+            raise NetworkError("block_number must be a non-negative int")
+        try:
+            blk = await self._w3.eth.get_block(block_number)
+        except Exception as exc:
+            raise self._failed(f"eth_getBlockByNumber({block_number}) failed", exc)
+        h, ts = blk.get("hash"), blk.get("timestamp")
+        if h is None or ts is None:
+            raise NetworkError(f"block {block_number} carries no hash or timestamp")
+        return bytes(h), int(ts)
+
+    async def get_storage_at(self, address: str, slot: int, block_identifier: str | int) -> bytes:
+        """The 32-byte storage word at ``slot`` of ``address`` as of ``block_identifier``. An integer
+        block needs historic state, which a non-archive endpoint refuses: that is a failed read,
+        never a zero."""
+        try:
+            word = await self._w3.eth.get_storage_at(address, slot, block_identifier=block_identifier)
+        except Exception as exc:
+            raise self._failed(f"eth_getStorageAt({slot}, {block_identifier!r}) failed", exc)
+        return bytes(word).rjust(32, b"\x00")
+
     async def get_logs(
         self,
         *,
@@ -556,6 +584,14 @@ class EthRpc:
         if len(raw) > _MAX_LOG_ENTRIES:
             raise NetworkError(f"eth_getLogs returned {len(raw)} entries (> {_MAX_LOG_ENTRIES} cap); refusing")
         return [dict(log) for log in raw]
+
+    async def get_logs_union(self, *, address: str, topics: list[Any], from_block: int, to_block: int) -> LogUnion:
+        """The #850 union log read (:func:`pyrxd.eth_wallet.disposition.union_logs`) over this one
+        endpoint: chunked, halved on a range-limit refusal, a failure recorded rather than read as
+        "no logs". For NOMINATION only. :meth:`get_logs` is unchanged."""
+        from .disposition import union_logs
+
+        return await union_logs(self, address=address, topics=topics, from_block=from_block, to_block=to_block)
 
     async def close(self) -> None:
         """Close the underlying provider session if it exposes one."""

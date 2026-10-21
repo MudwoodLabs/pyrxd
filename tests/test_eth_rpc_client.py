@@ -148,6 +148,9 @@ class _Eth:
     async def estimate_gas(self, *a, **k):
         return self._node.answer("estimate_gas", *a, **k)
 
+    async def get_storage_at(self, *a, **k):
+        return self._node.answer("get_storage_at", *a, **k)
+
 
 def _client(*, expected_chain_id: int = 1, **answers: Any) -> tuple[EthRpc, _Node]:
     """A real ``EthRpc`` (so the constructor's own validation runs) wired to a fake node."""
@@ -930,3 +933,65 @@ class TestEstimateGas:
         client, _ = _client(estimate_gas=ValueError("execution reverted: out of gas"))
         with pytest.raises(NetworkError):
             _run(client.estimate_gas(_CLAIM_TX))
+
+
+# --------------------------------------------------------------------------------------------
+# block_hash_and_timestamp / get_storage_at — the #850 disposition reader's invariant reads
+# --------------------------------------------------------------------------------------------
+
+
+class TestBlockHashAndTimestamp:
+    _HASH = HexBytes(bytes.fromhex("ab" * 32))
+
+    def test_hash_and_timestamp_come_from_one_block_read(self) -> None:
+        client, node = _client(
+            get_block=lambda n, *a, **k: AttributeDict({"hash": self._HASH, "timestamp": 1_700_000_012})
+        )
+        assert _run(client.block_hash_and_timestamp(0)) == (bytes.fromhex("ab" * 32), 1_700_000_012)
+        assert node.asked("get_block") == [((0,), {})]
+
+    @pytest.mark.parametrize("missing", ["hash", "timestamp"])
+    def test_a_block_missing_either_field_is_a_failed_read(self, missing) -> None:
+        blk = {"hash": self._HASH, "timestamp": 1_700_000_012}
+        blk[missing] = None
+        client, _ = _client(get_block=lambda n, *a, **k: AttributeDict(blk))
+        with pytest.raises(NetworkError):
+            _run(client.block_hash_and_timestamp(5))
+
+    @pytest.mark.parametrize("bad", [-1, True, 5.0, "5"])
+    def test_a_height_that_is_not_a_non_negative_int_is_refused_before_any_call(self, bad) -> None:
+        client, node = _client(get_block=lambda n, *a, **k: AttributeDict({"hash": self._HASH, "timestamp": 1}))
+        with pytest.raises(NetworkError):
+            _run(client.block_hash_and_timestamp(bad))
+        assert node.calls == []
+
+    def test_a_transport_failure_is_a_network_error(self) -> None:
+        client, _ = _client(get_block=ConnectionError("reset"))
+        with pytest.raises(NetworkError):
+            _run(client.block_hash_and_timestamp(5))
+
+
+class TestGetStorageAt:
+    def test_the_read_is_pinned_to_the_block_asked_for(self) -> None:
+        client, node = _client(get_storage_at=HexBytes(b"\x01"))
+        assert _run(client.get_storage_at(_ADDR, 0, 1234)) == b"\x00" * 31 + b"\x01"
+        assert node.asked("get_storage_at") == [((_ADDR, 0), {"block_identifier": 1234})]
+
+    def test_a_non_archive_refusal_is_a_failed_read_never_zero(self) -> None:
+        client, _ = _client(get_storage_at=ValueError("missing trie node"))
+        with pytest.raises(NetworkError):
+            _run(client.get_storage_at(_ADDR, 0, 1234))
+
+
+class TestGetLogsUnion:
+    def test_one_endpoint_union_records_that_it_answered(self) -> None:
+        client, node = _client(get_logs=[], block_number=12)
+        u = _run(client.get_logs_union(address=_ADDR, topics=[], from_block=5, to_block=9))
+        assert u.logs == () and u.answered == frozenset({str(client.source_key)}) and u.failed == {}
+        # One request, to this endpoint's own head (12), never past it and never an open "latest".
+        assert [(a[0]["fromBlock"], a[0]["toBlock"]) for a, _ in node.asked("get_logs")] == [(5, 12)]
+
+    def test_a_failed_log_read_is_recorded_never_empty(self) -> None:
+        client, _ = _client(get_logs=ConnectionError("429 Too Many Requests"), block_number=9)
+        u = _run(client.get_logs_union(address=_ADDR, topics=[], from_block=5, to_block=9))
+        assert u.answered == frozenset() and set(u.failed) == {str(client.source_key)}

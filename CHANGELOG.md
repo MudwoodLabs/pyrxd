@@ -8,6 +8,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd.eth_wallet.disposition.read_counter_disposition`: what the chain says about an ETH
+  counter-leg HTLC, read from the chain rather than from what we broadcast (#850 PR 4).** It
+  reports `OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `SETTLED_UNFINAL`, `REFUNDED`, `CLAIMED` or
+  `UNKNOWN` with a reason, plus every `Claimed` log that opens the hashlock as liveness. Nothing
+  calls it yet; the coordinator starts using it in a later PR.
+  - Terminal answers rest on the contract's `settled` slot and the block timestamp read at the
+    quorum-MIN finalized block, whose hash every endpoint must agree on, and on a refund or claim
+    receipt that every endpoint agrees on, at or below that block, in a canonical block, carrying
+    the event from this contract. A settlement at a finalized block before the timeout is a claim
+    whether or not any endpoint returns its log.
+  - Contradictions are `UNKNOWN`: a verified refund and a verified claim together, a verified
+    refund beside a settlement before the timeout, or a verified receipt beside an unsettled
+    contract. So is any failed, below-quorum or disagreeing read the answer depends on, and a log
+    scan that no endpoint answered.
+  - New reads: `get_logs_union` on `EthRpc` and `MultiSourceEthRpc` asks every endpoint, chunks
+    the range and halves it on a range-limit refusal, and records a 429 or timeout as a failure,
+    never as "no logs". `get_logs` is unchanged. `EthRpc` also gains `block_hash_and_timestamp`
+    and `get_storage_at`.
+  - With one endpoint, every answer is marked `single_source`.
+
 - **`pyrxd headers sync` and `pyrxd headers status`: a local cache of verified block headers, so
   `pyrxd verify` keeps verifying new marks between releases (#826, phase 1).** `pyrxd verify`
   links a mark's block at most 4,032 headers past its anchor, and until now that anchor was the
@@ -82,7 +102,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     that ran out of gas from one the contract reverted. Out of gas means status 0 with at least
     63/64 of the limit used, which also covers a starved payout call. Nothing calls it yet.
   - `EthRpc.estimate_gas` and `MultiSourceEthRpc.estimate_gas` (the MIN across the quorum).
-
+- **The watchtower reads the record's role, and an observed covenant no longer silences a due refund
+  (#850 PR 1b) [Changed (breaking)].**
+  - A taker's (or single operator's) `BTC_LOCKED` record is paged `taker_refund_btc` once the counter
+    leg's deadline passes (BTC: funding buried `>= t_btc`; ETH: past `eth_timeout_unix_s`), whether or
+    not the maker's covenant is observed. Before, an observed covenant made the tower WATCH for good,
+    and the maker locks first, so a maker who locked and never claimed left the taker unpaged (#850
+    item 6).
+  - The BTC refund is not autonomous while the covenant is known to exist, observed this tick or
+    pinned on the record: the maker can still claim (the claim leaf has no timelock) until the refund
+    confirms. The page says to refund and watch. A pinned covenant whose depth read fails no longer
+    reads as "maker never locked".
+  - A maker's record (`role: maker`) at `BTC_LOCKED`, `BOTH_LOCKED` or `PARAMS_MISMATCH` is paged to
+    refund its covenant at t_rxd (the page's deadline is when that refund opens), instead of the
+    taker's `taker_refund_btc` or `mutual_refund`.
+  - Autonomy (the pre-signed BTC refund and the autonomous covenant claim) is armed only for a record
+    whose `role` is `taker` or `none`. A record written before 0.27 has no role, so the tower pages it
+    but does not act on it until a 0.27 coordinator saves it again.
+  - A taker's fund now pins the covenant outpoint it was verified against on the record
+    (`radiant_covenant_outpoint`), so the claim and the tower's depth read follow that outpoint
+    (#850 design §2.9, deferred from PR 3 to land with these pages). The tower therefore reads the
+    covenant's depth for a taker's `BTC_LOCKED` record every tick: a maker's BTC claim on such a
+    record is now assessed (a claim page) instead of "finality un-assessable", and an RXD source set
+    below quorum pages "reconcile error" for it. The pin is written to the record before the
+    counter leg's value moves: with the BTC funding bytes; with the native ETH deploy; and for a
+    token, with the deploy and again with the push nonce and push hash. A crash after the broadcast
+    cannot lose it. A record written mid-fund by an older version is re-proved on resume, with the
+    caller's clock; if that re-proof fails, the lock is still recorded, unpinned. The tower does not
+    read the covenant of a NEGOTIATED record (pinned by a crashed fund), so it pages nothing for one.
+    The ETH pages read the pin too.
+  - `scripts/watchtower_dust_run.py` writes its record with `role: taker`.
 - **The BTC two-host runner's taker `--phase refund` and `--phase abort` refuse when the BTC HTLC
   is already spent (#850 PR 1c).** Before anything is sent they read the HTLC's funding outpoint.
   If the maker has claimed it (the spender's witness opens this swap's hashlock), the refusal says
