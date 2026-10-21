@@ -3518,8 +3518,15 @@ async def test_an_eth_resume_pins_the_covenant_ITS_OWN_proof_found(tmp_path):
     first = sink.load_record().radiant_covenant_outpoint
     assert first is not None
 
+    class _NativeResume(FakeEthLeg):
+        """A native leg: a resume verifies the deployed contract and pushes nothing, so no write
+        before a broadcast carries the new proof; only the lock record can."""
+
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            return await super().fund(terms, resume_from=resume_from, push_nonce=push_nonce)
+
     resumed = _eth_coord_full(
-        terms=terms, eth_leg=FakeEthLeg(preimage=secret, verdict=_final()), seen_store=seen, fund_lock=_MemLock()
+        terms=terms, eth_leg=_NativeResume(preimage=secret, verdict=_final()), seen_store=seen, fund_lock=_MemLock()
     )
     resumed._persist = sink
     real = resumed.taker_verify_asset_funding
