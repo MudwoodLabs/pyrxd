@@ -2069,12 +2069,13 @@ class FakeEthLeg:
         # Mirror the real leg: report the nonce the push is pinned to BEFORE broadcasting, so the
         # caller can make it durable. A fake that skipped this would hide a coordinator that never
         # records the pin — and an unrecorded pin is no pin at all on the retry that needs it.
+        # Mirror the real legs' ORDER (Mythos review of #891, F4): the deploy is reported first, then
+        # the push nonce. Reversed, a test of the deploy write was satisfied by the nonce write.
+        # The real legs do not re-report a resumed deploy.
+        if on_deploy is not None and resume_from is None:
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
         if on_push_nonce is not None and push_nonce is None:
             await on_push_nonce(7)
-        # Mirror the real leg: report the deployed address before returning a locator, so a
-        # coordinator test can observe what the record holds mid-fund.
-        if on_deploy is not None:
-            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
         loc = EthHtlcLocator(
             chain_id=11155111,
             contract_address="0x" + "ab" * 20,
@@ -3476,6 +3477,9 @@ async def test_a_crashed_fund_resumes_THROUGH_A_REAL_PERSISTED_FILE(tmp_path):
         "the crash left nothing on disk pointing at the deployed contract"
     )
     assert on_disk.pending_push_nonce == 7
+    # The covenant this fund was verified against is written with the deploy, not only when the lock
+    # is recorded, so a crash here cannot lose it (#850 PR 1b follow-up).
+    assert on_disk.radiant_covenant_outpoint is not None
 
     # --- run 2: a FRESH coordinator loads that file and completes the fund ---
     leg2 = FakeEthLeg(preimage=secret, verdict=_final())
@@ -3488,6 +3492,165 @@ async def test_a_crashed_fund_resumes_THROUGH_A_REAL_PERSISTED_FILE(tmp_path):
         "the resume deployed a second contract instead of completing the recorded one"
     )
     assert leg2.push_nonce_seen == 7, "the recorded nonce pin was not carried into the resume"
+
+
+async def test_an_eth_resume_pins_the_covenant_ITS_OWN_proof_found(tmp_path):
+    """Review of the write-ahead (F1): the deploy wrote pin P1; the resume's re-run verified P2 (P1
+    since spent, a second payment live). The real legs do not call `on_deploy` on a resume, so
+    without an overwrite the record stayed pinned to the spent P1 and the claim would follow it."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    class _CrashAfterDeploy(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            raise NetworkError("process died mid-fund")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(
+        terms=terms, eth_leg=_CrashAfterDeploy(preimage=secret, verdict=_final()), seen_store=seen
+    )
+    crashed._persist = sink
+    with pytest.raises(NetworkError):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+    first = sink.load_record().radiant_covenant_outpoint
+    assert first is not None
+
+    class _NativeResume(FakeEthLeg):
+        """A native leg: a resume verifies the deployed contract and pushes nothing, so no write
+        before a broadcast carries the new proof; only the lock record can."""
+
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            return await super().fund(terms, resume_from=resume_from, push_nonce=push_nonce)
+
+    resumed = _eth_coord_full(
+        terms=terms, eth_leg=_NativeResume(preimage=secret, verdict=_final()), seen_store=seen, fund_lock=_MemLock()
+    )
+    resumed._persist = sink
+    real = resumed.taker_verify_asset_funding
+    second = "ff" * 32 + ":1"
+
+    async def _elsewhere(*a, **k):
+        _o, value, upper = await real(*a, **k)
+        return second, value, upper
+
+    resumed.taker_verify_asset_funding = _elsewhere
+    rec = await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED
+    assert rec.radiant_covenant_outpoint == second != first
+
+
+async def test_a_token_resume_with_a_recorded_nonce_writes_its_proof_with_the_push_hash(tmp_path):
+    """Mythos review of #891, F2: with the push nonce already recorded the real ERC-20 leg skips
+    `on_push_nonce`, so the ONLY write before the re-sent push is `on_push_hash`. That hook carried the
+    pin, but no test reached it: the fake leg did not accept it and `_accepted_kwargs` dropped it."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    class _CrashAfterNonce(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            await on_push_nonce(7)
+            raise NetworkError("process died before the push was sent")
+
+    class _ResumeSendsThePush(FakeEthLeg):
+        async def fund(
+            self,
+            terms,
+            *,
+            on_deploy=None,
+            resume_from=None,
+            push_nonce=None,
+            on_push_nonce=None,
+            push_tx_hash=None,
+            on_push_hash=None,
+        ):
+            assert push_nonce == 7 and resume_from is not None  # as the real leg: no on_push_nonce
+            await on_push_hash(7, "0x" + "ee" * 32)
+            raise NetworkError("process died after the push was sent")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(terms=terms, eth_leg=_CrashAfterNonce(preimage=secret, verdict=_final()), seen_store=seen)
+    crashed._persist = sink
+    with pytest.raises(NetworkError):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+    first = sink.load_record().radiant_covenant_outpoint
+
+    resumed = _eth_coord_full(
+        terms=terms,
+        eth_leg=_ResumeSendsThePush(preimage=secret, verdict=_final()),
+        seen_store=seen,
+        fund_lock=_MemLock(),
+    )
+    resumed._persist = sink
+    real = resumed.taker_verify_asset_funding
+    second = "ff" * 32 + ":1"
+
+    async def _elsewhere(*a, **k):
+        _o, value, upper = await real(*a, **k)
+        return second, value, upper
+
+    resumed.taker_verify_asset_funding = _elsewhere
+    with pytest.raises(NetworkError):
+        await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    on_disk = sink.load_record()
+    assert on_disk.pending_push_tx_hash == "0x" + "ee" * 32
+    assert on_disk.radiant_covenant_outpoint == second != first
+
+
+async def test_an_eth_resume_that_pushes_writes_its_own_proof_before_the_push(tmp_path):
+    """Review of the write-ahead, round 2: a token resume whose re-run found P2 pushes against P2. If
+    it then crashes, the record on disk must already say P2, not the deploy-time P1."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    class _CrashAfterDeploy(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            raise NetworkError("process died mid-fund")
+
+    class _CrashAfterPushNonce(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_push_nonce(7)
+            raise NetworkError("process died after the push")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(
+        terms=terms, eth_leg=_CrashAfterDeploy(preimage=secret, verdict=_final()), seen_store=seen
+    )
+    crashed._persist = sink
+    with pytest.raises(NetworkError):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+    first = sink.load_record().radiant_covenant_outpoint
+
+    resumed = _eth_coord_full(
+        terms=terms,
+        eth_leg=_CrashAfterPushNonce(preimage=secret, verdict=_final()),
+        seen_store=seen,
+        fund_lock=_MemLock(),
+    )
+    resumed._persist = sink
+    real = resumed.taker_verify_asset_funding
+    second = "ff" * 32 + ":1"
+
+    async def _elsewhere(*a, **k):
+        _o, value, upper = await real(*a, **k)
+        return second, value, upper
+
+    resumed.taker_verify_asset_funding = _elsewhere
+    with pytest.raises(NetworkError):
+        await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    on_disk = sink.load_record()
+    assert on_disk.pending_push_nonce == 7 and on_disk.radiant_covenant_outpoint == second != first
 
 
 @pytest.mark.parametrize("held", ["pending_contract", "funded_locator"])

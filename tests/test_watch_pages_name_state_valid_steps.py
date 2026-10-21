@@ -36,6 +36,7 @@ from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import (
     TERMINAL_STATES,
     NegotiatedTerms,
+    RecordRole,
     SwapRecord,
     SwapState,
     can_transition,
@@ -176,8 +177,9 @@ def _policy(*, eth: bool = False) -> MarginPolicy:
 
 
 def _decide(state: SwapState, obs: Observations, *, eth: bool = False):
+    # The taker's record: autonomy is armed only for a record that names its writer (#850 PR 1b).
     return decide(
-        record=SwapRecord(state=state, terms=_terms(eth=eth)),
+        record=SwapRecord(state=state, terms=_terms(eth=eth), role=RecordRole.TAKER),
         observations=obs,
         policy=_policy(eth=eth),
         safety_window_blocks=SAFETY,
