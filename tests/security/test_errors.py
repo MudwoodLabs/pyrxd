@@ -351,6 +351,7 @@ _SAMPLE_ARGS: dict[str, object] = {
     "ceiling": 150_000,
     "need_wei": 10**15,
     "have_wei": 10**14,
+    "kind": "refunded",
 }
 
 

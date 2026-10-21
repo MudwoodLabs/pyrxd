@@ -398,9 +398,7 @@ class RefundReplacement:
     (:func:`pyrxd.eth_wallet.replacement.bump_replacement_fees`)."""
 
     nonce: int
-    #: ``None`` when the pending transaction cannot be read back: priced from the current quote, raised
-    #: the same 13%. A node refuses that replacement if the pending one pays more.
-    previous_fees: dict[str, int] | None
+    previous_fees: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -409,7 +407,8 @@ class RefundProgress:
     design §3.4). ``kind`` is one of:
 
     * ``"pending"``: not mined, and the broadcasting endpoint holds a transaction at its nonce;
-      ``fee_fields`` are that transaction's own, when the endpoint returns it by hash.
+      ``fee_fields`` are the fees of the first of our hashes the endpoint returns, ``None`` when it
+      returns none of them (the pending transaction may then be one we did not sign).
     * ``"dropped"``: not mined, and nothing is pending at its nonce.
     * ``"nonce_taken"``: not mined, and another transaction mined at its nonce.
     * ``"mined"``: mined with ``status == 1``. Says nothing about finality.
@@ -1223,10 +1222,7 @@ class EthHtlcContractLeg:
             nonce = replace.nonce
             if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
                 raise ValidationError("replace.nonce must be a non-negative int")
-            basis = replace.previous_fees
-            if basis is None:
-                basis = {k: int(built[k]) for k in ("maxFeePerGas", "maxPriorityFeePerGas")}
-            bumped = bump_replacement_fees(dict(basis))
+            bumped = bump_replacement_fees(dict(replace.previous_fees))
             built["nonce"] = nonce
             for fee in ("maxFeePerGas", "maxPriorityFeePerGas"):
                 built[fee] = max(int(bumped[fee]), int(built[fee]))
@@ -1268,10 +1264,19 @@ class EthHtlcContractLeg:
 
         return await self._sign_and_send(built, preflight=False, on_signed=hook)
 
-    async def refund_progress(self, tx_hash: str, nonce: int) -> RefundProgress:
+    async def refund_progress(self, tx_hash: str, nonce: int, *, earlier: tuple[str, ...] = ()) -> RefundProgress:
         """What happened to the refund we signed as ``tx_hash`` at ``nonce`` (:class:`RefundProgress`).
-        Read-only. A read that fails raises; the caller then decides nothing."""
-        receipt = await self._rpc.get_transaction_receipt(tx_hash)
+        ``earlier`` are refunds we signed before it at the same nonce (a replacement may lose to the
+        one it replaced, or never reach the node): any of them mined is what happened, and the fees of
+        whichever one the endpoint still holds are what a replacement must beat. Read-only. A read
+        that fails raises; the caller then decides nothing."""
+        hashes = (tx_hash, *earlier)
+        receipt, mined_hash = None, tx_hash
+        for h in hashes:
+            receipt = await self._rpc.get_transaction_receipt(h)
+            if receipt is not None:
+                mined_hash = h
+                break
         if receipt is None:
             addr = self._account_address()
             latest = int(await self._rpc.get_transaction_count(addr, "latest"))
@@ -1280,17 +1285,19 @@ class EthHtlcContractLeg:
             pending = int(await self._rpc.get_transaction_count(addr, "pending"))
             if pending <= nonce:
                 return RefundProgress("dropped")
-            try:
-                tx = await self._rpc.get_transaction(tx_hash)
-                fees = {k: int(tx[k]) for k in ("maxFeePerGas", "maxPriorityFeePerGas")}
-            except Exception as exc:  # not ours at that nonce, or the endpoint does not have it
-                _LOG.info("pending refund %s could not be read back by hash: %s", tx_hash, exc)
-                fees = None
-            return RefundProgress("pending", fee_fields=fees)
+            for h in hashes:
+                try:
+                    tx = await self._rpc.get_transaction(h)
+                    return RefundProgress(
+                        "pending", fee_fields={k: int(tx[k]) for k in ("maxFeePerGas", "maxPriorityFeePerGas")}
+                    )
+                except Exception as exc:  # replaced, never delivered, or not held by this endpoint
+                    _LOG.info("refund %s could not be read back by hash: %s", h, exc)
+            return RefundProgress("pending", fee_fields=None)
         status = _int_or_none(receipt.get("status"))
         if status == 1:
             return RefundProgress("mined")
-        gas_limit = int((await self._rpc.get_transaction(tx_hash))["gas"])
+        gas_limit = int((await self._rpc.get_transaction(mined_hash))["gas"])
         if refund_ran_out_of_gas(receipt, gas_limit=gas_limit):
             return RefundProgress("out_of_gas", gas_limit=gas_limit)
         return RefundProgress("reverted", gas_limit=gas_limit)

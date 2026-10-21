@@ -337,9 +337,9 @@ class EthLeg:
         # are forwarded unchanged; the coordinator records its pending refund through them (#850 PR 5b).
         return await self._leg.refund(locator, on_signed=on_signed, replace=replace)
 
-    async def refund_progress(self, tx_hash: str, nonce: int):
+    async def refund_progress(self, tx_hash: str, nonce: int, *, earlier: tuple[str, ...] = ()):
         """What happened to our refund ``tx_hash`` at ``nonce`` (``RefundProgress``). Read-only."""
-        return await self._leg.refund_progress(tx_hash, nonce)
+        return await self._leg.refund_progress(tx_hash, nonce, earlier=earlier)
 
     async def refund_estimate(self, locator: EthHtlcLocator) -> int:
         """``eth_estimateGas`` for a refund of *locator* now. Read-only."""

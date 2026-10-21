@@ -51,6 +51,9 @@ class _ChainLeg(FakeEthLeg):
         self._rpc = rpc
         self.refunds = 0
         self.signed: list[tuple[str, int, object]] = []
+        self.undelivered: set[str] = set()
+        self.fees: dict[str, dict[str, int]] = {}
+        self.fail_broadcast = False
         self.next_nonce = 7
         self.dropped: set[str] = set()
         self.nonce_taken: set[str] = set()
@@ -72,9 +75,20 @@ class _ChainLeg(FakeEthLeg):
         if on_signed is not None:
             await on_signed(tx, nonce)
         self.signed.append((tx, nonce, replace))
+        base = {"maxFeePerGas": 100, "maxPriorityFeePerGas": 2}
+        self.fees[tx] = (
+            {k: v * 113 // 100 + 1 for k, v in replace.previous_fees.items()} if replace is not None else base
+        )
+        if self.fail_broadcast:
+            self.undelivered.add(tx)
+            from pyrxd.security.errors import NetworkError
+
+            raise NetworkError("eth_sendRawTransaction failed: replacement transaction underpriced")
         return tx
 
-    async def refund_progress(self, tx_hash, nonce):
+    async def refund_progress(self, tx_hash, nonce, *, earlier=()):
+        """Reads the fake chain. A refund is "held" by the node unless it is in ``undelivered`` (it
+        never reached the node) or was displaced by a later one we sent at the same nonce."""
         from pyrxd.eth_wallet.htlc_leg import RefundProgress
 
         if tx_hash in self.out_of_gas:
@@ -85,10 +99,14 @@ class _ChainLeg(FakeEthLeg):
             return RefundProgress("nonce_taken")
         if tx_hash in self.dropped:
             return RefundProgress("dropped")
-        receipt = self.chain.receipts.get(tx_hash)
-        if receipt is not None and receipt["status"] == 1:
-            return RefundProgress("mined")
-        return RefundProgress("pending", fee_fields={"maxFeePerGas": 100, "maxPriorityFeePerGas": 2})
+        for h in (tx_hash, *earlier):
+            receipt = self.chain.receipts.get(h)
+            if receipt is not None and receipt["status"] == 1:
+                return RefundProgress("mined")
+        for h in (tx_hash, *earlier):
+            if h not in self.undelivered and h in self.fees:
+                return RefundProgress("pending", fee_fields=dict(self.fees[h]))
+        return RefundProgress("pending", fee_fields=None)
 
     async def refund_estimate(self, locator):
         return self.estimate

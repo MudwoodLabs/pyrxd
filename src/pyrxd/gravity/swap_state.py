@@ -46,9 +46,13 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # above its own (:class:`RecordFromNewerPyrxd`). Each PR that adds a persisted field bumps this.
 # v4 (#850 PR 5a) adds ``counter_claim_tx``, ``counter_disposition``, ``abort_reason`` and
 # ``asset_refund_txid``.
-# v5 (#850 PR 5b) adds ``counter_refund_tx_hash``, ``counter_refund_nonce`` and
-# ``counter_expiry_anchor``.
+# v5 (#850 PR 5b) adds ``counter_refund_tx_hash``, ``counter_refund_nonce``,
+# ``counter_refund_replaced_tx_hashes`` and ``counter_expiry_anchor``.
 SWAP_RECORD_SCHEMA_VERSION = 5
+#: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
+#: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours; the oldest are the
+#: lowest-priced, so dropping them loses only a fee basis a newer one already beats.
+MAX_REPLACED_REFUNDS = 16
 _PRE_ROLE_ETH_SCHEMA_VERSION = 2
 
 __all__ = [
@@ -779,6 +783,10 @@ class SwapRecord:
     #: the hash. Not evidence of anything: only the chain read (``counter_disposition``) is.
     counter_refund_tx_hash: str | None = None
     counter_refund_nonce: int | None = None
+    #: Refunds we signed EARLIER at that same nonce, newest first: a replacement may lose to the one
+    #: it replaced, or never reach the node, so what holds the nonce can be any of them. Cleared when
+    #: a refund is signed at another nonce; at most :data:`MAX_REPLACED_REFUNDS` kept.
+    counter_refund_replaced_tx_hashes: tuple[str, ...] = ()
     #: ``"<number>:0x<hash>"`` of a finalized block at which the counter-leg contract was unsettled
     #: and at or past its timeout, from a quorum read (design §2.3 ``F_EXPIRED``). From then on no
     #: claim can succeed, so a later settlement is a refund; the hash is rechecked canonical at use.
@@ -903,6 +911,20 @@ class SwapRecord:
             n = self.counter_refund_nonce
             if not isinstance(n, int) or isinstance(n, bool) or n < 0:
                 raise ValidationError("counter_refund_nonce must be a non-negative int")
+        replaced = self.counter_refund_replaced_tx_hashes
+        if not isinstance(replaced, tuple):
+            raise ValidationError("counter_refund_replaced_tx_hashes must be a tuple of tx hashes")
+        if replaced:
+            if self.counter_refund_tx_hash is None:
+                raise ValidationError("counter_refund_replaced_tx_hashes needs counter_refund_tx_hash")
+            if len(replaced) > MAX_REPLACED_REFUNDS:
+                raise ValidationError(f"counter_refund_replaced_tx_hashes holds at most {MAX_REPLACED_REFUNDS}")
+            for h in replaced:
+                check_tx_hash(h)
+                if h != h.lower():
+                    raise ValidationError("counter_refund_replaced_tx_hashes must be lower-case")
+            if len(set(replaced)) != len(replaced) or self.counter_refund_tx_hash in replaced:
+                raise ValidationError("counter_refund_replaced_tx_hashes must not repeat a hash")
         if self.counter_expiry_anchor is not None:
             if self.terms.counter_chain != "eth":
                 raise ValidationError("counter_expiry_anchor is an ETH counter-leg field")
@@ -1046,6 +1068,8 @@ class SwapRecord:
         if self.counter_refund_tx_hash is not None:
             d["counter_refund_tx_hash"] = self.counter_refund_tx_hash
             d["counter_refund_nonce"] = self.counter_refund_nonce
+        if self.counter_refund_replaced_tx_hashes:
+            d["counter_refund_replaced_tx_hashes"] = list(self.counter_refund_replaced_tx_hashes)
         if self.counter_expiry_anchor is not None:
             d["counter_expiry_anchor"] = self.counter_expiry_anchor
         return d
@@ -1105,6 +1129,7 @@ class SwapRecord:
             asset_refund_txid=d.get("asset_refund_txid"),
             counter_refund_tx_hash=d.get("counter_refund_tx_hash"),
             counter_refund_nonce=d.get("counter_refund_nonce"),
+            counter_refund_replaced_tx_hashes=_hash_tuple(d.get("counter_refund_replaced_tx_hashes")),
             counter_expiry_anchor=d.get("counter_expiry_anchor"),
         )
 
@@ -1112,6 +1137,14 @@ class SwapRecord:
 # ---------------------------------------------------------------------------
 # Small boundary helpers (kept local; mirror taproot._as_bytes discipline)
 # ---------------------------------------------------------------------------
+
+
+def _hash_tuple(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValidationError("counter_refund_replaced_tx_hashes must be a list")
+    return tuple(value)
 
 
 def parse_expiry_anchor(value: object) -> tuple[int, str]:

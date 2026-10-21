@@ -162,6 +162,18 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
             (),
         )
     ],
+    "counter_refund_replaced_tx_hashes": [
+        (
+            "counter-refund-replaced",
+            _with(
+                _eth_base,
+                counter_refund_tx_hash="0x" + "e1" * 32,
+                counter_refund_nonce=4,
+                counter_refund_replaced_tx_hashes=("0x" + "e2" * 32, "0x" + "e3" * 32),
+            ),
+            (),
+        )
+    ],
     "counter_expiry_anchor": [("expiry-anchor", _with(_eth_base, counter_expiry_anchor="90:0x" + "b1" * 32), ())],
     "pending_btc_funding_tx": [
         ("pending-btc-fund", lambda: dataclasses.replace(_btc_base(), pending_btc_funding_tx=_raw_btc_tx()), ())

@@ -1085,10 +1085,16 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
         async def step():
             from pyrxd.security.errors import NetworkError
 
+            signed_before = coord.record.counter_refund_tx_hash
             try:
                 rec = await coord.taker_refund_btc(resend_reverted_refund=resend_once[0])
             except NetworkError:
-                raise  # a failed read decided nothing: the flag stays for the next pass
+                # A failed READ decided nothing, so the flag stays for the next pass. A failed
+                # BROADCAST may still have delivered the refund the flag paid for: a refund was
+                # signed (the recorded hash moved), so the flag is spent (review round 2 of 5b).
+                if coord.record.counter_refund_tx_hash != signed_before:
+                    resend_once[0] = False
+                raise
             except Exception:
                 resend_once[0] = False
                 raise
@@ -1127,7 +1133,12 @@ async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step)
     decides. Bounded by ``--abort-poll-timeout-s`` (0: one pass); past it the record is left as it
     is, durable, and running ``--phase abort`` again picks up from it.
     """
-    from pyrxd.security.errors import CounterLegPayoutReverts, CounterLegRefundNeedsOperator, NetworkError
+    from pyrxd.security.errors import (
+        CounterLegPayoutReverts,
+        CounterLegRefundNeedsOperator,
+        CounterLegSingleSourceAnswer,
+        NetworkError,
+    )
 
     deadline = time.monotonic() + max(0.0, float(args.abort_poll_timeout_s))
     while True:
@@ -1139,19 +1150,34 @@ async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step)
                 # single-endpoint explanation would call that "settled, no verified claim, check
                 # elsewhere". The coordinator's chain read decides from here.
                 rec = await step()
+        except CounterLegSingleSourceAnswer as exc:
+            # Configuration, not an outage: retrying the same endpoint never gets past it.
+            raise SystemExit(
+                f"the record stays btc_locked: the ETH HTLC reads {exc.kind.upper()} at the finalized block, but "
+                "from ONE endpoint, and on a chain that carries value one endpoint's word changes nothing. This "
+                "runner reads one --eth-rpc-url and is testnet-only, where one endpoint may decide, so the chain "
+                "id is not one pyrxd knows as a testnet: check --eth-chain-id, or drive the swap through the "
+                "library with a MultiSourceEthRpc."
+                + (
+                    " If it was CLAIMED, p is public: run --phase claim to claim the RXD covenant before its "
+                    "CSV refund to the maker opens."
+                    if exc.kind == "claimed"
+                    else ""
+                )
+            ) from None
         except NetworkError as exc:
-            # A failed or disagreeing read while following our own refund: nothing changed and
-            # nothing was sent. Keep following until the deadline.
+            # A failed or disagreeing read, or a broadcast that failed, while following our own refund:
+            # the record is durable and the next pass reads what happened. Keep following until the deadline.
             if coord.record.counter_refund_tx_hash is None or time.monotonic() >= deadline:
                 raise
-            print(f"  a chain read failed while following our refund ({str(exc)[:160]}); retrying")
+            print(f"  a chain call failed while following our refund ({str(exc)[:160]}); retrying")
             await asyncio.sleep(float(args.poll_interval_s))
             continue
         except (CounterLegPayoutReverts, CounterLegRefundNeedsOperator) as exc:
             # Nothing was re-sent; the record is unchanged and durable. The operator decides.
             raise SystemExit(
-                f"the record stays btc_locked: {exc}\n  NEXT: after checking, run --phase abort again with "
-                "--resend-reverted-refund to send one more refund"
+                f"the record stays btc_locked: {exc}\n  NEXT: after checking, if our refund reverted, run "
+                "--phase abort again with --resend-reverted-refund to send one more refund"
                 + (
                     " (it is refused while the payout itself reverts)."
                     if isinstance(exc, CounterLegPayoutReverts)

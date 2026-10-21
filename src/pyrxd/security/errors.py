@@ -36,6 +36,7 @@ __all__ = [
     "CounterLegPayoutReverts",
     "CounterLegRefundNeedsOperator",
     "CounterLegSettledUnverified",
+    "CounterLegSingleSourceAnswer",
     "CovenantError",
     "DmintError",
     "FeePoolExhaustedError",
@@ -797,3 +798,15 @@ class MaxAttemptsError(DmintError):
         super().__init__(*args)
         self.attempts = attempts
         self.elapsed_s = elapsed_s
+
+
+class CounterLegSingleSourceAnswer(NetworkError):
+    """The ETH counter leg reads settled (claimed or refunded) at the finalized block, but from ONE
+    endpoint, on a chain that carries value (#850, design §2.5 / D4). Nothing changes and nothing is
+    sent until a multi-source rpc agrees. A :class:`NetworkError`, so a library caller may retry; its
+    own type because retrying the SAME configuration never succeeds: configure more endpoints.
+    ``kind`` is what that endpoint answered (``"claimed"`` or ``"refunded"``)."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind

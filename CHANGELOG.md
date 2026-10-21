@@ -93,18 +93,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     was dropped, or whose nonce another transaction used, is sent again. A refund still pending after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not measured) is
     replaced at the same nonce, with both fee fields raised from the pending transaction's own. A
     refund that ran out of gas is sent once more, and only when the current estimate is above the
-    limit it was signed with. A refund still pending whose transaction the endpoint cannot return by
-    the recorded hash cannot be priced for a replacement: that raises `CounterLegRefundNeedsOperator`,
-    and with the flag below it is replaced at 13% over the current quote. A replacement whose
-    broadcast fails puts the previously recorded refund back on the record.
+    limit it was signed with. The record keeps the earlier refunds signed at the same nonce
+    (`counter_refund_replaced_tx_hashes`, at most 16), because a replacement can lose to the one it
+    replaced or never reach the node. Any of them mined is what happened, and the next replacement
+    is priced over whichever one the node still holds. When a transaction is pending at the nonce
+    and it is none of these, it may be another transaction from the same key. It is never replaced:
+    `CounterLegRefundNeedsOperator` is raised after the wait, and the flag below does not override
+    it.
   - A mined refund that reverted is not sent again. The new `CounterLegPayoutReverts` is raised
     when a refund now would revert `TransferFailed` or `SendFailed`, meaning the payout itself
     fails. The new `CounterLegRefundNeedsOperator` is raised for any other revert, and for an
     out-of-gas refund the estimate does not exceed. After checking,
     `taker_refund_btc(resend_reverted_refund=True)` sends one more refund. That flag does not
     override `CounterLegPayoutReverts`. Both errors are `ValidationError`s.
-  - A terminal answer read from one endpoint on a chain that carries value now raises
-    `NetworkError` from `taker_refund_btc`, as `reconcile_counter_leg` does, and sends nothing.
+  - A terminal answer read from one endpoint on a chain that carries value now raises the new
+    `CounterLegSingleSourceAnswer` (a `NetworkError`) from `taker_refund_btc` and from
+    `reconcile_counter_leg`, and sends nothing. Retrying the same configuration never gets past it.
   - The expiry anchor. The first quorum read that finds the contract unsettled at a finalized
     block that is at or past the timeout records that block as `counter_expiry_anchor`. After that
     block no claim can succeed, so once the contract is settled at a later finalized block, the
@@ -116,7 +120,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `EthHtlcContractLeg.refund` (and the token and gravity legs that forward it): `on_signed` is
     now awaited with `(tx_hash, nonce)`, not just the hash. The new `replace=RefundReplacement(...)`
     signs at a given nonce with raised fees. New read-only methods: `refund_progress(tx_hash,
-    nonce)`, which returns a `RefundProgress` (`pending`, `dropped`, `nonce_taken`, `mined`,
+    nonce, earlier=())`, which returns a `RefundProgress` (`pending`, `dropped`, `nonce_taken`, `mined`,
     `out_of_gas` or `reverted`), `refund_estimate` and `refund_revert_reason`.
   - `scripts/eth_swap_two_host.py --role taker --phase abort` now polls until the record is
     terminal. The new `--abort-poll-timeout-s` sets how long (7200 s by default; 0 means one

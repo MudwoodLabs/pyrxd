@@ -94,8 +94,9 @@ async def test_a_pending_refund_is_not_sent_again_and_is_replaced_only_after_the
     assert rec.counter_refund_tx_hash == replaced_tx != first and rec.counter_refund_nonce == nonce
 
 
-async def test_a_pending_refund_whose_fees_cannot_be_read_asks_the_operator_after_the_wait(monkeypatch):
-    """Review of 5b (MEDIUM): waiting for fees that can never be read waited for ever, silently."""
+async def test_a_pending_transaction_that_is_none_of_our_refunds_is_never_replaced(monkeypatch):
+    """Review round 2 of 5b: replacing what holds the nonce when it is not one of our refunds could
+    cancel another transaction from the same key. It asks the operator; even the flag sends nothing."""
     from pyrxd.eth_wallet.htlc_leg import RefundProgress
 
     clock = [0.0]
@@ -103,43 +104,69 @@ async def test_a_pending_refund_whose_fees_cannot_be_read_asks_the_operator_afte
     coord, _chain, leg = _setup(chain_kw={"finalized": 90})
     await coord.taker_refund_btc()
 
-    async def unreadable(_h, _n):
+    async def foreign(_h, _n, **_k):
         return RefundProgress("pending", fee_fields=None)
 
-    leg.refund_progress = unreadable
+    leg.refund_progress = foreign
     await coord.taker_refund_btc()  # starts the clock: waits
     clock[0] += REFUND_REPLACE_AFTER_S
-    with pytest.raises(CounterLegRefundNeedsOperator, match="cannot be priced"):
+    with pytest.raises(CounterLegRefundNeedsOperator, match="none of the refunds this record signed"):
         await coord.taker_refund_btc()
+    with pytest.raises(CounterLegRefundNeedsOperator):
+        await coord.taker_refund_btc(resend_reverted_refund=True)
     assert leg.refunds == 1
-    await coord.taker_refund_btc(resend_reverted_refund=True)
-    _tx, replaced_nonce, replace = leg.signed[1]
-    assert replace.previous_fees is None and replace.nonce == replaced_nonce == leg.signed[0][1]
 
 
-async def test_a_replacement_whose_broadcast_fails_puts_the_previous_refund_back(monkeypatch):
-    """Review of 5b (MEDIUM): the replacement's hash was recorded before a broadcast that failed, so
-    every later pass read a hash the node never took and could not price the pending one."""
-    from pyrxd.security.errors import NetworkError
-
+async def test_a_replacement_that_never_reached_the_node_is_replaced_over_the_one_it_holds(monkeypatch):
+    """Review rounds 1 and 2 of 5b: the replacement's hash is recorded before a broadcast that failed.
+    The earlier refund still holds the nonce, so the next replacement is priced over IT, read through
+    the earlier hashes the record keeps. Plant "do not pass earlier hashes" and the pending refund
+    can never be priced again."""
     clock = [0.0]
     monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
     coord, _chain, leg = _setup(chain_kw={"finalized": 90})
     await coord.taker_refund_btc()
-    first = coord.record.counter_refund_tx_hash
+    first, nonce, _ = leg.signed[0]
     await coord.taker_refund_btc()
     clock[0] += REFUND_REPLACE_AFTER_S
-    real = leg.refund
+    leg.fail_broadcast = True
+    from pyrxd.security.errors import NetworkError
 
-    async def rejected(*a, **k):
-        await real(*a, **k)  # signs and records through on_signed...
-        raise NetworkError("replacement transaction underpriced")  # ...then the node refuses it
-
-    leg.refund = rejected
     with pytest.raises(NetworkError, match="underpriced"):
         await coord.taker_refund_btc()
-    assert coord.record.counter_refund_tx_hash == first
-    assert coord.persisted[-1].counter_refund_tx_hash == first  # durable, not only in memory
+    second = leg.signed[1][0]
+    assert coord.record.counter_refund_tx_hash == second  # recorded before the broadcast, as designed
+    assert coord.record.counter_refund_replaced_tx_hashes == (first,)
+    assert coord.persisted[-1].counter_refund_replaced_tx_hashes == (first,)  # durable
+    leg.fail_broadcast = False
+    await coord.taker_refund_btc()  # first seen pending under the new hash: starts its clock
+    clock[0] += REFUND_REPLACE_AFTER_S
+    rec = await coord.taker_refund_btc()
+    third, third_nonce, replace = leg.signed[2]
+    assert third_nonce == nonce and replace.previous_fees == leg.fees[first]  # priced over what the node holds
+    assert rec.counter_refund_tx_hash == third and rec.counter_refund_replaced_tx_hashes == (second, first)
+
+
+async def test_an_earlier_refund_that_mined_is_followed_not_replaced():
+    coord, chain, leg = _setup(chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+    first = leg.signed[0][0]
+    leg.dropped.add(first)
+    leg.next_nonce = leg.signed[0][1]  # a dropped nonce is free again: the re-send takes it
+    await coord.taker_refund_btc()  # re-sent at the same nonce: the first is kept as earlier
+    assert coord.record.counter_refund_replaced_tx_hashes == (first,)
+    leg.dropped.discard(first)
+    chain.refund(85, label=refund_label(1))  # ...and it was the first one that mined
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.ABORTED and leg.refunds == 2
+
+
+async def test_a_refund_at_a_new_nonce_clears_the_earlier_hashes():
+    coord, _chain, leg = _setup(chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+    leg.nonce_taken.add(leg.signed[0][0])
+    rec = await coord.taker_refund_btc()  # the fake signs the next one at a new nonce
+    assert rec.counter_refund_nonce != leg.signed[0][1] and rec.counter_refund_replaced_tx_hashes == ()
 
 
 async def test_a_mined_refund_is_followed_not_resent():

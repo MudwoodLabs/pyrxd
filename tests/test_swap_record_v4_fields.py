@@ -75,6 +75,40 @@ def test_from_dict_does_not_coerce_single_source():
         (_eth_base, {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": -1}),
         (_eth_base, {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": True}),
         (_eth_base, {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": "3"}),
+        # 5b: earlier refunds at the same nonce
+        (_eth_base, {"counter_refund_replaced_tx_hashes": ("0x" + "e2" * 32,)}),  # without a refund
+        (
+            _eth_base,
+            {
+                "counter_refund_tx_hash": "0x" + "e1" * 32,
+                "counter_refund_nonce": 3,
+                "counter_refund_replaced_tx_hashes": ["0x" + "e2" * 32],
+            },
+        ),
+        (
+            _eth_base,
+            {
+                "counter_refund_tx_hash": "0x" + "e1" * 32,
+                "counter_refund_nonce": 3,
+                "counter_refund_replaced_tx_hashes": ("0x" + "e1" * 32,),
+            },
+        ),
+        (
+            _eth_base,
+            {
+                "counter_refund_tx_hash": "0x" + "e1" * 32,
+                "counter_refund_nonce": 3,
+                "counter_refund_replaced_tx_hashes": ("0x" + "E2" * 32,),
+            },
+        ),
+        (
+            _eth_base,
+            {
+                "counter_refund_tx_hash": "0x" + "e1" * 32,
+                "counter_refund_nonce": 3,
+                "counter_refund_replaced_tx_hashes": tuple("0x" + f"{i:064x}" for i in range(17)),
+            },
+        ),
         # 5b: the expiry anchor
         (_btc_base, {"counter_expiry_anchor": "90:0x" + "b1" * 32}),
         (_eth_base, {"counter_expiry_anchor": "0x" + "b1" * 32}),

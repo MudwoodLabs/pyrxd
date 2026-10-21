@@ -1158,8 +1158,26 @@ async def test_refund_revert_reason_names_the_contract_error_by_selector(frozen_
     assert await _leg(_Rpc(head_ts=_NOW)).refund_revert_reason(_locator(timeout=_NOW)) is None
 
 
-async def test_a_replacement_with_unknown_previous_fees_is_priced_over_the_current_quote(frozen_clock):
-    rpc = _Rpc(head_ts=_NOW, max_fee=1_000, tip=10)
-    await _leg(rpc).refund(_locator(timeout=_NOW), replace=hl.RefundReplacement(nonce=3, previous_fees=None))
-    tx = _sent_tx(rpc)
-    assert tx["nonce"] == 3 and (tx["maxFeePerGas"], tx["maxPriorityFeePerGas"]) == (1_130, 12)
+async def test_refund_progress_reads_the_earlier_refunds_at_the_same_nonce():
+    """The recorded refund never reached the node; the earlier one it was to replace still holds the
+    nonce, and its fees are the basis. And an earlier one that mined is what happened."""
+    rpc = _progress_rpc(latest=7, pending=8)
+
+    async def get_transaction(h):
+        if h == _OURS:
+            raise NetworkError("not found")
+        return {"maxFeePerGas": 50, "maxPriorityFeePerGas": 3}
+
+    rpc.get_transaction = get_transaction
+    progress = await _leg(rpc).refund_progress(_OURS, 7, earlier=("0x" + "e0" * 32,))
+    assert progress.kind == "pending" and progress.fee_fields == {"maxFeePerGas": 50, "maxPriorityFeePerGas": 3}
+    assert (await _leg(rpc).refund_progress(_OURS, 7)).fee_fields is None
+
+    mined = _progress_rpc(latest=8, pending=8)
+
+    async def receipt(h):
+        return {"status": 1, "gasUsed": 51_000} if h == "0x" + "e0" * 32 else None
+
+    mined.get_transaction_receipt = receipt
+    assert (await _leg(mined).refund_progress(_OURS, 7, earlier=("0x" + "e0" * 32,))).kind == "mined"
+    assert (await _leg(mined).refund_progress(_OURS, 7)).kind == "nonce_taken"

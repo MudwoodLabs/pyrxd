@@ -2942,3 +2942,51 @@ async def test_the_resend_flag_survives_a_pass_whose_read_failed(eth_mod, tmp_pa
     with pytest.raises(SystemExit, match="--resend-reverted-refund"):
         await eth_mod.taker_phase_abort(args)
     assert len(leg.refund_calls) == 2  # the flag still sent its one refund
+
+
+async def test_the_resend_flag_is_spent_once_a_refund_was_signed_even_if_its_broadcast_errored(
+    eth_mod, tmp_path, monkeypatch
+):
+    """Review round 2 of 5b (LOW): a broadcast that timed out may still have delivered the refund the
+    flag paid for, so a signed refund spends the flag; keeping it sent a second one in the same run."""
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    leg = _RevertedRefundLeg()
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="--resend-reverted-refund"):
+        await eth_mod.taker_phase_abort(args)
+    real = leg.refund
+
+    async def delivered_then_timed_out(*a, **k):
+        await real(*a, **k)
+        raise NetworkError("eth_sendRawTransaction failed: ReadTimeout")
+
+    leg.refund = delivered_then_timed_out
+    args.resend_reverted_refund = True
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="--resend-reverted-refund"):
+        await eth_mod.taker_phase_abort(args)
+    assert len(leg.refund_calls) == 2  # the first send, and exactly ONE for the flag
+
+
+async def test_a_single_source_answer_stops_the_abort_with_its_cause(eth_mod, tmp_path, monkeypatch):
+    """Review round 2 of 5b (LOW): it was retried as an outage for the whole poll timeout, then a raw
+    traceback. Configuration, not an outage: one SystemExit naming it, and --phase claim if CLAIMED."""
+    from pyrxd.gravity.swap_coordinator import SwapCoordinator
+
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    leg = _DispositionCounterLeg()
+    leg.refunded_after_reads = 1
+    real = leg.counter_disposition
+
+    async def one_endpoint(locator, **kw):
+        d = await real(locator, **kw)
+        return dataclasses.replace(d, single_source=True)
+
+    leg.counter_disposition = one_endpoint
+    monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="REFUNDED at the finalized block, but from ONE endpoint"):
+        await eth_mod.taker_phase_abort(args)
+    assert leg.reads == 2 and len(leg.refund_calls) == 1
