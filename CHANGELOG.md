@@ -103,7 +103,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     covenant claim comes first. An unreadable covenant depth holds too.
   - A terminal answer read from a single endpoint changes nothing on a chain that carries value.
     It does on a known testnet or anvil, and is recorded as single-source.
-  - New record fields `counter_claim_tx`, `counter_disposition` and `abort_reason`;
+  - `mutual_refund` on its attempt-both path (role `none` or `maker`): a retry after one leg had
+    refunded never completed, because re-sending that leg failed and any failure kept the record
+    at `BOTH_LOCKED`. Now an ETH counter leg verified refunded at the finalized block is not sent
+    again, and the covenant refund is recorded as `asset_refund_txid` when its broadcast returns
+    and not sent again on a retry. A verified claim stops `mutual_refund` before the covenant is
+    refunded and moves the record to `SECRET_REVEALED`. A BTC counter leg is still re-sent on a
+    retry (#850 PR 9).
+  - New record fields `counter_claim_tx`, `counter_disposition`, `abort_reason` and
+    `asset_refund_txid`;
     `SWAP_RECORD_SCHEMA_VERSION` is 4. A record carrying any post-v2 field, `role` included, now
     writes 4, so a pyrxd that reads only up to 3 refuses it. The FSM has 15 edges.
 - **ETH and token counter-leg refunds are signed with up to 150,000 gas, up from 100,000, after an
