@@ -439,3 +439,93 @@ async def test_an_unreadable_recorded_covenant_refund_neither_skips_nor_resends(
     with pytest.raises(NetworkError, match="radiant server down"):
         await coord.mutual_refund()
     assert asset == [] and coord.record.state is SwapState.BOTH_LOCKED
+
+
+class _ForgetfulChainIO:
+    """A Radiant node that has FORGOTTEN our covenant refund (an error, as for an outage), and a
+    UTXO-set read that answers whether the covenant is still unspent."""
+
+    def __init__(self, unspent):
+        self.unspent = unspent
+
+    async def confirmations(self, txid):
+        raise NetworkError("No such mempool or blockchain transaction")
+
+    async def covenant_outpoint_unspent(self, spk, outpoint):
+        if isinstance(self.unspent, Exception):
+            raise self.unspent
+        return self.unspent
+
+
+@pytest.mark.parametrize(("unspent", "resent"), [(True, True), (False, False)])
+async def test_a_forgotten_covenant_refund_is_judged_by_the_covenant_itself(unspent, resent):
+    """Mythos review of #893 (MEDIUM): a dropped refund the node no longer knows answered like an
+    outage, so every retry raised and the covenant was never refunded in-band. The covenant's own
+    UTXO decides: still unspent means our refund did not land."""
+    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    asset = _count_asset_refunds(coord)
+    coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
+    coord.radiant_leg.chain_io = _ForgetfulChainIO(unspent)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and asset == ([1] if resent else [])
+
+
+async def test_a_forgotten_covenant_refund_with_an_unreadable_covenant_raises():
+    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    asset = _count_asset_refunds(coord)
+    coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
+    coord.radiant_leg.chain_io = _ForgetfulChainIO(NetworkError("radiant server down"))
+    with pytest.raises(NetworkError, match="radiant server down"):
+        await coord.mutual_refund()
+    assert asset == [] and coord.record.state is SwapState.BOTH_LOCKED
+
+
+async def test_mutual_refund_does_not_refund_the_covenant_while_a_claim_is_settled_at_the_tip():
+    """Mythos review of #893 (LOW): only a claim verified at F stopped the covenant refund. With the
+    claim mined above F the covenant went out while p was public."""
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"head": 79, "finalized": 60})
+    chain.claim(75)
+    asset = _count_asset_refunds(coord)
+    with pytest.raises(NetworkError, match="settled at the tip but not yet final"):
+        await coord.mutual_refund()
+    assert asset == [] and coord.record.state is SwapState.BOTH_LOCKED
+
+
+async def test_mutual_refund_does_not_refund_the_covenant_while_a_seen_claim_holds():
+    coord, _chain, _leg = _setup(
+        state=SwapState.BOTH_LOCKED, role=None, endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90}, confs=1
+    )
+    asset = _count_asset_refunds(coord)
+    with pytest.raises(NetworkError, match="p may be"):
+        await coord.mutual_refund()
+    assert asset == [] and coord.record.counter_claim_tx is not None
+
+
+async def test_the_real_chain_reader_answers_whether_the_covenant_outpoint_is_unspent():
+    """`RadiantChainIO.covenant_outpoint_unspent`: an empty set is an answer (False); a failed
+    read raises, so "spent" and "could not ask" never look alike."""
+    from types import SimpleNamespace
+
+    from pyrxd.gravity.radiant_leg import RadiantChainIO
+
+    class _Client:
+        def __init__(self, utxos):
+            self.utxos = utxos
+
+        async def broadcast(self, raw):  # required by RadiantChainIO; unused here
+            raise AssertionError("no broadcast in this test")
+
+        async def get_transaction_verbose(self, txid):  # required by RadiantChainIO; unused here
+            raise AssertionError("not read in this test")
+
+        async def get_utxos(self, script_hash):
+            if isinstance(self.utxos, Exception):
+                raise self.utxos
+            return self.utxos
+
+    live = [SimpleNamespace(tx_hash="ab" * 32, tx_pos=0)]
+    assert await RadiantChainIO(_Client(live)).covenant_outpoint_unspent(b"\x51", "ab" * 32 + ":0") is True
+    assert await RadiantChainIO(_Client(live)).covenant_outpoint_unspent(b"\x51", "ab" * 32 + ":1") is False
+    assert await RadiantChainIO(_Client([])).covenant_outpoint_unspent(b"\x51", "ab" * 32 + ":0") is False
+    with pytest.raises(NetworkError):
+        await RadiantChainIO(_Client(NetworkError("down"))).covenant_outpoint_unspent(b"\x51", "ab" * 32 + ":0")

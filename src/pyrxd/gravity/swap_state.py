@@ -139,8 +139,10 @@ class RecordRole(Enum):
 
 
 class AbortReason(Enum):
-    """Why a record went to ABORTED, when that is not the broadcast that took it there (#850 PR 5a,
-    design §4.1, M5). An enum, not free text: the record must never carry an arbitrary string."""
+    """Why a record went to ABORTED when the transition was taken on what the chain shows rather
+    than on a broadcast this call made (#850 PR 5a, design §4.1, M5). The refund observed may still
+    be one this process sent earlier. An enum, not free text: the record must never carry an
+    arbitrary string."""
 
     #: The counter leg was observed refunded at a finalized block, whoever sent the refund.
     COUNTER_LEG_REFUNDED = "counter_leg_refunded"

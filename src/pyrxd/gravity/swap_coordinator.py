@@ -4411,8 +4411,22 @@ class SwapCoordinator:
         chain_io = getattr(self.radiant_leg, "chain_io", None)
         if chain_io is None:
             return True
-        confs = await chain_io.confirmations(str(self.record.asset_refund_txid))
-        return isinstance(confs, int) and not isinstance(confs, bool) and confs >= 1
+        failure: Exception | None = None
+        try:
+            confs = await chain_io.confirmations(str(self.record.asset_refund_txid))
+            if isinstance(confs, int) and not isinstance(confs, bool) and confs >= 1:
+                return True
+        except Exception as exc:  # a node that has FORGOTTEN the tx answers an error, like an outage
+            failure = exc
+        # Not confirmed, or not known: ask the covenant itself. Still unspent means our refund did
+        # not land (re-send); spent means it did, or something else spent it (nothing to re-send).
+        unspent = getattr(chain_io, "covenant_outpoint_unspent", None)
+        outpoint, spk_hex = self.record.radiant_covenant_outpoint, self.record.radiant_covenant_spk_hex
+        if unspent is None or outpoint is None or spk_hex is None:
+            if failure is not None:
+                raise failure
+            return False
+        return not await unspent(bytes.fromhex(spk_hex), outpoint)
 
     async def _covenant_age_blocks(self) -> int:
         """Blocks since the covenant was MINED, read from its pinned funding transaction.
@@ -4784,6 +4798,17 @@ class SwapCoordinator:
                     "taker's to claim with p, so mutual_refund will not refund it. The evidence is on the record."
                 )
             counter_done = disposition.kind is DispositionKind.REFUNDED and outcome == "recorded"
+        # The covenant refund waits while the counter leg may have been CLAIMED: settled at a tip
+        # but not yet final, or a Claimed(p) log on record before t_rxd (design §3.3; Mythos review
+        # of #850 PR 5a). Refunding it then would give the maker both legs if that claim stands.
+        covenant_wait: str | None = None
+        if disposition is not None and disposition.kind is DispositionKind.SETTLED_UNFINAL:
+            covenant_wait = "the counter leg is settled at the tip but not yet final; retry once it is"
+        elif await self._claim_seen_holds_the_terminal():
+            covenant_wait = (
+                f"a Claimed(p) log on the counter leg (tx {self.record.counter_claim_tx}) opens H, so p may be "
+                "public; the covenant is not refunded before t_rxd matures"
+            )
         failures: list[tuple[str, Exception]] = []
         if not counter_done:
             try:
@@ -4793,7 +4818,9 @@ class SwapCoordinator:
         if self.record.asset_refund_txid is not None and not await self._recorded_asset_refund_landed():
             # Recorded, but not on chain (dropped or replaced): send it again.
             self.record = dataclasses.replace(self.record, asset_refund_txid=None)
-        if self.record.asset_refund_txid is None:
+        if covenant_wait is not None and self.record.asset_refund_txid is None:
+            failures.append(("radiant leg", NetworkError(f"not sent: {covenant_wait}")))
+        elif self.record.asset_refund_txid is None:
             try:
                 txid = await self.radiant_leg.refund_asset(self.record)
             except Exception as exc:

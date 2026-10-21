@@ -319,6 +319,19 @@ class RadiantChainIO:
         # this return value out of every slot that wants a height.
         return Confirmations(depth) if depth > 0 else Confirmations(0)
 
+    async def covenant_outpoint_unspent(self, spk: bytes, outpoint: str) -> bool:
+        """Whether ``outpoint`` is in the live UTXO set of ``spk``. An answer, not a guess: an empty
+        set is ``False``, and a read that fails RAISES, so "spent" and "could not ask" never look
+        alike (#850 PR 5a: a recorded covenant refund that a node has forgotten read as "server
+        down" and blocked every retry)."""
+        import hashlib
+
+        register = getattr(self._client, "register_spk", None)
+        if callable(register):
+            register(bytes(spk))
+        utxos = await self._client.get_utxos(hashlib.sha256(bytes(spk)).digest()[::-1])
+        return any(f"{u.tx_hash}:{u.tx_pos}" == outpoint for u in utxos)
+
     async def find_covenant_utxo(
         self, spk: bytes, *, expected_value: PhotonValue | None = None, pin_outpoint: str | None = None
     ) -> tuple[str, PhotonValue, ChainHeight]:

@@ -1084,6 +1084,13 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
                 "calldata wherever it was seen; recover it before t_rxd. The record goes terminal on its own "
                 "once t_rxd has matured."
             )
+        if rec.state is SwapState.BTC_LOCKED:
+            # Nothing sent and no claim on record: the contract is settled at some endpoint's tip but
+            # not yet at the finalized block (#850 PR 5a). Wait for finality, then run this again.
+            raise SystemExit(
+                "the record stays btc_locked: the ETH HTLC is settled at the chain tip but not yet final, "
+                "so nothing was sent. Run --phase abort again once that block is finalized."
+            )
         if rec.state is not SwapState.ABORTED:
             raise SystemExit(f"taker_refund_btc landed in {rec.state.value}, expected aborted")
         print(
