@@ -82,6 +82,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **On an ETH swap, the coordinator now acts on what the chain shows about the counter leg, not
+  only on what it broadcast (#850 PR 5a) [Changed (breaking)].** The disposition is read with
+  `pyrxd.eth_wallet.disposition` at the quorum-minimum finalized block.
+  - `taker_refund_btc` reads it first. A claim verified on chain moves the record to
+    `SECRET_REVEALED` (a new edge from `BTC_LOCKED`; `p` is public, claim the covenant). A refund
+    verified on chain, whoever sent it, moves it to `ABORTED` with `abort_reason:
+    counter_leg_refunded`. In both cases nothing is sent. Settled at the tip but not yet final:
+    nothing is sent and the record waits. Otherwise the refund is sent as before and the record
+    still goes to `ABORTED` on our broadcast (that changes in PR 5b). A `MAKER`-role coordinator
+    is refused.
+  - New `SwapCoordinator.reconcile_counter_leg()`: the same read and the same edges, with no
+    broadcast. An unreadable, below-quorum or contradictory chain changes nothing and raises
+    `NetworkError`. From `PARAMS_MISMATCH` a verified claim has deliberately no edge: the evidence
+    is recorded and it raises. A maker's record records the evidence and stays. Nothing in pyrxd
+    calls it yet; the runners and the watchtower use it in later #850 PRs.
+  - A `Claimed` log that opens the hashlock but does not verify is recorded as
+    `counter_claim_tx`. While one is recorded and the covenant's `t_rxd` has not matured, a
+    refunded counter leg does not take the record terminal, and neither does our own refund: the
+    covenant claim comes first. An unreadable covenant depth holds too.
+  - A terminal answer read from a single endpoint changes nothing on a chain that carries value.
+    It does on a known testnet or anvil, and is recorded as single-source.
+  - New record fields `counter_claim_tx`, `counter_disposition` and `abort_reason`;
+    `SWAP_RECORD_SCHEMA_VERSION` is 4. A record carrying any post-v2 field, `role` included, now
+    writes 4, so a pyrxd that reads only up to 3 refuses it. The FSM has 15 edges.
 - **ETH and token counter-leg refunds are signed with up to 150,000 gas, up from 100,000, after an
   `eth_estimateGas` check (#850 PR 4a).** An estimate above 150,000 raises the new
   `RefundGasAboveCeiling` before anything is signed.
