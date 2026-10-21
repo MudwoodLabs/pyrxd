@@ -124,6 +124,7 @@ async def test_a_claim_after_a_params_mismatch_has_no_edge_and_raises():
     with pytest.raises(ValidationError, match="params mismatch"):
         await coord.reconcile_counter_leg()
     assert coord.record.state is SwapState.PARAMS_MISMATCH and coord.record.counter_disposition.kind == "claimed"
+    assert coord.persisted[-1].counter_disposition.kind == "claimed"  # durable before the raise
 
 
 async def test_a_makers_record_records_the_evidence_and_stays():
@@ -139,6 +140,7 @@ async def test_a_claim_with_no_covenant_pin_records_and_raises():
     with pytest.raises(ValidationError, match="no covenant outpoint"):
         await coord.reconcile_counter_leg()
     assert coord.record.state is SwapState.BTC_LOCKED and coord.record.counter_claim_tx is not None
+    assert coord.persisted[-1].counter_claim_tx is not None  # durable before the raise
 
 
 async def test_an_unknown_disposition_changes_nothing_and_raises():
@@ -268,6 +270,7 @@ async def test_a_seen_claim_records_and_still_refunds_but_holds_the_terminal():
     coord, _chain, leg = _setup(endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90}, confs=1)
     rec = await coord.taker_refund_btc()
     assert leg.refunds == 1 and rec.state is SwapState.BTC_LOCKED and rec.counter_claim_tx is not None
+    assert coord.persisted[-1].counter_claim_tx == rec.counter_claim_tx
 
 
 async def test_a_maker_coordinator_may_not_send_the_takers_refund():
@@ -371,3 +374,30 @@ async def test_HONEST_the_hold_stays_before_t_rxd_by_the_funding_depth():
     coord.radiant_leg.chain_io = _ChainIO(int(coord.record.terms.t_rxd.value) - 1)
     chain.refund(85)
     assert (await coord.reconcile_counter_leg()).state is SwapState.BTC_LOCKED
+
+
+async def test_a_verified_claim_replaces_an_earlier_unverified_one_on_the_record():
+    """The record must name the claim that VERIFIED, not a seen-only (possibly forged) log."""
+    coord, chain, _leg = _setup(endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90})
+    tx = chain.claim(70)
+    rec = await coord.reconcile_counter_leg()
+    assert rec.state is SwapState.SECRET_REVEALED and rec.counter_claim_tx == tx
+
+
+async def test_a_recorded_seen_claim_is_not_overwritten_by_a_later_seen_one():
+    coord, chain, _leg = _setup(endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90}, confs=1)
+    coord.record = __import__("dataclasses").replace(coord.record, counter_claim_tx="0x" + "aa" * 32)
+    chain.refund(85)
+    rec = await coord.reconcile_counter_leg()
+    assert rec.counter_claim_tx == "0x" + "aa" * 32
+
+
+async def test_one_endpoint_on_a_value_bearing_chain_falls_through_to_the_send_in_the_refund(monkeypatch):
+    """D4 in taker_refund_btc: a single-source terminal answer changes no state; the refund path
+    then behaves as on an unknown answer (the leg's own checks decide; a settled contract reverts)."""
+    coord, chain, leg = _setup(chain_kw={"finalized": 90})
+    chain.refund(85)
+    leg._rpc = FakeEvmEndpoint(chain)
+    monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
+    await coord.taker_refund_btc()
+    assert leg.refunds == 1 and coord.record.counter_disposition is None
