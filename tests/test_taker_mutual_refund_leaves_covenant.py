@@ -395,7 +395,7 @@ def _real_eth_leg(rpc):
 
     contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=31337, artifact=_ART)
 
-    async def _refund_reverts(locator):
+    async def _refund_reverts(locator, **_kw):
         # Everything before the preflight needs a live node; the preflight's failure is what matters.
         raise _preflight_revert()
 

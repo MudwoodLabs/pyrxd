@@ -1249,3 +1249,67 @@ async def test_disposition_reads_an_open_contract_as_OPEN(anvil_url_fast_finalit
         assert d.kind is DispositionKind.OPEN, (d.reason, d.logs_failed)
     finally:
         await rpc.close()
+
+
+async def test_a_real_refund_is_signed_at_150k_and_uses_well_under_it(anvil_url):
+    """#850 PR 4a on a real node: the real eth_estimateGas against the ceiling, the limit signed and
+    the gas the refund actually used. (That the preflight keeps `gas` is pinned by the unit test on
+    the call's arguments, not here: no honest refund here fails at the limit.)"""
+    from pyrxd.eth_wallet.htlc_leg import REFUND_GAS_LIMIT, refund_ran_out_of_gas
+
+    rpc, taker, _maker = _legs(anvil_url)
+    try:
+        _p, h = _secret()
+        locator = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 100),
+            amount_wei=_AMOUNT_WEI,
+        )
+        await _advance_time(rpc, 200)
+        seen: list[str] = []
+
+        async def on_signed(tx_hash: str) -> None:
+            seen.append(tx_hash)
+
+        tx = await taker.refund(locator, on_signed=on_signed)
+        receipt = dict(await rpc.wait_receipt(tx))
+        sent = await rpc.get_transaction(tx)
+        assert seen == [tx]
+        assert int(sent["gas"]) == REFUND_GAS_LIMIT
+        assert receipt["status"] == 1 and int(receipt["gasUsed"]) < REFUND_GAS_LIMIT * 2 // 3
+        assert refund_ran_out_of_gas(receipt, gas_limit=REFUND_GAS_LIMIT) is False
+    finally:
+        await rpc.close()
+
+
+async def test_a_real_refund_from_a_sender_short_of_150k_gas_is_still_sent(anvil_url):
+    """The regression the PR 4a review measured: holding 120k x maxFee, the 100k refund on main was
+    sent, and a fixed 150k limit was refused by the node at broadcast. Now it is signed lower."""
+    from pyrxd.security.errors import RefundFeeUnaffordable
+
+    rpc, taker, _maker = _legs(anvil_url)
+    try:
+        _p, h = _secret()
+        locator = await taker.fund(
+            hashlock=h,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=await _now_plus(rpc, 100),
+            amount_wei=_AMOUNT_WEI,
+        )
+        await _advance_time(rpc, 200)
+        max_fee = int((await rpc.fee_fields())["maxFeePerGas"])
+
+        await rpc.w3.provider.make_request("anvil_setBalance", [_ADDR_TAKER, hex(10_000 * max_fee)])
+        with pytest.raises(RefundFeeUnaffordable, match="Add ETH"):
+            await taker.refund(locator)
+
+        await rpc.w3.provider.make_request("anvil_setBalance", [_ADDR_TAKER, hex(120_000 * max_fee)])
+        tx = await taker.refund(locator)
+        receipt = dict(await rpc.wait_receipt(tx))
+        assert receipt["status"] == 1
+        assert int((await rpc.get_transaction(tx))["gas"]) == 120_000
+    finally:
+        await rpc.close()

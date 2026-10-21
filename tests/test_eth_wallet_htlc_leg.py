@@ -144,9 +144,24 @@ class _Rpc:
     async def preflight(self, tx):
         return None
 
-    async def send_raw(self, raw):
-        from eth_utils import keccak
+    async def estimate_gas(self, tx):
+        return 86_000  # the design's measured token-refund gasUsed (§3.4), under the 150k limit
 
+    async def get_balance(self, address, block_identifier=None):
+        return 10**18  # plenty: 1 ETH covers 150k gas at any fee in these fixtures
+
+    async def send_raw(self, raw):
+        from eth_account.typed_transactions import TypedTransaction
+        from eth_utils import keccak
+        from hexbytes import HexBytes
+
+        held = getattr(self, "balance_wei", None)
+        if held is not None:
+            # What a real node checks before it accepts a broadcast (security review L2: without it
+            # the HONEST balance tests passed with the balance ignored entirely).
+            tx = TypedTransaction.from_bytes(HexBytes(bytes(raw))).as_dict()
+            if int(tx["gas"]) * int(tx["maxFeePerGas"]) > held:
+                raise NetworkError("eth_sendRawTransaction failed: insufficient funds for gas * price + value")
         self.sent.append(bytes(raw))
         return self.echo if self.echo is not None else "0x" + keccak(bytes(raw)).hex()
 
@@ -214,7 +229,7 @@ async def test_a_refund_is_priced_at_the_nodes_own_fee(frozen_clock):
     await _leg(rpc).refund(_locator(timeout=_NOW))
     (base,) = rpc.built
     assert (base["maxFeePerGas"], base["maxPriorityFeePerGas"]) == (2_000_000_002, 2)
-    assert base["gas"] == 100_000  # a field of the signed refund
+    assert base["gas"] == 150_000  # a field of the signed refund (REFUND_GAS_LIMIT, #850 PR 4a)
 
 
 async def test_a_claim_quoted_a_fee_BELOW_its_tip_is_priced_at_the_tip(frozen_clock):
@@ -849,3 +864,184 @@ async def test_fund_refuses_a_receipt_naming_ANY_other_address(lie):
     leg, _, _, _ = _funding_leg(lie=lie)
     with pytest.raises(ValidationError, match="deploy receipt names contract"):
         await leg.fund(amount_wei=10**15, **_FUND_ARGS)
+
+
+# ── refund plumbing (#850 PR 4a): the gas ceiling, the estimate check, the signed-hash hook ──────
+
+
+def _estimating(rpc, estimate, calls=None):
+    async def estimate_gas(tx):
+        if calls is not None:
+            calls.append(("estimate", tx))
+        return estimate
+
+    rpc.estimate_gas = estimate_gas
+    return rpc
+
+
+async def test_a_refund_estimated_above_the_ceiling_is_refused_before_signing(frozen_clock):
+    from pyrxd.security.errors import RefundGasAboveCeiling
+
+    rpc = _estimating(_Rpc(head_ts=_NOW), hl.REFUND_GAS_LIMIT + 1)
+    with pytest.raises(RefundGasAboveCeiling) as ei:
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert (ei.value.estimate, ei.value.ceiling) == (hl.REFUND_GAS_LIMIT + 1, hl.REFUND_GAS_LIMIT)
+    assert rpc.sent == []
+
+
+async def test_HONEST_a_refund_estimated_at_exactly_the_ceiling_is_sent(frozen_clock):
+    rpc = _estimating(_Rpc(head_ts=_NOW), hl.REFUND_GAS_LIMIT)
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert len(rpc.sent) == 1
+
+
+async def test_the_estimate_runs_before_the_preflight_and_each_runs_once(frozen_clock):
+    """The estimate first: a preflight at the limit would fail with an untyped out-of-gas before the
+    ceiling check could say "needs more gas" (review of PR 4a, measured on anvil)."""
+    calls: list = []
+    rpc = _estimating(_Rpc(head_ts=_NOW), 86_000, calls)
+
+    async def preflight(tx):
+        calls.append(("preflight", tx))
+
+    rpc.preflight = preflight
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert [c for c, _ in calls] == ["estimate", "preflight"]
+    assert calls[1][1]["gas"] == hl.REFUND_GAS_LIMIT  # the preflight sees the signed limit
+
+
+async def test_a_typed_revert_at_the_estimate_stops_the_refund_before_the_preflight(frozen_clock):
+    calls: list = []
+    rpc = _Rpc(head_ts=_NOW)
+
+    async def estimate_gas(tx):
+        raise ValidationError("tx would revert (eth_estimateGas)")
+
+    async def preflight(tx):
+        calls.append(tx)
+
+    rpc.estimate_gas, rpc.preflight = estimate_gas, preflight
+    with pytest.raises(ValidationError, match="would revert"):
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert calls == [] and rpc.sent == []
+
+
+def _balanced(rpc, wei):
+    async def get_balance(address, block_identifier=None):
+        return wei
+
+    rpc.get_balance = get_balance
+    rpc.balance_wei = wei  # the fake broadcast then refuses what a node would refuse
+    return rpc
+
+
+async def test_HONEST_a_sender_who_could_afford_the_old_100k_limit_is_still_sent(frozen_clock):
+    """The regression the PR 4a review measured on anvil: with 120k x maxFee held, main sent the
+    refund and a fixed 150k limit was refused at broadcast. Now it is signed at what it can hold."""
+    rpc = _balanced(_Rpc(head_ts=_NOW, max_fee=1_000, tip=1), 120_000 * 1_000)
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert len(rpc.sent) == 1
+
+
+async def test_the_limit_is_lowered_to_what_the_sender_holds_never_below_the_estimate(frozen_clock):
+    seen: list = []
+    rpc = _balanced(_Rpc(head_ts=_NOW, max_fee=1_000, tip=1), 120_000 * 1_000 + 999)
+
+    async def preflight(tx):
+        seen.append(tx["gas"])
+
+    rpc.preflight = preflight
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert seen == [120_000]
+
+
+async def test_a_sender_who_cannot_hold_the_estimate_is_told_to_add_eth(frozen_clock):
+    from pyrxd.security.errors import RefundFeeUnaffordable
+
+    rpc = _balanced(_Rpc(head_ts=_NOW, max_fee=1_000, tip=1), 86_000 * 1_000 - 1)
+    with pytest.raises(RefundFeeUnaffordable, match="Add ETH") as ei:
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert (ei.value.need_wei, ei.value.have_wei) == (86_000 * 1_000, 86_000 * 1_000 - 1)
+    assert rpc.sent == []
+
+
+async def test_HONEST_a_sender_holding_exactly_the_estimate_is_sent(frozen_clock):
+    rpc = _balanced(_Rpc(head_ts=_NOW, max_fee=1_000, tip=1), 86_000 * 1_000)
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert len(rpc.sent) == 1
+
+
+async def test_the_balance_is_read_from_the_broadcasting_endpoint(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW, max_fee=1_000, tip=1)
+
+    async def quorum_balance(address, block_identifier=None):
+        raise AssertionError("the quorum balance is not the broadcaster's")
+
+    rpc.get_balance = quorum_balance
+    rpc.primary = _balanced(types.SimpleNamespace(), 10**18)
+    await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert len(rpc.sent) == 1
+
+
+async def test_on_signed_sees_the_hash_before_the_broadcast(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW)
+    seen: list = []
+
+    async def on_signed(tx_hash):
+        seen.append((tx_hash, len(rpc.sent)))
+
+    sent_hash = await _leg(rpc).refund(_locator(timeout=_NOW), on_signed=on_signed)
+    assert seen == [(sent_hash, 0)] and len(rpc.sent) == 1
+
+
+async def test_a_failing_on_signed_means_nothing_is_broadcast(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW)
+
+    async def on_signed(_tx_hash):
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        await _leg(rpc).refund(_locator(timeout=_NOW), on_signed=on_signed)
+    assert rpc.sent == []
+
+
+@pytest.mark.parametrize(
+    ("receipt", "out_of_gas"),
+    [
+        ({"status": 0, "gasUsed": 150_000}, True),
+        ({"status": "0x0", "gasUsed": "0x249f0"}, True),  # the same receipt as hex strings
+        ({"status": 0, "gasUsed": 99_432 * 3 // 2}, True),  # payout starved (63/64), measured at 100k
+        ({"status": 0, "gasUsed": 150_000 - 150_000 // 64 - 1}, False),  # just under the 63/64 line
+        ({"status": 0, "gasUsed": 31_337}, False),  # a contract revert: AlreadySettled, say
+        ({"status": 1, "gasUsed": 150_000}, False),  # succeeded using all of it
+        ({"status": 0}, False),  # gasUsed missing: not proven out of gas
+    ],
+)
+def test_out_of_gas_is_status_zero_with_the_whole_limit_used(receipt, out_of_gas):
+    assert hl.refund_ran_out_of_gas(receipt, gas_limit=150_000) is out_of_gas
+
+
+async def test_a_typed_preflight_failure_at_a_lowered_limit_says_it_may_be_gas(frozen_clock):
+    """Mythos review of PR 4a (LOW): a node that types an out-of-gas as a revert made a short-funded
+    refund read as "can never succeed". The type stays ValidationError; the message names the cause."""
+    rpc = _balanced(_Rpc(head_ts=_NOW, max_fee=1_000, tip=1), 100_000 * 1_000)
+
+    async def preflight(tx):
+        raise ValidationError("tx would revert (preflight eth_call): execution reverted")
+
+    rpc.preflight = preflight
+    with pytest.raises(ValidationError, match="may simply have run out of gas") as ei:
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert "sized at 100000 gas" in str(ei.value) and rpc.sent == []
+
+
+async def test_HONEST_a_typed_preflight_failure_at_the_full_limit_is_unchanged(frozen_clock):
+    rpc = _Rpc(head_ts=_NOW)
+
+    async def preflight(tx):
+        raise ValidationError("tx would revert (preflight eth_call): AlreadySettled")
+
+    rpc.preflight = preflight
+    with pytest.raises(ValidationError) as ei:
+        await _leg(rpc).refund(_locator(timeout=_NOW))
+    assert "run out of gas" not in str(ei.value)

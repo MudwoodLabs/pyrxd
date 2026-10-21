@@ -48,6 +48,8 @@ __all__ = [
     "PoolTooSmallError",
     "PreRevealAbort",
     "PreRevealExpired",
+    "RefundFeeUnaffordable",
+    "RefundGasAboveCeiling",
     "RpcMethodNotFound",
     "RxdSdkError",
     "ServerInconsistencyError",
@@ -367,6 +369,37 @@ class NothingToRefund(ValidationError):
     def __init__(self, message: str, *, contract_address: str | None = None) -> None:
         super().__init__(message)
         self.contract_address = contract_address
+
+
+class RefundGasAboveCeiling(ValidationError):
+    """An EVM refund was refused BEFORE signing because ``eth_estimateGas`` says it needs more gas
+    than the refund's fixed limit (#850 PR 4a).
+
+    A refund sent anyway would run out of gas, revert, and leave the contract unsettled while the
+    sender pays for the whole limit. Measured honest refunds use about 51k (ETH) and 86k (token)
+    gas against the 150k limit, so an estimate above it means something about this contract, its
+    refundee or the chain is not what the swap was built for. Its own type so the operator is told that, not "would
+    revert" or "not yet mature". Nothing was signed or sent.
+    """
+
+    def __init__(self, message: str, *, estimate: int, ceiling: int) -> None:
+        super().__init__(message)
+        self.estimate = estimate
+        self.ceiling = ceiling
+
+
+class RefundFeeUnaffordable(ValidationError):
+    """An EVM refund was refused BEFORE signing because the sender cannot hold even the ESTIMATED
+    gas at the quoted ``maxFeePerGas`` (#850 PR 4a). A node would refuse the broadcast ("insufficient
+    funds for gas * price + value"), which arrives as a retryable network error and would be retried
+    forever. Its own type because the fix is the operator's: add ETH to the sending account. A
+    :class:`ValidationError`, so a driver stops and says so rather than retrying. Nothing was signed.
+    """
+
+    def __init__(self, message: str, *, need_wei: int, have_wei: int) -> None:
+        super().__init__(message)
+        self.need_wei = need_wei
+        self.have_wei = have_wei
 
 
 class CounterLegClaimedByCounterparty(ValidationError):

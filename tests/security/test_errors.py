@@ -347,6 +347,10 @@ _SAMPLE_ARGS: dict[str, object] = {
     "contract_address": "0x" + "c0" * 20,
     "local_txid": "cd" * 32,
     "echoed": "ef" * 32,
+    "estimate": 151_000,
+    "ceiling": 150_000,
+    "need_wei": 10**15,
+    "have_wei": 10**14,
 }
 
 

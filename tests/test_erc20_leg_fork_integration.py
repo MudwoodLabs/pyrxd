@@ -323,3 +323,30 @@ def test_the_preimage_is_recoverable_from_the_real_claim(fork_url: str) -> None:
         logs=receipt.get("logs", []),
     )
     assert bytes.fromhex(rec.preimage_hex) == preimage
+
+
+def test_a_real_token_refund_fits_the_150k_refund_limit(fork_url: str) -> None:
+    """#850 PR 4a: the refund limit was 100,000 and the design measured token refunds at about
+    86k. This re-measures on the pinned anvil, through the real estimate check, against real USDC."""
+    import hashlib
+
+    from pyrxd.eth_wallet.htlc_leg import REFUND_GAS_LIMIT
+
+    taker = _leg(fork_url)
+    _p = os.urandom(32)
+    locator = asyncio.run(
+        taker.fund(
+            hashlock=hashlib.sha256(_p).digest(),
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=int(time.time()) + 60,
+            amount_wei=_AMOUNT,
+        )
+    )
+    _rpc_call(fork_url, "evm_increaseTime", [3600])
+    _rpc_call(fork_url, "evm_mine", [])
+    tx_hash = asyncio.run(taker.refund(locator))
+    receipt = _receipt(fork_url, tx_hash)
+    assert int(receipt["status"], 16) == 1, "the token refund reverted"
+    used = int(receipt["gasUsed"], 16)
+    assert used < REFUND_GAS_LIMIT * 2 // 3, f"token refund used {used} gas against {REFUND_GAS_LIMIT}"

@@ -145,6 +145,9 @@ class _Eth:
     async def get_logs(self, *a, **k):
         return self._node.answer("get_logs", *a, **k)
 
+    async def estimate_gas(self, *a, **k):
+        return self._node.answer("estimate_gas", *a, **k)
+
     async def get_storage_at(self, *a, **k):
         return self._node.answer("get_storage_at", *a, **k)
 
@@ -473,7 +476,9 @@ class TestPreflight:
         client, node = _client(call=HexBytes(b""))  # an eth_call that returns nothing, as web3 does
         assert _run(client.preflight(_CLAIM_TX)) is None
         (args, _kwargs) = node.asked("call")[0]
-        assert args[0] == {k: _CLAIM_TX[k] for k in ("from", "to", "value", "data")}
+        # `gas` is KEPT (#850 PR 4a): without it the call runs at the node's own cap, so a tx that
+        # would run out of gas at its signed limit passed here.
+        assert args[0] == {k: _CLAIM_TX[k] for k in ("from", "to", "value", "data", "gas")}
 
     @pytest.mark.parametrize(
         "exc",
@@ -910,6 +915,24 @@ class TestResponseBounds:
         # Four orders of magnitude above the handful a per-contract query returns, so it cannot
         # refuse honest work, and small enough to bound the allocation.
         assert rpc_mod._MAX_LOG_ENTRIES == 10_000
+
+
+class TestEstimateGas:
+    def test_the_estimate_is_asked_without_the_gas_or_fee_fields(self) -> None:
+        client, node = _client(estimate_gas=85_712)
+        assert _run(client.estimate_gas(_CLAIM_TX)) == 85_712
+        (args, _kwargs) = node.asked("estimate_gas")[0]
+        assert args[0] == {k: _CLAIM_TX[k] for k in ("from", "to", "value", "data")}
+
+    def test_a_TYPED_revert_is_permanent(self) -> None:
+        client, _ = _client(estimate_gas=web3.exceptions.ContractCustomError("0x59912c06"))
+        with pytest.raises(ValidationError):
+            _run(client.estimate_gas(_CLAIM_TX))
+
+    def test_an_UNTYPED_failure_is_retryable(self) -> None:
+        client, _ = _client(estimate_gas=ValueError("execution reverted: out of gas"))
+        with pytest.raises(NetworkError):
+            _run(client.estimate_gas(_CLAIM_TX))
 
 
 # --------------------------------------------------------------------------------------------
