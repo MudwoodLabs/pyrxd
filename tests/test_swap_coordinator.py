@@ -3476,6 +3476,9 @@ async def test_a_crashed_fund_resumes_THROUGH_A_REAL_PERSISTED_FILE(tmp_path):
         "the crash left nothing on disk pointing at the deployed contract"
     )
     assert on_disk.pending_push_nonce == 7
+    # The covenant this fund was verified against is written with the deploy, not only when the lock
+    # is recorded, so a crash here cannot lose it (#850 PR 1b follow-up).
+    assert on_disk.radiant_covenant_outpoint is not None
 
     # --- run 2: a FRESH coordinator loads that file and completes the fund ---
     leg2 = FakeEthLeg(preimage=secret, verdict=_final())
