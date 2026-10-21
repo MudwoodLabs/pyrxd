@@ -1078,9 +1078,11 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
             # #850 PR 5a (D14): a Claimed(p) log is on record, so p may be public. The record stays
             # BTC_LOCKED until the covenant's t_rxd matures: claim the covenant first.
             raise SystemExit(
-                f"the record stays btc_locked: a claim of this HTLC (tx {rec.counter_claim_tx}) opens H, so p "
-                "may be public. Run --phase claim now to claim the RXD covenant before its CSV refund to the "
-                "maker opens; the record goes terminal on its own once t_rxd has matured."
+                f"the record stays btc_locked: a Claimed log on this HTLC (tx {rec.counter_claim_tx}) opens H, "
+                "so p may be public. If that claim is on chain, run --phase claim to claim the RXD covenant before "
+                "its CSV refund to the maker opens. If it was dropped or reorged out, p is in that transaction's "
+                "calldata wherever it was seen; recover it before t_rxd. The record goes terminal on its own "
+                "once t_rxd has matured."
             )
         if rec.state is not SwapState.ABORTED:
             raise SystemExit(f"taker_refund_btc landed in {rec.state.value}, expected aborted")

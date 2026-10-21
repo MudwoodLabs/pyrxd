@@ -4403,6 +4403,17 @@ class SwapCoordinator:
         except ValidationError:
             return False
 
+    async def _recorded_asset_refund_landed(self) -> bool:
+        """Whether the covenant refund recorded as ``asset_refund_txid`` is on chain (one
+        confirmation). A refund that was broadcast and then dropped or replaced must be sent again,
+        not skipped. Without a chain reader (a leg written before 0.27) it is taken as sent, which is
+        what a retry did before. A depth read that fails raises: neither skip nor re-send blind."""
+        chain_io = getattr(self.radiant_leg, "chain_io", None)
+        if chain_io is None:
+            return True
+        confs = await chain_io.confirmations(str(self.record.asset_refund_txid))
+        return isinstance(confs, int) and not isinstance(confs, bool) and confs >= 1
+
     async def _covenant_age_blocks(self) -> int:
         """Blocks since the covenant was MINED, read from its pinned funding transaction.
 
@@ -4764,6 +4775,14 @@ class SwapCoordinator:
                 # Verified claim: p is public and the record is SECRET_REVEALED. The covenant is
                 # claimable with p, so it is not refunded here.
                 return self.record
+            if disposition.kind is DispositionKind.CLAIMED and outcome == "recorded":
+                # A maker's record (it does not take the edge): the maker claimed the counter leg,
+                # so the covenant is the taker's to claim with p. Refunding it now would take both
+                # legs (review of #850 PR 5a).
+                raise ValidationError(
+                    "the counter leg was CLAIMED (verified at the finalized block): the covenant is the "
+                    "taker's to claim with p, so mutual_refund will not refund it. The evidence is on the record."
+                )
             counter_done = disposition.kind is DispositionKind.REFUNDED and outcome == "recorded"
         failures: list[tuple[str, Exception]] = []
         if not counter_done:
@@ -4771,6 +4790,9 @@ class SwapCoordinator:
                 await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
             except Exception as exc:
                 failures.append(("counter leg", exc))
+        if self.record.asset_refund_txid is not None and not await self._recorded_asset_refund_landed():
+            # Recorded, but not on chain (dropped or replaced): send it again.
+            self.record = dataclasses.replace(self.record, asset_refund_txid=None)
         if self.record.asset_refund_txid is None:
             try:
                 txid = await self.radiant_leg.refund_asset(self.record)

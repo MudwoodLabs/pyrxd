@@ -403,3 +403,39 @@ async def test_one_endpoint_on_a_value_bearing_chain_falls_through_to_the_send_i
     monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
     await coord.taker_refund_btc()
     assert leg.refunds == 1 and coord.record.counter_disposition is None
+
+
+async def test_a_makers_mutual_refund_refuses_to_refund_the_covenant_after_a_verified_claim():
+    """Round 2 of the review: a maker's record does not take the claim edge, so the early return
+    did not fire and the covenant refund went out: the maker would have taken both legs."""
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=SwapRole.MAKER, chain_kw={"finalized": 90})
+    chain.claim(70)
+    asset = _count_asset_refunds(coord)
+    with pytest.raises(ValidationError, match="taker's to claim"):
+        await coord.mutual_refund()
+    assert asset == [] and leg.refunds == 0 and coord.record.counter_disposition.kind == "claimed"
+
+
+@pytest.mark.parametrize(("confs", "resent"), [(0, True), (1, False)])
+async def test_a_recorded_covenant_refund_that_never_landed_is_sent_again(confs, resent):
+    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    asset = _count_asset_refunds(coord)
+    coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
+    coord.radiant_leg.chain_io = _ChainIO(confs)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and asset == ([1] if resent else [])
+
+
+async def test_an_unreadable_recorded_covenant_refund_neither_skips_nor_resends():
+    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    asset = _count_asset_refunds(coord)
+    coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
+
+    class _Down:
+        async def confirmations(self, txid):
+            raise NetworkError("radiant server down")
+
+    coord.radiant_leg.chain_io = _Down()
+    with pytest.raises(NetworkError, match="radiant server down"):
+        await coord.mutual_refund()
+    assert asset == [] and coord.record.state is SwapState.BOTH_LOCKED
