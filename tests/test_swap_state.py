@@ -134,6 +134,8 @@ _LEGAL_EDGES = frozenset(
         (SwapState.SECRET_REVEALED, SwapState.ASSET_VULNERABLE),
         (SwapState.ASSET_VULNERABLE, SwapState.ONE_SIDED_LOSS_TAKER),
         (SwapState.ASSET_VULNERABLE, SwapState.COMPLETED),
+        # #850 PR 5a: the taker learns of the maker's counter-leg claim from the chain.
+        (SwapState.BTC_LOCKED, SwapState.SECRET_REVEALED),
     }
 )
 
@@ -161,6 +163,11 @@ _LEGAL_TRIPLES = frozenset(
         (_S.SECRET_REVEALED, _E.TAKER_OFFLINE_OR_PINNED, _S.ASSET_VULNERABLE),
         (_S.ASSET_VULNERABLE, _E.MAKER_REFUNDS_ASSET_CSV, _S.ONE_SIDED_LOSS_TAKER),
         (_S.ASSET_VULNERABLE, _E.TAKER_SCRAPES_P_CLAIMS_ASSET, _S.COMPLETED),
+        # #850 PR 5a (design §3.2): edges taken on a disposition verified at a finalized block.
+        (_S.BTC_LOCKED, _E.COUNTER_LEG_REFUNDED_OBSERVED, _S.ABORTED),
+        (_S.PARAMS_MISMATCH, _E.COUNTER_LEG_REFUNDED_OBSERVED, _S.ABORTED),
+        (_S.BTC_LOCKED, _E.COUNTER_LEG_CLAIMED_OBSERVED, _S.SECRET_REVEALED),
+        (_S.BOTH_LOCKED, _E.COUNTER_LEG_CLAIMED_OBSERVED, _S.SECRET_REVEALED),
     }
 )
 
@@ -191,7 +198,7 @@ def test_each_state_event_pair_has_exactly_one_target():
 
 
 def test_transition_count():
-    assert len(TRANSITIONS) == 14
+    assert len(TRANSITIONS) == 15  # 14 + BTC_LOCKED -> SECRET_REVEALED (#850 PR 5a)
 
 
 def test_every_legal_transition_allowed():

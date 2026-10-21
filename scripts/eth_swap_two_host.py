@@ -1074,6 +1074,23 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
             auto_yes=args.yes,
         )
         rec = await _taker_eth_refund_explained(args, coord, loc, coord.taker_refund_btc)
+        if rec.state is SwapState.BTC_LOCKED and rec.counter_claim_tx is not None:
+            # #850 PR 5a (D14): a Claimed(p) log is on record, so p may be public. The record stays
+            # BTC_LOCKED until the covenant's t_rxd matures: claim the covenant first.
+            raise SystemExit(
+                f"the record stays btc_locked: a Claimed log on this HTLC (tx {rec.counter_claim_tx}) opens H, "
+                "so p may be public. If that claim is on chain, run --phase claim to claim the RXD covenant before "
+                "its CSV refund to the maker opens. If it was dropped or reorged out, p is in that transaction's "
+                "calldata wherever it was seen; recover it before t_rxd. The record goes terminal on its own "
+                "once t_rxd has matured."
+            )
+        if rec.state is SwapState.BTC_LOCKED:
+            # Nothing sent and no claim on record: the contract is settled at some endpoint's tip but
+            # not yet at the finalized block (#850 PR 5a). Wait for finality, then run this again.
+            raise SystemExit(
+                "the record stays btc_locked: the ETH HTLC is settled at the chain tip but not yet final, "
+                "so nothing was sent. Run --phase abort again once that block is finalized."
+            )
         if rec.state is not SwapState.ABORTED:
             raise SystemExit(f"taker_refund_btc landed in {rec.state.value}, expected aborted")
         print(

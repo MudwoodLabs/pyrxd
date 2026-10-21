@@ -44,7 +44,9 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # carrying any post-v2 field writes the current maximum, a BTC record included; a record with none
 # of them serialises exactly as before (v2 for ETH, no key for BTC). ``from_dict`` refuses a version
 # above its own (:class:`RecordFromNewerPyrxd`). Each PR that adds a persisted field bumps this.
-SWAP_RECORD_SCHEMA_VERSION = 3
+# v4 (#850 PR 5a) adds ``counter_claim_tx``, ``counter_disposition``, ``abort_reason`` and
+# ``asset_refund_txid``.
+SWAP_RECORD_SCHEMA_VERSION = 4
 _PRE_ROLE_ETH_SCHEMA_VERSION = 2
 
 __all__ = [
@@ -52,6 +54,8 @@ __all__ = [
     "REVEALED_STATES",
     "TERMINAL_STATES",
     "TRANSITIONS",
+    "AbortReason",
+    "CounterDispositionRecord",
     "NegotiatedTerms",
     "RecordFromNewerPyrxd",
     "RecordRole",
@@ -134,6 +138,69 @@ class RecordRole(Enum):
         return cls(role.value)
 
 
+class AbortReason(Enum):
+    """Why a record went to ABORTED when the transition was taken on what the chain shows rather
+    than on a broadcast this call made (#850 PR 5a, design §4.1, M5). The refund observed may still
+    be one this process sent earlier. An enum, not free text: the record must never carry an
+    arbitrary string."""
+
+    #: The counter leg was observed refunded at a finalized block, whoever sent the refund.
+    COUNTER_LEG_REFUNDED = "counter_leg_refunded"
+
+
+@dataclasses.dataclass(frozen=True)
+class CounterDispositionRecord:
+    """The chain evidence behind a counter-leg transition, as recorded on the swap (#850 PR 5a).
+
+    The persisted form of :class:`pyrxd.eth_wallet.disposition.DispositionEvidence`: what the
+    disposition was, the finalized block it was read at, the verified transaction (``None`` when the
+    invariants alone proved it), which endpoints were asked, and whether there was only one.
+    """
+
+    kind: str
+    block_number: int
+    block_hash: str
+    tx_hash: str | None
+    sources: tuple[str, ...]
+    single_source: bool
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("refunded", "claimed"):
+            raise ValidationError(f"counter_disposition.kind must be 'refunded' or 'claimed', not {self.kind!r}")
+        if not isinstance(self.block_number, int) or isinstance(self.block_number, bool) or self.block_number < 0:
+            raise ValidationError("counter_disposition.block_number must be a non-negative int")
+        check_tx_hash(self.block_hash)  # same shape: 0x + 32 bytes
+        if self.tx_hash is not None:
+            check_tx_hash(self.tx_hash)
+        if not isinstance(self.sources, tuple) or not all(isinstance(x, str) for x in self.sources):
+            raise ValidationError("counter_disposition.sources must be a tuple of str")
+        if not isinstance(self.single_source, bool):
+            raise ValidationError("counter_disposition.single_source must be a bool")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "block_number": self.block_number,
+            "block_hash": self.block_hash,
+            "tx_hash": self.tx_hash,
+            "sources": list(self.sources),
+            "single_source": self.single_source,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> CounterDispositionRecord:
+        if not isinstance(d, dict):
+            raise ValidationError("counter_disposition must be an object")
+        return cls(
+            kind=d.get("kind"),  # type: ignore[arg-type]
+            block_number=d.get("block_number"),  # type: ignore[arg-type]
+            block_hash=d.get("block_hash"),  # type: ignore[arg-type]
+            tx_hash=d.get("tx_hash"),
+            sources=tuple(d.get("sources") or ()),
+            single_source=d.get("single_source"),  # type: ignore[arg-type]
+        )
+
+
 class RecordFromNewerPyrxd(ValidationError):
     """A persisted :class:`SwapRecord` declares a ``schema_version`` above this pyrxd's.
 
@@ -181,6 +248,10 @@ class SwapEvent(Enum):
     TAKER_SCRAPES_P_CLAIMS_ASSET = "taker_scrapes_p_claims_asset"
     TAKER_OFFLINE_OR_PINNED = "taker_offline_or_pinned"
     MAKER_REFUNDS_ASSET_CSV = "maker_refunds_asset_csv"
+    # #850 PR 5a: what the CHAIN says happened to the counter leg, read and verified at a finalized
+    # block (pyrxd.eth_wallet.disposition), as opposed to what this process broadcast.
+    COUNTER_LEG_REFUNDED_OBSERVED = "counter_leg_refunded_observed"
+    COUNTER_LEG_CLAIMED_OBSERVED = "counter_leg_claimed_observed"
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +305,18 @@ _TRANSITION_TABLE: frozenset[tuple[SwapState, SwapEvent, SwapState]] = frozenset
         (SwapState.ASSET_VULNERABLE, SwapEvent.MAKER_REFUNDS_ASSET_CSV, SwapState.ONE_SIDED_LOSS_TAKER),
         # ASSET_VULNERABLE --> COMPLETED : taker still lands claim first (winner-take-all)
         (SwapState.ASSET_VULNERABLE, SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET, SwapState.COMPLETED),
+        # #850 PR 5a (design §3.2): edges taken on what the chain shows at a finalized block, so a
+        # refund someone else sent, or a claim the taker only learns of from the chain, is recorded.
+        # BTC_LOCKED --> ABORTED : the counter leg is refunded (by anyone), verified at F
+        (SwapState.BTC_LOCKED, SwapEvent.COUNTER_LEG_REFUNDED_OBSERVED, SwapState.ABORTED),
+        # PARAMS_MISMATCH --> ABORTED : the same, after a params mismatch
+        (SwapState.PARAMS_MISMATCH, SwapEvent.COUNTER_LEG_REFUNDED_OBSERVED, SwapState.ABORTED),
+        # BTC_LOCKED --> SECRET_REVEALED : the maker's counter-leg claim is verified at F. A NEW
+        # edge: on an ETH swap the taker's record stays BTC_LOCKED for the whole swap (only the
+        # maker's process takes MAKER_LOCKS_ASSET), so this is where the taker learns p is public.
+        (SwapState.BTC_LOCKED, SwapEvent.COUNTER_LEG_CLAIMED_OBSERVED, SwapState.SECRET_REVEALED),
+        # BOTH_LOCKED --> SECRET_REVEALED : the same, from BOTH_LOCKED
+        (SwapState.BOTH_LOCKED, SwapEvent.COUNTER_LEG_CLAIMED_OBSERVED, SwapState.SECRET_REVEALED),
     }
 )
 
@@ -673,6 +756,21 @@ class SwapRecord:
     #: the two-host runners refuse a phase run as the other side. ``None`` on a record from before
     #: 0.27 ("unknown"). Serialised only when set.
     role: RecordRole | None = None
+    #: A ``Claimed(p)`` transaction on the counter-leg contract, seen in its logs but NOT verified
+    #: (#850 PR 5a, design §2.3 CLAIM_SEEN). Liveness only: ``p`` is public wherever that transaction
+    #: is, so the covenant claim is due; it proves nothing about the contract. While it is set and
+    #: t_rxd has not matured, an observed refund does not take the record terminal (D14).
+    counter_claim_tx: str | None = None
+    #: The verified chain evidence behind the last counter-leg transition this record took
+    #: (:class:`CounterDispositionRecord`), or one recorded where no edge exists. Serialised only
+    #: when set.
+    counter_disposition: CounterDispositionRecord | None = None
+    #: Why the record went to ABORTED when no broadcast of ours took it there (:class:`AbortReason`).
+    abort_reason: AbortReason | None = None
+    #: The covenant's CSV refund this process broadcast in ``mutual_refund`` (Radiant txid hex),
+    #: written the moment the broadcast returns. A retry does not send it again: the covenant is
+    #: spent, so re-sending fails, and the retry never completed (#850 PR 5a).
+    asset_refund_txid: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -764,6 +862,21 @@ class SwapRecord:
             raise ValidationError("fund_refusal must be a str or None")
         if self.role is not None and not isinstance(self.role, RecordRole):
             raise ValidationError("SwapRecord.role must be a RecordRole or None")
+        if self.counter_claim_tx is not None:
+            if self.terms.counter_chain != "eth":
+                raise ValidationError("counter_claim_tx is an ETH counter-leg field")
+            check_tx_hash(self.counter_claim_tx)
+        if self.counter_disposition is not None:
+            if not isinstance(self.counter_disposition, CounterDispositionRecord):
+                raise ValidationError("counter_disposition must be a CounterDispositionRecord or None")
+            if self.terms.counter_chain != "eth":
+                raise ValidationError("counter_disposition is an ETH counter-leg field")
+        if self.abort_reason is not None and not isinstance(self.abort_reason, AbortReason):
+            raise ValidationError("abort_reason must be an AbortReason or None")
+        if self.asset_refund_txid is not None:
+            txid = self.asset_refund_txid
+            if not isinstance(txid, str) or len(txid) != 64 or any(c not in "0123456789abcdef" for c in txid):
+                raise ValidationError("asset_refund_txid must be 64 lower-case hex characters")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -848,9 +961,16 @@ class SwapRecord:
         }
         loc = self.counterchain_locator
         # Any post-v2 field writes the current maximum; without one, the pre-0.27 form exactly.
-        post_v2 = self.role is not None or (
-            not self.pending_counter_contract
-            and (self.pending_push_nonce is not None or self.pending_push_tx_hash is not None)
+        post_v2 = (
+            self.role is not None
+            or self.counter_claim_tx is not None
+            or self.counter_disposition is not None
+            or self.abort_reason is not None
+            or self.asset_refund_txid is not None
+            or (
+                not self.pending_counter_contract
+                and (self.pending_push_nonce is not None or self.pending_push_tx_hash is not None)
+            )
         )
         if post_v2:
             d["schema_version"] = SWAP_RECORD_SCHEMA_VERSION
@@ -883,6 +1003,14 @@ class SwapRecord:
             d["pending_btc_funding_tx"] = self.pending_btc_funding_tx
         if self.role is not None:
             d["role"] = self.role.value
+        if self.counter_claim_tx is not None:
+            d["counter_claim_tx"] = self.counter_claim_tx
+        if self.counter_disposition is not None:
+            d["counter_disposition"] = self.counter_disposition.to_dict()
+        if self.abort_reason is not None:
+            d["abort_reason"] = self.abort_reason.value
+        if self.asset_refund_txid is not None:
+            d["asset_refund_txid"] = self.asset_refund_txid
         return d
 
     @classmethod
@@ -930,12 +1058,29 @@ class SwapRecord:
             fund_refusal=d.get("fund_refusal"),
             pending_btc_funding_tx=d.get("pending_btc_funding_tx"),
             role=_record_role(role),
+            counter_claim_tx=d.get("counter_claim_tx"),
+            counter_disposition=(
+                CounterDispositionRecord.from_dict(d["counter_disposition"])
+                if d.get("counter_disposition") is not None
+                else None
+            ),
+            abort_reason=_abort_reason(d.get("abort_reason")),
+            asset_refund_txid=d.get("asset_refund_txid"),
         )
 
 
 # ---------------------------------------------------------------------------
 # Small boundary helpers (kept local; mirror taproot._as_bytes discipline)
 # ---------------------------------------------------------------------------
+
+
+def _abort_reason(value: object) -> AbortReason | None:
+    if value is None:
+        return None
+    try:
+        return AbortReason(value)
+    except ValueError:
+        raise ValidationError(f"unknown abort_reason {value!r}") from None
 
 
 def _record_role(value: object) -> RecordRole | None:

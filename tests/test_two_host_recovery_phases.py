@@ -38,7 +38,7 @@ import pytest
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.eth_wallet.events import function_selector
-from pyrxd.gravity.swap_state import SwapRole, SwapState
+from pyrxd.gravity.swap_state import SWAP_RECORD_SCHEMA_VERSION, SwapRole, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
@@ -1597,7 +1597,7 @@ class TestEveryPhaseKeepsThePersistedRecord:
             # takes the record to schema v3. Everything the record held must survive unchanged.
             kept = _kept_fields(after)
             assert kept.pop("role") == role, f"run {run}: the record does not name the {role} role"
-            assert kept.pop("schema_version") == 3
+            assert kept.pop("schema_version") == SWAP_RECORD_SCHEMA_VERSION
             assert kept == {k: v for k, v in before.items() if k != "schema_version"}, (
                 f"run {run}: the phase dropped persisted fields"
             )

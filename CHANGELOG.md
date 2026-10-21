@@ -82,6 +82,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **On an ETH swap, the coordinator now acts on what the chain shows about the counter leg, not
+  only on what it broadcast (#850 PR 5a) [Changed (breaking)].** The disposition is read with
+  `pyrxd.eth_wallet.disposition` at the quorum-minimum finalized block.
+  - `taker_refund_btc` reads it first. A claim proven on chain (a verified claim transaction, or
+    the contract settled at a finalized block before the timeout) moves the record to
+    `SECRET_REVEALED` (a new edge from `BTC_LOCKED`; `p` is public, claim the covenant). A refund
+    verified on chain, whoever sent it, moves it to `ABORTED` with `abort_reason:
+    counter_leg_refunded`. In both cases nothing is sent. Settled at the tip but not yet final:
+    nothing is sent and the record waits. Otherwise the refund is sent as before and the record
+    still goes to `ABORTED` on our broadcast (that changes in PR 5b). A `MAKER`-role coordinator
+    is refused.
+  - New `SwapCoordinator.reconcile_counter_leg()`: the same read and the same edges, with no
+    broadcast. An unreadable, below-quorum or contradictory chain changes no state and raises
+    `NetworkError` (a seen claim is still recorded); so does a terminal answer from one endpoint
+    on a chain that carries value, with its own message. From `PARAMS_MISMATCH` a verified claim has deliberately no edge: the evidence
+    is recorded and it raises. A maker's record records the evidence and stays. Nothing in pyrxd
+    calls it yet; the runners and the watchtower use it in later #850 PRs.
+  - A `Claimed` log that opens the hashlock but does not verify is recorded as
+    `counter_claim_tx`. While one is recorded and the covenant's `t_rxd` has not matured, a
+    refunded counter leg does not take the record terminal, and neither does our own refund: the
+    covenant claim comes first. An unreadable covenant depth holds too. The covenant's age is read
+    from its pinned funding transaction, so the hold lifts once `t_rxd` matures even after the
+    covenant is spent.
+  - A terminal answer read from a single endpoint changes nothing on a chain that carries value.
+    It does on a known testnet or anvil, and is recorded as single-source.
+  - `mutual_refund` on its attempt-both path (role `none` or `maker`): a retry after one leg had
+    refunded never completed, because re-sending that leg failed and any failure kept the record
+    at `BOTH_LOCKED`. Now an ETH counter leg verified refunded at the finalized block is not sent
+    again, and the covenant refund is recorded as `asset_refund_txid` when its broadcast returns
+    and not sent again on a retry once it has a confirmation. A recorded refund that is not
+    confirmed is judged by the covenant itself: still unspent means it never landed, and it is sent
+    again (a node that has forgotten the refund answers like an outage, so its own depth cannot
+    decide). The covenant refund also waits while the counter leg may have been claimed: settled at
+    the tip but not yet final, or a `Claimed` log on record before t_rxd. A verified claim stops `mutual_refund` before the covenant is refunded: a
+    single operator's record moves to `SECRET_REVEALED`, and a maker's raises, because the
+    covenant is then the taker's to claim. A BTC counter leg is still re-sent on a retry (#850
+    PR 9), and so is an ETH counter leg read refunded from one endpoint on a chain that carries
+    value.
+  - New record fields `counter_claim_tx`, `counter_disposition`, `abort_reason` and
+    `asset_refund_txid`;
+    `SWAP_RECORD_SCHEMA_VERSION` is 4. A record carrying any post-v2 field, `role` included, now
+    writes 4, so a pyrxd that reads only up to 3 refuses it. The FSM has 15 edges.
 - **`mutual_refund` names a counter-leg refusal a retry cannot pass.** On the attempt-both path
   (role `none` or `maker`), a `RefundFeeUnaffordable`, `RefundGasAboveCeiling` or `NothingToRefund`
   from the counter leg is still reported inside the retryable "mutual refund incomplete"

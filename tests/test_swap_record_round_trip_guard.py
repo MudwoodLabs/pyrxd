@@ -26,7 +26,7 @@ from collections.abc import Callable
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
-from pyrxd.gravity.swap_state import RecordRole, SwapRecord, SwapState
+from pyrxd.gravity.swap_state import AbortReason, CounterDispositionRecord, RecordRole, SwapRecord, SwapState
 from tests.test_swap_record_erc20_migration import _erc20_locator, _token_terms
 from tests.test_swap_state import _eth_locator, _eth_terms, _locator, _terms
 
@@ -125,6 +125,29 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
     "single_operator_override": [("override", _with(_btc_base, single_operator_override="operator said so"), ())],
     "fund_refusal": [("fund-refusal", _with(_btc_base, fund_refusal="refused: gate"), ())],
     "role": [(f"role-{r.value}", _with(_btc_base, role=r), ()) for r in RecordRole],
+    "counter_claim_tx": [("counter-claim-tx", _with(_eth_base, counter_claim_tx="0x" + "c1" * 32), ())],
+    "counter_disposition": [
+        (
+            f"counter-disposition-{kind}",
+            _with(
+                _eth_base,
+                counter_disposition=CounterDispositionRecord(
+                    kind=kind,
+                    block_number=90,
+                    block_hash="0x" + "b1" * 32,
+                    tx_hash=tx,
+                    sources=("source-a.test", "source-b.test"),
+                    single_source=False,
+                ),
+            ),
+            (),
+        )
+        for kind, tx in (("refunded", "0x" + "d1" * 32), ("claimed", None))
+    ],
+    "abort_reason": [
+        (f"abort-reason-{r.value}", _with(_btc_base, state=SwapState.ABORTED, abort_reason=r), ()) for r in AbortReason
+    ],
+    "asset_refund_txid": [("asset-refund-txid", _with(_eth_base, asset_refund_txid="ab" * 32), ())],
     "pending_btc_funding_tx": [
         ("pending-btc-fund", lambda: dataclasses.replace(_btc_base(), pending_btc_funding_tx=_raw_btc_tx()), ())
     ],
