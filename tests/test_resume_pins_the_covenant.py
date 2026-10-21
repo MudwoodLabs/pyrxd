@@ -122,6 +122,17 @@ async def test_the_pin_is_on_disk_before_the_broadcast_so_a_resume_needs_no_repr
     assert record.state is SwapState.BTC_LOCKED and record.radiant_covenant_outpoint is not None
 
 
+async def test_a_pinned_record_is_not_reproved_on_resume(tmp_path, caplog):
+    """Review of the write-ahead (F3): a pinned record was re-proved anyway, and a failed re-proof
+    logged "without pinning" over a record that was pinned."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    record = await _crash_then_resume(tmp_path, break_reproof=True)
+    assert record.radiant_covenant_outpoint is not None
+    assert not [r for r in caplog.records if "without pinning" in r.getMessage()]
+
+
 async def test_an_older_record_whose_reproof_fails_still_records_the_lock_unpinned(tmp_path):
     """Recording the landed lock never depends on the re-proof: the funds already moved."""
     record = await _crash_then_resume(tmp_path, break_reproof=True, older_record=True)

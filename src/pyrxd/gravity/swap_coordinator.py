@@ -2914,6 +2914,9 @@ class SwapCoordinator:
         if self.record.state is not SwapState.NEGOTIATED:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
         self._refuse_to_overwrite_a_recorded_counter_leg(terms)
+        # A proof belongs to the call that made it: never carry one from an earlier fund on this
+        # coordinator object into this record (review of the write-ahead, F4).
+        self._fund_verified_covenant = None
         btc_resume_tx = self._btc_resume_tx(terms)
         if btc_resume_tx is not None:
             landed = await self.counter_leg.read_confirmed_funding(terms, btc_resume_tx)
@@ -2921,7 +2924,10 @@ class SwapCoordinator:
                 # The interrupted fund already landed: record the truth. No gate and no reservation
                 # check run — recording an output already on chain sends nothing, and refusing would
                 # only leave the funds untracked (the stranding this path exists to end).
-                if getattr(self, "_fund_verified_covenant", None) is None:
+                if (
+                    getattr(self, "_fund_verified_covenant", None) is None
+                    and self.record.radiant_covenant_outpoint is None
+                ):
                     await self._try_pin_covenant_on_resume(
                         terms, now_unix_s=now_unix_s, now_sampled_monotonic=now_sampled_monotonic
                     )
@@ -3081,7 +3087,12 @@ class SwapCoordinator:
             # that crash destroys. Measured 2026-08-24: a re-send at a recorded nonce REPLACES
             # rather than adds, which is what makes funding idempotent without a distributed lock,
             # and unlike `flock` that property holds across hosts.
-            self.record = dataclasses.replace(self.record, pending_push_nonce=int(nonce))
+            # The pin rides along: on a RESUME the leg never calls `on_deploy`, so this (with the
+            # push hash below) is the write before the push that carries the proof it was judged
+            # against (review of the write-ahead, F1).
+            self.record = self._pinned_to_the_verified_covenant(
+                dataclasses.replace(self.record, pending_push_nonce=int(nonce))
+            )
             await self._persist_record(self.record, shield=True)
 
         async def _remember_push_hash(nonce: int, tx_hash: str) -> None:
@@ -3089,7 +3100,9 @@ class SwapCoordinator:
             # It had no production caller until #850 PR 3: `EthLeg.fund` never passed it, so the
             # field was written only by tests and a resume could not read its own pending push back.
             # Adopted only once the write returns, like the BTC funding bytes below.
-            staged = dataclasses.replace(self.record, pending_push_nonce=int(nonce), pending_push_tx_hash=tx_hash)
+            staged = self._pinned_to_the_verified_covenant(
+                dataclasses.replace(self.record, pending_push_nonce=int(nonce), pending_push_tx_hash=tx_hash)
+            )
             await self._persist_record(staged, shield=True)
             self.record = staged
 
@@ -3243,8 +3256,11 @@ class SwapCoordinator:
             )
         # (H was already reserved atomically pre-broadcast above — no post-fund mark.)
         self.record = self.record.with_counter_lock(locator)
+        # This call's own proof wins over an earlier pin: the latest re-run is what the lock was
+        # judged against (an ETH resume verifies again and may find a different live output). The
+        # proof is reset at the top of `taker_funds_btc`, so it is never another swap's.
         verified = getattr(self, "_fund_verified_covenant", None)
-        if verified is not None and self.record.radiant_covenant_outpoint is None:
+        if verified is not None:
             self.record = self.record.with_radiant_lock(*verified)
         self._advance(SwapEvent.TAKER_FUNDS_BTC)
         # Shielded: the BTC is locked on-chain now; losing this write would

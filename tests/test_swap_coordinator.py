@@ -2073,7 +2073,7 @@ class FakeEthLeg:
             await on_push_nonce(7)
         # Mirror the real leg: report the deployed address before returning a locator, so a
         # coordinator test can observe what the record holds mid-fund.
-        if on_deploy is not None:
+        if on_deploy is not None and resume_from is None:  # the real legs do not re-report a resumed deploy
             await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
         loc = EthHtlcLocator(
             chain_id=11155111,
@@ -3491,6 +3491,48 @@ async def test_a_crashed_fund_resumes_THROUGH_A_REAL_PERSISTED_FILE(tmp_path):
         "the resume deployed a second contract instead of completing the recorded one"
     )
     assert leg2.push_nonce_seen == 7, "the recorded nonce pin was not carried into the resume"
+
+
+async def test_an_eth_resume_pins_the_covenant_ITS_OWN_proof_found(tmp_path):
+    """Review of the write-ahead (F1): the deploy wrote pin P1; the resume's re-run verified P2 (P1
+    since spent, a second payment live). The real legs do not call `on_deploy` on a resume, so
+    without an overwrite the record stayed pinned to the spent P1 and the claim would follow it."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    class _CrashAfterDeploy(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            raise NetworkError("process died mid-fund")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(
+        terms=terms, eth_leg=_CrashAfterDeploy(preimage=secret, verdict=_final()), seen_store=seen
+    )
+    crashed._persist = sink
+    with pytest.raises(NetworkError):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+    first = sink.load_record().radiant_covenant_outpoint
+    assert first is not None
+
+    resumed = _eth_coord_full(
+        terms=terms, eth_leg=FakeEthLeg(preimage=secret, verdict=_final()), seen_store=seen, fund_lock=_MemLock()
+    )
+    resumed._persist = sink
+    real = resumed.taker_verify_asset_funding
+    second = "ff" * 32 + ":1"
+
+    async def _elsewhere(*a, **k):
+        _o, value, upper = await real(*a, **k)
+        return second, value, upper
+
+    resumed.taker_verify_asset_funding = _elsewhere
+    rec = await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED
+    assert rec.radiant_covenant_outpoint == second != first
 
 
 @pytest.mark.parametrize("held", ["pending_contract", "funded_locator"])
