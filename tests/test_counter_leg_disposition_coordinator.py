@@ -379,6 +379,8 @@ async def test_HONEST_the_hold_stays_before_t_rxd_by_the_funding_depth():
 async def test_a_verified_claim_replaces_an_earlier_unverified_one_on_the_record():
     """The record must name the claim that VERIFIED, not a seen-only (possibly forged) log."""
     coord, chain, _leg = _setup(endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90})
+    # An earlier read recorded the seen-only claim.
+    coord.record = __import__("dataclasses").replace(coord.record, counter_claim_tx="0x" + "dd" * 32)
     tx = chain.claim(70)
     rec = await coord.reconcile_counter_leg()
     assert rec.state is SwapState.SECRET_REVEALED and rec.counter_claim_tx == tx
