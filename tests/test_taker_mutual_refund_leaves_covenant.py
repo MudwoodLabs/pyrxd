@@ -269,6 +269,8 @@ async def test_eth_tower_after_a_taker_only_refund_pages_refund_with_text_that_s
     assert d.intent is Intent.PAGE_REFUND
     assert d.recommended_action == "mutual_refund"
     assert "does not clear after you run it" in d.reason
+    # #850 PR 6: a leg that reads its disposition is followed by running it again (Mythos review, F2).
+    assert "run it again" in d.reason and "CounterLegDispositionUnknown" in d.reason
     assert "repeats" not in d.reason  # it does not: a WARN is paged once per situation
     assert "BOTH_LOCKED" in d.reason
 

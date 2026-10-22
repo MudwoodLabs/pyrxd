@@ -321,13 +321,13 @@ _STEP_FROM_SECRET_REVEALED = "taker_scrape_and_claim_asset"  # nosec B105
 _STEP_FROM_VULNERABLE = "taker_claim_asset_from_vulnerable"
 
 # The BOTH_LOCKED maker-stall page, per counter chain (#850). The two differ because mutual_refund
-# does: on an ETH counter leg a TAKER-role coordinator refunds only the taker's ETH HTLC and leaves
-# the record BOTH_LOCKED (the covenant refund pays the maker and is the maker's to send). The tower
-# sees no claim in a refund and the situation does not change, so this stays the decision on every
-# tick; DedupAlerter delivers a WARN once per situation, from in-memory state, so the operator sees
-# it again only after a tower restart. On a BTC counter leg mutual_refund is unchanged in this
-# release: it also sends the covenant refund, which cannot be mined before t_rxd, and reaches the
-# terminal MUTUAL_REFUND.
+# does: on an ETH counter leg it reads the HTLC from the chain and keeps the record BOTH_LOCKED until
+# our refund is final at the finalized block, so it is called until it ends (#850 PR 6). A
+# TAKER-role coordinator then takes MUTUAL_REFUND without the covenant (its refund pays the maker
+# and is the maker's to send); with no role the covenant refund follows. Until then the tower sees
+# the same situation; DedupAlerter delivers a WARN once per situation, from in-memory state. On a BTC
+# counter leg mutual_refund is unchanged in this release: it also sends the covenant refund, which
+# cannot be mined before t_rxd, and reaches the terminal MUTUAL_REFUND.
 #
 # Both replace a sentence that said the counter leg "cannot mature until t_btc > t_rxd". The
 # relation was inverted in #482. The gates require t_rxd's refund to open no earlier than the
@@ -344,12 +344,15 @@ _BOTH_LOCKED_REFUND_REASON_BTC = _BOTH_LOCKED_REFUND_COMMON + (
 )
 _BOTH_LOCKED_REFUND_REASON_ETH = _BOTH_LOCKED_REFUND_COMMON + (
     "The ETH refund opens first (the swap was gated on the covenant refund opening no earlier than "
-    "eth_timeout_unix_s + margin). On an ETH counter leg a TAKER-role mutual_refund refunds only your "
-    "ETH HTLC and leaves the record BOTH_LOCKED (the covenant is the maker's to refund), so this "
-    "situation does not clear after you run it: check the refund on-chain rather than re-running it. "
-    "If the refund fails, mutual_refund names a maker claim only when it can verify one from the "
-    "contract's logs, which it reads from one endpoint; if it reports the contract settled with no "
-    "verified claim, check the contract's events on another source before the covenant's CSV refund opens."
+    "eth_timeout_unix_s + margin). On an ETH counter leg that reads its disposition, mutual_refund "
+    "reads the HTLC from the chain, then sends or follows your ETH refund; the record stays BOTH_LOCKED "
+    "until that refund is final at the finalized block, so run it again (the two-host runner's --phase "
+    "refund polls) until it ends. A TAKER-role run ends at MUTUAL_REFUND without touching the covenant "
+    "(the maker's to refund); with no role the covenant refund follows. If the chain cannot say what "
+    "happened to the contract and the refund is refused, it raises CounterLegDispositionUnknown: check "
+    "the contract's events on another source before the covenant's CSV refund opens. On a leg that "
+    "cannot read its disposition, a TAKER-role run sends the refund once and the record stays "
+    "BOTH_LOCKED, so this situation does not clear after you run it: check the refund on-chain."
 )
 
 # -- the record's role (#850 PR 1b, design §5.1) ------------------------------------------------

@@ -4699,11 +4699,17 @@ class SwapCoordinator:
         return self.record
 
     async def _send_or_follow_counter_refund(
-        self, *, resend_reverted_refund: bool, step: str = "taker_refund_btc"
+        self, *, resend_reverted_refund: bool, step: str = "taker_refund_btc", settled_is_unexplained: bool = False
     ) -> SwapRecord:
         """The re-send rules for our own ETH counter-leg refund (design §3.4), once the contract
         reads unsettled at the tip. Never advances the record. See :meth:`taker_refund_btc`. *step*
-        is the coordinator step the operator calls again, named in the messages."""
+        is the coordinator step the operator calls again, named in the messages.
+
+        *settled_is_unexplained*: the chain read just now could not say how the contract settled
+        (``UNKNOWN``). Our refund reverting ``AlreadySettled`` then means something else settled it,
+        possibly a claim whose log is withheld, so it is raised (as a ``ValidationError``, which
+        :meth:`_counter_refund_on_the_read` reports as ``CounterLegDispositionUnknown``) instead of
+        waited on: no later read would end the wait (Mythos review of #850 PR 6, F1)."""
         locator = self.record.counterchain_locator
         recorded, nonce = self.record.counter_refund_tx_hash, self.record.counter_refund_nonce
         replace = None
@@ -4783,6 +4789,11 @@ class SwapCoordinator:
                         reason=reason,
                     )
                 if reason == "AlreadySettled":
+                    if settled_is_unexplained:
+                        raise ValidationError(
+                            f"our counter-leg refund {subject} was mined and reverted AlreadySettled: something "
+                            "else settled the contract first, and the chain read cannot say what"
+                        )
                     logger.info("the counter-leg contract settled after it was read; waiting for the chain")
                     return self.record
                 if not resend_reverted_refund:
@@ -4848,7 +4859,11 @@ class SwapCoordinator:
         from pyrxd.eth_wallet.disposition import DispositionKind
 
         try:
-            return await self._send_or_follow_counter_refund(resend_reverted_refund=resend_reverted_refund, step=step)
+            return await self._send_or_follow_counter_refund(
+                resend_reverted_refund=resend_reverted_refund,
+                step=step,
+                settled_is_unexplained=disposition.kind is DispositionKind.UNKNOWN,
+            )
         except (*_NEEDS_OPERATOR_ACTION, CounterLegPayoutReverts, CounterLegRefundNeedsOperator, NetworkError):
             raise
         except ValidationError as exc:
@@ -4858,7 +4873,7 @@ class SwapCoordinator:
             seen = self.record.counter_claim_tx
             raise CounterLegDispositionUnknown(
                 f"the counter leg's disposition is UNKNOWN ({disposition.reason}), and the refund was not sent: "
-                f"{exc}. Nothing on the record moved. This is NOT a refund: a contract settled with neither a "
+                f"{exc}. The record's state did not change. This is NOT a refund: a contract settled with neither a "
                 "refund nor a claim that verifies is also what a real claim looks like when its log is withheld "
                 "or pruned. Check the contract's events on other endpoints. If it was CLAIMED, p is public: claim "
                 f"the covenant with it before its CSV refund to the maker opens, t_rxd = {t_rxd.value} "
@@ -4997,7 +5012,7 @@ class SwapCoordinator:
         # operator's, whose covenant refund goes out now and only now (design §3.3 step 4).
         failures: list[tuple[str, Exception]] = []
         await self._refund_the_covenant_once(failures)
-        return await self._finish_mutual_refund(failures)
+        return await self._finish_mutual_refund(failures, counter_leg_refunded=True)
 
     async def _refund_the_covenant_once(self, failures: list[tuple[str, Exception]]) -> None:
         """Send the covenant's CSV refund unless one is recorded and on chain; record its txid when
@@ -5035,8 +5050,23 @@ class SwapCoordinator:
             self.record = recorded
             await self._persist_record(self.record, shield=True)
 
-    async def _finish_mutual_refund(self, failures: list[tuple[str, Exception]]) -> SwapRecord:
-        """Advance to MUTUAL_REFUND when nothing failed; otherwise raise, the record unchanged."""
+    async def _finish_mutual_refund(
+        self, failures: list[tuple[str, Exception]], *, counter_leg_refunded: bool = False
+    ) -> SwapRecord:
+        """Advance to MUTUAL_REFUND when nothing failed; otherwise raise, the record unchanged.
+        *counter_leg_refunded*: the chain already shows the counter leg REFUNDED at the finalized
+        block, so only the covenant refund was attempted, and only it is retried."""
+        if failures and counter_leg_refunded:
+            blocked = [exc for _leg, exc in failures if isinstance(exc, _NEEDS_OPERATOR_ACTION)]
+            message = (
+                "mutual refund incomplete — "
+                + "; ".join(f"{leg}: {exc}" for leg, exc in failures)
+                + ". The counter leg is already refunded at the finalized block and is not sent again. The "
+                "swap stays BOTH_LOCKED so a retry re-attempts the covenant refund."
+            )
+            if blocked:
+                raise NetworkError(message) from blocked[0]
+            raise NetworkError(message)
         if failures:
             # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts what is left.
             #

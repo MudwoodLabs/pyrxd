@@ -326,6 +326,8 @@ async def _mutual_refund_to_terminal(coord, *, timeout_s: float, interval_s: flo
                     f"the ETH HTLC is REFUNDED at the finalized block, but a Claimed log on it (tx "
                     f"{rec.counter_claim_tx}) opens H, so the record and the covenant refund wait until t_rxd matures"
                 )
+            elif rec.counter_refund_tx_hash is None:
+                why = "nothing of ours is sent: the ETH HTLC is settled at the tip but not yet final"
             else:
                 why = f"our ETH refund {rec.counter_refund_tx_hash} is not yet REFUNDED at the finalized block"
             print(f"  the record is still both_locked: {why}; waiting")

@@ -289,3 +289,41 @@ async def test_a_refunded_answer_with_no_evidence_never_refunds_the_covenant(mon
     with pytest.raises(ValidationError, match="no evidence"):
         await coord.mutual_refund()
     assert asset == [] and leg.refunds == 0 and coord.record.state is SwapState.BOTH_LOCKED
+
+
+# --------------------------------------------------------------------------- our refund lost the race
+
+
+def _with_a_reverted_refund(coord, leg):
+    """Our refund is on the record, mined, and reverted AlreadySettled: something settled the contract first."""
+    import dataclasses
+
+    tx = "0x" + "ee" * 32
+    coord.record = dataclasses.replace(coord.record, counter_refund_tx_hash=tx, counter_refund_nonce=7)
+    leg.reverted.add(tx)
+    leg.revert_reason = "AlreadySettled"
+
+
+async def test_our_refund_beaten_while_the_chain_cannot_say_how_is_reported_not_followed():
+    """Mythos review of PR 6, F1: with the disposition UNKNOWN (here a claim whose log is withheld),
+    our refund reverting AlreadySettled was waited on for ever, and the "check for a claim, claim the
+    covenant before t_rxd" advice never shown. It is now CounterLegDispositionUnknown."""
+    coord, chain, leg = _setup(
+        state=SwapState.BOTH_LOCKED,
+        endpoints=lambda c: [FakeEvmEndpoint(c, hide_claimed=True) for _ in range(3)],
+        chain_kw={"finalized": 90},
+    )
+    chain.claim(70)
+    _with_a_reverted_refund(coord, leg)
+    with pytest.raises(CounterLegDispositionUnknown, match="AlreadySettled"):
+        await coord.mutual_refund()
+    assert leg.refunds == 0 and coord.record.state is SwapState.BOTH_LOCKED
+
+
+async def test_HONEST_our_refund_beaten_after_a_read_that_knew_the_contract_unsettled_waits():
+    """The 5b rule stands when the read was not UNKNOWN: the contract settled after it was read, and
+    the next read says how. Nothing is sent and nothing is raised."""
+    coord, _chain, leg = _setup(state=SwapState.BOTH_LOCKED, chain_kw={"finalized": 90})
+    _with_a_reverted_refund(coord, leg)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.BOTH_LOCKED and leg.refunds == 0

@@ -131,8 +131,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     pass). A run that times out leaves the record as it is, and running the phase again follows
     the recorded refund. The pre-check that refuses a settled or claimed HTLC runs only before our
     refund is recorded, because after that a contract settled at the tip is most likely our own
-    refund. `--phase refund` refuses while a refund recorded by `--phase abort` is being followed,
-    because `mutual_refund` would send a second one beside it.
+    refund. (`--phase refund` follows a refund `--phase abort` recorded; see PR 6 below.)
 - **On an ETH swap, `mutual_refund` reads the counter leg from the chain and no longer moves the
   record on our own refund's broadcast (#850 PR 6) [Changed (breaking)].** It reads the contract's
   disposition at the finalized block before it sends anything, sends or follows our refund by the

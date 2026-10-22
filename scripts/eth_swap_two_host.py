@@ -1276,8 +1276,10 @@ async def _poll_taker_refund_to_terminal(args, coord, step, *, phase: str):
                 f"{stays}: the ETH HTLC is refunded, but a Claimed log on it (tx "
                 f"{rec.counter_claim_tx}) opens H, so p may be public. If that claim is on chain, run --phase claim "
                 "to claim the RXD covenant before its CSV refund to the maker opens. If it was dropped or reorged "
-                "out, p is in that transaction's calldata wherever it was seen; recover it before t_rxd. The "
-                f"record goes terminal on its own once t_rxd has matured: run --phase {phase} again then."
+                "out, p is in that transaction's calldata wherever it was seen; recover it before t_rxd. Your "
+                "ETH is already refunded. The record goes terminal once t_rxd has matured: run --phase "
+                f"{phase} again then. If the maker has refunded the covenant by then and the phase cannot read "
+                "it, the record staying put is harmless: nothing else is owed to you on the ETH side."
             )
         if time.monotonic() >= deadline:
             sent = rec.counter_refund_tx_hash
