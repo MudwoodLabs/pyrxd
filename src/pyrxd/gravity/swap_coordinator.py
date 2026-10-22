@@ -4983,9 +4983,11 @@ class SwapCoordinator:
             abandon_case=case,
             abort_note_sha256=digest,
         )
+        # A cancellation is not rolled back: the shielded persist still finishes, so memory keeps what
+        # the disk will hold (re-review of #850 PR 7b).
         try:
             await self._persist_record(self.record, shield=True)
-        except BaseException:
+        except Exception:
             self.record = before  # not durable, so not taken: a retry reads the chain again
             raise
         logger.warning(

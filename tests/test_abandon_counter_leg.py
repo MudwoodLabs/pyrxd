@@ -9,6 +9,7 @@ record carries only its hash.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import json
@@ -446,6 +447,59 @@ async def test_one_endpoint_that_contradicts_a_claim_cannot_make_it_abandonable(
     )
     chain2.claim(70)
     assert (await honest._read_counter_disposition()).kind is DispositionKind.CLAIMED  # Gap B
+
+
+@pytest.mark.parametrize("n", [2, 3])
+async def test_a_claim_log_hidden_while_the_other_endpoints_fail_is_not_abandoned(n):
+    """Re-review of #850 PR 7b, MEDIUM: claimed before the timeout, finalized past it. One endpoint
+    hides the Claimed log and every other endpoint's log scan fails. The scan is partial, so the read
+    is not SETTLED_UNVERIFIABLE: a retry may show the claim and ``p``."""
+
+    def partial(chain):
+        return [FakeEvmEndpoint(chain, hide_claimed=True)] + [
+            FakeEvmEndpoint(chain, logs_429=True) for _ in range(n - 1)
+        ]
+
+    coord, chain, _leg = _native_setup(endpoints=partial, chain_kw={"finalized": 90})
+    sink = _with_sink(coord)
+    chain.claim(70)
+    read = await coord._read_counter_disposition()
+    assert read.kind is DispositionKind.UNKNOWN and read.logs_failed and not read.settled_unexplained
+    with pytest.raises(NetworkError, match="unknown"):
+        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+    honest, chain2, _l = _native_setup(chain_kw={"finalized": 90})
+    chain2.claim(70)
+    assert (await honest._read_counter_disposition()).kind is DispositionKind.CLAIMED
+
+
+async def test_a_cancelled_abandon_keeps_what_the_disk_holds():
+    """Re-review of #850 PR 7b, LOW: the shielded persist finishes after a cancellation, so the
+    record in memory is the ABORTED one the disk holds, not the state before."""
+    coord, _chain, _leg, sink = _token()
+    gate = asyncio.Event()
+
+    class _Slow(_Sink):
+        async def __call__(self, record) -> None:
+            await gate.wait()
+            self.coord.persisted.append(record)
+
+    sink.__class__ = _Slow
+    task = asyncio.ensure_future(_abandon(coord, AbandonCase.EXPIRED_EMPTY))
+    for _ in range(200):
+        if sink.notes:
+            break
+        await asyncio.sleep(0)
+    assert sink.notes  # the persist has started
+    await asyncio.sleep(0)
+    task.cancel()
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert [r.state for r in coord.persisted] == [SwapState.ABORTED]
+    assert coord.record.state is SwapState.ABORTED and coord.record == coord.persisted[0]
 
 
 async def test_a_failed_persist_leaves_the_record_as_it_was():

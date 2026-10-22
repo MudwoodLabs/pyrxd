@@ -188,7 +188,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     state), `PAYOUT_REVERTS` (unsettled and expired at the finalized block, and a refund would
     revert `TransferFailed` or `SendFailed`), `CLAIMED_AFTER_MISMATCH` (claimed, at
     `PARAMS_MISMATCH`), `SETTLED_UNVERIFIABLE` (settled at the finalized block, which is at or
-    past the timeout, every nominated transaction checked, no endpoint contradicting, and no
+    past the timeout, every endpoint's log scan answered, every nominated transaction checked, no
+    endpoint contradicting, and no
     `Claimed` log that opens the hashlock) and `SINGLE_SOURCE_REFUND` (a refund seen by one endpoint on a
     chain that carries value). Any other read raises the new `AbandonNotAccepted`
     (`pyrxd.security.errors`), which names the read and, where there is one, the step that ends it

@@ -830,7 +830,7 @@ a case with no step of its own, past the timeout at the finalized block or settl
 when the operator named that case and the contract's address. The cases are an empty expired
 contract that has no automatic end from the record's state (`expired_empty`), a refund that would revert
 (`payout_reverts`), a claim after a params mismatch (`claimed_after_mismatch`), a settled contract
-whose evidence cannot say how (`settled_unverifiable`: every gate read, no endpoint contradicting,
+whose evidence cannot say how (`settled_unverifiable`: every gate read, every endpoint's log scan answered, no endpoint contradicting,
 the finalized block at or past the timeout, and no `Claimed` log that opens the hashlock), and a refund seen by one endpoint on a chain
 that carries value (`single_source_refund`). `abort_reason` is `operator_abandoned`, and the record
 keeps the case (`abandon_case`), the read it rests on (`counter_disposition`) and the SHA-256 of the

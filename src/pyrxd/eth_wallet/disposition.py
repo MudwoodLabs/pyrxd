@@ -182,8 +182,8 @@ class CounterDisposition:
     finalized_hash: str | None = None
     sources: tuple[str, ...] = ()
     #: ``True`` only on the one UNKNOWN answer that read every gate and found no contradiction: the
-    #: contract is settled at ``F``, ``F`` is at or past the timeout, every nominated transaction was
-    #: checked, and neither a refund nor a claim verifies (#850 PR 7b, the abandon's
+    #: contract is settled at ``F``, ``F`` is at or past the timeout, every endpoint's log scan
+    #: answered, every nominated transaction was checked, and neither a refund nor a claim verifies (#850 PR 7b, the abandon's
     #: ``SETTLED_UNVERIFIABLE``). ``settled_at_finalized`` is also set on answers that DO contradict.
     settled_unexplained: bool = False
 
@@ -661,7 +661,9 @@ async def read_counter_disposition(
             "settled at the finalized block with neither a verified refund nor a verified claim",
             finalized,
             settled_at_finalized=True,
-            settled_unexplained=True,
+            # Only when every endpoint's log scan answered: an endpoint that failed may hold the very
+            # Claimed log the others hide, so its silence is unknown, not "no claim" (re-review of 7b).
+            settled_unexplained=not union.failed,
             **common,
         )
 

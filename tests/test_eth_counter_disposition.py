@@ -251,14 +251,14 @@ async def test_rule_2_a_verified_refund_and_a_verified_claim_is_unknown():
     chain.claim(70)
     chain.force_receipt(85, topic0=REFUNDED_TOPIC0, label="impossible-refund")
     d = await _read(_quorum(chain), chain)
-    assert d.kind is DispositionKind.UNKNOWN and "rule 2" in d.reason
+    assert d.kind is DispositionKind.UNKNOWN and "rule 2" in d.reason and not d.settled_unexplained
 
 
 async def test_rule_3_a_verified_refund_beside_gap_b_is_unknown():
     chain = _chain()
     chain.force_receipt(50, topic0=REFUNDED_TOPIC0, label="early-refund", settles=True)
     d = await _read(_quorum(chain), chain)
-    assert d.kind is DispositionKind.UNKNOWN and "rule 3" in d.reason
+    assert d.kind is DispositionKind.UNKNOWN and "rule 3" in d.reason and not d.settled_unexplained
 
 
 async def test_rule_4_a_verified_refund_beside_an_unverified_claim_seen_is_refunded():
