@@ -259,7 +259,7 @@ def _setup(
 
 @pytest.mark.parametrize("role", [SwapRole.TAKER, None])
 async def test_closed_empty_contract_aborts_the_record_and_sends_nothing(role):
-    coord, _chain_, leg = _setup(role=role)
+    coord, _c, leg = _setup(role=role)
     rec = await coord.taker_refund_btc()
     assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.EXPIRED_EMPTY
     assert rec.counter_disposition.kind == "expired_empty_closed"
@@ -269,7 +269,7 @@ async def test_closed_empty_contract_aborts_the_record_and_sends_nothing(role):
 
 
 async def test_reconcile_takes_the_same_edge():
-    coord, _chain_, _leg = _setup()
+    coord, _c, _leg = _setup()
     rec = await coord.reconcile_counter_leg()
     assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.EXPIRED_EMPTY
 
@@ -289,7 +289,7 @@ def _with_a_dropped_claim(chain):
 @pytest.mark.parametrize("role", [SwapRole.TAKER, None])
 async def test_a_seen_claim_holds_the_closed_empty_terminal_until_t_rxd(role):
     """D14 / N1 (scenario 6b): p is public, so the covenant claim comes first."""
-    coord, _chain_, leg = _setup(role=role, endpoints=_with_a_dropped_claim, confs=1)
+    coord, _c, leg = _setup(role=role, endpoints=_with_a_dropped_claim, confs=1)
     rec = await coord.taker_refund_btc()
     assert rec.state is SwapState.BTC_LOCKED and rec.abort_reason is None
     assert rec.counter_claim_tx == "0x" + "dd" * 32 and rec.counter_disposition.kind == "expired_empty_closed"
@@ -297,14 +297,14 @@ async def test_a_seen_claim_holds_the_closed_empty_terminal_until_t_rxd(role):
 
 
 async def test_HONEST_once_t_rxd_has_matured_the_held_empty_record_aborts():
-    coord, _chain_, _leg = _setup(endpoints=_with_a_dropped_claim)
+    coord, _c, _leg = _setup(endpoints=_with_a_dropped_claim)
     coord.radiant_leg.report_confs = int(coord.record.terms.t_rxd.value)
     rec = await coord.taker_refund_btc()
     assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.EXPIRED_EMPTY
 
 
 async def test_open_empty_contract_refuses_the_refund_and_names_the_close():
-    coord, _chain_, leg = _setup(nonces={20: PUSH_NONCE})
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
     with pytest.raises(NothingToRefund, match="close_push_nonce") as e:
         await coord.taker_refund_btc()
     assert e.value.contract_address == coord.record.counterchain_locator.contract_address
@@ -347,14 +347,14 @@ async def test_scenario_12_a_nonce_less_record_closes_by_its_own_close():
 
 
 async def test_a_pending_close_is_followed_not_resent():
-    coord, _chain_, leg = _setup(nonces={20: PUSH_NONCE})
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
     await coord.close_push_nonce()
     await coord.close_push_nonce()
     assert len(leg.closes) == 1
 
 
 async def test_a_dropped_close_is_sent_again_at_the_same_nonce():
-    coord, _chain_, leg = _setup(nonces={20: PUSH_NONCE})
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
     await coord.close_push_nonce()
     leg.dropped_closes.add(leg.closes[0][0])
     rec = await coord.close_push_nonce()
@@ -364,7 +364,7 @@ async def test_a_dropped_close_is_sent_again_at_the_same_nonce():
 
 async def test_close_refuses_when_the_push_nonce_is_above_the_count_at_F():
     """Closing a lower nonce would not reach the push's own: wait, send nothing."""
-    coord, _chain_, leg = _setup(nonces={20: PUSH_NONCE - 2})
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE - 2})
     with pytest.raises(NetworkError, match="above the funding key's nonce"):
         await coord.close_push_nonce()
     assert leg.closes == [] and coord.record.push_close_tx_hash is None
@@ -382,14 +382,14 @@ async def test_close_sends_nothing_when_the_nonce_at_F_is_unknown():
     def disagree(chain):
         return [FakeEvmEndpoint(chain), FakeEvmEndpoint(chain), FakeEvmEndpoint(chain, lie_nonce=99)]
 
-    coord, _chain_, leg = _setup(nonces={20: PUSH_NONCE}, endpoints=disagree)
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE}, endpoints=disagree)
     with pytest.raises(NetworkError, match="could not be read at every endpoint"):
         await coord.close_push_nonce()
     assert leg.closes == []
 
 
 async def test_close_on_an_already_closed_contract_ends_the_record_and_sends_nothing():
-    coord, _chain_, leg = _setup()
+    coord, _c, leg = _setup()
     rec = await coord.close_push_nonce()
     assert rec.state is SwapState.ABORTED and leg.closes == []
 
@@ -403,7 +403,7 @@ async def test_close_on_an_already_closed_contract_ends_the_record_and_sends_not
     ],
 )
 async def test_close_is_refused_where_the_design_gives_it_no_place(state, role, why):
-    coord, _chain_, leg = _setup(state=state, role=role, nonces={20: PUSH_NONCE})
+    coord, _c, leg = _setup(state=state, role=role, nonces={20: PUSH_NONCE})
     with pytest.raises(ValidationError, match=why):
         await coord.close_push_nonce()
     assert leg.closes == []
@@ -421,7 +421,7 @@ async def test_close_is_refused_on_a_native_counter_leg():
 
 
 async def test_params_mismatch_has_no_edge_on_a_closed_empty_contract():
-    coord, _chain_, leg = _setup(state=SwapState.PARAMS_MISMATCH, role=None)
+    coord, _c, leg = _setup(state=SwapState.PARAMS_MISMATCH, role=None)
     with pytest.raises(ValidationError, match="no edge out of PARAMS_MISMATCH"):
         await coord.taker_refund_btc()
     assert coord.record.state is SwapState.PARAMS_MISMATCH
@@ -430,7 +430,7 @@ async def test_params_mismatch_has_no_edge_on_a_closed_empty_contract():
 
 
 async def test_a_makers_record_records_the_closed_empty_contract_and_stays():
-    coord, _chain_, _leg = _setup(role=SwapRole.MAKER)
+    coord, _c, _leg = _setup(role=SwapRole.MAKER)
     rec = await coord.reconcile_counter_leg()
     assert rec.state is SwapState.BTC_LOCKED and rec.counter_disposition.kind == "expired_empty_closed"
 
@@ -438,7 +438,7 @@ async def test_a_makers_record_records_the_closed_empty_contract_and_stays():
 @pytest.mark.parametrize("nonces", [{20: PUSH_NONCE}, {20: PUSH_NONCE + 1}])
 async def test_both_locked_with_an_empty_contract_names_the_abandon_and_sends_nothing(nonces):
     """N2 / scenario 14b's first half: no refund is possible, and abandon_counter_leg is the exit."""
-    coord, _chain_, leg = _setup(state=SwapState.BOTH_LOCKED, nonces=nonces)
+    coord, _c, leg = _setup(state=SwapState.BOTH_LOCKED, nonces=nonces)
     with pytest.raises(NothingToRefund, match="abandon_counter_leg"):
         await coord.mutual_refund()
     assert coord.record.state is SwapState.BOTH_LOCKED and leg.refunds == 0
