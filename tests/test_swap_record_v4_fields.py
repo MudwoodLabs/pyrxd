@@ -118,6 +118,22 @@ def test_from_dict_does_not_coerce_single_source():
         (_eth_base, {"counter_expiry_anchor": "90:0x" + "b1" * 31}),
         (_eth_base, {"counter_expiry_anchor": "٩٠:0x" + "b1" * 32}),
         (_eth_base, {"counter_expiry_anchor": 90}),
+        # 7a: the push close, recorded together, ETH only, lower-case, a non-negative int nonce
+        (_btc_base, {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": 1}),
+        (_eth_base, {"push_close_tx_hash": "0x" + "c7" * 32}),
+        (_eth_base, {"push_close_nonce": 1}),
+        (_eth_base, {"push_close_tx_hash": "0x" + "C7" * 32, "push_close_nonce": 1}),
+        (_eth_base, {"push_close_tx_hash": "0x" + "c7" * 31, "push_close_nonce": 1}),
+        (_eth_base, {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": -1}),
+        (_eth_base, {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": True}),
+        # 7a review: the push key, ETH only, with the push nonce, a lower-case 20-byte address
+        (_btc_base, {"push_signer": "0x" + "ab" * 20, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "0x" + "ab" * 20}),
+        (_eth_base, {"push_signer": "0x" + "AB" * 20, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "0x" + "ab" * 19, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "0x" + "zz" * 20, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "ab" * 21, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": 7, "pending_push_nonce": 7}),
     ],
 )
 def test_a_bad_record_field_is_refused(base, fields):
@@ -134,14 +150,32 @@ def test_a_bad_record_field_is_refused(base, fields):
         {"asset_refund_txid": "ab" * 32},
         {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": 0},
         {"counter_expiry_anchor": "0:0x" + "b1" * 32},
+        {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": 0},
+        {"push_signer": "0x" + "ab" * 20, "pending_push_nonce": 0},
+        {"abort_reason": AbortReason.EXPIRED_EMPTY, "state": SwapState.ABORTED},
     ],
 )
 def test_each_new_field_alone_writes_the_current_schema_version(fields):
     record = dataclasses.replace(_eth_base(), **fields)
     d = record.to_dict()
-    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 5
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 6
     assert SwapRecord.from_dict(d) == record
 
 
 def test_HONEST_a_record_without_them_keeps_its_old_form():
     assert "schema_version" not in _btc_base().to_dict()
+
+
+def test_a_push_signer_alone_writes_the_current_schema_version():
+    """Mid-fund (a pending deploy), the push nonce alone keeps the v2 form; the push key does not."""
+    pending = dataclasses.replace(
+        _eth_base(),
+        pending_counter_contract="0x" + "77" * 20,
+        pending_counter_deploy_tx="0x" + "de" * 32,
+        pending_push_nonce=3,
+    )
+    assert "schema_version" not in pending.to_dict()  # honest: nothing new, the old form
+    signed = dataclasses.replace(pending, push_signer="0x" + "ab" * 20)
+    d = signed.to_dict()
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION
+    assert SwapRecord.from_dict(d) == signed

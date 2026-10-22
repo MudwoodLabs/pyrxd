@@ -386,6 +386,10 @@ def refund_ran_out_of_gas(receipt: dict[str, Any], *, gas_limit: int) -> bool:
     return status == 0 and used is not None and used >= int(gas_limit) - int(gas_limit) // 64
 
 
+#: Gas for :meth:`EthHtlcContractLeg.close_nonce`, a plain transfer to an externally owned account
+#: (the intrinsic cost of a transaction with no data). Read from the protocol rule, not measured.
+CLOSE_NONCE_GAS = 21_000
+
 #: Revert names :meth:`EthHtlcContractLeg.refund_revert_reason` recognises, both contracts' custom
 #: errors that ``refund()`` can raise. Matched by 4-byte selector in the node's error text.
 _REFUND_REVERTS = ("AlreadySettled", "NotYetExpired", "NothingToRefund", "TransferFailed", "SendFailed")
@@ -1321,6 +1325,45 @@ class EthHtlcContractLeg:
         if refund_ran_out_of_gas(receipt, gas_limit=gas_limit):
             return RefundProgress("out_of_gas", gas_limit=gas_limit, tx_hash=mined_hash)
         return RefundProgress("reverted", gas_limit=gas_limit, tx_hash=mined_hash)
+
+    async def close_nonce(self, nonce: int, *, on_signed: Callable[[str, int], Awaitable[None]] | None = None) -> str:
+        """Consume ``nonce`` with a 0-value transfer from this key to itself (#850 PR 7a, design §2.7).
+
+        Once a transaction at ``nonce`` is final, no other transaction this key signed at or below it
+        can land, which is how an empty expired token contract is proven to stay empty: the token push
+        was signed at or below it. It moves no value and needs no contract.
+
+        Refuses, with nothing signed, unless the broadcasting endpoint's ``latest`` count for this key
+        is exactly ``nonce``: above it, the nonce is already consumed (wait for finality); below it,
+        an earlier transaction of this key is missing, and this one would queue behind it.
+        ``on_signed`` is awaited with ``(tx_hash, nonce)`` before the broadcast; an exception from it
+        stops the send. Nothing here prices this transaction to replace one pending at ``nonce`` (a
+        push, say). The node usually refuses it as underpriced, but if fees have risen enough since the
+        pending one was priced, it replaces it. Either way one transaction consumes the nonce, and the
+        contract is read for tokens at the finalized block, not assumed empty."""
+        if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
+            raise ValidationError("nonce must be a non-negative int")
+        await self._rpc.assert_chain()
+        addr = self._account_address()
+        latest = int(await self._rpc.get_transaction_count(addr, "latest"))
+        if latest > nonce:
+            raise NetworkError(
+                f"nonce {nonce} of {addr} is already consumed at the tip (latest count {latest}); nothing was "
+                "sent. Wait until it is final; the contract then reads closed."
+            )
+        if latest < nonce:
+            raise NetworkError(
+                f"{addr}'s latest count at the broadcasting endpoint is {latest}, below nonce {nonce}: the "
+                "endpoint is behind, or an earlier transaction of this key is missing. Nothing was sent."
+            )
+        tx = {**await self._base_tx(gas=CLOSE_NONCE_GAS), "to": addr, "value": 0, "nonce": nonce}
+        hook = None
+        if on_signed is not None:
+
+            async def hook(tx_hash: str) -> None:
+                await on_signed(tx_hash, nonce)
+
+        return await self._sign_and_send(tx, preflight=False, on_signed=hook)
 
     async def refund_estimate(self, locator: EthHtlcLocator) -> int:
         """``eth_estimateGas`` for a refund of *locator* now. A typed revert raises

@@ -168,6 +168,8 @@ _LEGAL_TRIPLES = frozenset(
         (_S.PARAMS_MISMATCH, _E.COUNTER_LEG_REFUNDED_OBSERVED, _S.ABORTED),
         (_S.BTC_LOCKED, _E.COUNTER_LEG_CLAIMED_OBSERVED, _S.SECRET_REVEALED),
         (_S.BOTH_LOCKED, _E.COUNTER_LEG_CLAIMED_OBSERVED, _S.SECRET_REVEALED),
+        # #850 PR 7a: an empty expired token contract whose push nonce is closed at F.
+        (_S.BTC_LOCKED, _E.COUNTER_LEG_EXPIRED_EMPTY, _S.ABORTED),
     }
 )
 
@@ -198,7 +200,8 @@ def test_each_state_event_pair_has_exactly_one_target():
 
 
 def test_transition_count():
-    assert len(TRANSITIONS) == 15  # 14 + BTC_LOCKED -> SECRET_REVEALED (#850 PR 5a)
+    # 14 + BTC_LOCKED -> SECRET_REVEALED (#850 PR 5a). PR 7a adds an event on an existing pair.
+    assert len(TRANSITIONS) == 15
 
 
 def test_every_legal_transition_allowed():

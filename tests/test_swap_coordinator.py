@@ -2139,6 +2139,12 @@ class FakeEthLeg:
         self.calls.append("verdict")
         return self._verdict
 
+    async def created_by_this_key(self, contract_address, deploy_tx_hash) -> bool:
+        # A resume of a push pinned before the record named its key needs this key's deploy (#850
+        # PR 7a). This fake deployed every contract its tests resume.
+        self.calls.append("deploy-proof")
+        return True
+
     async def verify_counterparty_funded(self, contract_address, terms, *, block_identifier=None):
         """MAKER-side gate stand-in: records the call, raises if configured hostile, else returns a
         locator bound to the contract address (the real EthLeg builds it from the maker's config).
