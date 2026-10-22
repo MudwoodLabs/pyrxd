@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import json
 import os
 
 import pytest
@@ -20,7 +21,14 @@ from pyrxd.eth_wallet.disposition import read_unfunded_token_balance
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import SwapCoordinator
-from pyrxd.gravity.swap_state import SWAP_RECORD_SCHEMA_VERSION, AbortReason, SwapRecord, SwapRole, SwapState
+from pyrxd.gravity.swap_state import (
+    SWAP_RECORD_SCHEMA_VERSION,
+    AbortReason,
+    RecordRole,
+    SwapRecord,
+    SwapRole,
+    SwapState,
+)
 from pyrxd.security.errors import NetworkError, ValidationError
 from tests._fake_evm_chain import CHAIN_ID, CONTRACT, TOKEN, FakeEvmChain, FakeEvmEndpoint
 from tests.test_swap_coordinator import (
@@ -103,10 +111,48 @@ async def test_a_record_with_nothing_on_chain_is_abandoned_and_the_hashlock_stay
     assert coord.seen_store.reserve(rec.terms.hashlock) is False  # still reserved: H is never funded again
 
 
-async def test_a_btc_record_with_no_funding_transaction_is_abandoned():
+async def test_a_btc_record_written_with_a_role_is_abandoned(tmp_path):
+    """0.27 writes ``role`` on every record a coordinator persists, and records the BTC funding
+    transaction before its broadcast, so a record on disk that names a role and holds no funding
+    transaction was never funded."""
     coord, _c, _leg = _setup(contract=False)
-    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms())
+    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), role=RecordRole.TAKER)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+    coord._persist = sink
     rec = await coord.abandon_unfunded()
+    assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.TAKER_NEVER_FUNDS
+    assert sink.load_record() == rec
+
+
+async def test_a_btc_record_never_persisted_is_abandoned(tmp_path):
+    coord, _c, _leg = _setup(contract=False)
+    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), role=RecordRole.TAKER)
+    coord._persist = JsonFileRecordSink(tmp_path / "swap.json")
+    assert (await coord.abandon_unfunded()).state is SwapState.ABORTED
+
+
+@pytest.mark.parametrize("where", ["on_disk_without_a_role", "sink_cannot_read_back"])
+async def test_a_btc_record_that_may_predate_its_funding_record_needs_the_htlc_checked(tmp_path, where):
+    """Before #841 a BTC fund whose readback failed left a NEGOTIATED record with no trace of the BTC
+    in the HTLC. A record on disk with no role (pre-0.27), or one that cannot be read back, may be
+    that record: refused until the caller confirms the HTLC address never received an output."""
+    coord, _c, _leg = _setup(contract=False)
+    terms = _terms()
+    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER)
+    if where == "on_disk_without_a_role":
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        await sink(SwapRecord(state=SwapState.NEGOTIATED, terms=terms))  # as 0.26.x wrote it
+        assert "role" not in json.loads(sink.path.read_text())
+        coord._persist = sink
+        written = lambda: sink.load_record()  # noqa: E731
+    else:
+        written = lambda: list(coord.persisted)  # noqa: E731
+    before, before_written = coord.record, written()
+    with pytest.raises(ValidationError, match="0.26.x or earlier.*confirm_btc_htlc_empty=True"):
+        await coord.abandon_unfunded()
+    assert coord.record == before and written() == before_written
+    rec = await coord.abandon_unfunded(confirm_btc_htlc_empty=True)
     assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.TAKER_NEVER_FUNDS
 
 

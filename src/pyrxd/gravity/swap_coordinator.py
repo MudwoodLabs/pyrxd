@@ -4866,7 +4866,7 @@ class SwapCoordinator:
     # -- the taker's NEGOTIATED exit (#850 PR 8, design §3.5) --------------------------------------
 
     @_serialized_step
-    async def abandon_unfunded(self) -> SwapRecord:
+    async def abandon_unfunded(self, *, confirm_btc_htlc_empty: bool = False) -> SwapRecord:
         """End a NEGOTIATED record that holds nothing that may hold value (``TAKER_NEVER_FUNDS``;
         #850 PR 8, design §3.5). The taker's step; a maker's NEGOTIATED exit is #850 PR 11.
 
@@ -4884,23 +4884,26 @@ class SwapCoordinator:
           ``NEGOTIATED`` or holds a counter-leg locator, pending contract, BTC funding transaction or
           token push that this coordinator's record does not. It is read under
           ``CoordinatorConfig.fund_lock`` when one is set, which the fund holds across deploy and
-          push.
+          push;
+        * a BTC record that may have been written by pyrxd 0.26.x or earlier, unless
+          *confirm_btc_htlc_empty* is ``True``: one whose record on disk names no ``role``, or any
+          BTC record when the persist hook cannot read the record back (``load_record``). Those
+          versions recorded no funding transaction before its broadcast (#841), so such a record
+          reads as never funded even if a fund was broadcast and its readback failed, and this step
+          cannot scan the HTLC address. Pass ``True`` only after checking that the HTLC address
+          (``BitcoinTaprootLeg.htlc_address(terms)``) has never received an output.
 
         Nothing is broadcast. ``abort_reason`` is ``TAKER_NEVER_FUNDS``. The hashlock stays reserved
         in the seen-store, so this ``H`` is never funded again. A token contract that was deployed
         stays on the record (``pending_counter_contract``).
-
-        Not covered: a BTC record written by pyrxd 0.26.x or earlier, which recorded no funding
-        transaction before its broadcast (#841). Such a record reads as never funded even if a fund
-        was broadcast and its readback failed; this step does not scan the HTLC address.
         """
         lock = self.config.fund_lock
         # Held from the read of the record on disk to the write, as the fund holds it across deploy
         # and push: a fund in another process sharing the lock cannot sign a push in between.
         with lock() if lock is not None else contextlib.nullcontext():
-            return await self._abandon_unfunded_under_the_fund_lock()
+            return await self._abandon_unfunded_under_the_fund_lock(confirm_btc_htlc_empty)
 
-    async def _abandon_unfunded_under_the_fund_lock(self) -> SwapRecord:
+    async def _abandon_unfunded_under_the_fund_lock(self, confirm_btc_htlc_empty: bool) -> SwapRecord:
         # First: a coordinator built on a stale or fresh record must not overwrite the one on disk.
         self._refuse_to_overwrite_a_recorded_counter_leg(self.record.terms)
         state = self.record.state
@@ -4913,6 +4916,8 @@ class SwapCoordinator:
                 "this record holds a BTC funding transaction, written before its broadcast, so it may have been "
                 "sent: resume the fund (taker_funds_btc), then refund the HTLC after its timeout. Nothing was recorded."
             )
+        if self.record.terms.counter_chain == "btc" and not confirm_btc_htlc_empty:
+            self._refuse_a_btc_record_that_may_predate_its_funding_record()
         contract = self.record.pending_counter_contract
         if contract:
             token = self.record.terms.token_address
@@ -4957,6 +4962,28 @@ class SwapCoordinator:
             raise
         logger.warning("swap abandoned unfunded from negotiated; the hashlock stays reserved")
         return self.record
+
+    def _refuse_a_btc_record_that_may_predate_its_funding_record(self) -> None:
+        """Refuse a BTC record that may have been written by pyrxd 0.26.x or earlier (#850 PR 8).
+
+        Before #841 a BTC fund broadcast first and wrote nothing until its readback succeeded, so a
+        failed readback left a NEGOTIATED record with no trace of BTC locked in the HTLC. 0.27 writes
+        ``role`` on every record a coordinator persists, and those versions did not, so a record on
+        disk that names a role was written after the fix. A record on disk without one, or a persist
+        hook that cannot read the record back, cannot show that."""
+        load = getattr(self._persist, "load_record", None)
+        on_disk = load() if callable(load) else None
+        if callable(load) and (on_disk is None or on_disk.role is not None):
+            return  # nothing of this swap persisted, or written by a pyrxd that records the fund first
+        where = getattr(self.counter_leg, "htlc_address", None)
+        address = where(self.record.terms) if callable(where) else "the HTLC address of these terms"
+        raise ValidationError(
+            "this BTC record may have been written by pyrxd 0.26.x or earlier"
+            + (" (the record on disk names no role)" if callable(load) else " (the persist hook cannot read it back)")
+            + ", which recorded no funding transaction before broadcasting it (#841): BTC may be locked in "
+            f"{address}. Check that address; if it never received an output, call "
+            "abandon_unfunded(confirm_btc_htlc_empty=True). Nothing was recorded."
+        )
 
     # -- the gated explicit abandon (#850 PR 7b, design §3.6) -------------------------------------
 

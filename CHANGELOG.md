@@ -178,8 +178,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x
     `taker_refund_btc` would send again, go to `ABORTED`, and drop the recorded hash.
 - **A taker can end a swap it never funded (#850 PR 8) [Changed (breaking)].** New
-  `SwapCoordinator.abandon_unfunded()` takes a taker's or single operator's `NEGOTIATED` record to
-  `ABORTED` on the existing `TAKER_NEVER_FUNDS` edge, with the new `abort_reason`
+  `SwapCoordinator.abandon_unfunded(*, confirm_btc_htlc_empty=False)` takes a taker's or single
+  operator's `NEGOTIATED` record to `ABORTED` on the existing `TAKER_NEVER_FUNDS` edge, with the new `abort_reason`
   `taker_never_funds`. It broadcasts nothing, and the hashlock stays reserved, so the same `H` is
   never funded again. It refuses, and records nothing, while the record holds anything that may hold
   value: a BTC funding transaction (`pending_btc_funding_tx`, written before its broadcast), a native
@@ -193,9 +193,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   funding transaction or token push that the coordinator's record does not (the same guard the fund
   uses, which now also compares the push nonce and hash). It holds `CoordinatorConfig.fund_lock`,
   when one is set, from that read to its write. A `MAKER`-role coordinator is
-  refused: the maker's `NEGOTIATED` exit is #850 PR 11. Not covered: a BTC record written by 0.26.x
-  or earlier, which recorded no funding transaction before its broadcast (#841), reads as never
-  funded even if a fund was broadcast; this step does not scan the HTLC address. `SWAP_RECORD_SCHEMA_VERSION` is 8; a record
+  refused: the maker's `NEGOTIATED` exit is #850 PR 11. A BTC record that may have been written by
+  0.26.x or earlier is refused unless the caller passes `confirm_btc_htlc_empty=True` after checking
+  the HTLC address: one whose record on disk names no `role`, or any BTC record when the persist hook
+  cannot read the record back. Those versions recorded no funding transaction before its broadcast
+  (#841), so such a record reads as never funded even if a fund was broadcast, and this step cannot
+  scan the HTLC address. `SWAP_RECORD_SCHEMA_VERSION` is 8; a record
   carrying `taker_never_funds` writes 8, which a pyrxd from 0.27 development before this change
   refuses. A 0.26.x pyrxd ignores unknown keys and reads the record as `ABORTED` without saying why.
 - **An operator can end an ETH swap record on a counter-leg case that has no automatic end, after

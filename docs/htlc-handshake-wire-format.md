@@ -849,7 +849,10 @@ this swap on disk is past `NEGOTIATED`, or holds a counter-leg locator, pending 
 transaction, push nonce or push hash that differs from the coordinator's record. `abort_reason` is
 `taker_never_funds`. The hashlock stays reserved. A maker's record has no such exit yet. A BTC record
 written by 0.26.x or earlier recorded no funding transaction before its broadcast (#841), so it reads
-as never funded even if a fund was broadcast: this step does not scan the HTLC address.
+as never funded even if a fund was broadcast, and this step cannot scan the HTLC address. A BTC record
+on disk that names no `role` (0.27 writes one on every record a coordinator persists), or one the
+persist hook cannot read back, is therefore refused unless the caller passes
+`confirm_btc_htlc_empty=True` after checking that address.
 
 `BOTH_TIMEOUTS_ELAPSE` on an ETH counter leg (#850, PR 6) is also taken on the chain, not on a
 broadcast: `mutual_refund` sends or follows the taker's ETH refund, and the record stays
