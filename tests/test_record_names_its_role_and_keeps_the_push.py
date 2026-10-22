@@ -464,17 +464,31 @@ async def test_a_resumed_record_without_a_push_key_does_not_adopt_the_resuming_o
     assert proofs == [(old.pending_counter_contract, old.pending_counter_deploy_tx)]
 
 
-@pytest.mark.parametrize("prover", ["another key deployed it", "the leg cannot say"])
+@pytest.mark.parametrize("prover", ["another key deployed it", "the leg cannot say", "the record names no contract"])
 async def test_a_record_without_a_push_key_is_not_resumed_by_a_key_that_did_not_deploy(tmp_path, prover) -> None:
     """Re-review of #850 PR 7a, round 2: the push was pinned at nonce 9 before the record named its
     key. A key that cannot be shown to have deployed the contract would push at ITS nonce 9 and leave
     the first push free to land. Refused before the token leg is reached; the honest pair is the test
-    above, where the deploy proof holds."""
+    above, where the deploy proof holds. A record with the nonce and no contract has nothing to prove
+    the deploy against, so it is refused even by a leg whose proof would say yes."""
     order: list[str] = []
     leg, seen = _shipped_token_eth_leg(order)
     old = dataclasses.replace(_pending_push(leg.signer_address()), push_signer=None)
+    if prover == "the record names no contract":
+        old = dataclasses.replace(
+            old, pending_counter_contract=None, pending_counter_deploy_tx=None, pending_push_tx_hash=None
+        )
     coord, terms = _token_coordinator(leg, record=old)
-    if prover == "another key deployed it":
+    if prover == "the record names no contract":
+        from tests.test_swap_coordinator import FakeSeenStore
+
+        coord.seen_store = FakeSeenStore()  # a store that lost H: one that holds it refuses at the reserve
+
+        async def _yes(address, deploy_tx_hash):
+            return True
+
+        leg.created_by_this_key = _yes
+    elif prover == "another key deployed it":
 
         async def _created(address, deploy_tx_hash):
             return False
