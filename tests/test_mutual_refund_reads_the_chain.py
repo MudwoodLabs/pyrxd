@@ -359,3 +359,32 @@ async def test_HONEST_a_failed_read_with_our_refund_beaten_keeps_waiting():
     _with_a_reverted_refund(coord, leg)
     rec = await coord.mutual_refund()
     assert rec.state is SwapState.BOTH_LOCKED and leg.refunds == 0
+
+
+def test_every_unknown_for_a_contract_settled_at_f_is_tagged():
+    """``settled_at_finalized`` gates the AlreadySettled stop (Mythos F1). Derived from the reader's
+    source, not a hand-typed list: every ``unknown(...)`` inside the ``if settled_f:`` branch passes
+    the tag, and none outside it does."""
+    import ast
+    import inspect
+
+    from pyrxd.eth_wallet import disposition
+
+    tree = ast.parse(inspect.getsource(disposition))
+    branch = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "settled_f"
+    )
+    inside = {id(c) for c in ast.walk(branch) if isinstance(c, ast.Call)}
+    tagged, untagged_inside, tagged_outside = 0, [], []
+    for call in ast.walk(tree):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "unknown"):
+            continue
+        has = any(k.arg == "settled_at_finalized" for k in call.keywords)
+        if id(call) in inside:
+            tagged += has
+            if not has:
+                untagged_inside.append(call.lineno)
+        elif has:
+            tagged_outside.append(call.lineno)
+    assert tagged >= 5, "the scan found too few tagged answers: it has stopped running"
+    assert untagged_inside == [] and tagged_outside == [], (untagged_inside, tagged_outside)

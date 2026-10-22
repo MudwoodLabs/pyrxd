@@ -349,7 +349,7 @@ _BOTH_LOCKED_REFUND_REASON_ETH = _BOTH_LOCKED_REFUND_COMMON + (
     "until that refund is final at the finalized block, so run it again (the two-host runner's --phase "
     "refund polls) until it ends. A TAKER-role run ends at MUTUAL_REFUND without touching the covenant "
     "(the maker's to refund); with no role the covenant refund follows. While a Claimed log that opens H "
-    "is on record, neither happens before t_rxd matures: claim the covenant first. If the chain cannot say what "
+    "is on record, neither happens until the covenant's own timelock has matured: claim the covenant first. If the chain cannot say what "
     "happened to the contract and the refund is refused, it raises CounterLegDispositionUnknown: check "
     "the contract's events on another source before the covenant's CSV refund opens. On a leg that "
     "cannot read its disposition, a TAKER-role run sends the refund once and the record stays "

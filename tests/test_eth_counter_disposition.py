@@ -668,3 +668,28 @@ async def test_HONEST_an_anchor_proves_a_refund_with_no_log_and_no_hash():
     d = await _read(MultiSourceEthRpc(logless), chain, expiry_anchor=_anchor(82))
     assert d.kind is DispositionKind.REFUNDED and d.evidence.tx_hash is None
     assert (await _read(MultiSourceEthRpc(logless), chain)).kind is DispositionKind.UNKNOWN  # without it
+
+
+@pytest.mark.parametrize("claim_visible", [True, False], ids=["claim_nominated", "claim_withheld"])
+async def test_an_uncheckable_settlement_is_tagged_settled_at_f_only_when_no_claim_is_nominated(claim_visible):
+    """#850 PR 6: ``settled_at_finalized`` stops the coordinator following a refund of ours that lost
+    the race. When a nominated transaction cannot be checked but a claim IS nominated, the claim is
+    already surfaced (``claims_seen``); when every endpoint withholds the claim, only the tag is left."""
+    chain = _chain(finalized=90)
+    chain.claim(70)
+    hide = not claim_visible
+    liar = FakeEvmEndpoint(chain, forge_refunded_tx="0x" + "ee" * 32, forge_receipt=True, hide_claimed=hide)
+    rpc = MultiSourceEthRpc(
+        [liar, FakeEvmEndpoint(chain, hide_claimed=hide), FakeEvmEndpoint(chain, hide_claimed=hide)]
+    )
+    d = await _read(rpc, chain)
+    assert d.kind is DispositionKind.UNKNOWN and "could not be checked" in d.reason
+    assert bool(d.claims_seen) is claim_visible
+    assert d.settled_at_finalized is (not claim_visible)
+
+
+async def test_a_failed_read_is_never_tagged_settled_at_f():
+    chain = _chain(finalized=90)
+    chain.claim(70)
+    d = await _read(MultiSourceEthRpc([FakeEvmEndpoint(chain, logs_429=True) for _ in range(3)]), chain)
+    assert d.kind is DispositionKind.UNKNOWN and d.settled_at_finalized is False
