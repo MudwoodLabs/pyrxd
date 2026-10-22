@@ -327,3 +327,20 @@ async def test_HONEST_our_refund_beaten_after_a_read_that_knew_the_contract_unse
     _with_a_reverted_refund(coord, leg)
     rec = await coord.mutual_refund()
     assert rec.state is SwapState.BOTH_LOCKED and leg.refunds == 0
+
+
+async def test_a_failed_covenant_refund_after_the_counter_leg_refunded_says_only_the_covenant_is_retried():
+    """Mythos review of PR 6, F3: on the read path the counter leg is already REFUNDED and is not
+    sent again, so the failure must not say "the other leg was attempted" or "re-attempts both"."""
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)
+
+    async def fails(_record):
+        raise NetworkError("radiant node down")
+
+    coord.radiant_leg.refund_asset = fails
+    with pytest.raises(NetworkError) as raised:
+        await coord.mutual_refund()
+    msg = str(raised.value)
+    assert "not sent again" in msg and "re-attempts the covenant refund" in msg
+    assert "re-attempts both" not in msg and leg.refunds == 0
