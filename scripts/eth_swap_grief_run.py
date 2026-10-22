@@ -281,9 +281,10 @@ async def run(args) -> None:
         if rec.state is SwapState.BOTH_LOCKED:
             print(
                 "  NOT FINISHED: the record is still both_locked and the covenant refund has not gone. Do NOT re-run "
-                "this script: it has no resume, and a re-run starts a new swap. The record is saved beside "
-                "--keys-out (.swaprec.json); finish from it by calling SwapCoordinator.mutual_refund until the record "
-                "is mutual_refund."
+                "this script: it has no resume (with the same --keys-out it refuses to overwrite it; with a new one "
+                "it starts a second swap). The record is saved at <--keys-out>.swaprec.json; finish from it with a "
+                "SwapCoordinator built with role=None (as this run was: a TAKER role never refunds the covenant), "
+                "calling mutual_refund until the record is mutual_refund."
             )
         if rec.state is SwapState.MUTUAL_REFUND:
             print("\n  S1 PROVEN ON REAL CHAINS: the stalling maker caused NO one-sided loss —")
@@ -319,15 +320,16 @@ async def _mutual_refund_to_terminal(coord, *, timeout_s: float, interval_s: flo
         else:
             if rec.state is not SwapState.BOTH_LOCKED or time.monotonic() >= deadline:
                 return rec
-            if rec.counter_claim_tx is not None:
-                print(
-                    f"  a Claimed log on the ETH HTLC (tx {rec.counter_claim_tx}) opens H, so p may be public: the "
-                    "record and the covenant refund wait until t_rxd has matured; waiting"
+            print(
+                f"  the record is still both_locked (our ETH refund: {rec.counter_refund_tx_hash}); it waits for that "
+                "refund to read REFUNDED at the finalized block"
+                + (
+                    f", and, while a Claimed log (tx {rec.counter_claim_tx}) opens H, for t_rxd to mature"
+                    if rec.counter_claim_tx is not None
+                    else ""
                 )
-            else:
-                print(
-                    f"  our ETH refund {rec.counter_refund_tx_hash} is not yet REFUNDED at the finalized block; waiting"
-                )
+                + "; waiting"
+            )
         await asyncio.sleep(interval_s)
 
 
