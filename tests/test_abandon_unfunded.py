@@ -216,6 +216,24 @@ async def test_the_sink_keeps_the_mark_on_a_write_that_names_no_role(tmp_path):
     assert back.role is RecordRole.TAKER and back.read_without_role
 
 
+async def test_a_record_read_without_a_role_keeps_its_mark_over_a_record_that_names_one(tmp_path):
+    """A 0.26.x record read back (no role, marked in memory) and written straight over this swap's
+    record from a 0.27 coordinator: the sink gives it the role on disk, and the mark with it."""
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    terms = _terms()
+    await sink(SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER))
+    old = SwapRecord.from_dict(SwapRecord(state=SwapState.NEGOTIATED, terms=terms).to_dict())
+    assert old.role is None and old.read_without_role
+    await sink(old)
+    on_disk = json.loads(sink.path.read_text())
+    assert on_disk["role"] == "taker" and on_disk["read_without_role"] is True
+    coord, _c, _leg = _setup(contract=False)
+    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER)
+    coord._persist = sink
+    with pytest.raises(ValidationError, match=r"\(the record on disk was written without a role\)"):
+        await coord.abandon_unfunded()
+
+
 def test_HONEST_a_record_without_a_role_keeps_its_old_wire_form():
     """The mark is written only with a role: a record without one reads back marked and writes back
     byte-identical, so the v1 form of a BTC record is unchanged."""

@@ -154,6 +154,10 @@ class JsonFileRecordSink:
         as_dict = record.to_dict()
         prior = self._refuse_to_clobber_a_different_swap(as_dict)
         self._keep_the_persisted_role(prior, as_dict)
+        if getattr(record, "read_without_role", False) and as_dict.get("role") is not None:
+            # A record without a role does not write its mark; the role this write takes from disk must
+            # not hide it (#850 PR 8).
+            as_dict["read_without_role"] = True
         self._keep_a_persisted_reveal(prior, as_dict, self._path)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
         self._atomic_replace(self._path, payload, what="the swap record")
