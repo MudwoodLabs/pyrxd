@@ -3153,6 +3153,22 @@ class SwapCoordinator:
                     f"this swap's token push was signed by {self.record.push_signer}, and this counter leg's key "
                     f"is {signer}: resume with the key that signed the push. Nothing was sent."
                 )
+            if self.record.push_signer is None and self.record.pending_push_nonce is not None:
+                # A push pinned before the record named its key (a 0.26.x record, or a leg that did
+                # not say its key). Pushing at that nonce with another key would leave the first push
+                # free to land, as above, so the resume needs this key to have deployed the contract.
+                # That shows the key funded this swap; it does not prove the same key pushed.
+                created = getattr(self.counter_leg, "created_by_this_key", None)
+                if (
+                    resume_from is None
+                    or created is None
+                    or not await created(resume_from.address, resume_from.deploy_tx_hash)
+                ):
+                    raise ValidationError(
+                        f"this swap's token push was pinned at nonce {self.record.pending_push_nonce} before the "
+                        "record named the key that signs it, and this counter leg's key cannot be shown to have "
+                        "deployed the contract: resume with the key that deployed it. Nothing was sent."
+                    )
             lock = self.config.fund_lock
             # Held across deploy AND push: the window the lock exists to close is between reading
             # the balance and sending the shortfall, which spans both.

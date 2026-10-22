@@ -556,6 +556,17 @@ async def test_a_record_whose_push_key_is_not_this_legs_key_sends_no_close():
     assert coord2.record.state is SwapState.BTC_LOCKED
 
 
+async def test_a_leg_that_does_not_say_its_key_sends_no_close():
+    """Re-review of #850 PR 7a, round 2: the record names the push key and the leg names none. A close
+    from an unknown key would be recorded as this record's bound without stopping the push."""
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
+    coord.record = dataclasses.replace(coord.record, push_signer=leg.signer_address())
+    leg.signer_address = None  # a leg written before signer_address
+    with pytest.raises(ValidationError, match="only a close from the push's key"):
+        await coord.close_push_nonce()
+    assert leg.closes == [] and coord.record.push_close_nonce is None
+
+
 async def test_HONEST_a_record_whose_push_key_is_this_legs_key_closes():
     coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
     coord.record = dataclasses.replace(coord.record, push_signer=FUNDER)

@@ -378,6 +378,7 @@ async def test_a_resume_hands_the_recorded_push_hash_back_to_the_token_leg(tmp_p
         pending_counter_deploy_tx="0x" + "de" * 32,
         pending_push_nonce=9,
         pending_push_tx_hash=_PUSH_HASH,
+        push_signer=leg.signer_address(),
     )
     coord, terms = _token_coordinator(leg, record=pending)
     try:
@@ -443,6 +444,13 @@ async def test_a_resumed_record_without_a_push_key_does_not_adopt_the_resuming_o
         persisted.append(record)
 
     coord, terms = _token_coordinator(leg, record=old, persist=_persist)
+    proofs: list[tuple[str, str]] = []
+
+    async def _created(address, deploy_tx_hash):  # this key's CREATE address at the deploy's nonce
+        proofs.append((address, deploy_tx_hash))
+        return True
+
+    leg.created_by_this_key = _created
 
     async def _fund(**kw):  # the resume reports its push hash at the pinned nonce, then stops
         await kw["on_push_hash"](kw["push_nonce"], _PUSH_HASH)
@@ -453,6 +461,30 @@ async def test_a_resumed_record_without_a_push_key_does_not_adopt_the_resuming_o
         await coord.taker_funds_btc(terms, now_unix_s=_FUND_TIMEOUT - 40_000)
     assert any(r.pending_push_tx_hash == _PUSH_HASH for r in persisted), "the push hash write never ran"
     assert {r.push_signer for r in persisted} == {None}
+    assert proofs == [(old.pending_counter_contract, old.pending_counter_deploy_tx)]
+
+
+@pytest.mark.parametrize("prover", ["another key deployed it", "the leg cannot say"])
+async def test_a_record_without_a_push_key_is_not_resumed_by_a_key_that_did_not_deploy(tmp_path, prover) -> None:
+    """Re-review of #850 PR 7a, round 2: the push was pinned at nonce 9 before the record named its
+    key. A key that cannot be shown to have deployed the contract would push at ITS nonce 9 and leave
+    the first push free to land. Refused before the token leg is reached; the honest pair is the test
+    above, where the deploy proof holds."""
+    order: list[str] = []
+    leg, seen = _shipped_token_eth_leg(order)
+    old = dataclasses.replace(_pending_push(leg.signer_address()), push_signer=None)
+    coord, terms = _token_coordinator(leg, record=old)
+    if prover == "another key deployed it":
+
+        async def _created(address, deploy_tx_hash):
+            return False
+
+        leg.created_by_this_key = _created
+    else:
+        leg.created_by_this_key = None
+    with pytest.raises(ValidationError, match="resume with the key that deployed it"):
+        await coord.taker_funds_btc(terms, now_unix_s=_FUND_TIMEOUT - 40_000)
+    assert seen == {} and coord.record.state is SwapState.NEGOTIATED
 
 
 async def test_a_resume_with_a_leg_that_does_not_say_its_key_is_refused(tmp_path) -> None:
@@ -548,3 +580,26 @@ def test_a_single_operator_record_refused_by_a_two_host_runner_names_the_runner_
     assert "single-operator run" in msg and "--role none" not in msg, msg
     with pytest.raises(SystemExit, match="Run it with --role maker"):
         _refuse_another_roles_record(dataclasses.replace(record, role=RecordRole.MAKER), role="taker", path="swap.json")
+
+
+async def test_the_deploy_proof_is_this_keys_create_address_at_the_deploys_nonce(tmp_path) -> None:
+    """``EthLeg.created_by_this_key``: only the deploy's nonce comes from the endpoint, and the CREATE
+    derivation checks it. Another key's contract, or a read that fails, proves nothing."""
+    from pyrxd.eth_wallet.erc20_leg import _create_address
+
+    leg, _seen = _shipped_token_eth_leg([])
+    ours = _create_address(leg.signer_address(), 5)
+    answers: dict[str, object] = {"0x" + "de" * 32: {"nonce": 5}, "0x" + "df" * 32: {"nonce": True}}
+
+    async def _get_transaction(tx_hash):
+        if tx_hash not in answers:
+            raise ConnectionError("endpoint down")
+        return answers[tx_hash]
+
+    leg._leg._rpc.get_transaction = _get_transaction
+    assert await leg.created_by_this_key(ours, "0x" + "de" * 32) is True
+    assert await leg.created_by_this_key(ours.lower(), "0x" + "de" * 32) is True
+    assert await leg.created_by_this_key("0x" + "77" * 20, "0x" + "de" * 32) is False
+    at_one = _create_address(leg.signer_address(), 1)  # where a bool read as the integer 1 would point
+    assert await leg.created_by_this_key(at_one, "0x" + "df" * 32) is False  # a bool is not a nonce
+    assert await leg.created_by_this_key(ours, "0x" + "e0" * 32) is False

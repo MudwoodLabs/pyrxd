@@ -423,14 +423,19 @@ class EthLeg:
         the deploy transaction's nonce is the contract address. Only the nonce comes from the
         endpoint, and the derivation checks it, so a lying endpoint cannot make this true for
         another key's contract. A read that fails is ``False``."""
+        return await self.created_by_this_key(locator.contract_address, locator.deploy_tx_hash)
+
+    async def created_by_this_key(self, contract_address: str, deploy_tx_hash: str) -> bool:
+        """:meth:`deployed_by_this_key` by address and deploy hash, for a contract with no locator yet
+        (an interrupted fund's pending deploy). A read that fails is ``False``."""
         from pyrxd.eth_wallet.erc20_leg import _create_address
 
         try:
-            tx = await self._leg._rpc.get_transaction(locator.deploy_tx_hash)
+            tx = await self._leg._rpc.get_transaction(deploy_tx_hash)
             nonce = tx["nonce"]
             if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
                 return False
-            return _create_address(self.signer_address(), nonce).lower() == locator.contract_address.lower()
+            return _create_address(self.signer_address(), nonce).lower() == contract_address.lower()
         except Exception:  # an unreadable deploy proves nothing either way
             return False
 

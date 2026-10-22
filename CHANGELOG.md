@@ -220,8 +220,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     before anything is sent. A record without `push_signer` (written before this change, and still
     without one after a resume) is read with this leg's key only when the deploy transaction proves
     this key created the contract (its CREATE address at the deploy's nonce); otherwise no count is
-    read and the contract stays `EXPIRED_EMPTY_OPEN`. That check does not prove this key signed the
-    push: a 0.26.x resume that pushed with another key leaves a record it can read wrongly.
+    read and the contract stays `EXPIRED_EMPTY_OPEN`. A fund resumed from such a record with a push
+    nonce is refused unless the same check holds. That check does not prove this key signed the
+    push: a 0.26.x resume that already pushed with another key leaves a record it can read wrongly.
   - `mutual_refund` reads an empty expired contract before sending anything and raises
     `NothingToRefund` naming the gated abandon, as the leg's refusal did before.
   - `SWAP_RECORD_SCHEMA_VERSION` is 6. A record carrying a push close, a push signer, an
