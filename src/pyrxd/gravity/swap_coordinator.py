@@ -4886,8 +4886,10 @@ class SwapCoordinator:
           ``CoordinatorConfig.fund_lock`` when one is set, which the fund holds across deploy and
           push;
         * a BTC record that may have been written by pyrxd 0.26.x or earlier, unless
-          *confirm_btc_htlc_empty* is ``True``: one whose record on disk names no ``role``, or any
-          BTC record when the persist hook cannot read the record back (``load_record``). Those
+          *confirm_btc_htlc_empty* is ``True``: one that was read without a ``role``
+          (``read_without_role``, kept after a 0.27 coordinator stamps one), whose record on disk
+          names no ``role`` or carries that mark, or any BTC record when there is no persist hook
+          that reads the record back (``load_record``). Those
           versions recorded no funding transaction before its broadcast (#841), so such a record
           reads as never funded even if a fund was broadcast and its readback failed, and this step
           cannot scan the HTLC address. Pass ``True`` only after checking that the HTLC address
@@ -4968,21 +4970,29 @@ class SwapCoordinator:
 
         Before #841 a BTC fund broadcast first and wrote nothing until its readback succeeded, so a
         failed readback left a NEGOTIATED record with no trace of BTC locked in the HTLC. 0.27 writes
-        ``role`` on every record a coordinator persists, and those versions did not, so a record on
-        disk that names a role was written after the fix. A record on disk without one, or a persist
-        hook that cannot read the record back, cannot show that."""
+        ``role`` on every record a coordinator persists, and those versions did not. A record read
+        without one keeps ``read_without_role`` after a 0.27 coordinator stamps its role. So a record
+        is accepted only when this coordinator's record and the record on disk carry no such mark, and
+        the record on disk names a role or there is none."""
         load = getattr(self._persist, "load_record", None)
-        on_disk = load() if callable(load) else None
-        if callable(load) and (on_disk is None or on_disk.role is not None):
-            return  # nothing of this swap persisted, or written by a pyrxd that records the fund first
+        if self.record.read_without_role:
+            why = "this record was read without a role"
+        elif self._persist is None:
+            why = "there is no persist hook to read the record on disk from"
+        elif not callable(load):
+            why = "the persist hook cannot read the record back"
+        else:
+            on_disk = load()
+            if on_disk is None or (on_disk.role is not None and not on_disk.read_without_role):
+                return  # nothing of this swap persisted, or written by a pyrxd that records the fund first
+            why = "the record on disk was written without a role"
         where = getattr(self.counter_leg, "htlc_address", None)
         address = where(self.record.terms) if callable(where) else "the HTLC address of these terms"
         raise ValidationError(
-            "this BTC record may have been written by pyrxd 0.26.x or earlier"
-            + (" (the record on disk names no role)" if callable(load) else " (the persist hook cannot read it back)")
-            + ", which recorded no funding transaction before broadcasting it (#841): BTC may be locked in "
-            f"{address}. Check that address; if it never received an output, call "
-            "abandon_unfunded(confirm_btc_htlc_empty=True). Nothing was recorded."
+            f"this BTC record may have been written by pyrxd 0.26.x or earlier ({why}), which recorded no "
+            f"funding transaction before broadcasting it (#841): BTC may be locked in {address}. Check that "
+            "address; if it never received an output, call abandon_unfunded(confirm_btc_htlc_empty=True). "
+            "Nothing was recorded."
         )
 
     # -- the gated explicit abandon (#850 PR 7b, design §3.6) -------------------------------------

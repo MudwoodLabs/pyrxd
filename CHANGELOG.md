@@ -195,12 +195,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when one is set, from that read to its write. A `MAKER`-role coordinator is
   refused: the maker's `NEGOTIATED` exit is #850 PR 11. A BTC record that may have been written by
   0.26.x or earlier is refused unless the caller passes `confirm_btc_htlc_empty=True` after checking
-  the HTLC address: one whose record on disk names no `role`, or any BTC record when the persist hook
-  cannot read the record back. Those versions recorded no funding transaction before its broadcast
-  (#841), so such a record reads as never funded even if a fund was broadcast, and this step cannot
-  scan the HTLC address. `SWAP_RECORD_SCHEMA_VERSION` is 8; a record
-  carrying `taker_never_funds` writes 8, which a pyrxd from 0.27 development before this change
-  refuses. A 0.26.x pyrxd ignores unknown keys and reads the record as `ABORTED` without saying why.
+  the HTLC address: one that was read without a `role`, one whose record on disk names no `role` or
+  was once read without one, or any BTC record when there is no persist hook that reads the record
+  back. Those versions recorded no funding transaction before its broadcast (#841), so such a record
+  reads as never funded even if a fund was broadcast, and this step cannot scan the HTLC address. A
+  record read without a role keeps the new `read_without_role` once a 0.27 coordinator stamps its
+  role, and `JsonFileRecordSink` sets it on a write that adds a role over a record on disk without
+  one. It is written only with a role, so a record without one keeps its old wire form.
+  `SWAP_RECORD_SCHEMA_VERSION` is 9; a record carrying `taker_never_funds` or a role writes 9, which
+  a pyrxd from 0.27 development before this change refuses. A 0.26.x pyrxd ignores unknown keys and reads the record as `ABORTED` without saying why.
 - **An operator can end an ETH swap record on a counter-leg case that has no automatic end, after
   the chain is read and only on the case it shows (#850 PR 7b) [Changed (breaking)].**
   - New `SwapCoordinator.abandon_counter_leg(*, confirm_contract, reason_code, note)`, from

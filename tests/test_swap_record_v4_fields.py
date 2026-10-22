@@ -184,7 +184,7 @@ def test_a_bad_record_field_is_refused(base, fields):
 def test_each_new_field_alone_writes_the_current_schema_version(fields):
     record = dataclasses.replace(_eth_base(), **fields)
     d = record.to_dict()
-    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 8
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 9
     assert SwapRecord.from_dict(d) == record
 
 

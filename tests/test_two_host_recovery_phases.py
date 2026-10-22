@@ -1668,6 +1668,8 @@ class TestEveryPhaseKeepsThePersistedRecord:
             kept = _kept_fields(after)
             assert kept.pop("role") == role, f"run {run}: the record does not name the {role} role"
             assert kept.pop("schema_version") == SWAP_RECORD_SCHEMA_VERSION
+            # The seeded record names no role, so the stamped one says it was read without one (#850 PR 8).
+            assert kept.pop("read_without_role") is True, f"run {run}: the record lost read_without_role"
             assert kept == {k: v for k, v in before.items() if k != "schema_version"}, (
                 f"run {run}: the phase dropped persisted fields"
             )

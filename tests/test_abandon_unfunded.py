@@ -156,6 +156,86 @@ async def test_a_btc_record_that_may_predate_its_funding_record_needs_the_htlc_c
     assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.TAKER_NEVER_FUNDS
 
 
+@pytest.mark.parametrize("writer", ["the_record_read_from_disk", "a_record_built_in_memory"])
+async def test_a_role_written_later_does_not_hide_a_record_read_without_one(tmp_path, writer):
+    """A 0.27 coordinator that takes in a 0.26.x record stamps its role, and any write it makes (the
+    intent persist of a fund that is then refused) puts that role on disk. The record keeps
+    ``read_without_role``, written by the record itself or added by the sink over a record on disk
+    without a role, so a later abandon is still refused."""
+    terms = _terms()
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(SwapRecord(state=SwapState.NEGOTIATED, terms=terms))  # as 0.26.x wrote it
+    first, _c, _leg = _setup(contract=False)
+    first._persist = sink
+    if writer == "the_record_read_from_disk":
+        first.record = first._adopted(sink.load_record())  # as the constructor takes it in
+    else:
+        first.record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER)
+    await first._persist_record(first.record)
+    on_disk = json.loads(sink.path.read_text())
+    assert on_disk["role"] == "taker" and on_disk["read_without_role"] is True
+    assert on_disk["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 9
+    fresh, _c, _leg = _setup(contract=False)
+    fresh.record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER)
+    fresh._persist = sink
+    with pytest.raises(ValidationError, match=r"0\.26\.x or earlier \(the record on disk was written without a role\)"):
+        await fresh.abandon_unfunded()
+    assert json.loads(sink.path.read_text()) == on_disk
+    rec = await fresh.abandon_unfunded(confirm_btc_htlc_empty=True)
+    assert rec.state is SwapState.ABORTED and json.loads(sink.path.read_text())["read_without_role"] is True
+
+
+async def test_a_record_read_without_a_role_is_refused_whatever_the_sink_holds(tmp_path):
+    """A 0.26.x record read from one place and persisted to an empty sink elsewhere: the record itself
+    says it was read without a role."""
+    old = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms()).to_dict()
+    coord, _c, _leg = _setup(contract=False)
+    coord.record = coord._adopted(SwapRecord.from_dict(old))
+    assert coord.record.role is RecordRole.TAKER and coord.record.read_without_role
+    coord._persist = JsonFileRecordSink(tmp_path / "elsewhere.json")
+    with pytest.raises(ValidationError, match=r"\(this record was read without a role\)"):
+        await coord.abandon_unfunded()
+    assert not (tmp_path / "elsewhere.json").exists()
+    assert (await coord.abandon_unfunded(confirm_btc_htlc_empty=True)).state is SwapState.ABORTED
+
+
+async def test_with_no_persist_hook_the_refusal_says_so():
+    coord, _c, _leg = _setup(contract=False)
+    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), role=RecordRole.TAKER)
+    coord._persist = None
+    with pytest.raises(ValidationError, match=r"\(there is no persist hook to read the record on disk from\)"):
+        await coord.abandon_unfunded()
+
+
+async def test_the_sink_keeps_the_mark_on_a_write_that_names_no_role(tmp_path):
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    terms = _terms()
+    await sink(SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER, read_without_role=True))
+    await sink(SwapRecord(state=SwapState.NEGOTIATED, terms=terms))  # a record built outside a coordinator
+    back = sink.load_record()
+    assert back.role is RecordRole.TAKER and back.read_without_role
+
+
+def test_HONEST_a_record_without_a_role_keeps_its_old_wire_form():
+    """The mark is written only with a role: a record without one reads back marked and writes back
+    byte-identical, so the v1 form of a BTC record is unchanged."""
+    old = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms()).to_dict()
+    back = SwapRecord.from_dict(old)
+    assert back.read_without_role and back.to_dict() == old and "read_without_role" not in old
+    unmarked = SwapRecord.from_dict(
+        SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), role=RecordRole.TAKER).to_dict()
+    )
+    assert not unmarked.read_without_role
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_a_mark_that_is_not_a_bool_is_refused_on_read(value):
+    d = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), role=RecordRole.TAKER).to_dict()
+    d["read_without_role"] = value
+    with pytest.raises(ValidationError, match="read_without_role must be a bool"):
+        SwapRecord.from_dict(d)
+
+
 async def test_an_empty_token_contract_never_pushed_into_is_abandoned():
     coord, _c, leg = _setup()
     rec = await coord.abandon_unfunded()
@@ -174,7 +254,7 @@ async def test_the_abandoned_record_round_trips_at_the_current_schema_version():
     coord, _c, _leg = _setup()
     rec = await coord.abandon_unfunded()
     d = rec.to_dict()
-    assert d["abort_reason"] == "taker_never_funds" and d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 8
+    assert d["abort_reason"] == "taker_never_funds" and d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 9
     assert SwapRecord.from_dict(d) == rec
 
 

@@ -121,8 +121,17 @@ class JsonFileRecordSink:
         """The role on disk binds every later write (#850 PR 3). A write naming ANOTHER role is
         refused: the record is the other party's, and its role-scoped steps would act for the wrong
         side. A write naming none (a record built outside a coordinator) keeps the persisted one,
-        and the schema version that comes with it, rather than dropping it."""
-        if prior is None or prior.get("role") is None:
+        and the schema version that comes with it, rather than dropping it.
+
+        A write naming a role over a record on disk that names none, or that was once read without
+        one, says so (``read_without_role``, #850 PR 8): the record may be from pyrxd 0.26.x or earlier,
+        and the role this write adds must not hide that."""
+        if prior is None:
+            return
+        a_role_is_written = incoming.get("role") is not None or prior.get("role") is not None
+        if a_role_is_written and (prior.get("role") is None or prior.get("read_without_role") is True):
+            incoming["read_without_role"] = True
+        if prior.get("role") is None:
             return
         role = incoming.get("role")
         if role is None:

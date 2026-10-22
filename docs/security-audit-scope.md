@@ -275,7 +275,7 @@ this commit, not against a plan:
    (`is_legacy_container_script`) but nothing can recover it.
 3. **The handshake has no version negotiation.** The envelope `schema` tag is written at four
    sites and read at none; `NegotiatedTerms` has **no version field** and `from_dict` silently
-   drops unknown keys (`gravity/swap_state.py:708-727`; locked by
+   drops unknown keys (`gravity/swap_state.py:709-728`; locked by
    `test_from_dict_silently_ignores_unknown_keys`). A receiver cannot detect that a sender meant
    something it does not understand; safety rests entirely on the two independently re-derived
    scriptPubKey comparisons (HZ-2, [`htlc-handshake-wire-format.md`](htlc-handshake-wire-format.md)).
