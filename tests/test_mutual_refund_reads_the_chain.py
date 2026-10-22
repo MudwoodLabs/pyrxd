@@ -247,3 +247,45 @@ async def test_a_network_failure_under_unknown_is_not_relabelled():
     with pytest.raises(NetworkError) as raised:
         await coord.mutual_refund()
     assert raised.value is down
+
+
+# --------------------------------------------------------------------------- the covenant's own guards
+
+
+@pytest.mark.parametrize("matured", [False, True], ids=["held_before_t_rxd", "HONEST_sent_after_t_rxd"])
+async def test_the_covenant_refund_itself_holds_while_a_seen_claim_opens_h(matured):
+    """``_refund_the_covenant_once`` re-checks D14 itself, so no caller can refund the covenant while
+    a recorded ``Claimed`` log opens H before t_rxd (it is also the legacy path's only hold)."""
+    import dataclasses
+
+    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90}, confs=1)
+    coord.record = dataclasses.replace(coord.record, counter_claim_tx="0x" + "dd" * 32)
+    if matured:
+        coord.radiant_leg.report_confs = int(coord.record.terms.t_rxd.value)
+    asset = _count_asset_refunds(coord)
+    failures: list = []
+    await coord._refund_the_covenant_once(failures)
+    if matured:
+        assert asset == [1] and failures == []
+    else:
+        assert asset == [] and [leg for leg, _exc in failures] == ["radiant leg"]
+        assert "not sent" in str(failures[0][1])
+
+
+async def test_a_refunded_answer_with_no_evidence_never_refunds_the_covenant(monkeypatch):
+    """A REFUNDED answer that carried no evidence was neither checked against D4 nor recorded, so a
+    single operator's covenant refund must not go on it (the real reader always attaches evidence;
+    this pins the guard for a leg that does not)."""
+    from pyrxd.eth_wallet.disposition import CounterDisposition, DispositionKind
+
+    coord, _chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    bare = CounterDisposition(DispositionKind.REFUNDED, "scripted", 90, None)
+
+    async def read():
+        return bare
+
+    monkeypatch.setattr(coord, "_read_counter_disposition", read)
+    asset = _count_asset_refunds(coord)
+    with pytest.raises(ValidationError, match="no evidence"):
+        await coord.mutual_refund()
+    assert asset == [] and leg.refunds == 0 and coord.record.state is SwapState.BOTH_LOCKED

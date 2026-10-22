@@ -246,8 +246,9 @@ it does not mean the covenant was refunded.
 
 **ETH taker `abort` and taker `refund` decide from the chain, not from one log read (#850 PRs 5b
 and 6).** Before sending anything, the coordinator reads the HTLC's disposition at the finalized
-block, the same reader the watchtower uses. Taker `refund` also reads it first, before the
-covenant and timeout checks:
+block through the shared reader (`pyrxd.eth_wallet.disposition`), from every endpoint the leg is
+given; this runner gives it the one `--eth-rpc-url`, which it allows only on a known testnet. Taker
+`refund` also reads it first, before the covenant and timeout checks:
 
 - **Claimed**, verified at the finalized block: the phase refuses, sends nothing, names the claim
   tx and tells you to run `--phase claim` before `t_rxd`.

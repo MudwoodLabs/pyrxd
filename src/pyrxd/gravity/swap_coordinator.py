@@ -4901,7 +4901,7 @@ class SwapCoordinator:
           refunded (D14, N1): ``p`` may be public, and the covenant claim comes first.
 
         **BTC counter leg, and an ETH leg that cannot read its disposition** (a leg written before
-        0.27): unchanged. ``TAKER`` on ETH refunds the counter leg only and stays BOTH_LOCKED. Every
+        0.27): unchanged, except that ``MAKER`` on ETH is refused here too. ``TAKER`` on ETH refunds the counter leg only and stays BOTH_LOCKED. Every
         other case attempts both refunds and goes to MUTUAL_REFUND only if both returned. The BTC
         claim leaf has no timelock, so a maker can still claim with ``p`` while the taker's refund
         is unconfirmed; fixing BTC needs the watchtower's spender classification first (#850 PR 9).

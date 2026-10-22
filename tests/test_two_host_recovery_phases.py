@@ -3176,6 +3176,7 @@ class _ScriptedMutualRefund:
         rec = type("Rec", (), {})()
         rec.state = step
         rec.counter_refund_tx_hash = self.record.counter_refund_tx_hash
+        rec.counter_claim_tx = None
         return rec
 
 
@@ -3195,4 +3196,15 @@ async def test_the_grief_run_stops_at_its_deadline_and_leaves_the_record_as_it_i
     coord = _ScriptedMutualRefund([SwapState.BOTH_LOCKED])
     rec = await mod._mutual_refund_to_terminal(coord, timeout_s=0.0, interval_s=0.0)
     assert rec.state is SwapState.BOTH_LOCKED
+    assert coord.calls == 1
+
+
+async def test_the_grief_run_does_not_retry_a_refusal_that_needs_the_operator():
+    """An UNKNOWN disposition is a NetworkError too, but retrying it for an hour changes nothing."""
+    from pyrxd.security.errors import CounterLegDispositionUnknown
+
+    mod = _load("eth_swap_grief_run")
+    coord = _ScriptedMutualRefund([CounterLegDispositionUnknown("unknown", reason="r"), SwapState.MUTUAL_REFUND])
+    with pytest.raises(CounterLegDispositionUnknown):
+        await mod._mutual_refund_to_terminal(coord, timeout_s=60.0, interval_s=0.0)
     assert coord.calls == 1
