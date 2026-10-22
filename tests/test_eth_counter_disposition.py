@@ -670,22 +670,31 @@ async def test_HONEST_an_anchor_proves_a_refund_with_no_log_and_no_hash():
     assert (await _read(MultiSourceEthRpc(logless), chain)).kind is DispositionKind.UNKNOWN  # without it
 
 
-@pytest.mark.parametrize("claim_visible", [True, False], ids=["claim_nominated", "claim_withheld"])
-async def test_an_uncheckable_settlement_is_tagged_settled_at_f_only_when_no_claim_is_nominated(claim_visible):
+@pytest.mark.parametrize("claim", ["verifies", "withheld", "unverifiable"])
+async def test_an_uncheckable_settlement_is_tagged_settled_at_f_unless_a_claim_verifies(claim):
     """#850 PR 6: ``settled_at_finalized`` stops the coordinator following a refund of ours that lost
-    the race. When a nominated transaction cannot be checked but a claim IS nominated, the claim is
-    already surfaced (``claims_seen``); when every endpoint withholds the claim, only the tag is left."""
+    the race. When a nominated transaction cannot be checked but a claim verifies, the claim is
+    surfaced (``claims_seen``) and the tag is clear. When every endpoint withholds the claim, or the
+    claim is nominated but its receipt cannot be agreed, only the tag is left."""
     chain = _chain(finalized=90)
-    chain.claim(70)
-    hide = not claim_visible
+    claim_tx = chain.claim(70)
+    hide = claim == "withheld"
     liar = FakeEvmEndpoint(chain, forge_refunded_tx="0x" + "ee" * 32, forge_receipt=True, hide_claimed=hide)
+    if claim == "unverifiable":
+
+        async def disputed(tx_hash, _orig=liar.get_transaction_receipt):
+            r = await _orig(tx_hash)
+            return dict(r, blockHash="0x" + "ab" * 32) if tx_hash == claim_tx else r
+
+        liar.get_transaction_receipt = disputed
     rpc = MultiSourceEthRpc(
         [liar, FakeEvmEndpoint(chain, hide_claimed=hide), FakeEvmEndpoint(chain, hide_claimed=hide)]
     )
     d = await _read(rpc, chain)
     assert d.kind is DispositionKind.UNKNOWN and "could not be checked" in d.reason
-    assert bool(d.claims_seen) is claim_visible
-    assert d.settled_at_finalized is (not claim_visible)
+    assert bool(d.claims_seen) is (claim != "withheld")
+    assert any(c.verified for c in d.claims_seen) is (claim == "verifies")
+    assert d.settled_at_finalized is (claim != "verifies")
 
 
 async def test_a_forged_claim_nomination_does_not_clear_the_settled_at_f_tag():
