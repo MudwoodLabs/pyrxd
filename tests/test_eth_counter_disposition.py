@@ -19,7 +19,7 @@ from pyrxd.eth_wallet.disposition import DispositionKind, read_counter_dispositi
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.security.errors import ValidationError
-from tests._fake_evm_chain import OTHER_CONTRACT, FakeEvmChain, FakeEvmEndpoint
+from tests._fake_evm_chain import CONTRACT, OTHER_CONTRACT, FakeEvmChain, FakeEvmEndpoint
 
 TIMEOUT_BLOCK = 80
 
@@ -688,7 +688,32 @@ async def test_an_uncheckable_settlement_is_tagged_settled_at_f_only_when_no_cla
     assert d.settled_at_finalized is (not claim_visible)
 
 
-async def test_a_failed_read_is_never_tagged_settled_at_f():
+async def test_a_forged_claim_nomination_does_not_clear_the_settled_at_f_tag():
+    """Re-review of PR 6: every endpoint withholds the real claim, and one liar nominates a Claimed log
+    for a transaction that does not exist. An unverified nomination must not clear the tag, or the
+    liar alone turns the coordinator back to following a refund of ours that lost the race."""
+    chain = _chain(finalized=90)
+    chain.claim(70)
+    decoy = {
+        "address": CONTRACT,
+        "topics": [CLAIMED_TOPIC0],
+        "data": "0x" + chain.preimage.hex(),
+        "transactionHash": "0x" + "dc" * 32,
+        "blockNumber": 72,
+    }
+    liar = FakeEvmEndpoint(
+        chain, forge_refunded_tx="0x" + "ee" * 32, forge_receipt=True, hide_claimed=True, extra_logs=(decoy,)
+    )
+    rpc = MultiSourceEthRpc(
+        [liar, FakeEvmEndpoint(chain, hide_claimed=True), FakeEvmEndpoint(chain, hide_claimed=True)]
+    )
+    d = await _read(rpc, chain)
+    assert d.kind is DispositionKind.UNKNOWN and "could not be checked" in d.reason
+    assert d.claims_seen and not any(c.verified for c in d.claims_seen)
+    assert d.settled_at_finalized is True
+
+
+async def test_no_endpoint_answering_the_log_scan_is_never_tagged_settled_at_f():
     chain = _chain(finalized=90)
     chain.claim(70)
     d = await _read(MultiSourceEthRpc([FakeEvmEndpoint(chain, logs_429=True) for _ in range(3)]), chain)

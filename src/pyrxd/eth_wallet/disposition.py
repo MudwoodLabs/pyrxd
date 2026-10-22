@@ -154,7 +154,7 @@ class CounterDisposition:
     expiry_anchor: tuple[int, str] | None = None
     #: ``True`` on an :attr:`DispositionKind.UNKNOWN` answer that read the contract SETTLED at the
     #: finalized block (it settled, and the evidence cannot say how), except where a transaction could
-    #: not be checked and a claim was nominated (``claims_seen`` already surfaces it). ``False`` on every
+    #: not be checked and a nominated claim was verified (``claims_seen`` already surfaces it). ``False`` on every
     #: other answer, including an UNKNOWN from a failed or below-quorum read.
     settled_at_finalized: bool = False
 
@@ -560,13 +560,13 @@ async def read_counter_disposition(
                 terminal=True,
             )
         if incomplete:
-            # Tagged only when no claim was nominated: a nominated claim is already surfaced to the
-            # operator (``claims_seen``), and its check may simply be lagging. With none, nothing
-            # else would tell them a claim may hide behind this settlement (re-review of PR 6).
+            # Tagged unless a nominated claim was verified: a verified claim is surfaced to the operator
+            # (``claims_seen``). An unverified nomination does not count, or one endpoint could clear
+            # the tag with a forged Claimed log for a transaction that does not exist (re-review of PR 6).
             return unknown(
                 "settled, but a nominated transaction could not be checked: " + "; ".join(incomplete),
                 finalized,
-                settled_at_finalized=not seen,
+                settled_at_finalized=not any(c.verified for c in seen),
                 **common,
             )
         if f_ts < timeout:
