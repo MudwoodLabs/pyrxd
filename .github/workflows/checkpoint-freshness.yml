@@ -19,6 +19,12 @@
 #
 # The decision is tested offline in tests/test_checkpoint_freshness_check.py,
 # which runs in ordinary CI.
+#
+# A red scheduled run used to reach nobody: GitHub emails a scheduled failure only
+# to whoever last edited the cron line, and only if their notification settings
+# allow it. So a second job opens (or comments on) an issue when the scheduled
+# check fails, and closes it when a scheduled check passes again. It is the only
+# job holding a token, and it runs no repository code: no checkout, only `gh`.
 
 name: Checkpoint freshness
 
@@ -70,3 +76,48 @@ jobs:
 
       - name: Check the checkpoint horizon against the mainnet tip
         run: poetry run python scripts/check_checkpoint_freshness.py
+
+  alert:
+    name: Open or close the freshness issue
+    needs: freshness
+    # Scheduled and manual runs only, never a pull request; on success too, to close a stale issue.
+    if: always() && github.event_name != 'pull_request' && github.repository == 'MudwoodLabs/pyrxd'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report the result as an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RESULT: ${{ needs.freshness.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Radiant checkpoint table is going stale"
+          EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n 1)
+          if [ "$RESULT" = success ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" --body "The freshness check passed again: $RUN_URL. Closing."
+              gh issue close "$EXISTING"
+            fi
+            exit 0
+          fi
+          {
+            echo "The scheduled **Checkpoint freshness** check ended \`$RESULT\`: $RUN_URL"
+            echo
+            echo "Either fewer than 864 blocks remain before the 4,032-header horizon of the newest"
+            echo "shipped checkpoint, or the check could not read the tip. The run log says which."
+            echo "Refresh the table with the maintainer's node (docs/runbooks/cutting-a-release.md):"
+            echo
+            echo '```'
+            echo 'PYTHONPATH=src python scripts/refresh_radiant_checkpoints.py --write \'
+            echo '    --node-cli "<command that runs radiant-cli against your node>"'
+            echo '```'
+          } > body.md
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file body.md
+          else
+            gh issue create --title "$TITLE" --body-file body.md
+          fi
