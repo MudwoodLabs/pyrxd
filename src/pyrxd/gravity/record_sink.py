@@ -9,6 +9,7 @@ exclusion the funding path had. Neither is useful as an option a caller may forg
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -146,20 +147,37 @@ class JsonFileRecordSink:
         self._keep_the_persisted_role(prior, as_dict)
         self._keep_a_persisted_reveal(prior, as_dict, self._path)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
+        self._atomic_replace(self._path, payload, what="the swap record")
+
+    @property
+    def abort_note_path(self) -> Path:
+        """Where :meth:`write_abort_note` keeps the operator's abandon note: beside the record, under
+        a name a record store's ``*.json`` scan does not pick up (#850 PR 7b, design D18)."""
+        return self._path.with_name(self._path.name + ".abort-note")
+
+    def write_abort_note(self, payload: bytes) -> str:
+        """Write the operator's abandon note (``payload``, UTF-8 JSON) atomically, mode 600, and
+        return its SHA-256 (lower-case hex), which the record carries as ``abort_note_sha256``. Each
+        abandon replaces the note; a record names only the one it was ended with."""
+        self._atomic_replace(self.abort_note_path, bytes(payload), what="the abandon note")
+        return hashlib.sha256(bytes(payload)).hexdigest()
+
+    @staticmethod
+    def _atomic_replace(target: Path, payload: bytes, *, what: str) -> None:
         tmp = None
         try:
             # INSIDE the try: creating the temp file is itself a filesystem operation that fails on
             # a read-only or missing directory, and an unwrapped OSError escaping here would reach
             # the coordinator as something it cannot classify — while the whole reason it awaits
             # this call is to distinguish "persisted" from "could not persist" before value moves.
-            fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), prefix=".swaprec-", suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".swaprec-", suffix=".tmp")
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(payload)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self._path)
-            dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
+            os.replace(tmp, target)
+            dir_fd = os.open(str(target.parent), os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
             finally:
@@ -168,7 +186,7 @@ class JsonFileRecordSink:
             if tmp is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(tmp)
-            raise NetworkError(f"could not persist the swap record to {self._path}: {exc}") from exc
+            raise NetworkError(f"could not persist {what} to {target}: {exc}") from exc
 
     def load(self) -> dict | None:
         """Read the raw record dict back, or None if it was never written.

@@ -26,7 +26,14 @@ from collections.abc import Callable
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
-from pyrxd.gravity.swap_state import AbortReason, CounterDispositionRecord, RecordRole, SwapRecord, SwapState
+from pyrxd.gravity.swap_state import (
+    AbandonCase,
+    AbortReason,
+    CounterDispositionRecord,
+    RecordRole,
+    SwapRecord,
+    SwapState,
+)
 from tests.test_swap_record_erc20_migration import _erc20_locator, _token_terms
 from tests.test_swap_state import _eth_locator, _eth_terms, _locator, _terms
 
@@ -43,6 +50,29 @@ def _eth_base() -> SwapRecord:
 
 def _token_base() -> SwapRecord:
     return SwapRecord(state=SwapState.NEGOTIATED, terms=_token_terms())
+
+
+def _abandoned(case: AbandonCase, *, note: str = "ab" * 32) -> Callable[[], SwapRecord]:
+    """An ETH record ended by the operator's abandon (#850 PR 7b), with the read it rests on."""
+
+    def build() -> SwapRecord:
+        return dataclasses.replace(
+            _eth_base(),
+            state=SwapState.ABORTED,
+            abort_reason=AbortReason.OPERATOR_ABANDONED,
+            abandon_case=case,
+            abort_note_sha256=note,
+            counter_disposition=CounterDispositionRecord(
+                kind="expired_empty_open",
+                block_number=90,
+                block_hash="0x" + "f9" * 32,
+                tx_hash=None,
+                sources=("a", "b"),
+                single_source=False,
+            ),
+        )
+
+    return build
 
 
 def _raw_btc_tx() -> str:
@@ -145,8 +175,13 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
         for kind, tx in (("refunded", "0x" + "d1" * 32), ("claimed", None))
     ],
     "abort_reason": [
-        (f"abort-reason-{r.value}", _with(_btc_base, state=SwapState.ABORTED, abort_reason=r), ()) for r in AbortReason
-    ],
+        (f"abort-reason-{r.value}", _with(_btc_base, state=SwapState.ABORTED, abort_reason=r), ())
+        for r in AbortReason
+        if r is not AbortReason.OPERATOR_ABANDONED
+    ]
+    + [("abort-reason-operator-abandoned", _abandoned(AbandonCase.PAYOUT_REVERTS), ())],
+    "abandon_case": [(f"abandon-case-{c.value}", _abandoned(c), ()) for c in AbandonCase],
+    "abort_note_sha256": [("abort-note-sha256", _abandoned(AbandonCase.EXPIRED_EMPTY, note="0" * 64), ())],
     "asset_refund_txid": [("asset-refund-txid", _with(_eth_base, asset_refund_txid="ab" * 32), ())],
     "counter_refund_tx_hash": [
         (

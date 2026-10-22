@@ -1,0 +1,407 @@
+"""The gated explicit abandon, ``SwapCoordinator.abandon_counter_leg`` (#850 PR 7b, design §3.6).
+
+An operator ends a record ABORTED on a counter-leg case that has no automatic end. The chain is read
+first with the real reader over the fake EVM chain; the case it shows must be past the timeout at the
+finalized block (or settled there), must be accepted from the record's state, and must be the case
+the operator named. Nothing is broadcast. The operator's note lives in a sidecar file (D18), and the
+record carries only its hash.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+
+import pytest
+
+from pyrxd.eth_wallet.disposition import ClaimSeen, CounterDisposition, DispositionKind
+from pyrxd.gravity.record_sink import JsonFileRecordSink
+from pyrxd.gravity.swap_coordinator import SwapCoordinator
+from pyrxd.gravity.swap_state import AbandonCase, AbortReason, SwapRecord, SwapRole, SwapState
+from pyrxd.security.errors import AbandonNotAccepted, NetworkError, ValidationError
+from tests._fake_evm_chain import FakeEvmEndpoint
+from tests.test_counter_leg_disposition_coordinator import _setup as _native_setup
+from tests.test_expired_empty_token_counter_leg import PUSH_NONCE
+from tests.test_expired_empty_token_counter_leg import _setup as _token_setup
+
+NOTE = "checked the funding wallet by hand; the push never left it"
+
+
+class _Sink:
+    """A persist hook that also keeps the abandon note, like ``JsonFileRecordSink``."""
+
+    def __init__(self, coord) -> None:
+        self.coord = coord
+        self.notes: list[bytes] = []
+
+    async def __call__(self, record) -> None:
+        self.coord.persisted.append(record)
+
+    def write_abort_note(self, payload: bytes) -> str:
+        self.notes.append(bytes(payload))
+        return hashlib.sha256(bytes(payload)).hexdigest()
+
+
+def _with_sink(coord) -> _Sink:
+    sink = _Sink(coord)
+    coord._persist = sink
+    return sink
+
+
+def _token(*, state=SwapState.BTC_LOCKED, role=SwapRole.TAKER, closed=False):
+    """An expired, empty token contract: OPEN (the nonce not past the push) or CLOSED."""
+    coord, chain, leg = _token_setup(state=state, role=role, nonces={20: PUSH_NONCE + (1 if closed else 0)})
+    return coord, chain, leg, _with_sink(coord)
+
+
+async def _abandon(coord, case, *, contract=None, note=NOTE):
+    return await coord.abandon_counter_leg(
+        confirm_contract=contract or coord.record.counterchain_locator.contract_address, reason_code=case, note=note
+    )
+
+
+def _unchanged(coord, sink, state) -> None:
+    assert coord.record.state is state and coord.record.abort_reason is None
+    assert coord.persisted == [] and sink.notes == []
+
+
+# --------------------------------------------------------------------------- the accepted cases
+
+
+async def test_an_open_empty_contract_is_abandoned_with_its_read_and_the_notes_hash():
+    coord, chain, leg, sink = _token()
+    rec = await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.OPERATOR_ABANDONED
+    assert rec.abandon_case is AbandonCase.EXPIRED_EMPTY
+    ((note,),) = [sink.notes]
+    assert rec.abort_note_sha256 == hashlib.sha256(note).hexdigest()
+    side = json.loads(note)
+    assert side["note"] == NOTE and side["abandon_case"] == "expired_empty"
+    assert side["contract"] == rec.counterchain_locator.contract_address
+    ev = rec.counter_disposition
+    assert ev.kind == "expired_empty_open" and ev.tx_hash is None and ev.block_number == chain.finalized
+    assert ev.block_hash == "0x" + FakeEvmEndpoint(chain)._hash(chain.finalized).hex()
+    assert len(ev.sources) == 3 and ev.single_source is False
+    assert coord.persisted[-1] == rec and NOTE not in json.dumps(rec.to_dict())  # the record keeps no free text
+    assert rec.counterchain_locator is not None  # a refund by address stays possible
+    assert leg.closes == [] and leg.refunds == 0
+
+
+@pytest.mark.parametrize(
+    ("state", "role", "closed"),
+    [
+        (SwapState.PARAMS_MISMATCH, None, True),
+        (SwapState.PARAMS_MISMATCH, SwapRole.MAKER, False),
+        (SwapState.BOTH_LOCKED, SwapRole.TAKER, False),
+        (SwapState.BOTH_LOCKED, SwapRole.TAKER, True),
+        (SwapState.BOTH_LOCKED, None, True),
+    ],
+)
+async def test_an_empty_contract_is_abandoned_where_the_table_accepts_it(state, role, closed):
+    coord, _chain, _leg, _sink = _token(state=state, role=role, closed=closed)
+    rec = await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert rec.state is SwapState.ABORTED and rec.abandon_case is AbandonCase.EXPIRED_EMPTY
+    assert rec.counter_disposition.kind == ("expired_empty_closed" if closed else "expired_empty_open")
+
+
+async def test_a_payout_that_reverts_is_abandoned_on_an_expired_contract():
+    coord, chain, leg, sink = _token()
+    chain.token_balances[30] = 1_000_000
+    leg.revert_reason = "TransferFailed"
+    rec = await _abandon(coord, AbandonCase.PAYOUT_REVERTS)
+    assert rec.state is SwapState.ABORTED and rec.counter_disposition.kind == "f_expired"
+    assert json.loads(sink.notes[0])["read"]["kind"] == "payout_reverts"
+    assert leg.refunds == 0
+
+
+async def test_a_claim_after_a_params_mismatch_is_abandoned():
+    coord, chain, _leg = _native_setup(state=SwapState.PARAMS_MISMATCH, role=None, chain_kw={"finalized": 90})
+    _with_sink(coord)
+    tx = chain.claim(70)
+    rec = await _abandon(coord, AbandonCase.CLAIMED_AFTER_MISMATCH)
+    assert rec.state is SwapState.ABORTED and rec.counter_disposition.kind == "claimed"
+    assert rec.counter_disposition.tx_hash == tx
+
+
+async def test_a_settlement_that_cannot_be_verified_is_abandoned():
+    def blind(chain):
+        return [FakeEvmEndpoint(chain, hide_all_logs=True) for _ in range(3)]
+
+    coord, chain, _leg = _native_setup(endpoints=blind, chain_kw={"finalized": 90})
+    _with_sink(coord)
+    chain.refund(85)
+    rec = await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    assert rec.state is SwapState.ABORTED and rec.counter_disposition.kind == "unknown"
+    assert rec.counter_disposition.tx_hash is None and rec.counter_disposition.block_number == 90
+
+
+async def test_a_single_source_refund_on_a_value_bearing_chain_is_abandoned(monkeypatch):
+    coord, chain, leg = _native_setup(chain_kw={"finalized": 90})
+    _with_sink(coord)
+    tx = chain.refund(85)
+    leg._rpc = FakeEvmEndpoint(chain)
+    monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
+    rec = await _abandon(coord, AbandonCase.SINGLE_SOURCE_REFUND)
+    assert rec.state is SwapState.ABORTED and rec.counter_disposition.kind == "refunded"
+    assert rec.counter_disposition.single_source is True and rec.counter_disposition.tx_hash == tx
+
+
+# --------------------------------------------------------------------------- refused, nothing recorded
+
+
+async def test_a_case_other_than_the_one_named_is_refused():
+    coord, _chain, _leg, sink = _token()
+    with pytest.raises(AbandonNotAccepted, match="which is the case expired_empty, not payout_reverts") as e:
+        await _abandon(coord, AbandonCase.PAYOUT_REVERTS)
+    assert e.value.kind == "expired_empty_open"
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_another_contract_is_refused():
+    coord, _chain, _leg, sink = _token()
+    with pytest.raises(ValidationError, match="is not this record's counter-leg contract"):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY, contract="0x" + "12" * 20)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_HONEST_the_contract_is_confirmed_in_any_case():
+    coord, _chain, _leg, _sink = _token()
+    addr = coord.record.counterchain_locator.contract_address
+    rec = await _abandon(coord, AbandonCase.EXPIRED_EMPTY, contract=addr.upper().replace("0X", "0x"))
+    assert rec.state is SwapState.ABORTED
+
+
+async def test_a_closed_empty_contract_at_btc_locked_has_its_own_end():
+    coord, _chain, _leg, sink = _token(closed=True)
+    with pytest.raises(AbandonNotAccepted, match="has its own end") as e:
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert e.value.next_step == "taker_refund_btc"
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+async def test_a_verified_claim_is_never_abandoned_where_it_has_an_edge(state):
+    coord, chain, _leg = _native_setup(state=state, chain_kw={"finalized": 90})
+    sink = _with_sink(coord)
+    chain.claim(70)
+    with pytest.raises(AbandonNotAccepted, match="p is public") as e:
+        await _abandon(coord, AbandonCase.CLAIMED_AFTER_MISMATCH)
+    assert e.value.next_step == "reconcile_counter_leg"
+    _unchanged(coord, sink, state)
+
+
+@pytest.mark.parametrize(
+    ("state", "step"), [(SwapState.BTC_LOCKED, "reconcile_counter_leg"), (SwapState.BOTH_LOCKED, "mutual_refund")]
+)
+async def test_a_refund_verified_at_every_endpoint_has_its_own_end(state, step):
+    coord, chain, _leg = _native_setup(state=state, chain_kw={"finalized": 90})
+    sink = _with_sink(coord)
+    chain.refund(85)
+    with pytest.raises(AbandonNotAccepted, match="REFUNDED") as e:
+        await _abandon(coord, AbandonCase.SINGLE_SOURCE_REFUND)
+    assert e.value.next_step == step
+    _unchanged(coord, sink, state)
+
+
+async def test_tokens_that_can_still_be_refunded_are_not_abandoned():
+    coord, chain, leg, sink = _token()
+    chain.token_balances[30] = 1_000_000
+    leg.revert_reason = None
+    with pytest.raises(AbandonNotAccepted, match="would not revert") as e:
+        await _abandon(coord, AbandonCase.PAYOUT_REVERTS)
+    assert e.value.next_step == "taker_refund_btc"
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_a_contract_not_expired_at_the_finalized_block_is_not_abandoned():
+    coord, chain, _leg, sink = _token()
+    chain.finalized = 70  # before the timeout block
+    with pytest.raises(AbandonNotAccepted, match="a claim may still succeed"):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_an_unknown_read_records_nothing():
+    def throttled(chain):
+        return [FakeEvmEndpoint(chain, logs_429=True) for _ in range(3)]
+
+    coord, chain, _leg = _native_setup(endpoints=throttled, chain_kw={"finalized": 90})
+    sink = _with_sink(coord)
+    chain.refund(85)
+    with pytest.raises(NetworkError, match="unknown"):
+        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_a_settlement_with_a_verified_claim_seen_is_not_abandoned(monkeypatch):
+    """Settled and unverifiable, but a nominated claim opens H: p is public, and the covenant claim is
+    the step. The reader does not produce this combination today; the gate must not depend on that."""
+    coord, _chain, _leg, _ = _token()
+    sink = _with_sink(coord)
+    seen = ClaimSeen(tx_hash="0x" + "c1" * 32, block_number=70, nominated_by=("a",), verified=True)
+    read = CounterDisposition(
+        DispositionKind.UNKNOWN,
+        "settled",
+        90,
+        settled_at_finalized=True,
+        claims_seen=(seen,),
+        finalized_hash="0x" + "f9" * 32,
+    )
+
+    async def fake_read():
+        return read
+
+    monkeypatch.setattr(coord, "_read_counter_disposition", fake_read)
+    with pytest.raises(NetworkError, match="unknown"):
+        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+    async def fake_read_no_claim():
+        return dataclasses.replace(read, claims_seen=())
+
+    monkeypatch.setattr(coord, "_read_counter_disposition", fake_read_no_claim)
+    rec = await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)  # honest: no verified claim
+    assert rec.state is SwapState.ABORTED
+
+
+@pytest.mark.parametrize(
+    ("state", "role", "why"),
+    [
+        (SwapState.NEGOTIATED, SwapRole.TAKER, "not valid from negotiated"),
+        (SwapState.SECRET_REVEALED, SwapRole.TAKER, "not valid from secret_revealed"),
+        (SwapState.BTC_LOCKED, SwapRole.MAKER, "taker's step"),
+        (SwapState.BOTH_LOCKED, SwapRole.MAKER, "taker's step"),
+    ],
+)
+async def test_abandon_is_refused_where_the_design_gives_it_no_place(state, role, why):
+    coord, _chain, _leg, sink = _token(role=role)
+    coord.record = dataclasses.replace(coord.record, state=state)
+    with pytest.raises(ValidationError, match=why):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert coord.persisted == [] and sink.notes == []
+
+
+@pytest.mark.parametrize(
+    ("note", "why"),
+    [
+        ("", "non-empty"),
+        ("   ", "non-empty"),
+        ("x" * 2001, "at most 2000"),
+        ("ok\x1b[2J", "printable"),
+        (7, "non-empty"),
+    ],
+)
+async def test_a_bad_note_is_refused(note, why):
+    coord, _chain, _leg, sink = _token()
+    with pytest.raises(ValidationError, match=why):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY, note=note)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_HONEST_a_note_with_newlines_and_tabs_is_kept():
+    coord, _chain, _leg, sink = _token()
+    await _abandon(coord, AbandonCase.EXPIRED_EMPTY, note="line one\n\tline two")
+    assert json.loads(sink.notes[0])["note"] == "line one\n\tline two"
+
+
+async def test_a_reason_code_that_is_not_an_abandon_case_is_refused():
+    coord, _chain, _leg, sink = _token()
+    with pytest.raises(ValidationError, match="must be an AbandonCase"):
+        await _abandon(coord, "expired_empty")
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_a_persist_hook_that_cannot_keep_the_note_is_refused():
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    with pytest.raises(ValidationError, match="cannot write one"):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert coord.record.state is SwapState.BTC_LOCKED and coord.persisted == []
+
+
+async def test_a_btc_counter_leg_is_refused():
+    from tests.test_swap_coordinator import _coordinator, _terms
+
+    coord = _coordinator(terms=_terms())
+    coord.record = dataclasses.replace(coord.record, state=SwapState.BTC_LOCKED)
+    sink = _Sink(coord)
+    coord.persisted = []
+    coord._persist = sink
+    with pytest.raises(ValidationError, match="only to an ETH counter leg"):
+        await coord.abandon_counter_leg(
+            confirm_contract="0x" + "12" * 20, reason_code=AbandonCase.EXPIRED_EMPTY, note=NOTE
+        )
+    assert sink.notes == []
+
+
+# --------------------------------------------------------------------------- the shipped sink
+
+
+async def test_the_shipped_sink_keeps_the_note_beside_the_record_and_the_hash_names_it(tmp_path):
+    from pyrxd.gravity.watch.adapters import JsonDirRecordStore
+
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap1.json")
+    coord._persist = sink
+    rec = await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    note = sink.abort_note_path.read_bytes()
+    assert hashlib.sha256(note).hexdigest() == rec.abort_note_sha256
+    assert json.loads(note)["note"] == NOTE
+    assert oct(sink.abort_note_path.stat().st_mode & 0o777) == "0o600"
+    assert SwapRecord.from_dict(json.loads((tmp_path / "swap1.json").read_text())) == rec
+    # The record store's scan reads records only: the note is not taken for an unreadable record.
+    assert sink.abort_note_path.name == "swap1.json.abort-note"
+    store = JsonDirRecordStore(tmp_path)
+    assert await store.list_active() == [] and store.unreadable == []  # ABORTED, and nothing unreadable
+
+
+@pytest.mark.parametrize("missing", ["finalized_block", "finalized_hash"])
+async def test_a_read_that_names_no_finalized_block_records_nothing(monkeypatch, missing):
+    """The record keeps the block the read rests on; a read that cannot name it is not acted on."""
+    coord, _chain, _leg, _ = _token()
+    sink = _with_sink(coord)
+    read = CounterDisposition(
+        DispositionKind.UNKNOWN, "settled", 90, settled_at_finalized=True, finalized_hash="0x" + "f9" * 32
+    )
+    read = dataclasses.replace(read, **{missing: None})
+
+    async def fake_read():
+        return read
+
+    monkeypatch.setattr(coord, "_read_counter_disposition", fake_read)
+    with pytest.raises(NetworkError, match="names no finalized block"):
+        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_only_a_claim_or_a_refund_names_its_transaction_on_the_record(monkeypatch):
+    """Evidence that carries a transaction on any other read (the reader does not produce it today) is
+    not copied: an abandon-only kind names no transaction, and the record would refuse it."""
+    from pyrxd.eth_wallet.disposition import DispositionEvidence
+
+    coord, _chain, _leg, _ = _token()
+    _with_sink(coord)
+    evidence = DispositionEvidence(
+        kind=DispositionKind.UNKNOWN,
+        block_number=90,
+        block_hash="0x" + "f9" * 32,
+        tx_hash="0x" + "c2" * 32,
+        sources=("a.test", "b.test"),
+        single_source=False,
+    )
+    read = CounterDisposition(
+        DispositionKind.UNKNOWN,
+        "settled",
+        90,
+        evidence=evidence,
+        settled_at_finalized=True,
+        finalized_hash="0x" + "f9" * 32,
+    )
+
+    async def fake_read():
+        return read
+
+    monkeypatch.setattr(coord, "_read_counter_disposition", fake_read)
+    rec = await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    assert rec.counter_disposition.kind == "unknown" and rec.counter_disposition.tx_hash is None
+    assert rec.counter_disposition.sources == ("a.test", "b.test")

@@ -519,7 +519,8 @@ class TestEveryPhaseIsBothDispatchableAndReachable:
     """
 
     def test_eth_dispatch_table(self, eth_mod):
-        assert set(eth_mod._DISPATCH) == _EXPECTED_PHASES
+        # #850 PR 7b: the ETH runner alone has the gated abandon (an ETH counter-leg step).
+        assert set(eth_mod._DISPATCH) == _EXPECTED_PHASES | {("taker", "abandon")}
 
     def test_btc_dispatch_table(self, btc_mod):
         assert set(btc_mod._DISPATCH) == _EXPECTED_PHASES
@@ -2386,6 +2387,10 @@ class TestThePhaseStateTable:
         expected = {
             (role, phase, state) for role in ("taker", "maker") for phase in ("abort", "refund") for state in _P_PUBLIC
         }
+        # #850 PR 7b: the taker's abandon refuses where p is public too, and where there is no
+        # btc_locked / both_locked / params_mismatch record for it to end.
+        abandon = {s for s in SwapState} - {SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED, SwapState.PARAMS_MISMATCH}
+        expected |= {("taker", "abandon", state) for state in abandon}
         assert refused == expected
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
@@ -3209,3 +3214,116 @@ async def test_the_grief_run_does_not_retry_a_refusal_that_needs_the_operator():
     with pytest.raises(CounterLegDispositionUnknown):
         await mod._mutual_refund_to_terminal(coord, timeout_s=60.0, interval_s=0.0)
     assert coord.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# --phase abandon (#850 PR 7b): the runner drives abandon_counter_leg and broadcasts nothing
+# ---------------------------------------------------------------------------
+
+
+class _PayoutRevertsLeg(_FakeCounterLeg):
+    """An ETH counter leg past its timeout at the finalized block whose refund would revert
+    ``revert`` (``SendFailed``: the refundee cannot take ETH). ``None`` = a refund would succeed."""
+
+    def __init__(self, revert: str | None = "SendFailed") -> None:
+        super().__init__()
+        self.revert = revert
+
+    async def counter_disposition(self, locator, **_kw):
+        from pyrxd.eth_wallet.disposition import CounterDisposition, DispositionKind
+
+        return CounterDisposition(
+            DispositionKind.F_EXPIRED,
+            "unsettled and past the timeout at the finalized block",
+            90,
+            finalized_hash="0x" + "c1" * 32,
+            sources=("a.test", "b.test"),
+        )
+
+    async def refund_revert_reason(self, locator):
+        return self.revert
+
+
+def _abandon_args(args, io_dir: Path, **over):
+    loc = _exchange_locator(io_dir, eth=True)
+    base = {
+        "phase": "abandon",
+        "confirm_contract": loc.contract_address.upper().replace("0X", "0x"),
+        "abandon_case": "payout_reverts",
+        "abandon_note": "the refundee is a contract that rejects ETH",
+    }
+    return argparse.Namespace(**{**vars(args), **base, **over})
+
+
+class TestTheAbandonPhase:
+    async def _seeded(self, eth_mod, tmp_path, state=SwapState.BTC_LOCKED):
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        loc = _exchange_locator(io_dir, eth=True)
+        await _seed(args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(state))
+        return args, io_dir
+
+    @pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+    async def test_a_payout_that_reverts_ends_the_record_and_sends_nothing(self, eth_mod, tmp_path, monkeypatch, state):
+        from pyrxd.gravity.swap_state import AbandonCase, AbortReason
+
+        args, io_dir = await self._seeded(eth_mod, tmp_path, state)
+        built = _wire_eth(eth_mod, monkeypatch, counter_leg=_PayoutRevertsLeg())
+        await eth_mod.taker_phase_abandon(_abandon_args(args, io_dir))
+        rec = _read_back(args)
+        assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.OPERATOR_ABANDONED
+        assert rec.abandon_case is AbandonCase.PAYOUT_REVERTS
+        note = Path(str(_record_path(args)) + ".abort-note").read_bytes()
+        assert rec.abort_note_sha256 == hashlib.sha256(note).hexdigest()
+        assert json.loads(note)["note"] == "the refundee is a contract that rejects ETH"
+        assert built["counter"].refund_calls == [] and built["rpc"].closed
+        assert built["rxd"].refund_calls == []
+
+    async def test_a_case_the_chain_does_not_show_is_refused_with_the_next_step(self, eth_mod, tmp_path, monkeypatch):
+        """A refund that would succeed has its own end: the phase says which, and records nothing."""
+        args, io_dir = await self._seeded(eth_mod, tmp_path)
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(eth_mod, monkeypatch, counter_leg=_PayoutRevertsLeg(revert=None))
+        with pytest.raises(SystemExit, match=r"REFUSED: .*\n  NEXT: taker_refund_btc"):
+            await eth_mod.taker_phase_abandon(_abandon_args(args, io_dir))
+        assert _record_path(args).read_bytes() == before
+        assert not Path(str(_record_path(args)) + ".abort-note").exists()
+        assert built["counter"].refund_calls == [] and built["rpc"].closed
+
+    async def test_another_contract_is_refused(self, eth_mod, tmp_path, monkeypatch):
+        args, io_dir = await self._seeded(eth_mod, tmp_path)
+        before = _record_path(args).read_bytes()
+        _wire_eth(eth_mod, monkeypatch, counter_leg=_PayoutRevertsLeg())
+        with pytest.raises(SystemExit, match="REFUSED"):
+            await eth_mod.taker_phase_abandon(_abandon_args(args, io_dir, confirm_contract="0x" + "99" * 20))
+        assert _record_path(args).read_bytes() == before
+
+    @pytest.mark.parametrize("missing", ["confirm_contract", "abandon_case", "abandon_note"])
+    async def test_each_operator_argument_is_required(self, eth_mod, tmp_path, monkeypatch, missing):
+        args, io_dir = await self._seeded(eth_mod, tmp_path)
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(eth_mod, monkeypatch, counter_leg=_PayoutRevertsLeg())
+        with pytest.raises(SystemExit, match="--phase abandon needs --confirm-contract"):
+            await eth_mod.taker_phase_abandon(_abandon_args(args, io_dir, **{missing: ""}))
+        assert _record_path(args).read_bytes() == before and built == {}
+
+    async def test_a_host_with_no_record_has_nothing_to_abandon(self, eth_mod, tmp_path, monkeypatch):
+        args, _terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_eth(eth_mod, monkeypatch, counter_leg=_PayoutRevertsLeg())
+        with pytest.raises(SystemExit, match="no swap record"):
+            await eth_mod.taker_phase_abandon(_abandon_args(args, io_dir))
+        assert not _record_path(args).exists() and built == {}
+
+    async def test_a_record_past_the_reveal_is_refused_before_any_read(self, eth_mod, tmp_path, monkeypatch):
+        """p is public at SECRET_REVEALED: the persisted-state gate refuses before any leg is built."""
+        args, io_dir = await self._seeded(eth_mod, tmp_path, SwapState.BOTH_LOCKED)
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        rec = _read_back(args)
+        await _seed(args, SwapRecord.from_dict({**rec.to_dict(), "state": SwapState.SECRET_REVEALED.value}))
+        before = _record_path(args).read_bytes()
+        built = _wire_eth(eth_mod, monkeypatch, counter_leg=_PayoutRevertsLeg())
+        with pytest.raises(SystemExit):
+            await eth_mod.taker_phase_abandon(_abandon_args(args, io_dir))
+        assert _record_path(args).read_bytes() == before and built == {}

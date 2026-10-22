@@ -176,6 +176,11 @@ class CounterDisposition:
     #: key's pending count, latest count and count at ``F`` as one number, i.e. nothing of this key
     #: is in flight (design §2.7). ``None`` when not asked or not read.
     funding_key_idle: bool | None = None
+    #: ``"0x" + hash(F)`` and every endpoint the reader was given, on an answer that got as far as
+    #: the log scan (#850 PR 7b): what an operator's abandon records as the read it rests on, also
+    #: for an answer with no ``evidence``. ``None`` and ``()`` on an answer that stopped earlier.
+    finalized_hash: str | None = None
+    sources: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------- fan-out helpers
@@ -516,7 +521,12 @@ async def read_counter_disposition(
         from_block=int(from_block),
         to_block=max(int(from_block), int(head)),
     )
-    common: dict[str, Any] = {"logs_answered": union.answered, "logs_failed": union.failed}
+    common: dict[str, Any] = {
+        "logs_answered": union.answered,
+        "logs_failed": union.failed,
+        "finalized_hash": "0x" + bytes(f_hash).hex(),
+        "sources": keys,
+    }
     if not union.answered:
         # §2.6: a union with zero answers is UNKNOWN. Nothing could be nominated, so a claim
         # whose ``p`` is already public would go unseen, whatever the invariants say.

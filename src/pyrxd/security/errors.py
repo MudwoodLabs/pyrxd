@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 __all__ = [
+    "AbandonNotAccepted",
     "Base58Error",
     "BroadcastEchoMismatch",
     "ClaimNotConfirmed",
@@ -815,6 +816,19 @@ class MaxAttemptsError(DmintError):
         super().__init__(*args)
         self.attempts = attempts
         self.elapsed_s = elapsed_s
+
+
+class AbandonNotAccepted(ValidationError):
+    """An operator's ``abandon_counter_leg`` was refused: what the chain shows at the finalized block
+    is not a case the gated abandon accepts from this state, or not the case the operator named
+    (#850 PR 7b, design §3.6). Nothing was recorded and nothing was sent. ``kind`` is what the read
+    showed (a ``DispositionKind`` value, or ``"payout_reverts"``), and ``next_step`` names the step
+    that applies instead, or is empty when there is none yet (wait for the finalized block)."""
+
+    def __init__(self, message: str, *, kind: str, next_step: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.next_step = next_step
 
 
 class CounterLegSingleSourceAnswer(NetworkError):

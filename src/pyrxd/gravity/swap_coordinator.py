@@ -37,6 +37,7 @@ import dataclasses
 import functools
 import hashlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -60,6 +61,7 @@ from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbo
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
 from pyrxd.security.errors import (
+    AbandonNotAccepted,
     CounterLegDispositionUnknown,
     CounterLegPayoutReverts,
     CounterLegRefundNeedsOperator,
@@ -98,6 +100,9 @@ from .funding_spv import (
 )
 from .ref_authenticity import verify_ref_authenticity
 from .swap_state import (
+    AbandonCase,
+    AbortReason,
+    CounterDispositionRecord,
     NegotiatedTerms,
     RecordRole,
     SwapEvent,
@@ -4573,7 +4578,6 @@ class SwapCoordinator:
           is ``"recorded"``.
         * A terminal answer from one endpoint on a chain that carries value changes nothing (D4).
         """
-        from .swap_state import AbortReason, CounterDispositionRecord
 
         if disposition is None:
             return "none"
@@ -4662,8 +4666,8 @@ class SwapCoordinator:
                             "the counter-leg contract expired EMPTY at the finalized block, and no push can still "
                             "land in it, but there is deliberately no edge out of PARAMS_MISMATCH on that: "
                             "refund your covenant by its CSV leg at t_rxd. The exit for this record is the gated "
-                            "abandon, abandon_counter_leg, which is not in this release yet. The evidence is on "
-                            "the record."
+                            "abandon: abandon_counter_leg(confirm_contract=..., reason_code=AbandonCase.EXPIRED_EMPTY, "
+                            "note=...). The evidence is on the record."
                         )
                     if acts and state is SwapState.BTC_LOCKED:
                         if await self._claim_seen_holds_the_terminal():
@@ -4852,6 +4856,189 @@ class SwapCoordinator:
             self.record.state.name,
         )
         return self.record
+
+    # -- the gated explicit abandon (#850 PR 7b, design §3.6) -------------------------------------
+
+    #: The longest operator note ``abandon_counter_leg`` keeps, in characters. CHOSEN.
+    ABANDON_NOTE_MAX_CHARS = 2000
+
+    @_serialized_step
+    async def abandon_counter_leg(self, *, confirm_contract: str, reason_code: AbandonCase, note: str) -> SwapRecord:
+        """End the record ABORTED on a counter-leg case that has no automatic end (#850 PR 7b, design
+        §3.6). Valid from BTC_LOCKED and BOTH_LOCKED (not for a maker's record) and from
+        PARAMS_MISMATCH (any role). ETH counter leg only. Nothing is broadcast; the counter-leg
+        locator stays on the record, so a refund by address remains possible.
+
+        The chain is read first (every gate read must succeed; a failed, below-quorum or
+        contradictory read refuses and records nothing), and the case it shows must be past the
+        timeout at the finalized block or already settled there, so no claim can succeed again:
+
+        ================================  ==========  ===============  ===========
+        case (``reason_code``)            BTC_LOCKED  PARAMS_MISMATCH  BOTH_LOCKED
+        ================================  ==========  ===============  ===========
+        ``EXPIRED_EMPTY``: OPEN           yes         yes              yes
+        ``EXPIRED_EMPTY``: CLOSED         no (edge)   yes              yes
+        ``PAYOUT_REVERTS``                yes         yes              yes
+        ``CLAIMED_AFTER_MISMATCH``        no (edge)   yes              no (edge)
+        ``SETTLED_UNVERIFIABLE``          yes         yes              yes
+        ``SINGLE_SOURCE_REFUND``          yes         yes              yes
+        ================================  ==========  ===============  ===========
+
+        ``confirm_contract`` must be the locator's contract address, and ``reason_code`` the case the
+        read shows; either mismatch refuses (:class:`AbandonNotAccepted`), as does a case with an edge
+        of its own (the error names that step). ``note`` (the operator's reason, at most
+        :attr:`ABANDON_NOTE_MAX_CHARS` printable characters) is written to a sidecar file through the
+        persist hook's ``write_abort_note`` (:class:`JsonFileRecordSink`, design D18); the record
+        carries only its SHA-256, ``abandon_case`` and ``abort_reason`` ``OPERATOR_ABANDONED``, with
+        the read as ``counter_disposition``. A recorded ``Claimed`` log does not hold this step
+        (D14): it is the operator's choice, made with that page in front of them.
+
+        What it gives up: on ``SETTLED_UNVERIFIABLE`` the contract may have been CLAIMED, so ``p`` may
+        be public and the covenant claimable until t_rxd; on ``EXPIRED_EMPTY`` a token push may still
+        land; on ``PAYOUT_REVERTS`` the tokens stay in the contract. The record stops being followed.
+        A single operator's BOTH_LOCKED covenant is not touched: refund it by its CSV leg at t_rxd.
+        """
+        from pyrxd.eth_wallet.disposition import DispositionKind
+
+        state = self.record.state
+        if state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
+            raise ValidationError(f"abandon_counter_leg not valid from {state.value}")
+        if self.config.role is SwapRole.MAKER and state is not SwapState.PARAMS_MISMATCH:
+            raise ValidationError(
+                f"abandon_counter_leg from {state.value} is the taker's step; a maker's record abandons only from "
+                "params_mismatch"
+            )
+        if not isinstance(reason_code, AbandonCase):
+            raise ValidationError("reason_code must be an AbandonCase")
+        if not isinstance(note, str) or not note.strip():
+            raise ValidationError("note must be a non-empty str: say why the record is abandoned")
+        if len(note) > self.ABANDON_NOTE_MAX_CHARS:
+            raise ValidationError(f"note is {len(note)} characters; at most {self.ABANDON_NOTE_MAX_CHARS}")
+        if any(not (c.isprintable() or c in "\n\t") for c in note):
+            raise ValidationError("note must be printable text (newlines and tabs allowed)")
+        locator = self.record.counterchain_locator
+        if self.record.terms.counter_chain != "eth" or not isinstance(locator, EthHtlcLocator):
+            raise ValidationError("abandon_counter_leg applies only to an ETH counter leg")
+        if not isinstance(confirm_contract, str) or confirm_contract.lower() != locator.contract_address.lower():
+            raise ValidationError(
+                f"confirm_contract {confirm_contract!r} is not this record's counter-leg contract "
+                f"{locator.contract_address}; nothing was recorded"
+            )
+        write_note = getattr(self._persist, "write_abort_note", None)
+        if not callable(write_note):
+            raise ValidationError(
+                "abandon_counter_leg keeps the operator's note in a sidecar file, and this coordinator's persist "
+                "hook cannot write one (use a JsonFileRecordSink); nothing was recorded"
+            )
+        disposition = await self._read_counter_disposition()
+        if disposition is None:
+            raise ValidationError("abandon_counter_leg needs an ETH counter leg that reads its disposition")
+        case, kind = await self._abandon_case_of(disposition, state)
+        if case is not reason_code:
+            raise AbandonNotAccepted(
+                f"the counter leg reads {kind} ({disposition.reason}), which is the case {case.value}, not "
+                f"{reason_code.value}; nothing was recorded. Check the contract, then name the case it shows.",
+                kind=kind,
+            )
+        block_hash = disposition.finalized_hash
+        if disposition.finalized_block is None or block_hash is None:
+            raise NetworkError(f"the read names no finalized block, so nothing was recorded ({disposition.reason})")
+        evidence = disposition.evidence
+        record_kind = kind if kind != "payout_reverts" else DispositionKind.F_EXPIRED.value
+        recorded = CounterDispositionRecord(
+            kind=record_kind,
+            block_number=int(disposition.finalized_block),
+            block_hash=block_hash.lower(),
+            tx_hash=evidence.tx_hash if evidence is not None and record_kind in ("claimed", "refunded") else None,
+            sources=tuple(evidence.sources if evidence is not None else disposition.sources),
+            single_source=bool(disposition.single_source),
+        )
+        sidecar = {
+            "contract": locator.contract_address,
+            "abandon_case": case.value,
+            "read": {"kind": kind, "reason": disposition.reason, "finalized_block": recorded.block_number},
+            "note": note,
+        }
+        digest = write_note(json.dumps(sidecar, indent=2, sort_keys=True).encode())
+        self.record = dataclasses.replace(
+            self.record,
+            counter_disposition=recorded,
+            abort_reason=AbortReason.OPERATOR_ABANDONED,
+            abandon_case=case,
+            abort_note_sha256=digest,
+        )
+        self._advance(SwapEvent.OPERATOR_ABANDONED)
+        await self._persist_record(self.record, shield=True)
+        logger.warning(
+            "counter-leg contract %s abandoned by the operator (%s, read %s at block %d); the record is ABORTED",
+            locator.contract_address,
+            case.value,
+            kind,
+            recorded.block_number,
+        )
+        return self.record
+
+    async def _abandon_case_of(self, disposition: Any, state: SwapState) -> tuple[AbandonCase, str]:
+        """The §3.6 case *disposition* shows from *state*, and the read's name; raises
+        :class:`AbandonNotAccepted` (or :class:`NetworkError` for an unknown read) when none applies."""
+        from pyrxd.eth_wallet.disposition import DispositionKind
+
+        kind = disposition.kind
+        name = kind.value
+        locator = self.record.counterchain_locator
+        if kind is DispositionKind.EXPIRED_EMPTY_OPEN:
+            return AbandonCase.EXPIRED_EMPTY, name
+        if kind is DispositionKind.EXPIRED_EMPTY_CLOSED:
+            if state is SwapState.BTC_LOCKED:
+                raise AbandonNotAccepted(
+                    "the counter-leg contract reads expired_empty_closed: that has its own end. Run taker_refund_btc "
+                    "(or reconcile_counter_leg); nothing was recorded.",
+                    kind=name,
+                    next_step="taker_refund_btc",
+                )
+            return AbandonCase.EXPIRED_EMPTY, name
+        if kind is DispositionKind.CLAIMED:
+            if state is SwapState.PARAMS_MISMATCH:
+                return AbandonCase.CLAIMED_AFTER_MISMATCH, name
+            raise AbandonNotAccepted(
+                "the counter leg reads CLAIMED, so p is public: claim the covenant with p before t_rxd "
+                "(reconcile_counter_leg takes the record there). Nothing was recorded.",
+                kind=name,
+                next_step="reconcile_counter_leg",
+            )
+        if kind is DispositionKind.REFUNDED:
+            if disposition.single_source and not self._single_source_may_decide(int(locator.chain_id)):
+                return AbandonCase.SINGLE_SOURCE_REFUND, name
+            step = "mutual_refund" if state is SwapState.BOTH_LOCKED else "reconcile_counter_leg"
+            raise AbandonNotAccepted(
+                f"the counter leg reads REFUNDED at the finalized block: that has its own end. Run {step}; nothing "
+                "was recorded.",
+                kind=name,
+                next_step=step,
+            )
+        if kind is DispositionKind.UNKNOWN:
+            if disposition.settled_at_finalized and not any(c.verified for c in disposition.claims_seen):
+                return AbandonCase.SETTLED_UNVERIFIABLE, name
+            raise NetworkError(
+                f"the counter leg's disposition is unknown ({disposition.reason}); an abandon needs a read that "
+                "succeeds at every gate, so nothing was recorded"
+            )
+        if kind is DispositionKind.F_EXPIRED:
+            reason = await self.counter_leg.refund_revert_reason(locator)
+            if reason in ("TransferFailed", "SendFailed"):
+                return AbandonCase.PAYOUT_REVERTS, "payout_reverts"
+            raise AbandonNotAccepted(
+                "the counter-leg contract is unsettled and expired at the finalized block, and a refund "
+                + (f"would revert {reason}" if reason else "would not revert")
+                + ": refund it (taker_refund_btc, or mutual_refund from both_locked). Nothing was recorded.",
+                kind=name,
+                next_step="mutual_refund" if state is SwapState.BOTH_LOCKED else "taker_refund_btc",
+            )
+        raise AbandonNotAccepted(
+            f"the counter leg reads {name} ({disposition.reason}): not past its timeout at the finalized block, or "
+            "not final there, so a claim may still succeed. Nothing was recorded; wait for the finalized block.",
+            kind=name,
+        )
 
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)
     @_serialized_step
@@ -5220,9 +5407,9 @@ class SwapCoordinator:
                 f"the counter-leg contract {locator.contract_address} expired EMPTY at the finalized block "
                 f"({disposition.reason}). mutual_refund cannot finish this swap: there is nothing to refund "
                 "(a token push that never landed, or tokens removed after the maker verified them). The record "
-                "stays BOTH_LOCKED. Its exit is the gated abandon, abandon_counter_leg, once the contract's "
-                "expiry is final at the finalized block (design N2); that step is not in this release yet. If "
-                "tokens reach the contract first, mutual_refund refunds them.",
+                "stays BOTH_LOCKED. Its exit is the gated abandon, abandon_counter_leg (reason_code "
+                "AbandonCase.EXPIRED_EMPTY), now that the contract's expiry is final at the finalized block "
+                "(design N2). If tokens reach the contract first, mutual_refund refunds them.",
                 contract_address=locator.contract_address,
             )
         if disposition.kind is not DispositionKind.REFUNDED:
@@ -5234,9 +5421,9 @@ class SwapCoordinator:
                 raise NothingToRefund(
                     f"{exc} mutual_refund cannot finish this swap: the counter-leg contract holds nothing to "
                     "refund (a token push that never landed, or tokens removed after the maker verified them). "
-                    "The record stays BOTH_LOCKED. Its exit is the gated abandon, abandon_counter_leg, once the "
-                    "contract's expiry is final at the finalized block (design N2); that step is not in this "
-                    "release yet. If tokens reach the contract first, mutual_refund refunds them.",
+                    "The record stays BOTH_LOCKED. Its exit is the gated abandon, abandon_counter_leg (reason_code "
+                    "AbandonCase.EXPIRED_EMPTY), once the contract's expiry is final at the finalized block (design "
+                    "N2). If tokens reach the contract first, mutual_refund refunds them.",
                     contract_address=exc.contract_address,
                 ) from exc
             return self.record

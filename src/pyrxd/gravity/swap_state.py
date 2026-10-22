@@ -50,7 +50,10 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # ``counter_refund_replaced_tx_hashes`` and ``counter_expiry_anchor``.
 # v6 (#850 PR 7a) adds ``push_close_tx_hash``, ``push_close_nonce`` and ``push_signer``, and the
 # ``abort_reason`` value ``expired_empty``.
-SWAP_RECORD_SCHEMA_VERSION = 6
+# v7 (#850 PR 7b) adds ``abandon_case`` and ``abort_note_sha256``, the ``abort_reason`` value
+# ``operator_abandoned``, and the ``counter_disposition`` kinds an abandon records
+# (``expired_empty_open``, ``f_expired``, ``unknown``).
+SWAP_RECORD_SCHEMA_VERSION = 7
 #: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
 #: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours. The coordinator keeps
 #: the oldest and the newest: when replacements never reach the node, the oldest is the one it holds.
@@ -58,10 +61,12 @@ MAX_REPLACED_REFUNDS = 16
 _PRE_ROLE_ETH_SCHEMA_VERSION = 2
 
 __all__ = [
+    "ABANDON_ONLY_DISPOSITION_KINDS",
     "ASSET_VARIANTS",
     "REVEALED_STATES",
     "TERMINAL_STATES",
     "TRANSITIONS",
+    "AbandonCase",
     "AbortReason",
     "CounterDispositionRecord",
     "NegotiatedTerms",
@@ -158,6 +163,34 @@ class AbortReason(Enum):
     #: nonce at that block is past every token push it signed for this swap, so no push can land
     #: (#850 PR 7a, design §2.7, ``EXPIRED_EMPTY_CLOSED``). Nothing was refunded: nothing was there.
     EXPIRED_EMPTY = "expired_empty"
+    #: The operator ended the record with ``abandon_counter_leg`` (#850 PR 7b, design §3.6): the
+    #: chain showed a case with no automatic end, named by ``SwapRecord.abandon_case``. Nothing was
+    #: refunded by this step, and the counter-leg locator stays on the record.
+    OPERATOR_ABANDONED = "operator_abandoned"
+
+
+class AbandonCase(Enum):
+    """Which case of design §3.6 an operator's abandon was accepted on (#850 PR 7b). The operator
+    names it, and the chain read must show it: a mismatch refuses."""
+
+    #: The contract expired EMPTY at the finalized block (``EXPIRED_EMPTY_OPEN``, or
+    #: ``EXPIRED_EMPTY_CLOSED`` where that has no edge). The operator accepts that no proof says a
+    #: push cannot still land.
+    EXPIRED_EMPTY = "expired_empty"
+    #: Unsettled and expired at the finalized block, and a refund reverts in the payout itself
+    #: (``TransferFailed`` / ``SendFailed``: a frozen token address, or a refundee refusing ETH).
+    PAYOUT_REVERTS = "payout_reverts"
+    #: Claimed (verified at the finalized block) after a params mismatch, where no edge exists.
+    CLAIMED_AFTER_MISMATCH = "claimed_after_mismatch"
+    #: Settled at the finalized block, and neither a refund nor a claim can be verified.
+    SETTLED_UNVERIFIABLE = "settled_unverifiable"
+    #: Refunded by the evidence of ONE endpoint, on a chain where one endpoint may not decide (D4).
+    SINGLE_SOURCE_REFUND = "single_source_refund"
+
+
+#: ``counter_disposition`` kinds only an abandon records: reads with no edge of their own, at a
+#: finalized block, naming no transaction.
+ABANDON_ONLY_DISPOSITION_KINDS = frozenset({"expired_empty_open", "f_expired", "unknown"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,13 +210,13 @@ class CounterDispositionRecord:
     single_source: bool
 
     def __post_init__(self) -> None:
-        if self.kind not in ("refunded", "claimed", "expired_empty_closed"):
-            raise ValidationError(
-                f"counter_disposition.kind must be 'refunded', 'claimed' or 'expired_empty_closed', not {self.kind!r}"
-            )
-        if self.kind == "expired_empty_closed" and self.tx_hash is not None:
-            # Proven by reads at F alone (balance and nonce): no transaction is the evidence (#850 PR 7a).
-            raise ValidationError("an expired_empty_closed counter_disposition names no transaction")
+        kinds = ("refunded", "claimed", "expired_empty_closed", *sorted(ABANDON_ONLY_DISPOSITION_KINDS))
+        if self.kind not in kinds:
+            raise ValidationError(f"counter_disposition.kind must be one of {', '.join(kinds)}, not {self.kind!r}")
+        if self.kind in ("expired_empty_closed", *ABANDON_ONLY_DISPOSITION_KINDS) and self.tx_hash is not None:
+            # Proven by reads at F alone (balance and nonce, #850 PR 7a), or recorded by an abandon on
+            # a read that has no transaction to name (PR 7b).
+            raise ValidationError(f"a {self.kind} counter_disposition names no transaction")
         if not isinstance(self.block_number, int) or isinstance(self.block_number, bool) or self.block_number < 0:
             raise ValidationError("counter_disposition.block_number must be a non-negative int")
         check_tx_hash(self.block_hash)  # same shape: 0x + 32 bytes
@@ -271,6 +304,8 @@ class SwapEvent(Enum):
     COUNTER_LEG_CLAIMED_OBSERVED = "counter_leg_claimed_observed"
     # #850 PR 7a: the token counter-leg contract expired empty and no push can still land in it.
     COUNTER_LEG_EXPIRED_EMPTY = "counter_leg_expired_empty"
+    # #850 PR 7b: the operator ends the record on a case with no automatic end (design §3.6).
+    OPERATOR_ABANDONED = "operator_abandoned"
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +375,12 @@ _TRANSITION_TABLE: frozenset[tuple[SwapState, SwapEvent, SwapState]] = frozenset
         # EMPTY at F and the funding key's nonce at F is past every push it signed, so nothing is
         # there to refund and nothing can arrive. Not a new (from, to) pair.
         (SwapState.BTC_LOCKED, SwapEvent.COUNTER_LEG_EXPIRED_EMPTY, SwapState.ABORTED),
+        # #850 PR 7b (design §3.2, §3.6): the gated explicit abandon, `abandon_counter_leg`, on what
+        # the chain shows past the timeout at F. BTC_LOCKED and PARAMS_MISMATCH reuse their -> ABORTED
+        # pairs; BOTH_LOCKED -> ABORTED is a NEW pair (D15, N2).
+        (SwapState.BTC_LOCKED, SwapEvent.OPERATOR_ABANDONED, SwapState.ABORTED),
+        (SwapState.PARAMS_MISMATCH, SwapEvent.OPERATOR_ABANDONED, SwapState.ABORTED),
+        (SwapState.BOTH_LOCKED, SwapEvent.OPERATOR_ABANDONED, SwapState.ABORTED),
     }
 )
 
@@ -819,6 +860,11 @@ class SwapRecord:
     #: and the count read for ``EXPIRED_EMPTY_CLOSED`` are this key's; a resume with another key
     #: is refused. ``None`` on a record written before it was kept.
     push_signer: str | None = None
+    #: Set together with ``abort_reason`` ``OPERATOR_ABANDONED`` and only with it (#850 PR 7b): the
+    #: §3.6 case the abandon was accepted on, and the SHA-256 (lower-case hex) of the sidecar file
+    #: holding the operator's note (design D18), so the record itself carries no free text.
+    abandon_case: AbandonCase | None = None
+    abort_note_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -921,6 +967,26 @@ class SwapRecord:
                 raise ValidationError("counter_disposition is an ETH counter-leg field")
         if self.abort_reason is not None and not isinstance(self.abort_reason, AbortReason):
             raise ValidationError("abort_reason must be an AbortReason or None")
+        abandoned = self.abort_reason is AbortReason.OPERATOR_ABANDONED
+        if abandoned != (self.abandon_case is not None) or abandoned != (self.abort_note_sha256 is not None):
+            raise ValidationError(
+                "abandon_case and abort_note_sha256 are recorded together with abort_reason operator_abandoned, "
+                "and only with it"
+            )
+        if self.abandon_case is not None and not isinstance(self.abandon_case, AbandonCase):
+            raise ValidationError("abandon_case must be an AbandonCase or None")
+        if self.abort_note_sha256 is not None:
+            h = self.abort_note_sha256
+            if not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
+                raise ValidationError("abort_note_sha256 must be 64 lower-case hex characters")
+        if (
+            self.counter_disposition is not None
+            and self.counter_disposition.kind in ABANDON_ONLY_DISPOSITION_KINDS
+            and not abandoned
+        ):
+            raise ValidationError(
+                f"a {self.counter_disposition.kind} counter_disposition is recorded only by an operator's abandon"
+            )
         if self.asset_refund_txid is not None:
             txid = self.asset_refund_txid
             if not isinstance(txid, str) or len(txid) != 64 or any(c not in "0123456789abcdef" for c in txid):
@@ -1074,6 +1140,7 @@ class SwapRecord:
             or self.counter_claim_tx is not None
             or self.counter_disposition is not None
             or self.abort_reason is not None
+            or self.abandon_case is not None
             or self.asset_refund_txid is not None
             or self.counter_refund_tx_hash is not None
             or self.counter_expiry_anchor is not None
@@ -1121,6 +1188,9 @@ class SwapRecord:
             d["counter_disposition"] = self.counter_disposition.to_dict()
         if self.abort_reason is not None:
             d["abort_reason"] = self.abort_reason.value
+        if self.abandon_case is not None:
+            d["abandon_case"] = self.abandon_case.value
+            d["abort_note_sha256"] = self.abort_note_sha256
         if self.asset_refund_txid is not None:
             d["asset_refund_txid"] = self.asset_refund_txid
         if self.counter_refund_tx_hash is not None:
@@ -1197,6 +1267,8 @@ class SwapRecord:
             push_close_tx_hash=d.get("push_close_tx_hash"),
             push_close_nonce=d.get("push_close_nonce"),
             push_signer=d.get("push_signer"),
+            abandon_case=_abandon_case(d.get("abandon_case")),
+            abort_note_sha256=d.get("abort_note_sha256"),
         )
 
 
@@ -1223,6 +1295,15 @@ def parse_expiry_anchor(value: object) -> tuple[int, str]:
     if m is None:
         raise ValidationError(f"counter_expiry_anchor must be '<number>:0x<64 lower-case hex>', got {value[:80]!r}")
     return int(m.group(1)), m.group(2)
+
+
+def _abandon_case(value: object) -> AbandonCase | None:
+    if value is None:
+        return None
+    try:
+        return AbandonCase(value)
+    except ValueError:
+        raise ValidationError(f"unknown abandon_case {value!r}") from None
 
 
 def _abort_reason(value: object) -> AbortReason | None:
