@@ -188,8 +188,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at every endpoint, or that any endpoint reads as settled at either block (new
   `pyrxd.eth_wallet.disposition.read_unfunded_token_balance` and `EthLeg.unfunded_token_balance`).
   A balance read that fails or disagrees raises `NetworkError`, as does a balance read from one
-  endpoint on a chain that carries value. It also refuses, first, when the persist hook holds a
-  record of this swap on disk that the coordinator was not built from. A `MAKER`-role coordinator is
+  endpoint on a chain that carries value. It also refuses, first, when the persist hook's record of
+  this swap on disk is past `NEGOTIATED` or holds a counter-leg locator, pending contract, BTC
+  funding transaction or token push that the coordinator's record does not (the same guard the fund
+  uses, which now also compares the push nonce and hash). It holds `CoordinatorConfig.fund_lock`,
+  when one is set, from that read to its write. A `MAKER`-role coordinator is
   refused: the maker's `NEGOTIATED` exit is #850 PR 11. Not covered: a BTC record written by 0.26.x
   or earlier, which recorded no funding transaction before its broadcast (#841), reads as never
   funded even if a fund was broadcast; this step does not scan the HTLC address. `SWAP_RECORD_SCHEMA_VERSION` is 8; a record

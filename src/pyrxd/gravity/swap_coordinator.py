@@ -3235,8 +3235,8 @@ class SwapCoordinator:
 
         The fund persists its intent before broadcasting. A caller that built the coordinator on a
         fresh NEGOTIATED record, instead of loading the one on disk, then overwrote the only record of
-        an earlier fund: the pending contract or funding transaction of an interrupted fund, or the
-        locator of a completed one. With the seen-store holding H the gate's reuse probe refuses
+        an earlier fund: the pending contract, funding transaction or signed token push of an
+        interrupted fund, or the locator of a completed one. With the seen-store holding H the gate's reuse probe refuses
         before that write; with a store that lost H (deleted, restored) the fund went ahead and put a
         SECOND counter leg on chain under the same H. Checked first, before anything is read or
         written. Applies when the persist hook can read back (``load_record``, as
@@ -3248,7 +3248,13 @@ class SwapCoordinator:
         on_disk = load()
         if on_disk is None or bytes(on_disk.terms.hashlock) != bytes(terms.hashlock):
             return
-        handles = ("counterchain_locator", "pending_counter_contract", "pending_btc_funding_tx")
+        handles = (
+            "counterchain_locator",
+            "pending_counter_contract",
+            "pending_btc_funding_tx",
+            "pending_push_nonce",  # a signed token push: abandon_unfunded would drop it (#850 PR 8 re-review)
+            "pending_push_tx_hash",
+        )
         held = [
             n for n in handles if getattr(on_disk, n) is not None and getattr(on_disk, n) != getattr(self.record, n)
         ]
@@ -4874,8 +4880,11 @@ class SwapCoordinator:
           that is settled, or whose balance cannot be read: the token balance must read 0 and the
           contract unsettled at the finalized block and at the tip at every endpoint, and on a chain
           that carries value from more than one endpoint;
-        * a different record of this swap on disk (the persist hook's ``load_record``) that this
-          coordinator was not built from.
+        * a record of this swap on disk (the persist hook's ``load_record``) that is past
+          ``NEGOTIATED`` or holds a counter-leg locator, pending contract, BTC funding transaction or
+          token push that this coordinator's record does not. It is read under
+          ``CoordinatorConfig.fund_lock`` when one is set, which the fund holds across deploy and
+          push.
 
         Nothing is broadcast. ``abort_reason`` is ``TAKER_NEVER_FUNDS``. The hashlock stays reserved
         in the seen-store, so this ``H`` is never funded again. A token contract that was deployed
@@ -4885,7 +4894,14 @@ class SwapCoordinator:
         transaction before its broadcast (#841). Such a record reads as never funded even if a fund
         was broadcast and its readback failed; this step does not scan the HTLC address.
         """
-        # First: a coordinator built on a fresh record must not overwrite the one on disk.
+        lock = self.config.fund_lock
+        # Held from the read of the record on disk to the write, as the fund holds it across deploy
+        # and push: a fund in another process sharing the lock cannot sign a push in between.
+        with lock() if lock is not None else contextlib.nullcontext():
+            return await self._abandon_unfunded_under_the_fund_lock()
+
+    async def _abandon_unfunded_under_the_fund_lock(self) -> SwapRecord:
+        # First: a coordinator built on a stale or fresh record must not overwrite the one on disk.
         self._refuse_to_overwrite_a_recorded_counter_leg(self.record.terms)
         state = self.record.state
         if state is not SwapState.NEGOTIATED:

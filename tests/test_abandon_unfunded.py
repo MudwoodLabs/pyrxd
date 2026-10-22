@@ -269,6 +269,53 @@ async def test_a_fresh_coordinator_never_overwrites_the_record_on_disk(tmp_path,
     assert sink.path.read_bytes() == before_bytes and leg.reads == []
 
 
+async def test_a_coordinator_built_before_the_push_never_drops_the_signed_push_on_disk(tmp_path):
+    """Re-review of #850 PR 8, MEDIUM: built from a copy taken after the deploy and before the push
+    nonce was written, the coordinator's record has the same contract and no push. The disk has the
+    signed push. Before the push lands the balance is 0, so ABORTED would have been written over the
+    only record of the push's nonce and hash."""
+    coord, _c, leg = _setup()
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(dataclasses.replace(coord.record, pending_push_nonce=7, pending_push_tx_hash="0x" + "ab" * 32))
+    before_bytes = sink.path.read_bytes()
+    coord._persist = sink
+    with pytest.raises(ValidationError, match="already holds this swap's counter leg.*pending_push_nonce"):
+        await coord.abandon_unfunded()
+    assert sink.path.read_bytes() == before_bytes and leg.reads == []
+
+
+async def test_the_fund_lock_is_held_from_the_disk_read_to_the_write(tmp_path):
+    """A fund in another process holds the same lock across deploy and push, so it cannot sign a
+    push between the read of the record on disk and the ABORTED write."""
+    coord, _c, _leg = _setup()
+    events: list[str] = []
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+
+    class _Lock:
+        def __enter__(self):
+            events.append("lock")
+
+        def __exit__(self, *exc):
+            events.append("unlock")
+
+    class _Watched:
+        path = sink.path
+
+        def load_record(self):
+            events.append("read")
+            return sink.load_record()
+
+        async def __call__(self, record):
+            events.append("write")
+            await sink(record)
+
+    coord.config = dataclasses.replace(coord.config, fund_lock=_Lock)
+    coord._persist = _Watched()
+    await coord.abandon_unfunded()
+    assert events == ["lock", "read", "write", "unlock"]
+
+
 async def test_HONEST_the_record_on_disk_it_was_built_from_is_abandoned(tmp_path):
     coord, _c, _leg = _setup()
     sink = JsonFileRecordSink(tmp_path / "swap.json")
