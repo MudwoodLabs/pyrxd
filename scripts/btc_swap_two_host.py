@@ -1043,7 +1043,8 @@ _BTC_SPENDER_BURIED_CONFS = 6
 
 async def _refuse_if_btc_leg_spent(args, source, loc, terms, *, phase: str) -> None:
     """The taker's ``--phase refund`` and ``--phase abort`` pre-check (#850 PR 1c, the BTC sibling
-    of the ETH runner's ``_refuse_if_counter_leg_settled_or_claimed``). It refuses; it never
+    of the ETH runner's pre-check, which since #850 PR 6 is the disposition reader's
+    ``_refuse_if_the_counter_leg_was_claimed``). It refuses; it never
     concludes, and the coordinator is unchanged.
 
     Refuses when the BTC HTLC's funding outpoint is already spent, as the ``--btc-rpc-url`` node

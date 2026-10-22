@@ -33,6 +33,7 @@ __all__ = [
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
     "CounterLegClaimedByCounterparty",
+    "CounterLegDispositionUnknown",
     "CounterLegPayoutReverts",
     "CounterLegRefundNeedsOperator",
     "CounterLegSettledUnverified",
@@ -441,6 +442,10 @@ class CounterLegRefundNeedsOperator(ValidationError):
 class CounterLegClaimedByCounterparty(ValidationError):
     """A taker's counter-leg refund failed because the counterparty CLAIMED that leg, revealing ``p``.
 
+    **No longer raised** (#850 PR 6): ``mutual_refund`` now reads the counter leg's disposition from
+    the chain first, and a claim proven there moves the record to ``SECRET_REVEALED`` instead. Kept
+    so code that catches it still imports. What follows describes 0.26.x.
+
     Raised by ``SwapCoordinator.mutual_refund`` on a TAKER-role ETH swap, only after the claim has
     been verified from the chain: a claim tx found in the HTLC contract's logs, ``p`` scraped from
     it with ``sha256(p) == H``, and the provenance gate passed (a successful tx emitting ``p`` from
@@ -460,6 +465,10 @@ class CounterLegClaimedByCounterparty(ValidationError):
 
 class CounterLegSettledUnverified(ValidationError):
     """A taker's counter-leg refund failed: the HTLC is already settled, and no claim was VERIFIED.
+
+    **No longer raised** (#850 PR 6): the same situation now reads as an ``UNKNOWN`` disposition and
+    raises :class:`CounterLegDispositionUnknown`. Kept so code that catches it still imports. What
+    follows describes 0.26.x.
 
     This is NOT "refunded". The contract's ``settled`` flag says someone claimed or refunded it, and
     both emit an event, so an honest log source always shows one of them. Seeing no verified claim
@@ -818,3 +827,20 @@ class CounterLegSingleSourceAnswer(NetworkError):
     def __init__(self, message: str, *, kind: str) -> None:
         super().__init__(message)
         self.kind = kind
+
+
+class CounterLegDispositionUnknown(NetworkError):
+    """The ETH counter leg's disposition is ``UNKNOWN`` (a read failed, fell below quorum, or the
+    evidence contradicts itself), and the counter-leg refund it would have sent did not go out
+    (#850 PR 6, design §3.3 "UNKNOWN"). Nothing changed on the record beyond what the read recorded.
+
+    Raised in place of the leg's own refusal (most often a preflight revert against a contract that
+    is already settled) when the chain could not say what happened. "Settled, and neither a refund
+    nor a claim verifies" is one such answer, and it is what a real claim looks like when its log is
+    withheld or pruned, so it is never read as "refunded". A :class:`NetworkError`, so a caller may
+    retry once the endpoints agree. ``reason`` is the reader's reason; a ``Claimed`` log seen on
+    the contract is on the record as ``counter_claim_tx``."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason

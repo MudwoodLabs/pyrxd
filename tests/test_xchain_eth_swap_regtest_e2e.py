@@ -858,6 +858,11 @@ class TestEthRxdSwap:
         # 2. t_rxd matures last; now mutual_refund unwinds BOTH legs.
         node.rxd_mine(terms.t_rxd.value - cov_confs)
         rec = await coord.mutual_refund()
+        # #850 PR 6: our ETH refund is RECORDED and the record waits for the chain; with no role the
+        # covenant refund goes only once the ETH HTLC is REFUNDED at the finalized block.
+        assert rec.state is SwapState.BOTH_LOCKED and rec.counter_refund_tx_hash is not None, rec.state.value
+        _anvil_mine(url, 3)  # --slots-in-an-epoch 1: finalized = latest - 2
+        rec = await coord.mutual_refund()
         assert rec.state is SwapState.MUTUAL_REFUND
         _outpoint_txid, _, _outpoint_vout = coord.record.radiant_covenant_outpoint.partition(":")
         rxd_spent = node.rxd("gettxout", _outpoint_txid, _outpoint_vout or "0")

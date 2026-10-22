@@ -1305,9 +1305,12 @@ class RadiantCovenantLeg:
             )
             # blocks_to_deadline=None (the plain relay floor, no urgency premium): unlike the
             # claim, the CSV refund has no closing window. It only becomes broadcastable AT
-            # maturity and stays valid indefinitely thereafter — the competing claim branch
-            # needs p, which on this path the counterparty has not revealed. A premium here
-            # would burn fee for urgency that does not exist. The floor itself still binds.
+            # maturity and stays valid indefinitely thereafter. The competing claim branch needs
+            # p. That is NOT guaranteed secret here: once the counter leg has been claimed, p is
+            # public and the claim branch pays the taker (the F-A race, #850). So the coordinator
+            # does not send this refund from a taker's process on an ETH swap (BTC: #850 PR 9a),
+            # nor while a claim of the counter leg is seen before t_rxd (D14); a premium would
+            # only help this refund beat that claim. The floor itself still binds.
             self._assert_affordable(tx, fee, blocks_to_deadline=None, kind="refund")
         return await self._broadcast(tx)
 
