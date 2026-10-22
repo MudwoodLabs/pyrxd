@@ -380,27 +380,59 @@ class EthLeg:
         recorded_refund_hashes: tuple[str, ...] = (),
         expiry_anchor: tuple[int, str] | None = None,
         push_nonce_bound: int | None = None,
+        push_signer: str | None = None,
+        nonce_less: bool = False,
     ):
         """What the chain says about this swap's HTLC, read and verified at the finalized block
         (:func:`pyrxd.eth_wallet.disposition.read_counter_disposition`, #850 PR 5a). Read-only; never
         raises for a chain read (an unreadable chain is ``UNKNOWN``).
 
         A token HTLC (:class:`Erc20HtlcLocator`) is also read for ``EXPIRED_EMPTY_*`` (#850 PR 7a):
-        its token balance, and this leg's key's nonce at the finalized block against
-        ``push_nonce_bound``. This leg's key is the one that signed the push."""
+        its token balance, and the push key's nonce at the finalized block against
+        ``push_nonce_bound``. The push key is ``push_signer`` when the record names it. A record
+        that does not (one written before it was kept) is read with this leg's key only when this
+        key deployed the contract (:meth:`deployed_by_this_key`); otherwise no nonce is read and the
+        contract can only read ``EXPIRED_EMPTY_OPEN``. ``nonce_less`` is passed through."""
         from pyrxd.eth_wallet.disposition import read_counter_disposition
         from pyrxd.eth_wallet.locator import Erc20HtlcLocator
 
         token = locator.token_address if isinstance(locator, Erc20HtlcLocator) else None
+        funding = None
+        if token is not None:
+            if push_signer is not None:
+                funding = push_signer
+            elif await self.deployed_by_this_key(locator):
+                funding = self.signer_address()
         return await read_counter_disposition(
             self._leg._rpc,
             locator,
             recorded_refund_hashes=recorded_refund_hashes,
             expiry_anchor=expiry_anchor,
             token_address=token,
-            funding_account=self._leg._account_address() if token is not None else None,
+            funding_account=funding,
             push_nonce_bound=push_nonce_bound if token is not None else None,
+            nonce_less=nonce_less if token is not None else False,
         )
+
+    def signer_address(self) -> str:
+        """This leg's key's address, lower-case: the key that deploys, pushes and closes."""
+        return str(self._leg._account_address()).lower()
+
+    async def deployed_by_this_key(self, locator: EthHtlcLocator) -> bool:
+        """Whether this leg's key created ``locator``'s contract: the CREATE address of this key at
+        the deploy transaction's nonce is the contract address. Only the nonce comes from the
+        endpoint, and the derivation checks it, so a lying endpoint cannot make this true for
+        another key's contract. A read that fails is ``False``."""
+        from pyrxd.eth_wallet.erc20_leg import _create_address
+
+        try:
+            tx = await self._leg._rpc.get_transaction(locator.deploy_tx_hash)
+            nonce = tx["nonce"]
+            if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
+                return False
+            return _create_address(self.signer_address(), nonce).lower() == locator.contract_address.lower()
+        except Exception:  # an unreadable deploy proves nothing either way
+            return False
 
     async def close_push_nonce(self, nonce: int, *, on_signed=None) -> str:
         """Consume ``nonce`` of this leg's key with a 0-value self-transfer (#850 PR 7a, design §2.7;

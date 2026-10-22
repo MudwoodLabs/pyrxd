@@ -181,6 +181,7 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
     "push_close_nonce": [
         ("push-close-nonce", _with(_eth_base, push_close_tx_hash="0x" + "c7" * 32, push_close_nonce=0), ())
     ],
+    "push_signer": [("push-signer", _with(_eth_base, pending_push_nonce=3, push_signer="0x" + "ab" * 20), ())],
     "pending_btc_funding_tx": [
         ("pending-btc-fund", lambda: dataclasses.replace(_btc_base(), pending_btc_funding_tx=_raw_btc_tx()), ())
     ],

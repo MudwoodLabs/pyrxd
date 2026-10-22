@@ -22,9 +22,9 @@ from pyrxd.eth_wallet.disposition import DispositionKind, read_counter_dispositi
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
-from pyrxd.gravity.swap_coordinator import SwapCoordinator
+from pyrxd.gravity.swap_coordinator import CounterLegRefundNeedsOperator, SwapCoordinator
 from pyrxd.gravity.swap_state import AbortReason, SwapRecord, SwapRole, SwapState
-from pyrxd.security.errors import NetworkError, NothingToRefund, ValidationError
+from pyrxd.security.errors import CounterLegSingleSourceAnswer, NetworkError, NothingToRefund, ValidationError
 from tests._fake_evm_chain import FUNDER, TOKEN, FakeEvmChain, FakeEvmEndpoint
 from tests._fake_evm_chain import _tx_hash as _fake_tx_hash
 from tests.test_counter_leg_disposition_coordinator import _ChainLeg
@@ -54,13 +54,14 @@ def _rpc(chain: FakeEvmChain, *endpoints: FakeEvmEndpoint) -> MultiSourceEthRpc:
     return MultiSourceEthRpc(list(endpoints) or [FakeEvmEndpoint(chain) for _ in range(3)])
 
 
-async def _read(chain, *endpoints, bound=PUSH_NONCE, funder=FUNDER, token=TOKEN):
+async def _read(chain, *endpoints, bound=PUSH_NONCE, funder=FUNDER, token=TOKEN, nonce_less=False):
     return await read_counter_disposition(
         _rpc(chain, *endpoints),
         chain.token_locator(),
         token_address=token,
         funding_account=funder,
         push_nonce_bound=bound,
+        nonce_less=nonce_less,
     )
 
 
@@ -183,9 +184,14 @@ class _TokenLeg(_ChainLeg):
         self.coord = None
 
     async def counter_disposition(self, locator, **kwargs):
+        # As EthLeg reads it: the recorded push signer, else this key (the fake deployed it).
+        signer = kwargs.pop("push_signer", None)
         if isinstance(locator, Erc20HtlcLocator):
-            kwargs.update(token_address=locator.token_address, funding_account=FUNDER)
+            kwargs.update(token_address=locator.token_address, funding_account=signer or self.signer_address())
         return await read_counter_disposition(self._rpc, locator, **kwargs)
+
+    def signer_address(self):
+        return getattr(self, "key", FUNDER)
 
     async def close_push_nonce(self, nonce, *, on_signed=None):
         latest = self.chain.count_at(self.chain.head)
@@ -201,6 +207,8 @@ class _TokenLeg(_ChainLeg):
     async def close_progress(self, tx_hash, nonce):
         from pyrxd.eth_wallet.htlc_leg import RefundProgress
 
+        if getattr(self, "progress_kind", None) is not None:
+            return RefundProgress(self.progress_kind)
         if tx_hash in self.dropped_closes:
             return RefundProgress("dropped")
         if self.chain.count_at(self.chain.head) > nonce:
@@ -228,7 +236,8 @@ def _setup(
         ),
         token_address=TOKEN,
     )
-    rpc = MultiSourceEthRpc(endpoints(chain) if endpoints else [FakeEvmEndpoint(chain) for _ in range(3)])
+    eps = endpoints(chain) if endpoints else [FakeEvmEndpoint(chain) for _ in range(3)]
+    rpc = eps[0] if len(eps) == 1 else MultiSourceEthRpc(eps)  # one endpoint is read as single-source
     leg = _TokenLeg(preimage=chain.preimage, verdict=_final(), rpc=rpc)
     leg.chain = chain
     rxd = FakeRadiantLeg()
@@ -450,3 +459,130 @@ async def test_HONEST_tokens_in_an_expired_contract_are_refunded_not_closed():
     chain.token_balances[30] = 1_000_000
     rec = await coord.taker_refund_btc()
     assert leg.refunds == 1 and rec.state is SwapState.BTC_LOCKED and rec.counter_refund_tx_hash is not None
+
+
+# --------------------------------------------------------------------------- review of PR 7a
+
+
+async def test_nonce_less_a_key_with_a_transaction_in_flight_is_not_closed():
+    """Design §2.7: with no push nonce, our own close is the bound, and a push still in flight above it
+    (pending at an endpoint) can land after it. Not CLOSED until the key is idle everywhere."""
+    chain = _chain(nonces={20: 41})  # our close at 40 is final
+    chain.pending_txs = 1
+    d = await _read(chain, bound=40, nonce_less=True)
+    assert d.kind is DispositionKind.EXPIRED_EMPTY_OPEN and d.funding_key_idle is False
+    assert "in flight" in d.reason
+
+
+async def test_HONEST_nonce_less_an_idle_key_past_our_close_is_closed():
+    chain = _chain(nonces={20: 41})
+    d = await _read(chain, bound=40, nonce_less=True)
+    assert d.kind is DispositionKind.EXPIRED_EMPTY_CLOSED and d.funding_key_idle is True
+
+
+async def test_nonce_less_a_count_mined_above_F_is_not_idle():
+    chain = _chain(nonces={20: 41, FINALIZED + 2: 42})
+    d = await _read(chain, bound=40, nonce_less=True)
+    assert d.kind is DispositionKind.EXPIRED_EMPTY_OPEN and d.funding_key_idle is False
+
+
+async def test_nonce_less_an_endpoint_that_cannot_read_the_pending_count_is_not_closed():
+    class _NoPending(FakeEvmEndpoint):
+        async def get_transaction_count(self, address, block="pending"):
+            if block == "pending":
+                raise NetworkError("eth_getTransactionCount failed: 429 Too Many Requests")
+            return await super().get_transaction_count(address, block)
+
+    chain = _chain(nonces={20: 41})
+    d = await _read(chain, FakeEvmEndpoint(chain), _NoPending(chain), bound=40, nonce_less=True)
+    assert d.kind is DispositionKind.EXPIRED_EMPTY_OPEN and d.funding_key_idle is False
+
+
+async def test_with_a_push_nonce_the_pending_count_is_not_needed():
+    """The recorded nonce is the bound, and every push of the key is at or below it."""
+    chain = _chain(nonces={20: PUSH_NONCE + 1})
+    chain.pending_txs = 3
+    d = await _read(chain)
+    assert d.kind is DispositionKind.EXPIRED_EMPTY_CLOSED and d.funding_key_idle is None
+
+
+async def test_nonce_less_close_is_not_sent_while_the_key_has_a_transaction_in_flight():
+    coord, chain, leg = _setup(push_nonce=None, nonces={20: 40})
+    chain.pending_txs = 1
+    with pytest.raises(NetworkError, match="not idle at every endpoint"):
+        await coord.close_push_nonce()
+    assert leg.closes == [] and coord.record.push_close_tx_hash is None
+
+
+async def test_nonce_less_record_stays_while_a_push_is_in_flight_above_our_final_close():
+    coord, chain, leg = _setup(push_nonce=None, nonces={20: 40})
+    await coord.close_push_nonce()
+    _mine_close(chain, 40, block=FINALIZED + 1)
+    chain.finalized = FINALIZED + 3
+    chain.pending_txs = 1  # a push at 41 that our close made executable
+    with pytest.raises(NothingToRefund):
+        await coord.taker_refund_btc()
+    assert coord.record.state is SwapState.BTC_LOCKED
+    chain.pending_txs = 0
+    assert (await coord.taker_refund_btc()).state is SwapState.ABORTED
+    assert len(leg.closes) == 1 and leg.refunds == 0
+
+
+OTHER_KEY = "0x" + "ab" * 20
+
+
+async def test_a_record_whose_push_key_is_not_this_legs_key_sends_no_close():
+    """Review M1: the taker funded with key A, the runner restarted with key B. B's nonce does not
+    stop A's push, so no close is sent; and the read is of A's count (0 here), so nothing ends."""
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
+    coord.record = dataclasses.replace(coord.record, push_signer=OTHER_KEY)
+    with pytest.raises(ValidationError, match="only a close from the push's key"):
+        await coord.close_push_nonce()
+    assert leg.closes == []
+    coord2, _c2, _l2 = _setup()  # FUNDER's count at F is past the push nonce...
+    coord2.record = dataclasses.replace(coord2.record, push_signer=OTHER_KEY)
+    with pytest.raises(NothingToRefund):  # ...but the push key is OTHER_KEY, whose count is not
+        await coord2.taker_refund_btc()
+    assert coord2.record.state is SwapState.BTC_LOCKED
+
+
+async def test_HONEST_a_record_whose_push_key_is_this_legs_key_closes():
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
+    coord.record = dataclasses.replace(coord.record, push_signer=FUNDER)
+    await coord.close_push_nonce()
+    assert leg.closes == [(_fake_tx_hash("close-1"), PUSH_NONCE)]
+
+
+async def test_one_endpoint_on_a_value_bearing_chain_does_not_end_a_closed_empty_record(monkeypatch):
+    """D4 for EXPIRED_EMPTY_CLOSED: the fixture chain is a testnet, so force the value-bearing rule."""
+    coord, _c, leg = _setup(endpoints=lambda chain: [FakeEvmEndpoint(chain)])
+    monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
+    with pytest.raises(CounterLegSingleSourceAnswer):
+        await coord.close_push_nonce()
+    with pytest.raises(NetworkError, match="from ONE endpoint, on a chain that carries value"):
+        await coord.taker_refund_btc()
+    assert coord.record.state is SwapState.BTC_LOCKED and coord.record.counter_disposition is None
+    assert coord.record.counter_expiry_anchor is None and leg.closes == [] and leg.refunds == 0
+
+
+async def test_HONEST_one_endpoint_on_a_testnet_ends_a_closed_empty_record():
+    coord, _c, _leg = _setup(endpoints=lambda chain: [FakeEvmEndpoint(chain)])
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.ABORTED and rec.counter_disposition.single_source is True
+
+
+async def test_a_close_whose_earlier_nonce_is_missing_needs_the_operator():
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
+    await coord.close_push_nonce()
+    leg.progress_kind = "nonce_gap"
+    with pytest.raises(CounterLegRefundNeedsOperator, match="earlier transaction from the same ETH key is missing"):
+        await coord.close_push_nonce()
+    assert len(leg.closes) == 1
+
+
+async def test_a_close_whose_nonce_another_transaction_took_waits_and_resends_nothing():
+    coord, _c, leg = _setup(nonces={20: PUSH_NONCE})
+    await coord.close_push_nonce()
+    leg.progress_kind = "nonce_taken"
+    rec = await coord.close_push_nonce()
+    assert len(leg.closes) == 1 and rec.state is SwapState.BTC_LOCKED

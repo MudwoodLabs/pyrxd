@@ -56,6 +56,9 @@ class FakeEvmChain:
     #: and the funding key's ``{block: transaction count from that block on}``.
     token_balances: dict[int, int] = field(default_factory=dict)
     nonces: dict[int, int] = field(default_factory=dict)
+    #: The funding key's transactions in the mempool: its ``pending`` count is its count at the tip
+    #: plus this.
+    pending_txs: int = 0
 
     def __post_init__(self) -> None:
         self.hashlock = hashlib.sha256(self.preimage).digest()
@@ -299,7 +302,7 @@ class FakeEvmEndpoint:
             return self.lie_nonce
         if address.lower() != FUNDER:
             return 0
-        return self.chain.count_at(at)
+        return self.chain.count_at(at) + (self.chain.pending_txs if block == "pending" else 0)
 
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         if self.forge_receipt and tx_hash == self.forge_refunded_tx:

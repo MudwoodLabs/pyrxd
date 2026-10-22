@@ -9,6 +9,7 @@ The signing is real; the rpc is a recorder.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -186,34 +187,92 @@ def _loc(**extra):
     return Erc20HtlcLocator(**base, **extra) if extra else EthHtlcLocator(**base)
 
 
-@pytest.mark.parametrize("token", [True, False])
-async def test_eth_leg_reads_a_token_contract_with_its_token_and_push_key(monkeypatch, token):
-    from pyrxd.eth_wallet import disposition
+def _adapter(leg):
     from pyrxd.gravity.eth_leg import EthLeg
 
-    leg, _rpc, addr = _leg(latest=0)
-    adapter = EthLeg(
+    return EthLeg(
         contract_leg=leg,
         network="mainnet",
         claim_to="0x" + "44" * 20,
         refund_to="0x" + "55" * 20,
         eth_timeout_unix_s=1_800_000_000,
     )
-    captured = {}
+
+
+def _capture(monkeypatch) -> dict:
+    from pyrxd.eth_wallet import disposition
+
+    captured: dict = {}
 
     async def fake_read(rpc, locator, **kwargs):
         captured.update(kwargs)
         return "read"
 
     monkeypatch.setattr(disposition, "read_counter_disposition", fake_read)
-    locator = _loc(token_address="0x" + "70" * 20) if token else _loc()
-    assert await adapter.counter_disposition(locator, push_nonce_bound=7) == "read"
-    if token:
-        assert captured["token_address"] == "0x" + "70" * 20
-        assert captured["funding_account"] == addr and captured["push_nonce_bound"] == 7
+    return captured
+
+
+def _deployed_by(rpc: _Rpc, deployer: str, nonce: int = 5, *, answer=None) -> Erc20HtlcLocator:
+    """A token locator whose contract is ``deployer``'s CREATE address at ``nonce``; the rpc answers the
+    deploy transaction with that nonce (or with ``answer``)."""
+    from pyrxd.eth_wallet.erc20_leg import _create_address
+
+    loc = _loc(token_address="0x" + "70" * 20)
+    loc = dataclasses.replace(loc, contract_address=_create_address(deployer, nonce).lower())
+
+    async def get_transaction(tx_hash):
+        if isinstance(answer, Exception):
+            raise answer
+        assert tx_hash == loc.deploy_tx_hash
+        return answer if answer is not None else {"nonce": nonce}
+
+    rpc.get_transaction = get_transaction
+    return loc
+
+
+async def test_eth_leg_reads_the_recorded_push_signer_not_its_own_key(monkeypatch):
+    leg, rpc, addr = _leg(latest=0)
+    captured = _capture(monkeypatch)
+    other = "0x" + "ab" * 20
+    loc = _deployed_by(rpc, addr)  # deployed by this key, and still the recorded signer wins
+    assert await _adapter(leg).counter_disposition(loc, push_nonce_bound=7, push_signer=other) == "read"
+    assert captured["token_address"] == "0x" + "70" * 20 and captured["funding_account"] == other
+    assert captured["push_nonce_bound"] == 7 and captured["nonce_less"] is False
+
+
+async def test_HONEST_without_a_recorded_signer_the_deploying_key_is_read(monkeypatch):
+    leg, rpc, addr = _leg(latest=0)
+    captured = _capture(monkeypatch)
+    loc = _deployed_by(rpc, addr)
+    assert await _adapter(leg).counter_disposition(loc, push_nonce_bound=7, nonce_less=True) == "read"
+    assert captured["funding_account"] == addr.lower() and captured["nonce_less"] is True
+
+
+@pytest.mark.parametrize("case", ["another_deployer", "nonce_lies", "unreadable", "bad_nonce"], ids=lambda c: c)
+async def test_without_a_recorded_signer_a_key_that_did_not_deploy_is_never_read(monkeypatch, case):
+    leg, rpc, addr = _leg(latest=0)
+    captured = _capture(monkeypatch)
+    if case == "another_deployer":  # the review's restart with another key (key B, contract of key A)
+        loc = _deployed_by(rpc, "0x" + "ab" * 20)
+    elif case == "nonce_lies":  # an endpoint can only supply a nonce, and the derivation checks it
+        loc = _deployed_by(rpc, "0x" + "ab" * 20, answer={"nonce": 6})
+    elif case == "unreadable":
+        loc = _deployed_by(rpc, addr, answer=NetworkError("eth_getTransactionByHash failed"))
     else:
-        assert captured["token_address"] is None and captured["funding_account"] is None
-        assert captured["push_nonce_bound"] is None
+        loc = _deployed_by(rpc, addr, answer={"nonce": True})
+    assert await _adapter(leg).counter_disposition(loc, push_nonce_bound=7) == "read"
+    assert captured["funding_account"] is None, "no key's count is read, so the contract cannot read CLOSED"
+
+
+async def test_a_native_contract_is_read_without_token_or_key(monkeypatch):
+    leg, _rpc, _addr = _leg(latest=0)
+    captured = _capture(monkeypatch)
+    out = await _adapter(leg).counter_disposition(
+        _loc(), push_nonce_bound=7, push_signer="0x" + "ab" * 20, nonce_less=True
+    )
+    assert out == "read"
+    assert captured["token_address"] is None and captured["funding_account"] is None
+    assert captured["push_nonce_bound"] is None and captured["nonce_less"] is False
 
 
 async def test_the_multi_source_balance_read_is_an_identity_read():

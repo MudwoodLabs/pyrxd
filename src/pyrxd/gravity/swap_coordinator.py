@@ -3113,8 +3113,9 @@ class SwapCoordinator:
             # The pin rides along: on a RESUME the leg never calls `on_deploy`, so this (with the
             # push hash below) is the write before the push that carries the proof it was judged
             # against (review of the write-ahead, F1).
+            # The key rides with it (#850 PR 7a): the nonce means nothing without the key it counts.
             self.record = self._pinned_to_the_verified_covenant(
-                dataclasses.replace(self.record, pending_push_nonce=int(nonce))
+                dataclasses.replace(self.record, pending_push_nonce=int(nonce), push_signer=self._counter_signer())
             )
             await self._persist_record(self.record, shield=True)
 
@@ -3124,7 +3125,12 @@ class SwapCoordinator:
             # field was written only by tests and a resume could not read its own pending push back.
             # Adopted only once the write returns, like the BTC funding bytes below.
             staged = self._pinned_to_the_verified_covenant(
-                dataclasses.replace(self.record, pending_push_nonce=int(nonce), pending_push_tx_hash=tx_hash)
+                dataclasses.replace(
+                    self.record,
+                    pending_push_nonce=int(nonce),
+                    pending_push_tx_hash=tx_hash,
+                    push_signer=self.record.push_signer or self._counter_signer(),
+                )
             )
             await self._persist_record(staged, shield=True)
             self.record = staged
@@ -3140,6 +3146,14 @@ class SwapCoordinator:
             await self._persist_record(self.record, shield=True)
 
         if terms.counter_chain == "eth":
+            signer = self._counter_signer()
+            if self.record.push_signer is not None and signer is not None and signer != self.record.push_signer:
+                # The pinned push nonce is the recorded key's slot; pushing with another key at it
+                # would leave the first key's push free to land, and no close of ours could reach it.
+                raise ValidationError(
+                    f"this swap's token push was signed by {self.record.push_signer}, and this counter leg's key "
+                    f"is {signer}: resume with the key that signed the push. Nothing was sent."
+                )
             lock = self.config.fund_lock
             # Held across deploy AND push: the window the lock exists to close is between reading
             # the balance and sending the shortfall, which spans both.
@@ -4425,11 +4439,23 @@ class SwapCoordinator:
             from .swap_state import parse_expiry_anchor
 
             kwargs["expiry_anchor"] = parse_expiry_anchor(self.record.counter_expiry_anchor)
-        bound = self._push_nonce_bound()
-        if bound is not None and isinstance(locator, Erc20HtlcLocator):
-            # #850 PR 7a: the highest nonce a push for this contract (or our close of it) was signed at.
-            kwargs["push_nonce_bound"] = bound
+        if isinstance(locator, Erc20HtlcLocator):
+            # #850 PR 7a: the highest nonce a push for this contract (or our close of it) was signed
+            # at, and the key that signed the push. With no push nonce recorded the close is the only
+            # bound, and closing needs the key idle at every endpoint (design §2.7).
+            bound = self._push_nonce_bound()
+            if bound is not None:
+                kwargs["push_nonce_bound"] = bound
+            if self.record.push_signer is not None:
+                kwargs["push_signer"] = self.record.push_signer
+            if self.record.pending_push_nonce is None:
+                kwargs["nonce_less"] = True
         return await read(locator, **kwargs)
+
+    def _counter_signer(self) -> str | None:
+        """The counter leg's key's address (lower-case), or ``None`` when the leg does not say."""
+        signer = getattr(self.counter_leg, "signer_address", None)
+        return str(signer()).lower() if callable(signer) else None
 
     def _push_nonce_bound(self) -> int | None:
         """The highest nonce at which this record's key signed a token push for the counter-leg
@@ -4715,6 +4741,14 @@ class SwapCoordinator:
         if not isinstance(locator, Erc20HtlcLocator):
             raise ValidationError("close_push_nonce applies only to a token (ERC-20) counter leg")
         close = getattr(self.counter_leg, "close_push_nonce", None)
+        signer = self._counter_signer()
+        if self.record.push_signer is not None and signer != self.record.push_signer:
+            # A close consumes a nonce of the key that sends it; only the push's own key's nonce
+            # stops the push.
+            raise ValidationError(
+                f"the token push was signed by {self.record.push_signer}, and this counter leg's key is {signer}: "
+                "only a close from the push's key can stop it. Nothing was sent."
+            )
         disposition = await self._read_counter_disposition()
         if close is None or disposition is None:
             raise ValidationError(
@@ -4773,6 +4807,16 @@ class SwapCoordinator:
                 )
                 return self.record
             logger.warning("push-closing transaction %s was dropped; sending another at nonce %d", recorded, nonce)
+
+        if push is None and disposition.funding_key_idle is not True:
+            # Design §2.7: with no push nonce recorded, a push may be in flight at any nonce; a close
+            # at the count at F could fill the gap below it and let it land. Close only when nothing
+            # of this key is in flight at any endpoint.
+            raise NetworkError(
+                "no push nonce is recorded, and the funding key is not idle at every endpoint (pending, latest and "
+                f"the count at the finalized block are not one number): {disposition.reason}. Nothing was sent. "
+                "Retry once the key's transactions are final."
+            )
 
         async def _record_before_broadcast(tx_hash: str, signed_nonce: int) -> None:
             # Persisted BEFORE the broadcast (design §2.8), adopted only once the write returns.

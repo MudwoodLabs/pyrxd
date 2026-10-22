@@ -172,6 +172,10 @@ class CounterDisposition:
     #: ``EXPIRED_EMPTY_*`` answer that could read it; ``None`` otherwise. The nonce a push-closing
     #: transaction consumes (design §2.7).
     nonce_at_finalized: int | None = None
+    #: For a record with no push nonce (``nonce_less``): whether every endpoint reads the funding
+    #: key's pending count, latest count and count at ``F`` as one number, i.e. nothing of this key
+    #: is in flight (design §2.7). ``None`` when not asked or not read.
+    funding_key_idle: bool | None = None
 
 
 # --------------------------------------------------------------------------- fan-out helpers
@@ -410,6 +414,7 @@ async def read_counter_disposition(
     token_address: str | None = None,
     funding_account: str | None = None,
     push_nonce_bound: int | None = None,
+    nonce_less: bool = False,
 ) -> CounterDisposition:
     """The disposition of the counter-leg contract *locator* describes.
 
@@ -427,7 +432,9 @@ async def read_counter_disposition(
     (``EXPIRED_EMPTY_*``, PR 7a). ``funding_account`` is the key that signed the token push, and
     ``push_nonce_bound`` the highest nonce at which it signed a push for this contract (or a
     transaction that closed that nonce); with both, a count at ``F`` above the bound is
-    ``EXPIRED_EMPTY_CLOSED``.
+    ``EXPIRED_EMPTY_CLOSED``. ``nonce_less`` says no push nonce is recorded (the bound, if any, is
+    our own close's nonce): then CLOSED also needs ``pending == latest == count-at-F`` at every
+    endpoint (design §2.7), so a push still in flight above our close is not read as closed.
 
     LIVENESS LIMITS, by design. One endpoint that nominates a transaction (a forged log) and then
     disagrees with the others about its receipt makes every answer for a SETTLED contract UNKNOWN for
@@ -464,6 +471,8 @@ async def read_counter_disposition(
         not isinstance(push_nonce_bound, int) or isinstance(push_nonce_bound, bool) or push_nonce_bound < 0
     ):
         raise ValidationError("push_nonce_bound must be a non-negative int")
+    if not isinstance(nonce_less, bool):
+        raise ValidationError("nonce_less must be a bool")
     panel = _panel_of(rpc)
     single = len(panel.sources) == 1
     keys = tuple(sorted(_key(s) for s in panel.sources))
@@ -681,6 +690,7 @@ async def read_counter_disposition(
             finalized=finalized,
             funding_account=funding_account,
             push_nonce_bound=push_nonce_bound,
+            nonce_less=nonce_less,
             evidence=lambda: evidence(DispositionKind.EXPIRED_EMPTY_CLOSED, None),
         )
     if tip_ts >= timeout:
@@ -697,6 +707,7 @@ async def _expired_empty(
     finalized: int,
     funding_account: str | None,
     push_nonce_bound: int | None,
+    nonce_less: bool,
     evidence: Callable[[], DispositionEvidence],
 ) -> CounterDisposition:
     """Refine an ``F_EXPIRED`` answer for a token contract (§2.3 ``EXPIRED_EMPTY_*``, §2.7).
@@ -719,7 +730,9 @@ async def _expired_empty(
         expired, kind=DispositionKind.EXPIRED_EMPTY_OPEN, reason="expired, and the contract holds no tokens"
     )
     if funding_account is None:
-        return empty
+        return dataclasses.replace(
+            empty, reason=f"{empty.reason}; the key that signed the push is not known, so its nonce was not read"
+        )
     try:
         counts = await _every(
             panel, lambda s: s.get_transaction_count(funding_account, finalized), f"nonce at {finalized}"
@@ -730,6 +743,32 @@ async def _expired_empty(
         return dataclasses.replace(empty, reason=f"{empty.reason}; the funding key's nonce at F is unknown: {exc}")
     count = int(counts[0])
     empty = dataclasses.replace(empty, nonce_at_finalized=count)
+    if nonce_less:
+        # Design §2.7: with no push nonce recorded, a push may sit at any nonce of this key. Nothing
+        # in flight anywhere we can see (pending == latest == count at F at every endpoint) is the
+        # condition for closing count-at-F, and for reading our own close as the end. It does not
+        # see a privately submitted or evicted push (§2.7, D5): that residual is the design's.
+        try:
+            pending = await _every(
+                panel, lambda s: s.get_transaction_count(funding_account, "pending"), "pending nonce"
+            )
+            latest = await _every(panel, lambda s: s.get_transaction_count(funding_account, "latest"), "latest nonce")
+        except _BelowQuorum as exc:
+            return dataclasses.replace(
+                empty,
+                funding_key_idle=False,
+                reason=f"{empty.reason}; whether the funding key has transactions in flight is unknown: {exc}",
+            )
+        idle = all(int(n) == count for n in (*pending, *latest))
+        empty = dataclasses.replace(empty, funding_key_idle=idle)
+        if not idle:
+            return dataclasses.replace(
+                empty,
+                reason=(
+                    f"{empty.reason}; no push nonce is recorded and the funding key has transactions in flight "
+                    f"(nonce at F {count}, pending {sorted(set(pending))}, latest {sorted(set(latest))})"
+                ),
+            )
     if push_nonce_bound is None:
         return dataclasses.replace(
             empty, reason=f"{empty.reason}; no push nonce is recorded, so a push may still land (design §2.7)"

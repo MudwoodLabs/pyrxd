@@ -1337,8 +1337,10 @@ class EthHtlcContractLeg:
         is exactly ``nonce``: above it, the nonce is already consumed (wait for finality); below it,
         an earlier transaction of this key is missing, and this one would queue behind it.
         ``on_signed`` is awaited with ``(tx_hash, nonce)`` before the broadcast; an exception from it
-        stops the send. A transaction pending at ``nonce`` (a push, say) is NOT replaced on purpose:
-        the node then refuses this one as underpriced and the pending one decides the nonce."""
+        stops the send. Nothing here prices this transaction to replace one pending at ``nonce`` (a
+        push, say). The node usually refuses it as underpriced, but if fees have risen enough since the
+        pending one was priced, it replaces it. Either way one transaction consumes the nonce, and the
+        contract is read for tokens at the finalized block, not assumed empty."""
         if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
             raise ValidationError("nonce must be a non-negative int")
         await self._rpc.assert_chain()

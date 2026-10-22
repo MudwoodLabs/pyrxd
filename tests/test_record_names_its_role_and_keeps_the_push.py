@@ -387,6 +387,60 @@ async def test_a_resume_hands_the_recorded_push_hash_back_to_the_token_leg(tmp_p
     assert seen.get("push_tx_hash") == _PUSH_HASH and seen.get("push_nonce") == 9, seen
 
 
+async def test_the_push_key_reaches_the_record_with_the_push_nonce(tmp_path) -> None:
+    """#850 PR 7a: the push nonce is a count of one key; the record names the key, from the shipped
+    ``EthLeg``, in the same write as the nonce, before the push."""
+    order: list[str] = []
+    leg, _seen = _shipped_token_eth_leg(order)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    persisted: list[SwapRecord] = []
+
+    async def _persist(record):
+        persisted.append(record)
+        await sink(record)
+
+    coord, terms = _token_coordinator(leg, persist=_persist)
+    await coord.taker_funds_btc(terms, now_unix_s=_FUND_TIMEOUT - 40_000)
+    first_nonce = next(r for r in persisted if r.pending_push_nonce is not None)
+    assert first_nonce.push_signer == leg.signer_address()
+    assert leg.signer_address() == leg._leg._account_address().lower()
+    assert sink.load_record().push_signer == leg.signer_address()
+
+
+def _pending_push(signer: str) -> SwapRecord:
+    return SwapRecord(
+        state=SwapState.NEGOTIATED,
+        terms=_token_terms(),
+        pending_counter_contract="0x" + "77" * 20,
+        pending_counter_deploy_tx="0x" + "de" * 32,
+        pending_push_nonce=9,
+        pending_push_tx_hash=_PUSH_HASH,
+        push_signer=signer,
+    )
+
+
+async def test_a_resume_with_another_key_than_the_push_is_refused(tmp_path) -> None:
+    """A push pinned at key A's nonce 9 is not stopped by key B's nonce 9: a resume with B would push
+    again and leave A's push free to land. Refused before the token leg is reached."""
+    order: list[str] = []
+    leg, seen = _shipped_token_eth_leg(order)
+    coord, terms = _token_coordinator(leg, record=_pending_push("0x" + "ab" * 20))
+    with pytest.raises(ValidationError, match="resume with the key that signed the push"):
+        await coord.taker_funds_btc(terms, now_unix_s=_FUND_TIMEOUT - 40_000)
+    assert seen == {} and coord.record.state is SwapState.NEGOTIATED
+
+
+async def test_HONEST_a_resume_with_the_push_key_reaches_the_token_leg(tmp_path) -> None:
+    order: list[str] = []
+    leg, seen = _shipped_token_eth_leg(order)
+    coord, terms = _token_coordinator(leg, record=_pending_push(leg.signer_address()))
+    try:
+        await coord.taker_funds_btc(terms, now_unix_s=_FUND_TIMEOUT - 40_000)
+    except Exception as exc:  # the fake chain holds no such contract; only the handoff matters
+        assert seen, f"the fund failed before reaching the token leg: {exc}"
+    assert seen.get("push_nonce") == 9, seen
+
+
 async def test_resume_interrupted_fund_checks_and_stamps_the_role(tmp_path) -> None:
     """``resume_interrupted_fund`` adopts the record from its sink; it skipped the constructor's
     check, so another side's record was driven and a pre-0.27 one was persisted with no role."""

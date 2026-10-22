@@ -48,8 +48,8 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # ``asset_refund_txid``.
 # v5 (#850 PR 5b) adds ``counter_refund_tx_hash``, ``counter_refund_nonce``,
 # ``counter_refund_replaced_tx_hashes`` and ``counter_expiry_anchor``.
-# v6 (#850 PR 7a) adds ``push_close_tx_hash`` and ``push_close_nonce``, and the ``abort_reason``
-# value ``expired_empty``.
+# v6 (#850 PR 7a) adds ``push_close_tx_hash``, ``push_close_nonce`` and ``push_signer``, and the
+# ``abort_reason`` value ``expired_empty``.
 SWAP_RECORD_SCHEMA_VERSION = 6
 #: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
 #: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours. The coordinator keeps
@@ -814,6 +814,11 @@ class SwapRecord:
     #: it can land, so an empty expired contract stays empty. Not evidence: the chain read is.
     push_close_tx_hash: str | None = None
     push_close_nonce: int | None = None
+    #: The address (lower-case) of the key that signs the token push at ``pending_push_nonce``,
+    #: written with the nonce before the push (#850 PR 7a). The nonce closed by ``close_push_nonce``
+    #: and the count read for ``EXPIRED_EMPTY_CLOSED`` are this key's; a resume with another key
+    #: is refused. ``None`` on a record written before it was kept.
+    push_signer: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -966,6 +971,20 @@ class SwapRecord:
             n = self.push_close_nonce
             if not isinstance(n, int) or isinstance(n, bool) or n < 0:
                 raise ValidationError("push_close_nonce must be a non-negative int")
+        if self.push_signer is not None:
+            if self.terms.counter_chain != "eth":
+                raise ValidationError("push_signer is an ETH counter-leg field")
+            if self.pending_push_nonce is None:
+                raise ValidationError("push_signer is recorded with pending_push_nonce: it names that nonce's key")
+            a = self.push_signer
+            if (
+                not isinstance(a, str)
+                or len(a) != 42
+                or not a.startswith("0x")
+                or a != a.lower()
+                or any(c not in "0123456789abcdef" for c in a[2:])
+            ):
+                raise ValidationError("push_signer must be a lower-case 0x-prefixed 20-byte hex address")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -1059,6 +1078,7 @@ class SwapRecord:
             or self.counter_refund_tx_hash is not None
             or self.counter_expiry_anchor is not None
             or self.push_close_tx_hash is not None
+            or self.push_signer is not None
             or (
                 not self.pending_counter_contract
                 and (self.pending_push_nonce is not None or self.pending_push_tx_hash is not None)
@@ -1113,6 +1133,8 @@ class SwapRecord:
         if self.push_close_tx_hash is not None:
             d["push_close_tx_hash"] = self.push_close_tx_hash
             d["push_close_nonce"] = self.push_close_nonce
+        if self.push_signer is not None:
+            d["push_signer"] = self.push_signer
         return d
 
     @classmethod
@@ -1174,6 +1196,7 @@ class SwapRecord:
             counter_expiry_anchor=d.get("counter_expiry_anchor"),
             push_close_tx_hash=d.get("push_close_tx_hash"),
             push_close_nonce=d.get("push_close_nonce"),
+            push_signer=d.get("push_signer"),
         )
 
 

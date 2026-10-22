@@ -126,6 +126,14 @@ def test_from_dict_does_not_coerce_single_source():
         (_eth_base, {"push_close_tx_hash": "0x" + "c7" * 31, "push_close_nonce": 1}),
         (_eth_base, {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": -1}),
         (_eth_base, {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": True}),
+        # 7a review: the push key, ETH only, with the push nonce, a lower-case 20-byte address
+        (_btc_base, {"push_signer": "0x" + "ab" * 20, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "0x" + "ab" * 20}),
+        (_eth_base, {"push_signer": "0x" + "AB" * 20, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "0x" + "ab" * 19, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "0x" + "zz" * 20, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": "ab" * 21, "pending_push_nonce": 7}),
+        (_eth_base, {"push_signer": 7, "pending_push_nonce": 7}),
     ],
 )
 def test_a_bad_record_field_is_refused(base, fields):
@@ -143,6 +151,7 @@ def test_a_bad_record_field_is_refused(base, fields):
         {"counter_refund_tx_hash": "0x" + "e1" * 32, "counter_refund_nonce": 0},
         {"counter_expiry_anchor": "0:0x" + "b1" * 32},
         {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": 0},
+        {"push_signer": "0x" + "ab" * 20, "pending_push_nonce": 0},
         {"abort_reason": AbortReason.EXPIRED_EMPTY, "state": SwapState.ABORTED},
     ],
 )
