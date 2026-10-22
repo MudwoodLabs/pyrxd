@@ -289,7 +289,14 @@ class TestEthAdversarial:
             _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
             _anvil_mine(url, 1)
             rec = await coord.taker_refund_btc()
-            assert rec.state is SwapState.ABORTED
+            # #850 PR 5b: our refund is RECORDED and the record waits for the chain; it does not go
+            # ABORTED on our broadcast. The refund mined (automine), but not yet at the finalized block.
+            assert rec.state is SwapState.PARAMS_MISMATCH and rec.counter_refund_tx_hash is not None
+            _anvil_mine(url, 3)  # --slots-in-an-epoch 1: finalized = latest - 2
+            rec = await coord.taker_refund_btc()
+            assert rec.state is SwapState.ABORTED, rec.state.value
+            assert rec.counter_disposition.kind == "refunded"
+            assert rec.counter_disposition.tx_hash == rec.counter_refund_tx_hash  # OUR refund, verified
         finally:
             await rpc.close()
 

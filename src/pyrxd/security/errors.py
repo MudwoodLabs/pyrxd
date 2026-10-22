@@ -33,7 +33,10 @@ __all__ = [
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
     "CounterLegClaimedByCounterparty",
+    "CounterLegPayoutReverts",
+    "CounterLegRefundNeedsOperator",
     "CounterLegSettledUnverified",
+    "CounterLegSingleSourceAnswer",
     "CovenantError",
     "DmintError",
     "FeePoolExhaustedError",
@@ -400,6 +403,39 @@ class RefundFeeUnaffordable(ValidationError):
         super().__init__(message)
         self.need_wei = need_wei
         self.have_wei = have_wei
+
+
+class CounterLegPayoutReverts(ValidationError):
+    """Our mined refund of the ETH counter leg reverted, and a refund now would revert the same way
+    because the PAYOUT fails: ``TransferFailed`` (the token refused to move, for example a frozen
+    address) or ``SendFailed`` (the refundee refused the ETH) (#850 PR 5b, design §2.3
+    ``PAYOUT_REVERTS``). Re-sending only burns gas until that changes, so nothing is re-sent
+    automatically. The contract stays unsettled and still refundable. ``reason`` is the contract
+    error's name, read from one endpoint's error text."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class CounterLegRefundNeedsOperator(ValidationError):
+    """Our ETH counter-leg refund is in a state an automatic step may not fix (#850 PR 5b, design
+    §3.4), and nothing more is sent until the operator has looked:
+
+    * it MINED and failed: ran out of gas although signed at or above the current estimate, or
+      reverted for a reason this does not recognise. ``taker_refund_btc(resend_reverted_refund=True)``
+      sends one more refund. ``tx_hash`` is the refund that mined.
+    * a transaction is pending at its nonce that is none of the refunds the record signed there (it
+      may be another transaction from the same key), or a lower nonce of the key is missing so ours
+      waits behind it. Nothing is replaced, and the flag does not change that. ``tx_hash`` is the
+      newest refund recorded.
+
+    ``cause`` says which: ``"mined_failed"`` (the flag applies) or ``"other_tx"`` (it does not)."""
+
+    def __init__(self, message: str, *, tx_hash: str, cause: str = "mined_failed") -> None:
+        super().__init__(message)
+        self.tx_hash = tx_hash
+        self.cause = cause
 
 
 class CounterLegClaimedByCounterparty(ValidationError):
@@ -770,3 +806,15 @@ class MaxAttemptsError(DmintError):
         super().__init__(*args)
         self.attempts = attempts
         self.elapsed_s = elapsed_s
+
+
+class CounterLegSingleSourceAnswer(NetworkError):
+    """The ETH counter leg reads settled (claimed or refunded) at the finalized block, but from ONE
+    endpoint, on a chain that carries value (#850, design §2.5 / D4). Nothing changes and nothing is
+    sent until a multi-source rpc agrees. A :class:`NetworkError`, so a library caller may retry; its
+    own type because retrying the SAME configuration never succeeds: configure more endpoints.
+    ``kind`` is what that endpoint answered (``"claimed"`` or ``"refunded"``)."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind

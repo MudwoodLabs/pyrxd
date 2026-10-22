@@ -1,4 +1,4 @@
-"""The coordinator acts on what the chain shows about the ETH counter leg (#850 PR 5a).
+"""The coordinator acts on what the chain shows about the ETH counter leg (#850 PRs 5a and 5b).
 
 `reconcile_counter_leg` and the read-first branch of `taker_refund_btc`, driven through the real
 `SwapCoordinator` and the real reader (`pyrxd.eth_wallet.disposition`) over the fake EVM chain of PR 4,
@@ -19,6 +19,7 @@ from pyrxd.gravity.swap_coordinator import SwapCoordinator
 from pyrxd.gravity.swap_state import AbortReason, RecordRole, SwapRecord, SwapRole, SwapState
 from pyrxd.security.errors import NetworkError, ValidationError
 from tests._fake_evm_chain import FakeEvmChain, FakeEvmEndpoint
+from tests._fake_evm_chain import _tx_hash as _fake_tx_hash
 from tests.test_swap_coordinator import (
     CoordinatorConfig,
     FakeEthLeg,
@@ -34,20 +35,84 @@ TIMEOUT_BLOCK = 80
 _COVENANT = "ef" * 32 + ":0"
 
 
+def refund_label(n: int) -> str:
+    """The label the fake chain hashes for our n-th refund, so ``chain.refund(block, label=...)``
+    mines exactly the transaction the leg signed."""
+    return f"our-refund-{n}"
+
+
 class _ChainLeg(FakeEthLeg):
-    """FakeEthLeg whose disposition is read by the REAL reader from the fake chain."""
+    """FakeEthLeg whose disposition is read by the REAL reader from the fake chain. Its refund signs
+    a hash the fake chain can later mine (:func:`refund_label`), reports it through ``on_signed``
+    before "broadcasting", and leaves it pending; ``refund_progress`` reads the fake chain."""
 
     def __init__(self, *a, rpc, **k):
         super().__init__(*a, **k)
         self._rpc = rpc
         self.refunds = 0
+        self.signed: list[tuple[str, int, object]] = []
+        self.undelivered: set[str] = set()
+        self.fees: dict[str, dict[str, int]] = {}
+        self.fail_broadcast = False
+        self.next_nonce = 7
+        self.dropped: set[str] = set()
+        self.nonce_taken: set[str] = set()
+        self.out_of_gas: set[str] = set()
+        self.reverted: set[str] = set()
+        self.estimate = 60_000
+        self.revert_reason = None
+        self.gas_limit = 150_000
 
-    async def counter_disposition(self, locator):
-        return await read_counter_disposition(self._rpc, locator)
+    async def counter_disposition(self, locator, **kwargs):
+        return await read_counter_disposition(self._rpc, locator, **kwargs)
 
-    async def refund(self, locator, timeout=None, **_k):
+    async def refund(self, locator, timeout=None, *, on_signed=None, replace=None):
         self.refunds += 1
-        return "0x" + "fe" * 32
+        tx = _fake_tx_hash(refund_label(self.refunds))
+        nonce = replace.nonce if replace is not None else self.next_nonce
+        if replace is None:
+            self.next_nonce += 1
+        if on_signed is not None:
+            await on_signed(tx, nonce)
+        self.signed.append((tx, nonce, replace))
+        base = {"maxFeePerGas": 100, "maxPriorityFeePerGas": 2}
+        self.fees[tx] = (
+            {k: v * 113 // 100 + 1 for k, v in replace.previous_fees.items()} if replace is not None else base
+        )
+        if self.fail_broadcast:
+            self.undelivered.add(tx)
+            from pyrxd.security.errors import NetworkError
+
+            raise NetworkError("eth_sendRawTransaction failed: replacement transaction underpriced")
+        return tx
+
+    async def refund_progress(self, tx_hash, nonce, *, earlier=()):
+        """Reads the fake chain. A refund is "held" by the node unless it is in ``undelivered`` (it
+        never reached the node) or was displaced by a later one we sent at the same nonce."""
+        from pyrxd.eth_wallet.htlc_leg import RefundProgress
+
+        if tx_hash in self.out_of_gas:
+            return RefundProgress("out_of_gas", gas_limit=self.gas_limit)
+        if tx_hash in self.reverted:
+            return RefundProgress("reverted", gas_limit=self.gas_limit)
+        if tx_hash in self.nonce_taken:
+            return RefundProgress("nonce_taken")
+        if tx_hash in self.dropped:
+            return RefundProgress("dropped")
+        for h in (tx_hash, *earlier):
+            receipt = self.chain.receipts.get(h)
+            if receipt is not None and receipt["status"] == 1:
+                return RefundProgress("mined")
+        for h in (tx_hash, *earlier):
+            if h not in self.undelivered and h in self.fees:
+                return RefundProgress("pending", fee_fields=dict(self.fees[h]))
+        return RefundProgress("pending", fee_fields=None)
+
+    async def refund_estimate(self, locator):
+        return self.estimate
+
+    async def refund_revert_reason(self, locator):
+        return self.revert_reason
 
 
 def _setup(*, state=SwapState.BTC_LOCKED, role=SwapRole.TAKER, endpoints=None, chain_kw=None, confs=None, pin=True):
@@ -57,6 +122,7 @@ def _setup(*, state=SwapState.BTC_LOCKED, role=SwapRole.TAKER, endpoints=None, c
     terms = _eth_terms(hashlock=hashlib.sha256(p).digest(), eth_timeout_unix_s=chain.timeout, now_unix_s=chain.ts(0))
     rpc = MultiSourceEthRpc(endpoints(chain) if endpoints else [FakeEvmEndpoint(chain) for _ in range(3)])
     leg = _ChainLeg(preimage=p, verdict=_final(), rpc=rpc)
+    leg.chain = chain
     rxd = FakeRadiantLeg()
     rxd.report_confs = confs
     record = SwapRecord(state=state, terms=terms).with_counter_lock(chain.locator())
@@ -251,10 +317,12 @@ async def test_the_taker_refund_waits_while_settled_only_at_the_tip():
     assert rec.state is SwapState.BTC_LOCKED and leg.refunds == 0
 
 
-async def test_HONEST_an_expired_unsettled_contract_is_refunded_as_before():
+async def test_HONEST_an_expired_unsettled_contract_is_refunded_and_the_record_waits_for_the_chain():
+    """5b: our refund is sent and RECORDED; the record no longer advances on our broadcast."""
     coord, _chain, leg = _setup(chain_kw={"finalized": 90})
     rec = await coord.taker_refund_btc()
-    assert leg.refunds == 1 and rec.state is SwapState.ABORTED and rec.abort_reason is None
+    assert leg.refunds == 1 and rec.state is SwapState.BTC_LOCKED
+    assert (rec.counter_refund_tx_hash, rec.counter_refund_nonce) == leg.signed[0][:2]
 
 
 async def test_HONEST_an_unknown_disposition_still_sends_as_before():
@@ -263,7 +331,7 @@ async def test_HONEST_an_unknown_disposition_still_sends_as_before():
 
     coord, _chain, leg = _setup(endpoints=throttled, chain_kw={"finalized": 90})
     rec = await coord.taker_refund_btc()
-    assert leg.refunds == 1 and rec.state is SwapState.ABORTED
+    assert leg.refunds == 1 and rec.state is SwapState.BTC_LOCKED and rec.counter_refund_tx_hash is not None
 
 
 async def test_a_seen_claim_records_and_still_refunds_but_holds_the_terminal():
@@ -394,15 +462,17 @@ async def test_a_recorded_seen_claim_is_not_overwritten_by_a_later_seen_one():
     assert rec.counter_claim_tx == "0x" + "aa" * 32
 
 
-async def test_one_endpoint_on_a_value_bearing_chain_falls_through_to_the_send_in_the_refund(monkeypatch):
-    """D4 in taker_refund_btc: a single-source terminal answer changes no state; the refund path
-    then behaves as on an unknown answer (the leg's own checks decide; a settled contract reverts)."""
+async def test_one_endpoint_on_a_value_bearing_chain_raises_in_the_refund_and_sends_nothing(monkeypatch):
+    """D4 in taker_refund_btc: a single-source terminal answer changes no state and sends nothing. 5a
+    fell through to a send (which reverts on a settled contract); with 5b's follow path a recorded
+    refund then waited for a quorum one endpoint can never give, silently (review of 5b, MEDIUM)."""
     coord, chain, leg = _setup(chain_kw={"finalized": 90})
     chain.refund(85)
     leg._rpc = FakeEvmEndpoint(chain)
     monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
-    await coord.taker_refund_btc()
-    assert leg.refunds == 1 and coord.record.counter_disposition is None
+    with pytest.raises(NetworkError, match="ONE endpoint"):
+        await coord.taker_refund_btc()
+    assert leg.refunds == 0 and coord.record.counter_disposition is None
 
 
 async def test_a_makers_mutual_refund_refuses_to_refund_the_covenant_after_a_verified_claim():

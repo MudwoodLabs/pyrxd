@@ -32,14 +32,20 @@ Single source: with one endpoint every answer is recorded ``single_source=True``
 change a record's state is the CONSUMER's rule (§2.5: never on a value-bearing chain), not this
 module's; this module only reports it.
 
-Not in this PR (each lands with the PR that produces its input, design §8): ``REFUND_PENDING`` and
-``PAYOUT_REVERTS`` (PR 5b), the expiry-anchor and historic-storage proofs of a refund (§2.3 (a), (b)),
-and ``EXPIRED_EMPTY_*`` (PR 7a).
+The expiry anchor (§2.3 (a), #850 PR 5b): an :attr:`DispositionKind.F_EXPIRED` answer carries
+``(F, hash(F))`` for the caller to persist. Passed back in, it proves a later settlement was a
+refund, because the contract was unsettled at a canonical block already at or past the timeout, and
+``claim()`` reverts from then on. Its hash is rechecked canonical, agreed, at every use.
+
+Not here: ``REFUND_PENDING`` and ``PAYOUT_REVERTS`` are the coordinator's reading of its OWN refund
+transaction (``SwapCoordinator.taker_refund_btc``, PR 5b), not of the contract; the historic-storage
+proof of a refund (§2.3 (b)); and ``EXPIRED_EMPTY_*`` (PR 7a).
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import re
 from collections.abc import Awaitable, Callable, Sequence
@@ -91,7 +97,7 @@ class DispositionKind(Enum):
     TIP_EXPIRED = "tip_expired"  # not settled at the tip, tip (MIN) at or past the timeout: a refund may be sent
     F_EXPIRED = "f_expired"  # not settled at F, and F itself is at or past the timeout
     SETTLED_UNFINAL = "settled_unfinal"  # settled at the tip, not yet at F: wait
-    REFUNDED = "refunded"  # settled at F, and a refund verified (§2.3 (d))
+    REFUNDED = "refunded"  # settled at F, and a refund verified (§2.3 (d)) or the expiry anchor holds (a)
     CLAIMED = "claimed"  # settled at F, and a claim verified, or Gap B
     UNKNOWN = "unknown"  # a read failed, fell below quorum, or the evidence contradicts itself
 
@@ -143,6 +149,9 @@ class CounterDisposition:
     logs_answered: frozenset[str] = frozenset()
     logs_failed: dict[str, str] = field(default_factory=dict)
     single_source: bool = False
+    #: ``(F, "0x" + hash(F))`` on an :attr:`DispositionKind.F_EXPIRED` answer: the expiry anchor to
+    #: persist (§2.3 (a)). ``None`` on every other answer.
+    expiry_anchor: tuple[int, str] | None = None
 
 
 # --------------------------------------------------------------------------- fan-out helpers
@@ -366,6 +375,7 @@ async def read_counter_disposition(
     *,
     from_block: int | None = None,
     recorded_refund_hashes: Sequence[str] = (),
+    expiry_anchor: tuple[int, str] | None = None,
 ) -> CounterDisposition:
     """The disposition of the counter-leg contract *locator* describes.
 
@@ -375,6 +385,9 @@ async def read_counter_disposition(
     ``from_block`` bounds the log scan (the deploy block). When ``None`` it is read from the deploy
     transaction's receipt, which needs a real ``locator.deploy_tx_hash``. ``recorded_refund_hashes``
     are refund transactions we sent ourselves, nominated alongside the logs and verified like them.
+    ``expiry_anchor`` is a ``(number, hash)`` this reader returned on an earlier ``F_EXPIRED`` answer
+    (§2.3 (a)); with the contract settled at ``F``, an anchor whose hash is still canonical proves a
+    refund even when no refund transaction can be verified.
 
     LIVENESS LIMITS, by design. One endpoint that nominates a transaction (a forged log) and then
     disagrees with the others about its receipt makes every answer for a SETTLED contract UNKNOWN for
@@ -390,6 +403,18 @@ async def read_counter_disposition(
     for h in recorded_refund_hashes:
         if not isinstance(h, str) or not h.startswith("0x") or len(h) != 66 or not _is_hex(h[2:]):
             raise ValidationError("recorded_refund_hashes must be 0x-prefixed 32-byte hex hashes")
+    if expiry_anchor is not None:
+        a_num, a_hash = expiry_anchor if isinstance(expiry_anchor, tuple) and len(expiry_anchor) == 2 else (None, None)
+        if (
+            not isinstance(a_num, int)
+            or isinstance(a_num, bool)
+            or a_num < 0
+            or not isinstance(a_hash, str)
+            or not a_hash.startswith("0x")
+            or len(a_hash) != 66
+            or not _is_hex(a_hash[2:])
+        ):
+            raise ValidationError("expiry_anchor must be (block number, 0x-prefixed 32-byte hex hash)")
     panel = _panel_of(rpc)
     single = len(panel.sources) == 1
     keys = tuple(sorted(_key(s) for s in panel.sources))
@@ -499,6 +524,23 @@ async def read_counter_disposition(
     if settled_f:
         if verified_refund and verified_claim:
             return unknown("both a refund and a claim verify for one contract (rule 2)", finalized, **common)
+        if expiry_anchor is not None and await _anchor_holds(panel, expiry_anchor, finalized):
+            # §2.3 (a). Unsettled at a canonical block already at or past the timeout: claim() has
+            # reverted ever since, so whatever settled the contract later was a refund. The anchor
+            # outranks nominations (an unverifiable one cannot make this UNKNOWN), not invariants.
+            # An anchor that no longer holds is simply not used (design §7.2 scenario 10).
+            if verified_claim:
+                return unknown(
+                    "a verified claim beside an expiry anchor (a claim after the timeout)", finalized, **common
+                )
+            if f_ts < timeout:
+                return unknown("an expiry anchor beside a finalized block before the timeout", finalized, **common)
+            return done(
+                DispositionKind.REFUNDED,
+                "settled at the finalized block after the expiry anchor, so by a refund",
+                verified_refund,
+                terminal=True,
+            )
         if incomplete:
             return unknown(
                 "settled, but a nominated transaction could not be checked: " + "; ".join(incomplete),
@@ -550,10 +592,27 @@ async def read_counter_disposition(
     if settled_tip:
         return done(DispositionKind.SETTLED_UNFINAL, "settled at the tip, not yet at the finalized block")
     if f_ts >= timeout:
-        return done(DispositionKind.F_EXPIRED, "not settled, and the finalized block is at or past the timeout")
+        return dataclasses.replace(
+            done(DispositionKind.F_EXPIRED, "not settled, and the finalized block is at or past the timeout"),
+            expiry_anchor=(finalized, "0x" + bytes(f_hash).hex()),
+        )
     if tip_ts >= timeout:
         return done(DispositionKind.TIP_EXPIRED, "not settled, and the tip is at or past the timeout")
     return done(DispositionKind.OPEN, "not settled, and before the timeout")
+
+
+async def _anchor_holds(panel: _Panel, anchor: tuple[int, str], finalized: int) -> bool:
+    """Whether the expiry anchor's block is at or below ``F`` and its hash is still the canonical
+    hash at that height, agreed. A read that fails or disagrees is "does not hold": the anchor is
+    then not used, and the answer rests on the other evidence alone."""
+    number, block_hash = anchor
+    if number > finalized:
+        return False
+    try:
+        canonical = await _identity(panel, lambda s: s.canonical_block_hash(number), f"canonical_block_hash({number})")
+    except _BelowQuorum:
+        return False
+    return "0x" + bytes(canonical).hex() == block_hash.lower()
 
 
 def _is_hex(text: str) -> bool:

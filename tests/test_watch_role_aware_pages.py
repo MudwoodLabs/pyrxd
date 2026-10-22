@@ -128,6 +128,21 @@ def test_an_eth_taker_record_with_the_covenant_observed_pages_past_the_deadline(
     assert d.autonomous_btc_refund is False
 
 
+@pytest.mark.parametrize("pending", [None, "0x" + "e1" * 32])
+def test_the_eth_refund_page_names_our_recorded_refund_while_it_is_not_final(pending) -> None:
+    """#850 PR 5b (design §4.4, M6): the record now stays BTC_LOCKED after our refund is sent, so the
+    page keeps firing until the refund is final. It names the recorded refund, so it reads as "follow
+    it", not "send one"."""
+    rec = dataclasses.replace(_eth(SwapState.BTC_LOCKED), role=RecordRole.TAKER)
+    if pending is not None:
+        rec = dataclasses.replace(rec, counter_refund_tx_hash=pending, counter_refund_nonce=3)
+    d = _decide_e(rec, _eth_btc_locked_obs(now_unix_s=4_000_000_001, lock=LOCK))
+    assert d.intent is Intent.PAGE_REFUND and d.recommended_action == "taker_refund_btc"
+    assert ("is recorded and not yet final" in d.reason) is (pending is not None)
+    if pending is not None:
+        assert pending in d.reason
+
+
 # --------------------------------------------------------------------------- the claim race
 
 

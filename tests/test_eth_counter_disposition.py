@@ -624,3 +624,47 @@ def test_which_refusals_halve_the_range(text, halves):
     from pyrxd.eth_wallet.disposition import _is_range_limit
 
     assert _is_range_limit(Exception(text)) is halves
+
+
+# --------------------------------------------------------------------------- the expiry anchor (#850 PR 5b)
+
+
+def _anchor(number: int) -> tuple[int, str]:
+    from tests._fake_evm_chain import _block_hash
+
+    return number, "0x" + _block_hash(number).hex()
+
+
+async def test_an_anchor_beside_a_verified_claim_is_unknown_not_refunded():
+    """Mythos review of #894 (F3): unpinned. A claim cannot succeed after a canonical unsettled block at
+    or past the timeout, so both together mean a lie somewhere; the anchor must not win."""
+    chain = _chain(finalized=90)
+    chain.force_receipt(
+        85, topic0=CLAIMED_TOPIC0, data="0x" + chain.preimage.hex(), label="impossible-claim", settles=True
+    )
+    d = await _read(_quorum(chain), chain, expiry_anchor=_anchor(82))
+    assert d.kind is DispositionKind.UNKNOWN and "claim" in d.reason
+
+
+async def test_an_anchor_beside_a_finalized_block_before_the_timeout_is_unknown_not_refunded():
+    chain = _chain(finalized=70)
+    chain.claim(50)
+    hidden = [FakeEvmEndpoint(chain, hide_claimed=True) for _ in range(3)]
+    d = await _read(MultiSourceEthRpc(hidden), chain, expiry_anchor=_anchor(65))
+    assert d.kind is DispositionKind.UNKNOWN and "before the timeout" in d.reason
+
+
+async def test_HONEST_without_the_anchor_that_settlement_is_gap_b_claimed():
+    chain = _chain(finalized=70)
+    chain.claim(50)
+    hidden = [FakeEvmEndpoint(chain, hide_claimed=True) for _ in range(3)]
+    assert (await _read(MultiSourceEthRpc(hidden), chain)).kind is DispositionKind.CLAIMED
+
+
+async def test_HONEST_an_anchor_proves_a_refund_with_no_log_and_no_hash():
+    chain = _chain(finalized=90)
+    chain.refund(85, label="someone")
+    logless = [FakeEvmEndpoint(chain, hide_all_logs=True) for _ in range(3)]
+    d = await _read(MultiSourceEthRpc(logless), chain, expiry_anchor=_anchor(82))
+    assert d.kind is DispositionKind.REFUNDED and d.evidence.tx_hash is None
+    assert (await _read(MultiSourceEthRpc(logless), chain)).kind is DispositionKind.UNKNOWN  # without it

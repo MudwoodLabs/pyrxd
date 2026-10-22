@@ -82,6 +82,61 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **On an ETH swap, `taker_refund_btc` no longer moves the record on our own refund's broadcast
+  (#850 PR 5b) [Changed (breaking)].** The record stays `BTC_LOCKED` (or `PARAMS_MISMATCH`) until
+  the chain shows the counter-leg contract refunded at the finalized block, and only then goes to
+  `ABORTED`. Call `taker_refund_btc` again to follow it. A BTC counter leg is unchanged: it still
+  goes to `ABORTED` on broadcast (#850 PR 9a).
+  - Our refund's hash and nonce are written to the record between signing and broadcasting, as
+    `counter_refund_tx_hash` and `counter_refund_nonce`. If that write fails, nothing is sent.
+  - A retry reads what happened to the recorded refund before it sends anything. A refund that
+    was dropped, or whose nonce another transaction used, is sent again. A refund still pending after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not measured) is
+    replaced at the same nonce, with both fee fields raised from the pending transaction's own. A
+    refund that ran out of gas is sent once more, and only when the current estimate is above the
+    limit it was signed with. The record keeps the earlier refunds signed at the same nonce
+    (`counter_refund_replaced_tx_hashes`, at most 16), because a replacement can lose to the one it
+    replaced or never reach the node. Any of them mined is what happened, and the next replacement
+    is priced over whichever one the node still holds. When a transaction is pending at the nonce
+    and it is none of these, it may be another transaction from the same key. It is never replaced:
+    `CounterLegRefundNeedsOperator` is raised after the wait, and the flag below does not override
+    it.
+  - A mined refund that reverted is not sent again. The new `CounterLegPayoutReverts` is raised
+    when a refund now would revert `TransferFailed` or `SendFailed`, meaning the payout itself
+    fails. The new `CounterLegRefundNeedsOperator` is raised for any other revert, and for an
+    out-of-gas refund the estimate does not exceed. After checking,
+    `taker_refund_btc(resend_reverted_refund=True)` sends one more refund. That flag does not
+    override `CounterLegPayoutReverts`. Both errors are `ValidationError`s.
+  - A terminal answer read from one endpoint on a chain that carries value now raises the new
+    `CounterLegSingleSourceAnswer` (a `NetworkError`) from `taker_refund_btc` and from
+    `reconcile_counter_leg`, and sends nothing. Retrying the same configuration never gets past it.
+  - The expiry anchor. The first quorum read that finds the contract unsettled at a finalized
+    block that is at or past the timeout records that block as `counter_expiry_anchor`. After that
+    block no claim can succeed, so once the contract is settled at a later finalized block, the
+    anchor proves it was refunded, with or without a refund transaction or log to verify. Its hash
+    is rechecked canonical at each use. An anchor that no longer checks out is not used. A read
+    from one endpoint on a chain that carries value records no anchor.
+    `read_counter_disposition` takes the new `expiry_anchor=` argument and returns
+    `CounterDisposition.expiry_anchor` on an `F_EXPIRED` answer.
+  - `EthHtlcContractLeg.refund` (and the token and gravity legs that forward it): `on_signed` is
+    now awaited with `(tx_hash, nonce)`, not just the hash. The new `replace=RefundReplacement(...)`
+    signs at a given nonce with raised fees. New read-only methods: `refund_progress(tx_hash,
+    nonce, earlier=())`, which returns a `RefundProgress` (`pending`, `dropped`, `nonce_taken`, `mined`,
+    `out_of_gas`, `reverted` or `nonce_gap`), `refund_estimate` and `refund_revert_reason`.
+    `nonce_gap` means the key's latest nonce is below the refund's: an earlier transaction of the
+    key is missing, so nothing is re-sent and `CounterLegRefundNeedsOperator` is raised with
+    `cause="other_tx"`. Every refund recorded at the nonce, not only the newest, is nominated to the
+    disposition reader, so an earlier one that mined proves the refund by its hash.
+  - `scripts/eth_swap_two_host.py --role taker --phase abort` now polls until the record is
+    terminal. The new `--abort-poll-timeout-s` sets how long (7200 s by default; 0 means one
+    pass). A run that times out leaves the record as it is, and running the phase again follows
+    the recorded refund. The pre-check that refuses a settled or claimed HTLC runs only before our
+    refund is recorded, because after that a contract settled at the tip is most likely our own
+    refund. `--phase refund` refuses while a refund recorded by `--phase abort` is being followed,
+    because `mutual_refund` would send a second one beside it.
+  - `SWAP_RECORD_SCHEMA_VERSION` is 5. A record carrying any of the new fields writes 5. Do not
+    drive one record with mixed pyrxd versions. A pyrxd from before this change refuses a v5
+    record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x
+    `taker_refund_btc` would send again, go to `ABORTED`, and drop the recorded hash.
 - **On an ETH swap, the coordinator now acts on what the chain shows about the counter leg, not
   only on what it broadcast (#850 PR 5a) [Changed (breaking)].** The disposition is read with
   `pyrxd.eth_wallet.disposition` at the quorum-minimum finalized block.

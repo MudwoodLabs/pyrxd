@@ -285,13 +285,13 @@ async def test_claim_refund_fetch_verdict_delegate(monkeypatch):
     # refund ignores the BTC-shaped relative Timelock the coordinator passes
     assert await leg.refund(loc, timeout="ignored-relative-timelock") == "0xrefund"
     assert seen["refund"] is loc
-    assert seen["refund_kw"] == {"on_signed": None}
+    assert seen["refund_kw"] == {"on_signed": None, "replace": None}
 
     async def hook(_h):
         return None
 
-    await leg.refund(loc, on_signed=hook)
-    assert seen["refund_kw"] == {"on_signed": hook}  # #850 PR 4a: forwarded unchanged
+    await leg.refund(loc, on_signed=hook, replace="r")
+    assert seen["refund_kw"] == {"on_signed": hook, "replace": "r"}  # #850 PRs 4a, 5b: forwarded unchanged
     assert await leg.fetch_claim_artifacts("0xtx") == [b"blob"]
     assert seen["fetch"] == "0xtx"
     v = await leg.claim_finality_verdict("0xtx")

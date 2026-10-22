@@ -590,7 +590,11 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         )
 
     async def refund(
-        self, locator: EthHtlcLocator, *, on_signed: Callable[[str], Awaitable[None]] | None = None
+        self,
+        locator: EthHtlcLocator,
+        *,
+        on_signed: Callable[[str, int], Awaitable[None]] | None = None,
+        replace: Any = None,
     ) -> str:
         """Refund after the timeout, refusing up front when the contract holds nothing to refund.
 
@@ -631,7 +635,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                     "Do not record this swap as refunded.",
                     contract_address=locator.contract_address,
                 )
-        return await super().refund(locator, on_signed=on_signed)
+        return await super().refund(locator, on_signed=on_signed, replace=replace)
 
     async def _read_every_endpoint(self, read: Callable[[Any], Awaitable[Any]], *, label: str) -> list[Any]:
         """``read`` against every configured endpoint; all must answer, or this raises.

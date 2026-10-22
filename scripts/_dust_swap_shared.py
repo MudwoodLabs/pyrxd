@@ -230,8 +230,8 @@ _LOCK_CLAIM = (
 )
 _TAKER_OWN_LEG = (
     "allow",
-    "the taker's own counter leg; a terminal state is written at broadcast, so re-sending a dropped "
-    "refund stays possible",
+    "the taker's own counter leg; on BTC a terminal state is written at broadcast, and on ETH the record "
+    "stays open until the refund is final at the finalized block, so a dropped refund can be sent again",
 )
 _TAKER_P_PUBLIC = (
     "refuse",

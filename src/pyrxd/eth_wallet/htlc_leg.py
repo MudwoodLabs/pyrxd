@@ -40,6 +40,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from pyrxd.eth_wallet.locator import EthHtlcLocator, normalise_tx_hash
@@ -60,7 +61,15 @@ from pyrxd.security.errors import (
 from pyrxd.security.reveal import mark_reveal_crossed, watching_for_reveal
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-__all__ = ["REFUND_GAS_LIMIT", "EthHtlcContractLeg", "create_address", "load_artifact", "refund_ran_out_of_gas"]
+__all__ = [
+    "REFUND_GAS_LIMIT",
+    "EthHtlcContractLeg",
+    "RefundProgress",
+    "RefundReplacement",
+    "create_address",
+    "load_artifact",
+    "refund_ran_out_of_gas",
+]
 
 #: ``immutableReferences`` and ``immutable_names`` are REQUIRED AT CONSTRUCTION, not merely at verify
 #: time. The exact runtime compare in :meth:`EthHtlcContractLeg._expected_runtime` cannot be built
@@ -375,6 +384,50 @@ def refund_ran_out_of_gas(receipt: dict[str, Any], *, gas_limit: int) -> bool:
     status = _int_or_none(receipt.get("status"))
     used = _int_or_none(receipt.get("gasUsed"))
     return status == 0 and used is not None and used >= int(gas_limit) - int(gas_limit) // 64
+
+
+#: Revert names :meth:`EthHtlcContractLeg.refund_revert_reason` recognises, both contracts' custom
+#: errors that ``refund()`` can raise. Matched by 4-byte selector in the node's error text.
+_REFUND_REVERTS = ("AlreadySettled", "NotYetExpired", "NothingToRefund", "TransferFailed", "SendFailed")
+
+
+@dataclass(frozen=True)
+class RefundReplacement:
+    """Replace our pending refund at ``nonce``: the new one is priced from the pending one's own fee
+    fields (``previous_fees``), raised enough that a node accepts it as a replacement
+    (:func:`pyrxd.eth_wallet.replacement.bump_replacement_fees`)."""
+
+    nonce: int
+    previous_fees: dict[str, int]
+
+
+@dataclass(frozen=True)
+class RefundProgress:
+    """What happened to a refund we signed, read from the chain by hash and nonce (#850 PR 5b,
+    design §3.4). ``kind`` is one of:
+
+    * ``"pending"``: not mined, and the broadcasting endpoint holds a transaction at its nonce;
+      ``fee_fields`` are the fees of the first of our hashes the endpoint returns, ``None`` when it
+      returns none of them (the pending transaction may then be one we did not sign).
+    * ``"dropped"``: not mined, the key's latest nonce equals it, and nothing is pending there.
+    * ``"nonce_gap"``: not mined, and the key's latest nonce is BELOW it: an earlier transaction from
+      this key is missing, so ours cannot mine yet.
+    * ``"nonce_taken"``: not mined, and another transaction mined at its nonce.
+    * ``"mined"``: mined with ``status == 1``. Says nothing about finality.
+    * ``"out_of_gas"``: mined ``status == 0`` having used at least 63/64 of ``gas_limit``, the limit
+      it was signed with (:func:`refund_ran_out_of_gas`).
+    * ``"reverted"``: mined ``status == 0`` for any other reason.
+
+    The receipt is a quorum read on a multi-source rpc; the nonce counts and the transaction body
+    are the broadcasting endpoint's, the node whose mempool the refund went to.
+    """
+
+    kind: str
+    gas_limit: int | None = None
+    fee_fields: dict[str, int] | None = None
+    #: Which of our hashes this is about: the one that MINED (``mined``, ``out_of_gas``,
+    #: ``reverted``) or the one the node HOLDS (``pending`` with fees). ``None`` otherwise.
+    tx_hash: str | None = None
 
 
 #: How long the claim-confirmation read will wait for the OTHER endpoints to catch up with the
@@ -1122,14 +1175,22 @@ class EthHtlcContractLeg:
         return tx_hash
 
     async def refund(
-        self, locator: EthHtlcLocator, *, on_signed: Callable[[str], Awaitable[None]] | None = None
+        self,
+        locator: EthHtlcLocator,
+        *,
+        on_signed: Callable[[str, int], Awaitable[None]] | None = None,
+        replace: RefundReplacement | None = None,
     ) -> str:
         """Taker: call refund() after timeout; returns the tx hash. Taker-unilateral
         (no maker signature; the contract pays the immutable refundee).
 
-        ``on_signed`` is awaited with the tx hash after signing and before the broadcast, as for
-        ``fund`` (#502 item 2), so a caller can record the refund before it can be mined. Nothing
-        passes it yet; PR 5b of #850 records the pending refund through it.
+        ``on_signed`` is awaited with ``(tx_hash, nonce)`` after signing and before the broadcast, as
+        for ``fund`` (#502 item 2), so a caller can record the refund before it can be mined; it is how
+        the coordinator records a pending refund (#850 PR 5b). An exception from it stops the send.
+
+        ``replace`` signs at that nonce, with both fee fields raised from the pending refund's own
+        (never below the current quote), so the node takes it as a replacement rather than as a
+        second transaction (#850 PR 5b, design §3.4).
 
         Gas (#850 PR 4a): ``eth_estimateGas`` runs first and must come in at or under
         :data:`REFUND_GAS_LIMIT`, or this raises :class:`RefundGasAboveCeiling`. The refund is signed
@@ -1160,6 +1221,16 @@ class EthHtlcContractLeg:
             )
         c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         built = dict(await c.functions.refund().build_transaction(await self._base_tx(gas=REFUND_GAS_LIMIT)))
+        if replace is not None:
+            from pyrxd.eth_wallet.replacement import bump_replacement_fees
+
+            nonce = replace.nonce
+            if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
+                raise ValidationError("replace.nonce must be a non-negative int")
+            bumped = bump_replacement_fees(dict(replace.previous_fees))
+            built["nonce"] = nonce
+            for fee in ("maxFeePerGas", "maxPriorityFeePerGas"):
+                built[fee] = max(int(bumped[fee]), int(built[fee]))
         # The estimate FIRST, with no gas field: it is the one read that can say "needs more than the
         # limit". A preflight at the limit would fail first with an untyped out-of-gas or a
         # SendFailed and hide that (review of PR 4a). A contract revert (premature, settled) is
@@ -1189,7 +1260,93 @@ class EthHtlcContractLeg:
                 "because the sender could not hold more at the quoted fee; at that limit the call may simply "
                 "have run out of gas. Add ETH to the sender and retry before concluding the refund cannot succeed."
             ) from exc
-        return await self._sign_and_send(built, preflight=False, on_signed=on_signed)
+        hook = None
+        if on_signed is not None:
+            signed_nonce = int(built["nonce"])
+
+            async def hook(tx_hash: str) -> None:
+                await on_signed(tx_hash, signed_nonce)
+
+        return await self._sign_and_send(built, preflight=False, on_signed=hook)
+
+    async def refund_progress(self, tx_hash: str, nonce: int, *, earlier: tuple[str, ...] = ()) -> RefundProgress:
+        """What happened to the refund we signed as ``tx_hash`` at ``nonce`` (:class:`RefundProgress`).
+        ``earlier`` are refunds we signed before it at the same nonce (a replacement may lose to the
+        one it replaced, or never reach the node): any of them mined is what happened, and the fees of
+        whichever one the endpoint still holds are what a replacement must beat. Read-only. A read
+        that fails raises; the caller then decides nothing."""
+        hashes = (tx_hash, *earlier)
+        receipt, mined_hash = None, tx_hash
+        for h in hashes:
+            receipt = await self._rpc.get_transaction_receipt(h)
+            if receipt is not None:
+                mined_hash = h
+                break
+        if receipt is None:
+            addr = self._account_address()
+            latest = int(await self._rpc.get_transaction_count(addr, "latest"))
+            if latest > nonce:
+                return RefundProgress("nonce_taken")
+            if latest < nonce:
+                # A lower nonce of this key is unmined: ours (if the node holds it) is queued behind a
+                # gap and cannot mine, and "pending" may count only up to the gap (Mythos, #894 F2).
+                return RefundProgress("nonce_gap")
+            pending = int(await self._rpc.get_transaction_count(addr, "pending"))
+            if pending <= nonce:
+                return RefundProgress("dropped")
+            find = getattr(self._rpc, "find_transaction", None)
+            for h in hashes:
+                if find is not None:
+                    # "Not held" is an ANSWER (None); a failed read raises and decides nothing. Read as
+                    # one, a 429 made our own pending refund look like a transaction we did not sign
+                    # (review round 3 of #850 PR 5b).
+                    tx = await find(h)
+                else:  # a duck-typed rpc without it: any failure reads as "not held"
+                    try:
+                        tx = await self._rpc.get_transaction(h)
+                    except Exception as exc:
+                        _LOG.info("refund %s could not be read back by hash: %s", h, exc)
+                        tx = None
+                if tx is not None:
+                    return RefundProgress(
+                        "pending",
+                        fee_fields={k: int(tx[k]) for k in ("maxFeePerGas", "maxPriorityFeePerGas")},
+                        tx_hash=h,
+                    )
+            return RefundProgress("pending", fee_fields=None)
+        status = _int_or_none(receipt.get("status"))
+        if status == 1:
+            return RefundProgress("mined", tx_hash=mined_hash)
+        gas_limit = int((await self._rpc.get_transaction(mined_hash))["gas"])
+        if refund_ran_out_of_gas(receipt, gas_limit=gas_limit):
+            return RefundProgress("out_of_gas", gas_limit=gas_limit, tx_hash=mined_hash)
+        return RefundProgress("reverted", gas_limit=gas_limit, tx_hash=mined_hash)
+
+    async def refund_estimate(self, locator: EthHtlcLocator) -> int:
+        """``eth_estimateGas`` for a refund of *locator* now. A typed revert raises
+        :class:`ValidationError`; see :meth:`refund_revert_reason` to name it."""
+        c = self._rpc.write_w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+        built = dict(await c.functions.refund().build_transaction(await self._base_tx(gas=REFUND_GAS_LIMIT)))
+        return int(await self._rpc.estimate_gas(built))
+
+    async def refund_revert_reason(self, locator: EthHtlcLocator) -> str | None:
+        """Why a refund of *locator* would revert NOW: the contract error's name when the node's typed
+        revert carries a selector this knows (``AlreadySettled``, ``TransferFailed``, ...),
+        ``"unrecognised: <text>"`` for any other typed revert, or ``None`` when it would not revert.
+
+        The text is one endpoint's, so this NAMES a revert; it must not be what decides to move
+        value. The coordinator uses it only to choose which refusal to raise."""
+        from pyrxd.eth_wallet.events import function_selector
+
+        try:
+            await self.refund_estimate(locator)
+        except ValidationError as exc:
+            text = str(exc).lower()
+            for name in _REFUND_REVERTS:
+                if "0x" + function_selector(f"{name}()").hex() in text:
+                    return name
+            return f"unrecognised: {str(exc)[:200]}"
+        return None
 
     async def _affordable_refund_gas(self, built: dict[str, Any], *, estimate: int, contract: str) -> int:
         """The refund's gas limit: :data:`REFUND_GAS_LIMIT`, or less when the sender cannot hold

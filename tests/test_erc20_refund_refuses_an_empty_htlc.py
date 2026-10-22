@@ -190,7 +190,7 @@ async def test_the_real_parent_reports_not_yet_mature_as_a_NetworkError(monkeypa
 
 
 async def test_on_signed_is_forwarded_to_the_parent_refund(rig) -> None:
-    """#850 PR 4a: the token leg passes the signed-hash hook through, unchanged."""
+    """#850 PRs 4a and 5b: the token leg passes the signed hook and the replacement through, unchanged."""
     _run, state = rig
 
     async def hook(_h):
@@ -198,5 +198,5 @@ async def test_on_signed_is_forwarded_to_the_parent_refund(rig) -> None:
 
     state.update(now=_TIMEOUT, settled=False, balance=5)
     state["leg"]._rpc.now = _TIMEOUT
-    await state["leg"].refund(_locator(), on_signed=hook)
-    assert state["parent_kw"] == {"on_signed": hook}
+    await state["leg"].refund(_locator(), on_signed=hook, replace="r")
+    assert state["parent_kw"] == {"on_signed": hook, "replace": "r"}
