@@ -700,14 +700,18 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
     )
 
     try:
+        if eth_claim_tx is None and coord.record.counter_claim_tx is not None:
+            # A claim an earlier phase's chain read recorded (#850 PR 5a).
+            eth_claim_tx = coord.record.counter_claim_tx
+            print(f"  maker_claim.json absent; using the claim tx {eth_claim_tx} this host's record holds")
         if eth_claim_tx is None:
-            eth_claim_tx = await eth_leg.observed_claim_tx(loc)
+            eth_claim_tx, why = await _claim_tx_from_the_chain(eth_leg, loc)
             if eth_claim_tx is None:
                 raise SystemExit(
                     f"no {claim_path} and no claim found in the logs of this swap's HTLC "
-                    f"{loc.contract_address} through this RPC. That is NOT proof the maker has not claimed: "
-                    "this RPC may not serve the contract's log history. Check its events on another RPC or an "
-                    "explorer; if there is a Claimed event, write its tx hash into "
+                    f"{loc.contract_address} through this RPC ({why}). That is NOT proof the maker has not "
+                    "claimed: this RPC may not serve the contract's log history. Check its events on another RPC "
+                    "or an explorer; if there is a Claimed event, write its tx hash into "
                     f'{claim_path} as {{"eth_claim_tx_hash": "0x…"}} and re-run this phase. It must run '
                     f"before the covenant's CSV refund to the maker opens, t_rxd = {terms.t_rxd.value} "
                     f"{terms.t_rxd.unit.value} after the covenant was mined."
@@ -767,6 +771,23 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
             raise SystemExit(f"unexpected state {rec.state.value}; operator must intervene")
     finally:
         await rpc.close()
+
+
+async def _claim_tx_from_the_chain(eth_leg, loc: EthHtlcLocator) -> tuple[str | None, str]:
+    """A claim of this swap's HTLC found by the coordinator's disposition reader (#850 PR 6; it was
+    ``EthLeg.observed_claim_tx``, a single-endpoint scan). Returns ``(tx hash or None, why)``.
+
+    A claim proven at the finalized block comes first, then a ``Claimed`` log that verifies, then
+    one that opens H but does not verify (yet). It is only a NOMINATION either way:
+    ``taker_observed_reveal`` verifies it from the chain before anything is claimed."""
+    disposition = await eth_leg.counter_disposition(loc)
+    evidence = disposition.evidence
+    if disposition.kind.value == "claimed" and evidence is not None and evidence.tx_hash:
+        return evidence.tx_hash, "a claim verified at the finalized block"
+    seen = sorted(disposition.claims_seen, key=lambda c: not c.verified)
+    if seen:
+        return seen[0].tx_hash, "a Claimed log that opens H"
+    return None, f"the chain read says {disposition.kind.value}: {disposition.reason}"
 
 
 # ---------------------------------------------------------------------------
@@ -966,7 +987,7 @@ class _CapturingEthLeg:
 #                    refundee, which is the taker. The Radiant leg is built with _NoFeeSource, so
 #                    this phase cannot broadcast a covenant spend at all.
 #
-#   (taker, refund)  SwapCoordinator.mutual_refund()         BOTH_LOCKED -> BOTH_LOCKED
+#   (taker, refund)  SwapCoordinator.mutual_refund()         BOTH_LOCKED -> MUTUAL_REFUND
 #                    The taker's ETH leg ONLY (#850). The covenant refund needs no maker key —
 #                    build_htlc_refund_tx puts <OP_1> and nothing else in the covenant scriptSig —
 #                    so the taker COULD send it, and this phase used to. It must not: if the maker
@@ -974,7 +995,9 @@ class _CapturingEthLeg:
 #                    with the revealed p, and a covenant refund sent from here pays the maker
 #                    instead. A TAKER-role coordinator's mutual_refund refuses to send it on an ETH
 #                    counter leg, and the Radiant leg here is built with _NoFeeSource as well. The
-#                    record stays BOTH_LOCKED: the covenant is still locked, and still the maker's.
+#                    record goes to MUTUAL_REFUND once the ETH HTLC reads refunded at the finalized
+#                    block (#850 PR 6): for a taker that means "my leg is back; the covenant is the
+#                    maker's". It does not say the covenant was refunded.
 #
 #   (maker, refund)  SwapCoordinator.maybe_refund_asset_on_maker_stall()
 #                                                    BOTH_LOCKED -> ASSET_REFUNDED_TAKER_ACTS
@@ -1026,8 +1049,10 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
     spend dispenses a fee input first. The covenant's CSV refund pays the MAKER; leaving it alone is
     the unwind working as designed, not value the taker is giving up.
 
-    It sends the same counter-leg refund as ``--phase refund``, so it runs the same pre-check
-    (refuse when the HTLC is settled or a claim is found) and the same failure explanation.
+    The coordinator reads what the chain shows about the ETH HTLC before it sends anything (#850 PR
+    5a): a claim proven there ends the phase pointing at ``--phase claim``, and a refund already
+    final ends it ABORTED. Since #850 PR 6 that read is also what explains a refund that could not be
+    sent; the single-endpoint pre-check and failure explanation this phase used to run are gone.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
@@ -1067,41 +1092,14 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
             print(f"  maker's covenant: could not be read ({str(exc)[:120]}) — not needed for this refund.")
 
         if coord.record.counter_refund_tx_hash is None:
-            # The same pre-check as --phase refund (#850 PR R, review F2): this phase sends the same
-            # counter-leg refund, so a settled or claimed HTLC must stop it here too. Only before
-            # OUR refund is recorded (#850 PR 5b): after it, a contract settled at the tip is most
-            # likely our own refund, and the coordinator's chain read is what decides.
-            await _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc, terms)
             confirm(
                 "taker_refund_btc: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
                 auto_yes=args.yes,
             )
         else:
             print(f"  our ETH refund is already recorded ({coord.record.counter_refund_tx_hash}); following it.")
-        # --resend-reverted-refund is ONE more refund, so it applies to the first pass only: on every
-        # pass it would re-send each time the new refund reverted too, for as long as the phase polls.
-        resend_once = [bool(getattr(args, "resend_reverted_refund", False))]
-
-        async def step():
-            from pyrxd.security.errors import NetworkError
-
-            signed_before = coord.record.counter_refund_tx_hash
-            try:
-                rec = await coord.taker_refund_btc(resend_reverted_refund=resend_once[0])
-            except NetworkError:
-                # A failed READ decided nothing, so the flag stays for the next pass. A failed
-                # BROADCAST may still have delivered the refund the flag paid for: a refund was
-                # signed (the recorded hash moved), so the flag is spent (review round 2 of 5b).
-                if coord.record.counter_refund_tx_hash != signed_before:
-                    resend_once[0] = False
-                raise
-            except Exception:
-                resend_once[0] = False
-                raise
-            resend_once[0] = False
-            return rec
-
-        rec = await _poll_taker_refund_to_terminal(args, coord, loc, step)
+        step = _refund_step(args, coord, lambda resend: coord.taker_refund_btc(resend_reverted_refund=resend))
+        rec = await _poll_taker_refund_to_terminal(args, coord, step, phase="abort")
         if rec.state is SwapState.SECRET_REVEALED:
             raise SystemExit(
                 "the record is secret_revealed: the maker's CLAIM of the ETH HTLC verified at the finalized block, "
@@ -1124,54 +1122,89 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
         await rpc.close()
 
 
-def _next_after_refusal(exc) -> str:
+def _refund_step(args, coord, call):
+    """One pass of a taker step that sends or follows our ETH refund. ``--resend-reverted-refund`` is
+    ONE more refund, so it applies to the first pass only: on every pass it would re-send each time
+    the new refund reverted too, for as long as the phase polls."""
+    resend_once = [bool(getattr(args, "resend_reverted_refund", False))]
+
+    async def step():
+        signed_before = coord.record.counter_refund_tx_hash
+        try:
+            rec = await call(resend_once[0])
+        except NetworkError:
+            # A failed READ decided nothing, so the flag stays for the next pass. A failed
+            # BROADCAST may still have delivered the refund the flag paid for: a refund was
+            # signed (the recorded hash moved), so the flag is spent (review round 2 of 5b).
+            if coord.record.counter_refund_tx_hash != signed_before:
+                resend_once[0] = False
+            raise
+        except Exception:
+            resend_once[0] = False
+            raise
+        resend_once[0] = False
+        return rec
+
+    return step
+
+
+#: Per phase: the state the record waits in while our refund is followed, and the terminal it ends in.
+_REFUND_PHASES = {
+    "abort": (SwapState.BTC_LOCKED, SwapState.ABORTED, "taker_refund_btc"),
+    "refund": (SwapState.BOTH_LOCKED, SwapState.MUTUAL_REFUND, "mutual_refund"),
+}
+
+
+def _next_after_refusal(exc, phase: str = "abort") -> str:
     """The NEXT line for a refusal the operator must act on, matched to what the flag can do
     (Mythos review of #894, F4): it sends one more refund only after one of ours MINED and failed."""
     from pyrxd.security.errors import CounterLegPayoutReverts
 
     if isinstance(exc, CounterLegPayoutReverts):
         return (
-            "the payout itself reverts; once it would not (the token or refundee accepts it), run --phase abort "
+            f"the payout itself reverts; once it would not (the token or refundee accepts it), run --phase {phase} "
             "again with --resend-reverted-refund to send one more refund."
         )
     if getattr(exc, "cause", None) == "other_tx":
         return (
             "another transaction from this ETH key is in the way; deal with it from the wallet that sent it, "
-            "then run --phase abort again (--resend-reverted-refund does not apply here)."
+            f"then run --phase {phase} again (--resend-reverted-refund does not apply here)."
         )
-    return "after checking our refund, run --phase abort again with --resend-reverted-refund to send one more refund."
+    return (
+        f"after checking our refund, run --phase {phase} again with --resend-reverted-refund to send one more refund."
+    )
 
 
-async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step):
-    """Drive ``step`` (``taker_refund_btc``) until the record is terminal (#850 PR 5b, design §4.4).
+async def _poll_taker_refund_to_terminal(args, coord, step, *, phase: str):
+    """Drive ``step`` until the record is terminal (#850 PRs 5b and 6, design §4.4).
 
-    The coordinator no longer advances on its own broadcast: the record stays btc_locked until the
-    chain shows the contract refunded at the finalized block, so one call is not the end. Each pass
-    reads the chain and sends, re-sends or replaces only by the coordinator's rules; nothing here
-    decides. Bounded by ``--abort-poll-timeout-s`` (0: one pass); past it the record is left as it
-    is, durable, and running ``--phase abort`` again picks up from it.
+    ``phase`` is ``"abort"`` (``taker_refund_btc``: btc_locked until ABORTED) or ``"refund"``
+    (``mutual_refund``: both_locked until MUTUAL_REFUND). The coordinator does not advance on its
+    own broadcast: the record waits until the chain shows the contract refunded at the finalized
+    block, so one call is not the end. Each pass reads the chain and sends, re-sends or replaces only
+    by the coordinator's rules; nothing here decides. Bounded by ``--abort-poll-timeout-s`` (0: one
+    pass); past it the record is left as it is, durable, and running the phase again picks up from it.
     """
     from pyrxd.security.errors import (
+        CounterLegDispositionUnknown,
         CounterLegPayoutReverts,
         CounterLegRefundNeedsOperator,
         CounterLegSingleSourceAnswer,
-        NetworkError,
+        NothingToRefund,
     )
 
+    waiting, terminal, _name = _REFUND_PHASES[phase]
+    stays = f"the record stays {waiting.value}"
+    claim_cmd = f"python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ..."
+    announced_claim = False
     deadline = time.monotonic() + max(0.0, float(args.abort_poll_timeout_s))
     while True:
         try:
-            if coord.record.counter_refund_tx_hash is None:
-                rec = await _taker_eth_refund_explained(args, coord, loc, step)
-            else:
-                # Our refund is recorded, so the contract is most likely settled by it: the #851
-                # single-endpoint explanation would call that "settled, no verified claim, check
-                # elsewhere". The coordinator's chain read decides from here.
-                rec = await step()
+            rec = await step()
         except CounterLegSingleSourceAnswer as exc:
             # Configuration, not an outage: retrying the same endpoint never gets past it.
             raise SystemExit(
-                f"the record stays btc_locked: the ETH HTLC reads {exc.kind.upper()} at the finalized block, but "
+                f"{stays}: the ETH HTLC reads {exc.kind.upper()} at the finalized block, but "
                 "from ONE endpoint, and on a chain that carries value one endpoint's word changes nothing. This "
                 "runner reads one --eth-rpc-url and is testnet-only, where one endpoint may decide, so the chain "
                 "id is not one pyrxd knows as a testnet: check --eth-chain-id, or drive the swap through the "
@@ -1183,6 +1216,18 @@ async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step)
                     else ""
                 )
             ) from None
+        except CounterLegDispositionUnknown as exc:
+            # #850 PR 6, replacing #851's single-endpoint explanation: the chain could not say what
+            # happened to the HTLC, and the refund was not sent. NEVER "done".
+            t_rxd = coord.record.terms.t_rxd
+            raise SystemExit(
+                f"{stays}: {exc}\n  NEXT: check the events of {coord.record.counterchain_locator.contract_address} on "
+                "another RPC or an explorer. If there is a Claimed event, write its tx hash into "
+                f'{args.io}/maker_claim.json as {{"eth_claim_tx_hash": "0x…"}} and run: {claim_cmd} --eth-rpc-url '
+                f"<the endpoint that showed it> (before t_rxd = {t_rxd.value} {t_rxd.unit.value} after the covenant "
+                f"was mined). If it shows only a refund to your address, run --phase {phase} again once the RPC "
+                "serves it."
+            ) from None
         except NetworkError as exc:
             # A failed or disagreeing read, or a broadcast that failed, while following our own refund:
             # the record is durable and the next pass reads what happened. Keep following until the deadline.
@@ -1191,146 +1236,102 @@ async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step)
             print(f"  a chain call failed while following our refund ({str(exc)[:160]}); retrying")
             await asyncio.sleep(float(args.poll_interval_s))
             continue
+        except NothingToRefund as exc:
+            raise SystemExit(f"{stays}: {exc}") from None
         except (CounterLegPayoutReverts, CounterLegRefundNeedsOperator) as exc:
             # Nothing was re-sent; the record is unchanged and durable. The operator decides.
-            raise SystemExit(f"the record stays btc_locked: {exc}\n  NEXT: {_next_after_refusal(exc)}") from None
+            raise SystemExit(f"{stays}: {exc}\n  NEXT: {_next_after_refusal(exc, phase)}") from None
         except ValidationError as exc:
             if coord.record.counter_refund_tx_hash is None:
-                raise
+                # Nothing of ours is sent, so there is nothing to follow: the refusal is the answer (for
+                # example a claim proven with no covenant pinned to claim). No traceback.
+                raise SystemExit(
+                    f"{stays}: {type(exc).__name__}: {exc}\n  NEXT: act on the message above; nothing was sent."
+                ) from None
             # While following our recorded refund (for example AlreadySettled because it mined between
             # two reads, or a fee the sender cannot hold): the record is durable; say so, no traceback.
             raise SystemExit(
-                f"the record stays btc_locked: {type(exc).__name__}: {exc}\n  NEXT: act on the message above if "
-                "it names something to do, then run --phase abort again; it follows the recorded refund."
+                f"{stays}: {type(exc).__name__}: {exc}\n  NEXT: act on the message above if "
+                f"it names something to do, then run --phase {phase} again; it follows the recorded refund."
             ) from None
-        if rec.state in (SwapState.ABORTED, SwapState.SECRET_REVEALED):
+        if rec.state in (terminal, SwapState.SECRET_REVEALED):
             return rec
-        if rec.state is not SwapState.BTC_LOCKED:
-            raise SystemExit(f"taker_refund_btc landed in {rec.state.value}, expected btc_locked or aborted")
+        if rec.state is waiting and getattr(coord.counter_leg, "counter_disposition", None) is None:
+            # A leg that reads no disposition (one written before 0.27) has nothing to follow: its
+            # refund was sent once, and another pass would send another.
+            return rec
+        if rec.state is not waiting:
+            raise SystemExit(f"{_name} landed in {rec.state.value}, expected {waiting.value} or {terminal.value}")
+        if rec.counter_claim_tx is not None and not announced_claim:
+            # A Claimed log that opens H is on record (#850 PR 5a): p may be public, whatever our refund does.
+            announced_claim = True
+            print(
+                f"  WARNING: a Claimed log on the ETH HTLC (tx {rec.counter_claim_tx}) opens H, so p may be public. "
+                f"If that claim is on chain, run {claim_cmd} now, before the covenant's CSV refund to the maker opens."
+            )
         if rec.counter_claim_tx is not None and rec.counter_disposition is not None:
-            # #850 PR 5a (D14): REFUNDED, but a Claimed(p) log is on record, so p may be public. The
-            # record stays btc_locked until the covenant's t_rxd matures: claim the covenant first.
+            # #850 PR 5a/6 (D14): REFUNDED, but a Claimed(p) log is on record, so p may be public. The
+            # record waits until the covenant's t_rxd matures: claim the covenant first.
             raise SystemExit(
-                f"the record stays btc_locked: the ETH HTLC is refunded, but a Claimed log on it (tx "
+                f"{stays}: the ETH HTLC is refunded, but a Claimed log on it (tx "
                 f"{rec.counter_claim_tx}) opens H, so p may be public. If that claim is on chain, run --phase claim "
                 "to claim the RXD covenant before its CSV refund to the maker opens. If it was dropped or reorged "
-                "out, p is in that transaction's calldata wherever it was seen; recover it before t_rxd. The "
-                "record goes terminal on its own once t_rxd has matured: run --phase abort again then."
+                "out, p is in that transaction's calldata wherever it was seen; recover it before t_rxd. Your "
+                "ETH is already refunded. The record goes terminal once t_rxd has matured: run --phase "
+                f"{phase} again then. If the maker has refunded the covenant by then and the phase cannot read "
+                "it, the record staying put is harmless: nothing else is owed to you on the ETH side."
             )
         if time.monotonic() >= deadline:
             sent = rec.counter_refund_tx_hash
             raise SystemExit(
-                "the record stays btc_locked: "
+                f"{stays}: "
                 + (
                     f"our ETH refund {sent} is sent but not yet REFUNDED at the finalized block. "
                     if sent
                     else "the ETH HTLC is settled at the chain tip but not yet final, and nothing was sent. "
                 )
-                + "Run --phase abort again to keep following it (it reads the recorded refund before it sends "
+                + f"Run --phase {phase} again to keep following it (it reads the recorded refund before it sends "
                 "anything)."
             )
         await asyncio.sleep(float(args.poll_interval_s))
 
 
-async def _taker_eth_refund_explained(args, coord, loc: EthHtlcLocator, step):
-    """Run a taker step that sends the ETH counter-leg refund; turn a failure into what happened.
+async def _refuse_if_the_counter_leg_was_claimed(args, eth_leg, loc: EthHtlcLocator, terms) -> None:
+    """``--phase refund``'s first read (#850 PR 6; replaces PR R's single-endpoint pre-check, which
+    read ``EthLeg.is_settled`` and ``EthLeg.observed_claim_tx``).
 
-    Both taker phases that send it go through here: ``--phase refund`` (``mutual_refund``, which
-    already explains its own failure) and ``--phase abort`` (``taker_refund_btc``, which does not).
-    For the second, a failure is passed to the coordinator's #851 read
-    (``_explain_failed_taker_eth_refund``), which raises ``CounterLegClaimedByCounterparty`` for a
-    VERIFIED maker claim and ``CounterLegSettledUnverified`` for a settled contract with no verified
-    claim, and otherwise returns so the original error propagates. Both become a non-zero exit
-    naming the next step; neither is ever reported as "refunded". PR 6 replaces that read.
+    It is the coordinator's own disposition reader, run before the covenant read and the timeout
+    check so that a claim never waits behind "nothing is recoverable yet". A claim proven at the
+    finalized block (CLAIMED) refuses and names ``--phase claim``. A ``Claimed`` log that opens H
+    but is not proven is printed and the phase goes on: the coordinator records it, still refunds
+    an expired HTLC (no claim can succeed after the timeout), and holds the record open until
+    ``t_rxd`` (D14). Every other answer is the coordinator's to act on. It never concludes
+    "refunded"; a leg that reads no disposition skips it.
     """
-    from pyrxd.security.errors import CounterLegClaimedByCounterparty, CounterLegSettledUnverified
-
-    t_rxd = coord.record.terms.t_rxd
-    window = f"t_rxd = {t_rxd.value} {t_rxd.unit.value} after the covenant was mined"
-    claim_cmd = f"python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ..."
-    try:
-        try:
-            return await step()
-        except (CounterLegClaimedByCounterparty, CounterLegSettledUnverified):
-            raise
-        except Exception as exc:
-            await coord._explain_failed_taker_eth_refund(loc, exc)
-            raise
-    except CounterLegClaimedByCounterparty as exc:
-        # The maker claimed first, verified from the chain. The covenant is untouched and the
-        # taker's to claim with p: say exactly that, and name the phase that does it.
-        raise SystemExit(
-            f"the ETH refund failed because the MAKER CLAIMED the HTLC {exc.contract_address} in tx "
-            f"{exc.tx_hash}, revealing p (verified: sha256(p) == H, and the claim emits p from this swap's "
-            "contract). The refund can never succeed now. The RXD covenant was NOT touched and is yours to "
-            f"claim with p before its CSV refund to the maker opens, {window}.\n"
-            f"  NEXT: {claim_cmd} (it reads the claim tx from maker_claim.json, or finds {exc.tx_hash} on the "
-            "contract if that file is absent)."
-        ) from None
-    except CounterLegSettledUnverified as exc:
-        # NEVER "done": settled with no verified claim is also what a withheld or forged log
-        # looks like after a real maker claim. Exit non-zero with the check and the next steps.
-        raise SystemExit(
-            f"the ETH refund failed: the HTLC {exc.contract_address} is ALREADY SETTLED (claimed or refunded), "
-            "and this endpoint showed NO VERIFIED CLAIM. That does not mean it was refunded: the logs come "
-            "from one endpoint, which may be incomplete or wrong.\n"
-            f"  NEXT: check the events of {exc.contract_address} on another RPC or an explorer. If there is a "
-            f'Claimed event, write its tx hash into {args.io}/maker_claim.json as {{"eth_claim_tx_hash": "0x…"}} '
-            f"and run: {claim_cmd} --eth-rpc-url <the endpoint that showed the Claimed event> (before {window}). "
-            "The claim phase verifies the receipt, so a lying endpoint makes it fail. If it shows only a "
-            "refund to your address, nothing more is needed on the ETH side."
-        ) from None
-
-
-async def _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc: EthHtlcLocator, terms) -> None:
-    """The taker's ``--phase refund`` and ``--phase abort`` pre-check (#850 PR R, Mythos M1, review
-    F2). It refuses; it never concludes.
-
-    Refuses when the ETH HTLC is already settled (``EthLeg.is_settled``: claimed or refunded) or a
-    claim on it is found in its logs (``EthLeg.observed_claim_tx``). Both reads come from ONE
-    endpoint, the one ``--eth-rpc-url`` names, which is why this only ever refuses: it never reports
-    the contract as refunded, and a claim found here is verified by ``--phase claim``, not here.
-
-    An unreadable settled flag refuses too: nothing is known, and nothing is sent. An unreadable log
-    history on a contract that is NOT settled does not refuse: a claim that landed would have set the
-    flag, and many endpoints cap or prune old logs.
-    """
-    contract = loc.contract_address
+    read = getattr(eth_leg, "counter_disposition", None)
+    if read is None:
+        return
+    disposition = await read(loc)
     claim_cmd = f"python scripts/eth_swap_two_host.py --role taker --phase claim --io {args.io} ..."
     window = f"t_rxd = {terms.t_rxd.value} {terms.t_rxd.unit.value} after the covenant was mined"
-    try:
-        settled = await eth_leg.is_settled(loc)
-    except Exception as exc:
+    if disposition.kind.value == "claimed":
+        tx = disposition.evidence.tx_hash if disposition.evidence is not None else None
         raise SystemExit(
-            f"REFUSING to refund: could not read whether the ETH HTLC {contract} is already settled "
-            f"({str(exc)[:160]}). Nothing was sent. Retry, or pass an --eth-rpc-url that can answer."
-        ) from None
-    try:
-        claim_tx = await eth_leg.observed_claim_tx(loc)
-    except Exception as exc:
-        if not settled:
-            print(f"  could not read the HTLC's logs ({str(exc)[:120]}); it is not settled, so no claim has landed.")
-            return
-        claim_tx = None
-    if claim_tx is not None:
-        state = "settled" if settled else "NOT settled"
-        raise SystemExit(
-            f"REFUSING to refund: a claim of the ETH HTLC {contract} was found in its logs, tx {claim_tx}. It was "
-            f"read from one endpoint and is not verified here; the contract is {state} at that endpoint's tip. "
-            "If the maker claimed, p is public and the RXD covenant is yours to claim before its CSV refund to "
-            f"the maker opens, {window}. Nothing was sent.\n"
-            f"  NEXT: {claim_cmd} (it verifies the claim on chain before using it; if maker_claim.json is "
-            f'absent, write {{"eth_claim_tx_hash": "{claim_tx}"}} into it or let the phase find the claim).'
+            f"REFUSING to refund: the ETH HTLC {loc.contract_address} was CLAIMED"
+            + (
+                f" in tx {tx}, verified at the finalized block"
+                if tx
+                else ", proven by the contract settled at a finalized block before its timeout (no claim log "
+                "was retrieved: find the claim tx on another RPC or an explorer)"
+            )
+            + f". p is public, and the RXD covenant is yours to claim before its CSV refund to the maker opens, "
+            f"{window}. Nothing was sent.\n  NEXT: {claim_cmd}"
         )
-    if settled:
-        raise SystemExit(
-            f"REFUSING to refund: the ETH HTLC {contract} is already SETTLED (claimed or refunded) at this "
-            "endpoint's tip, and no claim was found in its logs here. That does not mean it was refunded: the "
-            "logs come from one endpoint, which may be incomplete or wrong. Nothing was sent.\n"
-            f"  NEXT: check the events of {contract} on another RPC or a block explorer. If there is a Claimed "
-            f'event, write its tx hash into {args.io}/maker_claim.json as {{"eth_claim_tx_hash": "0x…"}} and '
-            f"run: {claim_cmd} (before {window}). If it shows only a refund to your address, nothing more is "
-            "needed on the ETH side."
+    for seen in disposition.claims_seen:
+        print(
+            f"  WARNING: a Claimed log on the ETH HTLC (tx {seen.tx_hash}, {'verified' if seen.verified else 'not verified'}) "
+            f"opens H, so p may be public. If that claim is on chain, run {claim_cmd} before {window}. This phase "
+            "goes on: after the timeout no claim can succeed, so refunding the HTLC is still right."
         )
 
 
@@ -1338,32 +1339,29 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     """TAKER recovery — the taker's half of the mutual unwind (``--phase refund``).
 
     Drives ``SwapCoordinator.mutual_refund()`` on a TAKER-role coordinator, which on an ETH counter
-    leg refunds the ETH HTLC to the TAKER and nothing else (#850). The record stays BOTH_LOCKED. The
-    RXD covenant's CSV refund pays the MAKER and is the maker's to send (its ``--phase refund``);
-    this phase does not send it, because if the maker claimed the ETH HTLC before its timeout the
-    taker can still claim the covenant with the revealed p (``--phase claim``), and a covenant
-    refund sent from here would take that away. The Radiant leg is built with ``_NoFeeSource``, so
-    this phase cannot broadcast a covenant spend by any route, and no ``--fee-*`` is needed.
+    leg refunds the ETH HTLC to the TAKER and nothing else (#850). The RXD covenant's CSV refund pays
+    the MAKER and is the maker's to send (its ``--phase refund``); this phase does not send it,
+    because if the maker claimed the ETH HTLC before its timeout the taker can still claim the
+    covenant with the revealed p (``--phase claim``), and a covenant refund sent from here would take
+    that away. The Radiant leg is built with ``_NoFeeSource``, so this phase cannot broadcast a
+    covenant spend by any route, and no ``--fee-*`` is needed.
 
-    Before anything else it refuses when the ETH HTLC is already settled or a claim on it is found
-    (``_refuse_if_counter_leg_settled_or_claimed``). The covenant is read next so the record pins its
-    outpoint; the ETH timeout is checked before anything broadcasts. ``--phase abort`` does the same counter-leg refund without reading the
-    covenant, for when the maker never locked it or the Radiant node cannot answer.
+    Since #850 PR 6 the coordinator records our refund before sending it and follows it, and the
+    record goes to MUTUAL_REFUND once the chain shows the HTLC refunded at the finalized block. This
+    phase polls for that like ``--phase abort`` (``--abort-poll-timeout-s``), and a refund recorded
+    by either phase is followed rather than sent again.
+
+    Before anything else it reads the HTLC's disposition and refuses when a claim is proven
+    (``_refuse_if_the_counter_leg_was_claimed``). The covenant is read next so the record pins its
+    outpoint; the ETH timeout is checked before anything broadcasts. ``--phase abort`` does the same
+    counter-leg refund without reading the covenant, for when the maker never locked it or the
+    Radiant node cannot answer.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
     _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
-    persisted = _record_sink(args.local_out).load_record()
-    if persisted is not None and persisted.counter_refund_tx_hash is not None:
-        # #850 PR 5b (Mythos review of #894, N1): --phase abort already sent and recorded our ETH
-        # refund. mutual_refund sends its counter refund without that record (PR 6), so this phase
-        # would put a SECOND refund beside the pending one. Follow the recorded one instead.
-        raise SystemExit(
-            f"REFUSING --phase refund: our ETH refund {persisted.counter_refund_tx_hash} is already recorded "
-            "(sent by --phase abort) and is followed there. Nothing was sent. NEXT: run --phase abort again."
-        )
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
@@ -1380,10 +1378,9 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
 
     try:
-        # FIRST, before the covenant read and the timeout check: a settled or claimed contract
-        # changes what the taker should do next, and a claim must not wait behind a refusal that
-        # says "nothing is recoverable yet".
-        await _refuse_if_counter_leg_settled_or_claimed(args, eth_leg, loc, terms)
+        # FIRST, before the covenant read and the timeout check: a claim changes what the taker
+        # should do next, and must not wait behind a refusal that says "nothing is recoverable yet".
+        await _refuse_if_the_counter_leg_was_claimed(args, eth_leg, loc, terms)
         try:
             outpoint, value, confs = await _covenant_state(rxd_leg, cov=cov, expected_photons=terms.radiant_amount)
         except Exception as exc:
@@ -1415,20 +1412,35 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
         coord = _coordinator(
             args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="refund"
         )
-        confirm(
-            "mutual_refund: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
-            auto_yes=args.yes,
-        )
-        rec = await _taker_eth_refund_explained(args, coord, loc, coord.mutual_refund)
-        if rec.state is not SwapState.BOTH_LOCKED:
-            raise SystemExit(
-                f"mutual_refund landed in {rec.state.value}; a TAKER-role ETH refund leaves the record both_locked"
+        if coord.record.counter_refund_tx_hash is None:
+            confirm(
+                "mutual_refund: refund the taker's ETH HTLC to the taker (the covenant is NOT touched)",
+                auto_yes=args.yes,
             )
-        print(
-            "  -> ETH refund sent to the taker; the record stays both_locked because the covenant is "
-            "still the maker's to refund. Check the refund on-chain; once it has landed the maker can no "
-            "longer claim the ETH (the contract refuses a claim at or after its timeout)."
-        )
+        else:
+            print(f"  our ETH refund is already recorded ({coord.record.counter_refund_tx_hash}); following it.")
+        step = _refund_step(args, coord, lambda resend: coord.mutual_refund(resend_reverted_refund=resend))
+        rec = await _poll_taker_refund_to_terminal(args, coord, step, phase="refund")
+        if rec.state is SwapState.SECRET_REVEALED:
+            raise SystemExit(
+                "the record is secret_revealed: the maker's CLAIM of the ETH HTLC verified at the finalized block, "
+                "so p is public. Run --phase claim to claim the RXD covenant before its CSV refund to the maker opens."
+            )
+        evidence = rec.counter_disposition
+        if evidence is None:
+            # A leg that reads no disposition (one written before 0.27): the refund was sent and the
+            # record stays both_locked, as #851 shipped it.
+            print(
+                "  -> ETH refund sent to the taker; the record stays both_locked because the covenant is "
+                "still the maker's to refund. Check the refund on-chain; once it has landed the maker can no "
+                "longer claim the ETH (the contract refuses a claim at or after its timeout)."
+            )
+        else:
+            print(
+                f"  -> {rec.state.value}; the ETH HTLC is REFUNDED at the finalized block (evidence: tx "
+                f"{evidence.tx_hash or '(proven by the expiry anchor)'} at block {evidence.block_number}). Your "
+                "half of the unwind is done; the covenant is the maker's to refund."
+            )
     finally:
         await rpc.close()
 
@@ -1949,15 +1961,15 @@ def _args() -> argparse.Namespace:
     ap.add_argument(
         "--resend-reverted-refund",
         action="store_true",
-        help="--phase abort (taker): send one more ETH refund after our recorded one was mined and reverted "
+        help="--phase abort / refund (taker): send one more ETH refund after our recorded one was mined and reverted "
         "(the phase stops and asks first; never while the payout itself reverts)",
     )
     ap.add_argument(
         "--abort-poll-timeout-s",
         type=float,
         default=7200.0,
-        help="--phase abort (taker): how long to follow our ETH refund until the HTLC reads REFUNDED at the "
-        "finalized block (0: one pass). Re-running the phase resumes from the record.",
+        help="--phase abort / refund (taker): how long to follow our ETH refund until the HTLC reads REFUNDED at "
+        "the finalized block (0: one pass). Re-running the phase resumes from the record.",
     )
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
     args = ap.parse_args()

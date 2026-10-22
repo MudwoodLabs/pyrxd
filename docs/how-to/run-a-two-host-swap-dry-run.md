@@ -237,36 +237,43 @@ Both roles have both phases, and the rule for choosing between them is one sente
 ETH HTLC times out at `eth_timeout_unix_s`; the RXD covenant's CSV matures at `t_rxd`, which
 is deliberately the *later* of the two, so the taker's own leg is recoverable first.
 
-On ETH, taker `refund` refunds the ETH HTLC **only** and leaves the record at `both_locked`
-(#850). The covenant's refund pays the maker and is the maker's to send: if the maker claimed
-the ETH before its timeout, the taker can still claim the covenant with the revealed `p`
-(`--phase claim`), and a covenant refund sent from the taker's side would take that away.
-When the ETH refund fails, the phase reads the contract to say why. For a verified maker claim,
-it names the claim tx and `--phase claim`. For a settled contract with no verified claim, it
-exits non-zero and does **not** conclude "refunded": an honest node always shows a claim or a
-refund event, and the logs come from one RPC, so check the contract's events elsewhere, and if
-there is a claim, put its tx hash in `maker_claim.json` and run `--phase claim` before `t_rxd`.
-Any other failure is shown as it came.
+On ETH, taker `refund` refunds the ETH HTLC **only** (#850). The covenant's refund pays the
+maker and is the maker's to send: if the maker claimed the ETH before its timeout, the taker can
+still claim the covenant with the revealed `p` (`--phase claim`), and a covenant refund sent from
+the taker's side would take that away. Since #850 PR 6 the record goes to `mutual_refund` when the
+chain shows the HTLC refunded at the finalized block, which for a taker means "my leg is back";
+it does not mean the covenant was refunded.
 
-Before any of that, ETH taker `refund` and ETH taker `abort` (which sends the same refund) read
-the contract and **refuse up front**, sending nothing, when the HTLC is already settled or a
-claim is found in its logs. A failed `abort` refund is explained the same way as a failed
-`refund`. It never reads that
-as "refunded". A claim found there is not verified by this check; `--phase claim` verifies it.
-For a settled contract with no claim found, check the contract's events elsewhere, as above. An
-unreadable settled flag refuses too. An unreadable log history on a contract that is not settled
-does not refuse, because a claim that landed would have settled it.
+**ETH taker `abort` and taker `refund` decide from the chain, not from one log read (#850 PRs 5b
+and 6).** Before sending anything, the coordinator reads the HTLC's disposition at the finalized
+block through the shared reader (`pyrxd.eth_wallet.disposition`), from every endpoint the leg is
+given; this runner gives it the one `--eth-rpc-url`. A terminal answer (claimed or refunded) from one
+endpoint moves the record only on a chain id pyrxd knows as a testnet; on any other chain id it
+changes nothing. Taker
+`refund` also reads it first, before the covenant and timeout checks:
 
-**ETH taker `abort` follows its refund to the end (#850 PR 5b).** The record no longer goes to
-`aborted` when the refund is broadcast. It goes there when the chain shows the HTLC refunded at
-the finalized block, so the phase keeps polling until then, for up to `--abort-poll-timeout-s`
-(7200 s by default). The refund's hash is saved in the record before it is sent, and polling
-reads that refund before it sends anything. It re-sends only when the first was dropped or
-its nonce was used by another transaction. It replaces a refund still pending after 600 s at the
-same nonce, and re-sends once after an out-of-gas refund. If the run times out, run `--phase
-abort` again; it follows the saved refund and skips the up-front settled check, which our own
-mined refund would otherwise trip. A mined refund that reverted is not re-sent. The phase stops
-and names the revert.
+- **Claimed**, verified at the finalized block: the phase refuses, sends nothing, names the claim
+  tx and tells you to run `--phase claim` before `t_rxd`.
+- **A `Claimed` log that is not yet verified**: the phase prints a warning and goes on. An expired
+  HTLC can no longer be claimed, so the refund still goes, but the record stays open until `t_rxd`
+  matures, because `p` may be public. Claim the covenant first if that claim is on chain.
+- **Unknown** (the reads disagree, or a settled contract shows neither a verified claim nor a
+  verified refund): the refund is still attempted when the contract allows it. If it fails, the
+  phase exits non-zero and does **not** conclude "refunded". Check the contract's events on
+  another RPC or an explorer, and if there is a claim, put its tx hash in `maker_claim.json` and
+  run `--phase claim` before `t_rxd`.
+- **Refunded**: nothing is sent; the record goes terminal.
+
+**Both phases follow their refund to the end.** The record goes to `aborted` (abort) or
+`mutual_refund` (refund) when the chain shows the HTLC refunded at the finalized block, not when
+the refund is broadcast. The phase keeps polling until then, for up to `--abort-poll-timeout-s`
+(7200 s by default; the flag applies to both phases). The refund's hash is saved in the record
+before it is sent, and polling reads that refund before it sends anything. It re-sends only when
+the first was dropped or its nonce was used by another transaction. It replaces a refund still
+pending after 600 s at the same nonce, and re-sends once after an out-of-gas refund. If the run
+times out, run the same phase again; it follows the saved refund. A refund that `abort` sent is
+followed by `refund` too, once the record is `both_locked`. A mined refund that reverted is not
+re-sent: the phase stops, names the revert, and `--resend-reverted-refund` sends one more.
 
 **The swap record carries across phases.** Each phase rebuilds its record from the exchange
 files, and then merges it with the record this host saved (`<--local-out>.swaprec.json`). Fields
@@ -313,7 +320,7 @@ first, which is tracked in #850.
 | Role + phase | Coordinator entry point | FSM |
 |---|---|---|
 | taker `abort` | `SwapCoordinator.taker_refund_btc()`, polled (ETH) | `btc_locked → aborted` (ETH: once the refund is final at the finalized block) |
-| taker `refund` (ETH) | `SwapCoordinator.mutual_refund()` on a taker-role coordinator | `both_locked` (no advance) |
+| taker `refund` (ETH) | `SwapCoordinator.mutual_refund()` on a taker-role coordinator, polled | `both_locked → mutual_refund` once the ETH refund is final at the finalized block (the covenant is the maker's) |
 | taker `refund` (BTC) | `SwapCoordinator.mutual_refund()` | `both_locked → mutual_refund` |
 | maker `refund` | `SwapCoordinator.maybe_refund_asset_on_maker_stall()` | `both_locked → asset_refunded_taker_acts` |
 | maker `abort` | `RadiantCovenantLeg.refund_asset()` — **no coordinator entry point exists** | *(no advance)* |

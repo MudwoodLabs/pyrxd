@@ -69,6 +69,13 @@ _KNOWN_UNREACHED: dict[str, str] = {
     #    deprecation window; an internal caller would itself be a defect.
     "src/pyrxd/glyph/builder.py::DmintDeployResult": "deprecated alias of DmintV2DeployResult",
     "src/pyrxd/glyph/builder.py::DmintFullDeployParams": "deprecated alias of DmintV2DeployParams",
+    "src/pyrxd/security/errors.py::CounterLegClaimedByCounterparty": (
+        "no longer raised since #850 PR 6 (the disposition reader decides); kept so code that catches it still imports"
+    ),
+    "src/pyrxd/security/errors.py::CounterLegSettledUnverified": (
+        "no longer raised since #850 PR 6 (CounterLegDispositionUnknown replaces it); kept so code that catches it "
+        "still imports"
+    ),
     # -- external-caller protocol: the contrib miner BINARY (out of repo) speaks this protocol;
     #    in-repo callers are not expected.
     "src/pyrxd/contrib/miner/protocol.py::parse_progress_line": "caller is the external contrib miner",

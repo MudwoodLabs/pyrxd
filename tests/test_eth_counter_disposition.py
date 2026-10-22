@@ -19,7 +19,7 @@ from pyrxd.eth_wallet.disposition import DispositionKind, read_counter_dispositi
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.security.errors import ValidationError
-from tests._fake_evm_chain import OTHER_CONTRACT, FakeEvmChain, FakeEvmEndpoint
+from tests._fake_evm_chain import CONTRACT, OTHER_CONTRACT, FakeEvmChain, FakeEvmEndpoint
 
 TIMEOUT_BLOCK = 80
 
@@ -668,3 +668,62 @@ async def test_HONEST_an_anchor_proves_a_refund_with_no_log_and_no_hash():
     d = await _read(MultiSourceEthRpc(logless), chain, expiry_anchor=_anchor(82))
     assert d.kind is DispositionKind.REFUNDED and d.evidence.tx_hash is None
     assert (await _read(MultiSourceEthRpc(logless), chain)).kind is DispositionKind.UNKNOWN  # without it
+
+
+@pytest.mark.parametrize("claim", ["verifies", "withheld", "unverifiable"])
+async def test_an_uncheckable_settlement_is_tagged_settled_at_f_unless_a_claim_verifies(claim):
+    """#850 PR 6: ``settled_at_finalized`` stops the coordinator following a refund of ours that lost
+    the race. When a nominated transaction cannot be checked but a claim verifies, the claim is
+    surfaced (``claims_seen``) and the tag is clear. When every endpoint withholds the claim, or the
+    claim is nominated but its receipt cannot be agreed, only the tag is left."""
+    chain = _chain(finalized=90)
+    claim_tx = chain.claim(70)
+    hide = claim == "withheld"
+    liar = FakeEvmEndpoint(chain, forge_refunded_tx="0x" + "ee" * 32, forge_receipt=True, hide_claimed=hide)
+    if claim == "unverifiable":
+
+        async def disputed(tx_hash, _orig=liar.get_transaction_receipt):
+            r = await _orig(tx_hash)
+            return dict(r, blockHash="0x" + "ab" * 32) if tx_hash == claim_tx else r
+
+        liar.get_transaction_receipt = disputed
+    rpc = MultiSourceEthRpc(
+        [liar, FakeEvmEndpoint(chain, hide_claimed=hide), FakeEvmEndpoint(chain, hide_claimed=hide)]
+    )
+    d = await _read(rpc, chain)
+    assert d.kind is DispositionKind.UNKNOWN and "could not be checked" in d.reason
+    assert bool(d.claims_seen) is (claim != "withheld")
+    assert any(c.verified for c in d.claims_seen) is (claim == "verifies")
+    assert d.settled_at_finalized is (claim != "verifies")
+
+
+async def test_a_forged_claim_nomination_does_not_clear_the_settled_at_f_tag():
+    """Re-review of PR 6: every endpoint withholds the real claim, and one liar nominates a Claimed log
+    for a transaction that does not exist. An unverified nomination must not clear the tag, or the
+    liar alone turns the coordinator back to following a refund of ours that lost the race."""
+    chain = _chain(finalized=90)
+    chain.claim(70)
+    decoy = {
+        "address": CONTRACT,
+        "topics": [CLAIMED_TOPIC0],
+        "data": "0x" + chain.preimage.hex(),
+        "transactionHash": "0x" + "dc" * 32,
+        "blockNumber": 72,
+    }
+    liar = FakeEvmEndpoint(
+        chain, forge_refunded_tx="0x" + "ee" * 32, forge_receipt=True, hide_claimed=True, extra_logs=(decoy,)
+    )
+    rpc = MultiSourceEthRpc(
+        [liar, FakeEvmEndpoint(chain, hide_claimed=True), FakeEvmEndpoint(chain, hide_claimed=True)]
+    )
+    d = await _read(rpc, chain)
+    assert d.kind is DispositionKind.UNKNOWN and "could not be checked" in d.reason
+    assert d.claims_seen and not any(c.verified for c in d.claims_seen)
+    assert d.settled_at_finalized is True
+
+
+async def test_no_endpoint_answering_the_log_scan_is_never_tagged_settled_at_f():
+    chain = _chain(finalized=90)
+    chain.claim(70)
+    d = await _read(MultiSourceEthRpc([FakeEvmEndpoint(chain, logs_429=True) for _ in range(3)]), chain)
+    assert d.kind is DispositionKind.UNKNOWN and d.settled_at_finalized is False

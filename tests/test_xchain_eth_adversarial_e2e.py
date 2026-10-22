@@ -168,6 +168,11 @@ class TestEthAdversarial:
             #    covenant buried t_rxd deep, which is the last thing to mature.
             node.rxd_mine(max(0, asset_locked_at + terms.t_rxd.value - int(node.rxd("getblockcount"))))
             rec = await coord.mutual_refund()
+            # #850 PR 6: our ETH refund is RECORDED and the record waits for the chain; with no role the
+            # covenant refund goes only once the ETH HTLC is REFUNDED at the finalized block.
+            assert rec.state is SwapState.BOTH_LOCKED and rec.counter_refund_tx_hash is not None, rec.state.value
+            _anvil_mine(url, 3)  # --slots-in-an-epoch 1: finalized = latest - 2
+            rec = await coord.mutual_refund()
             assert rec.state is SwapState.MUTUAL_REFUND, (
                 f"honest taker recovers via mutual_refund on a maker stall, got {rec.state.value}"
             )

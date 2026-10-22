@@ -1755,7 +1755,8 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
 
         print(
             "\n  *** MONITORING WINDOW (BOTH_LOCKED): a maker stall (maker never claims the ETH, so p "
-            "is never revealed) is the real loss path. Recovery in THIS runbook is coord.mutual_refund() "
+            "is never revealed) is the real loss path. Recovery in THIS runbook is coord.mutual_refund(), "
+            "called until the record is mutual_refund (it waits for our ETH refund to finalize), "
             "AFTER BOTH timeouts elapse (t_eth -> taker's ETH HTLC; t_rxd/CSV -> maker's RXD covenant); "
             "it refunds BOTH legs, so neither side takes one-sided loss. Do NOT use "
             "maybe_refund_asset_on_maker_stall here OR on the BTC<->RXD runbook — the MAKER owns the RXD "

@@ -60,6 +60,7 @@ from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbo
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
 from pyrxd.security.errors import (
+    CounterLegDispositionUnknown,
     CounterLegPayoutReverts,
     CounterLegRefundNeedsOperator,
     CounterLegSingleSourceAnswer,
@@ -4506,8 +4507,11 @@ class SwapCoordinator:
           BOTH_LOCKED goes to SECRET_REVEALED. At PARAMS_MISMATCH there is deliberately no edge (B2):
           the evidence is recorded and this raises. A maker's record records the evidence and stays.
         * ``REFUNDED``: a taker's or single operator's record at BTC_LOCKED or PARAMS_MISMATCH goes to
-          ABORTED (``abort_reason``), unless a recorded claim holds it (D14). BOTH_LOCKED is PR 6's;
-          a maker's record records the evidence and stays.
+          ABORTED (``abort_reason``), unless a recorded claim holds it (D14). At BOTH_LOCKED a taker's
+          record goes to MUTUAL_REFUND (its covenant is the maker's), held the same way; a single
+          operator's is ``"recorded"`` (or ``"held"``), because its MUTUAL_REFUND also needs the
+          covenant refund that only :meth:`mutual_refund` sends. A maker's record records the
+          evidence and stays.
         * A terminal answer from one endpoint on a chain that carries value changes nothing (D4).
         """
         from .swap_state import AbortReason, CounterDispositionRecord
@@ -4595,6 +4599,15 @@ class SwapCoordinator:
                         self.record = dataclasses.replace(self.record, abort_reason=AbortReason.COUNTER_LEG_REFUNDED)
                         self._advance(SwapEvent.COUNTER_LEG_REFUNDED_OBSERVED)
                         outcome = "refunded"
+                elif acts and state is SwapState.BOTH_LOCKED:
+                    # #850 PR 6. A taker's MUTUAL_REFUND means "my counter leg is refunded at F; the
+                    # covenant is the maker's" (wire doc), so it is taken here. A single operator's
+                    # also needs the covenant refunded, which only mutual_refund sends: "recorded".
+                    if await self._claim_seen_holds_the_terminal():
+                        outcome = "held"
+                    elif self.config.role is SwapRole.TAKER:
+                        self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
+                        outcome = "refunded"
         if changed:
             await self._persist_record(self.record, shield=True)
         return outcome
@@ -4674,7 +4687,9 @@ class SwapCoordinator:
             if disposition.kind is DispositionKind.SETTLED_UNFINAL:
                 return self.record  # settled at the tip, not yet final: wait, send nothing
             # 5b: never advance on our own broadcast. The record moves when the chain shows it.
-            return await self._send_or_follow_counter_refund(resend_reverted_refund=resend_reverted_refund)
+            return await self._counter_refund_on_the_read(
+                disposition, resend_reverted_refund=resend_reverted_refund, step="taker_refund_btc"
+            )
         await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
         if state is SwapState.BTC_LOCKED:
             self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
@@ -4683,9 +4698,19 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
-    async def _send_or_follow_counter_refund(self, *, resend_reverted_refund: bool) -> SwapRecord:
+    async def _send_or_follow_counter_refund(
+        self, *, resend_reverted_refund: bool, step: str = "taker_refund_btc", settled_is_unexplained: bool = False
+    ) -> SwapRecord:
         """The re-send rules for our own ETH counter-leg refund (design §3.4), once the contract
-        reads unsettled at the tip. Never advances the record. See :meth:`taker_refund_btc`."""
+        reads unsettled at the tip. Never advances the record. See :meth:`taker_refund_btc`. *step*
+        is the coordinator step the operator calls again, named in the messages.
+
+        *settled_is_unexplained*: the chain read just now found the contract settled at the
+        finalized block and could not say how (``UNKNOWN`` with ``settled_at_finalized``; an UNKNOWN
+        from a failed read is not this, and keeps waiting). Our refund reverting ``AlreadySettled`` then means something else settled it,
+        possibly a claim whose log is withheld, so it is raised (as a ``ValidationError``, which
+        :meth:`_counter_refund_on_the_read` reports as ``CounterLegDispositionUnknown``) instead of
+        waited on: no later read would end the wait (Mythos review of #850 PR 6, F1)."""
         locator = self.record.counterchain_locator
         recorded, nonce = self.record.counter_refund_tx_hash, self.record.counter_refund_nonce
         replace = None
@@ -4745,7 +4770,7 @@ class SwapCoordinator:
                         f"our counter-leg refund {subject} ran out of gas at a limit of {progress.gas_limit}, "
                         f"at or above the current estimate of {estimate}, so a re-send at the estimate would "
                         "likely fail the same way. Nothing was sent. Check the refundee and the contract; "
-                        "taker_refund_btc(resend_reverted_refund=True) sends one more refund.",
+                        f"{step}(resend_reverted_refund=True) sends one more refund.",
                         tx_hash=subject,
                     )
                 logger.warning(
@@ -4761,10 +4786,16 @@ class SwapCoordinator:
                         f"our counter-leg refund {subject} reverted, and a refund now reverts {reason}: the "
                         "payout itself fails (a frozen token address, or a refundee that refuses ETH). Nothing "
                         "was re-sent. The contract is still unsettled and refundable once that changes; then "
-                        "run taker_refund_btc(resend_reverted_refund=True).",
+                        f"run {step}(resend_reverted_refund=True).",
                         reason=reason,
                     )
                 if reason == "AlreadySettled":
+                    if settled_is_unexplained:
+                        raise ValidationError(
+                            f"our counter-leg refund {subject} was mined and reverted, and a refund now would "
+                            "revert AlreadySettled: something else settled the contract, and the chain read "
+                            "cannot say what"
+                        )
                     logger.info("the counter-leg contract settled after it was read; waiting for the chain")
                     return self.record
                 if not resend_reverted_refund:
@@ -4772,7 +4803,7 @@ class SwapCoordinator:
                         f"our counter-leg refund {subject} was mined and reverted"
                         + (f"; a refund now would revert {reason}" if reason else "; a refund now would not revert")
                         + ". It is not re-sent automatically (design §3.4). Check the transaction, then run "
-                        "taker_refund_btc(resend_reverted_refund=True) to send one more refund.",
+                        f"{step}(resend_reverted_refund=True) to send one more refund.",
                         tx_hash=subject,
                     )
             # "dropped" and "nonce_taken": ours never mined and cannot now; build a new one.
@@ -4807,162 +4838,110 @@ class SwapCoordinator:
         )
         logger.info(
             "counter-leg refund %s sent; the record stays %s until the chain shows it refunded at the "
-            "finalized block. Call taker_refund_btc again to follow it.",
+            "finalized block. Call %s again to follow it.",
             sent,
             self.record.state.name,
+            step,
         )
         return self.record
 
-    async def _explain_failed_taker_eth_refund(self, locator: Any, refund_error: Exception) -> None:
-        """Turn a failed taker ETH refund into what actually happened on chain, when that is knowable.
+    async def _counter_refund_on_the_read(
+        self, disposition: Any, *, resend_reverted_refund: bool, step: str
+    ) -> SwapRecord:
+        """Send or follow our ETH counter-leg refund after the read-first branch found nothing to
+        apply (#850 PR 6; replaces #851's single-endpoint ``_explain_failed_taker_eth_refund``).
 
-        A real leg reports both "the maker claimed this contract" and "your own refund already
-        landed" as the same preflight ``ValidationError`` ("tx would revert"), usually carrying a
-        bare revert code. The two call for opposite actions — claim the covenant with ``p`` before
-        ``t_rxd``, or do nothing — so this reads the chain instead of the error text:
+        With the disposition ``UNKNOWN`` the refund still goes out when the leg's own checks pass
+        (design §3.3). When the leg refuses instead, most often a preflight revert because the
+        contract is already settled, the refusal is reported as
+        :class:`~pyrxd.security.errors.CounterLegDispositionUnknown` with the reader's reason: the
+        chain could not say what happened, and "settled, nothing verifies" is never "refunded". A
+        refusal with its own type (the operator must act) and a :class:`NetworkError` pass through
+        unchanged, as does every refusal under a disposition that is not ``UNKNOWN``."""
+        from pyrxd.eth_wallet.disposition import DispositionKind
 
-        (a) a claim tx in the contract's logs that VERIFIES (``p`` scraped with ``sha256 == H``, and
-            the provenance gate: a successful tx emitting ``p`` from this swap's contract) →
-            :class:`CounterLegClaimedByCounterparty`, naming the claim tx and the next step;
-        (b) the contract's ``settled`` flag set and NO verified claim →
-            :class:`CounterLegSettledUnverified`. Deliberately not "refunded": a claim and a refund
-            both emit an event, so an honest log source always shows one, and "no verified claim"
-            can equally be a log source that is incomplete or lying (read from ONE endpoint). It
-            tells the operator to check the contract's events elsewhere before ``t_rxd``;
-        (c) anything else (not settled, or the settled flag cannot be read) → returns, and the
-            caller re-raises the original error.
-
-        A claim log that does NOT verify, or a log read that fails, falls through to (b) when the
-        contract is settled: neither may be reported as the maker's claim, and neither is evidence
-        of a refund.
-
-        Read-only. Needs the leg's optional ``observed_claim_tx`` / ``is_settled`` (the shipped
-        :class:`pyrxd.gravity.eth_leg.EthLeg` has both); a leg without them gets (c).
-        """
-        # Local import: keeps this module's import block (and the doc citations into it) unchanged.
-        from pyrxd.security.errors import CounterLegClaimedByCounterparty, CounterLegSettledUnverified
-
-        find_claim = getattr(self.counter_leg, "observed_claim_tx", None)
-        is_settled = getattr(self.counter_leg, "is_settled", None)
-        if find_claim is None or is_settled is None:
-            return
-        contract = getattr(locator, "contract_address", None)
         try:
-            claim_tx = await find_claim(locator)
-        except Exception as exc:
-            # No verified claim — which, on a settled contract, is exactly case (b), not (c).
-            logger.warning("could not read the ETH HTLC %s's logs to explain a failed refund: %s", contract, exc)
-            claim_tx = None
-        if claim_tx is not None:
-            hashlock = self.record.terms.hashlock
-            try:
-                artifacts = await self.counter_leg.fetch_claim_artifacts(claim_tx)
-                p = self.counter_leg.scrape_secret(artifacts, hashlock)
-                if hashlib.sha256(bytes(p)).digest() != hashlock:
-                    raise ValidationError("the scraped value does not hash to H")
-                await self.counter_leg.assert_claim_provenance(claim_tx, contract_address=contract, preimage=bytes(p))
-            except Exception as exc:
-                logger.warning(
-                    "a log on the ETH HTLC %s named tx %s, but it did not verify as a claim of this swap: %s",
-                    contract,
-                    claim_tx,
-                    exc,
-                )
-                claim_tx = None
-        if claim_tx is not None:
-            raise CounterLegClaimedByCounterparty(
-                f"the ETH refund failed because the MAKER CLAIMED the HTLC {contract} in tx {claim_tx}, "
-                "revealing p (verified: sha256(p) == H, and the claim emits p from this swap's contract). "
-                "The refund can never succeed now. The RXD covenant "
-                f"{self.record.radiant_covenant_outpoint} was NOT touched and is yours to claim with p: run "
-                f"taker_observed_reveal({claim_tx!r}) and then taker_scrape_and_claim_asset (two-host "
-                f"runner: --phase claim). Do it before the covenant's CSV refund to the maker opens, "
-                f"t_rxd = {self.record.terms.t_rxd.value} {self.record.terms.t_rxd.unit.value} after the "
-                f"covenant was mined; the record is still {self.record.state.name}.",
-                tx_hash=claim_tx,
-                contract_address=contract,
-            ) from refund_error
-        try:
-            settled = await is_settled(locator)
-        except Exception as exc:
-            logger.warning(
-                "could not read the ETH HTLC %s's settled flag to explain a failed refund: %s", contract, exc
+            return await self._send_or_follow_counter_refund(
+                resend_reverted_refund=resend_reverted_refund,
+                step=step,
+                settled_is_unexplained=disposition.kind is DispositionKind.UNKNOWN
+                and bool(getattr(disposition, "settled_at_finalized", False)),
             )
-            return
-        if settled:
+        except (*_NEEDS_OPERATOR_ACTION, CounterLegPayoutReverts, CounterLegRefundNeedsOperator, NetworkError):
+            raise
+        except ValidationError as exc:
+            if disposition.kind is not DispositionKind.UNKNOWN:
+                raise
             t_rxd = self.record.terms.t_rxd
-            raise CounterLegSettledUnverified(
-                f"the ETH refund failed: the HTLC {contract} is ALREADY SETTLED (claimed or refunded), and "
-                "this endpoint showed NO VERIFIED CLAIM. That does not mean it was refunded: a claim and a "
-                "refund both emit an event, so an honest node always shows one of them, and the logs here "
-                "come from one endpoint that may be incomplete (pruned, range-limited) or not telling the "
-                f"truth. CHECK the events of {contract} on another RPC or a block explorer NOW. If the maker "
-                "CLAIMED it, p is public and the RXD covenant "
-                f"{self.record.radiant_covenant_outpoint} is yours to claim before its CSV refund to the "
-                f"maker opens, t_rxd = {t_rxd.value} {t_rxd.unit.value} after the covenant was mined: run "
-                "taker_observed_reveal(<claim tx hash>) then taker_scrape_and_claim_asset (two-host runner: "
-                'put {"eth_claim_tx_hash": "<claim tx hash>"} in maker_claim.json and run --phase claim). '
-                "If it shows only a refund to your address, nothing more is needed on the ETH side.",
-                contract_address=contract,
-            ) from refund_error
+            seen = self.record.counter_claim_tx
+            raise CounterLegDispositionUnknown(
+                f"the counter leg's disposition is UNKNOWN ({disposition.reason}), and no refund was sent this "
+                f"time: {exc}. The record's state did not change. Do not read this as refunded: a contract settled with neither a "
+                "refund nor a claim that verifies is also what a real claim looks like when its log is withheld "
+                "or pruned. Check the contract's events on other endpoints. If it was CLAIMED, p is public: claim "
+                f"the covenant with it before its CSV refund to the maker opens, t_rxd = {t_rxd.value} "
+                f"{t_rxd.unit.value} after the covenant was mined."
+                + (f" A Claimed log that opens H is on record: tx {seen}." if seen else ""),
+                reason=disposition.reason,
+            ) from exc
 
     # -- safe failure: both timeouts elapse, both refund (MUTUAL_REFUND) -----
     @_serialized_step
-    async def mutual_refund(self) -> SwapRecord:
+    async def mutual_refund(self, *, resend_reverted_refund: bool = False) -> SwapRecord:
         """Both legs refund after both timeouts elapse — the guaranteed-safe failure.
 
-        Valid from BOTH_LOCKED. The taker refunds BTC, the maker refunds the asset;
-        neither suffers one-sided loss. Requires the full locator be retained. Async
-        because both refunds broadcast on their chains.
+        Valid from BOTH_LOCKED. Requires the full locator be retained. Async because the refunds
+        broadcast on their chains.
 
-        **ETH counter leg, TAKER role: the counter leg ONLY** (#850). The covenant's CSV refund
-        pays the MAKER and needs no key, so the taker's process can broadcast it — and "attempt
-        both, always" did, even when the counter refund failed because the maker had already
-        claimed the ETH HTLC (revealing ``p``). The taker's own tool then sent the covenant back
-        to the maker while the taker could still have claimed it with ``p``. So for
-        ``role=SwapRole.TAKER`` on an ETH counter leg this broadcasts the counter-leg refund
-        only, leaves the covenant for the maker to refund (:meth:`maybe_refund_asset_on_maker_stall`
-        in the maker's process), and leaves the record at BOTH_LOCKED: one of the two refunds has
-        happened, and the record must stay where :meth:`taker_observed_reveal` can follow a maker
-        claim. Recording MUTUAL_REFUND would say both legs were refunded and make that path
-        unreachable. When the counter refund fails nothing else is broadcast, and the failure is
-        explained from the chain (:meth:`_explain_failed_taker_eth_refund`):
-        :class:`~pyrxd.security.errors.CounterLegClaimedByCounterparty` if the maker's claim is
-        found and verifies (claim the covenant next), :class:`~pyrxd.security.errors.CounterLegSettledUnverified`
-        if the contract is settled with no verified claim (check its events elsewhere; never read as
-        "refunded"), else the original error.
-        ``EthHtlc``/``Erc20Htlc`` refuse a claim at or after the timeout, so once the refund has
-        landed the maker can no longer claim.
+        **ETH counter leg** (#850 PR 6, design §3.3): what the chain shows is read FIRST
+        (:meth:`_read_counter_disposition`), and the record moves only on that.
 
-        **BTC counter leg: unchanged in this release, for every role** (#850, interim). The BTC
-        claim leaf has no timelock, so a maker can still claim with ``p`` while the taker's
-        refund is unconfirmed, and the taker's covenant refund forecloses its claim in that
-        race — the same defect. It is not closed here because a non-terminal BTC record is
-        misread by the watchtower: ``OutspendBtcClaimSource`` reports ANY spend of the BTC HTLC
-        as the maker's claim, so the taker's own refund would page a claim race on every tick.
-        Fixing BTC needs that spender classification first (#850 plan, PR 9).
+        * ``MAKER`` role: refused. The counter leg is the taker's to refund and the covenant the
+          maker's; the maker's own step is :meth:`maybe_refund_asset_on_maker_stall`.
+        * A claim proven on chain moves the record to SECRET_REVEALED (``p`` is public: claim the
+          covenant). Nothing is sent.
+        * A terminal answer from one endpoint on a chain that carries value raises
+          :class:`~pyrxd.security.errors.CounterLegSingleSourceAnswer`. Nothing is sent.
+        * Settled at the tip but not yet final: nothing is sent; the record waits.
+        * Not yet refunded: our counter-leg refund is sent, or the one already recorded is followed,
+          by the same rules as :meth:`taker_refund_btc` (recorded before the broadcast, re-sent or
+          replaced only as design §3.4 allows; ``resend_reverted_refund`` as there). The record stays
+          BOTH_LOCKED: call this again to follow it. An empty token contract raises
+          :class:`~pyrxd.security.errors.NothingToRefund` naming the abandon (design N2). With the
+          disposition ``UNKNOWN``, a refund the leg refuses raises
+          :class:`~pyrxd.security.errors.CounterLegDispositionUnknown`.
+        * Refunded at the finalized block: a ``TAKER`` record goes to MUTUAL_REFUND and the covenant
+          is never touched (its CSV refund pays the maker, and is the maker's to send). A single
+          operator's (role ``None``) covenant refund is sent now, and only now, recorded as
+          ``asset_refund_txid``, and the record goes to MUTUAL_REFUND once it has returned.
+        * While a ``Claimed`` log that opens ``H`` is on record (``counter_claim_tx``) and the
+          covenant's ``t_rxd`` has not matured, neither terminal is taken and the covenant is not
+          refunded (D14, N1): ``p`` may be public, and the covenant claim comes first.
 
-        ``role=None`` (one operator driving both legs) and ``role=SwapRole.MAKER`` keep the
-        behaviour below on both counter chains: attempt both refunds, advance to MUTUAL_REFUND
-        only if both returned. A maker's process holds no BTC refund key, so on BTC its counter
-        refund fails and the record stays BOTH_LOCKED; the maker's own recovery is
-        :meth:`maybe_refund_asset_on_maker_stall`.
+        **BTC counter leg, and an ETH leg that cannot read its disposition** (a leg written before
+        0.27): unchanged, except that ``MAKER`` on ETH is refused here too. ``TAKER`` on ETH
+        refunds the counter leg only and stays BOTH_LOCKED. Every other case attempts both refunds
+        and goes to MUTUAL_REFUND only if both returned. The BTC claim leaf has no timelock, so a
+        maker can still claim with ``p`` while the taker's refund is unconfirmed; fixing BTC needs
+        the watchtower's spender classification first (#850 PR 9).
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(f"mutual_refund only valid from BOTH_LOCKED, not {self.record.state.value}")
         if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; BTC would strand (state was lost)")
-        if self.config.role is SwapRole.TAKER and self.record.terms.counter_chain == "eth":
-            # The taker's own leg only. No FSM advance and nothing new to persist: the record
-            # already says BOTH_LOCKED, which is still true of the covenant. A failed refund is
-            # explained from the chain only when a claim VERIFIES; settled with no verified claim
-            # is reported as unverified (never as refunded); otherwise the error propagates.
-            locator = self.record.counterchain_locator
-            try:
-                await self.counter_leg.refund(locator, self.record.terms.t_btc)
-            except Exception as refund_error:
-                await self._explain_failed_taker_eth_refund(locator, refund_error)
-                raise
+        eth = self.record.terms.counter_chain == "eth"
+        if eth and self.config.role is SwapRole.MAKER:
+            raise ValidationError(
+                "mutual_refund on an ETH counter leg is not the maker's step: the counter leg is the taker's to "
+                "refund. The maker's own recovery is maybe_refund_asset_on_maker_stall."
+            )
+        disposition = await self._read_counter_disposition()
+        if disposition is not None:
+            return await self._mutual_refund_on_the_read(disposition, resend_reverted_refund=resend_reverted_refund)
+        if eth and self.config.role is SwapRole.TAKER:
+            # A leg that reads no disposition: the taker's own leg only, as #851 shipped it. No FSM
+            # advance: the record already says BOTH_LOCKED, which is still true of the covenant.
+            await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
             logger.info(
                 "mutual_refund (TAKER role, ETH): counter-leg refund sent; the covenant is left for the "
                 "maker to refund and the record stays BOTH_LOCKED."
@@ -4975,70 +4954,124 @@ class SwapCoordinator:
         # preflight reverts against the settled contract and raises BEFORE the Radiant refund ever
         # runs. The leg that still holds value could then never be refunded in-band, which is the
         # opposite of what "the guaranteed-safe failure" promises.
-        #
-        # A RETRY must not re-send a leg that already refunded (#850 PR 5a): the re-send fails, and
-        # before this any failure kept the record at BOTH_LOCKED, so a retry after one leg had
-        # refunded could never complete. The ETH counter leg is read from the chain; the covenant
-        # refund is recorded on the record when its broadcast returns.
-        counter_done = False
-        disposition = await self._read_counter_disposition()
-        if disposition is not None:
-            from pyrxd.eth_wallet.disposition import DispositionKind
-
-            outcome = await self._apply_counter_disposition(disposition)
-            if outcome == "claimed":
-                # Verified claim: p is public and the record is SECRET_REVEALED. The covenant is
-                # claimable with p, so it is not refunded here.
-                return self.record
-            if disposition.kind is DispositionKind.CLAIMED and outcome == "recorded":
-                # A maker's record (it does not take the edge): the maker claimed the counter leg,
-                # so the covenant is the taker's to claim with p. Refunding it now would take both
-                # legs (review of #850 PR 5a).
-                raise ValidationError(
-                    "the counter leg was CLAIMED (verified at the finalized block): the covenant is the "
-                    "taker's to claim with p, so mutual_refund will not refund it. The evidence is on the record."
-                )
-            counter_done = disposition.kind is DispositionKind.REFUNDED and outcome == "recorded"
-        # The covenant refund waits while the counter leg may have been CLAIMED: settled at a tip
-        # but not yet final, or a Claimed(p) log on record before t_rxd (design §3.3; Mythos review
-        # of #850 PR 5a). Refunding it then would give the maker both legs if that claim stands.
-        covenant_wait: str | None = None
-        if disposition is not None and disposition.kind is DispositionKind.SETTLED_UNFINAL:
-            covenant_wait = "the counter leg is settled at the tip but not yet final; retry once it is"
-        elif await self._claim_seen_holds_the_terminal():
-            covenant_wait = (
-                f"a Claimed(p) log on the counter leg (tx {self.record.counter_claim_tx}) opens H, so p may be "
-                "public; the covenant is not refunded before t_rxd matures"
-            )
         failures: list[tuple[str, Exception]] = []
-        if not counter_done:
+        try:
+            await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
+        except Exception as exc:
+            failures.append(("counter leg", exc))
+        await self._refund_the_covenant_once(failures)
+        return await self._finish_mutual_refund(failures)
+
+    async def _mutual_refund_on_the_read(self, disposition: Any, *, resend_reverted_refund: bool) -> SwapRecord:
+        """:meth:`mutual_refund` on an ETH counter leg that reads its disposition (#850 PR 6)."""
+        from pyrxd.eth_wallet.disposition import DispositionKind
+
+        outcome = await self._apply_counter_disposition(disposition)
+        if outcome in ("claimed", "refunded"):
+            # claimed: SECRET_REVEALED, the covenant is claimable with p. refunded: a taker's
+            # MUTUAL_REFUND. Nothing to send either way.
+            return self.record
+        if outcome == "single_source":
+            raise CounterLegSingleSourceAnswer(
+                f"the counter leg reads {disposition.kind.value} from ONE endpoint, on a chain that carries "
+                "value; nothing changes and nothing is sent until a multi-source rpc agrees (design §2.5)",
+                kind=disposition.kind.value,
+            )
+        if outcome == "held":
+            # Refunded, but a Claimed(p) log is on record before t_rxd (D14, N1): p may be public.
+            # No terminal, and no covenant refund: the covenant claim comes first.
+            logger.warning(
+                "the counter leg is refunded at the finalized block, but a Claimed log on it (tx %s) opens H, so "
+                "p may be public: claim the covenant before t_rxd. The record stays BOTH_LOCKED until t_rxd matures.",
+                self.record.counter_claim_tx,
+            )
+            return self.record
+        if disposition.kind is DispositionKind.SETTLED_UNFINAL:
+            logger.info("the counter leg is settled at the tip but not yet final; nothing is sent, waiting")
+            return self.record
+        if disposition.kind is DispositionKind.CLAIMED:
+            # Only a maker's record records a claim without taking the edge, and a maker was refused
+            # above. Kept so a change there can never fall through to a refund.
+            raise ValidationError("the counter leg was CLAIMED; mutual_refund sends nothing")
+        if disposition.kind is not DispositionKind.REFUNDED:
             try:
-                await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-            except Exception as exc:
-                failures.append(("counter leg", exc))
+                await self._counter_refund_on_the_read(
+                    disposition, resend_reverted_refund=resend_reverted_refund, step="mutual_refund"
+                )
+            except NothingToRefund as exc:
+                raise NothingToRefund(
+                    f"{exc} mutual_refund cannot finish this swap: the counter-leg contract holds nothing to "
+                    "refund (a token push that never landed, or tokens removed after the maker verified them). "
+                    "The record stays BOTH_LOCKED. Its exit is the gated abandon, abandon_counter_leg, once the "
+                    "contract's expiry is final at the finalized block (design N2); that step is not in this "
+                    "release yet. If tokens reach the contract first, mutual_refund refunds them.",
+                    contract_address=exc.contract_address,
+                ) from exc
+            return self.record
+        if outcome != "recorded":
+            # A REFUNDED answer that carried no evidence was not checked against D4 or recorded.
+            raise ValidationError("the counter leg reads refunded with no evidence; mutual_refund sends nothing")
+        # REFUNDED at F and not held. A taker's record took MUTUAL_REFUND above; this is a single
+        # operator's, whose covenant refund goes out now and only now (design §3.3 step 4).
+        failures: list[tuple[str, Exception]] = []
+        await self._refund_the_covenant_once(failures)
+        return await self._finish_mutual_refund(failures, counter_leg_refunded=True)
+
+    async def _refund_the_covenant_once(self, failures: list[tuple[str, Exception]]) -> None:
+        """Send the covenant's CSV refund unless one is recorded and on chain; record its txid when
+        the broadcast returns (``asset_refund_txid``, #850 PR 5a). A failure is appended to
+        *failures*. Held while a recorded ``Claimed`` log opens ``H`` before ``t_rxd`` (D14)."""
         if self.record.asset_refund_txid is not None and not await self._recorded_asset_refund_landed():
             # Recorded, but not on chain (dropped or replaced): send it again.
             self.record = dataclasses.replace(self.record, asset_refund_txid=None)
-        if covenant_wait is not None and self.record.asset_refund_txid is None:
-            failures.append(("radiant leg", NetworkError(f"not sent: {covenant_wait}")))
-        elif self.record.asset_refund_txid is None:
-            try:
-                txid = await self.radiant_leg.refund_asset(self.record)
-            except Exception as exc:
-                failures.append(("radiant leg", exc))
-            else:
-                try:
-                    recorded = dataclasses.replace(self.record, asset_refund_txid=str(txid).lower())
-                except ValidationError:
-                    # The broadcast happened; a leg that returns no txid only costs the retry skip.
-                    logger.warning("the covenant refund returned %r, not a txid; not recorded", txid)
-                else:
-                    self.record = recorded
-                    await self._persist_record(self.record, shield=True)
+        if self.record.asset_refund_txid is not None:
+            return
+        if await self._claim_seen_holds_the_terminal():
+            # p may be public: refunding the covenant now would give the maker both legs if that
+            # claim stands (Mythos review of #850 PR 5a).
+            failures.append(
+                (
+                    "radiant leg",
+                    NetworkError(
+                        f"not sent: a Claimed(p) log on the counter leg (tx {self.record.counter_claim_tx}) opens "
+                        "H, so p may be public; the covenant is not refunded before t_rxd matures"
+                    ),
+                )
+            )
+            return
+        try:
+            txid = await self.radiant_leg.refund_asset(self.record)
+        except Exception as exc:
+            failures.append(("radiant leg", exc))
+            return
+        try:
+            recorded = dataclasses.replace(self.record, asset_refund_txid=str(txid).lower())
+        except ValidationError:
+            # The broadcast happened; a leg that returns no txid only costs the retry skip.
+            logger.warning("the covenant refund returned %r, not a txid; not recorded", txid)
+        else:
+            self.record = recorded
+            await self._persist_record(self.record, shield=True)
+
+    async def _finish_mutual_refund(
+        self, failures: list[tuple[str, Exception]], *, counter_leg_refunded: bool = False
+    ) -> SwapRecord:
+        """Advance to MUTUAL_REFUND when nothing failed; otherwise raise, the record unchanged.
+        *counter_leg_refunded*: the chain already shows the counter leg REFUNDED at the finalized
+        block, so only the covenant refund was attempted, and only it is retried."""
+        if failures and counter_leg_refunded:
+            blocked = [exc for _leg, exc in failures if isinstance(exc, _NEEDS_OPERATOR_ACTION)]
+            message = (
+                "mutual refund incomplete — "
+                + "; ".join(f"{leg}: {exc}" for leg, exc in failures)
+                + ". The counter leg is already refunded at the finalized block and is not sent again. The "
+                "swap stays BOTH_LOCKED so a retry re-attempts the covenant refund."
+            )
+            if blocked:
+                raise NetworkError(message) from blocked[0]
+            raise NetworkError(message)
         if failures:
-            # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts both. A
-            # leg that already refunded fails harmlessly the second time; a leg that did not gets
-            # its chance.
+            # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts what is left.
             #
             # Retryable as a whole (the other leg's failure may be transient), but a refusal that
             # a retry cannot pass until the operator acts is NAMED as such and chained as the

@@ -131,8 +131,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     pass). A run that times out leaves the record as it is, and running the phase again follows
     the recorded refund. The pre-check that refuses a settled or claimed HTLC runs only before our
     refund is recorded, because after that a contract settled at the tip is most likely our own
-    refund. `--phase refund` refuses while a refund recorded by `--phase abort` is being followed,
-    because `mutual_refund` would send a second one beside it.
+    refund. (`--phase refund` follows a refund `--phase abort` recorded; see PR 6 below.)
+- **On an ETH swap, `mutual_refund` reads the counter leg from the chain and no longer moves the
+  record on our own refund's broadcast (#850 PR 6) [Changed (breaking)].** It reads the contract's
+  disposition at the finalized block before it sends anything, sends or follows our refund by the
+  same rules as `taker_refund_btc` (PR 5b), and the record stays `BOTH_LOCKED` until the chain
+  shows the contract refunded. Call `mutual_refund` again to follow it. A BTC counter leg is
+  unchanged.
+  - `MUTUAL_REFUND` now means different things by role. For a `TAKER` it means our counter leg
+    is refunded at the finalized block; the covenant is the maker's, and nothing is sent on
+    Radiant. Before, a taker's record stayed `BOTH_LOCKED` for good. For a single operator (no
+    role) the covenant refund is sent only once the counter leg reads `REFUNDED`, so the first
+    call returns `BOTH_LOCKED` after sending our ETH refund, and a later call sends the covenant
+    refund and goes to `MUTUAL_REFUND`.
+    `reconcile_counter_leg` takes a taker's `BOTH_LOCKED` record to `MUTUAL_REFUND` on the same
+    evidence; a single operator's records the evidence and stays.
+  - While a `Claimed` log that opens the hashlock is recorded, `MUTUAL_REFUND` waits until the
+    covenant's `t_rxd` has matured (D14), for a taker and for a single operator. A single
+    operator's covenant refund is not sent in that time either.
+  - A counter leg proven `CLAIMED` goes to `SECRET_REVEALED`, as in `taker_refund_btc`, and nothing
+    is refunded. A single-endpoint terminal answer on a chain that carries value raises
+    `CounterLegSingleSourceAnswer`.
+  - A `MAKER`-role `mutual_refund` on an ETH counter leg now raises `ValidationError` before it
+    reads anything: the maker's leg is the covenant (`maybe_refund_asset_on_maker_stall`).
+  - A contract with nothing to refund raises `NothingToRefund`, naming the gated abandon
+    (`abandon_counter_leg`, not in this release yet).
+  - When the refund fails and the chain could not say what happened to the contract (`UNKNOWN`),
+    `mutual_refund` and `taker_refund_btc` raise the new `CounterLegDispositionUnknown` (a
+    `NetworkError`, with `.reason`), which says the refund was not sent and is not a refund. This
+    replaces #851's single-endpoint explanation. The same error is raised when our recorded refund
+    mined and reverted because the contract was already settled, and the chain reads it settled at
+    the finalized block without saying how; before, that refund was followed with no end. A new
+    `CounterDisposition.settled_at_finalized` marks that kind of `UNKNOWN`, so one failed read is
+    not mistaken for it. `CounterLegClaimedByCounterparty` and
+    `CounterLegSettledUnverified` are no longer raised; they still import.
+  - `scripts/eth_swap_two_host.py --role taker --phase refund` polls until the record is
+    `mutual_refund`, as `--phase abort` does, with the same `--abort-poll-timeout-s` and
+    `--resend-reverted-refund`. It follows a refund recorded by `--phase abort` instead of
+    refusing. Its first read is the disposition reader: a proven claim refuses and names `--phase
+    claim`, and an unverified `Claimed` log is printed as a warning. `--phase claim` finds the
+    maker's claim tx from the record, then from the reader, instead of one endpoint's logs.
+  - `scripts/eth_swap_grief_run.py` calls `mutual_refund` until the record is terminal, for up to
+    the new `--refund-poll-timeout-s` (3600 s by default).
   - `SWAP_RECORD_SCHEMA_VERSION` is 5. A record carrying any of the new fields writes 5. Do not
     drive one record with mixed pyrxd versions. A pyrxd from before this change refuses a v5
     record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x
@@ -344,6 +384,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     458,657 (`Erc20Htlc`); an `Erc20Htlc` refund rises by 34 gas; claims are unchanged.
 
 ### Deprecated
+
+- **`CounterLegClaimedByCounterparty` and `CounterLegSettledUnverified` (`pyrxd.security.errors`)
+  are no longer raised (#850 PR 6).** A claim is now `SECRET_REVEALED` on the record, and an
+  unexplained failed refund raises `CounterLegDispositionUnknown`. Both classes still import, so
+  code that catches them keeps working.
 
 - **`wave_identity.names_resolving_now` in `glyph inspect --verify-wave --json` and `pyrxd verify
   --verify-wave --json`.** Use `names_held_now`, which carries the same list under an accurate name

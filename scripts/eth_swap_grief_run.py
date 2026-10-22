@@ -273,11 +273,19 @@ async def run(args) -> None:
             "the taker's ETH + CSV-refunds the covenant to the maker",
             auto_yes=args.yes,
         )
-        rec = await coord.mutual_refund()
+        rec = await _mutual_refund_to_terminal(coord, timeout_s=args.refund_poll_timeout_s)
         report.step(
             name="mutual_refund", chain="both", state=rec.state.value, covenant_outpoint=rec.radiant_covenant_outpoint
         )
         print(f"  -> {rec.state.value}")
+        if rec.state is SwapState.BOTH_LOCKED:
+            print(
+                "  NOT FINISHED: the record is still both_locked and the covenant refund has not gone. Do NOT re-run "
+                "this script: it has no resume (with the same --keys-out it refuses to overwrite it; with a new one "
+                "it starts a second swap). The record is saved at <--keys-out>.swaprec.json; finish from it with a "
+                "SwapCoordinator built with role=None (as this run was: a TAKER role never refunds the covenant), "
+                "calling mutual_refund until the record is mutual_refund."
+            )
         if rec.state is SwapState.MUTUAL_REFUND:
             print("\n  S1 PROVEN ON REAL CHAINS: the stalling maker caused NO one-sided loss —")
             print("    the taker's ETH refunded to the taker; the RXD covenant CSV-refunded to the maker.")
@@ -285,6 +293,45 @@ async def run(args) -> None:
         report.dump(args.report_out)
         print(f"  report -> {args.report_out}")
         await rpc.close()
+
+
+async def _mutual_refund_to_terminal(coord, *, timeout_s: float, interval_s: float = 30.0):
+    """Call ``mutual_refund`` until the record is terminal or ``timeout_s`` passes (#850 PR 6).
+
+    One call is not the end: the first sends our ETH refund and the record stays BOTH_LOCKED until the
+    chain shows the HTLC REFUNDED at the finalized block (about two epochs on Sepolia); only then does
+    a later call send the covenant refund. Every pass follows the recorded refund by the coordinator's
+    rules and never sends a second one. Past the deadline the record is left as it is, durable. Only a
+    failed chain call is retried: a refusal that needs the operator (``CounterLegDispositionUnknown``,
+    ``CounterLegSingleSourceAnswer``) stops the loop at once.
+    """
+    from pyrxd.security.errors import CounterLegDispositionUnknown, CounterLegSingleSourceAnswer, NetworkError
+
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            rec = await coord.mutual_refund()
+        except (CounterLegDispositionUnknown, CounterLegSingleSourceAnswer):
+            raise
+        except NetworkError as exc:
+            if coord.record.counter_refund_tx_hash is None or time.monotonic() >= deadline:
+                raise
+            print(f"  a chain call failed while following our refund ({str(exc)[:160]}); retrying")
+        else:
+            if rec.state is not SwapState.BOTH_LOCKED or time.monotonic() >= deadline:
+                return rec
+            refunded = rec.counter_disposition is not None and rec.counter_disposition.kind == "refunded"
+            if refunded and rec.counter_claim_tx is not None:
+                why = (
+                    f"the ETH HTLC is REFUNDED at the finalized block, but a Claimed log on it (tx "
+                    f"{rec.counter_claim_tx}) opens H, so the record and the covenant refund wait until t_rxd matures"
+                )
+            elif rec.counter_refund_tx_hash is None:
+                why = "nothing of ours is sent: the ETH HTLC is settled at the tip but not yet final"
+            else:
+                why = f"our ETH refund {rec.counter_refund_tx_hash} is not yet REFUNDED at the finalized block"
+            print(f"  the record is still both_locked: {why}; waiting")
+        await asyncio.sleep(interval_s)
 
 
 def _args():
@@ -306,6 +353,10 @@ def _args():
     # refuses a shorter deadline at construction (the smallest it accepts is 9,522 s). 1,800 s and 7,200 s
     # were refused.
     ap.add_argument("--eth-timeout-s", type=int, default=10_800)
+    # Our ETH refund must reach the finalized block (two epochs, the 768 s floor below) before the covenant
+    # refund goes; an hour (chosen, not measured) leaves room for a slow epoch. Past it the record stays
+    # BOTH_LOCKED and the script says how to finish (it has no resume).
+    ap.add_argument("--refund-poll-timeout-s", type=float, default=3_600.0)
     ap.add_argument("--rxd-photons", type=int, default=1000)
     # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
     ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)

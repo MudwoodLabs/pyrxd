@@ -206,6 +206,11 @@ class TestEthTierBIsolated:
             # to maker. No one-sided loss.
             node.rxd_mine(terms.t_rxd.value - cov_confs)
             rec = await coord.mutual_refund()
+            # #850 PR 6: our ETH refund is RECORDED and the record waits for the chain; with no role the
+            # covenant refund goes only once the ETH HTLC is REFUNDED at the finalized block.
+            assert rec.state is SwapState.BOTH_LOCKED and rec.counter_refund_tx_hash is not None, rec.state.value
+            _anvil_mine(url, 3)  # --slots-in-an-epoch 1: finalized = latest - 2
+            rec = await coord.mutual_refund()
             assert rec.state is SwapState.MUTUAL_REFUND
             cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
             assert node.rxd("gettxout", cov_txid, "0") in (None, ""), "covenant CSV-refunded (to the maker)"

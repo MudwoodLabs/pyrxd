@@ -653,20 +653,27 @@ class TestTheLibraryHasNoAssetRefundOutsideBothLocked:
     Grow a third one, or relax either state guard, and this fails."""
 
     def test_exactly_two_coordinator_methods_refund_the_asset(self):
+        # A private helper that calls ``refund_asset`` (``_refund_the_covenant_once``, #850 PR 6) is
+        # followed up to the public methods that reach it, so moving the call into a helper cannot
+        # hide a new entry point.
         tree = ast.parse(_COORDINATOR_SRC.read_text())
-        callers: set[str] = set()
+        calls: dict[str, set[str]] = {}
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            for sub in ast.walk(node):
-                if (
-                    isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Attribute)
-                    and sub.func.attr == "refund_asset"
-                ):
-                    callers.add(node.name)
-        assert callers, "the scan found no asset-refund caller at all — it has stopped running"
-        assert callers == {"maybe_refund_asset_on_maker_stall", "mutual_refund"}, callers
+            calls[node.name] = {
+                sub.func.attr
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+            }
+        direct = {name for name, called in calls.items() if "refund_asset" in called}
+        assert direct, "the scan found no asset-refund caller at all — it has stopped running"
+        reached, frontier = set(direct), set(direct)
+        while frontier:
+            frontier = {name for name, called in calls.items() if called & frontier} - reached
+            reached |= frontier
+        public = {name for name in reached if not name.startswith("_")}
+        assert public == {"maybe_refund_asset_on_maker_stall", "mutual_refund"}, (public, reached)
 
     async def test_both_of_them_refuse_from_negotiated(self, eth_mod, tmp_path):
         args, terms, _io = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True)
@@ -822,7 +829,7 @@ class _ClaimedEthCounterLeg(_FakeCounterLeg):
     def _not_yet(self) -> bool:
         return self._lands_after_precheck and not self.refund_calls
 
-    async def refund(self, locator, timeout=None) -> str:
+    async def refund(self, locator, timeout=None, **_kw) -> str:
         self.refund_calls.append(locator)
         sel = "0x" + function_selector("AlreadySettled()").hex()
         raise ValidationError(f"tx would revert (preflight eth_call): ('{sel}', '{sel}')")
@@ -863,47 +870,76 @@ def _wire_eth_claimed(mod, monkeypatch, leg, *, now_ts=1_900_000_000):
     return built
 
 
+def _disposition(kind: str, *, tx=None, seen=(), reason="scripted"):
+    """A ``CounterDisposition`` as the shared reader returns it. ``seen`` is ``(tx, verified)`` pairs."""
+    from pyrxd.eth_wallet.disposition import ClaimSeen, CounterDisposition, DispositionEvidence, DispositionKind
+
+    k = DispositionKind(kind)
+    evidence = None
+    if k in (DispositionKind.CLAIMED, DispositionKind.REFUNDED):
+        evidence = DispositionEvidence(k, 90, "0x" + "b1" * 32, tx, ("a.test", "b.test"), False)
+    claims = tuple(ClaimSeen(t, 70, ("a.test",), v) for t, v in seen)
+    return CounterDisposition(k, reason, 90, evidence, claims_seen=claims)
+
+
+class _ReadingClaimedLeg(_ClaimedEthCounterLeg):
+    """``_ClaimedEthCounterLeg`` that reads its disposition, as the shipped ``EthLeg`` does (#850 PR 6).
+    ``answers`` are returned in order, the last one repeating. Its refund still fails the way the
+    real leg's preflight does against a settled contract."""
+
+    def __init__(self, preimage, answers, **kw) -> None:
+        super().__init__(preimage, **kw)
+        self.answers = list(answers)
+        self.reads = 0
+
+    async def counter_disposition(self, locator, **_kw):
+        self.reads += 1
+        return self.answers[min(self.reads, len(self.answers)) - 1]
+
+
+_SETTLED_NOTHING_VERIFIES = "settled at the finalized block with neither a verified refund nor a verified claim"
+
+
 class TestTakerEthRefundSaysWhatHappenedWhenItFails:
-    """#850 review: the real leg's failure for "the maker claimed" is a bare preflight revert, the
-    same text as "your refund already landed". The phase must tell the operator which.
+    """#850: the real leg's failure for "the maker claimed" is a bare preflight revert, the same text
+    as "your refund already landed". The phase must tell the operator which.
 
-    Since #850 PR R the phase refuses BEFORE the refund when the contract already reads settled or
-    claimed (``TestTakerEthRefundPreCheck``). The coordinator's failure-time explanation still
-    matters for the race that pre-check cannot close: the claim lands between the pre-check and the
-    refund's preflight. These tests drive that race (``lands_after_precheck``)."""
+    Since #850 PR 6 the coordinator's disposition reader decides, read before anything is sent; the
+    single-endpoint explanation (#851) is gone. These drive the race the phase's first read cannot
+    close: the claim is seen only by the coordinator's own read, or never verifies."""
 
-    async def test_maker_already_claimed_names_the_claim_and_the_claim_phase(self, eth_mod, tmp_path, monkeypatch):
-        p = os.urandom(32)
-        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True, preimage=p)
-        leg = _ClaimedEthCounterLeg(p, lands_after_precheck=True)
+    async def test_a_claim_seen_only_by_the_coordinators_read_ends_secret_revealed(
+        self, eth_mod, tmp_path, monkeypatch
+    ):
+        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        claimed = _disposition("claimed", tx="0x" + "55" * 32)
+        leg = _ReadingClaimedLeg(None, [_disposition("tip_expired"), claimed])
         built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(SystemExit) as raised:
             await eth_mod.taker_phase_refund(args)
-        msg = str(raised.value)
-        assert "MAKER CLAIMED" in msg and "0x" + "55" * 32 in msg, msg
-        assert "--phase claim" in msg and "t_rxd" in msg, msg
-        assert leg.provenance_checked == ["0x" + "55" * 32], "the claim was not verified before being reported"
-        assert built["rxd"].refund_calls == []
+        msg = str(raised.value.code)
+        assert "secret_revealed" in msg and "--phase claim" in msg, msg
+        assert leg.refund_calls == [] and built["rxd"].refund_calls == []
+        rec = _read_back(args)
+        assert rec.state is SwapState.SECRET_REVEALED and rec.counter_claim_tx == "0x" + "55" * 32
 
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
     async def test_a_real_claim_hidden_by_the_logs_exits_non_zero_and_never_says_done(
-        self, eth_mod, tmp_path, monkeypatch, capsys
+        self, eth_mod, tmp_path, monkeypatch, capsys, phase
     ):
         """The #851 re-review probe through the runner: the maker really claimed (settled), but the
-        one endpoint withholds the claim log or forges a Refunded(). The phase used to print "done"
-        and exit 0 right after confirming the covenant was unspent; the taker stopped and the maker
-        kept both legs. It must exit non-zero with the check and the claim steps."""
+        endpoints withhold the claim log. The reader says UNKNOWN; the refund the leg refuses must
+        end the phase non-zero with the check and the claim steps, never "done"."""
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        # The leg's log scan finds no claim (withheld; a forged Refunded() reads the same through the
-        # real scan — that half is tested through the shipped EthLeg in
-        # test_taker_mutual_refund_leaves_covenant.py) while storage says settled.
-        leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True, lands_after_precheck=True)
+        leg = _ReadingClaimedLeg(None, [_disposition("unknown", reason=_SETTLED_NOTHING_VERIFIES)], claim_tx=None)
         built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        run = eth_mod.taker_phase_refund if phase == "refund" else eth_mod.taker_phase_abort
         with pytest.raises(SystemExit) as raised:
-            await eth_mod.taker_phase_refund(args)
-        assert len(leg.refund_calls) == 1, "the race case: the pre-check passed and the refund was attempted"
+            await run(args)
+        assert len(leg.refund_calls) == 1, "the refund was attempted, and refused by the leg"
         assert raised.value.code not in (None, 0), "the phase exited 0: the operator would stop here"
         msg = str(raised.value.code)
-        assert "ALREADY SETTLED" in msg and "does not mean it was refunded" in msg, msg
+        assert "Do not read this as refunded" in msg and _SETTLED_NOTHING_VERIFIES in msg, msg
         assert "maker_claim.json" in msg and "--phase claim" in msg and "t_rxd" in msg, msg
         assert "0x" + "33" * 20 in msg  # the contract to check
         assert "done" not in capsys.readouterr().out.lower()
@@ -919,26 +955,58 @@ class TestTakerEthRefundSaysWhatHappenedWhenItFails:
         class _Stop(Exception):
             pass
 
-        class _Leg(_ClaimedEthCounterLeg):
+        class _Leg(_ReadingClaimedLeg):
             async def assert_claim_provenance(self, tx_hash, *, contract_address, preimage) -> None:
                 self.provenance_checked.append(tx_hash)
                 raise _Stop  # far enough: the discovered hash reached the verified reveal
 
-        leg = _Leg(p, claim_tx="0x" + "66" * 32)
+        # A verified claim is preferred over one that does not verify (yet).
+        seen = (("0x" + "77" * 32, False), ("0x" + "66" * 32, True))
+        leg = _Leg(p, [_disposition("settled_unfinal", seen=seen)])
         _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(_Stop):
             await eth_mod.taker_phase_claim(_with_fee(args))
         assert leg.provenance_checked == ["0x" + "66" * 32]
 
+    async def test_claim_phase_uses_the_claim_this_hosts_record_holds(self, eth_mod, tmp_path, monkeypatch):
+        """A Claimed log an earlier phase's read recorded (counter_claim_tx) is used before any read."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        p = os.urandom(32)
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True, preimage=p)
+        loc = _exchange_locator(io_dir, eth=True)
+        await _seed(
+            args,
+            SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms, counter_claim_tx="0x" + "99" * 32).with_counter_lock(
+                loc
+            ),
+        )
+
+        class _Stop(Exception):
+            pass
+
+        class _Leg(_ReadingClaimedLeg):
+            async def assert_claim_provenance(self, tx_hash, *, contract_address, preimage) -> None:
+                self.provenance_checked.append(tx_hash)
+                raise _Stop
+
+        leg = _Leg(p, [_disposition("tip_expired")])
+        _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        with pytest.raises(_Stop):
+            await eth_mod.taker_phase_claim(_with_fee(args))
+        assert leg.provenance_checked == ["0x" + "99" * 32] and leg.reads == 0
+
     async def test_claim_phase_without_maker_claim_json_or_a_claim_refuses_clearly(
         self, eth_mod, tmp_path, monkeypatch
     ):
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        _wire_eth_claimed(eth_mod, monkeypatch, _ClaimedEthCounterLeg(None, claim_tx=None, settled=False))
+        leg = _ReadingClaimedLeg(None, [_disposition("unknown", reason="no endpoint answered the log scan")])
+        _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(SystemExit, match="no claim found in the logs") as raised:
             await eth_mod.taker_phase_claim(_with_fee(args))
         msg = str(raised.value.code)
         assert "NOT proof" in msg and "t_rxd = 120" in msg and "eth_claim_tx_hash" in msg, msg
+        assert "no endpoint answered the log scan" in msg, msg
 
 
 def _btc_spend(outpoint, witness: list[bytes]) -> bytes:
@@ -2198,78 +2266,52 @@ class TestTheMergeHelperOnItsOwn:
 
 
 class TestTakerEthRefundPreCheck:
-    """Refuses when the HTLC is settled or a claim is found in its logs; never concludes "refunded"."""
+    """``--phase refund`` reads the HTLC's disposition first (#850 PR 6, the shared reader): a claim
+    proven at the finalized block refuses; an unproven Claimed log is printed and the phase goes on.
+    It never concludes "refunded"."""
 
-    async def test_a_claim_in_the_logs_refuses_and_names_the_claim_phase(self, eth_mod, tmp_path, monkeypatch, capsys):
+    @pytest.mark.parametrize(
+        ("tx", "said"), [("0x" + "55" * 32, "verified at the finalized block"), (None, "no claim log")]
+    )
+    async def test_a_proven_claim_refuses_and_names_the_claim_phase(self, eth_mod, tmp_path, monkeypatch, tx, said):
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        leg = _ClaimedEthCounterLeg(os.urandom(32))
+        leg = _ReadingClaimedLeg(None, [_disposition("claimed", tx=tx)])
         built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(SystemExit) as raised:
             await eth_mod.taker_phase_refund(args)
         msg = str(raised.value.code)
-        assert msg.startswith("REFUSING to refund") and "0x" + "55" * 32 in msg, msg
-        assert "not verified here" in msg and "--phase claim" in msg and "t_rxd = 120" in msg, msg
-        assert "Nothing was sent" in msg, msg
-        assert leg.refund_calls == [], "the refund was attempted against a claimed contract"
-        assert built["rxd"].refund_calls == []
-        assert "refunded" not in capsys.readouterr().out.lower()
-
-    async def test_settled_with_no_claim_found_refuses_and_never_says_refunded(self, eth_mod, tmp_path, monkeypatch):
-        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True)
-        _wire_eth_claimed(eth_mod, monkeypatch, leg)
-        with pytest.raises(SystemExit) as raised:
-            await eth_mod.taker_phase_refund(args)
-        msg = str(raised.value.code)
-        assert "already SETTLED" in msg and "does not mean it was refunded" in msg, msg
-        assert "maker_claim.json" in msg and "--phase claim" in msg and "0x" + "33" * 20 in msg, msg
-        assert leg.refund_calls == []
-
-    async def test_a_claim_on_an_unsettled_contract_still_refuses(self, eth_mod, tmp_path, monkeypatch):
-        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        leg = _ClaimedEthCounterLeg(os.urandom(32), settled=False)
-        _wire_eth_claimed(eth_mod, monkeypatch, leg)
-        with pytest.raises(SystemExit, match="NOT settled"):
-            await eth_mod.taker_phase_refund(args)
-        assert leg.refund_calls == []
+        assert msg.startswith("REFUSING to refund") and said in msg, msg
+        assert "--phase claim" in msg and "t_rxd = 120" in msg and "Nothing was sent" in msg, msg
+        if tx:
+            assert tx in msg
+        assert leg.refund_calls == [] and built["rxd"].refund_calls == []
 
     async def test_it_runs_before_the_timeout_check(self, eth_mod, tmp_path, monkeypatch):
         """A claim before the ETH timeout is when the covenant claim is most urgent; the "has NOT
         timed out" refusal must not hide it."""
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        leg = _ClaimedEthCounterLeg(os.urandom(32))
+        leg = _ReadingClaimedLeg(None, [_disposition("claimed", tx="0x" + "55" * 32)])
         _wire_eth_claimed(eth_mod, monkeypatch, leg, now_ts=1_700_000_000)  # before the 1_800_000_000 timeout
-        with pytest.raises(SystemExit, match="a claim of the ETH HTLC"):
+        with pytest.raises(SystemExit, match="REFUSING to refund: the ETH HTLC"):
             await eth_mod.taker_phase_refund(args)
 
-    async def test_an_unreadable_settled_flag_refuses(self, eth_mod, tmp_path, monkeypatch):
+    async def test_an_unproven_claim_is_printed_and_the_refund_goes_on(self, eth_mod, tmp_path, monkeypatch, capsys):
+        """Design §3.7: a claim seen from one endpoint only pages; after the timeout no claim can
+        succeed, so refunding the HTLC is still right. The coordinator records it (D14)."""
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-
-        class _Leg(_FakeCounterLeg):
-            async def is_settled(self, locator) -> bool:
-                raise NetworkError("eth_getStorageAt timed out")
-
-        leg = _Leg()
-        _wire_eth_claimed(eth_mod, monkeypatch, leg)
-        with pytest.raises(SystemExit, match="could not read whether"):
+        leg = _SeenClaimDispositionLeg()
+        _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit, match="is sent but not yet REFUNDED"):
             await eth_mod.taker_phase_refund(args)
-        assert leg.refund_calls == []
+        out = capsys.readouterr().out
+        assert "WARNING: a Claimed log" in out and "0x" + "dd" * 32 in out and "--phase claim" in out, out
+        assert len(leg.refund_calls) == 1 and _read_back(args).counter_claim_tx == "0x" + "dd" * 32
 
-    async def test_unreadable_logs_on_an_unsettled_contract_do_not_block_the_refund(
-        self, eth_mod, tmp_path, monkeypatch
-    ):
-        """The honest path: many endpoints cap or prune old logs, and an unsettled contract has no
-        landed claim. A pre-check that refused here would block a valid refund."""
+    async def test_HONEST_a_leg_that_reads_no_disposition_skips_it(self, eth_mod, tmp_path, monkeypatch):
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-
-        class _Leg(_FakeCounterLeg):
-            async def observed_claim_tx(self, locator):
-                raise NetworkError("eth_getLogs: block range too large")
-
-        leg = _Leg()
-        _wire_eth_claimed(eth_mod, monkeypatch, leg)
+        built = _wire_eth(eth_mod, monkeypatch)
         await eth_mod.taker_phase_refund(args)
-        assert len(leg.refund_calls) == 1
+        assert len(built["counter"].refund_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2481,39 +2523,37 @@ class TestThePersistedStateGuardThroughTheRunners:
 
 
 class TestTakerEthAbortHasTheSameChecks:
-    async def test_a_claimed_htlc_refuses_before_the_refund(self, eth_mod, tmp_path, monkeypatch):
-        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        leg = _ClaimedEthCounterLeg(os.urandom(32))
+    async def test_a_proven_claim_sends_nothing_and_names_the_claim(self, eth_mod, tmp_path, monkeypatch):
+        """``taker_refund_btc`` reads first (#850 PR 5a). With the covenant outpoint pinned the record
+        goes to SECRET_REVEALED; the phase exits naming --phase claim. Nothing is sent."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+        loc = _exchange_locator(io_dir, eth=True)
+        await _seed(
+            args,
+            SwapRecord(state=SwapState.BTC_LOCKED, terms=terms)
+            .with_counter_lock(loc)
+            .with_radiant_lock("cc" * 32 + ":0", "51"),
+        )
+        leg = _ReadingClaimedLeg(None, [_disposition("claimed", tx="0x" + "55" * 32)])
         built = _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(SystemExit) as raised:
             await eth_mod.taker_phase_abort(args)
         msg = str(raised.value.code)
-        assert msg.startswith("REFUSING to refund") and "--phase claim" in msg and "t_rxd = 120" in msg, msg
+        assert "secret_revealed" in msg and "--phase claim" in msg, msg
         assert leg.refund_calls == [] and built["rxd"].refund_calls == []
 
-    async def test_a_claim_landing_after_the_pre_check_is_explained(self, eth_mod, tmp_path, monkeypatch):
-        """Before this, the abort sent the refund and surfaced a bare preflight ValidationError."""
-        p = os.urandom(32)
-        args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True, preimage=p)
-        leg = _ClaimedEthCounterLeg(p, lands_after_precheck=True)
-        _wire_eth_claimed(eth_mod, monkeypatch, leg)
-        with pytest.raises(SystemExit) as raised:
-            await eth_mod.taker_phase_abort(args)
-        msg = str(raised.value.code)
-        assert "MAKER CLAIMED" in msg and "0x" + "55" * 32 in msg and "--phase claim" in msg, msg
-        assert len(leg.refund_calls) == 1
-        assert leg.provenance_checked == ["0x" + "55" * 32], "the claim was not verified before being reported"
-
-    async def test_settled_with_no_verified_claim_after_the_pre_check_never_says_refunded(
-        self, eth_mod, tmp_path, monkeypatch
-    ):
+    async def test_a_proven_claim_with_no_covenant_pinned_still_names_the_claim(self, eth_mod, tmp_path, monkeypatch):
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
-        leg = _ClaimedEthCounterLeg(None, claim_tx=None, settled=True, lands_after_precheck=True)
+        leg = _ReadingClaimedLeg(None, [_disposition("claimed", tx="0x" + "55" * 32)])
         _wire_eth_claimed(eth_mod, monkeypatch, leg)
         with pytest.raises(SystemExit) as raised:
             await eth_mod.taker_phase_abort(args)
         msg = str(raised.value.code)
-        assert "ALREADY SETTLED" in msg and "does not mean it was refunded" in msg and "--phase claim" in msg, msg
+        assert "CLAIMED" in msg and "claim it with p before t_rxd" in msg, msg
+        assert leg.refund_calls == []
+        assert _read_back(args).counter_claim_tx == "0x" + "55" * 32
 
 
 # ---------------------------------------------------------------------------
@@ -2787,6 +2827,14 @@ class _DispositionCounterLeg(_FakeCounterLeg):
         return CounterDisposition(DispositionKind.TIP_EXPIRED, "past the timeout", 60)
 
 
+class _SeenClaimDispositionLeg(_DispositionCounterLeg):
+    """As ``_DispositionCounterLeg``, with an unverified Claimed log that opens H on every read."""
+
+    async def counter_disposition(self, locator, **kw):
+        d = await super().counter_disposition(locator, **kw)
+        return dataclasses.replace(d, claims_seen=_disposition("open", seen=(("0x" + "dd" * 32, False),)).claims_seen)
+
+
 class TestTakerEthAbortPollsToTerminal:
     """#850 PR 5b (design §4.4): the record no longer goes ABORTED on our broadcast, so the abort
     phase follows the refund until the chain shows it refunded at the finalized block."""
@@ -2820,14 +2868,14 @@ class TestTakerEthAbortPollsToTerminal:
         assert _read_back(args).state is SwapState.ABORTED
         assert len(leg.refund_calls) == 1  # followed, never sent twice
 
-    async def test_HONEST_a_first_run_still_refuses_a_contract_settled_before_we_sent(
+    async def test_HONEST_a_first_run_sends_nothing_to_a_contract_settled_before_we_sent(
         self, eth_mod, tmp_path, monkeypatch
     ):
         args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
         leg = _DispositionCounterLeg()
         leg.settled = True  # settled by someone else before any refund of ours was recorded
         _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
-        with pytest.raises(SystemExit, match="REFUSING to refund"):
+        with pytest.raises(SystemExit, match="settled at the chain tip but not yet final, and nothing was sent"):
             await eth_mod.taker_phase_abort(args)
         assert leg.refund_calls == []
 
@@ -3037,8 +3085,10 @@ async def test_a_validation_error_while_following_exits_with_the_record_kept(eth
     assert _read_back(args).counter_refund_tx_hash is not None
 
 
-async def test_phase_refund_refuses_beside_a_refund_abort_recorded(eth_mod, tmp_path, monkeypatch):
-    """N1: --phase refund sent a SECOND counter refund (mutual_refund has no pending record yet)."""
+async def test_phase_refund_follows_a_refund_abort_recorded(eth_mod, tmp_path, monkeypatch):
+    """Mythos N1 on #894: --phase refund sent a SECOND counter refund, so 5b made it refuse. Since
+    #850 PR 6 mutual_refund follows the recorded refund like taker_refund_btc, so the phase follows it
+    to MUTUAL_REFUND and sends nothing more."""
     args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
     leg = _DispositionCounterLeg()
     _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
@@ -3046,9 +3096,53 @@ async def test_phase_refund_refuses_beside_a_refund_abort_recorded(eth_mod, tmp_
         await eth_mod.taker_phase_abort(args)
     calls = len(leg.refund_calls)
     _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
-    with pytest.raises(SystemExit, match="REFUSING --phase refund: our ETH refund"):
+    with pytest.raises(SystemExit, match="the record stays both_locked: our ETH refund"):
         await eth_mod.taker_phase_refund(args)
     assert len(leg.refund_calls) == calls
+    leg.refunded_after_reads = leg.reads
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    await eth_mod.taker_phase_refund(args)
+    assert len(leg.refund_calls) == calls and _read_back(args).state is SwapState.MUTUAL_REFUND
+
+
+async def test_phase_refund_polls_until_the_refund_is_final(eth_mod, tmp_path, monkeypatch, capsys):
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    leg = _DispositionCounterLeg()
+    leg.refunded_after_reads = 3  # the phase's first read, then two coordinator reads
+    built = _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    await eth_mod.taker_phase_refund(args)
+    rec = _read_back(args)
+    assert rec.state is SwapState.MUTUAL_REFUND and rec.counter_refund_tx_hash == leg._TX
+    assert len(leg.refund_calls) == 1 and built["rxd"].refund_calls == []
+    assert "covenant is the maker's to refund" in capsys.readouterr().out
+
+
+async def test_phase_refund_names_itself_after_a_reverted_refund(eth_mod, tmp_path, monkeypatch):
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    leg = _RevertedRefundLeg()
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit) as raised:
+        await eth_mod.taker_phase_refund(args)
+    msg = str(raised.value.code)
+    assert "mutual_refund(resend_reverted_refund=True)" in msg and "run --phase refund again" in msg, msg
+    args.resend_reverted_refund = True
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="--resend-reverted-refund"):
+        await eth_mod.taker_phase_refund(args)
+    assert len(leg.refund_calls) == 2
+
+
+async def test_a_leg_that_reads_no_disposition_is_sent_once_however_long_the_phase_polls(
+    eth_mod, tmp_path, monkeypatch
+):
+    """A pre-0.27 leg has no recorded refund to follow: another pass would send another refund."""
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    built = _wire_eth(eth_mod, monkeypatch)
+    await eth_mod.taker_phase_refund(args)
+    assert len(built["counter"].refund_calls) == 1
 
 
 async def test_HONEST_phase_refund_still_runs_with_no_recorded_refund(eth_mod, tmp_path, monkeypatch):
@@ -3056,3 +3150,62 @@ async def test_HONEST_phase_refund_still_runs_with_no_recorded_refund(eth_mod, t
     built = _wire_eth(eth_mod, monkeypatch)
     await eth_mod.taker_phase_refund(args)
     assert len(built["counter"].refund_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 13. The grief run follows mutual_refund to the end (#850 PR 6)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedMutualRefund:
+    """A coordinator whose ``mutual_refund`` returns the scripted states (or raises), in order."""
+
+    def __init__(self, steps) -> None:
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        self.steps = list(steps)
+        self.calls = 0
+        self.record = SwapRecord.__new__(SwapRecord)
+        object.__setattr__(self.record, "counter_refund_tx_hash", "0x" + "ab" * 32)
+
+    async def mutual_refund(self):
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
+        self.calls += 1
+        if isinstance(step, Exception):
+            raise step
+        rec = type("Rec", (), {})()
+        rec.state = step
+        rec.counter_refund_tx_hash = self.record.counter_refund_tx_hash
+        rec.counter_claim_tx = None
+        rec.counter_disposition = None
+        return rec
+
+
+async def test_the_grief_run_calls_mutual_refund_until_the_record_is_terminal():
+    mod = _load("eth_swap_grief_run")
+    coord = _ScriptedMutualRefund(
+        [SwapState.BOTH_LOCKED, NetworkError("a read failed"), SwapState.BOTH_LOCKED, SwapState.MUTUAL_REFUND]
+    )
+    rec = await mod._mutual_refund_to_terminal(coord, timeout_s=60.0, interval_s=0.0)
+    assert rec.state is SwapState.MUTUAL_REFUND
+    assert coord.calls == 4
+
+
+async def test_the_grief_run_stops_at_its_deadline_and_leaves_the_record_as_it_is():
+    """HONEST bound: a refund that never finalizes is not followed for ever."""
+    mod = _load("eth_swap_grief_run")
+    coord = _ScriptedMutualRefund([SwapState.BOTH_LOCKED])
+    rec = await mod._mutual_refund_to_terminal(coord, timeout_s=0.0, interval_s=0.0)
+    assert rec.state is SwapState.BOTH_LOCKED
+    assert coord.calls == 1
+
+
+async def test_the_grief_run_does_not_retry_a_refusal_that_needs_the_operator():
+    """An UNKNOWN disposition is a NetworkError too, but retrying it for an hour changes nothing."""
+    from pyrxd.security.errors import CounterLegDispositionUnknown
+
+    mod = _load("eth_swap_grief_run")
+    coord = _ScriptedMutualRefund([CounterLegDispositionUnknown("unknown", reason="r"), SwapState.MUTUAL_REFUND])
+    with pytest.raises(CounterLegDispositionUnknown):
+        await mod._mutual_refund_to_terminal(coord, timeout_s=60.0, interval_s=0.0)
+    assert coord.calls == 1

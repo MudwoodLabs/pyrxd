@@ -50,6 +50,7 @@ class _ChainLeg(FakeEthLeg):
         super().__init__(*a, **k)
         self._rpc = rpc
         self.refunds = 0
+        self.preflight_refusals = 0
         self.signed: list[tuple[str, int, object]] = []
         self.undelivered: set[str] = set()
         self.fees: dict[str, dict[str, int]] = {}
@@ -67,6 +68,14 @@ class _ChainLeg(FakeEthLeg):
         return await read_counter_disposition(self._rpc, locator, **kwargs)
 
     async def refund(self, locator, timeout=None, *, on_signed=None, replace=None):
+        # The real leg's checks before it signs (#850 PR 6): a refund before the timeout is a
+        # retryable "not yet mature", and the eth_call preflight reverts AlreadySettled once the
+        # contract is settled at the tip. Nothing is signed or counted either way.
+        if self.chain.ts(self.chain.head) < self.chain.timeout:
+            raise NetworkError("ETH HTLC refund is not yet mature")
+        if self.chain.settled_at is not None and self.chain.settled_at <= self.chain.head:
+            self.preflight_refusals += 1
+            raise ValidationError("tx would revert (preflight eth_call): AlreadySettled()")
         self.refunds += 1
         tx = _fake_tx_hash(refund_label(self.refunds))
         nonce = replace.nonce if replace is not None else self.next_nonce
@@ -81,8 +90,6 @@ class _ChainLeg(FakeEthLeg):
         )
         if self.fail_broadcast:
             self.undelivered.add(tx)
-            from pyrxd.security.errors import NetworkError
-
             raise NetworkError("eth_sendRawTransaction failed: replacement transaction underpriced")
         return tx
 
@@ -220,14 +227,24 @@ async def test_an_unknown_disposition_changes_nothing_and_raises():
     assert coord.record.state is SwapState.BTC_LOCKED and coord.persisted == []
 
 
-async def test_both_locked_claimed_goes_to_secret_revealed_but_refunded_waits_for_pr6():
+async def test_both_locked_claimed_goes_to_secret_revealed():
     coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, chain_kw={"finalized": 90})
     chain.claim(70)
     assert (await coord.reconcile_counter_leg()).state is SwapState.SECRET_REVEALED
-    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, chain_kw={"finalized": 90})
+
+
+@pytest.mark.parametrize(
+    ("role", "lands_in"),
+    [(SwapRole.TAKER, SwapState.MUTUAL_REFUND), (None, SwapState.BOTH_LOCKED), (SwapRole.MAKER, SwapState.BOTH_LOCKED)],
+)
+async def test_both_locked_refunded_is_a_takers_mutual_refund_only(role, lands_in):
+    """#850 PR 6: a taker's MUTUAL_REFUND means its counter leg is refunded at F (the covenant is
+    the maker's). A single operator's also needs the covenant refunded, which reconcile never sends."""
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=role, chain_kw={"finalized": 90})
     chain.refund(85)
     rec = await coord.reconcile_counter_leg()
-    assert rec.state is SwapState.BOTH_LOCKED and rec.counter_disposition.kind == "refunded"
+    assert rec.state is lands_in and rec.counter_disposition.kind == "refunded"
+    assert leg.refunds == 0 and coord.radiant_leg.refunded is False
 
 
 # --------------------------------------------------------------------------- D14: a seen claim holds
@@ -384,22 +401,23 @@ async def test_a_retry_after_the_counter_leg_refunded_completes_without_resendin
     assert rec.state is SwapState.MUTUAL_REFUND and leg.refunds == 0 and asset == [1]
 
 
-async def test_a_retry_after_the_covenant_refunded_completes_without_resending_it():
-    coord, _chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
-    asset = _count_asset_refunds(coord)
+async def test_a_retry_after_the_covenant_refund_failed_completes_without_resending_either():
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)
+    calls = []
 
-    async def counter_down(*_a, **_k):
-        raise NetworkError("endpoint down")
+    async def immature(_record):
+        calls.append(1)
+        raise NetworkError("covenant CSV refund is not yet mature")
 
-    real_refund = leg.refund
-    leg.refund = counter_down
+    coord.radiant_leg.refund_asset = immature
     with pytest.raises(NetworkError, match="mutual refund incomplete"):
         await coord.mutual_refund()
-    assert coord.record.asset_refund_txid == "ab" * 32 and asset == [1]
-    assert coord.persisted[-1].asset_refund_txid == "ab" * 32  # durable before the retry
-    leg.refund = real_refund
+    assert coord.record.state is SwapState.BOTH_LOCKED and calls == [1] and leg.refunds == 0
+    asset = _count_asset_refunds(coord)
     rec = await coord.mutual_refund()
-    assert rec.state is SwapState.MUTUAL_REFUND and asset == [1] and leg.refunds == 1
+    assert rec.state is SwapState.MUTUAL_REFUND and asset == [1] and leg.refunds == 0
+    assert coord.persisted[-1].asset_refund_txid == "ab" * 32
 
 
 async def test_a_verified_claim_stops_mutual_refund_before_the_covenant_is_refunded():
@@ -410,11 +428,29 @@ async def test_a_verified_claim_stops_mutual_refund_before_the_covenant_is_refun
     assert rec.state is SwapState.SECRET_REVEALED and leg.refunds == 0 and asset == []
 
 
-async def test_HONEST_a_first_mutual_refund_sends_both_as_before():
-    coord, _chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+async def test_HONEST_a_single_operator_refunds_the_counter_leg_then_the_covenant():
+    """#850 PR 6 (design §3.3 step 4): the covenant refund goes out only once the counter leg is
+    refunded at the finalized block. The first call sends the counter refund and waits."""
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
     asset = _count_asset_refunds(coord)
     rec = await coord.mutual_refund()
+    assert rec.state is SwapState.BOTH_LOCKED and leg.refunds == 1 and asset == []
+    assert rec.counter_refund_tx_hash == _fake_tx_hash(refund_label(1))
+    chain.refund(85, label=refund_label(1))  # our refund mines, and is final at 90
+    rec = await coord.mutual_refund()
     assert rec.state is SwapState.MUTUAL_REFUND and leg.refunds == 1 and asset == [1]
+    assert rec.counter_disposition.tx_hash == rec.counter_refund_tx_hash
+
+
+async def test_a_makers_mutual_refund_on_an_eth_leg_is_refused_before_it_reads_or_sends():
+    """#850 PR 6: the maker's own step is maybe_refund_asset_on_maker_stall. Round 2 of the 5a
+    review found the maker taking both legs after its own claim; now nothing is read or sent."""
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=SwapRole.MAKER, chain_kw={"finalized": 90})
+    chain.claim(70)
+    asset = _count_asset_refunds(coord)
+    with pytest.raises(ValidationError, match="not the maker's step"):
+        await coord.mutual_refund()
+    assert asset == [] and leg.refunds == 0 and coord.record.state is SwapState.BOTH_LOCKED
 
 
 class _ChainIO:
@@ -475,20 +511,10 @@ async def test_one_endpoint_on_a_value_bearing_chain_raises_in_the_refund_and_se
     assert leg.refunds == 0 and coord.record.counter_disposition is None
 
 
-async def test_a_makers_mutual_refund_refuses_to_refund_the_covenant_after_a_verified_claim():
-    """Round 2 of the review: a maker's record does not take the claim edge, so the early return
-    did not fire and the covenant refund went out: the maker would have taken both legs."""
-    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=SwapRole.MAKER, chain_kw={"finalized": 90})
-    chain.claim(70)
-    asset = _count_asset_refunds(coord)
-    with pytest.raises(ValidationError, match="taker's to claim"):
-        await coord.mutual_refund()
-    assert asset == [] and leg.refunds == 0 and coord.record.counter_disposition.kind == "claimed"
-
-
 @pytest.mark.parametrize(("confs", "resent"), [(0, True), (1, False)])
 async def test_a_recorded_covenant_refund_that_never_landed_is_sent_again(confs, resent):
-    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)  # the counter leg is refunded at F, so the covenant step runs
     asset = _count_asset_refunds(coord)
     coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
     coord.radiant_leg.chain_io = _ChainIO(confs)
@@ -497,7 +523,8 @@ async def test_a_recorded_covenant_refund_that_never_landed_is_sent_again(confs,
 
 
 async def test_an_unreadable_recorded_covenant_refund_neither_skips_nor_resends():
-    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)  # the counter leg is refunded at F, so the covenant step runs
     asset = _count_asset_refunds(coord)
     coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
 
@@ -532,7 +559,8 @@ async def test_a_forgotten_covenant_refund_is_judged_by_the_covenant_itself(unsp
     """Mythos review of #893 (MEDIUM): a dropped refund the node no longer knows answered like an
     outage, so every retry raised and the covenant was never refunded in-band. The covenant's own
     UTXO decides: still unspent means our refund did not land."""
-    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)  # the counter leg is refunded at F, so the covenant step runs
     asset = _count_asset_refunds(coord)
     coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
     coord.radiant_leg.chain_io = _ForgetfulChainIO(unspent)
@@ -541,7 +569,8 @@ async def test_a_forgotten_covenant_refund_is_judged_by_the_covenant_itself(unsp
 
 
 async def test_a_forgotten_covenant_refund_with_an_unreadable_covenant_raises():
-    coord, _chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)  # the counter leg is refunded at F, so the covenant step runs
     asset = _count_asset_refunds(coord)
     coord.record = __import__("dataclasses").replace(coord.record, asset_refund_txid="cd" * 32)
     coord.radiant_leg.chain_io = _ForgetfulChainIO(NetworkError("radiant server down"))
@@ -550,25 +579,42 @@ async def test_a_forgotten_covenant_refund_with_an_unreadable_covenant_raises():
     assert asset == [] and coord.record.state is SwapState.BOTH_LOCKED
 
 
-async def test_mutual_refund_does_not_refund_the_covenant_while_a_claim_is_settled_at_the_tip():
+@pytest.mark.parametrize("role", [None, SwapRole.TAKER])
+async def test_mutual_refund_sends_nothing_while_a_claim_is_settled_at_the_tip(role):
     """Mythos review of #893 (LOW): only a claim verified at F stopped the covenant refund. With the
-    claim mined above F the covenant went out while p was public."""
-    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"head": 79, "finalized": 60})
+    claim mined above F the covenant went out while p was public. Since PR 6 the record waits."""
+    coord, chain, leg = _setup(state=SwapState.BOTH_LOCKED, role=role, chain_kw={"head": 79, "finalized": 60})
     chain.claim(75)
     asset = _count_asset_refunds(coord)
-    with pytest.raises(NetworkError, match="settled at the tip but not yet final"):
-        await coord.mutual_refund()
-    assert asset == [] and coord.record.state is SwapState.BOTH_LOCKED
+    rec = await coord.mutual_refund()
+    assert asset == [] and leg.refunds == 0 and rec.state is SwapState.BOTH_LOCKED
 
 
-async def test_mutual_refund_does_not_refund_the_covenant_while_a_seen_claim_holds():
-    coord, _chain, _leg = _setup(
-        state=SwapState.BOTH_LOCKED, role=None, endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90}, confs=1
+@pytest.mark.parametrize("role", [None, SwapRole.TAKER])
+async def test_mutual_refund_does_not_refund_the_covenant_or_end_while_a_seen_claim_holds(role):
+    """D14 / N1 on BOTH_LOCKED (#850 PR 6): refunded at F, but a Claimed log opens H before t_rxd.
+    Neither role's record goes terminal, and the covenant is not refunded: p may be public."""
+    coord, chain, leg = _setup(
+        state=SwapState.BOTH_LOCKED, role=role, endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90}, confs=1
     )
+    chain.refund(85)
     asset = _count_asset_refunds(coord)
-    with pytest.raises(NetworkError, match="p may be"):
-        await coord.mutual_refund()
-    assert asset == [] and coord.record.counter_claim_tx is not None
+    rec = await coord.mutual_refund()
+    assert asset == [] and leg.refunds == 0 and rec.state is SwapState.BOTH_LOCKED
+    assert rec.counter_claim_tx == "0x" + "dd" * 32 and rec.counter_disposition.kind == "refunded"
+
+
+@pytest.mark.parametrize("role", [None, SwapRole.TAKER])
+async def test_HONEST_once_t_rxd_has_matured_the_held_mutual_refund_completes(role):
+    coord, chain, leg = _setup(
+        state=SwapState.BOTH_LOCKED, role=role, endpoints=_with_a_dropped_claim, chain_kw={"finalized": 90}
+    )
+    coord.radiant_leg.report_confs = int(coord.record.terms.t_rxd.value)
+    chain.refund(85)
+    asset = _count_asset_refunds(coord)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and leg.refunds == 0
+    assert asset == ([1] if role is None else []), "a taker never refunds the covenant"
 
 
 async def test_the_real_chain_reader_answers_whether_the_covenant_outpoint_is_unspent():
