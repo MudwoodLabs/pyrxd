@@ -4860,6 +4860,69 @@ class SwapCoordinator:
     # -- the gated explicit abandon (#850 PR 7b, design §3.6) -------------------------------------
 
     #: The longest operator note ``abandon_counter_leg`` keeps, in characters. CHOSEN.
+    @_serialized_step
+    async def abandon_unfunded(self) -> SwapRecord:
+        """End a NEGOTIATED record that holds nothing that may hold value (``TAKER_NEVER_FUNDS``;
+        #850 PR 8, design §3.5). The taker's step; a maker's NEGOTIATED exit is #850 PR 11.
+
+        Refused, with nothing recorded, when the record holds:
+
+        * a BTC funding transaction (``pending_btc_funding_tx``): it is written before the broadcast,
+          so it may have been sent;
+        * a native ETH contract (``pending_counter_contract`` with no token): its deploy carries the
+          value, and its address is written before that broadcast;
+        * a token contract that a push was signed for (``pending_push_nonce``), or that holds tokens, or whose balance cannot be read: the token
+          balance must read 0 at the finalized block and at the tip at every endpoint, and on a chain
+          that carries value from more than one endpoint.
+
+        Nothing is broadcast. ``abort_reason`` is ``TAKER_NEVER_FUNDS``. The hashlock stays reserved
+        in the seen-store, so this ``H`` is never funded again. A token contract that was deployed
+        stays on the record (``pending_counter_contract``).
+        """
+        state = self.record.state
+        if state is not SwapState.NEGOTIATED:
+            raise ValidationError(f"abandon_unfunded not valid from {state.value}")
+        if self.config.role is SwapRole.MAKER:
+            raise ValidationError("abandon_unfunded is the taker's step; refused for a MAKER-role coordinator")
+        if self.record.pending_btc_funding_tx is not None:
+            raise ValidationError(
+                "this record holds a BTC funding transaction, written before its broadcast, so it may have been "
+                "sent: resume the fund (taker_funds_btc), then refund the HTLC after its timeout. Nothing was recorded."
+            )
+        contract = self.record.pending_counter_contract
+        if contract:
+            token = self.record.terms.token_address
+            if not token:
+                raise ValidationError(
+                    f"this record holds the ETH counter-leg contract {contract}, whose deploy carries the value: "
+                    "resume the fund (taker_funds_btc), then refund it after its timeout. Nothing was recorded."
+                )
+            if self.record.pending_push_nonce is not None:  # a push hash is recorded only with its nonce
+                raise ValidationError(
+                    f"a token push into {contract} was signed, so it may land: resume the fund (taker_funds_btc), "
+                    "then refund the contract after its timeout. Nothing was recorded."
+                )
+            read = getattr(self.counter_leg, "unfunded_token_balance", None)
+            if read is None:
+                raise ValidationError("abandon_unfunded needs an ETH counter leg that reads a token balance")
+            balance = await read(token=token, contract=contract)  # NetworkError: unknown, nothing recorded
+            chain_id = getattr(self.counter_leg, "chain_id", None)
+            if balance.single_source and (chain_id is None or not self._single_source_may_decide(int(chain_id))):
+                raise NetworkError(
+                    f"the token balance of {contract} was read from one endpoint, on a chain that carries value: "
+                    "read it from more than one. Nothing was recorded."
+                )
+            if not balance.empty:
+                raise ValidationError(
+                    f"the contract {contract} holds tokens: resume the fund (taker_funds_btc), then refund it after "
+                    "its timeout. Nothing was recorded."
+                )
+        self.record = dataclasses.replace(self.record, abort_reason=AbortReason.TAKER_NEVER_FUNDS)
+        self._advance(SwapEvent.TAKER_NEVER_FUNDS)
+        await self._persist_record(self.record, shield=True)
+        logger.warning("swap abandoned unfunded from negotiated; the hashlock stays reserved")
+        return self.record
+
     ABANDON_NOTE_MAX_CHARS = 2000
 
     @_serialized_step

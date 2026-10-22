@@ -1020,7 +1020,7 @@ class _CapturingEthLeg:
 #                    right after publishing the envelope, so a taker who never funds leaves the
 #                    maker holding a locked asset at NEGOTIATED — and BOTH coordinator asset refunds
 #                    require BOTH_LOCKED (the FSM's NEGOTIATED --TAKER_NEVER_FUNDS--> ABORTED edge
-#                    has no driver anywhere in the library). So this calls the SAME leg primitive
+#                    has no maker driver; the taker's is abandon_unfunded). So this calls the SAME leg primitive
 #                    both coordinator refunds call, and does NOT fabricate a BOTH_LOCKED record for
 #                    a counter leg that was never funded. The membership claim — exactly two
 #                    coordinator methods refund the asset, and both require BOTH_LOCKED — is pinned
@@ -1608,7 +1608,8 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
     a shortcut: the maker funds the covenant right after publishing the envelope, so a taker that
     never funds leaves the maker at NEGOTIATED with a locked asset — and BOTH coordinator asset
     refunds (``mutual_refund``, ``maybe_refund_asset_on_maker_stall``) require BOTH_LOCKED. The FSM's
-    NEGOTIATED --TAKER_NEVER_FUNDS--> ABORTED edge has no driver in the library. Rather than
+    NEGOTIATED --TAKER_NEVER_FUNDS--> ABORTED edge has no maker driver (the taker's is
+    ``abandon_unfunded``; the maker's is #850 PR 11). Rather than
     fabricate a BOTH_LOCKED record for a counter leg that was never funded, this calls the same leg
     primitive both coordinator refunds call and does not advance the FSM at all.
 

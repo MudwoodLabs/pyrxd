@@ -53,7 +53,8 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # v7 (#850 PR 7b) adds ``abandon_case`` and ``abort_note_sha256``, the ``abort_reason`` value
 # ``operator_abandoned``, and the ``counter_disposition`` kinds an abandon records
 # (``expired_empty_open``, ``f_expired``, ``unknown``).
-SWAP_RECORD_SCHEMA_VERSION = 7
+# v8 (#850 PR 8) adds the ``abort_reason`` value ``taker_never_funds``.
+SWAP_RECORD_SCHEMA_VERSION = 8
 #: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
 #: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours. The coordinator keeps
 #: the oldest and the newest: when replacements never reach the node, the oldest is the one it holds.
@@ -167,6 +168,10 @@ class AbortReason(Enum):
     #: chain showed a case with no automatic end, named by ``SwapRecord.abandon_case``. Nothing was
     #: refunded by this step, and the counter-leg locator stays on the record.
     OPERATOR_ABANDONED = "operator_abandoned"
+    #: The taker ended a NEGOTIATED record with ``abandon_unfunded`` (#850 PR 8, design §3.5): it
+    #: held nothing that may hold value (no BTC funding transaction, no native contract, and a token
+    #: contract only if it was never pushed into and holds no tokens). Nothing was sent.
+    TAKER_NEVER_FUNDS = "taker_never_funds"
 
 
 class AbandonCase(Enum):

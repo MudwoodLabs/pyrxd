@@ -63,7 +63,7 @@ from enum import Enum
 from typing import Any
 
 from ..network.source_identity import require_distinct_sources
-from ..security.errors import ValidationError
+from ..security.errors import NetworkError, ValidationError
 from .events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from .htlc_leg import SETTLED_SLOT, _addr, _b, _int_or_none, _receipt_facts
 from .locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator
@@ -75,7 +75,9 @@ __all__ = [
     "DispositionEvidence",
     "DispositionKind",
     "LogUnion",
+    "UnfundedTokenBalance",
     "read_counter_disposition",
+    "read_unfunded_token_balance",
     "union_logs",
 ]
 
@@ -835,3 +837,50 @@ async def _deploy_block(source: Any, deploy_tx_hash: str) -> int | None:
     if receipt is None:
         return None
     return _int_or_none(receipt.get("blockNumber"))
+
+
+# --------------------------------------------------------------------------- an unfunded token contract
+
+
+@dataclass(frozen=True)
+class UnfundedTokenBalance:
+    """The token balance of a counter-leg contract that was deployed and never pushed into, as
+    :func:`read_unfunded_token_balance` read it (#850 PR 8, design §3.5).
+
+    ``empty`` is ``True`` only when every endpoint answered 0 at ``finalized_block`` and every
+    endpoint answered 0 at the tip. ``single_source`` says the rpc had one endpoint."""
+
+    empty: bool
+    finalized_block: int
+    sources: tuple[str, ...]
+    single_source: bool
+
+
+async def read_unfunded_token_balance(rpc: Any, *, token: str, contract: str) -> UnfundedTokenBalance:
+    """Whether *contract* holds none of *token*: 0 at the quorum-minimum finalized block at every
+    endpoint, all agreeing, and 0 at the tip at every endpoint (#850 PR 8, design §3.5).
+
+    A balance is a negative reading ("nothing is there"), so every endpoint must answer, as for
+    ``EXPIRED_EMPTY_*``: the one that does not may be the one that would have said otherwise. A read
+    that fails, falls below quorum or disagrees raises :class:`NetworkError` (``UNKNOWN``: the caller
+    refuses and records nothing). Read-only."""
+    panel = _panel_of(rpc)
+    token_addr, contract_addr = _addr(token), _addr(contract)
+    try:
+        finalized = await _magnitude(panel, lambda s: s.finalized_block_number(), "finalized", min)
+        at_f = await _every(
+            panel, lambda s: s.erc20_balance_of(token_addr, contract_addr, finalized), f"balance at {finalized}"
+        )
+        if any(b != at_f[0] for b in at_f[1:]):
+            raise _BelowQuorum(f"balance at {finalized}: endpoints disagree")
+        at_tip = await _every(
+            panel, lambda s: s.erc20_balance_of(token_addr, contract_addr, "latest"), "balance at tip"
+        )
+    except _BelowQuorum as exc:
+        raise NetworkError(f"the token balance of {contract_addr} is unknown: {exc}") from None
+    return UnfundedTokenBalance(
+        empty=int(at_f[0]) == 0 and all(int(b) == 0 for b in at_tip),
+        finalized_block=int(finalized),
+        sources=tuple(sorted(_key(src) for src in panel.sources)),
+        single_source=len(panel.sources) == 1,
+    )

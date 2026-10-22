@@ -177,6 +177,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     drive one record with mixed pyrxd versions. A pyrxd from before this change refuses a v5
     record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x
     `taker_refund_btc` would send again, go to `ABORTED`, and drop the recorded hash.
+- **A taker can end a swap it never funded (#850 PR 8) [Changed (breaking)].** New
+  `SwapCoordinator.abandon_unfunded()` takes a taker's or single operator's `NEGOTIATED` record to
+  `ABORTED` on the existing `TAKER_NEVER_FUNDS` edge, with the new `abort_reason`
+  `taker_never_funds`. It broadcasts nothing, and the hashlock stays reserved, so the same `H` is
+  never funded again. It refuses, and records nothing, while the record holds anything that may hold
+  value: a BTC funding transaction (`pending_btc_funding_tx`, written before its broadcast), a native
+  ETH contract (`pending_counter_contract` with no token), or a token contract that a push was
+  signed for (`pending_push_nonce`) or whose balance is not 0 at the finalized block and at the tip
+  at every endpoint (new `pyrxd.eth_wallet.disposition.read_unfunded_token_balance` and
+  `EthLeg.unfunded_token_balance`). A balance read that fails or disagrees raises `NetworkError`, as
+  does a balance read from one endpoint on a chain that carries value. A `MAKER`-role coordinator is
+  refused: the maker's `NEGOTIATED` exit is #850 PR 11. `SWAP_RECORD_SCHEMA_VERSION` is 8; a record
+  carrying `taker_never_funds` writes 8, which a pyrxd from 0.27 development before this change
+  refuses. A 0.26.x pyrxd ignores unknown keys and reads the record as `ABORTED` without saying why.
 - **An operator can end an ETH swap record on a counter-leg case that has no automatic end, after
   the chain is read and only on the case it shows (#850 PR 7b) [Changed (breaking)].**
   - New `SwapCoordinator.abandon_counter_leg(*, confirm_contract, reason_code, note)`, from
