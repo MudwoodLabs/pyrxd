@@ -320,16 +320,15 @@ async def _mutual_refund_to_terminal(coord, *, timeout_s: float, interval_s: flo
         else:
             if rec.state is not SwapState.BOTH_LOCKED or time.monotonic() >= deadline:
                 return rec
-            print(
-                f"  the record is still both_locked (our ETH refund: {rec.counter_refund_tx_hash}); it waits for that "
-                "refund to read REFUNDED at the finalized block"
-                + (
-                    f", and, while a Claimed log (tx {rec.counter_claim_tx}) opens H, for t_rxd to mature"
-                    if rec.counter_claim_tx is not None
-                    else ""
+            refunded = rec.counter_disposition is not None and rec.counter_disposition.kind == "refunded"
+            if refunded and rec.counter_claim_tx is not None:
+                why = (
+                    f"the ETH HTLC is REFUNDED at the finalized block, but a Claimed log on it (tx "
+                    f"{rec.counter_claim_tx}) opens H, so the record and the covenant refund wait until t_rxd matures"
                 )
-                + "; waiting"
-            )
+            else:
+                why = f"our ETH refund {rec.counter_refund_tx_hash} is not yet REFUNDED at the finalized block"
+            print(f"  the record is still both_locked: {why}; waiting")
         await asyncio.sleep(interval_s)
 
 

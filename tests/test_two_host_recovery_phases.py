@@ -3177,6 +3177,7 @@ class _ScriptedMutualRefund:
         rec.state = step
         rec.counter_refund_tx_hash = self.record.counter_refund_tx_hash
         rec.counter_claim_tx = None
+        rec.counter_disposition = None
         return rec
 
 
