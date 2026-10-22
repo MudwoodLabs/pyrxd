@@ -55,7 +55,7 @@ from pyrxd.btc_wallet.taproot import (
     btc_input_outpoints_from_raw,
 )
 from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
-from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
@@ -4425,7 +4425,18 @@ class SwapCoordinator:
             from .swap_state import parse_expiry_anchor
 
             kwargs["expiry_anchor"] = parse_expiry_anchor(self.record.counter_expiry_anchor)
+        bound = self._push_nonce_bound()
+        if bound is not None and isinstance(locator, Erc20HtlcLocator):
+            # #850 PR 7a: the highest nonce a push for this contract (or our close of it) was signed at.
+            kwargs["push_nonce_bound"] = bound
         return await read(locator, **kwargs)
+
+    def _push_nonce_bound(self) -> int | None:
+        """The highest nonce at which this record's key signed a token push for the counter-leg
+        contract, or a transaction closing that nonce (design §2.7): ``None`` when neither is
+        recorded (a record from before the push nonce was kept)."""
+        nonces = [n for n in (self.record.pending_push_nonce, self.record.push_close_nonce) if n is not None]
+        return max(nonces) if nonces else None
 
     @staticmethod
     def _single_source_may_decide(chain_id: int) -> bool:
@@ -4512,6 +4523,11 @@ class SwapCoordinator:
           operator's is ``"recorded"`` (or ``"held"``), because its MUTUAL_REFUND also needs the
           covenant refund that only :meth:`mutual_refund` sends. A maker's record records the
           evidence and stays.
+        * ``EXPIRED_EMPTY_CLOSED`` (#850 PR 7a): a taker's or single operator's record at BTC_LOCKED
+          goes to ABORTED (``abort_reason`` ``EXPIRED_EMPTY``), held by a recorded claim exactly as an
+          observed refund is (D14, N1); returns ``"expired_empty"``. At PARAMS_MISMATCH there is no
+          edge: the evidence is recorded and this raises. At BOTH_LOCKED, and on a maker's record, it
+          is ``"recorded"``.
         * A terminal answer from one endpoint on a chain that carries value changes nothing (D4).
         """
         from .swap_state import AbortReason, CounterDispositionRecord
@@ -4538,7 +4554,8 @@ class SwapCoordinator:
         # §2.3 (a), from a quorum read only (D4): one endpoint on a chain that carries value must not
         # write a proof a later answer will rest on.
         if (
-            kind is DispositionKind.F_EXPIRED
+            kind
+            in (DispositionKind.F_EXPIRED, DispositionKind.EXPIRED_EMPTY_OPEN, DispositionKind.EXPIRED_EMPTY_CLOSED)
             and anchor is not None
             and self.record.counter_expiry_anchor is None
             and (
@@ -4548,7 +4565,8 @@ class SwapCoordinator:
         ):
             self.record = dataclasses.replace(self.record, counter_expiry_anchor=f"{anchor[0]}:{anchor[1].lower()}")
             changed = True
-        if kind in (DispositionKind.CLAIMED, DispositionKind.REFUNDED) and evidence is not None:
+        terminal_kinds = (DispositionKind.CLAIMED, DispositionKind.REFUNDED, DispositionKind.EXPIRED_EMPTY_CLOSED)
+        if kind in terminal_kinds and evidence is not None:
             locator = self.record.counterchain_locator
             if disposition.single_source and not self._single_source_may_decide(int(locator.chain_id)):
                 logger.warning(
@@ -4592,6 +4610,26 @@ class SwapCoordinator:
                             )
                         self._advance(SwapEvent.COUNTER_LEG_CLAIMED_OBSERVED)
                         outcome = "claimed"
+                elif kind is DispositionKind.EXPIRED_EMPTY_CLOSED:
+                    if acts and state is SwapState.PARAMS_MISMATCH:
+                        # No edge (design §3.2): this population is the maker's process, and its exit
+                        # is the gated abandon.
+                        await self._persist_record(self.record, shield=True)
+                        raise ValidationError(
+                            "the counter-leg contract expired EMPTY at the finalized block, and no push can still "
+                            "land in it, but there is deliberately no edge out of PARAMS_MISMATCH on that: "
+                            "refund your covenant by its CSV leg at t_rxd. The exit for this record is the gated "
+                            "abandon, abandon_counter_leg, which is not in this release yet. The evidence is on "
+                            "the record."
+                        )
+                    if acts and state is SwapState.BTC_LOCKED:
+                        if await self._claim_seen_holds_the_terminal():
+                            outcome = "held"
+                        else:
+                            self.record = dataclasses.replace(self.record, abort_reason=AbortReason.EXPIRED_EMPTY)
+                            self._advance(SwapEvent.COUNTER_LEG_EXPIRED_EMPTY)
+                            outcome = "expired_empty"
+                    # BOTH_LOCKED, or a maker's record: recorded. mutual_refund names the abandon.
                 elif acts and state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
                     if await self._claim_seen_holds_the_terminal():
                         outcome = "held"
@@ -4636,6 +4674,124 @@ class SwapCoordinator:
             )
         return self.record
 
+    # -- an empty expired token contract: close the push nonce (#850 PR 7a, design §2.7) ----------
+
+    def _nothing_to_refund_until_closed(self, disposition: Any) -> NothingToRefund:
+        """The refusal for ``EXPIRED_EMPTY_OPEN``: nothing to refund, and a push may still land."""
+        locator = self.record.counterchain_locator
+        return NothingToRefund(
+            f"nothing to refund: the counter-leg contract {locator.contract_address} expired EMPTY at the finalized "
+            f"block ({disposition.reason}). Nothing was sent, and the record did not change. A token push this key "
+            "signed may still land, so this is not yet an end: run close_push_nonce() to consume the push's nonce "
+            "(a 0-value transfer to yourself, gas only), then this step again once that is final. If tokens reach "
+            "the contract first, a refund returns them.",
+            contract_address=locator.contract_address,
+        )
+
+    @_serialized_step
+    async def close_push_nonce(self) -> SwapRecord:
+        """Close the token push's nonce, so an empty expired counter-leg contract can be shown to stay
+        empty (#850 PR 7a, design §2.7, §3.3). Valid from BTC_LOCKED on a token counter leg; refused
+        for a MAKER-role coordinator. Moves no value: a 0-value transfer from the funding key to itself.
+
+        What the chain shows is read first, and applied (an end already proven ends the record here).
+        It sends only when the contract reads ``EXPIRED_EMPTY_OPEN``, at the funding key's nonce at the
+        finalized block, every endpoint agreeing; the hash and nonce are recorded (``push_close_*``)
+        before the broadcast. Once a transaction at that nonce is final, the contract reads
+        ``EXPIRED_EMPTY_CLOSED`` and :meth:`taker_refund_btc` (or :meth:`reconcile_counter_leg`) ends
+        the record ABORTED with ``abort_reason`` ``EXPIRED_EMPTY``, unless a recorded claim holds it
+        until t_rxd (D14). A recorded close is followed, not re-sent, unless it was dropped.
+
+        Not from NEGOTIATED yet (design §3.3 lists it): a NEGOTIATED record has no locator to read,
+        and its exit, ``abandon_unfunded``, is #850 PR 8. Not from PARAMS_MISMATCH, by design.
+        """
+        from pyrxd.eth_wallet.disposition import DispositionKind
+
+        if self.record.state is not SwapState.BTC_LOCKED:
+            raise ValidationError(f"close_push_nonce not valid from {self.record.state.value}")
+        if self.config.role is SwapRole.MAKER:
+            raise ValidationError("close_push_nonce is the taker's step; refused for a MAKER-role coordinator")
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, Erc20HtlcLocator):
+            raise ValidationError("close_push_nonce applies only to a token (ERC-20) counter leg")
+        close = getattr(self.counter_leg, "close_push_nonce", None)
+        disposition = await self._read_counter_disposition()
+        if close is None or disposition is None:
+            raise ValidationError(
+                "close_push_nonce needs an ETH counter leg that reads its disposition and closes a nonce"
+            )
+        outcome = await self._apply_counter_disposition(disposition)
+        if outcome in ("claimed", "refunded", "held", "expired_empty"):
+            return self.record  # what the chain shows already decides it; nothing to close
+        if outcome == "single_source":
+            raise CounterLegSingleSourceAnswer(
+                f"the counter leg reads {disposition.kind.value} from ONE endpoint, on a chain that carries "
+                "value; nothing changes and nothing is sent until a multi-source rpc agrees (design §2.5)",
+                kind=disposition.kind.value,
+            )
+        if disposition.kind is DispositionKind.UNKNOWN:
+            raise NetworkError(f"the counter leg's disposition is unknown, so nothing was sent: {disposition.reason}")
+        if disposition.kind is not DispositionKind.EXPIRED_EMPTY_OPEN:
+            raise ValidationError(
+                f"close_push_nonce sends only when the contract reads expired and empty; it reads "
+                f"{disposition.kind.value} ({disposition.reason}). Nothing was sent."
+            )
+        nonce = disposition.nonce_at_finalized
+        if nonce is None:
+            raise NetworkError(
+                f"the funding key's nonce at the finalized block could not be read at every endpoint, so nothing "
+                f"was sent ({disposition.reason})"
+            )
+        push = self.record.pending_push_nonce
+        if push is not None and push > nonce:
+            # Closing `nonce` would not reach the push's own: transactions of this key below it are
+            # not final yet (or missing). Nothing to do but wait for them, or for the push itself.
+            raise NetworkError(
+                f"the token push was signed at nonce {push}, above the funding key's nonce {nonce} at the finalized "
+                "block: transactions of this key below the push are not final yet, or are missing. Nothing was "
+                "sent. Retry once they are final; if one is missing, send it from the wallet that owns the key."
+            )
+        recorded, recorded_nonce = self.record.push_close_tx_hash, self.record.push_close_nonce
+        if recorded is not None and recorded_nonce == nonce:
+            progress = await self.counter_leg.close_progress(recorded, recorded_nonce)
+            if progress.kind == "nonce_gap":
+                raise CounterLegRefundNeedsOperator(
+                    f"our push-closing transaction {recorded} is at nonce {recorded_nonce}, but this key's latest "
+                    "nonce is below that: an earlier transaction from the same ETH key is missing. Nothing was "
+                    "sent. Send or replace the missing transaction from the wallet that owns the key.",
+                    tx_hash=recorded,
+                    cause="other_tx",
+                )
+            if progress.kind != "dropped":
+                # Mined (a reverted transfer still consumes its nonce), pending, or the nonce taken by
+                # another transaction: either way the nonce is spoken for. Wait for the finalized block.
+                logger.info(
+                    "push-closing transaction %s at nonce %d is %s; waiting for the finalized block",
+                    recorded,
+                    recorded_nonce,
+                    progress.kind,
+                )
+                return self.record
+            logger.warning("push-closing transaction %s was dropped; sending another at nonce %d", recorded, nonce)
+
+        async def _record_before_broadcast(tx_hash: str, signed_nonce: int) -> None:
+            # Persisted BEFORE the broadcast (design §2.8), adopted only once the write returns.
+            pending = dataclasses.replace(
+                self.record, push_close_tx_hash=str(tx_hash).lower(), push_close_nonce=int(signed_nonce)
+            )
+            await self._persist_record(pending, shield=True)
+            self.record = pending
+
+        sent = await close(nonce, on_signed=_record_before_broadcast)
+        logger.info(
+            "push-closing transaction %s sent at nonce %d; the record stays %s until it is final. Then "
+            "taker_refund_btc or reconcile_counter_leg ends it.",
+            sent,
+            nonce,
+            self.record.state.name,
+        )
+        return self.record
+
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)
     @_serialized_step
     async def taker_refund_btc(self, *, resend_reverted_refund: bool = False) -> SwapRecord:
@@ -4674,8 +4830,9 @@ class SwapCoordinator:
             from pyrxd.eth_wallet.disposition import DispositionKind
 
             outcome = await self._apply_counter_disposition(disposition)
-            if outcome in ("claimed", "refunded", "held"):
-                return self.record  # observed: nothing to send (claimed: SECRET_REVEALED; refunded: done)
+            if outcome in ("claimed", "refunded", "held", "expired_empty"):
+                # observed: nothing to send (claimed: SECRET_REVEALED; refunded or expired empty: done)
+                return self.record
             if outcome == "single_source":
                 # Settled at F, read from ONE endpoint on a chain that carries value (D4). A refund would
                 # revert, and with ours recorded the follow path would wait for ever (review of 5b).
@@ -4686,6 +4843,8 @@ class SwapCoordinator:
                 )
             if disposition.kind is DispositionKind.SETTLED_UNFINAL:
                 return self.record  # settled at the tip, not yet final: wait, send nothing
+            if disposition.kind is DispositionKind.EXPIRED_EMPTY_OPEN:
+                raise self._nothing_to_refund_until_closed(disposition)
             # 5b: never advance on our own broadcast. The record moves when the chain shows it.
             return await self._counter_refund_on_the_read(
                 disposition, resend_reverted_refund=resend_reverted_refund, step="taker_refund_btc"
@@ -4993,6 +5152,18 @@ class SwapCoordinator:
             # Only a maker's record records a claim without taking the edge, and a maker was refused
             # above. Kept so a change there can never fall through to a refund.
             raise ValidationError("the counter leg was CLAIMED; mutual_refund sends nothing")
+        if disposition.kind in (DispositionKind.EXPIRED_EMPTY_OPEN, DispositionKind.EXPIRED_EMPTY_CLOSED):
+            # Read from the chain since #850 PR 7a, before anything is sent (it was the leg's refusal).
+            locator = self.record.counterchain_locator
+            raise NothingToRefund(
+                f"the counter-leg contract {locator.contract_address} expired EMPTY at the finalized block "
+                f"({disposition.reason}). mutual_refund cannot finish this swap: there is nothing to refund "
+                "(a token push that never landed, or tokens removed after the maker verified them). The record "
+                "stays BOTH_LOCKED. Its exit is the gated abandon, abandon_counter_leg, once the contract's "
+                "expiry is final at the finalized block (design N2); that step is not in this release yet. If "
+                "tokens reach the contract first, mutual_refund refunds them.",
+                contract_address=locator.contract_address,
+            )
         if disposition.kind is not DispositionKind.REFUNDED:
             try:
                 await self._counter_refund_on_the_read(

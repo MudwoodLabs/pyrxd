@@ -379,15 +379,39 @@ class EthLeg:
         *,
         recorded_refund_hashes: tuple[str, ...] = (),
         expiry_anchor: tuple[int, str] | None = None,
+        push_nonce_bound: int | None = None,
     ):
         """What the chain says about this swap's HTLC, read and verified at the finalized block
         (:func:`pyrxd.eth_wallet.disposition.read_counter_disposition`, #850 PR 5a). Read-only; never
-        raises for a chain read (an unreadable chain is ``UNKNOWN``)."""
-        from pyrxd.eth_wallet.disposition import read_counter_disposition
+        raises for a chain read (an unreadable chain is ``UNKNOWN``).
 
+        A token HTLC (:class:`Erc20HtlcLocator`) is also read for ``EXPIRED_EMPTY_*`` (#850 PR 7a):
+        its token balance, and this leg's key's nonce at the finalized block against
+        ``push_nonce_bound``. This leg's key is the one that signed the push."""
+        from pyrxd.eth_wallet.disposition import read_counter_disposition
+        from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+        token = locator.token_address if isinstance(locator, Erc20HtlcLocator) else None
         return await read_counter_disposition(
-            self._leg._rpc, locator, recorded_refund_hashes=recorded_refund_hashes, expiry_anchor=expiry_anchor
+            self._leg._rpc,
+            locator,
+            recorded_refund_hashes=recorded_refund_hashes,
+            expiry_anchor=expiry_anchor,
+            token_address=token,
+            funding_account=self._leg._account_address() if token is not None else None,
+            push_nonce_bound=push_nonce_bound if token is not None else None,
         )
+
+    async def close_push_nonce(self, nonce: int, *, on_signed=None) -> str:
+        """Consume ``nonce`` of this leg's key with a 0-value self-transfer (#850 PR 7a, design §2.7;
+        :meth:`EthHtlcContractLeg.close_nonce`). ``on_signed`` gets ``(tx_hash, nonce)`` before the
+        broadcast."""
+        return await self._leg.close_nonce(nonce, on_signed=on_signed)
+
+    async def close_progress(self, tx_hash: str, nonce: int):
+        """What happened to our push-closing transaction (``RefundProgress``: the same reads as for a
+        refund, by hash and nonce). Read-only."""
+        return await self._leg.refund_progress(tx_hash, nonce)
 
     # -- secret recovery + finality ------------------------------------------------------
 

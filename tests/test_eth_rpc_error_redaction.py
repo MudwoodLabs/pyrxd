@@ -92,6 +92,7 @@ _CALLS = {
     "get_logs": lambda r: r.get_logs(address="0x" + "11" * 20),
     "block_hash_and_timestamp": lambda r: r.block_hash_and_timestamp(1),
     "get_storage_at": lambda r: r.get_storage_at("0x" + "11" * 20, 0, 1),
+    "erc20_balance_of": lambda r: r.erc20_balance_of("0x" + "11" * 20, "0x" + "22" * 20, 1),
     # Records failures instead of raising, so the RECORDED text is what is checked: it is what a
     # page or a log line would show.
     "get_logs_union": lambda r: _union_failure_raised(r),

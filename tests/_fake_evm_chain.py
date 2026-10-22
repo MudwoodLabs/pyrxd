@@ -14,12 +14,13 @@ production ``MultiSourceEthRpc`` accepts them as a quorum.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.security.errors import NetworkError
 from tests._source_hosts import distinct_host
 
@@ -28,6 +29,8 @@ BLOCK_SECONDS = 12
 CHAIN_ID = 11155111
 CONTRACT = "0x" + "c0" * 20
 OTHER_CONTRACT = "0x" + "0d" * 20
+TOKEN = "0x" + "70" * 20
+FUNDER = "0x" + "bb" * 20
 
 
 def _block_hash(number: int, fork: str = "") -> bytes:
@@ -49,6 +52,10 @@ class FakeEvmChain:
     deploy_block: int = 10
     settled_at: int | None = None
     receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: #850 PR 7a, a token contract: ``{block: balance from that block on}`` (0 before the first),
+    #: and the funding key's ``{block: transaction count from that block on}``.
+    token_balances: dict[int, int] = field(default_factory=dict)
+    nonces: dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.hashlock = hashlib.sha256(self.preimage).digest()
@@ -63,6 +70,17 @@ class FakeEvmChain:
     def first_block_at(self, ts: int) -> int:
         """The lowest block whose timestamp is ``>= ts``."""
         return max(0, -(-(ts - GENESIS_TS) // BLOCK_SECONDS))
+
+    def balance_at(self, block: int) -> int:
+        steps = [b for b in self.token_balances if b <= block]
+        return self.token_balances[max(steps)] if steps else 0
+
+    def count_at(self, block: int) -> int:
+        steps = [b for b in self.nonces if b <= block]
+        return self.nonces[max(steps)] if steps else 0
+
+    def token_locator(self) -> Erc20HtlcLocator:
+        return Erc20HtlcLocator(**{**dataclasses.asdict(self.locator()), "token_address": TOKEN})
 
     def locator(self, *, deploy_tx_hash: str | None = None) -> EthHtlcLocator:
         return EthHtlcLocator(
@@ -177,6 +195,10 @@ class FakeEvmEndpoint:
         lie_settled_at_blocks: bool = False,
         lie_canonical: bool = False,
         hide_all_logs: bool = False,
+        balance_reads_fail: bool = False,
+        lie_balance: int | None = None,
+        nonce_reads_fail: bool = False,
+        lie_nonce: int | None = None,
     ) -> None:
         self.chain = chain
         self.lag = lag
@@ -193,6 +215,10 @@ class FakeEvmEndpoint:
         self.lie_settled_at_blocks = lie_settled_at_blocks
         self.lie_canonical = lie_canonical
         self.hide_all_logs = hide_all_logs
+        self.balance_reads_fail = balance_reads_fail
+        self.lie_balance = lie_balance
+        self.nonce_reads_fail = nonce_reads_fail
+        self.lie_nonce = lie_nonce
         self.source_key = distinct_host()
         self.expected_chain_id = CHAIN_ID
         self.log_requests: list[tuple[int, int | str]] = []
@@ -244,6 +270,36 @@ class FakeEvmEndpoint:
             return bytes(32)
         settled = self.chain.settled_at is not None and self.chain.settled_at <= at
         return (1 if settled else 0).to_bytes(32, "big")
+
+    def _block_of(self, block_identifier: str | int) -> int:
+        if block_identifier in ("latest", "pending"):
+            return self.head
+        at = int(block_identifier)
+        if not self.archive and at < self.head - 128:
+            raise NetworkError("missing trie node (historic state unavailable)")
+        if at > self.head:
+            raise NetworkError(f"block {at} not found")
+        return at
+
+    async def erc20_balance_of(self, token: str, owner: str, block_identifier: str | int) -> int:
+        if self.balance_reads_fail:
+            raise NetworkError("eth_call failed: 429 Too Many Requests")
+        at = self._block_of(block_identifier)
+        if self.lie_balance is not None:
+            return self.lie_balance
+        if token.lower() != TOKEN or owner.lower() != CONTRACT:
+            return 0
+        return self.chain.balance_at(at)
+
+    async def get_transaction_count(self, address: str, block: str | int = "pending") -> int:
+        if self.nonce_reads_fail:
+            raise NetworkError("eth_getTransactionCount failed: 429 Too Many Requests")
+        at = self._block_of(block)
+        if self.lie_nonce is not None:
+            return self.lie_nonce
+        if address.lower() != FUNDER:
+            return 0
+        return self.chain.count_at(at)
 
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         if self.forge_receipt and tx_hash == self.forge_refunded_tx:

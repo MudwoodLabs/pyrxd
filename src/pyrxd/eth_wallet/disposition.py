@@ -37,9 +37,18 @@ The expiry anchor (§2.3 (a), #850 PR 5b): an :attr:`DispositionKind.F_EXPIRED` 
 refund, because the contract was unsettled at a canonical block already at or past the timeout, and
 ``claim()`` reverts from then on. Its hash is rechecked canonical, agreed, at every use.
 
+An empty token contract (§2.3 ``EXPIRED_EMPTY_*``, §2.7, #850 PR 7a): given the token, an
+:attr:`DispositionKind.F_EXPIRED` contract whose token balance is 0 at ``F`` (identity across EVERY
+endpoint) and at the tip (every endpoint answering 0) is :attr:`DispositionKind.EXPIRED_EMPTY_OPEN`.
+It is :attr:`DispositionKind.EXPIRED_EMPTY_CLOSED`, a terminal answer, when the funding key's
+transaction count at ``F`` (identity across every endpoint) is above the push-nonce bound: every
+push that key signed for this contract had a nonce at or below the bound, so none can land. Without
+a bound, or with a count that is not above it or cannot be read, it stays OPEN. A balance read that
+fails leaves the answer :attr:`DispositionKind.F_EXPIRED`, which says nothing about the balance.
+
 Not here: ``REFUND_PENDING`` and ``PAYOUT_REVERTS`` are the coordinator's reading of its OWN refund
-transaction (``SwapCoordinator.taker_refund_btc``, PR 5b), not of the contract; the historic-storage
-proof of a refund (§2.3 (b)); and ``EXPIRED_EMPTY_*`` (PR 7a).
+transaction (``SwapCoordinator.taker_refund_btc``, PR 5b), not of the contract; and the
+historic-storage proof of a refund (§2.3 (b)).
 """
 
 from __future__ import annotations
@@ -99,6 +108,8 @@ class DispositionKind(Enum):
     SETTLED_UNFINAL = "settled_unfinal"  # settled at the tip, not yet at F: wait
     REFUNDED = "refunded"  # settled at F, and a refund verified (§2.3 (d)) or the expiry anchor holds (a)
     CLAIMED = "claimed"  # settled at F, and a claim verified, or Gap B
+    EXPIRED_EMPTY_OPEN = "expired_empty_open"  # F_EXPIRED, token balance 0 at F and tip; a push may still land
+    EXPIRED_EMPTY_CLOSED = "expired_empty_closed"  # ...and the funding key's nonce at F is past every push
     UNKNOWN = "unknown"  # a read failed, fell below quorum, or the evidence contradicts itself
 
 
@@ -157,6 +168,10 @@ class CounterDisposition:
     #: not be checked and a nominated claim was verified (``claims_seen`` already surfaces it). ``False`` on every
     #: other answer, including an UNKNOWN from a failed or below-quorum read.
     settled_at_finalized: bool = False
+    #: The funding key's transaction count at ``F``, agreed by every endpoint, on an
+    #: ``EXPIRED_EMPTY_*`` answer that could read it; ``None`` otherwise. The nonce a push-closing
+    #: transaction consumes (design §2.7).
+    nonce_at_finalized: int | None = None
 
 
 # --------------------------------------------------------------------------- fan-out helpers
@@ -222,6 +237,17 @@ async def _magnitude(
     if len(answers) < panel.need:
         raise _BelowQuorum(f"{what}: {len(answers)} of {len(panel.sources)} endpoints answered, need {panel.need}")
     return combine(answers)
+
+
+async def _every(panel: _Panel, call: Callable[[Any], Awaitable[Any]], what: str) -> list[Any]:
+    """EVERY source must answer (not only a quorum). For a conclusion a negative reading supports
+    ("the contract holds nothing"): the endpoint that does not answer may be the one that would have
+    said otherwise, so a missing answer is unknown, never a vote."""
+    results = await _ask_all(panel.sources, call)
+    failed = [r for _s, r in results if isinstance(r, BaseException)]
+    if failed:
+        raise _BelowQuorum(f"{what}: {len(failed)} of {len(panel.sources)} endpoints did not answer ({failed[0]})")
+    return [r for _s, r in results]
 
 
 # --------------------------------------------------------------------------- the union log read
@@ -381,6 +407,9 @@ async def read_counter_disposition(
     from_block: int | None = None,
     recorded_refund_hashes: Sequence[str] = (),
     expiry_anchor: tuple[int, str] | None = None,
+    token_address: str | None = None,
+    funding_account: str | None = None,
+    push_nonce_bound: int | None = None,
 ) -> CounterDisposition:
     """The disposition of the counter-leg contract *locator* describes.
 
@@ -393,6 +422,12 @@ async def read_counter_disposition(
     ``expiry_anchor`` is a ``(number, hash)`` this reader returned on an earlier ``F_EXPIRED`` answer
     (§2.3 (a)); with the contract settled at ``F``, an anchor whose hash is still canonical proves a
     refund even when no refund transaction can be verified.
+
+    ``token_address`` makes an expired, unsettled contract's token balance part of the answer
+    (``EXPIRED_EMPTY_*``, PR 7a). ``funding_account`` is the key that signed the token push, and
+    ``push_nonce_bound`` the highest nonce at which it signed a push for this contract (or a
+    transaction that closed that nonce); with both, a count at ``F`` above the bound is
+    ``EXPIRED_EMPTY_CLOSED``.
 
     LIVENESS LIMITS, by design. One endpoint that nominates a transaction (a forged log) and then
     disagrees with the others about its receipt makes every answer for a SETTLED contract UNKNOWN for
@@ -420,6 +455,15 @@ async def read_counter_disposition(
             or not _is_hex(a_hash[2:])
         ):
             raise ValidationError("expiry_anchor must be (block number, 0x-prefixed 32-byte hex hash)")
+    for name, value in (("token_address", token_address), ("funding_account", funding_account)):
+        if value is not None and (
+            not isinstance(value, str) or not value.startswith("0x") or len(value) != 42 or not _is_hex(value[2:])
+        ):
+            raise ValidationError(f"{name} must be a 0x-prefixed 20-byte hex address")
+    if push_nonce_bound is not None and (
+        not isinstance(push_nonce_bound, int) or isinstance(push_nonce_bound, bool) or push_nonce_bound < 0
+    ):
+        raise ValidationError("push_nonce_bound must be a non-negative int")
     panel = _panel_of(rpc)
     single = len(panel.sources) == 1
     keys = tuple(sorted(_key(s) for s in panel.sources))
@@ -622,13 +666,88 @@ async def read_counter_disposition(
     if settled_tip:
         return done(DispositionKind.SETTLED_UNFINAL, "settled at the tip, not yet at the finalized block")
     if f_ts >= timeout:
-        return dataclasses.replace(
+        anchor = (finalized, "0x" + bytes(f_hash).hex())
+        expired = dataclasses.replace(
             done(DispositionKind.F_EXPIRED, "not settled, and the finalized block is at or past the timeout"),
-            expiry_anchor=(finalized, "0x" + bytes(f_hash).hex()),
+            expiry_anchor=anchor,
+        )
+        if token_address is None:
+            return expired
+        return await _expired_empty(
+            panel,
+            expired,
+            contract=locator.contract_address,
+            token=token_address,
+            finalized=finalized,
+            funding_account=funding_account,
+            push_nonce_bound=push_nonce_bound,
+            evidence=lambda: evidence(DispositionKind.EXPIRED_EMPTY_CLOSED, None),
         )
     if tip_ts >= timeout:
         return done(DispositionKind.TIP_EXPIRED, "not settled, and the tip is at or past the timeout")
     return done(DispositionKind.OPEN, "not settled, and before the timeout")
+
+
+async def _expired_empty(
+    panel: _Panel,
+    expired: CounterDisposition,
+    *,
+    contract: str,
+    token: str,
+    finalized: int,
+    funding_account: str | None,
+    push_nonce_bound: int | None,
+    evidence: Callable[[], DispositionEvidence],
+) -> CounterDisposition:
+    """Refine an ``F_EXPIRED`` answer for a token contract (§2.3 ``EXPIRED_EMPTY_*``, §2.7).
+
+    Empty means 0 at ``F`` (every endpoint answering, all agreeing) AND 0 at the tip (every endpoint
+    answering 0): tokens at the tip still make a refund worth sending. A balance read that fails or
+    disagrees leaves *expired* as it is. Closed needs the funding key's count at ``F``, every endpoint
+    agreeing, above the bound; anything less is OPEN. Both reads are at the one block ``F``, so a
+    push cannot land between them (design §7.2 scenario 11)."""
+    try:
+        at_f = await _every(panel, lambda s: s.erc20_balance_of(token, contract, finalized), f"balance at {finalized}")
+        if any(b != at_f[0] for b in at_f[1:]):
+            raise _BelowQuorum(f"balance at {finalized}: endpoints disagree")
+        at_tip = await _every(panel, lambda s: s.erc20_balance_of(token, contract, "latest"), "balance at tip")
+    except _BelowQuorum as exc:
+        return dataclasses.replace(expired, reason=f"{expired.reason}; the token balance is unknown: {exc}")
+    if int(at_f[0]) != 0 or any(int(b) != 0 for b in at_tip):
+        return expired
+    empty = dataclasses.replace(
+        expired, kind=DispositionKind.EXPIRED_EMPTY_OPEN, reason="expired, and the contract holds no tokens"
+    )
+    if funding_account is None:
+        return empty
+    try:
+        counts = await _every(
+            panel, lambda s: s.get_transaction_count(funding_account, finalized), f"nonce at {finalized}"
+        )
+        if any(c != counts[0] for c in counts[1:]):
+            raise _BelowQuorum(f"nonce at {finalized}: endpoints disagree")
+    except _BelowQuorum as exc:
+        return dataclasses.replace(empty, reason=f"{empty.reason}; the funding key's nonce at F is unknown: {exc}")
+    count = int(counts[0])
+    empty = dataclasses.replace(empty, nonce_at_finalized=count)
+    if push_nonce_bound is None:
+        return dataclasses.replace(
+            empty, reason=f"{empty.reason}; no push nonce is recorded, so a push may still land (design §2.7)"
+        )
+    if count <= push_nonce_bound:
+        return dataclasses.replace(
+            empty,
+            reason=f"{empty.reason}; the funding key's nonce at F is {count}, not past the push nonce {push_nonce_bound}",
+        )
+    return dataclasses.replace(
+        empty,
+        kind=DispositionKind.EXPIRED_EMPTY_CLOSED,
+        reason=(
+            f"expired and empty at the finalized block, and the funding key's nonce there ({count}) is past "
+            f"every push it signed (at most {push_nonce_bound}), so none can land"
+        ),
+        evidence=evidence(),
+    )
 
 
 async def _anchor_holds(panel: _Panel, anchor: tuple[int, str], finalized: int) -> bool:

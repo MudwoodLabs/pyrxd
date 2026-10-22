@@ -177,6 +177,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     drive one record with mixed pyrxd versions. A pyrxd from before this change refuses a v5
     record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x
     `taker_refund_btc` would send again, go to `ABORTED`, and drop the recorded hash.
+- **An empty, expired ERC-20 counter-leg contract can now end the swap, once no token push can
+  still land in it (#850 PR 7a) [Changed (breaking)].** A contract whose token push failed or was
+  never sent has nothing to refund, but a push the funding key signed could still arrive later.
+  - The disposition reader takes the token, the funding key and the highest push nonce
+    (`read_counter_disposition(..., token_address=, funding_account=, push_nonce_bound=)`). An
+    expired, unsettled contract whose token balance is 0 at the finalized block and at the tip
+    (every endpoint answering, none seeing tokens) is `EXPIRED_EMPTY_OPEN`. It is
+    `EXPIRED_EMPTY_CLOSED`, a terminal answer, when the funding key's transaction count at the
+    finalized block, agreed by every endpoint, is past the push nonce. A balance that cannot be
+    read at every endpoint leaves the answer `F_EXPIRED`; a count that cannot be read, or a record
+    with no push nonce, leaves it `OPEN`. New `CounterDisposition.nonce_at_finalized`, and
+    `EthRpc.erc20_balance_of(token, owner, block)`.
+  - `taker_refund_btc` and `reconcile_counter_leg` take a taker's or single operator's
+    `BTC_LOCKED` record to `ABORTED` on `EXPIRED_EMPTY_CLOSED` (new event
+    `COUNTER_LEG_EXPIRED_EMPTY`, on the existing `BTC_LOCKED → ABORTED` pair; `abort_reason`
+    `expired_empty`; `counter_disposition.kind` `expired_empty_closed`). Nothing is sent. A recorded
+    `Claimed` log that opens the hashlock holds it until `t_rxd` matures, as for an observed refund
+    (D14). At `PARAMS_MISMATCH` there is no edge: the evidence is recorded and a `ValidationError`
+    names the gated abandon (not in this release yet). A maker's record records it and stays.
+  - On `EXPIRED_EMPTY_OPEN`, `taker_refund_btc` raises `NothingToRefund` naming the new
+    `close_push_nonce`, and the record does not change.
+  - New `SwapCoordinator.close_push_nonce()` (BTC_LOCKED, token leg, not for a maker): when the
+    contract reads `EXPIRED_EMPTY_OPEN`, it sends a 0-value transfer from the funding key to itself
+    at that key's nonce at the finalized block (`EthLeg.close_push_nonce`,
+    `EthHtlcContractLeg.close_nonce`), recorded as `push_close_tx_hash` / `push_close_nonce`
+    before the broadcast. Once it is final, the contract reads closed and `taker_refund_btc` ends
+    the record. A recorded close is followed, not re-sent, unless it was dropped. It refuses when
+    the push nonce is above the count at the finalized block. Not yet from `NEGOTIATED` (#850 PR 8).
+  - `mutual_refund` reads an empty expired contract before sending anything and raises
+    `NothingToRefund` naming the gated abandon, as the leg's refusal did before.
+  - `SWAP_RECORD_SCHEMA_VERSION` is 6. A record carrying a push close, an `expired_empty` abort
+    reason or an `expired_empty_closed` disposition is refused by a pyrxd from before this change.
 - **On an ETH swap, the coordinator now acts on what the chain shows about the counter leg, not
   only on what it broadcast (#850 PR 5a) [Changed (breaking)].** The disposition is read with
   `pyrxd.eth_wallet.disposition` at the quorum-minimum finalized block.

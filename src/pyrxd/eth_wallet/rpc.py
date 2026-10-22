@@ -380,7 +380,7 @@ class EthRpc:
         except Exception as exc:
             raise self._failed("eth_getBalance failed", exc)
 
-    async def get_transaction_count(self, address: str, block: str = "pending") -> int:
+    async def get_transaction_count(self, address: str, block: str | int = "pending") -> int:
         """Nonce for the sender. Defaults to ``pending`` so a freshly built tx does not collide
         with one still in the mempool.
 
@@ -568,6 +568,24 @@ class EthRpc:
         except Exception as exc:
             raise self._failed(f"eth_getStorageAt({slot}, {block_identifier!r}) failed", exc)
         return bytes(word).rjust(32, b"\x00")
+
+    async def erc20_balance_of(self, token: str, owner: str, block_identifier: str | int) -> int:
+        """``token.balanceOf(owner)`` as of ``block_identifier``, by a raw ``eth_call`` (#850 PR 7a).
+        An integer block needs historic state; a refusal is a failed read, never a zero. An answer
+        that is not one 32-byte word is a failed read too."""
+        from pyrxd.eth_wallet.events import function_selector
+
+        w3 = self._w3
+        owner_word = bytes.fromhex(owner.lower().removeprefix("0x")).rjust(32, b"\x00")
+        data = "0x" + (function_selector("balanceOf(address)") + owner_word).hex()
+        call = {"to": w3.to_checksum_address(token), "data": data}
+        try:
+            raw = bytes(await w3.eth.call(call, block_identifier))
+        except Exception as exc:
+            raise self._failed(f"{token}.balanceOf({owner}) at {block_identifier!r} failed", exc)
+        if len(raw) != 32:
+            raise NetworkError(f"{token}.balanceOf({owner}) returned {len(raw)} bytes, not one word")
+        return int.from_bytes(raw, "big")
 
     async def get_logs(
         self,

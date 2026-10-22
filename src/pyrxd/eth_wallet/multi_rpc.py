@@ -364,6 +364,17 @@ class MultiSourceEthRpc:
             label=f"get_storage_at({slot}, {block_identifier!r})",
         )
 
+    async def erc20_balance_of(self, token: str, owner: str, block_identifier: str | int) -> int:
+        """An IDENTITY read, like :meth:`get_storage_at`: pin an integer block for a decision. The
+        disposition reader does not use this; it asks EVERY endpoint itself, because "empty" is a
+        conclusion a missing answer must not support (#850 PR 7a)."""
+        return int(
+            await self.eth_call_quorum(
+                lambda s: s.erc20_balance_of(token, owner, block_identifier),
+                label=f"{token}.balanceOf({owner}) at {block_identifier!r}",
+            )
+        )
+
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         """Quorum on the two fields a swap decision turns on — did it succeed, and in which block.
 
@@ -427,7 +438,7 @@ class MultiSourceEthRpc:
 
     # --------------------------------------------- deliberately single-source
 
-    async def get_transaction_count(self, address: str, block: str = "pending") -> int:
+    async def get_transaction_count(self, address: str, block: str | int = "pending") -> int:
         """PRIMARY only, and it must be. The nonce is the mempool view of the endpoint that will
         broadcast; taking another's would build a transaction against a state that endpoint does
         not have.
