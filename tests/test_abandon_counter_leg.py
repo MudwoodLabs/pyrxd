@@ -245,6 +245,7 @@ async def test_a_settlement_with_a_verified_claim_seen_is_not_abandoned(monkeypa
         "settled",
         90,
         settled_at_finalized=True,
+        settled_unexplained=True,
         claims_seen=(seen,),
         finalized_hash="0x" + "f9" * 32,
     )
@@ -253,9 +254,12 @@ async def test_a_settlement_with_a_verified_claim_seen_is_not_abandoned(monkeypa
         return read
 
     monkeypatch.setattr(coord, "_read_counter_disposition", fake_read)
-    with pytest.raises(NetworkError, match="unknown"):
-        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
-    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+    for verified in (True, False):  # an unverified log that opens H carries p just the same
+        read = dataclasses.replace(read, claims_seen=(dataclasses.replace(seen, verified=verified),))
+        with pytest.raises(AbandonNotAccepted, match="p is public") as refused:
+            await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+        assert refused.value.next_step == "reconcile_counter_leg"
+        _unchanged(coord, sink, SwapState.BTC_LOCKED)
 
     async def fake_read_no_claim():
         return dataclasses.replace(read, claims_seen=())
@@ -361,7 +365,12 @@ async def test_a_read_that_names_no_finalized_block_records_nothing(monkeypatch,
     coord, _chain, _leg, _ = _token()
     sink = _with_sink(coord)
     read = CounterDisposition(
-        DispositionKind.UNKNOWN, "settled", 90, settled_at_finalized=True, finalized_hash="0x" + "f9" * 32
+        DispositionKind.UNKNOWN,
+        "settled",
+        90,
+        settled_at_finalized=True,
+        settled_unexplained=True,
+        finalized_hash="0x" + "f9" * 32,
     )
     read = dataclasses.replace(read, **{missing: None})
 
@@ -395,6 +404,7 @@ async def test_only_a_claim_or_a_refund_names_its_transaction_on_the_record(monk
         90,
         evidence=evidence,
         settled_at_finalized=True,
+        settled_unexplained=True,
         finalized_hash="0x" + "f9" * 32,
     )
 
@@ -405,3 +415,78 @@ async def test_only_a_claim_or_a_refund_names_its_transaction_on_the_record(monk
     rec = await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
     assert rec.counter_disposition.kind == "unknown" and rec.counter_disposition.tx_hash is None
     assert rec.counter_disposition.sources == ("a.test", "b.test")
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+async def test_one_endpoint_that_contradicts_a_claim_cannot_make_it_abandonable(state):
+    """Review of #850 PR 7b, HIGH: claimed before the timeout, finalized before the timeout, and one
+    endpoint of three forges a refund (the claim's log is pruned). The read is UNKNOWN and settled, but
+    contradicted, so it is not SETTLED_UNVERIFIABLE: without the forger it reads CLAIMED (Gap B)."""
+    forged = "0x" + "fa" * 32
+
+    def lying(chain):
+        return [  # the claim's log is pruned everywhere; the third endpoint forges a refund
+            FakeEvmEndpoint(chain, hide_claimed=True),
+            FakeEvmEndpoint(chain, hide_claimed=True),
+            FakeEvmEndpoint(chain, hide_claimed=True, forge_refunded_tx=forged, forge_receipt=True),
+        ]
+
+    coord, chain, _leg = _native_setup(state=state, endpoints=lying, chain_kw={"finalized": 75})
+    sink = _with_sink(coord)
+    chain.claim(70)
+    read = await coord._read_counter_disposition()
+    assert read.kind is DispositionKind.UNKNOWN and read.settled_at_finalized and not read.settled_unexplained
+    with pytest.raises(NetworkError, match="unknown"):
+        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    _unchanged(coord, sink, state)
+    honest, chain2, _l = _native_setup(
+        state=state,
+        endpoints=lambda c: [FakeEvmEndpoint(c, hide_claimed=True) for _ in range(3)],
+        chain_kw={"finalized": 75},
+    )
+    chain2.claim(70)
+    assert (await honest._read_counter_disposition()).kind is DispositionKind.CLAIMED  # Gap B
+
+
+async def test_a_failed_persist_leaves_the_record_as_it_was():
+    """The abandon is taken only once it is durable: a persist that fails leaves memory as the disk
+    has it, so a retry reads the chain again rather than finding an ABORTED record in memory."""
+    coord, _chain, _leg, sink = _token()
+
+    async def broken(_record):
+        raise OSError("disk full")
+
+    sink.coord.persisted.clear()
+    coord._persist = sink
+    sink.__class__ = type("_BrokenSink", (_Sink,), {"__call__": lambda self, r: broken(r)})
+    with pytest.raises(OSError, match="disk full"):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert coord.record.state is SwapState.BTC_LOCKED and coord.record.abort_reason is None
+    assert coord.record.abandon_case is None
+
+
+async def test_every_claim_log_seen_is_kept_in_the_note():
+    """D14 leaves the abandon to the operator while a Claimed log is seen; the evidence is kept."""
+    coord, chain, leg, sink = _token()
+    chain.token_balances[30] = 1_000_000
+    leg.revert_reason = "TransferFailed"
+    seen = ClaimSeen(tx_hash="0x" + "c3" * 32, block_number=70, nominated_by=("a",), verified=False)
+    real = coord._read_counter_disposition
+
+    async def with_a_claim():
+        return dataclasses.replace(await real(), claims_seen=(seen,))
+
+    coord._read_counter_disposition = with_a_claim
+    await _abandon(coord, AbandonCase.PAYOUT_REVERTS)
+    kept = json.loads(sink.notes[0])["read"]["claims_seen"]
+    assert kept == [{"tx_hash": seen.tx_hash, "block_number": 70, "verified": False}]
+
+
+def test_a_record_may_not_carry_an_abandon_before_it_is_aborted():
+    from pyrxd.security.errors import ValidationError as VE
+
+    coord, _chain, _leg, _ = _token()
+    d = coord.record.to_dict()
+    d.update(abort_reason="operator_abandoned", abandon_case="payout_reverts", abort_note_sha256="0" * 64)
+    with pytest.raises(VE, match="ABORTED record"):
+        SwapRecord.from_dict(d)

@@ -41,7 +41,7 @@ re-derive from it.
 |---|---|
 | The negotiated-terms object and its JSON wire form | `src/pyrxd/gravity/swap_state.py:486-722` (`NegotiatedTerms`) |
 | The state machine every message drives | `src/pyrxd/gravity/swap_state.py:91-447` (13 states, 16 edges, `advance`) |
-| The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:731-1272` (`SwapRecord`), `src/pyrxd/gravity/swap_state.py:56` (`SWAP_RECORD_SCHEMA_VERSION`) |
+| The durable per-swap record and its schema version | `src/pyrxd/gravity/swap_state.py:731-1277` (`SwapRecord`), `src/pyrxd/gravity/swap_state.py:56` (`SWAP_RECORD_SCHEMA_VERSION`) |
 | Role invariant + timelock-margin rule | `src/pyrxd/gravity/swap_coordinator.py:170-190` (`MAKER_SECRET_TAKER_LOCKS_BTC_FIRST`), `src/pyrxd/gravity/swap_coordinator.py:860-1022` (`assert_timelock_margin`) |
 | Pre-fund validation gate (what a taker checks before locking) | `src/pyrxd/gravity/swap_coordinator.py:1986-2168` (`pre_btc_lock_check`) |
 | Post-asset-lock revalidation (what a taker checks after the maker locks) | `src/pyrxd/gravity/swap_coordinator.py:3456-3523` (`post_asset_lock_revalidate`) |
@@ -241,7 +241,7 @@ The canonical wire form of `NegotiatedTerms`, produced by `NegotiatedTerms.to_di
 
 | Key | Type | Req. | Constraint | Source |
 |---|---|---|---|---|
-| `hashlock` | 64-hex | **yes** | Exactly 32 bytes. `H = SHA256(p)`, **single** SHA256. | `swap_state.py:508`; `_b32` (`swap_state.py:1327-1333`) |
+| `hashlock` | 64-hex | **yes** | Exactly 32 bytes. `H = SHA256(p)`, **single** SHA256. | `swap_state.py:508`; `_b32` (`swap_state.py:1332-1338`) |
 | `btc_sats` | int | **yes** | `> 0`. The counter-leg amount for a BTC swap. Vestigial but still required on an ETH swap. | `swap_state.py:509, 552-553` |
 | `radiant_amount` | int | **yes** | `> 0`. Photons (`rxd`), token units (`ft`), or carrier sats (`nft`). | `swap_state.py:516, 554-555` |
 | `t_btc` | `{value:int, unit:"blocks"\|"seconds"}` | **yes** | Counter-leg relative refund timelock. **Advisory on an ETH swap** — see **HZ-4**. | `swap_state.py:517, 597-598` |
@@ -601,13 +601,13 @@ funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG ent
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**
-(`scripts/btc_swap_two_host.py:855, 1483`; `scripts/eth_swap_two_host.py:849, 1819` — the second of
+(`scripts/btc_swap_two_host.py:855, 1483`; `scripts/eth_swap_two_host.py:849, 1822` — the second of
 each pair is the offline self-check fixture). No code path reads or validates the field: the taker
 phases go straight to `env["terms"]`. Worse, `NegotiatedTerms` itself has **no version field at
 all** — the only `SWAP_RECORD_SCHEMA_VERSION` (`swap_state.py:56`) versions the *durable
 record*. It is emitted when the counter leg is ETH or the record carries a field added after v2,
-such as the record's role (written at `:1138-1155`), and since 0.27 the record's own reader refuses a
-version above its own (`:1216`). That protects the durable record only, not these messages.
+such as the record's role (written at `:1143-1160`), and since 0.27 the record's own reader refuses a
+version above its own (`:1221`). That protects the durable record only, not these messages.
 
 Compounding it: `NegotiatedTerms.from_dict` reads named keys and **silently ignores anything else**
 (`swap_state.py:703-722`; verified by `test_from_dict_silently_ignores_unknown_keys`). Combined with
@@ -830,12 +830,14 @@ a case with no step of its own, past the timeout at the finalized block or settl
 when the operator named that case and the contract's address. The cases are an empty expired
 contract that has no automatic end from the record's state (`expired_empty`), a refund that would revert
 (`payout_reverts`), a claim after a params mismatch (`claimed_after_mismatch`), a settled contract
-whose evidence cannot say how (`settled_unverifiable`), and a refund seen by one endpoint on a chain
+whose evidence cannot say how (`settled_unverifiable`: every gate read, no endpoint contradicting,
+the finalized block at or past the timeout, and no `Claimed` log that opens the hashlock), and a refund seen by one endpoint on a chain
 that carries value (`single_source_refund`). `abort_reason` is `operator_abandoned`, and the record
 keeps the case (`abandon_case`), the read it rests on (`counter_disposition`) and the SHA-256 of the
 operator's note (`abort_note_sha256`). The note itself is written beside the record, never into it.
-A read that shows a claim from `BTC_LOCKED` or `BOTH_LOCKED` is refused: `p` is public, and the
-covenant claim comes first. From `BOTH_LOCKED` the edge is taken only after the contract's timeout
+A verified claim from `BTC_LOCKED` or `BOTH_LOCKED` is refused: `p` is public, and the covenant
+claim comes first. On the other cases an unverified `Claimed` log does not hold the abandon (D14);
+every one the read saw is kept in the note file. From `BOTH_LOCKED` the edge is taken only after the contract's timeout
 has passed at the finalized block.
 
 `BOTH_TIMEOUTS_ELAPSE` on an ETH counter leg (#850, PR 6) is also taken on the chain, not on a

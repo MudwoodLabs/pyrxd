@@ -3244,6 +3244,16 @@ class _PayoutRevertsLeg(_FakeCounterLeg):
         return self.revert
 
 
+class _ClosedEmptyLeg(_PayoutRevertsLeg):
+    """Reads EXPIRED_EMPTY_CLOSED: its own edge from BTC_LOCKED, an abandon from BOTH_LOCKED (§3.6)."""
+
+    async def counter_disposition(self, locator, **_kw):
+        from pyrxd.eth_wallet.disposition import DispositionKind
+
+        d = await super().counter_disposition(locator)
+        return dataclasses.replace(d, kind=DispositionKind.EXPIRED_EMPTY_CLOSED, reason="expired, empty, closed")
+
+
 def _abandon_args(args, io_dir: Path, **over):
     loc = _exchange_locator(io_dir, eth=True)
     base = {
@@ -3279,6 +3289,25 @@ class TestTheAbandonPhase:
         assert json.loads(note)["note"] == "the refundee is a contract that rejects ETH"
         assert built["counter"].refund_calls == [] and built["rpc"].closed
         assert built["rxd"].refund_calls == []
+
+    async def test_the_persisted_state_is_the_one_the_coordinator_judges(self, eth_mod, tmp_path, monkeypatch):
+        """Review of #850 PR 7b: the runner rebuilt every record as BTC_LOCKED, so a BOTH_LOCKED
+        record was judged by BTC_LOCKED's rules. A closed empty contract is an abandon from
+        BOTH_LOCKED and its own edge (taker_refund_btc) from BTC_LOCKED."""
+        from pyrxd.gravity.swap_state import AbandonCase
+
+        args, io_dir = await self._seeded(eth_mod, tmp_path, SwapState.BOTH_LOCKED)
+        _wire_eth(eth_mod, monkeypatch, counter_leg=_ClosedEmptyLeg())
+        await eth_mod.taker_phase_abandon(_abandon_args(args, io_dir, abandon_case="expired_empty"))
+        rec = _read_back(args)
+        assert rec.state is SwapState.ABORTED and rec.abandon_case is AbandonCase.EXPIRED_EMPTY
+
+        (tmp_path / "b").mkdir()
+        args2, io_dir2 = await self._seeded(eth_mod, tmp_path / "b", SwapState.BTC_LOCKED)
+        _wire_eth(eth_mod, monkeypatch, counter_leg=_ClosedEmptyLeg())
+        with pytest.raises(SystemExit, match="NEXT: taker_refund_btc"):
+            await eth_mod.taker_phase_abandon(_abandon_args(args2, io_dir2, abandon_case="expired_empty"))
+        assert _read_back(args2).state is SwapState.BTC_LOCKED
 
     async def test_a_case_the_chain_does_not_show_is_refused_with_the_next_step(self, eth_mod, tmp_path, monkeypatch):
         """A refund that would succeed has its own end: the phase says which, and records nothing."""

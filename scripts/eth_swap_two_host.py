@@ -1342,8 +1342,8 @@ async def taker_phase_abandon(args: argparse.Namespace) -> None:
     """TAKER — end the record on a counter-leg case that has no automatic end (``--phase abandon``,
     #850 PR 7b, design §3.6).
 
-    Drives ``SwapCoordinator.abandon_counter_leg`` on this host's persisted record (BTC_LOCKED or
-    BOTH_LOCKED). Nothing is broadcast. The coordinator reads the ETH HTLC first and accepts only a
+    Drives ``SwapCoordinator.abandon_counter_leg`` on this host's persisted record (BTC_LOCKED,
+    BOTH_LOCKED or PARAMS_MISMATCH), in the state it was persisted in. Nothing is broadcast. The coordinator reads the ETH HTLC first and accepts only a
     case past the timeout at the finalized block (or settled there) that has no step of its own, and
     only the case ``--abandon-case`` names; ``--confirm-contract`` must be the HTLC's address. The
     note goes to a file beside the record (``<record>.abort-note``); the record keeps its hash. The
@@ -1357,7 +1357,8 @@ async def taker_phase_abandon(args: argparse.Namespace) -> None:
     terms = NegotiatedTerms.from_dict(env["terms"])
     _refuse_by_persisted_state(args, terms, phase="abandon")  # before any chain read
     sink = _record_sink(args.local_out)
-    if sink.load_record() is None:
+    persisted = sink.load_record()
+    if persisted is None:
         raise SystemExit(f"REFUSING: there is no swap record at {sink.path} to abandon. Nothing was recorded.")
     if not args.abandon_case or not args.confirm_contract or not args.abandon_note:
         raise SystemExit(
@@ -1375,7 +1376,9 @@ async def taker_phase_abandon(args: argparse.Namespace) -> None:
         eth_timeout=int(terms.eth_timeout_unix_s),
     )
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
-    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED)
+    # The persisted state, not a fixed one: the merge keeps the rebuild's state, and §3.6 accepts
+    # different cases from BTC_LOCKED, BOTH_LOCKED and PARAMS_MISMATCH (#850 PR 7b review).
+    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(persisted.state)
     coord = _coordinator(
         args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="abandon"
     )

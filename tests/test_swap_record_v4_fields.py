@@ -176,6 +176,7 @@ def test_a_bad_record_field_is_refused(base, fields):
             "abandon_case": AbandonCase.SETTLED_UNVERIFIABLE,
             "abort_note_sha256": "0" * 64,
             "state": SwapState.ABORTED,
+            "counter_disposition": CounterDispositionRecord(**{**_GOOD, "kind": "unknown", "tx_hash": None}),
         },
     ],
 )

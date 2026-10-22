@@ -4891,7 +4891,11 @@ class SwapCoordinator:
         persist hook's ``write_abort_note`` (:class:`JsonFileRecordSink`, design D18); the record
         carries only its SHA-256, ``abandon_case`` and ``abort_reason`` ``OPERATOR_ABANDONED``, with
         the read as ``counter_disposition``. A recorded ``Claimed`` log does not hold this step
-        (D14): it is the operator's choice, made with that page in front of them.
+        (D14): it is the operator's choice, made with that page in front of them, and every
+        ``Claimed`` log the read saw goes into the sidecar. The exception is ``SETTLED_UNVERIFIABLE``:
+        it is accepted only on the read that checked every gate without a contradiction (settled at
+        the finalized block, that block at or past the timeout, every nominated transaction checked),
+        and refused while a ``Claimed`` log that opens H is seen, since that log carries ``p``.
 
         What it gives up: on ``SETTLED_UNVERIFIABLE`` the contract may have been CLAIMED, so ``p`` may
         be public and the covenant claimable until t_rxd; on ``EXPIRED_EMPTY`` a token push may still
@@ -4956,19 +4960,34 @@ class SwapCoordinator:
         sidecar = {
             "contract": locator.contract_address,
             "abandon_case": case.value,
-            "read": {"kind": kind, "reason": disposition.reason, "finalized_block": recorded.block_number},
+            "read": {
+                "kind": kind,
+                "reason": disposition.reason,
+                "finalized_block": recorded.block_number,
+                # Every Claimed log seen that opens H, verified or not (D14 leaves the choice to the
+                # operator; the evidence is kept).
+                "claims_seen": [
+                    {"tx_hash": c.tx_hash, "block_number": c.block_number, "verified": c.verified}
+                    for c in disposition.claims_seen
+                ],
+            },
             "note": note,
         }
         digest = write_note(json.dumps(sidecar, indent=2, sort_keys=True).encode())
+        before = self.record
         self.record = dataclasses.replace(
             self.record,
+            state=advance(state, SwapEvent.OPERATOR_ABANDONED),
             counter_disposition=recorded,
             abort_reason=AbortReason.OPERATOR_ABANDONED,
             abandon_case=case,
             abort_note_sha256=digest,
         )
-        self._advance(SwapEvent.OPERATOR_ABANDONED)
-        await self._persist_record(self.record, shield=True)
+        try:
+            await self._persist_record(self.record, shield=True)
+        except BaseException:
+            self.record = before  # not durable, so not taken: a retry reads the chain again
+            raise
         logger.warning(
             "counter-leg contract %s abandoned by the operator (%s, read %s at block %d); the record is ABORTED",
             locator.contract_address,
@@ -5017,7 +5036,20 @@ class SwapCoordinator:
                 next_step=step,
             )
         if kind is DispositionKind.UNKNOWN:
-            if disposition.settled_at_finalized and not any(c.verified for c in disposition.claims_seen):
+            if disposition.settled_unexplained and disposition.claims_seen:
+                # A Claimed log whose data opens H carries p, verified or not: the covenant claim is
+                # the step, not an abandon (#850 PR 7b review).
+                raise AbandonNotAccepted(
+                    "the counter leg is settled and a Claimed log that opens the hashlock is seen, so p is public: "
+                    "claim the covenant with p before t_rxd (reconcile_counter_leg records the claim). Nothing was "
+                    "recorded.",
+                    kind=name,
+                    next_step="reconcile_counter_leg",
+                )
+            if disposition.settled_unexplained:
+                # Only the read that checked every gate and found no contradiction: settled at F, F at
+                # or past the timeout, every nominated transaction checked. A read some endpoint
+                # contradicts (one that could not be checked, rule 2 or 3) is not this (#850 PR 7b review).
                 return AbandonCase.SETTLED_UNVERIFIABLE, name
             raise NetworkError(
                 f"the counter leg's disposition is unknown ({disposition.reason}); an abandon needs a read that "

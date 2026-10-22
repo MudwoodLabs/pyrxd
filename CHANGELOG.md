@@ -187,16 +187,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     named: `EXPIRED_EMPTY` (an empty expired token contract with no automatic end from this
     state), `PAYOUT_REVERTS` (unsettled and expired at the finalized block, and a refund would
     revert `TransferFailed` or `SendFailed`), `CLAIMED_AFTER_MISMATCH` (claimed, at
-    `PARAMS_MISMATCH`), `SETTLED_UNVERIFIABLE` (settled at the finalized block with no verified
-    claim and no evidence of how) and `SINGLE_SOURCE_REFUND` (a refund seen by one endpoint on a
+    `PARAMS_MISMATCH`), `SETTLED_UNVERIFIABLE` (settled at the finalized block, which is at or
+    past the timeout, every nominated transaction checked, no endpoint contradicting, and no
+    `Claimed` log that opens the hashlock) and `SINGLE_SOURCE_REFUND` (a refund seen by one endpoint on a
     chain that carries value). Any other read raises the new `AbandonNotAccepted`
     (`pyrxd.security.errors`), which names the read and, where there is one, the step that ends it
     (`next_step`: `taker_refund_btc`, `mutual_refund` or `reconcile_counter_leg`). A claim seen from
     `BTC_LOCKED` or `BOTH_LOCKED` is refused. An unknown read raises `NetworkError`.
-  - `confirm_contract` must be the HTLC's address. The note (not blank; at most 2,000 characters of printable text, newlines and tabs
-    allowed) is written to a file beside the record (`JsonFileRecordSink.write_abort_note`, at
-    `<record>.abort-note`) with the read it rests on; the record keeps only its SHA-256. A persist
-    hook without `write_abort_note` is refused.
+  - `confirm_contract` must be the HTLC's address. The note (not blank; at most 2,000 characters
+    of printable text, newlines and tabs allowed) is written to a file beside the record
+    (`JsonFileRecordSink.write_abort_note`, at `<record>.abort-note`) with the read it rests on and
+    every `Claimed` log the read saw; the record keeps only its SHA-256. A persist hook without
+    `write_abort_note` is refused. The record changes only once the persist succeeds.
   - The record keeps the case (`abandon_case`), the note's hash (`abort_note_sha256`) and the read
     (`counter_disposition`, whose kind may now also be `expired_empty_open`, `f_expired` or
     `unknown`); `abort_reason` is the new `operator_abandoned`. The HTLC's address stays on the

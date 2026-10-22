@@ -973,6 +973,11 @@ class SwapRecord:
                 "abandon_case and abort_note_sha256 are recorded together with abort_reason operator_abandoned, "
                 "and only with it"
             )
+        if abandoned and (self.state is not SwapState.ABORTED or self.counter_disposition is None):
+            raise ValidationError(
+                "an operator's abandon is recorded on an ABORTED record, with the read it rests on "
+                "(counter_disposition)"
+            )
         if self.abandon_case is not None and not isinstance(self.abandon_case, AbandonCase):
             raise ValidationError("abandon_case must be an AbandonCase or None")
         if self.abort_note_sha256 is not None:
