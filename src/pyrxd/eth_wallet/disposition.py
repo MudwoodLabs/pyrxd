@@ -524,7 +524,10 @@ async def read_counter_disposition(
         address=locator.contract_address,
         topics=[[CLAIMED_TOPIC0, REFUNDED_TOPIC0]],
         from_block=int(from_block),
-        to_block=max(int(from_block), int(head)),
+        # Never short of F: an endpoint that reports a head below F (every honest one is at or past
+        # it) would otherwise cut every endpoint's scan short of a claim at or before F, and the
+        # silence would read as "no claim" (re-review of #850 PR 7b). Such an endpoint fails its scan.
+        to_block=max(int(from_block), int(head), int(finalized)),
     )
     common: dict[str, Any] = {
         "logs_answered": union.answered,

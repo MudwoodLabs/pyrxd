@@ -5050,8 +5050,9 @@ class SwapCoordinator:
                 )
             if disposition.settled_unexplained:
                 # Only the read that checked every gate and found no contradiction: settled at F, F at
-                # or past the timeout, every nominated transaction checked. A read some endpoint
-                # contradicts (one that could not be checked, rule 2 or 3) is not this (#850 PR 7b review).
+                # or past the timeout, every endpoint's log scan answered through F, every nominated
+                # transaction checked. A read some endpoint contradicts (one that could not be checked,
+                # rule 2 or 3) is not this (#850 PR 7b review).
                 return AbandonCase.SETTLED_UNVERIFIABLE, name
             raise NetworkError(
                 f"the counter leg's disposition is unknown ({disposition.reason}); an abandon needs a read that "
