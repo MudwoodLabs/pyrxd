@@ -94,6 +94,7 @@ jobs:
           RESULT: ${{ needs.freshness.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          set -o pipefail
           TITLE="Radiant checkpoint table is going stale"
           EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number,title \
             --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n 1)
