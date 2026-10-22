@@ -164,3 +164,18 @@ def test_each_new_field_alone_writes_the_current_schema_version(fields):
 
 def test_HONEST_a_record_without_them_keeps_its_old_form():
     assert "schema_version" not in _btc_base().to_dict()
+
+
+def test_a_push_signer_alone_writes_the_current_schema_version():
+    """Mid-fund (a pending deploy), the push nonce alone keeps the v2 form; the push key does not."""
+    pending = dataclasses.replace(
+        _eth_base(),
+        pending_counter_contract="0x" + "77" * 20,
+        pending_counter_deploy_tx="0x" + "de" * 32,
+        pending_push_nonce=3,
+    )
+    assert "schema_version" not in pending.to_dict()  # honest: nothing new, the old form
+    signed = dataclasses.replace(pending, push_signer="0x" + "ab" * 20)
+    d = signed.to_dict()
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION
+    assert SwapRecord.from_dict(d) == signed

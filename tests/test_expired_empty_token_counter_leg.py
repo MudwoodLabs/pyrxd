@@ -480,6 +480,16 @@ async def test_HONEST_nonce_less_an_idle_key_past_our_close_is_closed():
     assert d.kind is DispositionKind.EXPIRED_EMPTY_CLOSED and d.funding_key_idle is True
 
 
+@pytest.mark.parametrize("which", [0, 1, 2])
+async def test_nonce_less_one_endpoint_that_sees_a_transaction_in_flight_is_enough(which):
+    """Every endpoint is asked, not the first: any one of them holding a pending transaction of the key
+    keeps it OPEN."""
+    chain = _chain(nonces={20: 41})
+    eps = [FakeEvmEndpoint(chain, pending_extra=1 if i == which else 0) for i in range(3)]
+    d = await _read(chain, *eps, bound=40, nonce_less=True)
+    assert d.kind is DispositionKind.EXPIRED_EMPTY_OPEN and d.funding_key_idle is False
+
+
 async def test_nonce_less_a_count_mined_above_F_is_not_idle():
     chain = _chain(nonces={20: 41, FINALIZED + 2: 42})
     d = await _read(chain, bound=40, nonce_less=True)

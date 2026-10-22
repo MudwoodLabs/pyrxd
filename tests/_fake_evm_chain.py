@@ -202,6 +202,7 @@ class FakeEvmEndpoint:
         lie_balance: int | None = None,
         nonce_reads_fail: bool = False,
         lie_nonce: int | None = None,
+        pending_extra: int = 0,
     ) -> None:
         self.chain = chain
         self.lag = lag
@@ -222,6 +223,8 @@ class FakeEvmEndpoint:
         self.lie_balance = lie_balance
         self.nonce_reads_fail = nonce_reads_fail
         self.lie_nonce = lie_nonce
+        #: Transactions of the funding key in THIS endpoint's pool only, on top of the chain's.
+        self.pending_extra = pending_extra
         self.source_key = distinct_host()
         self.expected_chain_id = CHAIN_ID
         self.log_requests: list[tuple[int, int | str]] = []
@@ -302,7 +305,8 @@ class FakeEvmEndpoint:
             return self.lie_nonce
         if address.lower() != FUNDER:
             return 0
-        return self.chain.count_at(at) + (self.chain.pending_txs if block == "pending" else 0)
+        pending = self.chain.pending_txs + self.pending_extra
+        return self.chain.count_at(at) + (pending if block == "pending" else 0)
 
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         if self.forge_receipt and tx_hash == self.forge_refunded_tx:

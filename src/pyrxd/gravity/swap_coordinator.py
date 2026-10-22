@@ -3125,12 +3125,10 @@ class SwapCoordinator:
             # field was written only by tests and a resume could not read its own pending push back.
             # Adopted only once the write returns, like the BTC funding bytes below.
             staged = self._pinned_to_the_verified_covenant(
-                dataclasses.replace(
-                    self.record,
-                    pending_push_nonce=int(nonce),
-                    pending_push_tx_hash=tx_hash,
-                    push_signer=self.record.push_signer or self._counter_signer(),
-                )
+                # push_signer is NOT stamped here: it is written only with a nonce this process chose
+                # (`_remember_push_nonce`). A resumed record from before it was kept stays without
+                # one, and is then read with this leg's key only if this key deployed the contract.
+                dataclasses.replace(self.record, pending_push_nonce=int(nonce), pending_push_tx_hash=tx_hash)
             )
             await self._persist_record(staged, shield=True)
             self.record = staged
@@ -3147,9 +3145,10 @@ class SwapCoordinator:
 
         if terms.counter_chain == "eth":
             signer = self._counter_signer()
-            if self.record.push_signer is not None and signer is not None and signer != self.record.push_signer:
+            if self.record.push_signer is not None and signer != self.record.push_signer:
                 # The pinned push nonce is the recorded key's slot; pushing with another key at it
                 # would leave the first key's push free to land, and no close of ours could reach it.
+                # A leg that does not say its key is refused too.
                 raise ValidationError(
                     f"this swap's token push was signed by {self.record.push_signer}, and this counter leg's key "
                     f"is {signer}: resume with the key that signed the push. Nothing was sent."
@@ -4427,6 +4426,8 @@ class SwapCoordinator:
             return None
         # Our own recorded refund is nominated alongside the logs, and the expiry anchor offered as
         # a proof of refund (#850 PR 5b). Passed only when set, so a leg without them still reads.
+        # The token arguments below (PR 7a) are passed for every token record that needs them: a leg
+        # that does not take them fails (TypeError) rather than reading without them.
         kwargs: dict[str, Any] = {}
         if self.record.counter_refund_tx_hash is not None:
             # Every refund we signed, not only the newest: an earlier one at the same nonce may be the

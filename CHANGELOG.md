@@ -188,8 +188,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `EXPIRED_EMPTY_CLOSED`, a terminal answer, when the funding key's transaction count at the
     finalized block, agreed by every endpoint, is past the push nonce. With no push nonce recorded,
     our own close is the bound, and closed also needs the key's pending count, latest count and
-    count at the finalized block to be one number at every endpoint (design §2.7); a push submitted
-    privately, or held only in another node's queue, is not seen by that check. A balance that
+    count at the finalized block to be one number at every endpoint (design §2.7). That check does
+    not see a push submitted privately, held only in another node's pool, queued above a nonce gap
+    (a geth node's pending count stops at the first gap), or at an endpoint that answers "pending"
+    with its latest count. A balance that
     cannot be read at every endpoint leaves the answer `F_EXPIRED`; a count that cannot be read, or
     a record with no push nonce and no final close, leaves it `EXPIRED_EMPTY_OPEN`. New
     `CounterDisposition.nonce_at_finalized` and `funding_key_idle`, and
@@ -212,12 +214,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the push nonce is above the count at the finalized block, when the record has no push nonce and
     the key is not idle at every endpoint, and when this leg's key is not the push's key. Not yet
     from `NEGOTIATED` (#850 PR 8).
-  - The record names the key that signs the token push (`push_signer`), written with the push
-    nonce before the push. The count read for `EXPIRED_EMPTY_CLOSED` is that key's. A resume with
-    another key is refused before anything is sent. A record written before this change is read
-    with this leg's key only when the deploy transaction proves this key created the contract (its
-    CREATE address at the deploy's nonce); otherwise no count is read and the contract stays
-    `EXPIRED_EMPTY_OPEN`.
+  - The record names the key that signs the token push (`push_signer`), written with a push nonce
+    this process chose, before the push. The count read for `EXPIRED_EMPTY_CLOSED` is that key's. A
+    resume of such a record with another key, or with a leg that does not say its key, is refused
+    before anything is sent. A record without `push_signer` (written before this change, and still
+    without one after a resume) is read with this leg's key only when the deploy transaction proves
+    this key created the contract (its CREATE address at the deploy's nonce); otherwise no count is
+    read and the contract stays `EXPIRED_EMPTY_OPEN`. That check does not prove this key signed the
+    push: a 0.26.x resume that pushed with another key leaves a record it can read wrongly.
   - `mutual_refund` reads an empty expired contract before sending anything and raises
     `NothingToRefund` naming the gated abandon, as the leg's refusal did before.
   - `SWAP_RECORD_SCHEMA_VERSION` is 6. A record carrying a push close, a push signer, an

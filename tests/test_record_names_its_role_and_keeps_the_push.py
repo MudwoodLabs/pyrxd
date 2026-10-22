@@ -430,6 +430,41 @@ async def test_a_resume_with_another_key_than_the_push_is_refused(tmp_path) -> N
     assert seen == {} and coord.record.state is SwapState.NEGOTIATED
 
 
+async def test_a_resumed_record_without_a_push_key_does_not_adopt_the_resuming_one(tmp_path) -> None:
+    """Re-review of #850 PR 7a: a record from before the key was kept (a 0.26.x pin) resumed with
+    whatever key this leg has. Stamping that key from the push-hash write would make it the key whose
+    count ends the record, unproven. Only a nonce this process chose names its key."""
+    order: list[str] = []
+    leg, _seen = _shipped_token_eth_leg(order)
+    old = dataclasses.replace(_pending_push(leg.signer_address()), push_signer=None)
+    persisted: list[SwapRecord] = []
+
+    async def _persist(record):
+        persisted.append(record)
+
+    coord, terms = _token_coordinator(leg, record=old, persist=_persist)
+
+    async def _fund(**kw):  # the resume reports its push hash at the pinned nonce, then stops
+        await kw["on_push_hash"](kw["push_nonce"], _PUSH_HASH)
+        raise RuntimeError("stop after the push hash")
+
+    leg._leg.fund = _fund
+    with pytest.raises(RuntimeError, match="stop after the push hash"):
+        await coord.taker_funds_btc(terms, now_unix_s=_FUND_TIMEOUT - 40_000)
+    assert any(r.pending_push_tx_hash == _PUSH_HASH for r in persisted), "the push hash write never ran"
+    assert {r.push_signer for r in persisted} == {None}
+
+
+async def test_a_resume_with_a_leg_that_does_not_say_its_key_is_refused(tmp_path) -> None:
+    order: list[str] = []
+    leg, seen = _shipped_token_eth_leg(order)
+    coord, terms = _token_coordinator(leg, record=_pending_push(leg.signer_address()))
+    leg.signer_address = None  # a leg written before signer_address
+    with pytest.raises(ValidationError, match="resume with the key that signed the push"):
+        await coord.taker_funds_btc(terms, now_unix_s=_FUND_TIMEOUT - 40_000)
+    assert seen == {}
+
+
 async def test_HONEST_a_resume_with_the_push_key_reaches_the_token_leg(tmp_path) -> None:
     order: list[str] = []
     leg, seen = _shipped_token_eth_leg(order)

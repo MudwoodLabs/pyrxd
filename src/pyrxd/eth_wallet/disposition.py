@@ -747,7 +747,9 @@ async def _expired_empty(
         # Design §2.7: with no push nonce recorded, a push may sit at any nonce of this key. Nothing
         # in flight anywhere we can see (pending == latest == count at F at every endpoint) is the
         # condition for closing count-at-F, and for reading our own close as the end. It does not
-        # see a privately submitted or evicted push (§2.7, D5): that residual is the design's.
+        # see a privately submitted or evicted push (§2.7, D5), nor a push queued above a gap in
+        # these endpoints' own pools (geth's pending count stops at the first gap), nor anything at
+        # an endpoint that answers "pending" with its latest count. Those residuals are the design's.
         try:
             pending = await _every(
                 panel, lambda s: s.get_transaction_count(funding_account, "pending"), "pending nonce"
