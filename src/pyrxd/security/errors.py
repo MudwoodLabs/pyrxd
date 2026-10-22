@@ -426,12 +426,16 @@ class CounterLegRefundNeedsOperator(ValidationError):
       reverted for a reason this does not recognise. ``taker_refund_btc(resend_reverted_refund=True)``
       sends one more refund. ``tx_hash`` is the refund that mined.
     * a transaction is pending at its nonce that is none of the refunds the record signed there (it
-      may be another transaction from the same key). It is never replaced, and the flag does not
-      change that. ``tx_hash`` is the newest refund recorded."""
+      may be another transaction from the same key), or a lower nonce of the key is missing so ours
+      waits behind it. Nothing is replaced, and the flag does not change that. ``tx_hash`` is the
+      newest refund recorded.
 
-    def __init__(self, message: str, *, tx_hash: str) -> None:
+    ``cause`` says which: ``"mined_failed"`` (the flag applies) or ``"other_tx"`` (it does not)."""
+
+    def __init__(self, message: str, *, tx_hash: str, cause: str = "mined_failed") -> None:
         super().__init__(message)
         self.tx_hash = tx_hash
+        self.cause = cause
 
 
 class CounterLegClaimedByCounterparty(ValidationError):

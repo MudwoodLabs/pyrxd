@@ -1114,6 +1114,7 @@ _OURS = "0x" + "e1" * 32
     [
         ({"latest": 7, "pending": 8, "tx": {"maxFeePerGas": 9, "maxPriorityFeePerGas": 1}}, "pending"),
         ({"latest": 7, "pending": 7}, "dropped"),
+        ({"latest": 6, "pending": 6}, "nonce_gap"),  # Mythos review of #894 (F2): a gap below ours
         ({"latest": 8, "pending": 8}, "nonce_taken"),
         ({"receipt": {"status": 1, "gasUsed": 51_000}}, "mined"),
         ({"receipt": {"status": 0, "gasUsed": 150_000}, "tx": {"gas": 150_000}}, "out_of_gas"),

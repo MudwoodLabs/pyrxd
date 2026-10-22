@@ -4414,7 +4414,12 @@ class SwapCoordinator:
         # a proof of refund (#850 PR 5b). Passed only when set, so a leg without them still reads.
         kwargs: dict[str, Any] = {}
         if self.record.counter_refund_tx_hash is not None:
-            kwargs["recorded_refund_hashes"] = (self.record.counter_refund_tx_hash,)
+            # Every refund we signed, not only the newest: an earlier one at the same nonce may be the
+            # one that mined, and with no log returned its hash is the only proof (Mythos, #894 F1).
+            kwargs["recorded_refund_hashes"] = (
+                self.record.counter_refund_tx_hash,
+                *self.record.counter_refund_replaced_tx_hashes,
+            )
         if self.record.counter_expiry_anchor is not None:
             from .swap_state import parse_expiry_anchor
 
@@ -4621,7 +4626,8 @@ class SwapCoordinator:
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)
     @_serialized_step
     async def taker_refund_btc(self, *, resend_reverted_refund: bool = False) -> SwapRecord:
-        """Refund the BTC via the timelock leg, ending in ABORTED.
+        """Refund the counter leg via its timelock leg; the record ends in ABORTED (on ETH, once the chain
+        shows the refund final, below).
 
         Valid from BTC_LOCKED (maker never locked, t_btc elapsed) or PARAMS_MISMATCH
         (maker locked the wrong covenant). The refund needs the FULL locator
@@ -4696,6 +4702,18 @@ class SwapCoordinator:
             if kind == "mined":
                 logger.info("our counter-leg refund %s is mined; waiting for the finalized block", subject)
                 return self.record
+            if kind == "nonce_gap":
+                # A transaction of this key BELOW our refund's nonce is missing, so ours cannot mine
+                # until it does. A re-send would take the gap nonce and the record would forget the
+                # refund queued at its own (Mythos review of #894, F2). Nothing is sent.
+                raise CounterLegRefundNeedsOperator(
+                    f"our counter-leg refund {recorded} is at nonce {nonce}, but this key's latest nonce is "
+                    "below that: an earlier transaction from the same ETH key is missing from the chain and "
+                    "the node, so our refund waits behind it. Nothing was sent. Send or replace the missing "
+                    "transaction from the wallet that owns it; the refund then mines on its own.",
+                    tx_hash=recorded,
+                    cause="other_tx",
+                )
             if kind == "pending":
                 since = self._refund_pending_since.setdefault(recorded, _monotonic())
                 waited = _monotonic() - since
@@ -4716,6 +4734,7 @@ class SwapCoordinator:
                         "once it mines, the next call sends a new refund. If it is stuck, deal with it from the "
                         "wallet that sent it.",
                         tx_hash=recorded,
+                        cause="other_tx",
                     )
                 replace = RefundReplacement(nonce=nonce, previous_fees=dict(progress.fee_fields))
                 logger.warning("our counter-leg refund %s is still pending; replacing it at nonce %d", recorded, nonce)

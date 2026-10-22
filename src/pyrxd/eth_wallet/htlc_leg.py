@@ -409,7 +409,9 @@ class RefundProgress:
     * ``"pending"``: not mined, and the broadcasting endpoint holds a transaction at its nonce;
       ``fee_fields`` are the fees of the first of our hashes the endpoint returns, ``None`` when it
       returns none of them (the pending transaction may then be one we did not sign).
-    * ``"dropped"``: not mined, and nothing is pending at its nonce.
+    * ``"dropped"``: not mined, the key's latest nonce equals it, and nothing is pending there.
+    * ``"nonce_gap"``: not mined, and the key's latest nonce is BELOW it: an earlier transaction from
+      this key is missing, so ours cannot mine yet.
     * ``"nonce_taken"``: not mined, and another transaction mined at its nonce.
     * ``"mined"``: mined with ``status == 1``. Says nothing about finality.
     * ``"out_of_gas"``: mined ``status == 0`` having used at least 63/64 of ``gas_limit``, the limit
@@ -1285,6 +1287,10 @@ class EthHtlcContractLeg:
             latest = int(await self._rpc.get_transaction_count(addr, "latest"))
             if latest > nonce:
                 return RefundProgress("nonce_taken")
+            if latest < nonce:
+                # A lower nonce of this key is unmined: ours (if the node holds it) is queued behind a
+                # gap and cannot mine, and "pending" may count only up to the gap (Mythos, #894 F2).
+                return RefundProgress("nonce_gap")
             pending = int(await self._rpc.get_transaction_count(addr, "pending"))
             if pending <= nonce:
                 return RefundProgress("dropped")

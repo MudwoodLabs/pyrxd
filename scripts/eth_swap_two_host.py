@@ -1124,6 +1124,24 @@ async def taker_phase_abort(args: argparse.Namespace) -> None:
         await rpc.close()
 
 
+def _next_after_refusal(exc) -> str:
+    """The NEXT line for a refusal the operator must act on, matched to what the flag can do
+    (Mythos review of #894, F4): it sends one more refund only after one of ours MINED and failed."""
+    from pyrxd.security.errors import CounterLegPayoutReverts
+
+    if isinstance(exc, CounterLegPayoutReverts):
+        return (
+            "the payout itself reverts; once it would not (the token or refundee accepts it), run --phase abort "
+            "again with --resend-reverted-refund to send one more refund."
+        )
+    if getattr(exc, "cause", None) == "other_tx":
+        return (
+            "another transaction from this ETH key is in the way; deal with it from the wallet that sent it, "
+            "then run --phase abort again (--resend-reverted-refund does not apply here)."
+        )
+    return "after checking our refund, run --phase abort again with --resend-reverted-refund to send one more refund."
+
+
 async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step):
     """Drive ``step`` (``taker_refund_btc``) until the record is terminal (#850 PR 5b, design §4.4).
 
@@ -1175,14 +1193,15 @@ async def _poll_taker_refund_to_terminal(args, coord, loc: EthHtlcLocator, step)
             continue
         except (CounterLegPayoutReverts, CounterLegRefundNeedsOperator) as exc:
             # Nothing was re-sent; the record is unchanged and durable. The operator decides.
+            raise SystemExit(f"the record stays btc_locked: {exc}\n  NEXT: {_next_after_refusal(exc)}") from None
+        except ValidationError as exc:
+            if coord.record.counter_refund_tx_hash is None:
+                raise
+            # While following our recorded refund (for example AlreadySettled because it mined between
+            # two reads, or a fee the sender cannot hold): the record is durable; say so, no traceback.
             raise SystemExit(
-                f"the record stays btc_locked: {exc}\n  NEXT: after checking, if our refund reverted, run "
-                "--phase abort again with --resend-reverted-refund to send one more refund"
-                + (
-                    " (it is refused while the payout itself reverts)."
-                    if isinstance(exc, CounterLegPayoutReverts)
-                    else "."
-                )
+                f"the record stays btc_locked: {type(exc).__name__}: {exc}\n  NEXT: act on the message above if "
+                "it names something to do, then run --phase abort again; it follows the recorded refund."
             ) from None
         if rec.state in (SwapState.ABORTED, SwapState.SECRET_REVEALED):
             return rec
@@ -1336,6 +1355,15 @@ async def taker_phase_refund(args: argparse.Namespace) -> None:
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
     _refuse_by_persisted_state(args, terms, phase="refund")  # before any chain read
+    persisted = _record_sink(args.local_out).load_record()
+    if persisted is not None and persisted.counter_refund_tx_hash is not None:
+        # #850 PR 5b (Mythos review of #894, N1): --phase abort already sent and recorded our ETH
+        # refund. mutual_refund sends its counter refund without that record (PR 6), so this phase
+        # would put a SECOND refund beside the pending one. Follow the recorded one instead.
+        raise SystemExit(
+            f"REFUSING --phase refund: our ETH refund {persisted.counter_refund_tx_hash} is already recorded "
+            "(sent by --phase abort) and is followed there. Nothing was sent. NEXT: run --phase abort again."
+        )
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
     maker_pkh = bytes.fromhex(env["maker_pkh_hex"])

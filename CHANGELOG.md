@@ -121,13 +121,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     now awaited with `(tx_hash, nonce)`, not just the hash. The new `replace=RefundReplacement(...)`
     signs at a given nonce with raised fees. New read-only methods: `refund_progress(tx_hash,
     nonce, earlier=())`, which returns a `RefundProgress` (`pending`, `dropped`, `nonce_taken`, `mined`,
-    `out_of_gas` or `reverted`), `refund_estimate` and `refund_revert_reason`.
+    `out_of_gas`, `reverted` or `nonce_gap`), `refund_estimate` and `refund_revert_reason`.
+    `nonce_gap` means the key's latest nonce is below the refund's: an earlier transaction of the
+    key is missing, so nothing is re-sent and `CounterLegRefundNeedsOperator` is raised with
+    `cause="other_tx"`. Every refund recorded at the nonce, not only the newest, is nominated to the
+    disposition reader, so an earlier one that mined proves the refund by its hash.
   - `scripts/eth_swap_two_host.py --role taker --phase abort` now polls until the record is
     terminal. The new `--abort-poll-timeout-s` sets how long (7200 s by default; 0 means one
     pass). A run that times out leaves the record as it is, and running the phase again follows
     the recorded refund. The pre-check that refuses a settled or claimed HTLC runs only before our
     refund is recorded, because after that a contract settled at the tip is most likely our own
-    refund.
+    refund. `--phase refund` refuses while a refund recorded by `--phase abort` is being followed,
+    because `mutual_refund` would send a second one beside it.
   - `SWAP_RECORD_SCHEMA_VERSION` is 5. A record carrying any of the new fields writes 5. Do not
     drive one record with mixed pyrxd versions. A pyrxd from before this change refuses a v5
     record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x

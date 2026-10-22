@@ -2990,3 +2990,69 @@ async def test_a_single_source_answer_stops_the_abort_with_its_cause(eth_mod, tm
     with pytest.raises(SystemExit, match="REFUNDED at the finalized block, but from ONE endpoint"):
         await eth_mod.taker_phase_abort(args)
     assert leg.reads == 2 and len(leg.refund_calls) == 1
+
+
+# --------------------------------------------------------------------------- Mythos review of #894
+
+
+class _OtherTxLeg(_DispositionCounterLeg):
+    """Our refund is recorded; what holds its nonce is none of ours."""
+
+    async def refund(self, *a, **k):
+        out = await super().refund(*a, **k)
+        self.settled = False  # ours waits behind the gap: nothing settled the contract
+        return out
+
+    async def refund_progress(self, tx_hash, nonce, **_k):
+        from pyrxd.eth_wallet.htlc_leg import RefundProgress
+
+        return RefundProgress("nonce_gap")
+
+
+async def test_a_refusal_the_flag_cannot_fix_does_not_point_at_the_flag(eth_mod, tmp_path, monkeypatch):
+    """F4: every operator refusal said "run again with --resend-reverted-refund", which does nothing
+    when another transaction of the key is in the way."""
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    leg = _OtherTxLeg()
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit) as info:
+        await eth_mod.taker_phase_abort(args)
+    assert "does not apply here" in str(info.value) and len(leg.refund_calls) == 1
+
+
+async def test_a_validation_error_while_following_exits_with_the_record_kept(eth_mod, tmp_path, monkeypatch):
+    """F4: AlreadySettled (our refund mined between two reads), say, escaped as a traceback."""
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    args.abort_poll_timeout_s = 60.0
+    leg = _RevertedRefundLeg()
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+
+    async def settled_meanwhile(_locator):
+        raise ValidationError("tx would revert (eth_estimateGas): AlreadySettled")
+
+    leg.refund_revert_reason = settled_meanwhile
+    with pytest.raises(SystemExit, match="the record stays btc_locked: ValidationError"):
+        await eth_mod.taker_phase_abort(args)
+    assert _read_back(args).counter_refund_tx_hash is not None
+
+
+async def test_phase_refund_refuses_beside_a_refund_abort_recorded(eth_mod, tmp_path, monkeypatch):
+    """N1: --phase refund sent a SECOND counter refund (mutual_refund has no pending record yet)."""
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    leg = _DispositionCounterLeg()
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="is sent but not yet REFUNDED"):
+        await eth_mod.taker_phase_abort(args)
+    calls = len(leg.refund_calls)
+    _wire_eth(eth_mod, monkeypatch, counter_leg=leg)
+    with pytest.raises(SystemExit, match="REFUSING --phase refund: our ETH refund"):
+        await eth_mod.taker_phase_refund(args)
+    assert len(leg.refund_calls) == calls
+
+
+async def test_HONEST_phase_refund_still_runs_with_no_recorded_refund(eth_mod, tmp_path, monkeypatch):
+    args, _terms, _io = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=True)
+    built = _wire_eth(eth_mod, monkeypatch)
+    await eth_mod.taker_phase_refund(args)
+    assert len(built["counter"].refund_calls) == 1

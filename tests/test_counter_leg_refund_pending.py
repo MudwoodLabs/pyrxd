@@ -110,8 +110,9 @@ async def test_a_pending_transaction_that_is_none_of_our_refunds_is_never_replac
     leg.refund_progress = foreign
     await coord.taker_refund_btc()  # starts the clock: waits
     clock[0] += REFUND_REPLACE_AFTER_S
-    with pytest.raises(CounterLegRefundNeedsOperator, match="none of the refunds this record signed"):
+    with pytest.raises(CounterLegRefundNeedsOperator, match="none of the refunds this record signed") as info:
         await coord.taker_refund_btc()
+    assert info.value.cause == "other_tx"  # the runner then does not point at the resend flag
     with pytest.raises(CounterLegRefundNeedsOperator):
         await coord.taker_refund_btc(resend_reverted_refund=True)
     assert leg.refunds == 1
@@ -387,3 +388,62 @@ async def test_an_error_about_an_earlier_refund_names_that_refund():
     with pytest.raises(CounterLegRefundNeedsOperator) as info:
         await coord.taker_refund_btc()
     assert info.value.tx_hash == earlier and earlier in str(info.value)
+
+
+# --------------------------------------------------------------------------- Mythos review of #894
+
+
+async def test_an_earlier_refund_that_mined_is_proven_by_its_hash_when_no_log_is_returned():
+    """Mythos review of #894 (F1, MEDIUM): the reader was given only the NEWEST recorded hash, so a
+    refund that mined under an EARLIER hash at the same nonce, with no log returned and no anchor,
+    read UNKNOWN for ever while the follow path read it "mined" and waited: the record wedged."""
+    coord, chain, leg = _setup(endpoints=_logless, chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+    first = leg.signed[0][0]
+    leg.dropped.add(first)
+    leg.next_nonce = leg.signed[0][1]
+    await coord.taker_refund_btc()  # re-sent at the same nonce; `first` is kept as earlier
+    assert coord.record.counter_refund_replaced_tx_hashes == (first,)
+    leg.dropped.discard(first)
+    coord.record = dataclasses.replace(coord.record, counter_expiry_anchor=None)  # the hashes alone
+    chain.refund(85, label=refund_label(1))  # the EARLIER one mined
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.ABORTED and rec.counter_disposition.tx_hash == first
+
+
+async def test_a_mined_refund_on_an_unknown_answer_is_followed_not_resent():
+    """Mythos review of #894 (F3): the "mined" branch had no test that reaches it (the earlier one is
+    stopped by SETTLED_UNFINAL first). On an UNKNOWN answer it is what stops a re-send."""
+    from pyrxd.eth_wallet.htlc_leg import RefundProgress
+
+    def throttled(chain):
+        return [FakeEvmEndpoint(chain, logs_429=True) for _ in range(3)]
+
+    coord, _chain, leg = _setup(endpoints=throttled, chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+
+    async def mined(_h, _n, **_k):
+        return RefundProgress("mined", tx_hash=_h)
+
+    leg.refund_progress = mined
+    for _ in range(3):
+        rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.BTC_LOCKED and leg.refunds == 1
+
+
+async def test_a_nonce_gap_below_our_refund_asks_the_operator_and_sends_nothing():
+    """Mythos review of #894 (F2): `latest < nonce` read as "dropped", so a re-send was signed at the
+    GAP nonce and the record forgot the refund still queued at its own."""
+    from pyrxd.eth_wallet.htlc_leg import RefundProgress
+
+    coord, _chain, leg = _setup(chain_kw={"finalized": 90})
+    await coord.taker_refund_btc()
+
+    async def gap(_h, _n, **_k):
+        return RefundProgress("nonce_gap")
+
+    leg.refund_progress = gap
+    with pytest.raises(CounterLegRefundNeedsOperator, match="below") as info:
+        await coord.taker_refund_btc(resend_reverted_refund=True)
+    assert info.value.cause == "other_tx"
+    assert leg.refunds == 1
