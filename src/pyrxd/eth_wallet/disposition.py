@@ -848,9 +848,12 @@ class UnfundedTokenBalance:
     :func:`read_unfunded_token_balance` read it (#850 PR 8, design §3.5).
 
     ``empty`` is ``True`` only when every endpoint answered 0 at ``finalized_block`` and every
-    endpoint answered 0 at the tip. ``single_source`` says the rpc had one endpoint."""
+    endpoint answered 0 at the tip. ``settled`` is ``True`` when any endpoint reads the contract's
+    ``settled`` slot set at either block: tokens went in and were paid out, so a push that was never
+    recorded landed. ``single_source`` says the rpc had one endpoint."""
 
     empty: bool
+    settled: bool
     finalized_block: int
     sources: tuple[str, ...]
     single_source: bool
@@ -858,7 +861,8 @@ class UnfundedTokenBalance:
 
 async def read_unfunded_token_balance(rpc: Any, *, token: str, contract: str) -> UnfundedTokenBalance:
     """Whether *contract* holds none of *token*: 0 at the quorum-minimum finalized block at every
-    endpoint, all agreeing, and 0 at the tip at every endpoint (#850 PR 8, design §3.5).
+    endpoint, all agreeing, and 0 at the tip at every endpoint (#850 PR 8, design §3.5); and whether
+    it is settled at either block at any endpoint.
 
     A balance is a negative reading ("nothing is there"), so every endpoint must answer, as for
     ``EXPIRED_EMPTY_*``: the one that does not may be the one that would have said otherwise. A read
@@ -876,10 +880,20 @@ async def read_unfunded_token_balance(rpc: Any, *, token: str, contract: str) ->
         at_tip = await _every(
             panel, lambda s: s.erc20_balance_of(token_addr, contract_addr, "latest"), "balance at tip"
         )
+        # A balance of 0 is also what a push that landed and was then claimed or refunded leaves, so
+        # the settled slot is read too. Any endpoint seeing it set is enough to refuse.
+        settled = [
+            word
+            for at in (finalized, "latest")
+            for word in await _every(
+                panel, lambda s, at=at: s.get_storage_at(contract_addr, SETTLED_SLOT, at), f"settled at {at}"
+            )
+        ]
     except _BelowQuorum as exc:
         raise NetworkError(f"the token balance of {contract_addr} is unknown: {exc}") from None
     return UnfundedTokenBalance(
         empty=int(at_f[0]) == 0 and all(int(b) == 0 for b in at_tip),
+        settled=any(any(bytes(word)) for word in settled),
         finalized_block=int(finalized),
         sources=tuple(sorted(_key(src) for src in panel.sources)),
         single_source=len(panel.sources) == 1,

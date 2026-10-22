@@ -843,9 +843,9 @@ has passed at the finalized block.
 `TAKER_NEVER_FUNDS` (#850, PR 8) is driven by the taker's `abandon_unfunded`, from `NEGOTIATED` only.
 It broadcasts nothing, and it refuses while the record holds anything that may hold value: a BTC
 funding transaction (written before its broadcast), a native ETH contract, or a token contract that a
-push was signed for or whose token balance is not 0 at the finalized block and at the tip at every
-endpoint. `abort_reason` is `taker_never_funds`. The hashlock stays reserved. A maker's record has no
-such exit yet.
+push was signed for, whose token balance is not 0 at the finalized block and at the tip at every
+endpoint, or that any endpoint reads as settled at either block. `abort_reason` is
+`taker_never_funds`. The hashlock stays reserved. A maker's record has no such exit yet.
 
 `BOTH_TIMEOUTS_ELAPSE` on an ETH counter leg (#850, PR 6) is also taken on the chain, not on a
 broadcast: `mutual_refund` sends or follows the taker's ETH refund, and the record stays

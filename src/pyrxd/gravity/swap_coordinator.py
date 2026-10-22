@@ -4857,9 +4857,8 @@ class SwapCoordinator:
         )
         return self.record
 
-    # -- the gated explicit abandon (#850 PR 7b, design §3.6) -------------------------------------
+    # -- the taker's NEGOTIATED exit (#850 PR 8, design §3.5) --------------------------------------
 
-    #: The longest operator note ``abandon_counter_leg`` keeps, in characters. CHOSEN.
     @_serialized_step
     async def abandon_unfunded(self) -> SwapRecord:
         """End a NEGOTIATED record that holds nothing that may hold value (``TAKER_NEVER_FUNDS``;
@@ -4871,14 +4870,23 @@ class SwapCoordinator:
           so it may have been sent;
         * a native ETH contract (``pending_counter_contract`` with no token): its deploy carries the
           value, and its address is written before that broadcast;
-        * a token contract that a push was signed for (``pending_push_nonce``), or that holds tokens, or whose balance cannot be read: the token
-          balance must read 0 at the finalized block and at the tip at every endpoint, and on a chain
-          that carries value from more than one endpoint.
+        * a token contract that a push was signed for (``pending_push_nonce``), that holds tokens,
+          that is settled, or whose balance cannot be read: the token balance must read 0 and the
+          contract unsettled at the finalized block and at the tip at every endpoint, and on a chain
+          that carries value from more than one endpoint;
+        * a different record of this swap on disk (the persist hook's ``load_record``) that this
+          coordinator was not built from.
 
         Nothing is broadcast. ``abort_reason`` is ``TAKER_NEVER_FUNDS``. The hashlock stays reserved
         in the seen-store, so this ``H`` is never funded again. A token contract that was deployed
         stays on the record (``pending_counter_contract``).
+
+        Not covered: a BTC record written by pyrxd 0.26.x or earlier, which recorded no funding
+        transaction before its broadcast (#841). Such a record reads as never funded even if a fund
+        was broadcast and its readback failed; this step does not scan the HTLC address.
         """
+        # First: a coordinator built on a fresh record must not overwrite the one on disk.
+        self._refuse_to_overwrite_a_recorded_counter_leg(self.record.terms)
         state = self.record.state
         if state is not SwapState.NEGOTIATED:
             raise ValidationError(f"abandon_unfunded not valid from {state.value}")
@@ -4912,17 +4920,31 @@ class SwapCoordinator:
                     f"the token balance of {contract} was read from one endpoint, on a chain that carries value: "
                     "read it from more than one. Nothing was recorded."
                 )
+            if balance.settled:
+                raise ValidationError(
+                    f"the contract {contract} is settled, so tokens were pushed into it and paid out: if it was "
+                    "claimed, the preimage is public. Read its Claimed or Refunded log. Nothing was recorded."
+                )
             if not balance.empty:
                 raise ValidationError(
                     f"the contract {contract} holds tokens: resume the fund (taker_funds_btc), then refund it after "
                     "its timeout. Nothing was recorded."
                 )
+        before = self.record
         self.record = dataclasses.replace(self.record, abort_reason=AbortReason.TAKER_NEVER_FUNDS)
         self._advance(SwapEvent.TAKER_NEVER_FUNDS)
-        await self._persist_record(self.record, shield=True)
+        # As in abandon_counter_leg: a cancellation is not rolled back (the shielded persist finishes).
+        try:
+            await self._persist_record(self.record, shield=True)
+        except Exception:
+            self.record = before  # not durable, so not taken
+            raise
         logger.warning("swap abandoned unfunded from negotiated; the hashlock stays reserved")
         return self.record
 
+    # -- the gated explicit abandon (#850 PR 7b, design §3.6) -------------------------------------
+
+    #: The longest operator note ``abandon_counter_leg`` keeps, in characters. CHOSEN.
     ABANDON_NOTE_MAX_CHARS = 2000
 
     @_serialized_step

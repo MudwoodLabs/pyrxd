@@ -9,6 +9,7 @@ EVM chain, through the production ``MultiSourceEthRpc``.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import os
@@ -17,6 +18,7 @@ import pytest
 
 from pyrxd.eth_wallet.disposition import read_unfunded_token_balance
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
+from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import SwapCoordinator
 from pyrxd.gravity.swap_state import SWAP_RECORD_SCHEMA_VERSION, AbortReason, SwapRecord, SwapRole, SwapState
 from pyrxd.security.errors import NetworkError, ValidationError
@@ -50,7 +52,7 @@ class _Leg:
 
 
 def _chain(**kw) -> FakeEvmChain:
-    return FakeEvmChain(preimage=os.urandom(32), timeout=0, finalized=FINALIZED, **kw)
+    return FakeEvmChain(preimage=os.urandom(32), **{"timeout": 0, "finalized": FINALIZED, **kw})
 
 
 def _setup(*, token=True, contract=True, role=SwapRole.TAKER, endpoints=None, chain_kw=None, chain_id=CHAIN_ID, **rec):
@@ -206,6 +208,110 @@ async def test_one_endpoint_on_a_chain_that_carries_value_is_refused(chain_id):
     _unchanged(coord, before)
 
 
+async def test_a_contract_that_is_settled_is_refused():
+    """Review of #850 PR 8: a push that was never recorded landed and was claimed, so the balance is
+    0 at F and at the tip. The settled slot shows it, and a claim makes the preimage public."""
+    coord, chain, _leg = _setup(chain_kw={"timeout": 10**12})
+    chain.claim(50)
+    before = coord.record
+    with pytest.raises(ValidationError, match="is settled"):
+        await coord.abandon_unfunded()
+    _unchanged(coord, before)
+
+
+async def test_a_contract_settled_only_at_the_tip_is_refused():
+    coord, chain, _leg = _setup(chain_kw={"timeout": 10**12})
+    chain.claim(FINALIZED + 5)
+    with pytest.raises(ValidationError, match="is settled"):
+        await coord.abandon_unfunded()
+
+
+@pytest.mark.parametrize(
+    "odd", [{"claim_settled_at_tip": True}, {"lie_settled_at_blocks": True}], ids=["at_tip", "at_F"]
+)
+async def test_one_endpoint_that_sees_the_contract_settled_is_enough_to_refuse(odd):
+    coord, _c, _leg = _setup(endpoints=lambda c: [FakeEvmEndpoint(c), FakeEvmEndpoint(c), FakeEvmEndpoint(c, **odd)])
+    with pytest.raises(ValidationError, match="is settled"):
+        await coord.abandon_unfunded()
+
+
+@pytest.mark.parametrize("held", ["btc_funding_tx", "native_contract", "btc_locked"])
+async def test_a_fresh_coordinator_never_overwrites_the_record_on_disk(tmp_path, held):
+    """Review of #850 PR 8, HIGH: a coordinator built on a fresh NEGOTIATED record, not the one on
+    disk, would have written ABORTED over the only record of a fund. It refuses first, and the file
+    is left as it was."""
+    from tests.test_btc_runners_record_the_fund import _signed_funding_tx_hex
+
+    coord, _c, leg = _setup(contract=False)
+    if held == "btc_funding_tx":
+        terms = _terms()
+        prior = SwapRecord(
+            state=SwapState.NEGOTIATED, terms=terms, pending_btc_funding_tx=_signed_funding_tx_hex(terms)
+        )
+    elif held == "native_contract":
+        terms = dataclasses.replace(coord.record.terms, token_address="")
+        prior = SwapRecord(
+            state=SwapState.NEGOTIATED,
+            terms=terms,
+            pending_counter_contract=CONTRACT,
+            pending_counter_deploy_tx=DEPLOY_TX,
+        )
+    else:
+        terms = _terms()
+        prior = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(prior)
+    before_bytes = sink.path.read_bytes()
+    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    coord._persist = sink
+    with pytest.raises(ValidationError, match="already holds this swap's counter leg"):
+        await coord.abandon_unfunded()
+    assert sink.path.read_bytes() == before_bytes and leg.reads == []
+
+
+async def test_HONEST_the_record_on_disk_it_was_built_from_is_abandoned(tmp_path):
+    coord, _c, _leg = _setup()
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+    coord._persist = sink
+    rec = await coord.abandon_unfunded()
+    assert sink.load_record() == rec and rec.state is SwapState.ABORTED
+
+
+async def test_a_failed_persist_leaves_the_record_as_it_was():
+    coord, _c, _leg = _setup()
+    before = coord.record
+
+    async def broken(_record):
+        raise OSError("disk full")
+
+    coord._persist = broken
+    with pytest.raises(OSError, match="disk full"):
+        await coord.abandon_unfunded()
+    assert coord.record == before
+
+
+async def test_a_cancelled_abandon_keeps_what_the_disk_holds():
+    coord, _c, _leg = _setup(contract=False)
+    gate, started = asyncio.Event(), asyncio.Event()
+
+    async def slow(record):
+        started.set()
+        await gate.wait()
+        coord.persisted.append(record)
+
+    coord._persist = slow
+    task = asyncio.ensure_future(coord.abandon_unfunded())
+    await started.wait()
+    task.cancel()
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert [r.state for r in coord.persisted] == [SwapState.ABORTED] and coord.record == coord.persisted[0]
+
+
 async def test_a_maker_is_refused():
     coord, _c, _leg = _setup(contract=False, role=SwapRole.MAKER)
     before = coord.record
@@ -241,8 +347,17 @@ async def test_the_reader_names_the_finalized_block_and_its_endpoints():
     read = await read_unfunded_token_balance(
         MultiSourceEthRpc(eps), token=TOKEN.upper().replace("0X", "0x"), contract=CONTRACT
     )
-    assert read.empty and read.finalized_block == FINALIZED and not read.single_source
+    assert read.empty and not read.settled and read.finalized_block == FINALIZED and not read.single_source
     assert len(read.sources) == 2
+
+
+async def test_the_finalized_block_is_the_lowest_any_endpoint_reports():
+    """``F`` is the minimum: an endpoint that lags has not reached a higher one, and every endpoint
+    must read the balance at ``F``."""
+    chain = _chain()
+    eps = [FakeEvmEndpoint(chain), FakeEvmEndpoint(chain), FakeEvmEndpoint(chain, lag=20)]
+    read = await read_unfunded_token_balance(MultiSourceEthRpc(eps), token=TOKEN, contract=CONTRACT)
+    assert read.empty and not read.settled and read.finalized_block == chain.head - 20 < FINALIZED
 
 
 async def test_the_shipped_eth_leg_reads_through_its_own_rpc():
