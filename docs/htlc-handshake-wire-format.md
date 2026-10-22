@@ -845,7 +845,8 @@ It broadcasts nothing, and it refuses while the record holds anything that may h
 funding transaction (written before its broadcast), a native ETH contract, or a token contract that a
 push was signed for, whose token balance is not 0 at the finalized block and at the tip at every
 endpoint, or that any endpoint reads as settled at either block. It also refuses when the record of
-this swap on disk holds more than the coordinator's record does. `abort_reason` is
+this swap on disk is past `NEGOTIATED`, or holds a counter-leg locator, pending contract, BTC funding
+transaction, push nonce or push hash that differs from the coordinator's record. `abort_reason` is
 `taker_never_funds`. The hashlock stays reserved. A maker's record has no such exit yet. A BTC record
 written by 0.26.x or earlier recorded no funding transaction before its broadcast (#841), so it reads
 as never funded even if a fund was broadcast: this step does not scan the HTLC address.
