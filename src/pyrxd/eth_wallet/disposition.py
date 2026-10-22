@@ -152,6 +152,10 @@ class CounterDisposition:
     #: ``(F, "0x" + hash(F))`` on an :attr:`DispositionKind.F_EXPIRED` answer: the expiry anchor to
     #: persist (§2.3 (a)). ``None`` on every other answer.
     expiry_anchor: tuple[int, str] | None = None
+    #: ``True`` on an :attr:`DispositionKind.UNKNOWN` answer that read the contract SETTLED at the
+    #: finalized block (it settled, and the evidence cannot say how); ``False`` on every other answer,
+    #: including an UNKNOWN from a failed or below-quorum read.
+    settled_at_finalized: bool = False
 
 
 # --------------------------------------------------------------------------- fan-out helpers
@@ -523,7 +527,12 @@ async def read_counter_disposition(
 
     if settled_f:
         if verified_refund and verified_claim:
-            return unknown("both a refund and a claim verify for one contract (rule 2)", finalized, **common)
+            return unknown(
+                "both a refund and a claim verify for one contract (rule 2)",
+                finalized,
+                settled_at_finalized=True,
+                **common,
+            )
         if expiry_anchor is not None and await _anchor_holds(panel, expiry_anchor, finalized):
             # §2.3 (a). Unsettled at a canonical block already at or past the timeout: claim() has
             # reverted ever since, so whatever settled the contract later was a refund. The anchor
@@ -531,10 +540,18 @@ async def read_counter_disposition(
             # An anchor that no longer holds is simply not used (design §7.2 scenario 10).
             if verified_claim:
                 return unknown(
-                    "a verified claim beside an expiry anchor (a claim after the timeout)", finalized, **common
+                    "a verified claim beside an expiry anchor (a claim after the timeout)",
+                    finalized,
+                    settled_at_finalized=True,
+                    **common,
                 )
             if f_ts < timeout:
-                return unknown("an expiry anchor beside a finalized block before the timeout", finalized, **common)
+                return unknown(
+                    "an expiry anchor beside a finalized block before the timeout",
+                    finalized,
+                    settled_at_finalized=True,
+                    **common,
+                )
             return done(
                 DispositionKind.REFUNDED,
                 "settled at the finalized block after the expiry anchor, so by a refund",
@@ -551,7 +568,12 @@ async def read_counter_disposition(
             # Gap B: settled by a block at or before F, every one of them before the timeout. The
             # contract refuses refund() before the timeout, so only a claim can have settled it.
             if verified_refund:
-                return unknown("a verified refund beside a settlement before the timeout (rule 3)", finalized, **common)
+                return unknown(
+                    "a verified refund beside a settlement before the timeout (rule 3)",
+                    finalized,
+                    settled_at_finalized=True,
+                    **common,
+                )
             return done(
                 DispositionKind.CLAIMED,
                 "settled at the finalized block, whose timestamp is before the timeout",
@@ -563,7 +585,10 @@ async def read_counter_disposition(
         if verified_refund:
             return done(DispositionKind.REFUNDED, "a refund verifies", verified_refund, terminal=True)
         return unknown(
-            "settled at the finalized block with neither a verified refund nor a verified claim", finalized, **common
+            "settled at the finalized block with neither a verified refund nor a verified claim",
+            finalized,
+            settled_at_finalized=True,
+            **common,
         )
 
     # Not settled at F. A receipt that verifies at a block <= F contradicts that (rule 5).

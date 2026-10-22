@@ -939,7 +939,7 @@ class TestTakerEthRefundSaysWhatHappenedWhenItFails:
         assert len(leg.refund_calls) == 1, "the refund was attempted, and refused by the leg"
         assert raised.value.code not in (None, 0), "the phase exited 0: the operator would stop here"
         msg = str(raised.value.code)
-        assert "NOT a refund" in msg and _SETTLED_NOTHING_VERIFIES in msg, msg
+        assert "Do not read this as refunded" in msg and _SETTLED_NOTHING_VERIFIES in msg, msg
         assert "maker_claim.json" in msg and "--phase claim" in msg and "t_rxd" in msg, msg
         assert "0x" + "33" * 20 in msg  # the contract to check
         assert "done" not in capsys.readouterr().out.lower()

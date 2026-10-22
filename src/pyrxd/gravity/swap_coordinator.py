@@ -4705,8 +4705,9 @@ class SwapCoordinator:
         reads unsettled at the tip. Never advances the record. See :meth:`taker_refund_btc`. *step*
         is the coordinator step the operator calls again, named in the messages.
 
-        *settled_is_unexplained*: the chain read just now could not say how the contract settled
-        (``UNKNOWN``). Our refund reverting ``AlreadySettled`` then means something else settled it,
+        *settled_is_unexplained*: the chain read just now found the contract settled at the
+        finalized block and could not say how (``UNKNOWN`` with ``settled_at_finalized``; an UNKNOWN
+        from a failed read is not this, and keeps waiting). Our refund reverting ``AlreadySettled`` then means something else settled it,
         possibly a claim whose log is withheld, so it is raised (as a ``ValidationError``, which
         :meth:`_counter_refund_on_the_read` reports as ``CounterLegDispositionUnknown``) instead of
         waited on: no later read would end the wait (Mythos review of #850 PR 6, F1)."""
@@ -4791,8 +4792,9 @@ class SwapCoordinator:
                 if reason == "AlreadySettled":
                     if settled_is_unexplained:
                         raise ValidationError(
-                            f"our counter-leg refund {subject} was mined and reverted AlreadySettled: something "
-                            "else settled the contract first, and the chain read cannot say what"
+                            f"our counter-leg refund {subject} was mined and reverted, and a refund now would "
+                            "revert AlreadySettled: something else settled the contract, and the chain read "
+                            "cannot say what"
                         )
                     logger.info("the counter-leg contract settled after it was read; waiting for the chain")
                     return self.record
@@ -4862,7 +4864,8 @@ class SwapCoordinator:
             return await self._send_or_follow_counter_refund(
                 resend_reverted_refund=resend_reverted_refund,
                 step=step,
-                settled_is_unexplained=disposition.kind is DispositionKind.UNKNOWN,
+                settled_is_unexplained=disposition.kind is DispositionKind.UNKNOWN
+                and bool(getattr(disposition, "settled_at_finalized", False)),
             )
         except (*_NEEDS_OPERATOR_ACTION, CounterLegPayoutReverts, CounterLegRefundNeedsOperator, NetworkError):
             raise
@@ -4872,8 +4875,8 @@ class SwapCoordinator:
             t_rxd = self.record.terms.t_rxd
             seen = self.record.counter_claim_tx
             raise CounterLegDispositionUnknown(
-                f"the counter leg's disposition is UNKNOWN ({disposition.reason}), and the refund was not sent: "
-                f"{exc}. The record's state did not change. This is NOT a refund: a contract settled with neither a "
+                f"the counter leg's disposition is UNKNOWN ({disposition.reason}), and no refund was sent this "
+                f"time: {exc}. The record's state did not change. Do not read this as refunded: a contract settled with neither a "
                 "refund nor a claim that verifies is also what a real claim looks like when its log is withheld "
                 "or pruned. Check the contract's events on other endpoints. If it was CLAIMED, p is public: claim "
                 f"the covenant with it before its CSV refund to the maker opens, t_rxd = {t_rxd.value} "

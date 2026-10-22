@@ -159,7 +159,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - When the refund fails and the chain could not say what happened to the contract (`UNKNOWN`),
     `mutual_refund` and `taker_refund_btc` raise the new `CounterLegDispositionUnknown` (a
     `NetworkError`, with `.reason`), which says the refund was not sent and is not a refund. This
-    replaces #851's single-endpoint explanation. `CounterLegClaimedByCounterparty` and
+    replaces #851's single-endpoint explanation. The same error is raised when our recorded refund
+    mined and reverted because the contract was already settled, and the chain reads it settled at
+    the finalized block without saying how; before, that refund was followed with no end. A new
+    `CounterDisposition.settled_at_finalized` marks that kind of `UNKNOWN`, so one failed read is
+    not mistaken for it. `CounterLegClaimedByCounterparty` and
     `CounterLegSettledUnverified` are no longer raised; they still import.
   - `scripts/eth_swap_two_host.py --role taker --phase refund` polls until the record is
     `mutual_refund`, as `--phase abort` does, with the same `--abort-poll-timeout-s` and

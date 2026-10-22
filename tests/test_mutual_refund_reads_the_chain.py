@@ -123,7 +123,7 @@ async def test_a_hidden_claim_is_never_read_as_refunded(served):
     with pytest.raises(CounterLegDispositionUnknown) as raised:
         await coord.mutual_refund()
     msg = str(raised.value)
-    assert "NOT a refund" in msg and "t_rxd" in msg, msg
+    assert "Do not read this as refunded" in msg and "t_rxd" in msg, msg
     assert isinstance(raised.value.__cause__, ValidationError)  # the leg's own refusal, chained
     assert leg.preflight_refusals == 1 and leg.refunds == 0 and asset == []
     assert coord.record.state is SwapState.BOTH_LOCKED and coord.record.counter_disposition is None
@@ -344,3 +344,18 @@ async def test_a_failed_covenant_refund_after_the_counter_leg_refunded_says_only
     msg = str(raised.value)
     assert "not sent again" in msg and "re-attempts the covenant refund" in msg
     assert "re-attempts both" not in msg and leg.refunds == 0
+
+
+async def test_HONEST_a_failed_read_with_our_refund_beaten_keeps_waiting():
+    """Re-review of the F1 fix: an UNKNOWN that comes from a failed read (here no endpoint answers
+    the log scan) is not "settled, and the chain cannot say how". One such read during the race must
+    not stop the follow with the claim alarm; the next pass reads again."""
+    coord, chain, leg = _setup(
+        state=SwapState.BOTH_LOCKED,
+        endpoints=lambda c: [FakeEvmEndpoint(c, logs_429=True) for _ in range(3)],
+        chain_kw={"finalized": 90},
+    )
+    chain.claim(70)
+    _with_a_reverted_refund(coord, leg)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.BOTH_LOCKED and leg.refunds == 0
