@@ -5121,11 +5121,14 @@ class SwapCoordinator:
             },
             "note": note,
         }
+        # Again, now the read is done: another process may have moved the record on disk meanwhile.
+        self._refuse_to_abandon_over_a_newer_record_on_disk(state)
         digest = write_note(json.dumps(sidecar, indent=2, sort_keys=True).encode())
         before = self.record
         # A Claimed log the read saw goes on the record as well as into the note, so whatever reads the
         # record later still sees that p may be public (Mythos review of #850 PR 7b, F3).
-        claim_tx = self.record.counter_claim_tx or next((c.tx_hash for c in disposition.claims_seen), None)
+        claims = sorted(disposition.claims_seen, key=lambda c: not c.verified)  # a verified claim first
+        claim_tx = self.record.counter_claim_tx or next((c.tx_hash for c in claims), None)
         self.record = dataclasses.replace(
             self.record,
             state=advance(state, SwapEvent.OPERATOR_ABANDONED),
