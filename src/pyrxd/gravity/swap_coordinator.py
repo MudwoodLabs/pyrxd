@@ -55,6 +55,7 @@ from pyrxd.btc_wallet.taproot import (
     TimeUnit,
     btc_input_outpoints_from_raw,
     btc_spend_fields_from_raw,
+    btc_txid_from_raw,
 )
 from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy
@@ -1900,6 +1901,9 @@ class SwapCoordinator:
         # When this instance first saw each recorded counter-leg refund pending (#850 PR 5b): the
         # clock REFUND_REPLACE_AFTER_S is measured on. In memory on purpose; see that constant.
         self._refund_pending_since: dict[str, float] = {}
+        # When this instance first saw the re-broadcast of our recorded BTC refund fail on a read that
+        # shows the HTLC unspent (#850 PR 9a review, F3): a node that rejects its fee never takes it.
+        self._refund_rejected_since: dict[str, float] = {}
         # THE ROLE ON THE RECORD (#850 PR 3, design §2.9). The configured role is not persisted, so
         # a record written by one side could be driven by a coordinator configured as the other,
         # and role-scoped steps (mutual_refund's TAKER branch, maybe_refund_asset_on_maker_stall's
@@ -4884,14 +4888,16 @@ class SwapCoordinator:
 
         * ``CLAIM_SEEN``: nothing is sent; the claim is on record (:meth:`_apply_btc_counter_disposition`).
         * ``REFUND_PENDING`` (ours, or the watchtower's pre-signed one: both spend the refund leaf):
-          mined but shallow, or at a depth below the quorum of answers, it waits. In every source's
-          mempool for :data:`REFUND_REPLACE_AFTER_S` (counted by this coordinator), it is replaced
+          mined but shallow, or mined at some source at a depth below the quorum of answers, it
+          waits. Held by no source as mined (in a mempool, even one source's) for :data:`REFUND_REPLACE_AFTER_S` (counted by this coordinator), it is replaced
           by BIP125 at a higher fee (``BitcoinTaprootLeg.refund_bump_fee``), the new bytes recorded
           before the broadcast. A bump past the leg's cap raises
           :class:`CounterLegRefundNeedsOperator` (``cause`` ``"fee_cap"``) and sends nothing.
         * ``UNSPENT``, or ``UNKNOWN`` with no spender named (a read below quorum): the recorded refund
           is broadcast again, the same bytes; with none recorded one is signed, recorded, then sent.
-          Re-broadcasting our own refund changes nothing that a read has not shown.
+          Re-broadcasting our own refund changes nothing that a read has not shown. When that
+          re-broadcast has failed for :data:`REFUND_REPLACE_AFTER_S` (a node may be refusing its
+          fee), it is replaced as a pending one is, by the same bump rule and cap.
         * ``UNKNOWN`` with a spender named (contradicting sources): nothing is sent, and this raises
           :class:`CounterLegDispositionUnknown`.
         """
@@ -4919,7 +4925,10 @@ class SwapCoordinator:
             )
         if kind is BtcDispositionKind.REFUND_PENDING:
             refunds = disposition.refunds_seen
-            mined = [r for r in refunds if r.confirmations != 0]
+            # Mined: a depth at the quorum above zero, or below the quorum but some source has it in a
+            # block. With no source placing it in a block it is pending, even if only one mempool
+            # holds it (review of part 2, F2: that refund must still be bumped).
+            mined = [r for r in refunds if r.confirmations or (r.confirmations is None and (r.deepest or 0) > 0)]
             if mined:
                 logger.info(
                     "the BTC refund %s is %s; waiting until it is buried %d deep",
@@ -4936,31 +4945,43 @@ class SwapCoordinator:
             if waited < REFUND_REPLACE_AFTER_S:
                 logger.info("the BTC refund %s is in the mempool (%.0fs seen); waiting", pending.txid, waited)
                 return self.record
-            try:
-                fee = self.counter_leg.refund_bump_fee(locator, pending.raw)
-            except ValidationError as exc:
-                raise CounterLegRefundNeedsOperator(
-                    f"the BTC refund {pending.txid} has been in the mempool {waited:.0f}s and was not bumped: {exc}. "
-                    "Nothing was sent. Bump it from a wallet that holds the refund key, or wait for it to confirm.",
-                    tx_hash=pending.txid,
-                    cause="fee_cap",
-                ) from exc
-            logger.warning(
-                "the BTC refund %s is still unconfirmed after %.0fs; replacing it at a fee of %d sats",
-                pending.txid,
-                waited,
-                fee,
-            )
-            return await self._send_btc_refund(
-                await self.counter_leg.sign_refund(locator, self.record.terms.t_btc, fee_sats=fee)
-            )
+            return await self._bump_btc_refund(pending.raw, pending.txid, f"has been in the mempool {waited:.0f}s")
         # UNSPENT, or UNKNOWN with no spender named.
         recorded = self.record.counter_refund_raw
         if recorded is not None:
+            raw = bytes.fromhex(recorded)
+            txid = btc_txid_from_raw(raw)
             logger.info("the BTC HTLC reads unspent; broadcasting our recorded refund again")
-            await self.counter_leg.broadcast_refund(bytes.fromhex(recorded))
+            try:
+                await self.counter_leg.broadcast_refund(raw)
+            except NetworkError:
+                since = self._refund_rejected_since.setdefault(txid, _monotonic())
+                waited = _monotonic() - since
+                if waited < REFUND_REPLACE_AFTER_S:
+                    raise
+                return await self._bump_btc_refund(raw, txid, f"has failed to broadcast for {waited:.0f}s")
+            self._refund_rejected_since.pop(txid, None)
             return self.record
         return await self._send_btc_refund(await self.counter_leg.sign_refund(locator, self.record.terms.t_btc))
+
+    async def _bump_btc_refund(self, raw: bytes, txid: str, why: str) -> SwapRecord:
+        """Replace our BTC refund *raw* at a higher fee (``BitcoinTaprootLeg.refund_bump_fee``), the
+        new bytes recorded before the broadcast. Past the leg's cap: :class:`CounterLegRefundNeedsOperator`
+        (``cause`` ``"fee_cap"``), nothing sent."""
+        locator = self.record.counterchain_locator
+        try:
+            fee = self.counter_leg.refund_bump_fee(locator, raw)
+        except ValidationError as exc:
+            raise CounterLegRefundNeedsOperator(
+                f"the BTC refund {txid} {why} and was not bumped: {exc}. Nothing was sent. Bump it from a wallet "
+                "that holds the refund key, or wait for it to confirm.",
+                tx_hash=txid,
+                cause="fee_cap",
+            ) from exc
+        logger.warning("the BTC refund %s %s; replacing it at a fee of %d sats", txid, why, fee)
+        return await self._send_btc_refund(
+            await self.counter_leg.sign_refund(locator, self.record.terms.t_btc, fee_sats=fee)
+        )
 
     async def _send_btc_refund(self, raw: bytes) -> SwapRecord:
         """Record *raw* as our BTC refund (shielded), then broadcast it (design §2.8)."""

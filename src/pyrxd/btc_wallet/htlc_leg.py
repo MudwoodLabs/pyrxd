@@ -807,19 +807,27 @@ class BitcoinTaprootLeg:
         """The fee for a refund that replaces *pending_raw* under BIP125 (#850 PR 9a, design §6).
 
         BIP125 rule 4: the replacement pays at least the replaced fee plus the incremental relay
-        fee (Bitcoin Core's default, 1 sat/vB) times its own size. A refund replacing a refund has
-        the same size (one input, one output, a 64-byte signature), so ``old + vsize`` clears it.
+        fee (Bitcoin Core's default, 1 sat/vB) times its own size. Ours has one input, one output
+        to :attr:`refund_to_scriptpubkey` and a 64-byte signature; the one it replaces may pay a
+        different script (the watchtower's pre-signed refund), so the size used is the larger of the
+        two (review of part 2, F5).
         This takes the larger of that and twice the old fee (CHOSEN, not measured: a bump that
         only clears the floor may not get mined sooner). Raises :class:`ValidationError` when the
         bump would leave the refund output below :data:`REFUND_BUMP_MIN_OUTPUT_SATS` or pay more
         than :data:`REFUND_BUMP_MAX_FEE_FRACTION` of the locked amount: the operator decides
         then, not a loop."""
         raw = bytes(pending_raw)
-        paid = sum(v for v, _spk in t.btc_spend_fields_from_raw(raw).outputs)
+        outputs = t.btc_spend_fields_from_raw(raw).outputs
+        paid = sum(v for v, _spk in outputs)
         old_fee = locator.amount_sats - paid
         if old_fee <= 0:
             raise ValidationError(f"the pending refund pays out {paid} of {locator.amount_sats} sats; no fee to bump")
-        new_fee = max(2 * old_fee, old_fee + _BIP125_INCREMENTAL_SATS_PER_VB * t.btc_vsize_from_raw(raw))
+        old_vsize = t.btc_vsize_from_raw(raw)
+        # Ours differs from it only in its outputs (value 8 bytes, a script length byte, the script;
+        # every script here is under 253 bytes, so its length is one byte).
+        ours_vsize = old_vsize - sum(9 + len(spk) for _v, spk in outputs) + 9 + len(self.refund_to_scriptpubkey)
+        new_fee = max(2 * old_fee, old_fee + _BIP125_INCREMENTAL_SATS_PER_VB * max(old_vsize, ours_vsize))
+        # floor-is-deliberate: the cap rounds down, so a bump never pays more than the fraction.
         cap = locator.amount_sats * REFUND_BUMP_MAX_FEE_FRACTION[0] // REFUND_BUMP_MAX_FEE_FRACTION[1]
         if new_fee > cap or locator.amount_sats - new_fee < REFUND_BUMP_MIN_OUTPUT_SATS:
             raise ValidationError(

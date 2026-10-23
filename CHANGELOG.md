@@ -121,9 +121,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Our refund is written to the record between signing and broadcasting (new
     `SwapRecord.counter_refund_raw`, hex; `SWAP_RECORD_SCHEMA_VERSION` 10). If that write fails,
     nothing is sent. A refund that was dropped is re-sent with the same bytes.
-  - A refund still in every source's mempool after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not
-    measured) is replaced by BIP125 at twice its fee, or its fee plus 1 sat/vB of its size if that
-    is more (`BitcoinTaprootLeg.refund_bump_fee`; the doubling is chosen, not measured). A bump that
+  - A refund that no source places in a block after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not
+    measured), even one only a single mempool holds, is replaced by BIP125 at twice its fee, or its
+    fee plus 1 sat/vB of the larger of the two transactions if that is more
+    (`BitcoinTaprootLeg.refund_bump_fee`; the doubling is chosen, not measured). A recorded refund
+    whose re-broadcast has failed for as long, on reads that show the HTLC unspent (a node may be
+    refusing its fee), is replaced the same way; during a long broadcaster outage this raises the
+    fee step by step up to the cap. A bump that
     would pay more than a tenth of the locked amount, or leave less than the dust limit, is not sent:
     `CounterLegRefundNeedsOperator` with `cause` `"fee_cap"`. The watchtower's pre-signed refund is
     followed and bumped the same way, because classification is by leaf.
@@ -133,8 +137,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`abort_reason` `counter_leg_refunded`) or, from `BOTH_LOCKED`, a taker's to `MUTUAL_REFUND`,
     held while a recorded claim and an immature `t_rxd` say `p` may be public (D14), as on ETH.
   - Contradicting sources (`UNKNOWN` with a spender named) raise `CounterLegDispositionUnknown` and
-    send nothing. A terminal answer from one source counts only on `bcrt` and `tb`
-    (`CounterLegSingleSourceAnswer` elsewhere).
+    send nothing. A terminal answer from one source, or from a reader whose quorum is one, counts
+    only on `bcrt` and `tb` (`CounterLegSingleSourceAnswer` elsewhere).
   - `mutual_refund` (F-A on BTC): a `TAKER` never sends the covenant refund, on a leg that reads its
     disposition or not; on one that does not, it refunds the BTC HTLC and stays `BOTH_LOCKED`. A
     single operator's covenant refund is sent only once the BTC refund is buried. A `MAKER`'s is

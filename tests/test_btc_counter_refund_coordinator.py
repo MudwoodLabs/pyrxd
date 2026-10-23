@@ -234,6 +234,80 @@ async def test_a_mined_refund_at_a_depth_below_the_quorum_of_answers_is_waited_o
     assert rec.state is SwapState.BTC_LOCKED and len(s.sent) == 1
 
 
+async def test_a_refund_only_one_mempool_holds_is_still_bumped(tmp_path, monkeypatch):
+    """Review of part 2, F2: the other sources hold the HTLC unspent and know nothing of the refund,
+    so its depth is below the quorum of answers. No source has it in a block: it is pending, not
+    mined, and is bumped after the wait."""
+    s = _Swap(tmp_path)
+    for src in s.sources[1:]:
+        src.sees_mempool = False
+        honest = src.confirmations
+
+        async def depth(txid, _honest=honest):
+            if txid != s.chain.funding_txid:
+                raise NetworkError("404 Transaction not found")
+            return await _honest(txid)
+
+        async def block(txid):
+            raise NetworkError("404 Transaction not found")
+
+        src.confirmations, src.tx_block = depth, block
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    await coord.taker_refund_btc()
+    assert len(s.sent) == 1
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.BTC_LOCKED and len(s.sent) == 2 and _fee(s.sent[1]) == 2 * _fee(s.sent[0])
+    assert bytes.fromhex(s.on_disk().counter_refund_raw) == s.sent[1]
+
+
+async def test_a_refund_the_node_keeps_refusing_is_replaced_after_the_wait(tmp_path, monkeypatch):
+    """Review of part 2, F3: a refund that never enters a mempool reads UNSPENT; re-sending the same
+    bytes for ever would never end. After REFUND_REPLACE_AFTER_S of failed re-broadcasts it is bumped."""
+    s = _Swap(tmp_path)
+    accept = s.chain.submit
+
+    def submit(raw):
+        if _fee(raw) < 1_000:
+            raise NetworkError("min relay fee not met")
+        return accept(raw)
+
+    s.chain.submit = submit
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    with pytest.raises(NetworkError):
+        await coord.taker_refund_btc()  # signed, recorded, refused
+    first = s.on_disk().counter_refund_raw
+    with pytest.raises(NetworkError):
+        await coord.taker_refund_btc()  # the same bytes again; the wait starts
+    clock[0] += sc.REFUND_REPLACE_AFTER_S - 1
+    with pytest.raises(NetworkError):
+        await coord.taker_refund_btc()
+    assert {r.hex() for r in s.sent} == {first}, "replaced before REFUND_REPLACE_AFTER_S"
+    clock[0] += 2
+    rec = await coord.taker_refund_btc()
+    bump = s.sent[-1]
+    assert rec.state is SwapState.BTC_LOCKED and _fee(bump) == 1_000 and s.chain.mempool == t.btc_txid_from_raw(bump)
+    assert s.on_disk().counter_refund_raw == bump.hex()
+
+
+async def test_a_quorum_of_one_on_mainnet_is_one_source(tmp_path):
+    """Review of part 2, F1: three sources at quorum one let any one decide. A lying source then
+    must not end the record on mainnet while our refund is only in the mempool."""
+    s = _Swap(tmp_path, network="bc", n=3, quorum=1)
+    s.chain.submit(s.chain.refund_tx())
+    s.sources[1].down = s.sources[2].down = True
+    s.sources[0].lie_depth = 50
+    s.sources[0].lie_block = (190, "aa" * 32)
+    with pytest.raises(CounterLegSingleSourceAnswer):
+        await s.coord().taker_refund_btc()
+    assert s.on_disk().state is SwapState.BTC_LOCKED and s.on_disk().counter_disposition is None
+
+
 async def test_the_towers_presigned_refund_is_followed_as_ours(tmp_path):
     """Classification is by leaf, not txid (M1): a refund we did not record is still our refund."""
     s = _Swap(tmp_path)
@@ -457,6 +531,18 @@ def test_the_bump_leaves_the_output_above_dust_whatever_the_cap(tmp_path, monkey
     assert leg.refund_bump_fee(s.chain.locator, s.chain.refund_tx(fee_sats=edge)) == 2 * edge
     with pytest.raises(ValidationError, match="dust"):
         leg.refund_bump_fee(s.chain.locator, s.chain.refund_tx(fee_sats=edge + 1))
+
+
+def test_the_bump_clears_rule_4_for_our_size_when_the_replaced_refund_is_smaller(tmp_path):
+    """Review of part 2, F5: the tower's pre-signed refund may pay a shorter script than ours, and
+    BIP125 rule 4 is priced on the replacement's size."""
+    s = _Swap(tmp_path)
+    leg = s.leg()
+    leg.refund_to_scriptpubkey = b"\x51\x20" + b"\x55" * 32  # P2TR, 12 bytes longer than REFUND_SPK
+    short = s.chain.refund_tx(fee_sats=130)  # pays REFUND_SPK (P2WPKH), at the relay floor
+    rule_4 = 130 + t.btc_vsize_from_raw(short) + 12
+    assert rule_4 > 2 * 130, "the case needs rule 4 to bind, not the doubling"
+    assert leg.refund_bump_fee(s.chain.locator, short) == rule_4
 
 
 def test_vsize_needs_a_segwit_transaction():

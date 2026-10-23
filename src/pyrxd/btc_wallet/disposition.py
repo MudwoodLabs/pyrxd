@@ -44,8 +44,9 @@ Precedence when evidence contradicts (the §2.4 rules, on BTC): two different sp
 is impossible on an honest chain and reads UNKNOWN. A buried refund beside an unburied claim seen
 elsewhere reads :attr:`BtcDispositionKind.REFUNDED`, and the claim stays in ``spenders`` (D14).
 
-Single source: with one source every answer is ``single_source=True``. Whether that may change a
-record's state is the CONSUMER's rule (design §2.5), not this module's.
+Single source: with one source, or with a quorum of one (any one source then decides alone),
+every answer is ``single_source=True``. Whether that may change a record's state is the
+CONSUMER's rule (design §2.5), not this module's.
 """
 
 from __future__ import annotations
@@ -99,7 +100,8 @@ class BtcSpender:
 
     ``verified``: its leaf signature verifies over the bytes served (always, for a refund).
     ``confirmations`` is the MINIMUM depth across the sources that answered, or ``None`` when fewer
-    than the quorum did. ``block`` is ``(height, block hash)`` when every source that places the
+    than the quorum did; ``deepest`` is the MAXIMUM any source answered (``None`` when none did), so
+    a caller can tell "mined, depth below quorum" from "no source has it mined". ``block`` is ``(height, block hash)`` when every source that places the
     transaction in a block agrees on it and at least the quorum do, else ``None``. ``contested``:
     sources served this txid with witnesses that classify differently; ``raw`` is then a claim's
     bytes when any was served, so ``p`` can be read from it."""
@@ -111,6 +113,7 @@ class BtcSpender:
     confirmations: int | None
     block: tuple[int, str] | None
     verified: bool = True
+    deepest: int | None = None
     contested: bool = False
     #: On a verified refund: a claim witness (unverified, carrying p) that a source served for the
     #: same txid. Reported through :attr:`BtcCounterDisposition.claims_seen`.
@@ -375,7 +378,8 @@ async def read_btc_counter_disposition(
         raise ValidationError("locator must be a BtcHtlcLocator")
     hashlock = t._as_bytes(hashlock, name="hashlock", length=32)
     keys = tuple(_key(r) for r in readers)
-    single = len(readers) == 1
+    # A quorum of one lets any one source decide, however many are asked (review of part 2, F1).
+    single = len(readers) == 1 or quorum < 2
     op = locator.funding_outpoint
 
     failed: dict[str, str] = {}
@@ -469,6 +473,7 @@ async def read_btc_counter_disposition(
                 confirmations=confirmations,
                 block=block,
                 verified=verified,
+                deepest=max(good_depths) if good_depths else None,
                 contested=contested,
                 claim_raw=claim_raw,
             )
