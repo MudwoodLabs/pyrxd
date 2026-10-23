@@ -4889,9 +4889,10 @@ class SwapCoordinator:
 
         * ``CLAIM_SEEN``: nothing is sent; the claim is on record (:meth:`_apply_btc_counter_disposition`).
         * ``REFUND_PENDING`` (ours, or the watchtower's pre-signed one: both spend the refund leaf):
-          mined but shallow, or mined at some source at a depth below the quorum of answers, it
-          waits. Held by no source as mined (in a mempool, even one source's) for :data:`REFUND_REPLACE_AFTER_S` (counted by this coordinator), it is replaced
-          by BIP125 at a higher fee (``BitcoinTaprootLeg.refund_bump_fee``), the new bytes recorded
+          mined at the quorum's depth (its MIN), or placed in a block by a source when too few
+          answered, it waits. At a quorum depth of 0 (any answering source holds it unmined, even if
+          another says it is mined) for :data:`REFUND_REPLACE_AFTER_S` (counted by this
+          coordinator), it is replaced by BIP125 at a higher fee (``BitcoinTaprootLeg.refund_bump_fee``), the new bytes recorded
           before the broadcast. A bump past the leg's cap raises
           :class:`CounterLegRefundNeedsOperator` (``cause`` ``"fee_cap"``) and sends nothing.
         * ``UNSPENT``, or ``UNKNOWN`` with no spender named (a read below quorum): the recorded refund
@@ -4931,10 +4932,11 @@ class SwapCoordinator:
             refunds = disposition.refunds_seen
             # Mined: the quorum's depth is above zero, or too few sources answered and one of them has
             # it in a block. A quorum that answers 0 is pending however deep one source says it is: one
-            # lying source must not stop the bump for good (third review, F1). The cost is that a
-            # source lagging one block behind can make a just-mined refund read pending, and the bump
-            # is then refused for its spent inputs; the next read shows it mined (re-review R2,
-            # accepted). With no source placing it in a block it is pending, even if only one mempool
+            # lying source must not stop the bump for good (third review, F1). The cost: while any
+            # source lags behind a just-mined refund, each pass after the wait re-signs a bump, records
+            # it and has it refused for spent inputs, until the lag clears (re-review R2, accepted:
+            # the recorded bump is a valid refund of the same outpoint, and burial needs that source
+            # anyway). With no source placing it in a block it is pending, even if only one mempool
             # holds it (review of part 2, F2).
             mined = [r for r in refunds if r.confirmations or (r.confirmations is None and (r.deepest or 0) > 0)]
             if mined:
