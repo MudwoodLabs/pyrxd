@@ -735,6 +735,61 @@ async def test_HONEST_the_sink_still_keeps_a_reveal_under_a_rewound_write(tmp_pa
     assert kept.state is SwapState.SECRET_REVEALED and kept.counter_claim_tx == "0x" + "c6" * 32
 
 
+async def test_a_claim_written_after_the_last_check_is_kept_under_the_abandon(tmp_path):
+    """Re-review: between the last check and the write another process records a claim. The abandon is
+    written, and the claim on disk stays on it, so whatever reads the record sees p may be public."""
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+    coord._persist = sink
+    claim = "0x" + "c8" * 32
+    real_write = sink.write_abort_note
+
+    def a_claim_lands_meanwhile(payload):
+        (tmp_path / "swap.json").write_text(
+            json.dumps(dataclasses.replace(coord.record, counter_claim_tx=claim).to_dict())
+        )  # another process
+        return real_write(payload)
+
+    sink.write_abort_note = a_claim_lands_meanwhile
+    rec = await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    on_disk = sink.load_record()
+    assert rec.state is SwapState.ABORTED and on_disk.state is SwapState.ABORTED
+    assert on_disk.counter_claim_tx == claim
+
+
+async def test_HONEST_a_write_names_its_own_claim_over_the_one_on_disk(tmp_path):
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(dataclasses.replace(coord.record, counter_claim_tx="0x" + "c9" * 32))
+    await sink(dataclasses.replace(coord.record, counter_claim_tx="0x" + "ca" * 32))
+    assert sink.load_record().counter_claim_tx == "0x" + "ca" * 32
+    other = JsonFileRecordSink(tmp_path / "other.json")
+    await other(coord.record)
+    await other(coord.record)
+    assert other.load_record().counter_claim_tx is None
+
+
+async def test_a_refused_abandon_says_its_note_names_no_record(tmp_path, caplog):
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+    coord._persist = sink
+    real_write = sink.write_abort_note
+
+    def a_reveal_lands_meanwhile(payload):
+        (tmp_path / "swap.json").write_text(
+            json.dumps(dataclasses.replace(coord.record, state=SwapState.SECRET_REVEALED).to_dict())
+        )  # another process
+        return real_write(payload)
+
+    sink.write_abort_note = a_reveal_lands_meanwhile
+    with pytest.raises(ValidationError, match="would not load"):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert sink.load_record().state is SwapState.SECRET_REVEALED and coord.record.state is SwapState.BTC_LOCKED
+    assert "no record names that note" in caplog.text
+
+
 async def test_a_verified_claim_is_the_one_the_aborted_record_names():
     coord, chain, leg, _sink = _token()
     chain.token_balances[30] = 1_000_000

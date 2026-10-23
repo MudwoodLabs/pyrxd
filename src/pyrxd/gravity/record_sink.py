@@ -117,6 +117,23 @@ class JsonFileRecordSink:
             )
             incoming["state"] = prior["state"]
 
+    @staticmethod
+    def _keep_a_persisted_claim(prior: dict[str, Any] | None, incoming: dict[str, Any]) -> None:
+        """A recorded counter-leg claim (``counter_claim_tx``) says ``p`` may be public; no step clears
+        it. A write without one, from a coordinator that read the record before the claim was written,
+        keeps the one on disk (and the schema version it needs) rather than dropping it (re-review of
+        the Mythos fixes, #850 PR 7b)."""
+        if prior is None or not prior.get("counter_claim_tx") or incoming.get("counter_claim_tx"):
+            return
+        from pyrxd.gravity.swap_state import SWAP_RECORD_SCHEMA_VERSION
+
+        incoming["counter_claim_tx"] = prior["counter_claim_tx"]
+        incoming["schema_version"] = max(
+            int(incoming.get("schema_version") or 0),
+            int(prior.get("schema_version") or 0),
+            SWAP_RECORD_SCHEMA_VERSION,
+        )
+
     def _keep_the_persisted_role(self, prior: dict[str, Any] | None, incoming: dict[str, Any]) -> None:
         """The role on disk binds every later write (#850 PR 3). A write naming ANOTHER role is
         refused: the record is the other party's, and its role-scoped steps would act for the wrong
@@ -173,6 +190,7 @@ class JsonFileRecordSink:
             # not hide it (#850 PR 8).
             as_dict["read_without_role"] = True
         self._keep_a_persisted_reveal(prior, as_dict, self._path)
+        self._keep_a_persisted_claim(prior, as_dict)
         from pyrxd.gravity.swap_state import SwapRecord
 
         if isinstance(record, SwapRecord):  # a duck-typed record names no wire form to hold it to
