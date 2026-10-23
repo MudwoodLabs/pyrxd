@@ -4982,7 +4982,9 @@ class SwapCoordinator:
             },
             "note": note,
         }
-        # Again, now the read is done: another process may have moved the record on disk meanwhile.
+        # Again, now the read is done: another process may have moved the record on disk meanwhile. This
+        # narrows the window and does not close it (there is no lock between processes); a reveal or a claim
+        # written after this check is kept by the sink (``JsonFileRecordSink``).
         self._refuse_to_abandon_over_a_newer_record_on_disk(state)
         digest = write_note(json.dumps(sidecar, indent=2, sort_keys=True).encode())
         before = self.record
@@ -5005,6 +5007,10 @@ class SwapCoordinator:
             await self._persist_record(self.record, shield=True)
         except Exception:
             self.record = before  # not durable, so not taken: a retry reads the chain again
+            logger.warning(
+                "the abandon note (sha256 %s) was written, but the record was not; no record names that note",
+                digest,
+            )
             raise
         logger.warning(
             "counter-leg contract %s abandoned by the operator (%s, read %s at block %d); the record is ABORTED",
