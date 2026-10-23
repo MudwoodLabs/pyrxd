@@ -177,6 +177,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     drive one record with mixed pyrxd versions. A pyrxd from before this change refuses a v5
     record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x
     `taker_refund_btc` would send again, go to `ABORTED`, and drop the recorded hash.
+- **A taker can end a swap it never funded (#850 PR 8) [Changed (breaking)].** New
+  `SwapCoordinator.abandon_unfunded(*, confirm_btc_htlc_empty=False)` takes a taker's or single
+  operator's `NEGOTIATED` record to `ABORTED` on the existing `TAKER_NEVER_FUNDS` edge, with the new `abort_reason`
+  `taker_never_funds`. It broadcasts nothing, and the hashlock stays reserved, so the same `H` is
+  never funded again. It refuses, and records nothing, while the record holds anything that may hold
+  value: a BTC funding transaction (`pending_btc_funding_tx`, written before its broadcast), a native
+  ETH contract (`pending_counter_contract` with no token), or a token contract that a push was
+  signed for (`pending_push_nonce`), whose balance is not 0 at the finalized block and at the tip
+  at every endpoint, or that any endpoint reads as settled at either block (new
+  `pyrxd.eth_wallet.disposition.read_unfunded_token_balance` and `EthLeg.unfunded_token_balance`),
+  or whose pushing key (this leg's key, when it created the contract) is not known or not idle at
+  every endpoint, since a push no record names may be in flight (a deploy that cannot be read leaves
+  the key unknown). A balance or nonce read that fails
+  or disagrees raises `NetworkError`, as does a balance read from one
+  endpoint on a chain that carries value. It also refuses, first, when the persist hook's record of
+  this swap on disk is past `NEGOTIATED` or holds a counter-leg locator, pending contract, BTC
+  funding transaction or token push that the coordinator's record does not (the same guard the fund
+  uses, which now also compares the push nonce and hash). It holds `CoordinatorConfig.fund_lock`,
+  when one is set, from that read to its write; only the ETH fund takes that lock, so it does not
+  exclude a BTC fund running at the same time in another process. A `MAKER`-role coordinator is
+  refused: the maker's `NEGOTIATED` exit is #850 PR 11. A BTC record that may have been written by
+  0.26.x or earlier is refused unless the caller passes `confirm_btc_htlc_empty=True` after checking
+  the HTLC address: one that was read without a `role`, one whose record on disk names no `role` or
+  was once read without one, or any BTC record when there is no persist hook that reads the record
+  back. Those versions recorded no funding transaction before its broadcast (#841), so such a record
+  reads as never funded even if a fund was broadcast, and this step cannot scan the HTLC address. A
+  record read without a role keeps the new `read_without_role` once a 0.27 coordinator stamps its
+  role, and `JsonFileRecordSink` sets it on a write that adds a role over a record on disk without
+  one. It is written only with a role, so a record without one keeps its old wire form.
+  `SWAP_RECORD_SCHEMA_VERSION` is 9; a record carrying `taker_never_funds` or a role writes 9, which
+  a pyrxd from 0.27 development before this change refuses. A 0.26.x pyrxd ignores unknown keys and reads the record as `ABORTED` without saying why.
 - **An operator can end an ETH swap record on a counter-leg case that has no automatic end, after
   the chain is read and only on the case it shows (#850 PR 7b) [Changed (breaking)].**
   - New `SwapCoordinator.abandon_counter_leg(*, confirm_contract, reason_code, note)`, from

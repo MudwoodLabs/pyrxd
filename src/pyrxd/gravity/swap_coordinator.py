@@ -3235,8 +3235,8 @@ class SwapCoordinator:
 
         The fund persists its intent before broadcasting. A caller that built the coordinator on a
         fresh NEGOTIATED record, instead of loading the one on disk, then overwrote the only record of
-        an earlier fund: the pending contract or funding transaction of an interrupted fund, or the
-        locator of a completed one. With the seen-store holding H the gate's reuse probe refuses
+        an earlier fund: the pending contract, funding transaction or signed token push of an
+        interrupted fund, or the locator of a completed one. With the seen-store holding H the gate's reuse probe refuses
         before that write; with a store that lost H (deleted, restored) the fund went ahead and put a
         SECOND counter leg on chain under the same H. Checked first, before anything is read or
         written. Applies when the persist hook can read back (``load_record``, as
@@ -3248,7 +3248,13 @@ class SwapCoordinator:
         on_disk = load()
         if on_disk is None or bytes(on_disk.terms.hashlock) != bytes(terms.hashlock):
             return
-        handles = ("counterchain_locator", "pending_counter_contract", "pending_btc_funding_tx")
+        handles = (
+            "counterchain_locator",
+            "pending_counter_contract",
+            "pending_btc_funding_tx",
+            "pending_push_nonce",  # a signed token push: abandon_unfunded would drop it (#850 PR 8 re-review)
+            "pending_push_tx_hash",
+        )
         held = [
             n for n in handles if getattr(on_disk, n) is not None and getattr(on_disk, n) != getattr(self.record, n)
         ]
@@ -4860,6 +4866,156 @@ class SwapCoordinator:
             self.record.state.name,
         )
         return self.record
+
+    # -- the taker's NEGOTIATED exit (#850 PR 8, design §3.5) --------------------------------------
+
+    @_serialized_step
+    async def abandon_unfunded(self, *, confirm_btc_htlc_empty: bool = False) -> SwapRecord:
+        """End a NEGOTIATED record that holds nothing that may hold value (``TAKER_NEVER_FUNDS``;
+        #850 PR 8, design §3.5). The taker's step; a maker's NEGOTIATED exit is #850 PR 11.
+
+        Refused, with nothing recorded, when the record holds:
+
+        * a BTC funding transaction (``pending_btc_funding_tx``): it is written before the broadcast,
+          so it may have been sent;
+        * a native ETH contract (``pending_counter_contract`` with no token): its deploy carries the
+          value, and its address is written before that broadcast;
+        * a token contract that a push was signed for (``pending_push_nonce``), that holds tokens,
+          that is settled, or whose balance cannot be read: the token balance must read 0 and the
+          contract unsettled at the finalized block and at the tip at every endpoint, and on a chain
+          that carries value from more than one endpoint; and the key that would push (this leg's
+          key, when it created the contract) must be idle at every endpoint, since a push no record
+          names may be in flight (design §2.7, with its residuals);
+        * a record of this swap on disk (the persist hook's ``load_record``) that is past
+          ``NEGOTIATED`` or holds a counter-leg locator, pending contract, BTC funding transaction or
+          token push that this coordinator's record does not. It is read under
+          ``CoordinatorConfig.fund_lock`` when one is set, which the ETH fund holds across deploy
+          and push (the BTC fund takes no lock, so a BTC fund in another process is not excluded);
+        * a BTC record that may have been written by pyrxd 0.26.x or earlier, unless
+          *confirm_btc_htlc_empty* is ``True``: one that was read without a ``role``
+          (``read_without_role``, kept after a 0.27 coordinator stamps one), whose record on disk
+          names no ``role`` or carries that mark, or any BTC record when there is no persist hook
+          that reads the record back (``load_record``). Those
+          versions recorded no funding transaction before its broadcast (#841), so such a record
+          reads as never funded even if a fund was broadcast and its readback failed, and this step
+          cannot scan the HTLC address. Pass ``True`` only after checking that the HTLC address
+          (``BitcoinTaprootLeg.htlc_address(terms)``) has never received an output.
+
+        Nothing is broadcast. ``abort_reason`` is ``TAKER_NEVER_FUNDS``. The hashlock stays reserved
+        in the seen-store, so this ``H`` is never funded again. A token contract that was deployed
+        stays on the record (``pending_counter_contract``).
+        """
+        lock = self.config.fund_lock
+        # Held from the read of the record on disk to the write, as the ETH fund holds it across deploy
+        # and push: an ETH fund in another process sharing the lock cannot sign a push in between. The
+        # BTC fund takes no lock (Mythos review of #850 PR 8, F6).
+        with lock() if lock is not None else contextlib.nullcontext():
+            return await self._abandon_unfunded_under_the_fund_lock(confirm_btc_htlc_empty)
+
+    async def _abandon_unfunded_under_the_fund_lock(self, confirm_btc_htlc_empty: bool) -> SwapRecord:
+        # First: a coordinator built on a stale or fresh record must not overwrite the one on disk.
+        self._refuse_to_overwrite_a_recorded_counter_leg(self.record.terms)
+        state = self.record.state
+        if state is not SwapState.NEGOTIATED:
+            raise ValidationError(f"abandon_unfunded not valid from {state.value}")
+        if self.config.role is SwapRole.MAKER:
+            raise ValidationError("abandon_unfunded is the taker's step; refused for a MAKER-role coordinator")
+        if self.record.pending_btc_funding_tx is not None:
+            raise ValidationError(
+                "this record holds a BTC funding transaction, written before its broadcast, so it may have been "
+                "sent: resume the fund (taker_funds_btc), then refund the HTLC after its timeout. Nothing was recorded."
+            )
+        if self.record.terms.counter_chain == "btc" and not confirm_btc_htlc_empty:
+            self._refuse_a_btc_record_that_may_predate_its_funding_record()
+        contract = self.record.pending_counter_contract
+        if contract:
+            token = self.record.terms.token_address
+            if not token:
+                raise ValidationError(
+                    f"this record holds the ETH counter-leg contract {contract}, whose deploy carries the value: "
+                    "resume the fund (taker_funds_btc), then refund it after its timeout. Nothing was recorded."
+                )
+            if self.record.pending_push_nonce is not None:  # a push hash is recorded only with its nonce
+                raise ValidationError(
+                    f"a token push into {contract} was signed, so it may land: resume the fund (taker_funds_btc), "
+                    "then refund the contract after its timeout. Nothing was recorded."
+                )
+            read = getattr(self.counter_leg, "unfunded_token_balance", None)
+            if read is None:
+                raise ValidationError("abandon_unfunded needs an ETH counter leg that reads a token balance")
+            # NetworkError: unknown, nothing recorded
+            balance = await read(token=token, contract=contract, deploy_tx_hash=self.record.pending_counter_deploy_tx)
+            chain_id = getattr(self.counter_leg, "chain_id", None)
+            if balance.single_source and (chain_id is None or not self._single_source_may_decide(int(chain_id))):
+                raise NetworkError(
+                    f"the token balance of {contract} was read from one endpoint, on a chain that carries value: "
+                    "read it from more than one. Nothing was recorded."
+                )
+            if balance.settled:
+                raise ValidationError(
+                    f"the contract {contract} is settled, so tokens were pushed into it and paid out: if it was "
+                    "claimed, the preimage is public. Read its Claimed or Refunded log. Nothing was recorded."
+                )
+            if not balance.empty:
+                raise ValidationError(
+                    f"the contract {contract} holds tokens: resume the fund (taker_funds_btc), then refund it after "
+                    "its timeout. Nothing was recorded."
+                )
+            # A push no record names (a 0.26.x record, or the key used outside pyrxd) may still be in
+            # flight while the balance reads 0 (design §2.7; Mythos review of #850 PR 8, F5).
+            if balance.funding_key_idle is None:
+                raise ValidationError(
+                    f"the key that would push into {contract} is not known (this leg's key did not create it, or "
+                    "its deploy could not be read), so a push in flight cannot be ruled out. Nothing was recorded. "
+                    "If the deploy could not be read, retry; an endpoint that has pruned it refuses every retry."
+                )
+            if balance.funding_key_idle is not True:
+                raise NetworkError(
+                    "the funding key is not idle at every endpoint (pending, latest and the count at the finalized "
+                    f"block are not one number), so a push into {contract} may be in flight. Nothing was recorded. "
+                    "Retry once the key's transactions are final."
+                )
+        before = self.record
+        self.record = dataclasses.replace(self.record, abort_reason=AbortReason.TAKER_NEVER_FUNDS)
+        self._advance(SwapEvent.TAKER_NEVER_FUNDS)
+        # As in abandon_counter_leg: a cancellation is not rolled back (the shielded persist finishes).
+        try:
+            await self._persist_record(self.record, shield=True)
+        except Exception:
+            self.record = before  # not durable, so not taken
+            raise
+        logger.warning("swap abandoned unfunded from negotiated; the hashlock stays reserved")
+        return self.record
+
+    def _refuse_a_btc_record_that_may_predate_its_funding_record(self) -> None:
+        """Refuse a BTC record that may have been written by pyrxd 0.26.x or earlier (#850 PR 8).
+
+        Before #841 a BTC fund broadcast first and wrote nothing until its readback succeeded, so a
+        failed readback left a NEGOTIATED record with no trace of BTC locked in the HTLC. 0.27 writes
+        ``role`` on every record a coordinator persists, and those versions did not. A record read
+        without one keeps ``read_without_role`` after a 0.27 coordinator stamps its role. So a record
+        is accepted only when this coordinator's record and the record on disk carry no such mark, and
+        the record on disk names a role or there is none."""
+        load = getattr(self._persist, "load_record", None)
+        if self.record.read_without_role:
+            why = "this record was read without a role"
+        elif self._persist is None:
+            why = "there is no persist hook to read the record on disk from"
+        elif not callable(load):
+            why = "the persist hook cannot read the record back"
+        else:
+            on_disk = load()
+            if on_disk is None or (on_disk.role is not None and not on_disk.read_without_role):
+                return  # nothing of this swap persisted, or written by a pyrxd that records the fund first
+            why = "the record on disk was written without a role"
+        where = getattr(self.counter_leg, "htlc_address", None)
+        address = where(self.record.terms) if callable(where) else "the HTLC address of these terms"
+        raise ValidationError(
+            f"this BTC record may have been written by pyrxd 0.26.x or earlier ({why}), which recorded no "
+            f"funding transaction before broadcasting it (#841): BTC may be locked in {address}. Check that "
+            "address; if it never received an output, call abandon_unfunded(confirm_btc_htlc_empty=True). "
+            "Nothing was recorded."
+        )
 
     # -- the gated explicit abandon (#850 PR 7b, design §3.6) -------------------------------------
 

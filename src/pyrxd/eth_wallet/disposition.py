@@ -63,7 +63,7 @@ from enum import Enum
 from typing import Any
 
 from ..network.source_identity import require_distinct_sources
-from ..security.errors import ValidationError
+from ..security.errors import NetworkError, ValidationError
 from .events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from .htlc_leg import SETTLED_SLOT, _addr, _b, _int_or_none, _receipt_facts
 from .locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator
@@ -75,7 +75,9 @@ __all__ = [
     "DispositionEvidence",
     "DispositionKind",
     "LogUnion",
+    "UnfundedTokenBalance",
     "read_counter_disposition",
+    "read_unfunded_token_balance",
     "union_logs",
 ]
 
@@ -846,3 +848,89 @@ async def _deploy_block(source: Any, deploy_tx_hash: str) -> int | None:
     if receipt is None:
         return None
     return _int_or_none(receipt.get("blockNumber"))
+
+
+# --------------------------------------------------------------------------- an unfunded token contract
+
+
+@dataclass(frozen=True)
+class UnfundedTokenBalance:
+    """The token balance of a counter-leg contract that was deployed and never pushed into, as
+    :func:`read_unfunded_token_balance` read it (#850 PR 8, design §3.5).
+
+    ``empty`` is ``True`` only when every endpoint answered 0 at ``finalized_block`` and every
+    endpoint answered 0 at the tip. ``settled`` is ``True`` when any endpoint reads the contract's
+    ``settled`` slot set at either block: tokens went in and were paid out, so a push that was never
+    recorded landed. ``single_source`` says the rpc had one endpoint. ``funding_key_idle`` is ``True``
+    when the funding key's count at ``finalized_block`` (every endpoint agreeing), at the tip and
+    pending are one number at every endpoint, ``False`` when they are not, and ``None`` when no
+    funding key was named."""
+
+    empty: bool
+    settled: bool
+    finalized_block: int
+    sources: tuple[str, ...]
+    single_source: bool
+    funding_key_idle: bool | None = None
+
+
+async def read_unfunded_token_balance(
+    rpc: Any, *, token: str, contract: str, funding_account: str | None = None
+) -> UnfundedTokenBalance:
+    """Whether *contract* holds none of *token*: 0 at the quorum-minimum finalized block at every
+    endpoint, all agreeing, and 0 at the tip at every endpoint (#850 PR 8, design §3.5); and whether
+    it is settled at either block at any endpoint.
+
+    A balance is a negative reading ("nothing is there"), so every endpoint must answer, as for
+    ``EXPIRED_EMPTY_*``: the one that does not may be the one that would have said otherwise. A read
+    that fails, falls below quorum or disagrees raises :class:`NetworkError` (``UNKNOWN``: the caller
+    refuses and records nothing). Read-only.
+
+    With *funding_account* (the key that would sign a push), whether that key is idle: a push no
+    record names may be in flight at any of its nonces, as for a nonce-less close (design §2.7). The
+    same residuals apply: a privately submitted or evicted push, one queued above a gap in these
+    endpoints' pools, or one at an endpoint that answers "pending" with its latest count, is not seen
+    (Mythos review of #850 PR 8, F5)."""
+    panel = _panel_of(rpc)
+    token_addr, contract_addr = _addr(token), _addr(contract)
+    try:
+        finalized = await _magnitude(panel, lambda s: s.finalized_block_number(), "finalized", min)
+        at_f = await _every(
+            panel, lambda s: s.erc20_balance_of(token_addr, contract_addr, finalized), f"balance at {finalized}"
+        )
+        if any(b != at_f[0] for b in at_f[1:]):
+            raise _BelowQuorum(f"balance at {finalized}: endpoints disagree")
+        at_tip = await _every(
+            panel, lambda s: s.erc20_balance_of(token_addr, contract_addr, "latest"), "balance at tip"
+        )
+        # A balance of 0 is also what a push that landed and was then claimed or refunded leaves, so
+        # the settled slot is read too. Any endpoint seeing it set is enough to refuse.
+        settled = [
+            word
+            for at in (finalized, "latest")
+            for word in await _every(
+                panel, lambda s, at=at: s.get_storage_at(contract_addr, SETTLED_SLOT, at), f"settled at {at}"
+            )
+        ]
+    except _BelowQuorum as exc:
+        raise NetworkError(f"the token balance of {contract_addr} is unknown: {exc}") from None
+    idle = None
+    if funding_account is not None:
+        funder = _addr(funding_account)
+        try:
+            counts = await _every(panel, lambda s: s.get_transaction_count(funder, finalized), f"nonce at {finalized}")
+            pending = await _every(panel, lambda s: s.get_transaction_count(funder, "pending"), "pending nonce")
+            latest = await _every(panel, lambda s: s.get_transaction_count(funder, "latest"), "latest nonce")
+        except _BelowQuorum as exc:
+            raise NetworkError(
+                f"whether the funding key {funder} has transactions in flight is unknown: {exc}"
+            ) from None
+        idle = all(int(n) == int(counts[0]) for n in (*counts, *pending, *latest))
+    return UnfundedTokenBalance(
+        empty=int(at_f[0]) == 0 and all(int(b) == 0 for b in at_tip),
+        settled=any(any(bytes(word)) for word in settled),
+        finalized_block=int(finalized),
+        sources=tuple(sorted(_key(src) for src in panel.sources)),
+        single_source=len(panel.sources) == 1,
+        funding_key_idle=idle,
+    )

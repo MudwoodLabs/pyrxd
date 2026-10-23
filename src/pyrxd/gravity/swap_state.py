@@ -53,7 +53,9 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # v7 (#850 PR 7b) adds ``abandon_case`` and ``abort_note_sha256``, the ``abort_reason`` value
 # ``operator_abandoned``, and the ``counter_disposition`` kinds an abandon records
 # (``expired_empty_open``, ``f_expired``, ``unknown``).
-SWAP_RECORD_SCHEMA_VERSION = 7
+# v8 (#850 PR 8) adds the ``abort_reason`` value ``taker_never_funds``.
+# v9 (#850 PR 8) adds ``read_without_role``.
+SWAP_RECORD_SCHEMA_VERSION = 9
 #: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
 #: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours. The coordinator keeps
 #: the oldest and the newest: when replacements never reach the node, the oldest is the one it holds.
@@ -167,6 +169,10 @@ class AbortReason(Enum):
     #: chain showed a case with no automatic end, named by ``SwapRecord.abandon_case``. Nothing was
     #: refunded by this step, and the counter-leg locator stays on the record.
     OPERATOR_ABANDONED = "operator_abandoned"
+    #: The taker ended a NEGOTIATED record with ``abandon_unfunded`` (#850 PR 8, design §3.5): it
+    #: held nothing that may hold value (no BTC funding transaction, no native contract, and a token
+    #: contract only if it was never pushed into and holds no tokens). Nothing was sent.
+    TAKER_NEVER_FUNDS = "taker_never_funds"
 
 
 class AbandonCase(Enum):
@@ -865,6 +871,14 @@ class SwapRecord:
     #: holding the operator's note (design D18), so the record itself carries no free text.
     abandon_case: AbandonCase | None = None
     abort_note_sha256: str | None = None
+    #: This record was once read with no ``role`` (#850 PR 8), so it may have been written by pyrxd
+    #: 0.26.x or earlier, which recorded no BTC funding transaction before its broadcast (#841).
+    #: ``from_dict`` sets it on a record without a role and keeps it once written, and
+    #: ``JsonFileRecordSink`` sets it on a write over a record on disk without a role, so a role
+    #: stamped later by a 0.27 coordinator does not erase what the missing role said. Written only
+    #: with a role: a record without one says the same thing by itself. ``compare=False``: a record
+    #: without a role reads back with the mark, and is still the same record.
+    read_without_role: bool = dataclasses.field(default=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -984,6 +998,8 @@ class SwapRecord:
             h = self.abort_note_sha256
             if not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
                 raise ValidationError("abort_note_sha256 must be 64 lower-case hex characters")
+        if not isinstance(self.read_without_role, bool):
+            raise ValidationError("read_without_role must be a bool")
         if (
             self.counter_disposition is not None
             and self.counter_disposition.kind in ABANDON_ONLY_DISPOSITION_KINDS
@@ -1140,6 +1156,7 @@ class SwapRecord:
         }
         loc = self.counterchain_locator
         # Any post-v2 field writes the current maximum; without one, the pre-0.27 form exactly.
+        # (``read_without_role`` is written only with ``role``, which is one.)
         post_v2 = (
             self.role is not None
             or self.counter_claim_tx is not None
@@ -1210,6 +1227,8 @@ class SwapRecord:
             d["push_close_nonce"] = self.push_close_nonce
         if self.push_signer is not None:
             d["push_signer"] = self.push_signer
+        if self.read_without_role and self.role is not None:
+            d["read_without_role"] = True
         return d
 
     @classmethod
@@ -1225,6 +1244,9 @@ class SwapRecord:
                     "know. Upgrade pyrxd to read it, and do not drive one record from mixed versions."
                 )
         role = d.get("role")
+        kept = d.get("read_without_role", False)
+        if not isinstance(kept, bool):
+            raise ValidationError(f"read_without_role must be a bool, got {kept!r}")
         if "counterchain_locator" in d:  # v2 chain-tagged form
             cc = d["counterchain_locator"]
             chain, locd = cc.get("chain"), cc.get("locator")
@@ -1274,6 +1296,7 @@ class SwapRecord:
             push_signer=d.get("push_signer"),
             abandon_case=_abandon_case(d.get("abandon_case")),
             abort_note_sha256=d.get("abort_note_sha256"),
+            read_without_role=kept or role is None,
         )
 
 

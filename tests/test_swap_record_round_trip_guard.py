@@ -155,6 +155,9 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
     "single_operator_override": [("override", _with(_btc_base, single_operator_override="operator said so"), ())],
     "fund_refusal": [("fund-refusal", _with(_btc_base, fund_refusal="refused: gate"), ())],
     "role": [(f"role-{r.value}", _with(_btc_base, role=r), ()) for r in RecordRole],
+    "read_without_role": [
+        ("read-without-role", _with(_btc_base, role=RecordRole.TAKER, read_without_role=True), ()),
+    ],
     "counter_claim_tx": [("counter-claim-tx", _with(_eth_base, counter_claim_tx="0x" + "c1" * 32), ())],
     "counter_disposition": [
         (
