@@ -31,6 +31,7 @@ from pyrxd.btc_wallet.taproot import (
     BtcHtlcLocator,
     Timelock,
     TimeUnit,
+    btc_input_outpoints_from_raw,
     btc_txid_from_raw,
 )
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, check_hex_addr, check_tx_hash
@@ -55,7 +56,9 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # (``expired_empty_open``, ``f_expired``, ``unknown``).
 # v8 (#850 PR 8) adds the ``abort_reason`` value ``taker_never_funds``.
 # v9 (#850 PR 8) adds ``read_without_role``.
-SWAP_RECORD_SCHEMA_VERSION = 9
+# v10 (#850 PR 9a) adds ``counter_refund_raw`` (BTC), and allows ``counter_claim_tx`` and
+# ``counter_disposition`` on a BTC record, with BTC txid and block hash shapes.
+SWAP_RECORD_SCHEMA_VERSION = 10
 #: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
 #: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours. The coordinator keeps
 #: the oldest and the newest: when replacements never reach the node, the oldest is the one it holds.
@@ -199,6 +202,21 @@ class AbandonCase(Enum):
 ABANDON_ONLY_DISPOSITION_KINDS = frozenset({"expired_empty_open", "f_expired", "unknown"})
 
 
+def _is_btc_hash(value: Any) -> bool:
+    """A BTC txid or block hash as pyrxd records one: 64 lower-case hex characters, no prefix."""
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _check_chain_hash(value: Any, what: str) -> str:
+    """An ETH hash (:func:`check_tx_hash`) or a BTC one (:func:`_is_btc_hash`)."""
+    if _is_btc_hash(value):
+        return str(value)
+    try:
+        return check_tx_hash(value)
+    except ValidationError:
+        raise ValidationError(f"{what} must be 0x + 64 hex (ETH) or 64 lower-case hex (BTC), not {value!r}") from None
+
+
 @dataclasses.dataclass(frozen=True)
 class CounterDispositionRecord:
     """The chain evidence behind a counter-leg transition, as recorded on the swap (#850 PR 5a).
@@ -225,9 +243,13 @@ class CounterDispositionRecord:
             raise ValidationError(f"a {self.kind} counter_disposition names no transaction")
         if not isinstance(self.block_number, int) or isinstance(self.block_number, bool) or self.block_number < 0:
             raise ValidationError("counter_disposition.block_number must be a non-negative int")
-        check_tx_hash(self.block_hash)  # same shape: 0x + 32 bytes
+        # ETH (0x + 32 bytes) or BTC (32 bytes, bare lower-case hex, #850 PR 9a). One record does not
+        # mix them, and SwapRecord checks the shape against its counter chain.
+        _check_chain_hash(self.block_hash, "counter_disposition.block_hash")
         if self.tx_hash is not None:
-            check_tx_hash(self.tx_hash)
+            _check_chain_hash(self.tx_hash, "counter_disposition.tx_hash")
+            if _is_btc_hash(self.tx_hash) != _is_btc_hash(self.block_hash):
+                raise ValidationError("counter_disposition mixes an ETH and a BTC hash")
         if not isinstance(self.sources, tuple) or not all(isinstance(x, str) for x in self.sources):
             raise ValidationError("counter_disposition.sources must be a tuple of str")
         if not isinstance(self.single_source, bool):
@@ -851,6 +873,11 @@ class SwapRecord:
     #: it replaced, or never reach the node, so what holds the nonce can be any of them. Cleared when
     #: a refund is signed at another nonce; at most :data:`MAX_REPLACED_REFUNDS` kept.
     counter_refund_replaced_tx_hashes: tuple[str, ...] = ()
+    #: Our own refund of the BTC counter leg (#850 PR 9a, design §6): the signed transaction, hex,
+    #: written between signing and broadcasting, so a crash after the send cannot lose it and a
+    #: re-send uses the same bytes. An RBF bump re-signs at a higher fee and overwrites it. Its txid
+    #: is derived from the bytes. Not evidence of anything: only the chain read is.
+    counter_refund_raw: str | None = None
     #: ``"<number>:0x<hash>"`` of a finalized block at which the counter-leg contract was unsettled
     #: and at or past its timeout, from a quorum read (design §2.3 ``F_EXPIRED``). From then on no
     #: claim can succeed, so a later settlement is a refund; the hash is rechecked canonical at use.
@@ -970,15 +997,37 @@ class SwapRecord:
             raise ValidationError("fund_refusal must be a str or None")
         if self.role is not None and not isinstance(self.role, RecordRole):
             raise ValidationError("SwapRecord.role must be a RecordRole or None")
+        btc = self.terms.counter_chain == "btc"
         if self.counter_claim_tx is not None:
-            if self.terms.counter_chain != "eth":
-                raise ValidationError("counter_claim_tx is an ETH counter-leg field")
-            check_tx_hash(self.counter_claim_tx)
+            if btc:
+                if not _is_btc_hash(self.counter_claim_tx):
+                    raise ValidationError("counter_claim_tx on a BTC record must be a txid: 64 lower-case hex")
+            else:
+                check_tx_hash(self.counter_claim_tx)
         if self.counter_disposition is not None:
             if not isinstance(self.counter_disposition, CounterDispositionRecord):
                 raise ValidationError("counter_disposition must be a CounterDispositionRecord or None")
-            if self.terms.counter_chain != "eth":
-                raise ValidationError("counter_disposition is an ETH counter-leg field")
+            if _is_btc_hash(self.counter_disposition.block_hash) != btc:
+                raise ValidationError(
+                    f"counter_disposition hashes are not {'BTC' if btc else 'ETH'}-shaped, on a "
+                    f"{self.terms.counter_chain} counter leg"
+                )
+        if self.counter_refund_raw is not None:
+            if not btc:
+                raise ValidationError("counter_refund_raw is a BTC counter-leg field")
+            if not isinstance(self.counter_refund_raw, str):
+                raise ValidationError("counter_refund_raw must be hex")
+            try:
+                refund_raw = bytes.fromhex(self.counter_refund_raw)
+            except ValueError:
+                raise ValidationError("counter_refund_raw must be hex") from None
+            btc_txid_from_raw(refund_raw)  # it parses
+            loc = self.counterchain_locator
+            if not isinstance(loc, BtcHtlcLocator):
+                raise ValidationError("counter_refund_raw needs the BTC locator it refunds")
+            if loc.funding_outpoint.prevout_bytes() not in btc_input_outpoints_from_raw(refund_raw):
+                raise ValidationError("counter_refund_raw does not spend this record's BTC HTLC funding outpoint")
+            object.__setattr__(self, "counter_refund_raw", refund_raw.hex())
         if self.abort_reason is not None and not isinstance(self.abort_reason, AbortReason):
             raise ValidationError("abort_reason must be an AbortReason or None")
         abandoned = self.abort_reason is AbortReason.OPERATOR_ABANDONED
@@ -1165,6 +1214,7 @@ class SwapRecord:
             or self.abandon_case is not None
             or self.asset_refund_txid is not None
             or self.counter_refund_tx_hash is not None
+            or self.counter_refund_raw is not None
             or self.counter_expiry_anchor is not None
             or self.push_close_tx_hash is not None
             or self.push_signer is not None
@@ -1220,6 +1270,8 @@ class SwapRecord:
             d["counter_refund_nonce"] = self.counter_refund_nonce
         if self.counter_refund_replaced_tx_hashes:
             d["counter_refund_replaced_tx_hashes"] = list(self.counter_refund_replaced_tx_hashes)
+        if self.counter_refund_raw is not None:
+            d["counter_refund_raw"] = self.counter_refund_raw
         if self.counter_expiry_anchor is not None:
             d["counter_expiry_anchor"] = self.counter_expiry_anchor
         if self.push_close_tx_hash is not None:
@@ -1290,6 +1342,7 @@ class SwapRecord:
             counter_refund_tx_hash=d.get("counter_refund_tx_hash"),
             counter_refund_nonce=d.get("counter_refund_nonce"),
             counter_refund_replaced_tx_hashes=_hash_tuple(d.get("counter_refund_replaced_tx_hashes")),
+            counter_refund_raw=d.get("counter_refund_raw"),
             counter_expiry_anchor=d.get("counter_expiry_anchor"),
             push_close_tx_hash=d.get("push_close_tx_hash"),
             push_close_nonce=d.get("push_close_nonce"),

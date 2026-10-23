@@ -54,6 +54,7 @@ from pyrxd.btc_wallet.taproot import (
     Timelock,
     TimeUnit,
     btc_input_outpoints_from_raw,
+    btc_spend_fields_from_raw,
 )
 from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy
@@ -4709,17 +4710,27 @@ class SwapCoordinator:
 
     @_serialized_step
     async def reconcile_counter_leg(self) -> SwapRecord:
-        """Bring the record up to what the chain shows about the ETH counter leg (#850 PR 5a,
-        design §3.3). No broadcast. Valid from BTC_LOCKED, PARAMS_MISMATCH and BOTH_LOCKED.
+        """Bring the record up to what the chain shows about the counter leg (#850 PR 5a for ETH,
+        design §3.3; PR 9a for BTC, design §6). No broadcast. Valid from BTC_LOCKED,
+        PARAMS_MISMATCH and BOTH_LOCKED. A BTC leg is read by
+        :meth:`_apply_btc_counter_disposition`, which keeps the D14 hold on a recorded claim.
 
         An unreadable, below-quorum or contradictory chain changes nothing and raises
         :class:`NetworkError` with the reason; see :meth:`_apply_counter_disposition` for the rest.
         """
         if self.record.state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
             raise ValidationError(f"reconcile_counter_leg not valid from {self.record.state.value}")
+        if self._btc_disposition_readable():
+            disposition = await self._read_btc_counter_disposition()
+            outcome = await self._apply_btc_counter_disposition(disposition)
+            if outcome == "unknown":
+                raise NetworkError(f"the counter leg's disposition is unknown: {disposition.reason}")
+            if outcome == "single_source":
+                raise self._btc_single_source_refusal(disposition)
+            return self.record
         disposition = await self._read_counter_disposition()
         if disposition is None:
-            raise ValidationError("reconcile_counter_leg needs an ETH counter leg that reads its disposition")
+            raise ValidationError("reconcile_counter_leg needs a counter leg that reads its disposition")
         outcome = await self._apply_counter_disposition(disposition)
         if outcome == "unknown":
             raise NetworkError(f"the counter leg's disposition is unknown: {disposition.reason}")
@@ -4730,6 +4741,277 @@ class SwapCoordinator:
                 kind=disposition.kind.value,
             )
         return self.record
+
+    # -- the BTC counter leg's disposition and our BTC refund (#850 PR 9a, design §6) -------------
+
+    def _btc_disposition_readable(self) -> bool:
+        """Whether this record's counter leg is BTC and its leg reads a disposition (0.27+)."""
+        return (
+            self.record.terms.counter_chain == "btc"
+            and isinstance(self.record.counterchain_locator, BtcHtlcLocator)
+            and getattr(self.counter_leg, "counter_disposition", None) is not None
+        )
+
+    def _btc_burial_blocks(self) -> int:
+        """How deep a BTC spender must be buried before the record moves on it (design §2.5): the
+        reorg depth a measured policy requires of the funding (:meth:`_btc_counter_funding_depth`),
+        else the leg's ``min_confirmations``, and never less than one block."""
+        depth = self._btc_counter_funding_depth()
+        if depth is None:
+            depth = int(getattr(self.counter_leg, "min_confirmations", 1) or 1)
+        return max(1, depth)
+
+    def _btc_single_source_may_decide(self) -> bool:
+        """D4 on BTC: one source decides only on regtest and the test networks (``bcrt``, ``tb``),
+        never on mainnet or a network the leg does not name."""
+        return getattr(self.counter_leg, "network", None) in ("bcrt", "tb")
+
+    async def _read_btc_counter_disposition(self) -> Any:
+        """The BTC counter leg's disposition (``BtcCounterDisposition``); see
+        :func:`pyrxd.btc_wallet.disposition.read_btc_counter_disposition`."""
+        return await self.counter_leg.counter_disposition(
+            self.record.counterchain_locator,
+            hashlock=self.record.terms.hashlock,
+            burial_blocks=self._btc_burial_blocks(),
+        )
+
+    async def _apply_btc_counter_disposition(self, disposition: Any) -> str:
+        """:meth:`_apply_counter_disposition` for a BTC counter leg. No broadcast. Returns one of
+        ``"claimed"``, ``"refunded"``, ``"held"``, ``"recorded"``, ``"single_source"``,
+        ``"unknown"``, ``"none"``, and persists, shielded, whenever the record changed.
+
+        * Every claim seen (``p`` is public in its witness), buried or not, verified or not, is kept as
+          ``counter_claim_tx`` (its txid) whatever else the answer is. From then on a refunded leg
+          is held off the terminal until the covenant's ``t_rxd`` matures (D14, N1).
+        * ``CLAIMED`` (a verified claim, buried): a taker's or single operator's record at BTC_LOCKED
+          or BOTH_LOCKED goes to SECRET_REVEALED. At PARAMS_MISMATCH there is no edge: the evidence
+          is recorded and this raises.
+        * ``REFUNDED`` (a refund, buried): at BTC_LOCKED or PARAMS_MISMATCH, ABORTED
+          (``abort_reason`` ``counter_leg_refunded``); at BOTH_LOCKED a taker's record goes to
+          MUTUAL_REFUND (the covenant is the maker's) and a single operator's is ``"recorded"``,
+          because its MUTUAL_REFUND also needs the covenant refund :meth:`mutual_refund` sends.
+        * A maker's record records the evidence and stays. One source on mainnet changes nothing (D4).
+        """
+        from pyrxd.btc_wallet.disposition import BtcDispositionKind
+
+        changed = False
+        claims = disposition.claims_seen
+        if self.record.counter_claim_tx is None and claims:
+            claim = claims[0]
+            self.record = dataclasses.replace(self.record, counter_claim_tx=claim.txid)
+            changed = True
+            logger.warning(
+                "a spend of the BTC HTLC by its claim leaf opens this swap's hashlock (tx %s, %s): p is public, so "
+                "claim the covenant before its CSV refund to the maker opens at t_rxd",
+                claim.txid,
+                "verified" if claim.verified else "signature not verified",
+            )
+        kind = disposition.kind
+        outcome = "unknown" if kind is BtcDispositionKind.UNKNOWN else "none"
+        evidence = disposition.evidence
+        if kind in (BtcDispositionKind.CLAIMED, BtcDispositionKind.REFUNDED) and evidence is not None:
+            if disposition.single_source and not self._btc_single_source_may_decide():
+                logger.warning(
+                    "the BTC counter leg reads %s, but from ONE source on network %r; nothing changes until a "
+                    "quorum of sources agrees (design §2.5)",
+                    kind.value,
+                    getattr(self.counter_leg, "network", None),
+                )
+                outcome = "single_source"
+            else:
+                self.record = dataclasses.replace(
+                    self.record,
+                    counter_disposition=CounterDispositionRecord(
+                        kind=kind.value,
+                        block_number=evidence.block_number,
+                        block_hash=evidence.block_hash,
+                        tx_hash=evidence.txid,
+                        sources=tuple(evidence.sources),
+                        single_source=evidence.single_source,
+                    ),
+                )
+                changed = True
+                outcome = "recorded"
+                state = self.record.state
+                acts = self.config.role is not SwapRole.MAKER
+                if kind is BtcDispositionKind.CLAIMED:
+                    self.record = dataclasses.replace(self.record, counter_claim_tx=evidence.txid)
+                    if acts and state is SwapState.PARAMS_MISMATCH:
+                        await self._persist_record(self.record, shield=True)
+                        raise ValidationError(
+                            "the BTC counter leg was CLAIMED (verified, buried) after a params mismatch. There is "
+                            "deliberately no path into the taker's claim flow from here: refund your covenant by its "
+                            "CSV leg at t_rxd. The evidence is on the record."
+                        )
+                    if acts and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED):
+                        if self.record.radiant_covenant_outpoint is None:
+                            await self._persist_record(self.record, shield=True)
+                            raise ValidationError(
+                                "the BTC counter leg was CLAIMED (verified, buried), so p is public, but this record "
+                                "names no covenant outpoint to claim. Find the covenant (pyrxd swap status) and claim "
+                                "it with p before t_rxd. The evidence is on the record."
+                            )
+                        self._advance(SwapEvent.COUNTER_LEG_CLAIMED_OBSERVED)
+                        outcome = "claimed"
+                elif acts and state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
+                    if await self._claim_seen_holds_the_terminal():
+                        outcome = "held"
+                    else:
+                        self.record = dataclasses.replace(self.record, abort_reason=AbortReason.COUNTER_LEG_REFUNDED)
+                        self._advance(SwapEvent.COUNTER_LEG_REFUNDED_OBSERVED)
+                        outcome = "refunded"
+                elif acts and state is SwapState.BOTH_LOCKED:
+                    if await self._claim_seen_holds_the_terminal():
+                        outcome = "held"
+                    elif self.config.role is SwapRole.TAKER:
+                        self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
+                        outcome = "refunded"
+        if changed:
+            await self._persist_record(self.record, shield=True)
+        return outcome
+
+    def _btc_single_source_refusal(self, disposition: Any) -> CounterLegSingleSourceAnswer:
+        return CounterLegSingleSourceAnswer(
+            f"the BTC counter leg reads {disposition.kind.value} from ONE source on network "
+            f"{getattr(self.counter_leg, 'network', None)!r}; nothing changes and nothing is sent until a quorum of "
+            "sources agrees (design §2.5). Give the leg a MultiSourceBtcFundingReader.",
+            kind=disposition.kind.value,
+        )
+
+    async def _btc_refund_on_the_read(self, disposition: Any, *, step: str) -> SwapRecord:
+        """Send or follow our BTC counter-leg refund once the read says nothing terminal (design §6).
+        Never advances the record: it moves when the refund is buried (the next read).
+
+        * ``CLAIM_SEEN``: nothing is sent; the claim is on record (:meth:`_apply_btc_counter_disposition`).
+        * ``REFUND_PENDING`` (ours, or the watchtower's pre-signed one: both spend the refund leaf):
+          mined but shallow, or at a depth below the quorum of answers, it waits. In every source's
+          mempool for :data:`REFUND_REPLACE_AFTER_S` (counted by this coordinator), it is replaced
+          by BIP125 at a higher fee (``BitcoinTaprootLeg.refund_bump_fee``), the new bytes recorded
+          before the broadcast. A bump past the leg's cap raises
+          :class:`CounterLegRefundNeedsOperator` (``cause`` ``"fee_cap"``) and sends nothing.
+        * ``UNSPENT``, or ``UNKNOWN`` with no spender named (a read below quorum): the recorded refund
+          is broadcast again, the same bytes; with none recorded one is signed, recorded, then sent.
+          Re-broadcasting our own refund changes nothing that a read has not shown.
+        * ``UNKNOWN`` with a spender named (contradicting sources): nothing is sent, and this raises
+          :class:`CounterLegDispositionUnknown`.
+        """
+        from pyrxd.btc_wallet.disposition import BtcDispositionKind
+
+        kind = disposition.kind
+        locator = self.record.counterchain_locator
+        if kind is BtcDispositionKind.CLAIM_SEEN:
+            logger.warning(
+                "the BTC HTLC has a claim seen (tx %s) that is not yet buried; nothing is sent. p is public: claim "
+                "the covenant before t_rxd",
+                self.record.counter_claim_tx,
+            )
+            return self.record
+        if kind is BtcDispositionKind.UNKNOWN and disposition.spenders:
+            t_rxd = self.record.terms.t_rxd
+            seen = self.record.counter_claim_tx
+            raise CounterLegDispositionUnknown(
+                f"the BTC counter leg's disposition is UNKNOWN ({disposition.reason}); nothing was sent and the "
+                "record did not change. Check the HTLC's funding outpoint on other sources. If it was CLAIMED, p is "
+                f"public: claim the covenant with it before t_rxd = {t_rxd.value} {t_rxd.unit.value} after the "
+                f"covenant was mined. Then run {step} again."
+                + (f" A claim that opens H is on record: tx {seen}." if seen else ""),
+                reason=disposition.reason,
+            )
+        if kind is BtcDispositionKind.REFUND_PENDING:
+            refunds = disposition.refunds_seen
+            mined = [r for r in refunds if r.confirmations != 0]
+            if mined:
+                logger.info(
+                    "the BTC refund %s is %s; waiting until it is buried %d deep",
+                    mined[0].txid,
+                    "below the quorum of depth answers" if mined[0].confirmations is None else "mined",
+                    self._btc_burial_blocks(),
+                )
+                return self.record
+            # In the mempool. Two of ours may be (one source holds the bump, another the original):
+            # the bump is priced over the one paying the most.
+            pending = max(refunds, key=lambda r: -sum(v for v, _spk in btc_spend_fields_from_raw(r.raw).outputs))
+            since = self._refund_pending_since.setdefault(pending.txid, _monotonic())
+            waited = _monotonic() - since
+            if waited < REFUND_REPLACE_AFTER_S:
+                logger.info("the BTC refund %s is in the mempool (%.0fs seen); waiting", pending.txid, waited)
+                return self.record
+            try:
+                fee = self.counter_leg.refund_bump_fee(locator, pending.raw)
+            except ValidationError as exc:
+                raise CounterLegRefundNeedsOperator(
+                    f"the BTC refund {pending.txid} has been in the mempool {waited:.0f}s and was not bumped: {exc}. "
+                    "Nothing was sent. Bump it from a wallet that holds the refund key, or wait for it to confirm.",
+                    tx_hash=pending.txid,
+                    cause="fee_cap",
+                ) from exc
+            logger.warning(
+                "the BTC refund %s is still unconfirmed after %.0fs; replacing it at a fee of %d sats",
+                pending.txid,
+                waited,
+                fee,
+            )
+            return await self._send_btc_refund(
+                await self.counter_leg.sign_refund(locator, self.record.terms.t_btc, fee_sats=fee)
+            )
+        # UNSPENT, or UNKNOWN with no spender named.
+        recorded = self.record.counter_refund_raw
+        if recorded is not None:
+            logger.info("the BTC HTLC reads unspent; broadcasting our recorded refund again")
+            await self.counter_leg.broadcast_refund(bytes.fromhex(recorded))
+            return self.record
+        return await self._send_btc_refund(await self.counter_leg.sign_refund(locator, self.record.terms.t_btc))
+
+    async def _send_btc_refund(self, raw: bytes) -> SwapRecord:
+        """Record *raw* as our BTC refund (shielded), then broadcast it (design §2.8)."""
+        self.record = dataclasses.replace(self.record, counter_refund_raw=bytes(raw).hex())
+        await self._persist_record(self.record, shield=True)
+        txid = await self.counter_leg.broadcast_refund(raw)
+        logger.info("our BTC refund %s is sent; the record moves once it is buried", txid)
+        return self.record
+
+    async def _taker_refund_btc_on_the_read(self) -> SwapRecord:
+        """:meth:`taker_refund_btc` on a BTC counter leg that reads its disposition (#850 PR 9a)."""
+        if self.config.role is SwapRole.MAKER:
+            raise ValidationError("taker_refund_btc is the taker's step; refused for a MAKER-role coordinator")
+        disposition = await self._read_btc_counter_disposition()
+        outcome = await self._apply_btc_counter_disposition(disposition)
+        if outcome in ("claimed", "refunded", "held"):
+            return self.record
+        if outcome == "single_source":
+            raise self._btc_single_source_refusal(disposition)
+        return await self._btc_refund_on_the_read(disposition, step="taker_refund_btc")
+
+    async def _mutual_refund_btc_on_the_read(self) -> SwapRecord:
+        """:meth:`mutual_refund` on a BTC counter leg that reads its disposition (#850 PR 9a, F-A on
+        BTC). A TAKER never touches the covenant; a single operator's covenant refund is sent only
+        once the BTC refund is buried."""
+        from pyrxd.btc_wallet.disposition import BtcDispositionKind
+
+        disposition = await self._read_btc_counter_disposition()
+        outcome = await self._apply_btc_counter_disposition(disposition)
+        if outcome in ("claimed", "refunded"):
+            return self.record
+        if outcome == "single_source":
+            raise self._btc_single_source_refusal(disposition)
+        if outcome == "held":
+            logger.warning(
+                "the BTC HTLC is refunded and buried, but a claim of it (tx %s) opens H, so p is public: claim the "
+                "covenant before t_rxd. The record stays BOTH_LOCKED until t_rxd matures.",
+                self.record.counter_claim_tx,
+            )
+            return self.record
+        if disposition.kind is BtcDispositionKind.CLAIMED:
+            # Only a maker's record records a buried claim without taking the edge (refused before this).
+            raise ValidationError("the BTC counter leg was CLAIMED; mutual_refund sends nothing")
+        if disposition.kind is not BtcDispositionKind.REFUNDED:
+            return await self._btc_refund_on_the_read(disposition, step="mutual_refund")
+        if outcome != "recorded":
+            raise ValidationError("the BTC counter leg reads refunded with no evidence; mutual_refund sends nothing")
+        # REFUNDED, buried and not held, on a single operator's record: its covenant refund now.
+        failures: list[tuple[str, Exception]] = []
+        await self._refund_the_covenant_once(failures)
+        return await self._finish_mutual_refund(failures, counter_leg_refunded=True)
 
     # -- an empty expired token contract: close the push nonce (#850 PR 7a, design §2.7) ----------
 
@@ -5330,12 +5612,24 @@ class SwapCoordinator:
         A mined refund that reverted is not re-sent: :class:`CounterLegPayoutReverts` when the
         payout is what fails, else :class:`CounterLegRefundNeedsOperator`; after looking, the
         operator passes ``resend_reverted_refund=True`` to send one more.
+
+        **BTC counter leg** (#850 PR 9a, design §6), when the leg reads its disposition
+        (``BitcoinTaprootLeg.counter_disposition``): the same shape. What the chain shows is read
+        first (:meth:`_apply_btc_counter_disposition`); the record goes to ABORTED only once a refund
+        is buried at the quorum's depth, and a buried verified claim takes it to SECRET_REVEALED.
+        Our refund's raw bytes are recorded (``counter_refund_raw``) before the broadcast; a retry
+        re-sends those bytes, or after :data:`REFUND_REPLACE_AFTER_S` in the mempool replaces them by
+        BIP125 (:meth:`_btc_refund_on_the_read`). ``MAKER`` role is refused; ``resend_reverted_refund``
+        has no meaning on BTC. A BTC leg that reads no disposition keeps the old path: refund, then
+        ABORTED on the broadcast.
         """
         state = self.record.state
         if state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
             raise ValidationError(f"taker_refund_btc not valid from {state.value}")
         if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot refund (state was lost)")
+        if self._btc_disposition_readable():
+            return await self._taker_refund_btc_on_the_read()
         disposition = await self._read_counter_disposition()
         if disposition is not None:
             # ETH (#850 PR 5a, design §3.3): read what the chain shows FIRST. The refund is the
@@ -5592,12 +5886,19 @@ class SwapCoordinator:
           covenant's ``t_rxd`` has not matured, neither terminal is taken and the covenant is not
           refunded (D14, N1): ``p`` may be public, and the covenant claim comes first.
 
-        **BTC counter leg, and an ETH leg that cannot read its disposition** (a leg written before
-        0.27): unchanged, except that ``MAKER`` on ETH is refused here too. ``TAKER`` on ETH
-        refunds the counter leg only and stays BOTH_LOCKED. Every other case attempts both refunds
-        and goes to MUTUAL_REFUND only if both returned. The BTC claim leaf has no timelock, so a
-        maker can still claim with ``p`` while the taker's refund is unconfirmed; fixing BTC needs
-        the watchtower's spender classification first (#850 PR 9).
+        **BTC counter leg that reads its disposition** (#850 PR 9a, design §6; F-A on BTC), for a
+        ``TAKER`` or single-operator record: the same rules, read by
+        :meth:`_apply_btc_counter_disposition` and sent or followed by :meth:`_btc_refund_on_the_read`
+        (raw bytes recorded before the broadcast, re-sent unchanged, replaced by BIP125 after
+        :data:`REFUND_REPLACE_AFTER_S`). A buried refund takes a ``TAKER`` record to MUTUAL_REFUND
+        without touching the covenant; a single operator's covenant refund is sent only then. The
+        D14 hold applies as on ETH. Until #850 PR 9b the watchtower still reads the taker's own
+        refund as a claim and pages it.
+
+        **A leg that cannot read its disposition** (written before 0.27), or a ``MAKER`` on BTC:
+        unchanged, except that ``MAKER`` on ETH is refused. ``TAKER`` refunds the counter leg only
+        and stays BOTH_LOCKED. Every other case attempts both refunds and goes to MUTUAL_REFUND
+        only if both returned.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(f"mutual_refund only valid from BOTH_LOCKED, not {self.record.state.value}")
@@ -5609,15 +5910,18 @@ class SwapCoordinator:
                 "mutual_refund on an ETH counter leg is not the maker's step: the counter leg is the taker's to "
                 "refund. The maker's own recovery is maybe_refund_asset_on_maker_stall."
             )
+        if self._btc_disposition_readable() and self.config.role is not SwapRole.MAKER:
+            return await self._mutual_refund_btc_on_the_read()
         disposition = await self._read_counter_disposition()
         if disposition is not None:
             return await self._mutual_refund_on_the_read(disposition, resend_reverted_refund=resend_reverted_refund)
-        if eth and self.config.role is SwapRole.TAKER:
-            # A leg that reads no disposition: the taker's own leg only, as #851 shipped it. No FSM
-            # advance: the record already says BOTH_LOCKED, which is still true of the covenant.
+        if self.config.role is SwapRole.TAKER:
+            # A leg that reads no disposition: the taker's own leg only, as #851 shipped it for ETH
+            # and #850 PR 9a extends to BTC (F-A). No FSM advance: the record already says
+            # BOTH_LOCKED, which is still true of the covenant.
             await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
             logger.info(
-                "mutual_refund (TAKER role, ETH): counter-leg refund sent; the covenant is left for the "
+                "mutual_refund (TAKER role): counter-leg refund sent; the covenant is left for the "
                 "maker to refund and the record stays BOTH_LOCKED."
             )
             return self.record

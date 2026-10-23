@@ -1117,6 +1117,17 @@ def build_refund_tx(
 # ---------------------------------------------------------------------------
 
 
+def btc_vsize_from_raw(raw_tx: bytes) -> int:
+    """BIP141 virtual size of a SEGWIT transaction (#850 PR 9a, the refund's RBF bump): the
+    stripped form is the whole less the marker, flag and witness section. Raises
+    :class:`ValidationError` for a transaction without the segwit marker."""
+    raw = bytes(raw_tx)
+    if raw[4:6] != b"\x00\x01":
+        raise ValidationError("btc_vsize_from_raw needs a segwit transaction (marker and flag)")
+    witness = sum(len(_serialize_witness(stack)) for stack in _iter_witness_stack(raw))
+    return bitcoin_virtual_size(stripped_size=len(raw) - 2 - witness, total_size=len(raw))
+
+
 def btc_txid_from_raw(raw_tx: bytes) -> str:
     """Compute a BTC transaction's canonical txid (big-endian hex) from raw bytes.
 
