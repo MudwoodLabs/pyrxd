@@ -526,6 +526,24 @@ class BitcoinTaprootLeg:
             )
         return self._htlc(terms).with_funding(outpoint, int(funded_sats))
 
+    # -- the counter leg's disposition, read from the chain (async, #850 PR 9a) ----
+    async def counter_disposition(self, locator: t.BtcHtlcLocator, *, hashlock: bytes, burial_blocks: int):
+        """What the chain shows about *locator*'s funding outpoint: unspent, or spent by a claim or
+        a refund, and whether that spend is buried *burial_blocks* deep
+        (:func:`pyrxd.btc_wallet.disposition.read_btc_counter_disposition`). Read only.
+
+        The sources are this leg's ``funding_reader``: each source of a quorum reader that exposes
+        ``panel()`` (:class:`pyrxd.network.bitcoin.MultiSourceBtcFundingReader`) with its quorum, or
+        the one reader alone (``single_source``). A reader without the spender read answers
+        UNKNOWN, never "unspent"."""
+        from .disposition import read_btc_counter_disposition
+
+        panel = getattr(self.funding_reader, "panel", None)
+        readers, quorum = panel() if callable(panel) else ((self.funding_reader,), 1)
+        return await read_btc_counter_disposition(
+            readers, locator, hashlock=hashlock, burial_blocks=burial_blocks, quorum=quorum
+        )
+
     # -- reorg gate: confirmation depth of the maker's claim (async) --------
     async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
         """Confirmation depth of the maker's BTC claim tx (the reorg gate's input).

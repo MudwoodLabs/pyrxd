@@ -8,6 +8,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd.btc_wallet.disposition.read_btc_counter_disposition`: what the chain says about a BTC
+  counter-leg HTLC's funding outpoint, read from every source rather than from what we broadcast
+  (#850 PR 9a, part 1).** It reports `UNSPENT`, `REFUND_PENDING`, `REFUNDED`, `CLAIM_SEEN`,
+  `CLAIMED` or `UNKNOWN` with a reason, and every spender any source named. Nothing in the
+  coordinator calls it yet; `BitcoinTaprootLeg.counter_disposition` wraps it for the leg's own
+  funding reader.
+  - Any one source naming a spender nominates it. Its bytes must hash to the txid it is filed under
+    and spend this outpoint, or that source counts as failed. "Unspent" needs the quorum saying so.
+  - A spender is classified by the leaf its witness spends, never by txid: the claim leaf with a
+    push that opens the hashlock is a claim, and the refund leaf is a refund (so the watchtower's
+    pre-signed refund is recognised as ours). A spend by neither is `UNKNOWN`.
+  - A spender is terminal (`REFUNDED` or `CLAIMED`) only when it is buried the given depth at the
+    quorum minimum and the sources that place it in a block agree on that block. Below that a
+    claim is `CLAIM_SEEN` and a refund `REFUND_PENDING`. Two different spenders both buried is
+    `UNKNOWN`.
+  - New reads: `outpoint_spender` and `tx_block` on `MempoolSpaceFundingReader` and
+    `BitcoinCoreFundingReader` (the Core one delegates to
+    `BitcoinCoreRpcSource.get_outpoint_spender`), and `MultiSourceBtcFundingReader.panel()`.
+  - With one source, every answer is marked `single_source`.
+
 - **`pyrxd.eth_wallet.disposition.read_counter_disposition`: what the chain says about an ETH
   counter-leg HTLC, read from the chain rather than from what we broadcast (#850 PR 4).** It
   reports `OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `SETTLED_UNFINAL`, `REFUNDED`, `CLAIMED` or
