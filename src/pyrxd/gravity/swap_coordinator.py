@@ -3103,12 +3103,12 @@ class SwapCoordinator:
             if not reserved:
                 raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
 
-        # An ETH-side contract address is not derivable from terms — it depends on the deployer's
-        # nonce — so unlike the BTC path there is nothing to persist BEFORE the broadcast. The next
-        # best thing is to persist it the instant the deploy confirms and, for the token leg,
-        # strictly before the tokens are pushed into it. Without this the intent record above knows
-        # the swap exists but not WHERE its value went, and a crash mid-fund leaves real value in a
-        # contract referenced only by an exception string.
+        # An ETH-side contract address is not derivable from terms alone — it depends on the deployer's
+        # nonce. The native leg derives it from the signed deploy and calls `on_deploy` before the
+        # broadcast (`EthHtlcContractLeg.fund`); the token leg, whose deploy carries no value, calls it
+        # the instant the deploy confirms and strictly before the tokens are pushed into it. Without
+        # this the intent record above knows the swap exists but not WHERE its value went, and a crash
+        # mid-fund leaves real value in a contract referenced only by an exception string.
         async def _remember_push_nonce(nonce: int) -> None:
             # Durable BEFORE the push is broadcast. The pin is only worth anything on a retry, and a
             # retry only happens after a crash — so a pin recorded after the send is the one thing
@@ -4461,6 +4461,10 @@ class SwapCoordinator:
             from .swap_state import parse_expiry_anchor
 
             kwargs["expiry_anchor"] = parse_expiry_anchor(self.record.counter_expiry_anchor)
+        if self.record.counter_claim_tx is not None:
+            # A claim seen earlier is nominated by its hash, so it is verified by its receipt when its log
+            # is no longer served (Mythos review of #850 PR 7b, F1).
+            kwargs["recorded_claim_hashes"] = (self.record.counter_claim_tx,)
         if isinstance(locator, Erc20HtlcLocator):
             # #850 PR 7a: the highest nonce a push for this contract (or our close of it) was signed
             # at, and the key that signed the push. With no push nonce recorded the close is the only
@@ -4892,10 +4896,14 @@ class SwapCoordinator:
         carries only its SHA-256, ``abandon_case`` and ``abort_reason`` ``OPERATOR_ABANDONED``, with
         the read as ``counter_disposition``. A recorded ``Claimed`` log does not hold this step
         (D14): it is the operator's choice, made with that page in front of them, and every
-        ``Claimed`` log the read saw goes into the sidecar. The exception is ``SETTLED_UNVERIFIABLE``:
-        it is accepted only on the read that checked every gate without a contradiction (settled at
-        the finalized block, that block at or past the timeout, every nominated transaction checked),
-        and refused while a ``Claimed`` log that opens H is seen, since that log carries ``p``.
+        ``Claimed`` log the read saw goes into the sidecar, and the first onto the record as
+        ``counter_claim_tx``. The exception is ``SETTLED_UNVERIFIABLE``: it is accepted only on the
+        read that checked every gate without a contradiction (settled at the finalized block, that
+        block at or past the timeout, every nominated transaction checked), and refused while a
+        ``Claimed`` log that opens H is seen or on the record, since that log carries ``p``. A claim
+        on the record is nominated to the reader by its hash. Every case but ``SINGLE_SOURCE_REFUND``
+        read from one endpoint on a chain that carries value raises :class:`NetworkError` (D4), and a
+        record on disk at another state, or holding a claim this record lacks, is refused.
 
         What it gives up: on ``SETTLED_UNVERIFIABLE`` the contract may have been CLAIMED, so ``p`` may
         be public and the covenant claimable until t_rxd; on ``EXPIRED_EMPTY`` a token push may still
@@ -4934,6 +4942,7 @@ class SwapCoordinator:
                 "abandon_counter_leg keeps the operator's note in a sidecar file, and this coordinator's persist "
                 "hook cannot write one (use a JsonFileRecordSink); nothing was recorded"
             )
+        self._refuse_to_abandon_over_a_newer_record_on_disk(state)
         disposition = await self._read_counter_disposition()
         if disposition is None:
             raise ValidationError("abandon_counter_leg needs an ETH counter leg that reads its disposition")
@@ -4975,9 +4984,13 @@ class SwapCoordinator:
         }
         digest = write_note(json.dumps(sidecar, indent=2, sort_keys=True).encode())
         before = self.record
+        # A Claimed log the read saw goes on the record as well as into the note, so whatever reads the
+        # record later still sees that p may be public (Mythos review of #850 PR 7b, F3).
+        claim_tx = self.record.counter_claim_tx or next((c.tx_hash for c in disposition.claims_seen), None)
         self.record = dataclasses.replace(
             self.record,
             state=advance(state, SwapEvent.OPERATOR_ABANDONED),
+            counter_claim_tx=claim_tx,
             counter_disposition=recorded,
             abort_reason=AbortReason.OPERATOR_ABANDONED,
             abandon_case=case,
@@ -4999,6 +5012,22 @@ class SwapCoordinator:
         )
         return self.record
 
+    def _refuse_to_abandon_over_a_newer_record_on_disk(self, state: SwapState) -> None:
+        """Refuse when the record of this swap on disk has moved on from this coordinator's: another state,
+        or a recorded claim this record lacks (Mythos review of #850 PR 7b, F4). The sink keeps a state at
+        or after the reveal, so an abandon from a stale record would otherwise be written beside it."""
+        load = getattr(self._persist, "load_record", None)
+        on_disk = load() if callable(load) else None
+        if on_disk is None:
+            return
+        if on_disk.state is not state or (on_disk.counter_claim_tx and not self.record.counter_claim_tx):
+            raise ValidationError(
+                f"the record of this swap on disk is at {on_disk.state.value}"
+                + (f" with a recorded claim {on_disk.counter_claim_tx}" if on_disk.counter_claim_tx else "")
+                + f", and this coordinator's is at {state.value}: rebuild the coordinator from the record on disk. "
+                "Nothing was recorded."
+            )
+
     async def _abandon_case_of(self, disposition: Any, state: SwapState) -> tuple[AbandonCase, str]:
         """The §3.6 case *disposition* shows from *state*, and the read's name; raises
         :class:`AbandonNotAccepted` (or :class:`NetworkError` for an unknown read) when none applies."""
@@ -5007,6 +5036,18 @@ class SwapCoordinator:
         kind = disposition.kind
         name = kind.value
         locator = self.record.counterchain_locator
+        if (
+            disposition.single_source
+            and kind is not DispositionKind.REFUNDED
+            and not self._single_source_may_decide(int(locator.chain_id))
+        ):
+            # D4: one endpoint's answer never ends a record on a chain that carries value. A one-endpoint
+            # refund is the one exception the design names (SINGLE_SOURCE_REFUND), below (Mythos review of
+            # #850 PR 7b, F2).
+            raise NetworkError(
+                f"the counter leg reads {name} from one endpoint, on a chain that carries value: read it from more "
+                "than one. Nothing was recorded."
+            )
         if kind is DispositionKind.EXPIRED_EMPTY_OPEN:
             return AbandonCase.EXPIRED_EMPTY, name
         if kind is DispositionKind.EXPIRED_EMPTY_CLOSED:
@@ -5038,11 +5079,13 @@ class SwapCoordinator:
                 next_step=step,
             )
         if kind is DispositionKind.UNKNOWN:
-            if disposition.settled_unexplained and disposition.claims_seen:
+            if disposition.settled_unexplained and (disposition.claims_seen or self.record.counter_claim_tx):
                 # A Claimed log whose data opens H carries p, verified or not: the covenant claim is
                 # the step, not an abandon (#850 PR 7b review).
+                # The record's own claim counts too: its log may no longer be served (Mythos review, F1).
                 raise AbandonNotAccepted(
-                    "the counter leg is settled and a Claimed log that opens the hashlock is seen, so p is public: "
+                    "the counter leg is settled and a Claimed log that opens the hashlock is seen or on record, so p is "
+                    "public: "
                     "claim the covenant with p before t_rxd (reconcile_counter_leg records the claim). Nothing was "
                     "recorded.",
                     kind=name,
