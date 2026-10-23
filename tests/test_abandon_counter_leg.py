@@ -691,6 +691,66 @@ async def test_HONEST_the_record_on_disk_it_was_built_from_is_abandoned(tmp_path
     assert rec.state is SwapState.ABORTED and sink.load_record() == rec
 
 
+async def test_a_record_on_disk_that_moves_on_during_the_read_is_not_abandoned_over(tmp_path):
+    """F4, re-review: the record on disk is checked again once the (long) read is done, so a reveal
+    written by another process while the read ran is not written over."""
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+    coord._persist = sink
+    real = coord._read_counter_disposition
+
+    async def a_reveal_lands_meanwhile():
+        read = await real()
+        await sink(dataclasses.replace(coord.record, state=SwapState.SECRET_REVEALED))
+        return read
+
+    coord._read_counter_disposition = a_reveal_lands_meanwhile
+    with pytest.raises(ValidationError, match="rebuild the coordinator from the record on disk"):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert sink.load_record().state is SwapState.SECRET_REVEALED and sink.load_record().abort_reason is None
+    assert not sink.abort_note_path.exists() and coord.record.state is SwapState.BTC_LOCKED
+
+
+async def test_the_sink_refuses_a_merged_write_that_would_not_load(tmp_path):
+    """An abandon written over a revealed record keeps the revealed state beside the abandon fields,
+    which no reader accepts; the sink refuses it and the file stays the record that loads."""
+    coord, _chain, _leg, _ = _token()
+    revealed = dataclasses.replace(coord.record, state=SwapState.SECRET_REVEALED)
+    aborted = await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(revealed)
+    before = (tmp_path / "swap.json").read_text()
+    with pytest.raises(ValidationError, match="would not load.*The record on disk is unchanged"):
+        await sink(aborted)
+    assert (tmp_path / "swap.json").read_text() == before
+
+
+async def test_HONEST_the_sink_still_keeps_a_reveal_under_a_rewound_write(tmp_path):
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(dataclasses.replace(coord.record, state=SwapState.SECRET_REVEALED))
+    await sink(dataclasses.replace(coord.record, counter_claim_tx="0x" + "c6" * 32))
+    kept = sink.load_record()
+    assert kept.state is SwapState.SECRET_REVEALED and kept.counter_claim_tx == "0x" + "c6" * 32
+
+
+async def test_a_verified_claim_is_the_one_the_aborted_record_names():
+    coord, chain, leg, _sink = _token()
+    chain.token_balances[30] = 1_000_000
+    leg.revert_reason = "TransferFailed"
+    guessed = ClaimSeen(tx_hash="0x" + "c1" * 32, block_number=70, nominated_by=("a",), verified=False)
+    proven = ClaimSeen(tx_hash="0x" + "c2" * 32, block_number=71, nominated_by=("b",), verified=True)
+    real = coord._read_counter_disposition
+
+    async def with_two_claims():
+        return dataclasses.replace(await real(), claims_seen=(guessed, proven))
+
+    coord._read_counter_disposition = with_two_claims
+    rec = await _abandon(coord, AbandonCase.PAYOUT_REVERTS)
+    assert rec.state is SwapState.ABORTED and rec.counter_claim_tx == proven.tx_hash
+
+
 def test_a_record_may_not_carry_an_abandon_before_it_is_aborted():
     from pyrxd.security.errors import ValidationError as VE
 

@@ -141,11 +141,29 @@ class JsonFileRecordSink:
                 f"overwrite it with a {role}-role record. Run this with the role the record names."
             )
 
+    def _refuse_a_write_that_cannot_be_read_back(self, as_dict: dict[str, Any]) -> None:
+        """The merges above keep fields from disk beside the incoming ones; a combination no reader
+        accepts (an abandon beside a kept revealed state, say) is refused rather than written, so the
+        file stays the last record that loads (Mythos review of #850 PR 7b)."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        try:
+            SwapRecord.from_dict(as_dict)
+        except ValidationError as exc:
+            raise ValidationError(
+                f"refusing to write the swap record at {self._path}: merged with the record on disk it would not "
+                f"load ({exc}). The record on disk is unchanged."
+            ) from exc
+
     async def __call__(self, record: Any) -> None:
         as_dict = record.to_dict()
         prior = self._refuse_to_clobber_a_different_swap(as_dict)
         self._keep_the_persisted_role(prior, as_dict)
         self._keep_a_persisted_reveal(prior, as_dict, self._path)
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        if isinstance(record, SwapRecord):  # a duck-typed record names no wire form to hold it to
+            self._refuse_a_write_that_cannot_be_read_back(as_dict)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
         self._atomic_replace(self._path, payload, what="the swap record")
 
