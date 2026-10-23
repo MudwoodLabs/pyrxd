@@ -125,9 +125,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     measured), even one only a single mempool holds, is replaced by BIP125 at twice its fee, or its
     fee plus 1 sat/vB of the larger of the two transactions if that is more
     (`BitcoinTaprootLeg.refund_bump_fee`; the doubling is chosen, not measured). A recorded refund
-    whose re-broadcast has failed for as long, on reads that show the HTLC unspent (a node may be
-    refusing its fee), is replaced the same way; during a long broadcaster outage this raises the
-    fee step by step up to the cap. A bump that
+    that the node has refused for its fee for as long, on reads that show the HTLC unspent, is
+    replaced the same way. Any other broadcast failure, a transport outage included, re-sends the
+    same bytes and never raises the fee.
+  - New `FeeRejected` (a `NetworkError`, not a `PolicyRejection`): `MempoolSpaceBroadcaster` and
+    `BitcoinCoreBroadcaster` raise it when the node's error names a fee refusal
+    (`pyrxd.network.bitcoin.BTC_FEE_REJECTION_MARKERS`); every other failure is unchanged. A bump that
     would pay more than a tenth of the locked amount, or leave less than the dust limit, is not sent:
     `CounterLegRefundNeedsOperator` with `cause` `"fee_cap"`. The watchtower's pre-signed refund is
     followed and bumped the same way, because classification is by leaf.

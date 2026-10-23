@@ -33,7 +33,7 @@ from urllib.parse import quote, urljoin
 import aiohttp
 
 from ..hash import hash256
-from ..security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
+from ..security.errors import FeeRejected, InsufficientConfirmationsError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
 from ._guards import finite_int, merkle_branch, nonneg_int, require_bool
@@ -1313,6 +1313,19 @@ class _MempoolHttpClient:
         return data
 
 
+#: Bitcoin Core's reject reasons for a transaction whose fee is too low to relay ("min relay fee not
+#: met", "mempool min fee not met") or to replace another under BIP125 ("insufficient fee"). Matched
+#: in a broadcaster's error text to raise :class:`FeeRejected` (#850 PR 9a). From Bitcoin Core's
+#: reject strings; not checked against a pinned Core source here.
+BTC_FEE_REJECTION_MARKERS = ("min relay fee not met", "mempool min fee not met", "insufficient fee")
+
+
+def btc_fee_rejection(text: str) -> str | None:
+    """The :data:`BTC_FEE_REJECTION_MARKERS` entry *text* contains, case-insensitively, else ``None``."""
+    low = text.lower()
+    return next((m for m in BTC_FEE_REJECTION_MARKERS if m in low), None)
+
+
 class MempoolSpaceBroadcaster:
     """``BtcBroadcaster`` over mempool.space ``POST /api/tx`` (the value-moving edge).
 
@@ -1368,6 +1381,9 @@ class MempoolSpaceBroadcaster:
                 if any(m in low for m in ("txn-already-known", "already in block chain", "already in mempool")):
                     # Idempotent success — derive the txid locally (no node on mainnet).
                     return btc_txid_from_raw(raw)
+                fee = btc_fee_rejection(body)
+                if fee is not None:
+                    raise FeeRejected(f"broadcast rejected (HTTP {resp.status}): {fee}", reason=fee)
                 raise NetworkError(f"broadcast rejected (HTTP {resp.status})")
         except aiohttp.ClientError as exc:
             raise NetworkError("broadcast HTTP request failed") from exc

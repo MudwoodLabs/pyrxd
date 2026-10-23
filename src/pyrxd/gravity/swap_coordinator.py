@@ -68,6 +68,7 @@ from pyrxd.security.errors import (
     CounterLegPayoutReverts,
     CounterLegRefundNeedsOperator,
     CounterLegSingleSourceAnswer,
+    FeeRejected,
     NetworkError,
     NothingToRefund,
     PreRevealAbort,
@@ -1901,8 +1902,8 @@ class SwapCoordinator:
         # When this instance first saw each recorded counter-leg refund pending (#850 PR 5b): the
         # clock REFUND_REPLACE_AFTER_S is measured on. In memory on purpose; see that constant.
         self._refund_pending_since: dict[str, float] = {}
-        # When this instance first saw the re-broadcast of our recorded BTC refund fail on a read that
-        # shows the HTLC unspent (#850 PR 9a review, F3): a node that rejects its fee never takes it.
+        # When this instance first saw the re-broadcast of our recorded BTC refund refused for its fee
+        # (FeeRejected) on a read that shows the HTLC unspent (#850 PR 9a review, F3).
         self._refund_rejected_since: dict[str, float] = {}
         # THE ROLE ON THE RECORD (#850 PR 3, design §2.9). The configured role is not persisted, so
         # a record written by one side could be driven by a coordinator configured as the other,
@@ -4895,9 +4896,11 @@ class SwapCoordinator:
           :class:`CounterLegRefundNeedsOperator` (``cause`` ``"fee_cap"``) and sends nothing.
         * ``UNSPENT``, or ``UNKNOWN`` with no spender named (a read below quorum): the recorded refund
           is broadcast again, the same bytes; with none recorded one is signed, recorded, then sent.
-          Re-broadcasting our own refund changes nothing that a read has not shown. When that
-          re-broadcast has failed for :data:`REFUND_REPLACE_AFTER_S` (a node may be refusing its
-          fee), it is replaced as a pending one is, by the same bump rule and cap.
+          Re-broadcasting our own refund changes nothing that a read has not shown. When the node
+          has refused that re-broadcast for its fee (:class:`FeeRejected`) for
+          :data:`REFUND_REPLACE_AFTER_S`, it is replaced as a pending one is, by the same bump rule
+          and cap. Any other broadcast failure (a transport error, an early time-based CSV) only
+          propagates: an outage never raises the fee.
         * ``UNKNOWN`` with a spender named (contradicting sources): nothing is sent, and this raises
           :class:`CounterLegDispositionUnknown`.
         """
@@ -4925,15 +4928,16 @@ class SwapCoordinator:
             )
         if kind is BtcDispositionKind.REFUND_PENDING:
             refunds = disposition.refunds_seen
-            # Mined: a depth at the quorum above zero, or below the quorum but some source has it in a
-            # block. With no source placing it in a block it is pending, even if only one mempool
-            # holds it (review of part 2, F2: that refund must still be bumped).
-            mined = [r for r in refunds if r.confirmations or (r.confirmations is None and (r.deepest or 0) > 0)]
+            # Mined: some source has it in a block, at whatever depth the quorum gives. With no source
+            # placing it in a block it is pending, even if only one mempool holds it (review of part
+            # 2, F2: that refund must still be bumped; re-review R2: a lagging source's 0 must not
+            # make a mined refund read pending and be bumped against its own inputs).
+            mined = [r for r in refunds if r.confirmations or (r.deepest or 0) > 0]
             if mined:
                 logger.info(
                     "the BTC refund %s is %s; waiting until it is buried %d deep",
                     mined[0].txid,
-                    "below the quorum of depth answers" if mined[0].confirmations is None else "mined",
+                    "mined at a depth below the quorum of answers" if not mined[0].confirmations else "mined",
                     self._btc_burial_blocks(),
                 )
                 return self.record
@@ -4954,7 +4958,7 @@ class SwapCoordinator:
             logger.info("the BTC HTLC reads unspent; broadcasting our recorded refund again")
             try:
                 await self.counter_leg.broadcast_refund(raw)
-            except NetworkError:
+            except FeeRejected:
                 since = self._refund_rejected_since.setdefault(txid, _monotonic())
                 waited = _monotonic() - since
                 if waited < REFUND_REPLACE_AFTER_S:

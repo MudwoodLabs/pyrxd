@@ -228,6 +228,12 @@ class BitcoinCoreBroadcaster:
                 # locally — segwit txid = hash256(non-witness), and the node already
                 # has a correct parser, so we don't ship a second one here.
                 return await self._txid_via_node(raw)
+            from pyrxd.network.bitcoin import btc_fee_rejection
+            from pyrxd.security.errors import FeeRejected
+
+            fee = btc_fee_rejection(str(exc))
+            if fee is not None:
+                raise FeeRejected(f"sendrawtransaction failed: {exc}", reason=fee) from exc
             raise NetworkError(f"sendrawtransaction failed: {exc}") from exc
         if not isinstance(result, str):
             raise NetworkError("sendrawtransaction did not return a txid")

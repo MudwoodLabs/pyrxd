@@ -25,6 +25,7 @@ from pyrxd.security.errors import (
     CounterLegDispositionUnknown,
     CounterLegRefundNeedsOperator,
     CounterLegSingleSourceAnswer,
+    FeeRejected,
     NetworkError,
     ValidationError,
 )
@@ -272,7 +273,7 @@ async def test_a_refund_the_node_keeps_refusing_is_replaced_after_the_wait(tmp_p
 
     def submit(raw):
         if _fee(raw) < 1_000:
-            raise NetworkError("min relay fee not met")
+            raise FeeRejected("mempool min fee not met", reason="mempool min fee not met")
         return accept(raw)
 
     s.chain.submit = submit
@@ -293,6 +294,44 @@ async def test_a_refund_the_node_keeps_refusing_is_replaced_after_the_wait(tmp_p
     bump = s.sent[-1]
     assert rec.state is SwapState.BTC_LOCKED and _fee(bump) == 1_000 and s.chain.mempool == t.btc_txid_from_raw(bump)
     assert s.on_disk().counter_refund_raw == bump.hex()
+
+
+async def test_a_broadcaster_outage_never_raises_the_fee(tmp_path, monkeypatch):
+    """Re-review R1: only a refusal for the fee (FeeRejected) bumps. A broadcaster that cannot be
+    reached, for however long, gets the same bytes again each pass."""
+    s = _Swap(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    first = s.on_disk().counter_refund_raw
+    s.chain.drop()
+    s.sources[0].down = True  # the broadcaster; the other two still read the HTLC unspent
+    for _ in range(6):
+        clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+        with pytest.raises(NetworkError):
+            await coord.taker_refund_btc()
+    assert s.on_disk().counter_refund_raw == first
+    s.sources[0].down = False
+    await coord.taker_refund_btc()
+    assert s.sent[-1].hex() == first and _fee(s.sent[-1]) == 500
+
+
+async def test_a_mined_refund_a_lagging_source_still_shows_pending_is_not_bumped(tmp_path, monkeypatch):
+    """Re-review R2: the quorum's MIN depth is 0 because one source lags, but another has it in a
+    block. Bumping would re-sign against spent inputs and overwrite the recorded bytes."""
+    s = _Swap(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    first = s.on_disk().counter_refund_raw
+    s.chain.mine(1)
+    s.sources[1].lag = s.sources[2].lag = 1
+    await coord.taker_refund_btc()
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.BTC_LOCKED and len(s.sent) == 1 and s.on_disk().counter_refund_raw == first
 
 
 async def test_a_quorum_of_one_on_mainnet_is_one_source(tmp_path):

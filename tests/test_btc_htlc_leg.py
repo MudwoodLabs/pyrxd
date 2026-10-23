@@ -27,7 +27,7 @@ from pyrxd.btc_wallet.htlc_leg import (
 from pyrxd.btc_wallet.keys import BtcKeypair, generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.gravity.swap_state import NegotiatedTerms
-from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
+from pyrxd.security.errors import FeeRejected, InsufficientConfirmationsError, NetworkError, ValidationError
 
 # --------------------------------------------------------------------------- helpers
 
@@ -582,6 +582,18 @@ async def test_broadcaster_raises_when_send_returns_non_str():
     bcaster = BitcoinCoreBroadcaster(_FakeRpc(send_result=12345))
     with pytest.raises(NetworkError, match="did not return a txid"):
         await bcaster.broadcast(b"\x02\x00rawtx")
+
+
+async def test_broadcaster_marks_a_fee_refusal_and_only_that():
+    """#850 PR 9a: a node refusing the fee raises FeeRejected; any other failure stays NetworkError."""
+    with pytest.raises(FeeRejected) as exc:
+        await BitcoinCoreBroadcaster(_FakeRpc(send_error="min relay fee not met, 100 < 141")).broadcast(
+            b"\x02\x00rawtx"
+        )
+    assert exc.value.reason == "min relay fee not met"
+    with pytest.raises(NetworkError) as exc:
+        await BitcoinCoreBroadcaster(_FakeRpc(send_error="non-BIP68-final")).broadcast(b"\x02\x00rawtx")
+    assert not isinstance(exc.value, FeeRejected)
 
 
 async def test_broadcaster_raises_when_decode_missing_txid_on_already_known():
