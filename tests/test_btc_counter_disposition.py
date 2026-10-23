@@ -181,6 +181,20 @@ async def test_a_lagging_source_holds_the_depth_down():
     assert d.kind is K.REFUND_PENDING and d.refunds_seen[0].confirmations == BURIAL - 3
 
 
+async def test_deepest_is_the_maximum_any_source_answered():
+    """``deepest`` lets the coordinator tell "mined, depth below quorum" from "in no block" (review
+    of part 2, F2): one source with it mined is enough to make it the maximum."""
+    chain = FakeBtcChain()
+    chain.submit(chain.refund_tx())
+    chain.mine(1)
+    lagging, mined, down = FakeBtcSource(chain, lag=1), FakeBtcSource(chain), FakeBtcSource(chain, down=True)
+    d = await _read(chain, [lagging, mined, down], quorum=3)
+    r = d.refunds_seen[0]
+    assert r.confirmations is None and r.deepest == 1
+    d = await _read(chain, [FakeBtcSource(chain, down=True) for _ in range(2)] + [lagging], quorum=3)
+    assert d.refunds_seen[0].deepest == 0
+
+
 async def test_depth_below_the_quorum_of_answers_is_not_a_depth():
     chain = FakeBtcChain()
     chain.submit(chain.refund_tx())
