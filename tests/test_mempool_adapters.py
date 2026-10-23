@@ -124,13 +124,21 @@ async def test_broadcast_refused_for_its_fee_raises_fee_rejected_and_nothing_els
         ),
         ("mempool min fee not met, 120 < 300", "mempool min fee not met"),
         ("insufficient fee, rejecting replacement abc", "insufficient fee"),
+        ("mempool full", "mempool full"),
     ):
         b = MempoolSpaceBroadcaster()
         b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, body)))
         with pytest.raises(FeeRejected) as exc:
             await b.broadcast(raw)
         assert exc.value.reason == marker
-    for body in ("non-mandatory-script-verify-flag (...)", "non-BIP68-final", "bad-txns-inputs-missingorspent"):
+    for body in (
+        "non-mandatory-script-verify-flag (...)",
+        "non-BIP68-final",
+        "bad-txns-inputs-missingorspent",
+        "max-fee-exceeded",
+        "absurdly-high-fee",
+        "bad-txns-in-belowout",
+    ):
         b = MempoolSpaceBroadcaster()
         b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, body)))
         with pytest.raises(NetworkError) as exc:

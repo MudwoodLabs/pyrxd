@@ -822,7 +822,7 @@ the leg's `min_confirmations`) in a block every source that places it agrees on.
 verified or not, is recorded as `counter_claim_tx` (its txid) and holds an observed refund exactly
 as on ETH. One source, or a reader whose quorum is one, decides only on `bcrt` and `tb`. The taker's own refund is recorded before it
 is broadcast (`counter_refund_raw`), re-sent with the same bytes if it is dropped, and replaced by
-BIP125 at a higher fee once no source has placed it in a block for `REFUND_REPLACE_AFTER_S`, or
+BIP125 at a higher fee once the quorum of sources has not placed it in a block for `REFUND_REPLACE_AFTER_S`, or
 once the node has refused it for its fee (`FeeRejected`) for as long; `taker_refund_btc`
 no longer advances on its broadcast. A BTC leg written before 0.27 (no `counter_disposition`) keeps
 the old behaviour.

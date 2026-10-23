@@ -4900,7 +4900,8 @@ class SwapCoordinator:
           has refused that re-broadcast for its fee (:class:`FeeRejected`) for
           :data:`REFUND_REPLACE_AFTER_S`, it is replaced as a pending one is, by the same bump rule
           and cap. Any other broadcast failure (a transport error, an early time-based CSV) only
-          propagates: an outage never raises the fee.
+          propagates: an outage never raises the fee. A broadcaster that lies about a fee refusal
+          can force a bump at most once per :data:`REFUND_REPLACE_AFTER_S`, up to the cap.
         * ``UNKNOWN`` with a spender named (contradicting sources): nothing is sent, and this raises
           :class:`CounterLegDispositionUnknown`.
         """
@@ -4928,11 +4929,14 @@ class SwapCoordinator:
             )
         if kind is BtcDispositionKind.REFUND_PENDING:
             refunds = disposition.refunds_seen
-            # Mined: some source has it in a block, at whatever depth the quorum gives. With no source
-            # placing it in a block it is pending, even if only one mempool holds it (review of part
-            # 2, F2: that refund must still be bumped; re-review R2: a lagging source's 0 must not
-            # make a mined refund read pending and be bumped against its own inputs).
-            mined = [r for r in refunds if r.confirmations or (r.deepest or 0) > 0]
+            # Mined: the quorum's depth is above zero, or too few sources answered and one of them has
+            # it in a block. A quorum that answers 0 is pending however deep one source says it is: one
+            # lying source must not stop the bump for good (third review, F1). The cost is that a
+            # source lagging one block behind can make a just-mined refund read pending, and the bump
+            # is then refused for its spent inputs; the next read shows it mined (re-review R2,
+            # accepted). With no source placing it in a block it is pending, even if only one mempool
+            # holds it (review of part 2, F2).
+            mined = [r for r in refunds if r.confirmations or (r.confirmations is None and (r.deepest or 0) > 0)]
             if mined:
                 logger.info(
                     "the BTC refund %s is %s; waiting until it is buried %d deep",

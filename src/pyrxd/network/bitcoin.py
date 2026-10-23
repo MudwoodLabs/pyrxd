@@ -1314,10 +1314,11 @@ class _MempoolHttpClient:
 
 
 #: Bitcoin Core's reject reasons for a transaction whose fee is too low to relay ("min relay fee not
-#: met", "mempool min fee not met") or to replace another under BIP125 ("insufficient fee"). Matched
+#: met", "mempool min fee not met", "mempool full": trimmed on arrival) or to replace another under
+#: BIP125 ("insufficient fee"). Matched
 #: in a broadcaster's error text to raise :class:`FeeRejected` (#850 PR 9a). From Bitcoin Core's
 #: reject strings; not checked against a pinned Core source here.
-BTC_FEE_REJECTION_MARKERS = ("min relay fee not met", "mempool min fee not met", "insufficient fee")
+BTC_FEE_REJECTION_MARKERS = ("min relay fee not met", "mempool min fee not met", "mempool full", "insufficient fee")
 
 
 def btc_fee_rejection(text: str) -> str | None:

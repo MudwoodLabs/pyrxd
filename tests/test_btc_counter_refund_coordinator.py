@@ -317,21 +317,18 @@ async def test_a_broadcaster_outage_never_raises_the_fee(tmp_path, monkeypatch):
     assert s.sent[-1].hex() == first and _fee(s.sent[-1]) == 500
 
 
-async def test_a_mined_refund_a_lagging_source_still_shows_pending_is_not_bumped(tmp_path, monkeypatch):
-    """Re-review R2: the quorum's MIN depth is 0 because one source lags, but another has it in a
-    block. Bumping would re-sign against spent inputs and overwrite the recorded bytes."""
+async def test_one_source_claiming_our_pending_refund_is_mined_does_not_stop_the_bump(tmp_path, monkeypatch):
+    """Third review, F1: the quorum answers depth 0, one source says 1. Pending: it is bumped."""
     s = _Swap(tmp_path)
     clock = [0.0]
     monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
     coord = s.coord()
     await coord.taker_refund_btc()
-    first = s.on_disk().counter_refund_raw
-    s.chain.mine(1)
-    s.sources[1].lag = s.sources[2].lag = 1
+    s.sources[2].lie_depth = 1
     await coord.taker_refund_btc()
     clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
-    rec = await coord.taker_refund_btc()
-    assert rec.state is SwapState.BTC_LOCKED and len(s.sent) == 1 and s.on_disk().counter_refund_raw == first
+    await coord.taker_refund_btc()
+    assert len(s.sent) == 2 and _fee(s.sent[1]) == 2 * _fee(s.sent[0])
 
 
 async def test_a_quorum_of_one_on_mainnet_is_one_source(tmp_path):

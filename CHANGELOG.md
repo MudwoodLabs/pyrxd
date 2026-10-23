@@ -121,7 +121,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Our refund is written to the record between signing and broadcasting (new
     `SwapRecord.counter_refund_raw`, hex; `SWAP_RECORD_SCHEMA_VERSION` 10). If that write fails,
     nothing is sent. A refund that was dropped is re-sent with the same bytes.
-  - A refund that no source places in a block after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not
+  - A refund the quorum of sources does not place in a block after `REFUND_REPLACE_AFTER_S` (600 s, chosen, not
     measured), even one only a single mempool holds, is replaced by BIP125 at twice its fee, or its
     fee plus 1 sat/vB of the larger of the two transactions if that is more
     (`BitcoinTaprootLeg.refund_bump_fee`; the doubling is chosen, not measured). A recorded refund
