@@ -119,13 +119,28 @@ def test_the_job_is_scheduled_daily_off_the_hour() -> None:
     assert "workflow_dispatch" in on
 
 
-def test_the_job_is_read_only_and_holds_no_secret() -> None:
+def test_the_check_is_read_only_and_holds_no_secret() -> None:
     doc = _workflow()
     assert doc["permissions"] == {"contents": "read"}
-    jobs = doc["jobs"]
-    assert jobs and all(j.get("permissions") == {"contents": "read"} for j in jobs.values())
-    text = WORKFLOW.read_text(encoding="utf-8")
+    check = doc["jobs"]["freshness"]
+    assert check.get("permissions") == {"contents": "read"}
+    text = yaml.safe_dump(check)
     assert "secrets." not in text and "GITHUB_TOKEN" not in text
+
+
+def test_only_the_alert_job_holds_a_token_and_it_runs_no_repository_code() -> None:
+    jobs = _workflow()["jobs"]
+    assert set(jobs) == {"freshness", "alert"}, "a new job must be classed as the check or the alert"
+    alert = jobs["alert"]
+    assert alert.get("permissions") == {"issues": "write"}
+    assert alert["needs"] == "freshness"
+    # No checkout and no third-party action: the token never meets code from the repository.
+    assert alert["steps"] and all("uses" not in step for step in alert["steps"])
+    # Never on a pull request (a PR's code must not decide an issue), and on success too, so a
+    # recovered table closes the issue it opened.
+    assert "always()" in alert["if"] and "github.event_name != 'pull_request'" in alert["if"]
+    run = alert["steps"][0]["run"]
+    assert "gh issue create" in run and "gh issue close" in run
 
 
 def test_the_job_runs_the_script_and_a_pr_touching_it_runs_the_job() -> None:

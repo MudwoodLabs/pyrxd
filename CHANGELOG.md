@@ -217,8 +217,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `PARAMS_MISMATCH`), `SETTLED_UNVERIFIABLE` (settled at the finalized block, which is at or
     past the timeout, every endpoint's log scan answered, every nominated transaction checked, no
     endpoint contradicting, and no
-    `Claimed` log that opens the hashlock) and `SINGLE_SOURCE_REFUND` (a refund seen by one endpoint on a
-    chain that carries value). Any other read raises the new `AbandonNotAccepted`
+    `Claimed` log that opens the hashlock, seen or on the record) and `SINGLE_SOURCE_REFUND` (a refund
+    seen by one endpoint on a chain that carries value). Every other case read from one endpoint on a
+    chain that carries value raises `NetworkError` (D4). Any other read raises the new `AbandonNotAccepted`
     (`pyrxd.security.errors`), which names the read and, where there is one, the step that ends it
     (`next_step`: `taker_refund_btc`, `mutual_refund` or `reconcile_counter_leg`). A claim seen from
     `BTC_LOCKED` or `BOTH_LOCKED` is refused. An unknown read raises `NetworkError`.
@@ -226,7 +227,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     of printable text, newlines and tabs allowed) is written to a file beside the record
     (`JsonFileRecordSink.write_abort_note`, at `<record>.abort-note`) with the read it rests on and
     every `Claimed` log the read saw; the record keeps only its SHA-256. A persist hook without
-    `write_abort_note` is refused. The record changes only once the persist succeeds.
+    `write_abort_note` is refused, as is a record on disk at another state or holding a claim this
+    record lacks. The record changes only once the persist succeeds, and keeps the first `Claimed`
+    log the read saw as `counter_claim_tx`.
+  - A `Claimed` transaction the record kept (`counter_claim_tx`) is now nominated to the reader by
+    its hash (new `recorded_claim_hashes` on `read_counter_disposition` and
+    `EthLeg.counter_disposition`), so it is verified by its receipt when its log is no longer
+    served.
   - The record keeps the case (`abandon_case`), the note's hash (`abort_note_sha256`) and the read
     (`counter_disposition`, whose kind may now also be `expired_empty_open`, `f_expired` or
     `unknown`); `abort_reason` is the new `operator_abandoned`. The HTLC's address stays on the

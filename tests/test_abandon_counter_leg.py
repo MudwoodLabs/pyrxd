@@ -536,6 +536,161 @@ async def test_every_claim_log_seen_is_kept_in_the_note():
     assert kept == [{"tx_hash": seen.tx_hash, "block_number": 70, "verified": False}]
 
 
+# --------------------------------------------------------------------------- Mythos review of 7b
+
+
+def _blind(chain):
+    return [FakeEvmEndpoint(chain, hide_all_logs=True) for _ in range(3)]
+
+
+async def test_a_claim_on_record_is_read_by_its_receipt_when_its_log_is_gone():
+    """F1: a claim an earlier read saw (``counter_claim_tx``) and whose log no endpoint serves any more.
+    The record nominates it, its receipt verifies, and the read is CLAIMED: p is public, so no abandon."""
+    coord, chain, _leg = _native_setup(endpoints=_blind, chain_kw={"finalized": 90})
+    sink = _with_sink(coord)
+    tx = chain.claim(70)
+    coord.record = dataclasses.replace(coord.record, counter_claim_tx=tx)
+    read = await coord._read_counter_disposition()
+    assert read.kind is DispositionKind.CLAIMED and read.evidence.tx_hash == tx
+    with pytest.raises(AbandonNotAccepted, match="p is public") as refused:
+        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    assert refused.value.next_step == "reconcile_counter_leg"
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_a_claim_on_record_holds_a_settlement_its_receipt_cannot_show(monkeypatch):
+    """F1: the recorded claim holds ``SETTLED_UNVERIFIABLE`` even when the read shows no claim at all."""
+    coord, _chain, _leg, _ = _token()
+    sink = _with_sink(coord)
+    coord.record = dataclasses.replace(coord.record, counter_claim_tx="0x" + "c7" * 32)
+    read = CounterDisposition(
+        DispositionKind.UNKNOWN,
+        "settled",
+        90,
+        settled_at_finalized=True,
+        settled_unexplained=True,
+        finalized_hash="0x" + "f9" * 32,
+    )
+
+    async def fake_read():
+        return read
+
+    monkeypatch.setattr(coord, "_read_counter_disposition", fake_read)
+    with pytest.raises(AbandonNotAccepted, match="seen or on record, so p is public"):
+        await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    _unchanged(coord, sink, SwapState.BTC_LOCKED)
+
+
+async def test_HONEST_a_claim_the_record_names_is_nominated_only_when_there_is_one():
+    coord, chain, leg = _native_setup(endpoints=_blind, chain_kw={"finalized": 90})
+    _with_sink(coord)
+    chain.refund(85)
+    seen = []
+    real = leg.counter_disposition
+
+    async def spy(locator, **kw):
+        seen.append(kw.get("recorded_claim_hashes"))
+        return await real(locator, **kw)
+
+    leg.counter_disposition = spy
+    rec = await _abandon(coord, AbandonCase.SETTLED_UNVERIFIABLE)
+    assert rec.state is SwapState.ABORTED and seen == [None]
+
+
+def _one_endpoint_case(case):
+    """A record whose counter leg is read from ONE endpoint, showing *case*."""
+    if case is AbandonCase.EXPIRED_EMPTY:
+        coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE}, endpoints=lambda c: [FakeEvmEndpoint(c)])
+        return coord
+    if case is AbandonCase.PAYOUT_REVERTS:
+        coord, chain, leg = _token_setup(nonces={20: PUSH_NONCE}, endpoints=lambda c: [FakeEvmEndpoint(c)])
+        chain.token_balances[30] = 1_000_000
+        leg.revert_reason = "TransferFailed"
+        return coord
+    if case is AbandonCase.SETTLED_UNVERIFIABLE:
+        coord, chain, leg = _native_setup(chain_kw={"finalized": 90})
+        chain.refund(85)
+        leg._rpc = FakeEvmEndpoint(chain, hide_all_logs=True)
+        return coord
+    coord, chain, leg = _native_setup(state=SwapState.PARAMS_MISMATCH, role=None, chain_kw={"finalized": 90})
+    chain.claim(70)
+    leg._rpc = FakeEvmEndpoint(chain)
+    return coord
+
+
+_ONE_ENDPOINT_CASES = [
+    AbandonCase.EXPIRED_EMPTY,
+    AbandonCase.PAYOUT_REVERTS,
+    AbandonCase.SETTLED_UNVERIFIABLE,
+    AbandonCase.CLAIMED_AFTER_MISMATCH,
+]
+
+
+@pytest.mark.parametrize("case", _ONE_ENDPOINT_CASES)
+async def test_one_endpoint_on_a_chain_that_carries_value_ends_no_record(monkeypatch, case):
+    """F2 / D4: only a one-endpoint refund is accepted on a value-bearing chain (SINGLE_SOURCE_REFUND)."""
+    coord = _one_endpoint_case(case)
+    sink = _with_sink(coord)
+    state = coord.record.state
+    monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: False))
+    with pytest.raises(NetworkError, match="from one endpoint, on a chain that carries value"):
+        await _abandon(coord, case)
+    _unchanged(coord, sink, state)
+
+
+@pytest.mark.parametrize("case", _ONE_ENDPOINT_CASES)
+async def test_HONEST_one_endpoint_on_a_testnet_may_end_a_record(monkeypatch, case):
+    coord = _one_endpoint_case(case)
+    _with_sink(coord)
+    monkeypatch.setattr(SwapCoordinator, "_single_source_may_decide", staticmethod(lambda _cid: True))
+    rec = await _abandon(coord, case)
+    assert rec.state is SwapState.ABORTED and rec.counter_disposition.single_source is True
+
+
+async def test_a_claim_log_the_read_saw_goes_on_the_aborted_record():
+    """F3: the record keeps the claim as well as the note, so what reads the record later sees p may be public."""
+    coord, chain, leg, _sink = _token()
+    chain.token_balances[30] = 1_000_000
+    leg.revert_reason = "TransferFailed"
+    seen = ClaimSeen(tx_hash="0x" + "c4" * 32, block_number=70, nominated_by=("a",), verified=False)
+    real = coord._read_counter_disposition
+
+    async def with_a_claim():
+        return dataclasses.replace(await real(), claims_seen=(seen,))
+
+    coord._read_counter_disposition = with_a_claim
+    rec = await _abandon(coord, AbandonCase.PAYOUT_REVERTS)
+    assert rec.state is SwapState.ABORTED and rec.counter_claim_tx == seen.tx_hash
+    assert SwapRecord.from_dict(rec.to_dict()).counter_claim_tx == seen.tx_hash
+
+
+@pytest.mark.parametrize("newer", ["revealed", "claim_recorded"])
+async def test_a_record_on_disk_that_moved_on_is_never_abandoned_over(tmp_path, newer):
+    """F4: a coordinator built on a stale record must not write an abandon beside a newer record on disk."""
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    if newer == "revealed":
+        on_disk = dataclasses.replace(coord.record, state=SwapState.SECRET_REVEALED)
+    else:
+        on_disk = dataclasses.replace(coord.record, counter_claim_tx="0x" + "c5" * 32)
+    await sink(on_disk)
+    before = (tmp_path / "swap.json").read_text()
+    coord._persist = sink
+    with pytest.raises(ValidationError, match="rebuild the coordinator from the record on disk"):
+        await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert (tmp_path / "swap.json").read_text() == before and not sink.abort_note_path.exists()
+    assert coord.record.state is SwapState.BTC_LOCKED
+
+
+async def test_HONEST_the_record_on_disk_it_was_built_from_is_abandoned(tmp_path):
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+    coord._persist = sink
+    rec = await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert rec.state is SwapState.ABORTED and sink.load_record() == rec
+
+
 def test_a_record_may_not_carry_an_abandon_before_it_is_aborted():
     from pyrxd.security.errors import ValidationError as VE
 

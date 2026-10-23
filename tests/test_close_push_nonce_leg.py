@@ -275,6 +275,15 @@ async def test_a_native_contract_is_read_without_token_or_key(monkeypatch):
     assert captured["push_nonce_bound"] is None and captured["nonce_less"] is False
 
 
+async def test_eth_leg_passes_the_recorded_claim_to_the_reader(monkeypatch):
+    """A claim the record kept reaches the reader, which verifies it by its receipt (Mythos review of #850 PR 7b)."""
+    leg, _rpc, _addr = _leg(latest=0)
+    captured = _capture(monkeypatch)
+    claim = "0x" + "c9" * 32
+    assert await _adapter(leg).counter_disposition(_loc(), recorded_claim_hashes=(claim,)) == "read"
+    assert captured["recorded_claim_hashes"] == (claim,)
+
+
 async def test_the_multi_source_balance_read_is_an_identity_read():
     from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
     from pyrxd.security.errors import RxdSdkError

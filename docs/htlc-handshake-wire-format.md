@@ -231,7 +231,7 @@ MUST verify, before acting on it (`swap_coordinator.py:4183-4188`):
    by byte offset** (`counter_chain_leg.py:45-48`);
 2. **provenance** — BTC: the transaction spends *this swap's* funding outpoint
    (`swap_coordinator.py:4062-4084`); ETH: the transaction targets *this swap's* contract instance
-   and emits `Claimed(p)` from it (`eth_leg.py:475-481`). Without this, a claim transaction from a
+   and emits `Claimed(p)` from it (`eth_leg.py:477-483`). Without this, a claim transaction from a
    different swap that happens to share `H` would be accepted.
 
 ## The `terms` object
@@ -831,13 +831,15 @@ when the operator named that case and the contract's address. The cases are an e
 contract that has no automatic end from the record's state (`expired_empty`), a refund that would revert
 (`payout_reverts`), a claim after a params mismatch (`claimed_after_mismatch`), a settled contract
 whose evidence cannot say how (`settled_unverifiable`: every gate read, every endpoint's log scan answered, no endpoint contradicting,
-the finalized block at or past the timeout, and no `Claimed` log that opens the hashlock), and a refund seen by one endpoint on a chain
-that carries value (`single_source_refund`). `abort_reason` is `operator_abandoned`, and the record
+the finalized block at or past the timeout, and no `Claimed` log that opens the hashlock, seen or on the record), and a refund seen by one endpoint on a chain
+that carries value (`single_source_refund`). Every other case read from one endpoint on a chain that
+carries value is refused (D4). A claim on the record is nominated to the reader by its hash, so its
+receipt verifies it when its log is no longer served. `abort_reason` is `operator_abandoned`, and the record
 keeps the case (`abandon_case`), the read it rests on (`counter_disposition`) and the SHA-256 of the
 operator's note (`abort_note_sha256`). The note itself is written beside the record, never into it.
 A verified claim from `BTC_LOCKED` or `BOTH_LOCKED` is refused: `p` is public, and the covenant
 claim comes first. On the other cases an unverified `Claimed` log does not hold the abandon (D14);
-every one the read saw is kept in the note file. From `BOTH_LOCKED` the edge is taken only after the contract's timeout
+every one the read saw is kept in the note file, and the first on the record (`counter_claim_tx`). From `BOTH_LOCKED` the edge is taken only after the contract's timeout
 has passed at the finalized block.
 
 `TAKER_NEVER_FUNDS` (#850, PR 8) is driven by the taker's `abandon_unfunded`, from `NEGOTIATED` only.

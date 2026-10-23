@@ -424,6 +424,7 @@ async def read_counter_disposition(
     recorded_refund_hashes: Sequence[str] = (),
     expiry_anchor: tuple[int, str] | None = None,
     token_address: str | None = None,
+    recorded_claim_hashes: Sequence[str] = (),
     funding_account: str | None = None,
     push_nonce_bound: int | None = None,
     nonce_less: bool = False,
@@ -436,6 +437,8 @@ async def read_counter_disposition(
     ``from_block`` bounds the log scan (the deploy block). When ``None`` it is read from the deploy
     transaction's receipt, which needs a real ``locator.deploy_tx_hash``. ``recorded_refund_hashes``
     are refund transactions we sent ourselves, nominated alongside the logs and verified like them.
+    ``recorded_claim_hashes`` are ``Claimed`` transactions a record kept from an earlier read; they are
+    nominated the same way, so a claim whose log is no longer served is still verified by its receipt.
     ``expiry_anchor`` is a ``(number, hash)`` this reader returned on an earlier ``F_EXPIRED`` answer
     (§2.3 (a)); with the contract settled at ``F``, an anchor whose hash is still canonical proves a
     refund even when no refund transaction can be verified.
@@ -459,9 +462,13 @@ async def read_counter_disposition(
         raise ValidationError("read_counter_disposition requires an EthHtlcLocator")
     if from_block is not None and (not isinstance(from_block, int) or isinstance(from_block, bool) or from_block < 0):
         raise ValidationError("from_block must be a non-negative int")
-    for h in recorded_refund_hashes:
-        if not isinstance(h, str) or not h.startswith("0x") or len(h) != 66 or not _is_hex(h[2:]):
-            raise ValidationError("recorded_refund_hashes must be 0x-prefixed 32-byte hex hashes")
+    for name, hashes in (
+        ("recorded_refund_hashes", recorded_refund_hashes),
+        ("recorded_claim_hashes", recorded_claim_hashes),
+    ):
+        for h in hashes:
+            if not isinstance(h, str) or not h.startswith("0x") or len(h) != 66 or not _is_hex(h[2:]):
+                raise ValidationError(f"{name} must be 0x-prefixed 32-byte hex hashes")
     if expiry_anchor is not None:
         a_num, a_hash = expiry_anchor if isinstance(expiry_anchor, tuple) and len(expiry_anchor) == 2 else (None, None)
         if (
@@ -556,6 +563,10 @@ async def read_counter_disposition(
             refunds.add(log["transactionHash"])
         elif log["topics"][0] == claimed_topic and _opens(log["data"], hashlock):
             claims.setdefault(log["transactionHash"], log)
+    for h in recorded_claim_hashes:
+        # A claim the record kept, nominated by the record itself: verified by its receipt like any other
+        # nomination, so a pruned log cannot hide it (Mythos review of #850 PR 7b, F1).
+        claims.setdefault(h.lower(), {"blockNumber": None, "nominated_by": ("record",)})
 
     incomplete: list[str] = []
     verified_refund: str | None = None
