@@ -9,6 +9,7 @@ exclusion the funding path had. Neither is useful as an option a caller may forg
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -116,6 +117,27 @@ class JsonFileRecordSink:
             )
             incoming["state"] = prior["state"]
 
+    @staticmethod
+    def _keep_a_persisted_claim(prior: dict[str, Any] | None, incoming: dict[str, Any]) -> None:
+        """A recorded counter-leg claim (``counter_claim_tx``) says ``p`` may be public; no step clears
+        it. A write without one, from a coordinator that read the record before the claim was written,
+        keeps the one on disk (and the schema version it needs) rather than dropping it (re-review of
+        the Mythos fixes, #850 PR 7b)."""
+        if prior is None or not prior.get("counter_claim_tx") or incoming.get("counter_claim_tx"):
+            return
+        from pyrxd.gravity.swap_state import SWAP_RECORD_SCHEMA_VERSION
+
+        logger.warning(
+            "swap record: kept the recorded counter-leg claim %s, which this write did not carry; p may be public",
+            prior["counter_claim_tx"],
+        )
+        incoming["counter_claim_tx"] = prior["counter_claim_tx"]
+        incoming["schema_version"] = max(
+            int(incoming.get("schema_version") or 0),
+            int(prior.get("schema_version") or 0),
+            SWAP_RECORD_SCHEMA_VERSION,
+        )
+
     def _keep_the_persisted_role(self, prior: dict[str, Any] | None, incoming: dict[str, Any]) -> None:
         """The role on disk binds every later write (#850 PR 3). A write naming ANOTHER role is
         refused: the record is the other party's, and its role-scoped steps would act for the wrong
@@ -140,26 +162,62 @@ class JsonFileRecordSink:
                 f"overwrite it with a {role}-role record. Run this with the role the record names."
             )
 
+    def _refuse_a_write_that_cannot_be_read_back(self, as_dict: dict[str, Any]) -> None:
+        """The merges above keep fields from disk beside the incoming ones; a combination no reader
+        accepts (an abandon beside a kept revealed state, say) is refused rather than written, so the
+        file stays the last record that loads (Mythos review of #850 PR 7b)."""
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        try:
+            SwapRecord.from_dict(as_dict)
+        except ValidationError as exc:
+            raise ValidationError(
+                f"refusing to write the swap record at {self._path}: merged with the record on disk it would not "
+                f"load ({exc}). The record on disk is unchanged."
+            ) from exc
+
     async def __call__(self, record: Any) -> None:
         as_dict = record.to_dict()
         prior = self._refuse_to_clobber_a_different_swap(as_dict)
         self._keep_the_persisted_role(prior, as_dict)
         self._keep_a_persisted_reveal(prior, as_dict, self._path)
+        self._keep_a_persisted_claim(prior, as_dict)
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        if isinstance(record, SwapRecord):  # a duck-typed record names no wire form to hold it to
+            self._refuse_a_write_that_cannot_be_read_back(as_dict)
         payload = json.dumps(as_dict, indent=2, sort_keys=True).encode()
+        self._atomic_replace(self._path, payload, what="the swap record")
+
+    @property
+    def abort_note_path(self) -> Path:
+        """Where :meth:`write_abort_note` keeps the operator's abandon note: beside the record, under
+        a name a record store's ``*.json`` scan does not pick up (#850 PR 7b, design D18)."""
+        return self._path.with_name(self._path.name + ".abort-note")
+
+    def write_abort_note(self, payload: bytes) -> str:
+        """Write the operator's abandon note (``payload``, UTF-8 JSON) atomically, mode 600, and
+        return its SHA-256 (lower-case hex), which the record carries as ``abort_note_sha256``. Each
+        abandon replaces the note; a record names only the one it was ended with."""
+        self._atomic_replace(self.abort_note_path, bytes(payload), what="the abandon note")
+        return hashlib.sha256(bytes(payload)).hexdigest()
+
+    @staticmethod
+    def _atomic_replace(target: Path, payload: bytes, *, what: str) -> None:
         tmp = None
         try:
             # INSIDE the try: creating the temp file is itself a filesystem operation that fails on
             # a read-only or missing directory, and an unwrapped OSError escaping here would reach
             # the coordinator as something it cannot classify — while the whole reason it awaits
             # this call is to distinguish "persisted" from "could not persist" before value moves.
-            fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), prefix=".swaprec-", suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".swaprec-", suffix=".tmp")
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(payload)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self._path)
-            dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
+            os.replace(tmp, target)
+            dir_fd = os.open(str(target.parent), os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
             finally:
@@ -168,7 +226,7 @@ class JsonFileRecordSink:
             if tmp is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(tmp)
-            raise NetworkError(f"could not persist the swap record to {self._path}: {exc}") from exc
+            raise NetworkError(f"could not persist {what} to {target}: {exc}") from exc
 
     def load(self) -> dict | None:
         """Read the raw record dict back, or None if it was never written.

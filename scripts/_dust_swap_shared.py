@@ -262,6 +262,16 @@ _MAKER_REVEALED = (
     "does not apply to this record as it stands; and p may be public, so the taker can still claim the "
     "covenant until it is refunded",
 )
+_ABANDON = (
+    "allow",
+    "the coordinator's abandon_counter_leg decides: it reads the counter leg at the finalized block and "
+    "accepts only a case with no step of its own, from btc_locked, both_locked or params_mismatch",
+)
+_ABANDON_NOTHING = (
+    "refuse",
+    "the persisted record says {state}: abandon_counter_leg ends a btc_locked, both_locked or "
+    "params_mismatch record only, so there is nothing for it to end here. Nothing was recorded",
+)
 _RESUME = (
     "allow",
     "single operator: rebuilds BTC_LOCKED and re-drives the claim path with p from the keys file",
@@ -390,6 +400,20 @@ PHASE_STATE_RULES: dict[tuple[str, str], dict[SwapState, tuple[str, str]]] = {
         ONE_SIDED_LOSS_TAKER=_MAKER_REFUND,
         ABORTED=_MAKER_REFUND,
         ASSET_REFUNDED_TAKER_ACTS=_MAKER_REFUND,
+    ),
+    ("taker", "abandon"): _row(
+        NEGOTIATED=_ABANDON_NOTHING,
+        BTC_LOCKED=_ABANDON,
+        BOTH_LOCKED=_ABANDON,
+        SECRET_REVEALED=_TAKER_P_PUBLIC,
+        COMPLETED=_TAKER_P_PUBLIC,
+        MUTUAL_REFUND=_ABANDON_NOTHING,
+        PARAMS_MISMATCH=_ABANDON,
+        MAKER_STALLS=_ABANDON_NOTHING,
+        ASSET_VULNERABLE=_TAKER_P_PUBLIC,
+        ONE_SIDED_LOSS_TAKER=_ABANDON_NOTHING,
+        ABORTED=_ABANDON_NOTHING,
+        ASSET_REFUNDED_TAKER_ACTS=_ABANDON_NOTHING,
     ),
     ("none", "resume"): _row(
         NEGOTIATED=_RESUME,

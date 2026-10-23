@@ -44,7 +44,7 @@ def test_dispatch_table_is_complete():
     """The BTC sibling has pinned its dispatch table since the harness was written and this one
     pinned nothing — the same documented-gap shape that let ``run_self_check`` rot here. Same
     literal as the BTC file, so a phase added to one harness and not the other is visible."""
-    assert set(_load()._DISPATCH) == _EXPECTED_PHASES
+    assert set(_load()._DISPATCH) == _EXPECTED_PHASES | {("taker", "abandon")}
 
 
 class TestTheFastTailIsWiredAndTheRegimeIsDISCLOSED:

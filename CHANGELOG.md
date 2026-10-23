@@ -155,7 +155,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A `MAKER`-role `mutual_refund` on an ETH counter leg now raises `ValidationError` before it
     reads anything: the maker's leg is the covenant (`maybe_refund_asset_on_maker_stall`).
   - A contract with nothing to refund raises `NothingToRefund`, naming the gated abandon
-    (`abandon_counter_leg`, not in this release yet).
+    (`abandon_counter_leg`, below).
   - When the refund fails and the chain could not say what happened to the contract (`UNKNOWN`),
     `mutual_refund` and `taker_refund_btc` raise the new `CounterLegDispositionUnknown` (a
     `NetworkError`, with `.reason`), which says the refund was not sent and is not a refund. This
@@ -177,6 +177,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     drive one record with mixed pyrxd versions. A pyrxd from before this change refuses a v5
     record, but a 0.26.x pyrxd ignores unknown keys. On a record with a pending refund, a 0.26.x
     `taker_refund_btc` would send again, go to `ABORTED`, and drop the recorded hash.
+- **An operator can end an ETH swap record on a counter-leg case that has no automatic end, after
+  the chain is read and only on the case it shows (#850 PR 7b) [Changed (breaking)].**
+  - New `SwapCoordinator.abandon_counter_leg(*, confirm_contract, reason_code, note)`, from
+    `BTC_LOCKED`, `BOTH_LOCKED` or `PARAMS_MISMATCH` (a `MAKER`-role coordinator only from
+    `PARAMS_MISMATCH`). It broadcasts nothing. It reads the ETH counter leg's disposition, and moves
+    the record to `ABORTED` (new event `OPERATOR_ABANDONED`; new edge `BOTH_LOCKED → ABORTED`, so
+    16 edges) only when the read is one of the new `AbandonCase` values and is the one the operator
+    named: `EXPIRED_EMPTY` (an empty expired token contract with no automatic end from this
+    state), `PAYOUT_REVERTS` (unsettled and expired at the finalized block, and a refund would
+    revert `TransferFailed` or `SendFailed`), `CLAIMED_AFTER_MISMATCH` (claimed, at
+    `PARAMS_MISMATCH`), `SETTLED_UNVERIFIABLE` (settled at the finalized block, which is at or
+    past the timeout, every endpoint's log scan answered, every nominated transaction checked, no
+    endpoint contradicting, and no
+    `Claimed` log that opens the hashlock, seen or on the record) and `SINGLE_SOURCE_REFUND` (a refund
+    seen by one endpoint on a chain that carries value). Every other case read from one endpoint on a
+    chain that carries value raises `NetworkError` (D4). Any other read raises the new `AbandonNotAccepted`
+    (`pyrxd.security.errors`), which names the read and, where there is one, the step that ends it
+    (`next_step`: `taker_refund_btc`, `mutual_refund` or `reconcile_counter_leg`). A claim seen from
+    `BTC_LOCKED` or `BOTH_LOCKED` is refused. An unknown read raises `NetworkError`.
+  - `confirm_contract` must be the HTLC's address. The note (not blank; at most 2,000 characters
+    of printable text, newlines and tabs allowed) is written to a file beside the record
+    (`JsonFileRecordSink.write_abort_note`, at `<record>.abort-note`) with the read it rests on and
+    every `Claimed` log the read saw; the record keeps only its SHA-256. A persist hook without
+    `write_abort_note` is refused, as is a record on disk at another state or holding a claim this
+    record lacks. The record changes only once the persist succeeds, and keeps the first `Claimed`
+    log the read saw as `counter_claim_tx`.
+  - A `Claimed` transaction the record kept (`counter_claim_tx`) is now nominated to the reader by
+    its hash (new `recorded_claim_hashes` on `read_counter_disposition` and
+    `EthLeg.counter_disposition`), so it is verified by its receipt when its log is no longer
+    served.
+  - The record keeps the case (`abandon_case`), the note's hash (`abort_note_sha256`) and the read
+    (`counter_disposition`, whose kind may now also be `expired_empty_open`, `f_expired` or
+    `unknown`); `abort_reason` is the new `operator_abandoned`. The HTLC's address stays on the
+    record, so a refund by address remains possible.
+  - `SWAP_RECORD_SCHEMA_VERSION` is 7. A record carrying an abandon writes 7, which a pyrxd from
+    0.27 development before this change refuses. A 0.26.x pyrxd ignores unknown keys and reads such a
+    record as `ABORTED` without saying why. Do not drive one record with
+    mixed pyrxd versions.
+  - The ETH two-host runner has a taker `--phase abandon` (`--confirm-contract`, `--abandon-case`,
+    `--abandon-note`) on this host's persisted record. It is refused where `p` may be public
+    (`SECRET_REVEALED`, `ASSET_VULNERABLE`, `COMPLETED`). There is no maker phase yet: the maker's
+    runner record holds no deploy transaction, so its contract reads `UNKNOWN`.
 - **An empty, expired ERC-20 counter-leg contract can now end the swap, once no token push can
   still land in it (#850 PR 7a) [Changed (breaking)].** A contract whose token push failed or was
   never sent has nothing to refund, but a push the funding key signed could still arrive later.
@@ -202,7 +244,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `expired_empty`; `counter_disposition.kind` `expired_empty_closed`). Nothing is sent. A recorded
     `Claimed` log that opens the hashlock holds it until `t_rxd` matures, as for an observed refund
     (D14). At `PARAMS_MISMATCH` there is no edge: the evidence is recorded and a `ValidationError`
-    names the gated abandon (not in this release yet). A maker's record records it and stays.
+    names the gated abandon (`abandon_counter_leg`, below). A maker's record records it and stays.
   - On `EXPIRED_EMPTY_OPEN`, `taker_refund_btc` raises `NothingToRefund` naming the new
     `close_push_nonce`, and the record does not change.
   - New `SwapCoordinator.close_push_nonce()` (BTC_LOCKED, token leg, not for a maker): when the

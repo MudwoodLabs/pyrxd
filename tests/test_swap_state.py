@@ -136,6 +136,8 @@ _LEGAL_EDGES = frozenset(
         (SwapState.ASSET_VULNERABLE, SwapState.COMPLETED),
         # #850 PR 5a: the taker learns of the maker's counter-leg claim from the chain.
         (SwapState.BTC_LOCKED, SwapState.SECRET_REVEALED),
+        # #850 PR 7b (D15, N2): the gated abandon from BOTH_LOCKED.
+        (SwapState.BOTH_LOCKED, SwapState.ABORTED),
     }
 )
 
@@ -170,6 +172,10 @@ _LEGAL_TRIPLES = frozenset(
         (_S.BOTH_LOCKED, _E.COUNTER_LEG_CLAIMED_OBSERVED, _S.SECRET_REVEALED),
         # #850 PR 7a: an empty expired token contract whose push nonce is closed at F.
         (_S.BTC_LOCKED, _E.COUNTER_LEG_EXPIRED_EMPTY, _S.ABORTED),
+        # #850 PR 7b: the gated explicit abandon (design §3.6).
+        (_S.BTC_LOCKED, _E.OPERATOR_ABANDONED, _S.ABORTED),
+        (_S.PARAMS_MISMATCH, _E.OPERATOR_ABANDONED, _S.ABORTED),
+        (_S.BOTH_LOCKED, _E.OPERATOR_ABANDONED, _S.ABORTED),
     }
 )
 
@@ -200,8 +206,9 @@ def test_each_state_event_pair_has_exactly_one_target():
 
 
 def test_transition_count():
-    # 14 + BTC_LOCKED -> SECRET_REVEALED (#850 PR 5a). PR 7a adds an event on an existing pair.
-    assert len(TRANSITIONS) == 15
+    # 14 + BTC_LOCKED -> SECRET_REVEALED (#850 PR 5a) + BOTH_LOCKED -> ABORTED (PR 7b). PR 7a adds an
+    # event on an existing pair, and PR 7b two more.
+    assert len(TRANSITIONS) == 16
 
 
 def test_every_legal_transition_allowed():

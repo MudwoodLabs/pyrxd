@@ -68,6 +68,9 @@ coordinator entry point each one drives, and docs/how-to/run-a-two-host-swap-dry
   # refund: each side refunds its OWN leg once BOTH are locked (the taker: the ETH HTLC only, #850):
   python scripts/eth_swap_two_host.py --role taker --phase refund     --io ./swapdir ...
   python scripts/eth_swap_two_host.py --role maker --phase refund     --io ./swapdir ...
+  # abandon: end the taker's record on a counter-leg case with no automatic end (#850 PR 7b):
+  python scripts/eth_swap_two_host.py --role taker --phase abandon    --io ./swapdir \
+      --confirm-contract 0x... --abandon-case payout_reverts --abandon-note "why" ...
 """
 
 from __future__ import annotations
@@ -116,10 +119,10 @@ from pyrxd.gravity.swap_coordinator import (
     SwapCoordinator,
     assert_timelock_margin,
 )
-from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, SwapState
+from pyrxd.gravity.swap_state import AbandonCase, NegotiatedTerms, SwapRecord, SwapRole, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import AbandonNotAccepted, NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 
@@ -1335,6 +1338,74 @@ async def _refuse_if_the_counter_leg_was_claimed(args, eth_leg, loc: EthHtlcLoca
         )
 
 
+async def taker_phase_abandon(args: argparse.Namespace) -> None:
+    """TAKER — end the record on a counter-leg case that has no automatic end (``--phase abandon``,
+    #850 PR 7b, design §3.6).
+
+    Drives ``SwapCoordinator.abandon_counter_leg`` on this host's persisted record (BTC_LOCKED,
+    BOTH_LOCKED or PARAMS_MISMATCH), in the state it was persisted in. Nothing is broadcast. The coordinator reads the ETH HTLC first and accepts only a
+    case past the timeout at the finalized block (or settled there) that has no step of its own, and
+    only the case ``--abandon-case`` names; ``--confirm-contract`` must be the HTLC's address. The
+    note goes to a file beside the record (``<record>.abort-note``); the record keeps its hash. The
+    Radiant leg is built with ``_NoFeeSource``, so this phase cannot spend the covenant.
+
+    It needs a record this host persisted: an abandon ends a record, so there must be one to end.
+    """
+    io_dir = _io_dir(args)
+    local = _load_local_secret(args)
+    env = _read_public(io_dir, "envelope.json")
+    terms = NegotiatedTerms.from_dict(env["terms"])
+    _refuse_by_persisted_state(args, terms, phase="abandon")  # before any chain read
+    sink = _record_sink(args.local_out)
+    persisted = sink.load_record()
+    if persisted is None:
+        raise SystemExit(f"REFUSING: there is no swap record at {sink.path} to abandon. Nothing was recorded.")
+    if not args.abandon_case or not args.confirm_contract or not args.abandon_note:
+        raise SystemExit(
+            "--phase abandon needs --confirm-contract (the ETH HTLC's address), --abandon-case (one of "
+            f"{', '.join(c.value for c in AbandonCase)}) and --abandon-note (why). Nothing was recorded."
+        )
+    case = AbandonCase(args.abandon_case)
+    loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
+    taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
+    maker_pkh = bytes.fromhex(env["maker_pkh_hex"])
+    rpc, eth_leg = _eth_leg(
+        args,
+        claim_to=env["eth_maker_claim_addr"],
+        refund_to=local["eth_taker_refund_addr"],
+        eth_timeout=int(terms.eth_timeout_unix_s),
+    )
+    rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=_NoFeeSource())
+    # The persisted state, not a fixed one: the merge keeps the rebuild's state, and §3.6 accepts
+    # different cases from BTC_LOCKED, BOTH_LOCKED and PARAMS_MISMATCH (#850 PR 7b review).
+    record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(persisted.state)
+    coord = _coordinator(
+        args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="abandon"
+    )
+    try:
+        confirm(
+            f"abandon_counter_leg: end this {coord.record.state.value} record ABORTED on {case.value} for "
+            f"{loc.contract_address}. Nothing is sent; the record stops being followed",
+            auto_yes=args.yes,
+        )
+        try:
+            rec = await coord.abandon_counter_leg(
+                confirm_contract=args.confirm_contract, reason_code=case, note=args.abandon_note
+            )
+        except AbandonNotAccepted as exc:
+            nxt = f"\n  NEXT: {exc.next_step}" if exc.next_step else ""
+            raise SystemExit(f"REFUSED: {exc}{nxt}") from None
+        except (ValidationError, NetworkError) as exc:
+            raise SystemExit(f"REFUSED: {exc}") from None
+        print(
+            f"  -> {rec.state.value} ({rec.abort_reason.value}, {rec.abandon_case.value}); the read at block "
+            f"{rec.counter_disposition.block_number} is on the record, and the note is at {sink.abort_note_path} "
+            f"(sha256 {rec.abort_note_sha256}). The HTLC's address stays on the record."
+        )
+    finally:
+        await rpc.close()
+
+
 async def taker_phase_refund(args: argparse.Namespace) -> None:
     """TAKER recovery — the taker's half of the mutual unwind (``--phase refund``).
 
@@ -1867,7 +1938,9 @@ def _args() -> argparse.Namespace:
             "CSV refund). 'refund' is each side's half of the mutual unwind once BOTH legs are locked "
             "(taker: SwapCoordinator.mutual_refund, the ETH HTLC only, #850; maker: "
             "SwapCoordinator.maybe_refund_asset_on_maker_stall, the asset half). 'abort' is "
-            "available EARLIER than 'refund' and is what a stalled operator reaches for first."
+            "available EARLIER than 'refund' and is what a stalled operator reaches for first. "
+            "'abandon' (taker) ends the record on a counter-leg case with no automatic end "
+            "(SwapCoordinator.abandon_counter_leg); it sends nothing."
         ),
     )
     ap.add_argument("--io", default="./swapdir", help="directory holding the out-of-band exchange files")
@@ -1972,6 +2045,14 @@ def _args() -> argparse.Namespace:
         "the finalized block (0: one pass). Re-running the phase resumes from the record.",
     )
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
+    ap.add_argument("--confirm-contract", default="", help="--phase abandon: the ETH HTLC's address, typed again")
+    ap.add_argument(
+        "--abandon-case",
+        default="",
+        choices=["", *(c.value for c in AbandonCase)],
+        help="--phase abandon: the case the chain shows (design §3.6); a mismatch refuses",
+    )
+    ap.add_argument("--abandon-note", default="", help="--phase abandon: why (kept in a file beside the record)")
     args = ap.parse_args()
     resolve_eth_key_file(args)
     # Resolve the ETH finalization window from the chain registry when not pinned (vetted per-chain).
@@ -1995,6 +2076,7 @@ _DISPATCH = {
     ("taker", "claim"): taker_phase_claim,
     ("taker", "abort"): taker_phase_abort,
     ("taker", "refund"): taker_phase_refund,
+    ("taker", "abandon"): taker_phase_abandon,
     ("maker", "envelope"): maker_phase_envelope,
     ("maker", "lock-claim"): maker_phase_lock_claim,
     ("maker", "abort"): maker_phase_abort,

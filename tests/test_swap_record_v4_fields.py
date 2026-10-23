@@ -10,13 +10,14 @@ import pytest
 
 from pyrxd.gravity.swap_state import (
     SWAP_RECORD_SCHEMA_VERSION,
+    AbandonCase,
     AbortReason,
     CounterDispositionRecord,
     SwapRecord,
     SwapState,
 )
 from pyrxd.security.errors import ValidationError
-from tests.test_swap_record_round_trip_guard import _btc_base, _eth_base
+from tests.test_swap_record_round_trip_guard import _abandoned, _btc_base, _eth_base
 
 _GOOD = {
     "kind": "refunded",
@@ -134,6 +135,23 @@ def test_from_dict_does_not_coerce_single_source():
         (_eth_base, {"push_signer": "0x" + "zz" * 20, "pending_push_nonce": 7}),
         (_eth_base, {"push_signer": "ab" * 21, "pending_push_nonce": 7}),
         (_eth_base, {"push_signer": 7, "pending_push_nonce": 7}),
+        # 7b: the abandon's three fields go together, and its disposition kinds need it
+        (_eth_base, {"abort_reason": AbortReason.OPERATOR_ABANDONED}),
+        (_eth_base, {"abandon_case": AbandonCase.PAYOUT_REVERTS, "abort_note_sha256": "0" * 64}),
+        (
+            _eth_base,
+            {
+                "abort_reason": AbortReason.EXPIRED_EMPTY,
+                "abandon_case": AbandonCase.PAYOUT_REVERTS,
+                "abort_note_sha256": "0" * 64,
+            },
+        ),
+        (_eth_base, {"abort_reason": AbortReason.OPERATOR_ABANDONED, "abandon_case": AbandonCase.PAYOUT_REVERTS}),
+        (_eth_base, {"abort_reason": AbortReason.OPERATOR_ABANDONED, "abort_note_sha256": "0" * 64}),
+        (_abandoned(AbandonCase.PAYOUT_REVERTS), {"abort_note_sha256": "A" * 64}),
+        (_abandoned(AbandonCase.PAYOUT_REVERTS), {"abort_note_sha256": "0" * 63}),
+        (_abandoned(AbandonCase.PAYOUT_REVERTS), {"abandon_case": "payout_reverts"}),
+        (_abandoned(AbandonCase.PAYOUT_REVERTS), {"abort_reason": AbortReason.COUNTER_LEG_REFUNDED}),
     ],
 )
 def test_a_bad_record_field_is_refused(base, fields):
@@ -153,12 +171,19 @@ def test_a_bad_record_field_is_refused(base, fields):
         {"push_close_tx_hash": "0x" + "c7" * 32, "push_close_nonce": 0},
         {"push_signer": "0x" + "ab" * 20, "pending_push_nonce": 0},
         {"abort_reason": AbortReason.EXPIRED_EMPTY, "state": SwapState.ABORTED},
+        {
+            "abort_reason": AbortReason.OPERATOR_ABANDONED,
+            "abandon_case": AbandonCase.SETTLED_UNVERIFIABLE,
+            "abort_note_sha256": "0" * 64,
+            "state": SwapState.ABORTED,
+            "counter_disposition": CounterDispositionRecord(**{**_GOOD, "kind": "unknown", "tx_hash": None}),
+        },
     ],
 )
 def test_each_new_field_alone_writes_the_current_schema_version(fields):
     record = dataclasses.replace(_eth_base(), **fields)
     d = record.to_dict()
-    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 6
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 7
     assert SwapRecord.from_dict(d) == record
 
 
@@ -179,3 +204,23 @@ def test_a_push_signer_alone_writes_the_current_schema_version():
     d = signed.to_dict()
     assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION
     assert SwapRecord.from_dict(d) == signed
+
+
+@pytest.mark.parametrize("kind", ["expired_empty_open", "f_expired", "unknown"])
+def test_an_abandon_only_disposition_kind_needs_an_abandon(kind):
+    evidence = CounterDispositionRecord(
+        kind=kind, block_number=90, block_hash="0x" + "f9" * 32, tx_hash=None, sources=(), single_source=False
+    )
+    with pytest.raises(ValidationError, match="only by an operator's abandon"):
+        dataclasses.replace(_eth_base(), counter_disposition=evidence)
+    with pytest.raises(ValidationError, match="names no transaction"):
+        dataclasses.replace(evidence, tx_hash="0x" + "d1" * 32)
+    rec = dataclasses.replace(_abandoned(AbandonCase.EXPIRED_EMPTY)(), counter_disposition=evidence)  # honest
+    assert SwapRecord.from_dict(rec.to_dict()) == rec
+
+
+def test_an_unknown_abandon_case_is_refused_on_read():
+    d = _abandoned(AbandonCase.EXPIRED_EMPTY)().to_dict()
+    d["abandon_case"] = "operator_felt_like_it"
+    with pytest.raises(ValidationError, match="unknown abandon_case"):
+        SwapRecord.from_dict(d)

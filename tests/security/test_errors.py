@@ -353,6 +353,7 @@ _SAMPLE_ARGS: dict[str, object] = {
     "have_wei": 10**14,
     "kind": "refunded",
     "cause": "other_tx",
+    "next_step": "taker_refund_btc",
 }
 
 

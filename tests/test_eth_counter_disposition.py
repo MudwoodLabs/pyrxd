@@ -246,19 +246,42 @@ async def test_a_receipt_in_a_non_canonical_block_does_not_verify():
 # --------------------------------------------------------------------------- precedence rules
 
 
+class _LowHead(FakeEvmEndpoint):
+    """Reports a head at the deploy block and answers every other read honestly."""
+
+    async def block_number(self) -> int:
+        return self.chain.deploy_block
+
+
+async def test_an_endpoint_reporting_a_low_head_cannot_cut_the_scan_short_of_a_claim():
+    """Re-review of #850 PR 7b, MEDIUM: with two endpoints the agreed head is the lower one. One that
+    reports the deploy block and hides the Claimed log cut the honest scan to the deploy block plus
+    the tail, short of a claim at block 20000, and the read was a settlement nobody could explain.
+    The scan now runs through F, so the low endpoint fails its own scan and the honest one sees the
+    claim."""
+    chain = FakeEvmChain(preimage=os.urandom(32), timeout=0, head=30_100, finalized=30_000)
+    chain.timeout = chain.ts(25_000)
+    chain.claim(20_000)
+    d = await _read(MultiSourceEthRpc([_LowHead(chain, hide_claimed=True), FakeEvmEndpoint(chain)]), chain)
+    assert not d.settled_unexplained and d.kind is DispositionKind.CLAIMED
+    assert d.logs_failed and len(d.logs_answered) == 1
+    honest = await _read(MultiSourceEthRpc([FakeEvmEndpoint(chain), FakeEvmEndpoint(chain)]), chain)
+    assert honest.kind is DispositionKind.CLAIMED and not honest.logs_failed
+
+
 async def test_rule_2_a_verified_refund_and_a_verified_claim_is_unknown():
     chain = _chain(finalized=90)
     chain.claim(70)
     chain.force_receipt(85, topic0=REFUNDED_TOPIC0, label="impossible-refund")
     d = await _read(_quorum(chain), chain)
-    assert d.kind is DispositionKind.UNKNOWN and "rule 2" in d.reason
+    assert d.kind is DispositionKind.UNKNOWN and "rule 2" in d.reason and not d.settled_unexplained
 
 
 async def test_rule_3_a_verified_refund_beside_gap_b_is_unknown():
     chain = _chain()
     chain.force_receipt(50, topic0=REFUNDED_TOPIC0, label="early-refund", settles=True)
     d = await _read(_quorum(chain), chain)
-    assert d.kind is DispositionKind.UNKNOWN and "rule 3" in d.reason
+    assert d.kind is DispositionKind.UNKNOWN and "rule 3" in d.reason and not d.settled_unexplained
 
 
 async def test_rule_4_a_verified_refund_beside_an_unverified_claim_seen_is_refunded():
