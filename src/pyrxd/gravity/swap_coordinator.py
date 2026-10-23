@@ -5008,10 +5008,26 @@ class SwapCoordinator:
         except Exception:
             self.record = before  # not durable, so not taken: a retry reads the chain again
             logger.warning(
-                "the abandon note (sha256 %s) was written, but the record was not; no record names that note",
+                "the abandon note (sha256 %s) was written, but the record may not have been; if it was not, no "
+                "record names that note",
                 digest,
             )
             raise
+        # A claim recorded on disk after the last check is kept there by the sink; take it into memory
+        # too, so the record this returns says p may be public (re-review of the Mythos fixes).
+        load = getattr(self._persist, "load_record", None)
+        try:
+            on_disk = load() if callable(load) else None
+        except Exception as exc:  # the abandon is written; only this echo of the disk is lost
+            logger.warning("could not read the abandoned record back: %s", exc)
+            on_disk = None
+        if on_disk is not None and on_disk.counter_claim_tx and not self.record.counter_claim_tx:
+            self.record = dataclasses.replace(self.record, counter_claim_tx=on_disk.counter_claim_tx)
+            logger.warning(
+                "a counter-leg claim %s was recorded while this abandon ran, so p may be public: read the "
+                "contract with reconcile_counter_leg",
+                on_disk.counter_claim_tx,
+            )
         logger.warning(
             "counter-leg contract %s abandoned by the operator (%s, read %s at block %d); the record is ABORTED",
             locator.contract_address,
