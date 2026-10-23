@@ -20,8 +20,10 @@ anything, and in this PR nothing in the coordinator calls it yet.
   liveness (``p`` is public wherever it is), and it is never terminal.
 * **Classification is by script path, never by txid** (§6, M1): the claim leaf with a witness push
   that opens ``H`` is a claim; the refund leaf is a refund, whoever broadcast it (the operator, or
-  the tower's pre-signed refund). Sources serving one txid with witnesses that classify differently
-  read :attr:`BtcDispositionKind.UNKNOWN`, with any claim among them kept.
+  the tower's pre-signed refund). Sources serving one txid with a refund and a claim whose
+  signatures both verify read :attr:`BtcDispositionKind.UNKNOWN`. A claim witness that does not
+  verify beside a verified refund does not hold the refund off (anyone who knows ``p`` can write
+  one over our refund's txid); it is still reported in ``claims_seen``.
 * **Burial decides.** A spender changes nothing until it is ``burial_blocks`` deep at the quorum
   MINIMUM of its depth, with at least ``quorum`` sources answering the depth and every source that
   places it in a block placing it in the SAME block. Below that a claim is
@@ -49,6 +51,7 @@ record's state is the CONSUMER's rule (design §2.5), not this module's.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -109,6 +112,9 @@ class BtcSpender:
     block: tuple[int, str] | None
     verified: bool = True
     contested: bool = False
+    #: On a verified refund: a claim witness (unverified, carrying p) that a source served for the
+    #: same txid. Reported through :attr:`BtcCounterDisposition.claims_seen`.
+    claim_raw: bytes | None = None
 
     def __repr__(self) -> str:  # the raw bytes are long; a claim's carry p, which is public but noisy
         return (
@@ -147,7 +153,13 @@ class BtcCounterDisposition:
     def claims_seen(self) -> tuple[BtcSpender, ...]:
         """Every nominated claim-leaf spend, buried or not, verified or not, on every kind of
         answer: ``p`` is public wherever one is."""
-        return tuple(s for s in self.spenders if s.path is SpendPath.CLAIM)
+        seen = [s for s in self.spenders if s.path is SpendPath.CLAIM]
+        seen += [
+            dataclasses.replace(s, path=SpendPath.CLAIM, raw=s.claim_raw, verified=False, claim_raw=None)
+            for s in self.spenders
+            if s.claim_raw is not None
+        ]
+        return tuple(seen)
 
     @property
     def refunds_seen(self) -> tuple[BtcSpender, ...]:
@@ -201,12 +213,17 @@ def spend_path_of(raw_tx: bytes, locator: t.BtcHtlcLocator, hashlock: bytes) -> 
     return SpendPath.UNRECOGNISED
 
 
+#: The sighash types BIP341 allows in a 65-byte signature (0x00 only as the implicit 64-byte form).
+_BIP341_HASH_TYPES = frozenset({0x01, 0x02, 0x03, 0x81, 0x82, 0x83})
+
+
 def spend_signature_verifies(raw_tx: bytes, locator: t.BtcHtlcLocator) -> bool | None:
     """Whether the BIP340 signature in *raw_tx*'s spend of ``locator``'s outpoint verifies for the
     key of the leaf it spends, over *raw_tx* itself (BIP341 script-path sighash).
 
-    ``None`` when this cannot be checked here: a spender with more than one input (its sighash
-    commits to every input's spent output, and only ours is known). ``False`` for a leaf this HTLC
+    ``None`` when this cannot be checked here: a spender with more than one input whose signature
+    is not ANYONECANPAY (its sighash commits to every input's spent output, and only ours is known).
+    Our own refunds are single-input (``taproot.build_refund_tx``), so a refund is always checked. ``False`` for a leaf this HTLC
     does not have, a malformed signature, or one that does not verify. Each leaf ends
     ``<32-byte x-only key> OP_CHECKSIG`` (``taproot.claim_leaf_script``, ``refund_leaf_script``),
     and that key is the one checked."""
@@ -223,24 +240,30 @@ def spend_signature_verifies(raw_tx: bytes, locator: t.BtcHtlcLocator) -> bool |
         return False
     script = items[-2]
     fields = t.btc_spend_fields_from_raw(raw)
-    if len(fields.input_prevouts) != 1:
-        return None
     sig = items[0]
     if len(sig) == 64:
         hash_type = t.SIGHASH_DEFAULT
-    elif len(sig) == 65 and sig[64] != t.SIGHASH_DEFAULT:
+    elif len(sig) == 65 and sig[64] in _BIP341_HASH_TYPES:
         hash_type, sig = sig[64], sig[:64]
     else:
-        return False
+        return False  # BIP341: a 65-byte signature never carries 0x00, nor a type outside the list
+    anyonecanpay = bool(hash_type & t.SIGHASH_ANYONECANPAY)
+    n_in = len(fields.input_prevouts)
+    if n_in != 1 and not anyonecanpay:
+        return None
     if script[-34:-33] != b"\x20" or script[-1:] != b"\xac":
         return False
+    # With ANYONECANPAY the sighash commits to this input's own spent output only, so the other
+    # inputs' spent outputs (unknown here) are placeholders the hash never reads.
+    spent = [(0, b"")] * n_in
+    spent[index] = (locator.amount_sats, locator.scriptpubkey)
     try:
         msg = t.taproot_sighash(
             tx_version=int.from_bytes(raw[:4], "little", signed=True),
             locktime=int.from_bytes(raw[-4:], "little"),
-            inputs=[(fields.input_prevouts[0], fields.input_sequences[0])],
+            inputs=list(zip(fields.input_prevouts, fields.input_sequences, strict=True)),
             input_index=index,
-            spent_outputs=[(locator.amount_sats, locator.scriptpubkey)],
+            spent_outputs=spent,
             outputs=list(fields.outputs),
             hash_type=hash_type,
             tapleaf_hash_value=t.tapleaf_hash(script, tree.leaf_version),
@@ -406,13 +429,22 @@ async def read_btc_counter_disposition(
 
     spenders: list[BtcSpender] = []
     for txid, entry in nominated.items():
-        paths = {p for _r, p, _v in entry.served}
         claims = [(r, v) for r, p, v in entry.served if p is SpendPath.CLAIM]
-        if claims:
+        refunds = [r for r, p, _v in entry.served if p is SpendPath.REFUND]  # all verified (_check_served)
+        claim_raw: bytes | None = None
+        contested = False
+        if refunds and not any(v for _r, v in claims):
+            # A verified refund beside claim witnesses that do not verify: anyone who knows p can write
+            # those over our refund's txid, so they must not hold the refund off (re-review N1). Each is
+            # still kept, as liveness: it carries p.
+            raw, path, verified = refunds[0], SpendPath.REFUND, True
+            claim_raw = claims[0][0] if claims else None
+        elif claims:
             # A claim is kept whatever else was served for this txid: it carries p. Prefer one whose
-            # signature verifies.
+            # signature verifies. Beside a verified refund too, both are signed over one txid: UNKNOWN.
             raw, verified = max(claims, key=lambda c: c[1])
             path = SpendPath.CLAIM
+            contested = bool(refunds)
         else:
             raw, path, verified = entry.served[0]
         depths = await _settle(readers, "confirmations", txid)
@@ -437,17 +469,18 @@ async def read_btc_counter_disposition(
                 confirmations=confirmations,
                 block=block,
                 verified=verified,
-                contested=len(paths) > 1,
+                contested=contested,
+                claim_raw=claim_raw,
             )
         )
     spenders.sort(key=lambda s: (s.path.value, s.txid))
     common: dict[str, Any] = {"spenders": tuple(spenders)}
 
-    contested = [s for s in spenders if s.contested]
-    if contested:
+    disputed = [s for s in spenders if s.contested]
+    if disputed:
         return answer(
             BtcDispositionKind.UNKNOWN,
-            f"sources served tx {contested[0].txid} with witnesses that spend different leaves; the txid binds "
+            f"sources served tx {disputed[0].txid} with witnesses that spend different leaves; the txid binds "
             "only the witness-stripped bytes, so which one is on chain is not known",
             **common,
         )

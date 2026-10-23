@@ -345,18 +345,129 @@ async def test_a_claim_whose_signature_does_not_verify_is_liveness_never_termina
     """Only a holder of p can write a claim witness, so it is kept (p is public), but a made-up
     signature never makes it CLAIMED."""
     chain = FakeBtcChain()
+    claim_witness = _with_witness_of(chain.refund_tx(), chain.claim_tx())  # a refund's txid, a claim's witness
+    assert spend_signature_verifies(claim_witness, chain.locator) is False
+    chain.submit(claim_witness)  # the fake does not check signatures: a forged spend, buried
+    chain.mine(BURIAL)
+    d = await _read(chain, _panel(chain))
+    assert d.kind is K.CLAIM_SEEN and not d.claims_seen[0].verified
+    assert t.scrape_secret(d.claims_seen[0].raw, chain.hashlock) == chain.preimage
+
+
+async def test_an_unverified_claim_witness_over_our_buried_refund_cannot_hold_it_off():
+    """Re-review N1: once p is public, anyone can write a claim witness over our buried refund's
+    txid. Read as "two leaves for one txid", one such source held the refund at UNKNOWN for ever,
+    with no key. A verified refund beats claims that do not verify; each is kept as liveness."""
+    chain = FakeBtcChain()
     refund = chain.refund_tx()
     chain.submit(refund)
     chain.mine(BURIAL)
-    claim_witness = _with_witness_of(refund, chain.claim_tx())  # the refund's txid, a claim's witness
-    d = await _read(chain, [FakeBtcSource(chain, forge_spender=claim_witness), *_panel(chain, 2)])
-    # Served for one txid as both a refund and a claim: UNKNOWN, and the claim stays visible.
+    claim_witness = _with_witness_of(refund, chain.claim_tx())
+    for sources in (
+        [FakeBtcSource(chain, forge_spender=claim_witness), *_panel(chain, 2)],
+        [*_panel(chain, 2), FakeBtcSource(chain, forge_spender=claim_witness)],
+    ):
+        d = await _read(chain, sources)
+        assert d.kind is K.REFUNDED and d.evidence is not None
+        assert d.evidence.txid == t.btc_txid_from_raw(refund)
+        assert len(d.claims_seen) == 1 and not d.claims_seen[0].verified
+        assert t.scrape_secret(d.claims_seen[0].raw, chain.hashlock) == chain.preimage
+    # ...while an honest panel alone carries no claim.
+    d = await _read(chain, _panel(chain))
+    assert d.kind is K.REFUNDED and d.claims_seen == ()
+
+
+def _claim_signed_over(chain: FakeBtcChain, refund: bytes) -> bytes:
+    """A claim the maker really signs over *refund*'s stripped bytes (its nSequence and output), so
+    the same txid with a claim witness that verifies: both leaves signed for one transaction."""
+    fields = t.btc_spend_fields_from_raw(refund)
+    ((amount, spk),) = fields.outputs
+    out = t._build_spend_tx(
+        locator=chain.locator,
+        witness_items_after_sig=[chain.preimage],
+        sign_privkey=chain.maker._privkey.unsafe_raw_bytes(),
+        leaf="claim",
+        to_scriptpubkey=spk,
+        out_amount_sats=amount,
+        nsequence=fields.input_sequences[0],
+        locktime=0,
+        aux_rand=t.fresh_aux_rand(),
+    )
+    assert t.btc_txid_from_raw(out) == t.btc_txid_from_raw(refund)
+    return out
+
+
+async def test_both_leaves_signed_for_one_buried_txid_is_unknown():
+    """With both signatures valid, which witness is on chain is not known from the txid: UNKNOWN,
+    and the claim is kept. The honest twin above: a refund alone reads REFUNDED."""
+    chain = FakeBtcChain()
+    refund = chain.refund_tx()
+    chain.submit(refund)
+    chain.mine(BURIAL)
+    claim = _claim_signed_over(chain, refund)
+    assert spend_signature_verifies(claim, chain.locator) is True
+    d = await _read(chain, [FakeBtcSource(chain, forge_spender=claim), *_panel(chain, 2)])
     assert d.kind is K.UNKNOWN and "different leaves" in d.reason
-    assert len(d.claims_seen) == 1 and d.claims_seen[0].contested
-    assert t.scrape_secret(d.claims_seen[0].raw, chain.hashlock) == chain.preimage
-    # Alone, an unverifiable claim buried at every source is CLAIM_SEEN, not CLAIMED.
-    d = await _read(chain, [FakeBtcSource(chain, forge_spender=claim_witness)], quorum=1)
-    assert d.kind is K.CLAIM_SEEN and not d.claims_seen[0].verified
+    assert len(d.claims_seen) == 1 and d.claims_seen[0].contested and d.claims_seen[0].verified
+
+
+@pytest.mark.parametrize("hash_type", [0x00, 0x04, 0x41, 0x80, 0x84])
+def test_a_65_byte_signature_with_a_hash_type_bip341_does_not_define_fails(hash_type):
+    """Re-review N2: BIP341 defines 0x01-0x03 and 0x81-0x83 for a 65-byte signature, and 0x00 only
+    as the 64-byte form. Any other byte is an invalid signature."""
+    chain = FakeBtcChain()
+    refund = chain.refund_tx()
+    sig = t._iter_witness_stack(refund)[0][0]
+    assert len(sig) == 64
+    bw = t._serialize_witness(t._iter_witness_stack(refund)[0])
+    stack = list(t._iter_witness_stack(refund)[0])
+    stack[0] = sig + bytes([hash_type])
+    forged = refund[: -4 - len(bw)] + t._serialize_witness(stack) + refund[-4:]
+    assert spend_signature_verifies(forged, chain.locator) is False
+
+
+def test_an_anyonecanpay_spend_with_other_inputs_is_checked_and_a_plain_one_is_not():
+    """Re-review N3: a SIGHASH_ALL|ANYONECANPAY signature commits to our input alone, so a spender
+    with more inputs is still checked; under SIGHASH_DEFAULT it commits to every spent output, and
+    only ours is known here, so it is ``None`` (unchecked), never ``True``."""
+    chain = FakeBtcChain()
+    signed = {}
+    for hash_type in (t.SIGHASH_DEFAULT, 0x81):
+        one = t._build_spend_tx(
+            locator=chain.locator,
+            witness_items_after_sig=[],
+            sign_privkey=chain.taker._privkey.unsafe_raw_bytes(),
+            leaf="refund",
+            to_scriptpubkey=REFUND_SPK,
+            out_amount_sats=99_000,
+            nsequence=chain.timeout.to_nsequence(),
+            locktime=0,
+            aux_rand=t.fresh_aux_rand(),
+            hash_type=hash_type,
+        )
+        signed[hash_type] = one
+    assert spend_signature_verifies(signed[0x81], chain.locator) is True
+    assert spend_signature_verifies(signed[t.SIGHASH_DEFAULT], chain.locator) is True
+    other = bytes(36)  # a second input before ours, empty witness
+    for hash_type, one in signed.items():
+        two = _with_extra_input_first(one, other)
+        expected = True if hash_type == 0x81 else None
+        assert spend_signature_verifies(two, chain.locator) is expected
+
+
+def _with_extra_input_first(raw: bytes, prevout: bytes) -> bytes:
+    """*raw* (one input, segwit) with a second input *prevout* put first, given an empty witness.
+    The first signature was made over one input, so only ANYONECANPAY still verifies."""
+    assert raw[4:6] == b"\x00\x01" and raw[6] == 1
+    body = raw[7:]
+    in0 = body[:41]  # 36-byte prevout, empty scriptSig, 4-byte sequence
+    assert in0[36] == 0
+    rest = body[41:]
+    stack = t._iter_witness_stack(raw)[0]
+    w = t._serialize_witness(stack)
+    outs = rest[: len(rest) - len(w) - 4]
+    extra = prevout + b"\x00" + b"\xff\xff\xff\xff"
+    return raw[:6] + b"\x02" + extra + in0 + outs + b"\x00" + w + raw[-4:]
 
 
 async def test_a_malformed_hashlock_is_refused_before_anything_is_read():
