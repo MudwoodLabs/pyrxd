@@ -188,7 +188,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at every endpoint, or that any endpoint reads as settled at either block (new
   `pyrxd.eth_wallet.disposition.read_unfunded_token_balance` and `EthLeg.unfunded_token_balance`),
   or whose pushing key (this leg's key, when it created the contract) is not known or not idle at
-  every endpoint, since a push no record names may be in flight. A balance or nonce read that fails
+  every endpoint, since a push no record names may be in flight (a deploy that cannot be read leaves
+  the key unknown). A balance or nonce read that fails
   or disagrees raises `NetworkError`, as does a balance read from one
   endpoint on a chain that carries value. It also refuses, first, when the persist hook's record of
   this swap on disk is past `NEGOTIATED` or holds a counter-leg locator, pending contract, BTC

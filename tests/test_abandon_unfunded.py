@@ -57,6 +57,7 @@ class _Leg:
 
     async def unfunded_token_balance(self, *, token, contract, deploy_tx_hash=None):
         self.reads.append((token, contract))
+        assert deploy_tx_hash in (None, DEPLOY_TX)  # the record's deploy, never another hash
         funding = self.funder if deploy_tx_hash is not None else None
         return await read_unfunded_token_balance(self._rpc, token=token, contract=contract, funding_account=funding)
 
@@ -566,6 +567,15 @@ async def test_the_shipped_eth_leg_reads_through_its_own_rpc():
 # --------------------------------------------------------------------------- a push no record names (Mythos F5)
 
 
+class _OtherForkAtF(FakeEvmEndpoint):
+    """An endpoint whose count at a historic block is one lower (another fork there); its latest and
+    pending counts agree with the others."""
+
+    async def get_transaction_count(self, address, block="pending"):
+        n = await super().get_transaction_count(address, block)
+        return n - 1 if isinstance(block, int) and n > 0 else n
+
+
 @pytest.mark.parametrize(
     "busy",
     [
@@ -573,8 +583,12 @@ async def test_the_shipped_eth_leg_reads_through_its_own_rpc():
         {"endpoints": lambda c: [FakeEvmEndpoint(c), FakeEvmEndpoint(c), FakeEvmEndpoint(c, pending_extra=1)]},
         {"endpoints": lambda c: [FakeEvmEndpoint(c, lie_nonce=9), FakeEvmEndpoint(c), FakeEvmEndpoint(c)]},
         {"chain_kw": {"nonces": {95: 4}}},  # a transaction of the key mined above the finalized block
+        {
+            "endpoints": lambda c: [FakeEvmEndpoint(c), FakeEvmEndpoint(c), _OtherForkAtF(c)],
+            "chain_kw": {"nonces": {40: 4}},
+        },
     ],
-    ids=["pending_everywhere", "pending_at_one_endpoint", "endpoints_disagree", "unfinalized"],
+    ids=["pending_everywhere", "pending_at_one_endpoint", "endpoints_disagree", "unfinalized", "count_at_F_differs"],
 )
 async def test_a_funding_key_with_transactions_in_flight_ends_no_record(busy):
     """F5: a push no record names may be in flight while the balance still reads 0."""

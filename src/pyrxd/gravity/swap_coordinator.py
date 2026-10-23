@@ -4966,7 +4966,8 @@ class SwapCoordinator:
             if balance.funding_key_idle is None:
                 raise ValidationError(
                     f"the key that would push into {contract} is not known (this leg's key did not create it, or "
-                    "its deploy could not be read), so a push in flight cannot be ruled out. Nothing was recorded."
+                    "its deploy could not be read), so a push in flight cannot be ruled out. Nothing was recorded. "
+                    "If the deploy could not be read, retry; an endpoint that has pruned it refuses every retry."
                 )
             if balance.funding_key_idle is not True:
                 raise NetworkError(

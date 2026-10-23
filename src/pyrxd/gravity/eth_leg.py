@@ -446,7 +446,8 @@ class EthLeg:
         finalized block and at the tip at every endpoint (#850 PR 8,
         :func:`pyrxd.eth_wallet.disposition.read_unfunded_token_balance`), and whether the key that
         would push into it is idle. That key is this leg's key only when it created the contract
-        (*deploy_tx_hash*); otherwise it is not known and ``funding_key_idle`` is ``None``. Read-only;
+        (*deploy_tx_hash*); otherwise it is not known and ``funding_key_idle`` is ``None``, as it is when
+        the deploy cannot be read (:meth:`created_by_this_key` reads it from one endpoint). Read-only;
         raises ``NetworkError`` when the balance or the key's nonces are unknown."""
         from pyrxd.eth_wallet.disposition import read_unfunded_token_balance
 

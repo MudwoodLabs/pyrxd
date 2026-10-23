@@ -888,8 +888,9 @@ async def read_unfunded_token_balance(
 
     With *funding_account* (the key that would sign a push), whether that key is idle: a push no
     record names may be in flight at any of its nonces, as for a nonce-less close (design §2.7). The
-    same residuals apply: a privately submitted or evicted push, or one queued above a gap in these
-    endpoints' pools, is not seen (Mythos review of #850 PR 8, F5)."""
+    same residuals apply: a privately submitted or evicted push, one queued above a gap in these
+    endpoints' pools, or one at an endpoint that answers "pending" with its latest count, is not seen
+    (Mythos review of #850 PR 8, F5)."""
     panel = _panel_of(rpc)
     token_addr, contract_addr = _addr(token), _addr(contract)
     try:
