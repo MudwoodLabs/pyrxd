@@ -200,6 +200,40 @@ async def test_a_bump_past_the_cap_is_left_to_the_operator(tmp_path, monkeypatch
     assert s.sent == [] and s.chain.mempool == t.btc_txid_from_raw(expensive)
 
 
+async def test_with_two_of_our_refunds_pending_the_bump_is_priced_over_the_dearer(tmp_path, monkeypatch):
+    """One source still holds the refund another source's mempool replaced: the bump must clear the
+    one paying the most, or the node refuses it."""
+    s = _Swap(tmp_path)
+    cheap, dear = s.chain.refund_tx(fee_sats=300), s.chain.refund_tx(fee_sats=600)
+    s.chain.submit(cheap)
+    s.chain.submit(dear)  # BIP125: dear replaces cheap at the chain
+    s.sources[2].forge_spender = cheap  # a source that has not seen the replacement
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    assert s.sent == []
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    await coord.taker_refund_btc()
+    assert len(s.sent) == 1 and _fee(s.sent[0]) == 2 * 600
+    assert s.chain.mempool == t.btc_txid_from_raw(s.sent[0])
+
+
+async def test_a_mined_refund_at_a_depth_below_the_quorum_of_answers_is_waited_on(tmp_path, monkeypatch):
+    """Mined, but too few sources answer its depth: not pending in the mempool, so never bumped."""
+    s = _Swap(tmp_path)
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    s.chain.mine(1)
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    s.sources[1].down = s.sources[2].down = True
+    await coord.taker_refund_btc()
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    rec = await coord.taker_refund_btc()
+    assert rec.state is SwapState.BTC_LOCKED and len(s.sent) == 1
+
+
 async def test_the_towers_presigned_refund_is_followed_as_ours(tmp_path):
     """Classification is by leaf, not txid (M1): a refund we did not record is still our refund."""
     s = _Swap(tmp_path)
@@ -305,6 +339,25 @@ async def test_a_read_below_quorum_signs_no_new_refund(tmp_path):
 # --------------------------------------------------------------------------- mutual_refund, reconcile
 
 
+@pytest.mark.parametrize("role", [SwapRole.TAKER, None])
+async def test_a_claim_seen_holds_a_mutual_refund_until_t_rxd_matures(tmp_path, role):
+    """D14 / N1 at BOTH_LOCKED: p is public, so neither terminal is taken and a single operator's
+    covenant is not refunded before t_rxd."""
+    s = _Swap(tmp_path, state=SwapState.BOTH_LOCKED, role=role)
+    claim = s.chain.claim_tx(fee_sats=500)
+    s.chain.submit(claim)
+    await s.coord().mutual_refund()  # CLAIM_SEEN: recorded
+    s.chain.drop()
+    await s.coord().mutual_refund()  # our refund now
+    s.chain.mine(BURIAL)
+    rec = await s.coord().mutual_refund()
+    assert rec.state is SwapState.BOTH_LOCKED and rec.counter_disposition.kind == "refunded"
+    assert not s.rxd.refunded
+    s.rxd.chain_io = _ChainIO(int(rec.terms.t_rxd.value))
+    rec = await s.coord().mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and s.rxd.refunded is (role is None)
+
+
 async def test_a_takers_mutual_refund_never_touches_the_covenant(tmp_path):
     """F-A on BTC: the covenant's CSV refund pays the maker, and the taker may still need to
     claim it with p."""
@@ -389,6 +442,21 @@ def test_the_bump_doubles_the_fee_or_clears_bip125_rule_4_and_refuses_past_the_c
     small = dataclasses.replace(s.chain.locator, amount_sats=1_000)
     with pytest.raises(ValidationError):
         leg.refund_bump_fee(small, s.chain.refund_tx(fee_sats=500))
+
+
+def test_the_bump_leaves_the_output_above_dust_whatever_the_cap(tmp_path, monkeypatch):
+    """Under the 1/10 cap the dust floor cannot bind (the bump is at least one vsize, ~125 sats);
+    it is checked on its own, so a wider cap cannot spend the output into dust."""
+    from pyrxd.btc_wallet import htlc_leg
+
+    s = _Swap(tmp_path)
+    monkeypatch.setattr(htlc_leg, "REFUND_BUMP_MAX_FEE_FRACTION", (1, 1))
+    leg = s.leg()
+    amount = s.chain.locator.amount_sats
+    edge = (amount - htlc_leg.REFUND_BUMP_MIN_OUTPUT_SATS) // 2
+    assert leg.refund_bump_fee(s.chain.locator, s.chain.refund_tx(fee_sats=edge)) == 2 * edge
+    with pytest.raises(ValidationError, match="dust"):
+        leg.refund_bump_fee(s.chain.locator, s.chain.refund_tx(fee_sats=edge + 1))
 
 
 def test_vsize_needs_a_segwit_transaction():
