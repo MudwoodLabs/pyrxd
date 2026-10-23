@@ -192,7 +192,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   this swap on disk is past `NEGOTIATED` or holds a counter-leg locator, pending contract, BTC
   funding transaction or token push that the coordinator's record does not (the same guard the fund
   uses, which now also compares the push nonce and hash). It holds `CoordinatorConfig.fund_lock`,
-  when one is set, from that read to its write. A `MAKER`-role coordinator is
+  when one is set, from that read to its write; only the ETH fund takes that lock, so it does not
+  exclude a BTC fund running at the same time in another process. A `MAKER`-role coordinator is
   refused: the maker's `NEGOTIATED` exit is #850 PR 11. A BTC record that may have been written by
   0.26.x or earlier is refused unless the caller passes `confirm_btc_htlc_empty=True` after checking
   the HTLC address: one that was read without a `role`, one whose record on disk names no `role` or

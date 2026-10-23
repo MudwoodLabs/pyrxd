@@ -4887,8 +4887,8 @@ class SwapCoordinator:
         * a record of this swap on disk (the persist hook's ``load_record``) that is past
           ``NEGOTIATED`` or holds a counter-leg locator, pending contract, BTC funding transaction or
           token push that this coordinator's record does not. It is read under
-          ``CoordinatorConfig.fund_lock`` when one is set, which the fund holds across deploy and
-          push;
+          ``CoordinatorConfig.fund_lock`` when one is set, which the ETH fund holds across deploy
+          and push (the BTC fund takes no lock, so a BTC fund in another process is not excluded);
         * a BTC record that may have been written by pyrxd 0.26.x or earlier, unless
           *confirm_btc_htlc_empty* is ``True``: one that was read without a ``role``
           (``read_without_role``, kept after a 0.27 coordinator stamps one), whose record on disk
@@ -4904,8 +4904,9 @@ class SwapCoordinator:
         stays on the record (``pending_counter_contract``).
         """
         lock = self.config.fund_lock
-        # Held from the read of the record on disk to the write, as the fund holds it across deploy
-        # and push: a fund in another process sharing the lock cannot sign a push in between.
+        # Held from the read of the record on disk to the write, as the ETH fund holds it across deploy
+        # and push: an ETH fund in another process sharing the lock cannot sign a push in between. The
+        # BTC fund takes no lock (Mythos review of #850 PR 8, F6).
         with lock() if lock is not None else contextlib.nullcontext():
             return await self._abandon_unfunded_under_the_fund_lock(confirm_btc_htlc_empty)
 
