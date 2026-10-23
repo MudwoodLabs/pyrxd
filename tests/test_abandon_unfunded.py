@@ -30,7 +30,7 @@ from pyrxd.gravity.swap_state import (
     SwapState,
 )
 from pyrxd.security.errors import NetworkError, ValidationError
-from tests._fake_evm_chain import CHAIN_ID, CONTRACT, TOKEN, FakeEvmChain, FakeEvmEndpoint
+from tests._fake_evm_chain import CHAIN_ID, CONTRACT, FUNDER, TOKEN, FakeEvmChain, FakeEvmEndpoint
 from tests.test_swap_coordinator import (
     CoordinatorConfig,
     FakeIndexer,
@@ -53,10 +53,12 @@ class _Leg:
         self._rpc = rpc
         self.chain_id = chain_id
         self.reads: list[tuple[str, str]] = []
+        self.funder: str | None = FUNDER  # the key that created the contract, as the shipped leg derives it
 
-    async def unfunded_token_balance(self, *, token, contract):
+    async def unfunded_token_balance(self, *, token, contract, deploy_tx_hash=None):
         self.reads.append((token, contract))
-        return await read_unfunded_token_balance(self._rpc, token=token, contract=contract)
+        funding = self.funder if deploy_tx_hash is not None else None
+        return await read_unfunded_token_balance(self._rpc, token=token, contract=contract, funding_account=funding)
 
 
 def _chain(**kw) -> FakeEvmChain:
@@ -559,3 +561,71 @@ async def test_the_shipped_eth_leg_reads_through_its_own_rpc():
     leg._leg._rpc = MultiSourceEthRpc([FakeEvmEndpoint(chain) for _ in range(2)])
     read = await leg.unfunded_token_balance(token=TOKEN, contract=CONTRACT)
     assert read.empty is False and read.finalized_block == FINALIZED
+
+
+# --------------------------------------------------------------------------- a push no record names (Mythos F5)
+
+
+@pytest.mark.parametrize(
+    "busy",
+    [
+        {"chain_kw": {"pending_txs": 1}},
+        {"endpoints": lambda c: [FakeEvmEndpoint(c), FakeEvmEndpoint(c), FakeEvmEndpoint(c, pending_extra=1)]},
+        {"endpoints": lambda c: [FakeEvmEndpoint(c, lie_nonce=9), FakeEvmEndpoint(c), FakeEvmEndpoint(c)]},
+        {"chain_kw": {"nonces": {95: 4}}},  # a transaction of the key mined above the finalized block
+    ],
+    ids=["pending_everywhere", "pending_at_one_endpoint", "endpoints_disagree", "unfinalized"],
+)
+async def test_a_funding_key_with_transactions_in_flight_ends_no_record(busy):
+    """F5: a push no record names may be in flight while the balance still reads 0."""
+    coord, _c, _leg = _setup(**busy)
+    before = coord.record
+    with pytest.raises(NetworkError, match="funding key is not idle"):
+        await coord.abandon_unfunded()
+    _unchanged(coord, before)
+
+
+async def test_a_funding_key_whose_nonces_cannot_be_read_ends_no_record():
+    coord, _c, _leg = _setup(
+        endpoints=lambda c: [FakeEvmEndpoint(c), FakeEvmEndpoint(c), FakeEvmEndpoint(c, nonce_reads_fail=True)]
+    )
+    before = coord.record
+    with pytest.raises(NetworkError, match="has transactions in flight is unknown"):
+        await coord.abandon_unfunded()
+    _unchanged(coord, before)
+
+
+async def test_a_contract_whose_pushing_key_is_not_known_ends_no_record():
+    coord, _c, leg = _setup()
+    leg.funder = None
+    before = coord.record
+    with pytest.raises(ValidationError, match="would push into .* is not known"):
+        await coord.abandon_unfunded()
+    _unchanged(coord, before)
+
+
+async def test_HONEST_an_idle_funding_key_with_past_transactions_is_abandoned():
+    coord, _c, _leg = _setup(chain_kw={"nonces": {40: 5}})
+    rec = await coord.abandon_unfunded()
+    assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.TAKER_NEVER_FUNDS
+
+
+@pytest.mark.parametrize("created", [True, False])
+async def test_the_shipped_eth_leg_reads_its_own_key_only_for_a_contract_it_created(created):
+    from tests.test_record_names_its_role_and_keeps_the_push import _shipped_token_eth_leg
+
+    chain = _chain(pending_txs=1)
+    leg, _seen = _shipped_token_eth_leg([])
+    leg._leg._rpc = MultiSourceEthRpc([FakeEvmEndpoint(chain) for _ in range(2)])
+
+    async def created_by_this_key(contract, deploy_tx_hash):
+        assert (contract, deploy_tx_hash) == (CONTRACT, DEPLOY_TX)
+        return created
+
+    leg.created_by_this_key = created_by_this_key
+    leg.signer_address = lambda: FUNDER
+    read = await leg.unfunded_token_balance(token=TOKEN, contract=CONTRACT, deploy_tx_hash=DEPLOY_TX)
+    assert read.empty and read.funding_key_idle is (False if created else None)
+    chain.pending_txs = 0
+    read = await leg.unfunded_token_balance(token=TOKEN, contract=CONTRACT, deploy_tx_hash=DEPLOY_TX)
+    assert read.funding_key_idle is (True if created else None)

@@ -4883,7 +4883,9 @@ class SwapCoordinator:
         * a token contract that a push was signed for (``pending_push_nonce``), that holds tokens,
           that is settled, or whose balance cannot be read: the token balance must read 0 and the
           contract unsettled at the finalized block and at the tip at every endpoint, and on a chain
-          that carries value from more than one endpoint;
+          that carries value from more than one endpoint; and the key that would push (this leg's
+          key, when it created the contract) must be idle at every endpoint, since a push no record
+          names may be in flight (design §2.7, with its residuals);
         * a record of this swap on disk (the persist hook's ``load_record``) that is past
           ``NEGOTIATED`` or holds a counter-leg locator, pending contract, BTC funding transaction or
           token push that this coordinator's record does not. It is read under
@@ -4941,7 +4943,8 @@ class SwapCoordinator:
             read = getattr(self.counter_leg, "unfunded_token_balance", None)
             if read is None:
                 raise ValidationError("abandon_unfunded needs an ETH counter leg that reads a token balance")
-            balance = await read(token=token, contract=contract)  # NetworkError: unknown, nothing recorded
+            # NetworkError: unknown, nothing recorded
+            balance = await read(token=token, contract=contract, deploy_tx_hash=self.record.pending_counter_deploy_tx)
             chain_id = getattr(self.counter_leg, "chain_id", None)
             if balance.single_source and (chain_id is None or not self._single_source_may_decide(int(chain_id))):
                 raise NetworkError(
@@ -4957,6 +4960,19 @@ class SwapCoordinator:
                 raise ValidationError(
                     f"the contract {contract} holds tokens: resume the fund (taker_funds_btc), then refund it after "
                     "its timeout. Nothing was recorded."
+                )
+            # A push no record names (a 0.26.x record, or the key used outside pyrxd) may still be in
+            # flight while the balance reads 0 (design §2.7; Mythos review of #850 PR 8, F5).
+            if balance.funding_key_idle is None:
+                raise ValidationError(
+                    f"the key that would push into {contract} is not known (this leg's key did not create it, or "
+                    "its deploy could not be read), so a push in flight cannot be ruled out. Nothing was recorded."
+                )
+            if balance.funding_key_idle is not True:
+                raise NetworkError(
+                    "the funding key is not idle at every endpoint (pending, latest and the count at the finalized "
+                    f"block are not one number), so a push into {contract} may be in flight. Nothing was recorded. "
+                    "Retry once the key's transactions are final."
                 )
         before = self.record
         self.record = dataclasses.replace(self.record, abort_reason=AbortReason.TAKER_NEVER_FUNDS)

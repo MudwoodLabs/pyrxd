@@ -441,14 +441,21 @@ class EthLeg:
         except Exception:  # an unreadable deploy proves nothing either way
             return False
 
-    async def unfunded_token_balance(self, *, token: str, contract: str):
+    async def unfunded_token_balance(self, *, token: str, contract: str, deploy_tx_hash: str | None = None):
         """Whether a token contract this swap deployed and never pushed into holds no tokens, at the
         finalized block and at the tip at every endpoint (#850 PR 8,
-        :func:`pyrxd.eth_wallet.disposition.read_unfunded_token_balance`). Read-only; raises
-        ``NetworkError`` when the balance is unknown."""
+        :func:`pyrxd.eth_wallet.disposition.read_unfunded_token_balance`), and whether the key that
+        would push into it is idle. That key is this leg's key only when it created the contract
+        (*deploy_tx_hash*); otherwise it is not known and ``funding_key_idle`` is ``None``. Read-only;
+        raises ``NetworkError`` when the balance or the key's nonces are unknown."""
         from pyrxd.eth_wallet.disposition import read_unfunded_token_balance
 
-        return await read_unfunded_token_balance(self._leg._rpc, token=token, contract=contract)
+        funding = None
+        if deploy_tx_hash is not None and await self.created_by_this_key(contract, deploy_tx_hash):
+            funding = self.signer_address()
+        return await read_unfunded_token_balance(
+            self._leg._rpc, token=token, contract=contract, funding_account=funding
+        )
 
     async def close_push_nonce(self, nonce: int, *, on_signed=None) -> str:
         """Consume ``nonce`` of this leg's key with a 0-value self-transfer (#850 PR 7a, design §2.7;
