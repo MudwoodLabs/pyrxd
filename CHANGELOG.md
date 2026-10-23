@@ -15,10 +15,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   coordinator calls it yet; `BitcoinTaprootLeg.counter_disposition` wraps it for the leg's own
   funding reader.
   - Any one source naming a spender nominates it. Its bytes must hash to the txid it is filed under
-    and spend this outpoint, or that source counts as failed. "Unspent" needs the quorum saying so.
+    and spend this outpoint, its witness must spend one of the HTLC's two leaves, and its BIP340
+    signature must verify for that leaf's key over the bytes served; otherwise that source counts
+    as failed. The txid binds only the witness-stripped bytes, so without the signature check one
+    source could serve a buried claim's txid with a refund witness. A claim whose signature cannot
+    be checked (more than one input) or does not verify is kept as liveness, because it carries
+    `p`, and is never terminal. "Unspent" needs the quorum saying so.
   - A spender is classified by the leaf its witness spends, never by txid: the claim leaf with a
     push that opens the hashlock is a claim, and the refund leaf is a refund (so the watchtower's
-    pre-signed refund is recognised as ours). A spend by neither is `UNKNOWN`.
+    pre-signed refund is recognised as ours). One txid served with witnesses of different leaves
+    is `UNKNOWN`. Every claim seen is reported on every answer, `UNKNOWN` included.
   - A spender is terminal (`REFUNDED` or `CLAIMED`) only when it is buried the given depth at the
     quorum minimum and the sources that place it in a block agree on that block. Below that a
     claim is `CLAIM_SEEN` and a refund `REFUND_PENDING`. Two different spenders both buried is

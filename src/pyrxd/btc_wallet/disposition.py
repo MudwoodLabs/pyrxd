@@ -6,28 +6,41 @@ funding outpoint been spent, by which leaf, and is that spend buried deep enough
 anything, and in this PR nothing in the coordinator calls it yet.
 
 * **Discovery** is broad: every source is asked who spends the outpoint, and ANY source naming a
-  spender nominates it (§6, "any source reports spent with a txid"). A source's spender is accepted
-  only when its bytes hash to the txid it is filed under and it spends OUR outpoint; a source that
-  serves anything else counts as failed, never as an answer.
-* **Classification is by script path, never by txid** (§6, M1). The input spending our outpoint
-  reveals its tapscript leaf: the claim leaf with a witness push that opens ``H`` is a claim; the
-  refund leaf is a refund. The refund leaf needs the taker's key, so every refund-leaf spend is the
-  taker's own refund, whoever broadcast it (the operator, or the tower's pre-signed refund).
-  Anything else is not a spend this HTLC can have, and reads :attr:`BtcDispositionKind.UNKNOWN`.
+  spender nominates it (§6, "any source reports spent with a txid"), once the spender passes the
+  checks below. A source that serves anything else counts as failed, never as an answer.
+* **What a served spender must pass.** Its bytes hash to the txid it is filed under and it spends
+  OUR outpoint. That binds the witness-stripped bytes only: a source can serve a real transaction's
+  txid with a witness it made up. So the witness is checked too. The input spending our outpoint
+  must spend one of the HTLC's two leaves, and its BIP340 signature must verify, for that leaf's own
+  key, over the transaction as served (``taproot_sighash``). A refund-leaf witness therefore needs
+  the taker's key and a claim-leaf witness the maker's, and neither can be made up by a source.
+  The one exception is a claim whose signature cannot be checked here (a spender with more than one
+  input, whose other spent outputs this reader does not know) or does not verify: its witness still
+  carries a preimage of ``H``, which only a holder of ``p`` can write, so it is kept, unverified, as
+  liveness (``p`` is public wherever it is), and it is never terminal.
+* **Classification is by script path, never by txid** (§6, M1): the claim leaf with a witness push
+  that opens ``H`` is a claim; the refund leaf is a refund, whoever broadcast it (the operator, or
+  the tower's pre-signed refund). Sources serving one txid with witnesses that classify differently
+  read :attr:`BtcDispositionKind.UNKNOWN`, with any claim among them kept.
 * **Burial decides.** A spender changes nothing until it is ``burial_blocks`` deep at the quorum
   MINIMUM of its depth, with at least ``quorum`` sources answering the depth and every source that
   places it in a block placing it in the SAME block. Below that a claim is
-  :attr:`BtcDispositionKind.CLAIM_SEEN` (liveness: ``p`` is public wherever the claim is, so the
-  covenant claim is due) and a refund is :attr:`BtcDispositionKind.REFUND_PENDING`: the claim leaf
-  has no timelock and the refund signals BIP125, so an unburied refund can still be replaced by a
-  claim, and either can be reorged out.
-* **Unspent** needs ``quorum`` sources saying so and none naming a spender: a source that cannot
-  answer is never a vote for "unspent".
+  :attr:`BtcDispositionKind.CLAIM_SEEN` and a refund :attr:`BtcDispositionKind.REFUND_PENDING`: the
+  claim leaf has no timelock and the refund signals BIP125, so an unburied refund can still be
+  replaced by a claim, and either can be reorged out. The minimum is the safe direction, and its
+  cost is liveness: one source that never reports the spender deep, or places it in another block,
+  holds every terminal answer back.
+* **Unspent** needs ``quorum`` sources saying so and none naming a spender that passes the checks:
+  a source that cannot answer is never a vote for "unspent". ``unspent_by`` lists who said so on
+  every answer, so a consumer can see a refund of ours that one source holds and the rest do not.
+
+**Claims are liveness on every answer.** ``claims_seen`` is filled whatever the kind, UNKNOWN
+included: a consumer pages the covenant claim on any non-empty ``claims_seen``, not only on
+:attr:`BtcDispositionKind.CLAIM_SEEN`.
 
 Precedence when evidence contradicts (the §2.4 rules, on BTC): two different spenders both buried
 is impossible on an honest chain and reads UNKNOWN. A buried refund beside an unburied claim seen
-elsewhere reads :attr:`BtcDispositionKind.REFUNDED`, and the claim stays in ``spenders``: ``p`` is
-public, so the consumer keeps the covenant claim paged (D14).
+elsewhere reads :attr:`BtcDispositionKind.REFUNDED`, and the claim stays in ``spenders`` (D14).
 
 Single source: with one source every answer is ``single_source=True``. Whether that may change a
 record's state is the CONSUMER's rule (design §2.5), not this module's.
@@ -54,6 +67,7 @@ __all__ = [
     "SpendPath",
     "read_btc_counter_disposition",
     "spend_path_of",
+    "spend_signature_verifies",
 ]
 
 
@@ -68,11 +82,11 @@ class SpendPath(Enum):
 class BtcDispositionKind(Enum):
     """What the chain says about the BTC HTLC funding outpoint (design §6)."""
 
-    UNSPENT = "unspent"  # quorum sources hold it unspent, and none names a spender
+    UNSPENT = "unspent"  # quorum sources hold it unspent, and none names a spender that passes the checks
     REFUND_PENDING = "refund_pending"  # a refund-leaf spend is nominated, not yet buried
     REFUNDED = "refunded"  # a refund-leaf spend is buried at the quorum depth
-    CLAIM_SEEN = "claim_seen"  # a claim-leaf spend that opens H is nominated, not yet buried: liveness
-    CLAIMED = "claimed"  # a claim-leaf spend is buried at the quorum depth
+    CLAIM_SEEN = "claim_seen"  # a claim-leaf spend that opens H is nominated, not buried (or unverified)
+    CLAIMED = "claimed"  # a verified claim-leaf spend is buried at the quorum depth
     UNKNOWN = "unknown"  # a read failed, fell below quorum, or the evidence contradicts itself
 
 
@@ -80,9 +94,12 @@ class BtcDispositionKind(Enum):
 class BtcSpender:
     """One transaction some source names as spending the outpoint, checked and classified.
 
+    ``verified``: its leaf signature verifies over the bytes served (always, for a refund).
     ``confirmations`` is the MINIMUM depth across the sources that answered, or ``None`` when fewer
     than the quorum did. ``block`` is ``(height, block hash)`` when every source that places the
-    transaction in a block agrees on it and at least the quorum do, else ``None``."""
+    transaction in a block agrees on it and at least the quorum do, else ``None``. ``contested``:
+    sources served this txid with witnesses that classify differently; ``raw`` is then a claim's
+    bytes when any was served, so ``p`` can be read from it."""
 
     txid: str
     path: SpendPath
@@ -90,11 +107,14 @@ class BtcSpender:
     nominated_by: tuple[str, ...]
     confirmations: int | None
     block: tuple[int, str] | None
+    verified: bool = True
+    contested: bool = False
 
     def __repr__(self) -> str:  # the raw bytes are long; a claim's carry p, which is public but noisy
         return (
             f"BtcSpender(txid={self.txid}, path={self.path.value}, nominated_by={self.nominated_by}, "
-            f"confirmations={self.confirmations}, block={self.block})"
+            f"confirmations={self.confirmations}, block={self.block}, verified={self.verified}, "
+            f"contested={self.contested})"
         )
 
 
@@ -119,11 +139,14 @@ class BtcCounterDisposition:
     spenders: tuple[BtcSpender, ...] = ()
     sources: tuple[str, ...] = ()
     failed: tuple[tuple[str, str], ...] = ()
+    #: The sources that answered "unspent", on every answer.
+    unspent_by: tuple[str, ...] = ()
     single_source: bool = False
 
     @property
     def claims_seen(self) -> tuple[BtcSpender, ...]:
-        """Every nominated claim-leaf spend, buried or not: ``p`` is public wherever one is."""
+        """Every nominated claim-leaf spend, buried or not, verified or not, on every kind of
+        answer: ``p`` is public wherever one is."""
         return tuple(s for s in self.spenders if s.path is SpendPath.CLAIM)
 
     @property
@@ -134,14 +157,21 @@ class BtcCounterDisposition:
 # --------------------------------------------------------------------------- classification
 
 
-def _input_witness(raw: bytes, prevout: bytes) -> list[bytes] | None:
-    """The witness stack of the input of *raw* that spends *prevout*, or ``None``."""
+def _input_witness(raw: bytes, prevout: bytes) -> tuple[int, list[bytes]] | None:
+    """``(input index, witness stack)`` of the input of *raw* that spends *prevout*, or ``None``."""
     prevouts = t.btc_input_outpoints_from_raw(raw)
     if prevout not in prevouts:
         return None
     stacks = t._iter_witness_stack(raw)
     index = prevouts.index(prevout)
-    return stacks[index] if index < len(stacks) else []
+    return index, (stacks[index] if index < len(stacks) else [])
+
+
+def _split_annex(stack: list[bytes]) -> tuple[list[bytes], bytes | None]:
+    items = list(stack)
+    if len(items) >= 2 and items[-1][:1] == b"\x50":
+        return items[:-1], items[-1]  # BIP341 annex
+    return items, None
 
 
 def spend_path_of(raw_tx: bytes, locator: t.BtcHtlcLocator, hashlock: bytes) -> SpendPath:
@@ -149,16 +179,15 @@ def spend_path_of(raw_tx: bytes, locator: t.BtcHtlcLocator, hashlock: bytes) -> 
 
     Read from the spending input's own witness: its tapscript is the item before the control block
     (BIP341, after dropping an annex). The claim leaf counts only with a witness push whose sha256 is
-    *hashlock*, so a claim here always reveals ``p``. Raises :class:`ValidationError` when *raw_tx*
-    does not spend the outpoint at all, or does not parse."""
+    *hashlock*, so a claim here always reveals ``p``. This reads the witness only; whether its
+    signature verifies is :func:`spend_signature_verifies`. Raises :class:`ValidationError` when
+    *raw_tx* does not spend the outpoint at all, or does not parse."""
     raw = bytes(raw_tx)
     h = t._as_bytes(hashlock, name="hashlock", length=32)
-    stack = _input_witness(raw, locator.funding_outpoint.prevout_bytes())
-    if stack is None:
+    found = _input_witness(raw, locator.funding_outpoint.prevout_bytes())
+    if found is None:
         raise ValidationError("the transaction does not spend this HTLC's funding outpoint")
-    items = list(stack)
-    if len(items) >= 2 and items[-1][:1] == b"\x50":
-        items = items[:-1]  # BIP341 annex
+    items, _annex = _split_annex(found[1])
     if len(items) < 2:
         return SpendPath.UNRECOGNISED  # a key-path spend; the NUMS internal key has no private key
     script = items[-2]
@@ -170,6 +199,56 @@ def spend_path_of(raw_tx: bytes, locator: t.BtcHtlcLocator, hashlock: bytes) -> 
     if script == tree.refund_script:
         return SpendPath.REFUND
     return SpendPath.UNRECOGNISED
+
+
+def spend_signature_verifies(raw_tx: bytes, locator: t.BtcHtlcLocator) -> bool | None:
+    """Whether the BIP340 signature in *raw_tx*'s spend of ``locator``'s outpoint verifies for the
+    key of the leaf it spends, over *raw_tx* itself (BIP341 script-path sighash).
+
+    ``None`` when this cannot be checked here: a spender with more than one input (its sighash
+    commits to every input's spent output, and only ours is known). ``False`` for a leaf this HTLC
+    does not have, a malformed signature, or one that does not verify. Each leaf ends
+    ``<32-byte x-only key> OP_CHECKSIG`` (``taproot.claim_leaf_script``, ``refund_leaf_script``),
+    and that key is the one checked."""
+    import coincurve
+
+    raw = bytes(raw_tx)
+    found = _input_witness(raw, locator.funding_outpoint.prevout_bytes())
+    if found is None:
+        return False
+    index, stack = found
+    items, annex = _split_annex(stack)
+    tree = locator.script_tree
+    if len(items) < 3 or items[-2] not in (tree.claim_script, tree.refund_script):
+        return False
+    script = items[-2]
+    fields = t.btc_spend_fields_from_raw(raw)
+    if len(fields.input_prevouts) != 1:
+        return None
+    sig = items[0]
+    if len(sig) == 64:
+        hash_type = t.SIGHASH_DEFAULT
+    elif len(sig) == 65 and sig[64] != t.SIGHASH_DEFAULT:
+        hash_type, sig = sig[64], sig[:64]
+    else:
+        return False
+    if script[-34:-33] != b"\x20" or script[-1:] != b"\xac":
+        return False
+    try:
+        msg = t.taproot_sighash(
+            tx_version=int.from_bytes(raw[:4], "little", signed=True),
+            locktime=int.from_bytes(raw[-4:], "little"),
+            inputs=[(fields.input_prevouts[0], fields.input_sequences[0])],
+            input_index=index,
+            spent_outputs=[(locator.amount_sats, locator.scriptpubkey)],
+            outputs=list(fields.outputs),
+            hash_type=hash_type,
+            tapleaf_hash_value=t.tapleaf_hash(script, tree.leaf_version),
+            annex=annex,
+        )
+        return bool(coincurve.PublicKeyXOnly(script[-33:-1]).verify(sig, msg))
+    except (ValidationError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------- the read
@@ -218,6 +297,33 @@ def _block_or_none(value: Any) -> tuple[int, str] | bool | None:
     return False
 
 
+@dataclass
+class _Nomination:
+    """Every witness served for one txid, each with its path and whether its signature verifies."""
+
+    served: list[tuple[bytes, SpendPath, bool]]
+    by: list[str]
+
+
+def _check_served(raw: bytes, locator: t.BtcHtlcLocator, hashlock: bytes) -> tuple[str, SpendPath, bool] | str:
+    """``(txid, path, verified)`` for a spender a source served, or why that source failed."""
+    op = locator.funding_outpoint
+    try:
+        txid = t.btc_txid_from_raw(raw)
+        if op.prevout_bytes() not in t.btc_input_outpoints_from_raw(raw):
+            return f"served tx {txid} as the spender, but it does not spend {op.txid}:{op.vout}"
+        path = spend_path_of(raw, locator, hashlock)
+        verifies = spend_signature_verifies(raw, locator)
+    except ValidationError as exc:
+        return f"served a spender that does not parse ({exc})"
+    if path is SpendPath.UNRECOGNISED:
+        return f"served tx {txid}, which spends the outpoint through neither the claim leaf with H nor the refund leaf"
+    if path is SpendPath.REFUND and verifies is not True:
+        # Needs the taker's key: a refund witness whose signature does not verify was made up.
+        return f"served tx {txid} with a refund-leaf witness whose signature does not verify"
+    return txid, path, verifies is True
+
+
 async def read_btc_counter_disposition(
     readers: Sequence[Any],
     locator: t.BtcHtlcLocator,
@@ -244,17 +350,26 @@ async def read_btc_counter_disposition(
         raise ValidationError("burial_blocks must be a positive int")
     if not isinstance(locator, t.BtcHtlcLocator):
         raise ValidationError("locator must be a BtcHtlcLocator")
+    hashlock = t._as_bytes(hashlock, name="hashlock", length=32)
     keys = tuple(_key(r) for r in readers)
     single = len(readers) == 1
     op = locator.funding_outpoint
-    prevout = op.prevout_bytes()
-
-    def answer(kind: BtcDispositionKind, reason: str, **kw: Any) -> BtcCounterDisposition:
-        return BtcCounterDisposition(kind=kind, reason=reason, sources=keys, single_source=single, **kw)
 
     failed: dict[str, str] = {}
     unspent_by: list[str] = []
-    nominated: dict[str, tuple[bytes, list[str]]] = {}
+    nominated: dict[str, _Nomination] = {}
+
+    def answer(kind: BtcDispositionKind, reason: str, **kw: Any) -> BtcCounterDisposition:
+        return BtcCounterDisposition(
+            kind=kind,
+            reason=reason,
+            sources=keys,
+            single_source=single,
+            failed=tuple(failed.items()),
+            unspent_by=tuple(unspent_by),
+            **kw,
+        )
+
     for key, result in zip(keys, await _settle(readers, "outpoint_spender", op.txid, op.vout), strict=True):
         if isinstance(result, BaseException):
             failed[key] = _short(result)
@@ -266,34 +381,40 @@ async def read_btc_counter_disposition(
             failed[key] = f"served a spender that is not raw transaction bytes ({type(result).__name__})"
             continue
         raw = bytes(result)
-        try:
-            txid = t.btc_txid_from_raw(raw)
-            spends = prevout in t.btc_input_outpoints_from_raw(raw)
-        except ValidationError as exc:
-            failed[key] = f"served a spender that does not parse ({exc})"
+        checked = _check_served(raw, locator, hashlock)
+        if isinstance(checked, str):
+            failed[key] = checked
             continue
-        if not spends:
-            failed[key] = f"served tx {txid} as the spender, but it does not spend {op.txid}:{op.vout}"
-            continue
-        nominated.setdefault(txid, (raw, []))[1].append(key)
+        txid, path, verified = checked
+        entry = nominated.setdefault(txid, _Nomination(served=[], by=[]))
+        if all(raw != r for r, _p, _v in entry.served):
+            entry.served.append((raw, path, verified))
+        entry.by.append(key)
 
     if not nominated:
         if len(unspent_by) >= quorum:
             return answer(
                 BtcDispositionKind.UNSPENT,
-                f"{len(unspent_by)} of {len(readers)} source(s) hold {op.txid}:{op.vout} unspent and none names a spender",
-                failed=tuple(failed.items()),
+                f"{len(unspent_by)} of {len(readers)} source(s) hold {op.txid}:{op.vout} unspent and none names a "
+                "spender that passes the checks",
             )
         return answer(
             BtcDispositionKind.UNKNOWN,
             f"only {len(unspent_by)} source(s) answered that {op.txid}:{op.vout} is unspent, below the quorum of "
             f"{quorum}; {len(failed)} failed",
-            failed=tuple(failed.items()),
         )
 
     spenders: list[BtcSpender] = []
-    for txid, (raw, by) in nominated.items():
-        path = spend_path_of(raw, locator, hashlock)
+    for txid, entry in nominated.items():
+        paths = {p for _r, p, _v in entry.served}
+        claims = [(r, v) for r, p, v in entry.served if p is SpendPath.CLAIM]
+        if claims:
+            # A claim is kept whatever else was served for this txid: it carries p. Prefer one whose
+            # signature verifies.
+            raw, verified = max(claims, key=lambda c: c[1])
+            path = SpendPath.CLAIM
+        else:
+            raw, path, verified = entry.served[0]
         depths = await _settle(readers, "confirmations", txid)
         blocks = await _settle(readers, "tx_block", txid)
         good_depths = [
@@ -308,20 +429,33 @@ async def read_btc_counter_disposition(
             else None
         )
         spenders.append(
-            BtcSpender(txid=txid, path=path, raw=raw, nominated_by=tuple(by), confirmations=confirmations, block=block)
+            BtcSpender(
+                txid=txid,
+                path=path,
+                raw=raw,
+                nominated_by=tuple(entry.by),
+                confirmations=confirmations,
+                block=block,
+                verified=verified,
+                contested=len(paths) > 1,
+            )
         )
     spenders.sort(key=lambda s: (s.path.value, s.txid))
-    common: dict[str, Any] = {"spenders": tuple(spenders), "failed": tuple(failed.items())}
+    common: dict[str, Any] = {"spenders": tuple(spenders)}
 
-    strange = [s for s in spenders if s.path is SpendPath.UNRECOGNISED]
-    if strange:
+    contested = [s for s in spenders if s.contested]
+    if contested:
         return answer(
             BtcDispositionKind.UNKNOWN,
-            f"tx {strange[0].txid} (named by {', '.join(strange[0].nominated_by)}) spends the outpoint through "
-            "neither the claim leaf with H nor the refund leaf",
+            f"sources served tx {contested[0].txid} with witnesses that spend different leaves; the txid binds "
+            "only the witness-stripped bytes, so which one is on chain is not known",
             **common,
         )
-    buried = [s for s in spenders if s.confirmations is not None and s.confirmations >= burial_blocks and s.block]
+    buried = [
+        s
+        for s in spenders
+        if s.verified and s.confirmations is not None and s.confirmations >= burial_blocks and s.block
+    ]
     if len(buried) > 1:
         return answer(
             BtcDispositionKind.UNKNOWN,
@@ -350,12 +484,13 @@ async def read_btc_counter_disposition(
                 evidence=evidence,
                 **common,
             )
-    claims = [s for s in spenders if s.path is SpendPath.CLAIM]
-    if claims:
+    claims_seen = [s for s in spenders if s.path is SpendPath.CLAIM]
+    if claims_seen:
+        c = claims_seen[0]
+        why = "its signature cannot be verified here" if not c.verified else f"{c.confirmations} of {burial_blocks}"
         return answer(
             BtcDispositionKind.CLAIM_SEEN,
-            f"tx {claims[0].txid} claims the outpoint (its witness opens H) and is not yet buried "
-            f"({claims[0].confirmations} of {burial_blocks})",
+            f"tx {c.txid} claims the outpoint (its witness opens H) and is not terminal ({why})",
             **common,
         )
     refund = spenders[0]

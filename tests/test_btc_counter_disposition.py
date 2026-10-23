@@ -15,6 +15,7 @@ from pyrxd.btc_wallet.disposition import (
     SpendPath,
     read_btc_counter_disposition,
     spend_path_of,
+    spend_signature_verifies,
 )
 from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
 from pyrxd.btc_wallet.payment import BtcUtxo
@@ -117,7 +118,7 @@ async def test_a_served_spender_of_another_outpoint_counts_as_a_failure():
     liar = FakeBtcSource(chain, forge_spender=other.refund_tx())
     d = await _read(chain, [*_panel(chain, 2), liar])
     assert d.kind is K.UNSPENT
-    assert any("does not spend" in why for _src, why in d.failed)
+    assert any("as the spender, but it does not spend" in why for _src, why in d.failed)
     d = await _read(chain, [FakeBtcSource(chain), liar])
     assert d.kind is K.UNKNOWN
 
@@ -270,15 +271,98 @@ async def test_two_spenders_both_reported_buried_is_unknown():
     assert d.kind is K.REFUNDED  # the liars agree with each other on the refund only...
     d = await _read(chain, [*liars, FakeBtcSource(chain, lie_depth=50, lie_block=block)])
     assert d.kind is K.UNKNOWN and "contradict" in d.reason  # ...until a source names the claim too
+    # An honest third source has never seen the liars' refund (its depth read fails, as an Esplora 404
+    # does), so the liars still make a quorum on it; but it names the buried claim, and two buried
+    # spenders are never a terminal answer.
     d = await _read(chain, [*liars, FakeBtcSource(chain)])
-    assert d.kind is K.CLAIMED  # an honest third source: its depth of 0 for the forged refund wins (MIN)
+    assert d.kind is K.UNKNOWN and len(d.claims_seen) == 1
 
 
-async def test_an_unrecognised_spender_is_unknown():
+async def test_an_unrecognised_spender_counts_as_a_failed_source():
+    """A spend through no leaf of this HTLC cannot be on chain: the source serving it failed, and it
+    neither blocks "unspent" nor hides a real claim (review of PR 9a, H2 and M1)."""
     chain = FakeBtcChain()
     forged = _witness_swap(chain.claim_tx(), 1, b"\x00" * 32)
-    d = await _read(chain, [*_panel(chain, 2), FakeBtcSource(chain, forge_spender=forged)])
-    assert d.kind is K.UNKNOWN and "neither the claim leaf" in d.reason
+    junk = FakeBtcSource(chain, forge_spender=forged)
+    d = await _read(chain, [*_panel(chain, 2), junk])
+    assert d.kind is K.UNSPENT and any("neither the claim leaf" in why for _s, why in d.failed)
+    chain.submit(chain.claim_tx())
+    d = await _read(chain, [junk, *_panel(chain, 2)])
+    assert d.kind is K.CLAIM_SEEN and len(d.claims_seen) == 1
+
+
+# --------------------------------------------------------------------------- forged witnesses (review H1, H2)
+
+
+def _with_witness_of(base: bytes, donor: bytes) -> bytes:
+    """*base*'s stripped bytes (so its txid) with *donor*'s witness: what a lying source can serve."""
+    bw = t._serialize_witness(t._iter_witness_stack(base)[0])
+    dw = t._serialize_witness(t._iter_witness_stack(donor)[0])
+    assert base[-4 - len(bw) : -4] == bw
+    out = base[: -4 - len(bw)] + dw + base[-4:]
+    assert t.btc_txid_from_raw(out) == t.btc_txid_from_raw(base)
+    return out
+
+
+def test_signatures_verify_for_real_spends_and_not_for_a_swapped_witness():
+    chain = FakeBtcChain()
+    claim, refund = chain.claim_tx(), chain.refund_tx()
+    assert spend_signature_verifies(claim, chain.locator) is True
+    assert spend_signature_verifies(refund, chain.locator) is True
+    assert spend_signature_verifies(_with_witness_of(claim, refund), chain.locator) is False
+    assert spend_signature_verifies(_witness_swap(refund, 0, b"\x01" * 64), chain.locator) is False
+
+
+@pytest.mark.parametrize("hostile_first", [True, False])
+async def test_a_buried_claim_served_with_a_refund_witness_stays_claimed(hostile_first):
+    """Review H1: the txid binds only the stripped bytes. A source serving the real claim's txid with
+    a refund-leaf witness (public script and control block, a made-up signature) turned a buried
+    CLAIM into REFUNDED and hid p, whenever it came first. Its signature does not verify, so it fails."""
+    chain = FakeBtcChain()
+    claim = chain.claim_tx(fee_sats=2_000)
+    chain.submit(claim)
+    chain.mine(BURIAL)
+    liar = FakeBtcSource(chain, forge_spender=_with_witness_of(claim, chain.refund_tx()))
+    sources = [liar, *_panel(chain, 2)] if hostile_first else [*_panel(chain, 2), liar]
+    d = await _read(chain, sources)
+    assert d.kind is K.CLAIMED and len(d.claims_seen) == 1
+    assert any("does not verify" in why for _s, why in d.failed)
+
+
+async def test_a_made_up_refund_cannot_hold_off_unspent():
+    """Review H2: a refund-leaf spend no source but one has, with a made-up signature, read
+    REFUND_PENDING ("wait") beside two sources saying unspent, so no refund would ever be sent."""
+    chain = FakeBtcChain()
+    made_up = _witness_swap(chain.refund_tx(fee_sats=777), 0, b"\x02" * 64)
+    d = await _read(chain, [FakeBtcSource(chain, forge_spender=made_up), *_panel(chain, 2)])
+    assert d.kind is K.UNSPENT and len(d.unspent_by) == 2
+    # ...while a real refund of ours that only one source holds still nominates (it is ours, and real).
+    d = await _read(chain, [FakeBtcSource(chain, forge_spender=chain.refund_tx()), *_panel(chain, 2)])
+    assert d.kind is K.REFUND_PENDING and len(d.unspent_by) == 2
+
+
+async def test_a_claim_whose_signature_does_not_verify_is_liveness_never_terminal():
+    """Only a holder of p can write a claim witness, so it is kept (p is public), but a made-up
+    signature never makes it CLAIMED."""
+    chain = FakeBtcChain()
+    refund = chain.refund_tx()
+    chain.submit(refund)
+    chain.mine(BURIAL)
+    claim_witness = _with_witness_of(refund, chain.claim_tx())  # the refund's txid, a claim's witness
+    d = await _read(chain, [FakeBtcSource(chain, forge_spender=claim_witness), *_panel(chain, 2)])
+    # Served for one txid as both a refund and a claim: UNKNOWN, and the claim stays visible.
+    assert d.kind is K.UNKNOWN and "different leaves" in d.reason
+    assert len(d.claims_seen) == 1 and d.claims_seen[0].contested
+    assert t.scrape_secret(d.claims_seen[0].raw, chain.hashlock) == chain.preimage
+    # Alone, an unverifiable claim buried at every source is CLAIM_SEEN, not CLAIMED.
+    d = await _read(chain, [FakeBtcSource(chain, forge_spender=claim_witness)], quorum=1)
+    assert d.kind is K.CLAIM_SEEN and not d.claims_seen[0].verified
+
+
+async def test_a_malformed_hashlock_is_refused_before_anything_is_read():
+    chain = FakeBtcChain()
+    with pytest.raises(ValidationError, match="hashlock"):
+        await read_btc_counter_disposition(_panel(chain), chain.locator, hashlock=b"x", burial_blocks=6, quorum=2)
 
 
 async def test_the_reader_refuses_a_bad_quorum_or_burial():

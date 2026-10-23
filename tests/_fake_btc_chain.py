@@ -223,8 +223,12 @@ class FakeBtcSource:
             raise NetworkError("connection refused")
 
     def _height_of(self, txid: str) -> int | None:
+        """The height of *txid* in this view, ``None`` when unmined. A txid this source has never
+        seen raises, as an Esplora 404 or a Core "no such transaction" does."""
         if txid == self.chain.funding_txid:
             return self.chain.funding_height
+        if txid not in self.chain.raws:
+            raise NetworkError(f"transaction {txid[:16]}… not found")
         height = self.chain.mined.get(txid)
         return height if height is not None and height <= self.head else None
 
