@@ -756,6 +756,7 @@ async def test_a_claim_written_after_the_last_check_is_kept_under_the_abandon(tm
     on_disk = sink.load_record()
     assert rec.state is SwapState.ABORTED and on_disk.state is SwapState.ABORTED
     assert on_disk.counter_claim_tx == claim
+    assert rec.counter_claim_tx == claim and coord.record == on_disk  # the caller is told too
 
 
 async def test_HONEST_a_write_names_its_own_claim_over_the_one_on_disk(tmp_path):

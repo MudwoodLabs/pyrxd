@@ -127,6 +127,10 @@ class JsonFileRecordSink:
             return
         from pyrxd.gravity.swap_state import SWAP_RECORD_SCHEMA_VERSION
 
+        logger.warning(
+            "swap record: kept the recorded counter-leg claim %s, which this write did not carry; p may be public",
+            prior["counter_claim_tx"],
+        )
         incoming["counter_claim_tx"] = prior["counter_claim_tx"]
         incoming["schema_version"] = max(
             int(incoming.get("schema_version") or 0),
