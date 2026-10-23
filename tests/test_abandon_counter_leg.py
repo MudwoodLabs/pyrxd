@@ -791,6 +791,30 @@ async def test_a_refused_abandon_says_its_note_names_no_record(tmp_path, caplog)
     assert "no record names that note" in caplog.text
 
 
+async def test_an_abandon_written_over_after_its_persist_says_so(tmp_path, caplog):
+    """Re-review: with no lock between processes, another writer may replace the abandon on disk
+    before it is read back. The abandon then does not report the record as ABORTED."""
+    coord, _chain, _leg = _token_setup(nonces={20: PUSH_NONCE})
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(coord.record)
+    coord._persist = sink
+    stale = coord.record
+    real_load = sink.load_record
+    loads = []
+
+    def load_after_another_writer():
+        loads.append(1)
+        if len(loads) == 3:  # the read-back after the persist (two checks came first)
+            (tmp_path / "swap.json").write_text(json.dumps(stale.to_dict()))  # another process
+        return real_load()
+
+    sink.load_record = load_after_another_writer
+    await _abandon(coord, AbandonCase.EXPIRED_EMPTY)
+    assert len(loads) == 3 and sink.load_record().state is SwapState.BTC_LOCKED
+    assert "no longer this abandon (it is at btc_locked)" in caplog.text
+    assert "the record is ABORTED" not in caplog.text
+
+
 async def test_a_verified_claim_is_the_one_the_aborted_record_names():
     coord, chain, leg, _sink = _token()
     chain.token_balances[30] = 1_000_000

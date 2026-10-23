@@ -5183,6 +5183,14 @@ class SwapCoordinator:
                 "contract with reconcile_counter_leg",
                 on_disk.counter_claim_tx,
             )
+        if on_disk is not None and on_disk.abort_note_sha256 != digest:
+            # There is no lock between processes: another one wrote the record after this abandon did.
+            logger.warning(
+                "the record of this swap on disk is no longer this abandon (it is at %s): another process wrote it "
+                "after this one. Rebuild the coordinator from the record on disk",
+                on_disk.state.value,
+            )
+            return self.record
         logger.warning(
             "counter-leg contract %s abandoned by the operator (%s, read %s at block %d); the record is ABORTED",
             locator.contract_address,
