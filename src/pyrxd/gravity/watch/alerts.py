@@ -106,13 +106,29 @@ def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
     if decision.deadline_rxd_height is not None:
         parts.append(f"by RXD height {decision.deadline_rxd_height}")
     if decision.low_corroboration:
-        parts.append("(LOW CORROBORATION — single-source RXD read; verify before acting)")
+        parts.append("(LOW CORROBORATION — single-source RXD or BTC read; verify before acting)")
     return " | ".join(parts)
 
 
+#: What one swap's page is about, for dedup and ACK: its intent and the decision's ``situation`` tag.
+#: Two decisions with the same intent but a different tag are different situations (#850 PR 9b,
+#: Mythos F1). Severity is not part of it: a situation that once paged CRITICAL stays CRITICAL while it
+#: lasts, so an ``urgent`` flag that flips with a flaky read neither storms pages nor drops an ACK
+#: (re-review of the F3 fix).
+_Situation = tuple[Intent, "str | None"]
+
+
+def _severity(decision: Decision) -> Severity | None:
+    """The page's severity: the intent's, raised to CRITICAL on an ``urgent`` refund page."""
+    if decision.urgent:
+        return Severity.CRITICAL
+    return _SEVERITY.get(decision.intent)
+
+
 class DedupAlerter:
-    """Routes actionable Decisions to an :class:`AlertChannel`, de-duplicated by
-    ``(swap_id, intent)``. Satisfies the reconciler's ``Alerter`` port structurally."""
+    """Routes actionable Decisions to an :class:`AlertChannel`, de-duplicated by swap and
+    situation (intent, ``situation`` tag, severity). Satisfies the reconciler's ``Alerter``
+    port structurally."""
 
     def __init__(self, *, channel: AlertChannel, repage_critical_every_ticks: int = 1) -> None:
         if (
@@ -122,15 +138,16 @@ class DedupAlerter:
         ):
             raise ValidationError("repage_critical_every_ticks must be an int >= 1")
         self._channel = channel
-        self._last: dict[str, Intent] = {}
+        # swap_id -> (its live situation, the highest severity that situation has paged at).
+        self._last: dict[str, tuple[_Situation, Severity]] = {}
         # Ticks (handle() calls) a CRITICAL situation has persisted since its last successful
         # page — the re-page backoff counter (review MEDIUM). Keyed by swap_id because a swap
         # has exactly one live intent per tick. Reset to 0 after each (re)page.
         self._critical_ticks: dict[str, int] = {}
-        # Operator-ACK'd CRITICAL situations: swap_id -> the exact CRITICAL Intent acknowledged.
+        # Operator-ACK'd CRITICAL situations: swap_id -> the exact CRITICAL situation acknowledged.
         # An ACK suppresses re-paging for THAT situation (the operator is handling it) and drops
-        # it from unacked_critical_count(); a DIFFERENT/escalated intent re-arms paging.
-        self._acked: dict[str, Intent] = {}
+        # it from unacked_critical_count(); a DIFFERENT/escalated situation re-arms paging.
+        self._acked: dict[str, _Situation] = {}
         self._repage_every = repage_critical_every_ticks
 
     def ack(self, swap_id: str) -> bool:
@@ -141,9 +158,9 @@ class DedupAlerter:
         page once anyway). Returns True if an ACK was recorded, False if there was nothing
         CRITICAL to ack. An escalation to a different CRITICAL intent re-arms paging.
         """
-        intent = self._last.get(swap_id)
-        if intent is not None and _SEVERITY.get(intent) is Severity.CRITICAL:
-            self._acked[swap_id] = intent
+        last = self._last.get(swap_id)
+        if last is not None and last[1] is Severity.CRITICAL:
+            self._acked[swap_id] = last[0]
             return True
         return False
 
@@ -156,15 +173,15 @@ class DedupAlerter:
         """
         return sum(
             1
-            for sid, intent in self._last.items()
-            if _SEVERITY.get(intent) is Severity.CRITICAL and self._acked.get(sid) is not intent
+            for sid, (situation, severity) in self._last.items()
+            if severity is Severity.CRITICAL and self._acked.get(sid) != situation
         )
 
     async def handle(self, swap_id: str, decision: Decision) -> None:
         if not isinstance(decision, Decision):
             raise ValidationError("DedupAlerter.handle requires a Decision")
         intent = decision.intent
-        severity = _SEVERITY.get(intent)
+        severity = _severity(decision)
         if severity is None:
             # WATCH / NOOP — not an alertable event (the reconciler shouldn't route these,
             # but stay defensive rather than paging noise).
@@ -174,14 +191,23 @@ class DedupAlerter:
             # mis-count a future swap reusing the id. The INFO "done" page still dedups via _last.
             self._critical_ticks.pop(swap_id, None)
             self._acked.pop(swap_id, None)
-        if self._last.get(swap_id) is intent:
-            # Same situation still live. WARN/INFO page once. A CRITICAL (claim/squeeze)
-            # race RE-PAGES on the tick-count backoff so a single missed page cannot
-            # silently lose funds (review MEDIUM) — unless the operator ACK'd this exact
-            # situation (they are handling it), then stay quiet until it changes.
+        situation: _Situation = (intent, decision.situation)
+        last = self._last.get(swap_id)
+        if (
+            last is not None
+            and last[0] == situation
+            and not (severity is Severity.CRITICAL and last[1] is not Severity.CRITICAL)
+        ):
+            # Same situation still live, at no higher severity than it paged at (an escalation to
+            # CRITICAL pages at once). WARN/INFO page once. A CRITICAL (claim/squeeze) race
+            # RE-PAGES on the tick-count backoff so a single missed page cannot silently lose
+            # funds (review MEDIUM), and stays CRITICAL on a tick that reads it less urgent —
+            # unless the operator ACK'd this exact situation (they are handling it), then stay
+            # quiet until it changes.
+            severity = last[1]
             if severity is not Severity.CRITICAL:
                 return
-            if self._acked.get(swap_id) is intent:
+            if self._acked.get(swap_id) == situation:
                 return
             self._critical_ticks[swap_id] = self._critical_ticks.get(swap_id, 0) + 1
             if self._critical_ticks[swap_id] < self._repage_every:
@@ -198,7 +224,7 @@ class DedupAlerter:
         # Send first; record dedup state only on success so a transient channel failure
         # is retried next tick rather than silently swallowed.
         await self._channel.send(page)
-        self._last[swap_id] = intent
+        self._last[swap_id] = (situation, severity)
         self._critical_ticks[swap_id] = 0  # reset the re-page backoff after a successful (re)page
 
 

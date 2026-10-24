@@ -102,10 +102,11 @@ class _Tower:
         covenant: bool = True,
         classify: bool = True,
         swap_id: str = SWAP,
+        quorum: int = 2,
     ) -> None:
         self.chain = FakeBtcChain()  # funding mined at 150, head 200: buried 51 >= t_btc 10, matured
         self.sources = [FakeBtcSource(self.chain) for _ in range(3)]
-        self.reader = MultiSourceBtcFundingReader(self.sources, quorum=2)
+        self.reader = MultiSourceBtcFundingReader(self.sources, quorum=quorum)
         self.dir = tmp_path / "records"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.swap_id = swap_id
@@ -134,11 +135,11 @@ class _Tower:
         (self.dir / f"{self.swap_id}.refund.json").write_text(json.dumps(blob.to_dict()))
         return raw
 
-    def reconciler(self, *, executor=None) -> Reconciler:
+    def reconciler(self, *, executor=None, alerter=None) -> Reconciler:
         return Reconciler(
             store=self.store,
             observer=self.observer,
-            alerter=self.pages,
+            alerter=self.pages if alerter is None else alerter,
             policy=_policy(),
             safety_window_blocks=6,
             executor=executor,
@@ -439,6 +440,7 @@ async def test_sources_that_contradict_each_other_page_an_investigation(tmp_path
     assert d.intent is Intent.PAGE_SQUEEZED
     assert d.recommended_action.startswith("investigate")
     assert d.autonomous_btc_refund is False
+    assert d.situation == "btc_spender_contradiction", "an ACK of it would silence the claim race"
 
 
 async def test_params_mismatch_with_our_refund_pending_does_not_arm_again(tmp_path):

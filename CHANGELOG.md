@@ -148,6 +148,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     RXD height) on agreement, or once the claim page is delivered after t_rxd. An unspent HTLC is
     never marked, which departs from design §5.2 item 4 on purpose (noted there). The store never
     writes a record.
+  - Fixes from the Mythos review of the PR (F1 to F6). `Decision` gains `situation` and `urgent`.
+    `DedupAlerter` dedups and ACKs by intent and situation, so an ACK of the pending-refund page, the
+    contradicting-sources page or the discovery-disagreement page no longer silences the claim race
+    (all are `PAGE_SQUEEZED`); a situation keeps the highest severity it paged at, so an `urgent`
+    flag that flips with a flaky read neither storms pages nor drops an ACK. The
+    armed refund page no longer says the tower broadcasts: the reconciler appends what this tick's
+    executor did. A refund page for an unspent HTLC near or past t_rxd is `urgent` (CRITICAL,
+    re-paged) at `BTC_LOCKED`, `PARAMS_MISMATCH` and `BOTH_LOCKED`, and on a legacy record also when
+    it pins no covenant; `decide_legacy` takes `safety_window_blocks`. A spender only discovery names,
+    beside our buried refund, pages "investigate" rather than a served claim witness, and a legacy
+    record with one is never marked (`Observations.btc_claim_witness_seen`). The page names the
+    buried refund, not the smallest txid seen. A single-source BTC read (`btc_single_source`, quorum
+    1, or one Esplora) marks the decision low-corroboration, and its "buried" decides nothing: it is
+    read as still pending, sets no claim aside as lost, ends no maker's or legacy record.
 
 - **On a BTC swap, `taker_refund_btc`, `mutual_refund` and `reconcile_counter_leg` follow the chain,
   not our own refund's broadcast (#850 PR 9a, part 2) [Changed (breaking)].** With a

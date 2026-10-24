@@ -21,6 +21,7 @@ Design (mirrors the brainstorm/plan):
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -91,6 +92,19 @@ class ReconcileResult:
     executed: ExecOutcome | None = None
     #: A legacy terminal record read by the D9 net (#850 PR 9b): never executed, only paged.
     legacy: bool = False
+
+
+def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
+    """What this tick's executor did with an armed refund page, appended to the page (#850 PR 9b,
+    Mythos F2). ``None`` means no executor acted (the alert-only default)."""
+    if outcome is ExecOutcome.BROADCAST:
+        return " This tick the tower broadcast the pre-signed refund."
+    if outcome is ExecOutcome.FAILED:
+        return " This tick the tower's refund broadcast FAILED: refund the BTC yourself (taker_refund_btc)."
+    return (
+        " This tick the tower did NOT broadcast a refund (no executor, dormant, or one of its gates refused): "
+        "refund the BTC yourself (taker_refund_btc)."
+    )
 
 
 class Reconciler:
@@ -171,7 +185,9 @@ class Reconciler:
         and pages nothing: the record is read again on a later tick (``UNKNOWN`` writes nothing)."""
         try:
             obs = await self._observer.observe(swap_id, record)
-            check: LegacyCheck = decide_legacy(record=record, observations=obs, policy=self._policy)
+            check: LegacyCheck = decide_legacy(
+                record=record, observations=obs, policy=self._policy, safety_window_blocks=self._safety
+            )
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             logger.warning("legacy check of swap %s failed; read again later: %s", swap_id, err)
@@ -230,6 +246,10 @@ class Reconciler:
                 # Autonomy (v2) runs FIRST but is ADDITIVE — the alerter ALWAYS still fires, so a
                 # dormant/declined/failed broadcast never silences the operator.
                 executed = await self._safe_execute(swap_id, record, decision)
+                if decision.autonomous_btc_refund:
+                    # decide() cannot know whether this tower broadcasts; the page says what it did
+                    # (#850 PR 9b, Mythos F2), so an alert-only or dormant tower never claims a broadcast.
+                    decision = dataclasses.replace(decision, reason=decision.reason + _executor_outcome_note(executed))
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, alert_delivered=delivered, executed=executed)
             logger.debug("swap %s: %s (%s)", swap_id, decision.intent.value, decision.reason)

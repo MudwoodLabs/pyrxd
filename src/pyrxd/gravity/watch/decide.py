@@ -140,6 +140,13 @@ class Observations:
     btc_disposition_reason: str | None = None
     #: Whether the read names any spender at all (an UNKNOWN with one is a contradiction, not a lag).
     btc_spenders_named: bool = False
+    #: Whether a source SERVED a claim witness (one that opens H). ``maker_has_claimed_btc`` is also set
+    #: by a spender only discovery named, which proves nothing about ``p`` (Mythos F4).
+    btc_claim_witness_seen: bool = False
+    #: Whether the read is one source's answer (quorum 1, or one source): it marks the decision
+    #: ``low_corroboration``, and a single-source REFUNDED is read as still pending (Mythos F6; design
+    #: §5.1, "a single endpoint's Refunded() never stops a page").
+    btc_single_source: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.maker_has_claimed_btc, bool):
@@ -162,6 +169,12 @@ class Observations:
             raise ValidationError("Observations.low_corroboration must be bool")
         if not isinstance(self.btc_spend_classified, bool) or not isinstance(self.btc_spenders_named, bool):
             raise ValidationError("Observations.btc_spend_classified and btc_spenders_named must be bool")
+        if not isinstance(self.btc_single_source, bool) or (self.btc_single_source and not self.btc_spend_classified):
+            raise ValidationError("Observations.btc_single_source must be bool, and needs a classified read")
+        if not isinstance(self.btc_claim_witness_seen, bool):
+            raise ValidationError("Observations.btc_claim_witness_seen must be bool")
+        if self.btc_claim_witness_seen and not (self.btc_spend_classified and self.maker_has_claimed_btc):
+            raise ValidationError("Observations.btc_claim_witness_seen needs a classified read and the claim trigger")
         if self.btc_disposition is not None and not isinstance(self.btc_disposition, BtcDispositionKind):
             raise ValidationError("Observations.btc_disposition must be a BtcDispositionKind or None")
         if self.btc_spend_classified != (self.btc_disposition is not None):
@@ -211,6 +224,14 @@ class Decision:
     # p-scrape source + finality model are out of scope here. The executor additionally re-asserts SAFE
     # against a FRESH read before broadcasting (a tick-open verdict is stale on a cheap-reorg chain).
     autonomous_asset_claim: bool = False
+    # Tells two situations with the same intent apart for the alerter's dedup and operator ACK (#850 PR
+    # 9b, Mythos F1): an ACK of "our refund is pending near t_rxd" must not silence the claim race that
+    # replaces it, which is a PAGE_SQUEEZED too. ``None`` for every decision that needs no such tag.
+    situation: str | None = None
+    # A refund page that is as time-critical as a race (#850 PR 9b, Mythos F3): the HTLC is still the
+    # taker's to refund while t_rxd is near or past, so the alerter pages it CRITICAL and re-pages it,
+    # rather than once as WARN. Only valid on PAGE_REFUND, which keeps its autonomy discriminator.
+    urgent: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, Intent):
@@ -229,6 +250,12 @@ class Decision:
             raise ValidationError("autonomous_btc_refund is only valid on a PAGE_REFUND decision")
         if self.autonomous_asset_claim and self.intent is not Intent.PAGE_CLAIM:
             raise ValidationError("autonomous_asset_claim is only valid on a PAGE_CLAIM decision")
+        if self.situation is not None and (not isinstance(self.situation, str) or not self.situation):
+            raise ValidationError("Decision.situation must be a non-empty str or None")
+        if not isinstance(self.urgent, bool):
+            raise ValidationError("Decision.urgent must be bool")
+        if self.urgent and self.intent is not Intent.PAGE_REFUND:
+            raise ValidationError("Decision.urgent is only valid on a PAGE_REFUND decision")
 
 
 def _value_at_risk_photons(terms: NegotiatedTerms) -> PhotonValue | None:
@@ -516,16 +543,62 @@ _BUMP_HOW = (
 )
 
 
-def _btc_refund_lost_claim_seen(record: SwapRecord, obs: Observations) -> bool:
-    """Our refund is buried and a claim witness was served beside it (D14 seen on the chain): the
-    claim lost, but ``p`` is public. Read as a covenant-claim page, not as a claim race on a claim
-    that will never be mined (review of PR 9b, M1)."""
+def _btc_refund_buried(obs: Observations) -> bool:
+    """Our refund is buried on a corroborated read. One source's "buried" decides nothing here: it is
+    read as still pending (design §5.1; Mythos F6 and its re-review)."""
+    return obs.btc_disposition is BtcDispositionKind.REFUNDED and not obs.btc_single_source
+
+
+def _btc_refunded_beside_claim_trigger(record: SwapRecord, obs: Observations) -> bool:
+    """Our refund is buried and the claim trigger is set beside it: not a claim race on a claim that
+    will never be mined (review of PR 9b, M1). Paged below as a covenant claim when a claim witness
+    was served (:func:`_btc_refund_lost_claim_seen`), else as a disagreement to investigate."""
     return (
         obs.btc_spend_classified
-        and obs.btc_disposition is BtcDispositionKind.REFUNDED
+        and _btc_refund_buried(obs)
         and obs.maker_has_claimed_btc
         and record.state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED)
     )
+
+
+def _btc_refund_lost_claim_seen(record: SwapRecord, obs: Observations) -> bool:
+    """Our refund is buried and a claim witness was SERVED beside it (D14 seen on the chain): the
+    claim lost, but ``p`` is public. A spender that only discovery named is not this (Mythos F4)."""
+    return _btc_refunded_beside_claim_trigger(record, obs) and obs.btc_claim_witness_seen
+
+
+def _t_rxd_near(record: SwapRecord, obs: Observations, policy: MarginPolicy, safety_window_blocks: int) -> bool:
+    """Whether the maker's covenant exists and t_rxd is within the safety window, or past it: once t_rxd
+    matures the maker can refund the covenant by its CSV leg AND still claim the BTC (the claim leaf has
+    no timelock), so a BTC HTLC still the taker's to refund is then as urgent as a race (#850 PR 9b,
+    Mythos F3). The predicate the BOTH_LOCKED maker-stall page uses. A known covenant whose lock height
+    could not be read, or heights the predicate cannot evaluate, fail closed toward urgent."""
+    if not _covenant_known(record, obs):
+        return False
+    if obs.asset_locked_at_height is None:
+        return True
+    try:
+        return taker_refund_window_open(
+            now_block_height=obs.now_rxd_height,
+            asset_locked_at_height=obs.asset_locked_at_height,
+            t_rxd=record.terms.t_rxd,
+            safety_window_blocks=safety_window_blocks,
+            maker_has_claimed_btc=False,
+            block_interval_s=policy.block_interval_s,
+        )
+    except ValidationError:
+        return True
+
+
+#: The ``Decision.situation`` of the page for our pending refund near t_rxd (Mythos F1). It is a
+#: PAGE_SQUEEZED like the claim race that replaces the refund, and an ACK of one must not silence the
+#: other.
+SITUATION_BTC_REFUND_PENDING = "btc_refund_pending"
+#: The ``situation`` of the page for sources that contradict each other on the spender, and of the
+#: page for a spender only discovery names beside our buried refund: an ACK of either must not
+#: silence the claim race (re-review of the F1 fix).
+SITUATION_BTC_SPENDER_CONTRADICTION = "btc_spender_contradiction"
+SITUATION_BTC_DISCOVERY_DISAGREES = "btc_discovery_disagrees"
 
 
 def _btc_spend_decision(
@@ -535,7 +608,7 @@ def _btc_spend_decision(
     no longer on the chain, or a read whose sources contradict each other. ``None`` when the read
     changes nothing here: unclassified (and no claim on record), unspent, a read below quorum, or a
     claim on the chain (the claim race, run before this, pages that)."""
-    corr = obs.low_corroboration
+    corr = _corroboration(obs)
     kind = obs.btc_disposition
     deadline = (
         None
@@ -556,8 +629,9 @@ def _btc_spend_decision(
             ),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
+            situation=SITUATION_BTC_SPENDER_CONTRADICTION,
         )
-    if kind is BtcDispositionKind.REFUNDED and record.role is RecordRole.MAKER:
+    if _btc_refund_buried(obs) and record.role is RecordRole.MAKER:
         return _maker_covenant_refund(f"the taker's BTC refund {txid} is buried", deadline=deadline, corr=corr)
     claim_on_record = record.counter_claim_tx is not None and record.role is not RecordRole.MAKER
     if claim_on_record or _btc_refund_lost_claim_seen(record, obs):
@@ -584,8 +658,32 @@ def _btc_spend_decision(
             deadline_rxd_height=deadline,
             low_corroboration=corr,
         )
+    if _btc_refunded_beside_claim_trigger(record, obs):
+        # A discovery source names a spender the disposition panel served no bytes for (a lagging
+        # source still naming a replaced refund, or a different host set). Nothing proves p public,
+        # and nothing proves it is not: say so, and name no step that needs a claim tx (Mythos F4).
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                f"our BTC refund {txid} is buried, but a discovery source names a different spender of the HTLC "
+                "funding outpoint that no source served the bytes of; the tower cannot tell whether p is public"
+            ),
+            recommended_action=(
+                "investigate — look up the spender the discovery source names; if it is a claim (its witness "
+                "opens H), p is public: claim the covenant before t_rxd (pyrxd swap build-claim); if it is our "
+                f"replaced refund, run {'mutual_refund' if record.state is SwapState.BOTH_LOCKED else 'reconcile_counter_leg'}"
+            ),
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+            situation=SITUATION_BTC_DISCOVERY_DISAGREES,
+        )
     if not obs.btc_spend_classified:
         return None
+    single = ""
+    if kind is BtcDispositionKind.REFUNDED and obs.btc_single_source:
+        # One source's "buried" stops no page (Mythos F6): read it as still pending.
+        kind = BtcDispositionKind.REFUND_PENDING
+        single = "; only one source reads it buried, which this tower does not act on"
     if kind is BtcDispositionKind.REFUNDED:
         step = "mutual_refund" if record.state is SwapState.BOTH_LOCKED else "reconcile_counter_leg"
         return Decision(
@@ -612,34 +710,22 @@ def _btc_spend_decision(
             reason=(
                 f"our BTC refund {txid} is still not buried and t_rxd is near or past: once t_rxd matures the "
                 "maker can refund the covenant by its CSV leg AND still claim the BTC by replacing our refund "
-                f"(the claim leaf has no timelock). Get the refund buried now ({obs.btc_disposition_reason})"
+                f"(the claim leaf has no timelock). Get the refund buried now ({obs.btc_disposition_reason}{single})"
             ),
             recommended_action=f"{step}: {_BUMP_HOW}; or bump it from a wallet that holds the refund key",
             deadline_rxd_height=deadline,
             low_corroboration=corr,
+            situation=SITUATION_BTC_REFUND_PENDING,
         )
-        if obs.asset_locked_at_height is not None:
-            # The same predicate the BOTH_LOCKED maker-stall page uses: within the safety window of t_rxd.
-            try:
-                due = taker_refund_window_open(
-                    now_block_height=obs.now_rxd_height,
-                    asset_locked_at_height=obs.asset_locked_at_height,
-                    t_rxd=record.terms.t_rxd,
-                    safety_window_blocks=safety_window_blocks,
-                    maker_has_claimed_btc=False,
-                    block_interval_s=policy.block_interval_s,
-                )
-            except ValidationError:
-                due = True  # un-evaluable heights: fail closed toward the page
-            if due:
-                return squeeze
+        if _t_rxd_near(record, obs, policy, safety_window_blocks):
+            return squeeze
         return Decision(
             Intent.WATCH,
             reason=(
                 f"our BTC refund {txid} spends the HTLC by the refund leaf and is not yet buried: the maker can still "
                 "claim until it is (the claim leaf has no timelock), and a claim pages; so does t_rxd coming near. "
                 f"A pre-signed refund has a fixed fee: to bump it run {step}; {_BUMP_HOW} "
-                f"({obs.btc_disposition_reason})"
+                f"({obs.btc_disposition_reason}{single})"
             ),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
@@ -650,16 +736,35 @@ def _btc_spend_decision(
 def _btc_spend_permits_autonomy(obs: Observations) -> bool:
     """Whether the spender read lets an autonomous refund go out: a classified read must hold the
     outpoint UNSPENT at its quorum (a read below quorum, or one that names a spender, never arms).
-    An unclassified read keeps the pre-9b rule, decided by the caller."""
+    A single-source read arms only as the executor allows any single-source read: it marks the
+    decision ``low_corroboration`` (:func:`_corroboration`; Mythos F6). An unclassified read keeps
+    the pre-9b rule, decided by the caller."""
     return not obs.btc_spend_classified or obs.btc_disposition is BtcDispositionKind.UNSPENT
 
 
+def _corroboration(obs: Observations) -> bool:
+    """``low_corroboration`` for a BTC decision: a single-source RXD read, or a single-source BTC
+    spender read (quorum 1). The executor refuses to broadcast on either unless the operator accepted
+    single-source reads (Mythos F6)."""
+    return obs.low_corroboration or obs.btc_single_source
+
+
+def _spend_read_note(obs: Observations) -> str:
+    """Why a classified spender read did not arm the refund, for the page."""
+    kind = obs.btc_disposition.value if obs.btc_disposition is not None else None
+    return f" Not autonomous: the spender read is {kind} ({obs.btc_disposition_reason})."
+
+
 def _autonomous_refund_note() -> str:
-    """Said on a page whose pre-signed refund goes out: what the tower does next (D12)."""
+    """Said on a page whose pre-signed refund MAY go out (D12). ``decide()`` cannot know the executor:
+    the shipped tower is alert-only unless it is given a refund script, and dormant on mainnet unless
+    audit-cleared, so the note is conditional, and the reconciler appends what this tick's executor did
+    (``reconciler._executor_outcome_note``; Mythos F2)."""
     return (
-        " The tower broadcasts the pre-signed refund. Its fee is fixed: if it does not confirm, bump it with "
-        f"taker_refund_btc ({_BUMP_HOW}). The tower keeps reading the spender by its leaf, so a claim that "
-        "replaces the refund pages the claim race, and a refund still unburied near t_rxd pages too."
+        " If this tower is armed it broadcasts the pre-signed refund (this page says below whether it did). Its "
+        f"fee is fixed: if it does not confirm, bump it with taker_refund_btc ({_BUMP_HOW}). The tower keeps "
+        "reading the spender by its leaf, so a claim that replaces the refund pages the claim race, and a refund "
+        "still unburied near t_rxd pages too."
     )
 
 
@@ -687,7 +792,7 @@ def decide(
 
     state = record.state
     obs = observations
-    corr = obs.low_corroboration
+    corr = _corroboration(obs)
 
     # 1. Terminal → stop watching.
     if is_terminal(state):
@@ -711,7 +816,7 @@ def decide(
     #    indicates the reveal arms the gate). Assess regardless of whether record.state caught up.
     #    A claim that lost to our buried refund is not a race: it is paged below (D14, review M1).
     if (
-        obs.maker_has_claimed_btc and not _btc_refund_lost_claim_seen(record, obs)
+        obs.maker_has_claimed_btc and not _btc_refunded_beside_claim_trigger(record, obs)
     ) or state is SwapState.SECRET_REVEALED:
         if obs.btc_claim_confirmations is None or obs.asset_locked_at_height is None:
             # Cannot assess finality — fail closed to a decision-required page.
@@ -807,13 +912,14 @@ def decide(
             reason="covenant params mismatch — refund the BTC counter-leg via the timelock leg"
             + (_no_autonomy_note(record) if matured else "")
             + (
-                f" Not autonomous: the spender read is {obs.btc_disposition.value} ({obs.btc_disposition_reason})."
+                _spend_read_note(obs)
                 if matured and _autonomy_allowed(record) and not armed and obs.btc_disposition is not None
                 else ""
             ),
             recommended_action="taker_refund_btc",
             autonomous_btc_refund=armed,
             low_corroboration=corr,
+            urgent=matured and _t_rxd_near(record, obs, policy, safety_window_blocks),
         )
     # 3c. Maker stall (FSM finding #2, 2026-06-09). Recovery is mutual_refund, NOT the asset-only
     #     maybe_refund_asset_on_maker_stall — IDENTICALLY to the ETH branch (_decide_eth). The maker
@@ -863,6 +969,7 @@ def decide(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                urgent=True,  # un-evaluable heights: fail closed toward urgent, as _t_rxd_near does
             )
         if refund_due and record.role is RecordRole.MAKER:
             return _maker_covenant_refund(
@@ -877,6 +984,7 @@ def decide(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                urgent=True,  # inside the safety window of t_rxd by the predicate itself (Mythos F3)
             )
         return Decision(
             Intent.WATCH,
@@ -945,9 +1053,7 @@ def decide(
                     "its own refund from a claim."
                 )
             else:
-                note = (
-                    f" Not autonomous: the spender read is {obs.btc_disposition.value} ({obs.btc_disposition_reason})."  # type: ignore[union-attr]
-                )
+                note = _spend_read_note(obs)
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=(
@@ -963,6 +1069,7 @@ def decide(
                 recommended_action="taker_refund_btc",
                 autonomous_btc_refund=armed,
                 low_corroboration=corr,
+                urgent=_t_rxd_near(record, obs, policy, safety_window_blocks),
             )
         if matured:
             armed = _autonomy_allowed(record) and _btc_spend_permits_autonomy(obs)
@@ -984,12 +1091,7 @@ def decide(
                     reason=(
                         f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
                         f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg."
-                        + (
-                            _no_autonomy_note(record)
-                            if not _autonomy_allowed(record)
-                            else f" Not autonomous: the spender read is {obs.btc_disposition.value} "  # type: ignore[union-attr]
-                            f"({obs.btc_disposition_reason})."
-                        )
+                        + (_no_autonomy_note(record) if not _autonomy_allowed(record) else _spend_read_note(obs))
                     ),
                     recommended_action="taker_refund_btc",
                     low_corroboration=corr,
@@ -1308,7 +1410,9 @@ class LegacyCheck:
     conclusive_once_delivered: bool = False
 
 
-def decide_legacy(*, record: SwapRecord, observations: Observations, policy: MarginPolicy) -> LegacyCheck:
+def decide_legacy(
+    *, record: SwapRecord, observations: Observations, policy: MarginPolicy, safety_window_blocks: int
+) -> LegacyCheck:
     """What a legacy terminal BTC record's funding outpoint says about how it really ended (D9).
 
     Pure, and never autonomous (no decision here sets an autonomy flag). The verdicts:
@@ -1321,12 +1425,14 @@ def decide_legacy(*, record: SwapRecord, observations: Observations, policy: Mar
       (``pyrxd swap build-refund``) and watch for a claim. NEVER conclusive, a deliberate divergence
       from design §5.2 item 4 ("or the swap's last deadline has passed"): an unspent HTLC is the
       taker's BTC, the maker can claim it at any time, and past t_rxd the maker can also refund the
-      covenant, so it is the taker's loss for as long as nobody refunds. The page goes out once per
-      tower run (WARN), and the check costs one of the per-tick slots.
+      covenant, so it is the taker's loss for as long as nobody refunds. The page is urgent (CRITICAL,
+      re-paged until ACKed) inside the safety window of t_rxd or past it, and whenever this tower
+      cannot say where t_rxd is (no covenant pin or lock height); otherwise a WARN once per tower run
+      (Mythos F3). The check costs one of the per-tick slots.
     * our refund buried → agrees; conclusive. Pending, or UNKNOWN → retried, nothing written.
     """
     obs = observations
-    corr = obs.low_corroboration
+    corr = _corroboration(obs)
     state = record.state
     if record.terms.counter_chain != "btc":
         return LegacyCheck(Decision(Intent.WATCH, reason="legacy net: only a BTC counter leg is read here"), "skipped")
@@ -1348,7 +1454,26 @@ def decide_legacy(*, record: SwapRecord, observations: Observations, policy: Mar
         "follow a refund to burial)"
     )
     kind = obs.btc_disposition
-    if obs.maker_has_claimed_btc and kind is BtcDispositionKind.REFUNDED:
+    if obs.maker_has_claimed_btc and kind is BtcDispositionKind.REFUNDED and not obs.btc_claim_witness_seen:
+        # A spender only discovery names, beside our buried refund (Mythos F4): never marked.
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=(
+                    f"{ended}. The refund {obs.btc_refund_txid} is buried, but a discovery source names a different "
+                    "spender of the HTLC that no source served the bytes of; the tower cannot tell whether p is public"
+                ),
+                recommended_action=(
+                    "investigate — look up the spender the discovery source names; if it is a claim (its witness "
+                    "opens H), p is public: claim the covenant before t_rxd (pyrxd swap build-claim)"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_BTC_DISCOVERY_DISAGREES,
+            ),
+            "discovery_disagrees",
+        )
+    if obs.maker_has_claimed_btc and _btc_refund_buried(obs):
         # D14 on the chain: our refund won, but a claim witness that opens H was served beside it.
         return LegacyCheck(
             Decision(
@@ -1423,8 +1548,18 @@ def decide_legacy(*, record: SwapRecord, observations: Observations, policy: Mar
                 ),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                urgent=not _covenant_known(record, obs) or _t_rxd_near(record, obs, policy, safety_window_blocks),
             ),
             "unspent",
+        )
+    if kind is BtcDispositionKind.REFUNDED and obs.btc_single_source:
+        return LegacyCheck(
+            Decision(
+                Intent.WATCH,
+                reason=f"legacy net: only one source reads our refund {obs.btc_refund_txid} buried; read again later",
+                low_corroboration=corr,
+            ),
+            "refunded_single_source",
         )
     if kind is BtcDispositionKind.REFUNDED:
         return LegacyCheck(
@@ -1443,6 +1578,7 @@ def decide_legacy(*, record: SwapRecord, observations: Observations, policy: Mar
                 ),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_BTC_SPENDER_CONTRADICTION,
             ),
             "contradiction",
         )

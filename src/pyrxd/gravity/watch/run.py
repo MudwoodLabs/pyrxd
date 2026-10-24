@@ -968,8 +968,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--auto-refund-on-single-source",
         action="store_true",
         help="permit the autonomous refund (--refund-spk) to broadcast on a single-source (low-corroboration) "
-        "RXD read. Off by default: a single source's 'not locked' then pages instead of broadcasting. "
-        "Separate from --accept-single-source, which only lets the tower start",
+        "RXD read, or a single-source BTC spender read (--quorum 1, or one Esplora). Off by default: a single "
+        "source's 'not locked' or 'unspent' then pages instead of broadcasting. Separate from "
+        "--accept-single-source, which only lets the tower start",
     )
     return p
 

@@ -27,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from pyrxd.btc_wallet.disposition import BtcDispositionKind
+from pyrxd.btc_wallet.disposition import BtcCounterDisposition, BtcDispositionKind
 from pyrxd.btc_wallet.taproot import BtcHtlcLocator
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState, FinalityStallTracker
@@ -159,6 +159,23 @@ class RxdChainSource(Protocol):
         Used to derive ``asset_locked_at_height = tip - confirmations + 1`` (the height
         the covenant was mined), mirroring the dust driver."""
         ...
+
+
+def _refund_txid(disposition: BtcCounterDisposition) -> str | None:
+    """The refund the page names: the buried one when the read is REFUNDED (its evidence), else the
+    deepest refund-leaf spend seen, ties by txid. Not the smallest txid: a replaced refund one source
+    still serves would be named in place of the bump that was mined (Mythos F5)."""
+    refunds = disposition.refunds_seen
+    evidence = disposition.evidence
+    if (
+        disposition.kind is BtcDispositionKind.REFUNDED
+        and evidence is not None
+        and any(r.txid == evidence.txid for r in refunds)
+    ):
+        return evidence.txid
+    if not refunds:
+        return None
+    return min(refunds, key=lambda r: (-(r.deepest if r.deepest is not None else -1), r.txid)).txid
 
 
 class ChainObserver(Observer):
@@ -298,7 +315,9 @@ class ChainObserver(Observer):
             if (
                 maker_claimed
                 and claim_txid is not None
-                and spend.get("btc_disposition") is not BtcDispositionKind.REFUNDED
+                and not (
+                    spend.get("btc_disposition") is BtcDispositionKind.REFUNDED and not spend.get("btc_single_source")
+                )
             ):
                 btc_confs = await self._btc.confirmations(claim_txid)
             # BTC-refund maturity: read the FUNDING outpoint depth ONLY when heading toward a BTC refund
@@ -344,9 +363,11 @@ class ChainObserver(Observer):
         fields = {
             "btc_spend_classified": True,
             "btc_disposition": disposition.kind,
-            "btc_refund_txid": sorted(refunds)[0] if refunds else None,
+            "btc_refund_txid": _refund_txid(disposition),
             "btc_disposition_reason": disposition.reason,
             "btc_spenders_named": bool(disposition.spenders),
+            "btc_claim_witness_seen": bool(claims),
+            "btc_single_source": disposition.single_source,
         }
         return claimed, claim_txid, fields
 
