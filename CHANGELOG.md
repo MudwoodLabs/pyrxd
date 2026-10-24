@@ -112,6 +112,57 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The watchtower tells a taker's BTC refund from the maker's claim, re-arms the pre-signed refund
+  on that read, and checks legacy BTC records once (#850 PR 9b) [Changed (breaking)].**
+  - `OutspendBtcClaimSource.spend_disposition` runs the shared BTC disposition reader (PR 9a) over
+    the funding reader's sources and quorum, and `ChainObserver` reads it for every funded BTC swap
+    (new `btc_burial_blocks`, required with a classifying source; the shipped tower passes the
+    policy's `btc_claim_reorg_depth` in blocks). A spend leaves the claim trigger only when that read
+    classifies its txid as a refund-leaf spend whose signature verifies, so the operator's refund
+    and the tower's pre-signed one both read as ours. Any claim the read sees is the trigger even
+    when the outspend discovery missed it, and a spend the read cannot account for stays a claim.
+    A claim source without `spend_disposition` keeps the earlier rule. `Observations` gains
+    `btc_spend_classified`, `btc_disposition`, `btc_refund_txid`, `btc_disposition_reason` and
+    `btc_spenders_named`.
+  - The pre-signed refund is autonomous again while the maker's covenant is observed (PR 1b turned
+    it off), on a classified read that holds the outpoint unspent at its quorum, for a taker's or
+    single operator's record. A read below quorum, or one that names a spender, arms nothing, also
+    at `PARAMS_MISMATCH` and for a never-locked covenant when the source classifies. The page says
+    the blob's fee is fixed and names `taker_refund_btc` for a bump.
+  - Our refund unburied: `WATCH` (the reason names the txid), and `PAGE_SQUEEZED` naming
+    `taker_refund_btc` (`mutual_refund` from `BOTH_LOCKED`) once t_rxd is within the safety window:
+    past t_rxd the maker can refund the covenant and still claim the BTC by replacing an
+    unconfirmed refund. Buried at the burial depth: new `Intent.RECONCILE` (INFO, routed) naming
+    `reconcile_counter_leg`, or `mutual_refund` from `BOTH_LOCKED`. A claim that opens H on record
+    (`counter_claim_tx`), or a claim witness served beside our buried refund, is a covenant-claim
+    page whatever the outpoint shows now, and arms nothing (D14). A maker's record is paged to
+    refund its covenant. Sources that contradict each other on the spender page `PAGE_SQUEEZED`
+    "investigate". Before, the tower paged our own refund as the maker's claim.
+  - The D9 net for BTC (design §5.2): `JsonDirRecordStore.legacy` lists at most
+    `LEGACY_CHECKS_PER_TICK` (5, chosen, not measured) terminal records per tick, in turn, that are
+    ABORTED or MUTUAL_REFUND, BTC, funded, without `counter_disposition`, not a maker's and not an
+    operator's abandon, and that have no `<swap_id>.legacy-checked.json` marker. The reconciler reads
+    each once through `decide_legacy` (never an executor): a claim pages the covenant claim (`pyrxd
+    swap build-claim`), an unspent HTLC pages a refund by address (`pyrxd swap build-refund`), a
+    buried refund agrees. The tower writes the marker (mode 600, atomic, carrying the verdict and the
+    RXD height) on agreement, or once the claim page is delivered after t_rxd. An unspent HTLC is
+    never marked, which departs from design §5.2 item 4 on purpose (noted there). The store never
+    writes a record.
+  - Fixes from the Mythos review of the PR (F1 to F6). `Decision` gains `situation` and `urgent`.
+    `DedupAlerter` dedups and ACKs by intent and situation, so an ACK of the pending-refund page, the
+    contradicting-sources page or the discovery-disagreement page no longer silences the claim race
+    (all are `PAGE_SQUEEZED`); a situation keeps the highest severity it paged at, so an `urgent`
+    flag that flips with a flaky read neither storms pages nor drops an ACK. The
+    armed refund page no longer says the tower broadcasts: the reconciler appends what this tick's
+    executor did. A refund page for an unspent HTLC near or past t_rxd is `urgent` (CRITICAL,
+    re-paged) at `BTC_LOCKED`, `PARAMS_MISMATCH` and `BOTH_LOCKED`, and on a legacy record also when
+    it pins no covenant; `decide_legacy` takes `safety_window_blocks`. A spender only discovery names,
+    beside our buried refund, pages "investigate" rather than a served claim witness, and a legacy
+    record with one is never marked (`Observations.btc_claim_witness_seen`). The page names the
+    buried refund, not the smallest txid seen. A single-source BTC read (`btc_single_source`, quorum
+    1, or one Esplora) marks the decision low-corroboration, and its "buried" decides nothing: it is
+    read as still pending, sets no claim aside as lost, ends no maker's or legacy record.
+
 - **On a BTC swap, `taker_refund_btc`, `mutual_refund` and `reconcile_counter_leg` follow the chain,
   not our own refund's broadcast (#850 PR 9a, part 2) [Changed (breaking)].** With a
   `BitcoinTaprootLeg` (which reads its disposition since part 1), each reads the HTLC funding
@@ -160,9 +211,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the PR 1c pre-check. A claim seen ends the phase naming `--phase claim` with the claim's bytes.
     `--phase refund` no longer sends the covenant refund, needs no `--fee-*`, and no longer waits
     for the covenant's `t_rxd`.
-  - Known interim until #850 PR 9b: the watchtower still reads any spend of the BTC HTLC as a
-    claim, so a taker's own refund on a `BOTH_LOCKED` record is paged as one (a page, never an
-    autonomous broadcast).
+  - Interim until #850 PR 9b (above, which fixes it): the watchtower read any spend of the BTC HTLC
+    as a claim, so a taker's own refund on a `BOTH_LOCKED` record was paged as one.
   - Do not drive one record from mixed versions: an older `taker_refund_btc` on a record with a
     pending v10 refund sends another and advances on its broadcast.
 

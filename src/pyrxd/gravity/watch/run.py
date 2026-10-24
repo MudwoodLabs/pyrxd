@@ -80,6 +80,7 @@ from pyrxd.gravity.watch import (
     run_loop,
 )
 from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
+from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
 from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
@@ -128,7 +129,15 @@ def build_reconciler(
     btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
     # RXD corroboration is ``rxd_corroborated`` (True only behind a real >= quorum MultiSourceRxdChainSource).
     # The single ETH RPC, if any, is still single-source → its pages stay low-corroboration.
-    observer = ChainObserver(btc=btc_source, eth=eth_source, rxd=rxd_source, rxd_corroborated=rxd_corroborated)
+    observer = ChainObserver(
+        btc=btc_source,
+        eth=eth_source,
+        rxd=rxd_source,
+        rxd_corroborated=rxd_corroborated,
+        # The depth our refund must be buried before it counts (#850 PR 9b): the policy's BTC reorg
+        # depth, the same number the claim gate requires of the maker's claim.
+        btc_burial_blocks=int(_required_btc_depth_blocks(policy)),
+    )
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
         store=store,
@@ -959,8 +968,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--auto-refund-on-single-source",
         action="store_true",
         help="permit the autonomous refund (--refund-spk) to broadcast on a single-source (low-corroboration) "
-        "RXD read. Off by default: a single source's 'not locked' then pages instead of broadcasting. "
-        "Separate from --accept-single-source, which only lets the tower start",
+        "RXD read, or a single-source BTC spender read (--quorum 1, or one Esplora). Off by default: a single "
+        "source's 'not locked' or 'unspent' then pages instead of broadcasting. Separate from "
+        "--accept-single-source, which only lets the tower start",
     )
     return p
 

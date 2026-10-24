@@ -67,10 +67,50 @@ into the same app or receiver changes nothing.
   From 0.27 the tower arms an autonomous refund or claim only for a record that names the taker (or
   the single operator) as its writer, `"role": "taker"` or `"none"`. A record written before 0.27
   has no role and is paged but never acted on; it gains one the next time a 0.27 coordinator saves
-  it. The BTC refund is also never autonomous while the maker's covenant is known (observed, or
-  pinned on the record), because the maker can still claim until the refund confirms: the tower
-  pages, and you refund and watch. A taker's coordinator pins the covenant its fund was verified
-  against, including on a resumed fund, so in practice a taker's BTC refund is paged, not sent.
+  it. While the maker's covenant is known (observed, or pinned on the record), the BTC refund is
+  autonomous only when the tower classifies the HTLC's spender and that read holds the funding
+  outpoint unspent at its quorum (#850 PR 9b). The tower reads each spender by the leaf it spends,
+  so its own pre-signed refund (or yours) is read back as a refund, not as the maker's claim, and a
+  claim that replaces it pages the claim race. A read below quorum, or a refund of yours already
+  seen, arms nothing. A read from one source (`--quorum 1`, or a network with one Esplora, as the
+  shipped non-mainnet setup is) marks the page low-corroboration, so the executor sends nothing
+  unless `--auto-refund-on-single-source` is set, and one source's "buried" is read as still
+  pending: such a tower never sends the `RECONCILE` page, and near t_rxd it pages the refund as
+  unburied. Run the coordinator step yourself once the refund is buried. The page says whether this tick's executor broadcast the refund: an
+  alert-only or dormant tower says it did not, and the refund is then yours to send. A refund page
+  for an unspent HTLC is CRITICAL, re-paged until you ACK it, once t_rxd is within
+  `--safety-window-blocks` or past it (also from BOTH_LOCKED and PARAMS_MISMATCH). The shipped
+  `pyrxd-watchtower` classifies; a third-party claim source without `spend_disposition` keeps the
+  earlier rule (paged, never sent).
+- **After a refund.** While a refund of ours is unburied the tower watches silently (the maker can
+  still claim; a claim pages) until t_rxd is within `--safety-window-blocks`: from then on it pages
+  CRITICAL, because once t_rxd matures the maker can refund the covenant and still claim the BTC by
+  replacing an unconfirmed refund. The pre-signed blob's fee is fixed. To bump it, run
+  `taker_refund_btc` (`mutual_refund` from BOTH_LOCKED) and keep it running: it reads the tower's
+  refund as its own, but replaces it only once that one process has seen it in the mempool for
+  `REFUND_REPLACE_AFTER_S` (600 s); the two-host runner's `--phase refund` polls for you. An ACK of
+  that page covers only it: a claim that replaces your refund pages again. Once the
+  refund is buried at the policy's BTC reorg depth the tower sends an INFO `RECONCILE` page naming
+  `reconcile_counter_leg` (`mutual_refund` from BOTH_LOCKED). The coordinator buries at its own
+  depth, so if that step still reads the refund as pending, run it again later.
+- **A claim on record.** If the record names a claim that opens H (`counter_claim_tx`), `p` is
+  public: the tower pages the covenant claim whatever the outpoint shows now, and arms nothing.
+- **Legacy records (the D9 net).** pyrxd before 0.27 ended a BTC refund's record on its broadcast.
+  The tower reads up to 5 such terminal records per tick (ABORTED or MUTUAL_REFUND, BTC, funded,
+  no `counter_disposition`, not a maker's), once each:
+  - spent by the maker's claim: a CRITICAL page to claim the covenant before t_rxd (`pyrxd swap
+    recover-preimage`, then `pyrxd swap build-claim`), not a refund;
+  - unspent: a page to refund by address (`pyrxd swap build-refund`), CRITICAL near or past t_rxd
+    or when the record pins no covenant, WARN otherwise. This one is read again every turn until the
+    refund is buried, because an unspent HTLC stays yours to lose;
+  - a spender only a discovery source names, beside your buried refund: a CRITICAL "investigate"
+    page, never marked;
+  - refunded and buried: nothing is paged.
+  A record that pins no covenant (every record written before 0.27) gives the tower no t_rxd, so
+  its claim page repeats until you ACK it, and it is never marked.
+  On a conclusive verdict (refunded, or a claim page delivered after t_rxd) the tower writes
+  `<swap_id>.legacy-checked.json` beside the record (mode 600, atomic). It never writes a record.
+  Delete the marker to have the record read again.
 - **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,
   whether or not the maker's covenant is on chain. A maker's record is paged to refund its covenant
   at t_rxd, never to run the taker's `taker_refund_btc` or `mutual_refund`.
@@ -104,7 +144,10 @@ pyrxd-watchtower-escalate \
     --webhook-url https://escalation.channel/endpoint
 ```
 
-Acknowledging a CRITICAL page is a one-liner — it is what stops the re-paging *and* the escalation:
+Acknowledging a CRITICAL page is a one-liner — it is what stops the re-paging *and* the escalation.
+An ACK covers the situation it was paged for. The pending-refund, contradicting-sources and
+discovery-disagreement pages are each their own situation, so the claim race still pages after an ACK
+of one of them; a page that turns less urgent for a tick stays CRITICAL, and stays ACKed:
 
 ```bash
 echo <swap_id> >> /run/wt/acks
