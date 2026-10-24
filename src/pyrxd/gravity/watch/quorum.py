@@ -25,8 +25,10 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
+from pyrxd.btc_wallet.disposition import BtcDispositionKind
+from pyrxd.btc_wallet.taproot import BtcHtlcLocator
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState, FinalityStallTracker
 from pyrxd.gravity.swap_state import SwapRecord, SwapState
@@ -86,6 +88,12 @@ class BtcClaimSource(Protocol):
         :meth:`confirmations` (a forged over-report still fails consensus BIP68; an under-report only
         delays the refund)."""
         ...
+
+    # OPTIONAL capability (duck-typed, probed like the ETH source's ``finality_checkpoint``): a source
+    # MAY expose ``spend_disposition(locator, *, hashlock, burial_blocks) -> BtcCounterDisposition``,
+    # the shared disposition reader (``pyrxd.btc_wallet.disposition``) over its sources (#850 PR 9b).
+    # With it the observer tells our refund from a claim by the leaf each spends; without it every
+    # spend is a claim, as before, and autonomy stays off while the covenant is observed.
 
 
 @dataclass(frozen=True)
@@ -184,6 +192,7 @@ class ChainObserver(Observer):
         eth: EthChainSource | None = None,
         rxd_corroborated: bool = False,
         clock: Callable[[], float] | None = None,
+        btc_burial_blocks: int | None = None,
     ) -> None:
         if not isinstance(rxd_corroborated, bool):
             raise ValidationError("ChainObserver.rxd_corroborated must be bool")
@@ -204,6 +213,20 @@ class ChainObserver(Observer):
             )
         if btc is None and eth is None:
             raise ValidationError("ChainObserver requires at least one counter-leg source (btc and/or eth)")
+        # The depth a BTC spender must be buried before a classified read calls it REFUNDED/CLAIMED
+        # (#850 PR 9b). Required whenever the BTC source classifies: a default here would be a
+        # second, silent policy for when our refund counts as final.
+        classifies = callable(getattr(btc, "spend_disposition", None))
+        if btc_burial_blocks is not None and (
+            not isinstance(btc_burial_blocks, int) or isinstance(btc_burial_blocks, bool) or btc_burial_blocks < 1
+        ):
+            raise ValidationError("ChainObserver.btc_burial_blocks must be a positive int or None")
+        if classifies and btc_burial_blocks is None:
+            raise ValidationError(
+                "ChainObserver: the BTC source classifies spenders (spend_disposition), so btc_burial_blocks is "
+                "required (the policy's BTC reorg depth)"
+            )
+        self._btc_burial_blocks = btc_burial_blocks if classifies else None
         self._btc = btc
         self._eth = eth
         self._rxd = rxd
@@ -261,12 +284,23 @@ class ChainObserver(Observer):
         maker_claimed = False
         btc_confs: Confirmations | None = None
         funding_confs: Confirmations | None = None
+        spend: dict[str, Any] = {}
         locator = record.btc_locator
         if locator is not None:
             status = await self._btc.claim_status(locator.funding_outpoint.txid, locator.funding_outpoint.vout)
             maker_claimed = status.claimed
-            if maker_claimed and status.claim_txid is not None:
-                btc_confs = await self._btc.confirmations(status.claim_txid)
+            claim_txid = status.claim_txid
+            if self._btc_burial_blocks is not None:
+                maker_claimed, claim_txid, spend = await self._classify_btc_spend(record, locator, status)
+            # Not when our refund is buried: a claim seen beside it lost and is never mined, so its depth
+            # read only fails (an honest source has no such tx) and turned a D14 page into a "reconcile
+            # error" (review of PR 9b, M1). decide() pages the covenant claim from the read instead.
+            if (
+                maker_claimed
+                and claim_txid is not None
+                and spend.get("btc_disposition") is not BtcDispositionKind.REFUNDED
+            ):
+                btc_confs = await self._btc.confirmations(claim_txid)
             # BTC-refund maturity: read the FUNDING outpoint depth ONLY when heading toward a BTC refund
             # (avoids a per-tick quorum round-trip for every swap on every tick). decide() gates the
             # autonomous refund on funding >= t_btc; a None here keeps decide() fail-closed.
@@ -279,7 +313,42 @@ class ChainObserver(Observer):
             btc_claim_confirmations=btc_confs,
             btc_funding_confirmations=funding_confs,
             low_corroboration=low_corr,
+            **spend,
         )
+
+    async def _classify_btc_spend(
+        self, record: SwapRecord, locator: BtcHtlcLocator, status: BtcClaimStatus
+    ) -> tuple[bool, str | None, dict[str, Any]]:
+        """``(maker_claimed, claim_txid, Observations fields)`` from the shared disposition read (#850
+        PR 9b, design §6).
+
+        A spend leaves the claim trigger only on proof: the discovery read (``claim_status``, any
+        source naming a spender) stays the trigger, and a spender it names is taken out of it only
+        when the disposition read classifies that txid as a refund-leaf spend (whose signature
+        verifies: ``_check_served``). Any claim the disposition read saw (verified or not, buried or
+        not, on every kind of answer) is a claim even when discovery missed it; any other spend the
+        read cannot account for stays one too, so a source that serves no bytes cannot turn a claim
+        into silence."""
+        disposition = await self._btc.spend_disposition(  # type: ignore[union-attr]  # probed in __init__
+            locator, hashlock=record.terms.hashlock, burial_blocks=self._btc_burial_blocks
+        )
+        claims = disposition.claims_seen
+        refunds = {s.txid for s in disposition.refunds_seen}
+        if claims:
+            verified = [c for c in claims if c.verified]
+            claimed, claim_txid = True, (verified or list(claims))[0].txid
+        elif status.claimed and status.claim_txid not in refunds:
+            claimed, claim_txid = True, status.claim_txid  # a spend the read could not prove is ours
+        else:
+            claimed, claim_txid = False, None
+        fields = {
+            "btc_spend_classified": True,
+            "btc_disposition": disposition.kind,
+            "btc_refund_txid": sorted(refunds)[0] if refunds else None,
+            "btc_disposition_reason": disposition.reason,
+            "btc_spenders_named": bool(disposition.spenders),
+        }
+        return claimed, claim_txid, fields
 
     async def _observe_eth_claim(self, swap_id: str, record: SwapRecord) -> tuple[bool, CounterClaimState | None]:
         """Detect the maker's ETH claim + its finalized-checkpoint verdict STATE. Returns

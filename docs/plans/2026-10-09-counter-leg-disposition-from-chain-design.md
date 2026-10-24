@@ -198,7 +198,7 @@ Settlement happens once, so a proven refund excludes a claim, and absence is nev
   `NotYetExpired` with no state change. This keeps today's timing.
 - **`F`** decides every state change.
 - One lagging endpoint delays tip decisions (MIN), which is the safe direction (Mythos L3). The
-  tower's deadline page uses the wall clock (`quorum.py:250`). That is fine for a page and is not
+  tower's deadline page uses the wall clock (`quorum.py:238`). That is fine for a page and is not
   an input to any terminal decision.
 
 ### 2.3 Dispositions (ETH counter leg)
@@ -633,6 +633,9 @@ Mechanism (PR 9b for BTC, PR 10 for ETH; both touch `src/pyrxd/gravity/watch/ada
    so only on a conclusive verdict: agrees, or the swap's last deadline has passed and the page
    has been delivered. `UNKNOWN` writes nothing, so the record is retried.
    - The tower becomes a writer of sidecars (D13). It never writes records.
+   - As built in PR 9b (BTC): "the last deadline" is t_rxd, and only the claim page uses it. An
+     UNSPENT HTLC is never conclusive: the maker can claim it at any time, and past t_rxd can also
+     refund the covenant, so the refund-by-address page is repeated until the refund is buried.
 5. **The marker carries the verdict and the block**, so a restart does not re-read conclusively
    checked records.
 
