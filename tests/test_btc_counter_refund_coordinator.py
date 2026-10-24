@@ -686,3 +686,73 @@ def test_vsize_needs_a_segwit_transaction():
     stripped = raw[:4] + raw[6:]
     with pytest.raises(ValidationError, match="segwit"):
         t.btc_vsize_from_raw(stripped)
+
+
+async def test_a_refusal_after_the_node_took_our_bump_outranks_the_acceptance(tmp_path, monkeypatch):
+    """Re-review of e6d1061, L1: our bump was taken, then evicted, and the node now refuses it for its
+    fee while the sources still show the original. The refusal decides, not the earlier acceptance:
+    after the wait the bump is priced over ours, not re-sent for ever."""
+    s = _Swap(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    original = s.sent[0]
+    await coord.taker_refund_btc()  # first seen pending
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    await coord.taker_refund_btc()
+    bump = s.sent[-1]
+    assert _fee(bump) == 1_000 and s.chain.mempool == t.btc_txid_from_raw(bump)
+    s.chain.drop()
+    for src in s.sources:
+        src.forge_spender = original  # the sources still show the original
+    accept = s.chain.submit
+
+    def submit(raw):
+        if _fee(raw) < 2_000:
+            raise FeeRejected("mempool min fee not met", reason="mempool min fee not met")
+        return accept(raw)
+
+    s.chain.submit = submit
+    clock[0] += 5
+    with pytest.raises(FeeRejected):
+        await coord.taker_refund_btc()  # ours again, refused now
+    assert s.sent[-1] == bump
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    await coord.taker_refund_btc()
+    assert _fee(s.sent[-1]) == 2_000 and s.chain.mempool == t.btc_txid_from_raw(s.sent[-1])
+    assert bytes.fromhex(s.on_disk().counter_refund_raw) == s.sent[-1]
+
+
+async def test_a_refund_taken_on_its_first_send_then_refused_on_a_resend_is_bumped_after_the_wait(
+    tmp_path, monkeypatch
+):
+    """Re-review of e6d1061, L2: a refund the node took on its first send, later evicted, and refused for
+    its fee on a re-send while the HTLC reads unspent. The re-send stamps the refusal itself, so the
+    refusal is waited on and then bumped."""
+    s = _Swap(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    ours = s.sent[0]
+    s.chain.drop()
+    accept = s.chain.submit
+
+    def submit(raw):
+        if _fee(raw) < 1_000:
+            raise FeeRejected("mempool min fee not met", reason="mempool min fee not met")
+        return accept(raw)
+
+    s.chain.submit = submit
+    with pytest.raises(FeeRejected):
+        await coord.taker_refund_btc()  # unspent: the same bytes again, refused
+    clock[0] += sc.REFUND_REPLACE_AFTER_S - 1
+    with pytest.raises(FeeRejected):
+        await coord.taker_refund_btc()
+    assert {r for r in s.sent} == {ours}, "replaced before REFUND_REPLACE_AFTER_S"
+    clock[0] += 2
+    rec = await coord.taker_refund_btc()
+    bump = s.sent[-1]
+    assert rec.state is SwapState.BTC_LOCKED and _fee(bump) == 1_000 and s.chain.mempool == t.btc_txid_from_raw(bump)
+    assert s.on_disk().counter_refund_raw == bump.hex()
