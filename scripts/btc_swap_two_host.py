@@ -1132,11 +1132,12 @@ async def _poll_btc_refund_to_terminal(args, coord, step, *, phase: str):
                         ". Your BTC refund is buried, and the record goes terminal once t_rxd has matured: run "
                         f"--phase {phase} again then"
                         if rec.radiant_covenant_outpoint is not None
-                        # No covenant pinned: the hold reads the covenant's age from the chain, cannot,
-                        # and holds for good (Mythos review of #850 PR 9a, F2). Say so, not "run again".
+                        # No covenant pinned: the hold finds the covenant as an UNSPENT output to read its
+                        # age, so it lifts only while one is there (Mythos review of #850 PR 9a, F2).
                         else ". Your BTC refund is buried, so no BTC of yours is at risk. This record names no "
-                        "covenant, so its age cannot be read and the record stays held: a later run will not "
-                        "end it. If the maker locked a covenant, claim it with p"
+                        "covenant: a later run ends the hold only if it finds the maker's covenant still "
+                        "unspent once t_rxd has matured; with none, or once it is spent, the record stays "
+                        "held. If the maker locked a covenant, claim it with p"
                     )
                     if held
                     else "; the claim is not yet buried, and nothing more was sent"

@@ -1170,7 +1170,7 @@ class TestTakerBtcRecoveryFollowsTheChain:
         back = _read_back(args)
         assert back.state is SwapState.BTC_LOCKED and back.radiant_covenant_outpoint is None
         assert back.counter_disposition.kind == "refunded"
-        assert "no BTC of yours is at risk" in msg and "a later run will not end it" in msg, msg
+        assert "no BTC of yours is at risk" in msg and "the record stays held" in msg, msg
         assert "run --phase abort again then" not in msg, msg
 
     async def test_a_buried_claim_reveals_and_names_the_claim_phase(self, btc_mod, tmp_path, monkeypatch):
