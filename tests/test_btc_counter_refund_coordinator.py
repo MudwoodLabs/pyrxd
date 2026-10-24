@@ -365,6 +365,36 @@ async def test_an_accepted_bump_the_sources_do_not_show_yet_is_waited_on_not_rep
     assert bytes.fromhex(s.on_disk().counter_refund_raw) == bump
 
 
+async def test_a_refund_taken_on_a_resend_is_not_replaced_by_a_cheaper_one(tmp_path, monkeypatch):
+    """Re-review of ca95658, L1: a refund first refused, then taken by the node on a re-send while the
+    HTLC read unspent, is ours as much as one taken on its first send. When the sources then show a
+    cheaper refund of the HTLC, ours is re-sent, not replaced by a bump over the cheaper one."""
+    s = _Swap(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    accept, refusing = s.chain.submit, [True]
+
+    def submit(raw):
+        if refusing[0]:
+            raise FeeRejected("mempool min fee not met", reason="mempool min fee not met")
+        return accept(raw)
+
+    s.chain.submit = submit
+    coord = s.coord()
+    with pytest.raises(FeeRejected):
+        await coord.taker_refund_btc()  # signed, recorded, refused
+    ours = s.sent[0]
+    refusing[0] = False
+    await coord.taker_refund_btc()  # unspent: the same bytes again, taken now
+    cheaper = s.chain.refund_tx(fee_sats=300)
+    for src in s.sources:
+        src.forge_spender = cheaper
+    await coord.taker_refund_btc()  # the cheaper one first seen pending
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    await coord.taker_refund_btc()
+    assert s.sent[-1] == ours and {_fee(r) for r in s.sent} == {_fee(ours)}
+
+
 async def test_a_broadcaster_outage_never_raises_the_fee(tmp_path, monkeypatch):
     """Re-review R1: only a refusal for the fee (FeeRejected) bumps. A broadcaster that cannot be
     reached, for however long, gets the same bytes again each pass."""
