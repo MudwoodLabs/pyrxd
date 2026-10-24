@@ -1150,6 +1150,29 @@ class TestTakerBtcRecoveryFollowsTheChain:
         assert _read_back(args).counter_claim_tx == bt.btc_txid_from_raw(claim)
         assert built["source"].closed
 
+    async def test_a_held_abort_with_no_covenant_pinned_does_not_promise_a_later_run_ends_it(
+        self, btc_mod, tmp_path, monkeypatch
+    ):
+        """Mythos review of #850 PR 9a, F2: --phase abort pins no covenant, so the D14 hold cannot read
+        the covenant's age and holds for good. The message must not say a later run ends it."""
+        p = os.urandom(32)
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True, preimage=p)
+        op = _funding_outpoint(io_dir)
+        claim = _btc_claim_of(op, terms, p)
+        refunded = _btc_answer("refunded", spender=_refund_like(op), confs=3, buried=True)
+        leg = _DispositionBtcLeg(op, [_btc_answer("claim_seen", spender=claim, path="claim"), refunded])
+        _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit):
+            await btc_mod.taker_phase_abort(_with_fee(args))  # the claim is recorded
+        with pytest.raises(SystemExit) as raised:
+            await btc_mod.taker_phase_abort(_with_fee(args))
+        msg = str(raised.value.code)
+        back = _read_back(args)
+        assert back.state is SwapState.BTC_LOCKED and back.radiant_covenant_outpoint is None
+        assert back.counter_disposition.kind == "refunded"
+        assert "no BTC of yours is at risk" in msg and "a later run will not end it" in msg, msg
+        assert "run --phase abort again then" not in msg, msg
+
     async def test_a_buried_claim_reveals_and_names_the_claim_phase(self, btc_mod, tmp_path, monkeypatch):
         p = os.urandom(32)
         args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True, preimage=p)

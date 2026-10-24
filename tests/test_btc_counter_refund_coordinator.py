@@ -296,6 +296,48 @@ async def test_a_refund_the_node_keeps_refusing_is_replaced_after_the_wait(tmp_p
     assert s.on_disk().counter_refund_raw == bump.hex()
 
 
+@pytest.mark.parametrize("refusal", ["fee", "outage"])
+async def test_a_refused_bump_escalates_only_on_a_fee_refusal_and_only_after_the_wait(tmp_path, monkeypatch, refusal):
+    """Mythos review of #850 PR 9a, F3: with the original still pending, a bump the node refuses for
+    its fee was re-signed at the same 2x for ever. It is now priced over in turn, REFUND_REPLACE_AFTER_S
+    after the refusal. A bump that fails for any other reason keeps the original as the base."""
+    s = _Swap(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+    coord = s.coord()
+    await coord.taker_refund_btc()
+    original = s.sent[0]
+    accept = s.chain.submit
+
+    def submit(raw):
+        if s.chain.mempool is not None and _fee(raw) < 2_000:
+            if refusal == "fee":
+                raise FeeRejected("insufficient fee, rejecting replacement", reason="insufficient fee")
+            raise NetworkError("connection reset")
+        return accept(raw)
+
+    s.chain.submit = submit
+    await coord.taker_refund_btc()  # first seen pending now
+    clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+    with pytest.raises(NetworkError):
+        await coord.taker_refund_btc()  # bump to 1000, refused
+    assert _fee(s.sent[-1]) == 1_000
+    clock[0] += 1
+    if refusal == "fee":
+        await coord.taker_refund_btc()  # refused 1s ago: wait
+        assert len(s.sent) == 2
+        clock[0] += sc.REFUND_REPLACE_AFTER_S
+        await coord.taker_refund_btc()  # priced over the refused 1000
+        assert _fee(s.sent[-1]) == 2_000 and s.chain.mempool == t.btc_txid_from_raw(s.sent[-1])
+    else:
+        for _ in range(3):
+            clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+            with pytest.raises(NetworkError):
+                await coord.taker_refund_btc()
+        assert {_fee(r) for r in s.sent[1:]} == {1_000}, "an outage ratcheted the fee"
+        assert s.chain.mempool == t.btc_txid_from_raw(original)
+
+
 async def test_a_broadcaster_outage_never_raises_the_fee(tmp_path, monkeypatch):
     """Re-review R1: only a refusal for the fee (FeeRejected) bumps. A broadcaster that cannot be
     reached, for however long, gets the same bytes again each pass."""

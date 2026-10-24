@@ -181,6 +181,23 @@ async def test_a_lagging_source_holds_the_depth_down():
     assert d.kind is K.REFUND_PENDING and d.refunds_seen[0].confirmations == BURIAL - 3
 
 
+@pytest.mark.parametrize("value", [2**63, 2**64 - 1])
+async def test_a_spender_with_an_impossible_output_value_fails_that_source_only(value):
+    """Mythos review of #850 PR 9a, F1: an output value outside the signed 64-bit range raised
+    struct.error out of the sighash, past every handler, so one source took down the read."""
+    chain = FakeBtcChain()
+    refund = chain.refund_tx()
+    fields = t.btc_spend_fields_from_raw(refund)
+    old = fields.outputs[0][0].to_bytes(8, "little")
+    assert refund.count(old) == 1
+    forged = refund.replace(old, value.to_bytes(8, "little"))
+    d = await _read(chain, [*_panel(chain, 2), FakeBtcSource(chain, forge_spender=forged)])
+    assert d.kind is K.UNSPENT and len(d.failed) == 1
+    # Honest twin: the same source serving the real refund nominates it.
+    d = await _read(chain, [*_panel(chain, 2), FakeBtcSource(chain, forge_spender=refund)])
+    assert d.kind is K.REFUND_PENDING
+
+
 async def test_deepest_is_the_maximum_any_source_answered():
     """``deepest`` lets the coordinator tell "mined, depth below quorum" from "in no block" (review
     of part 2, F2): one source with it mined is enough to make it the maximum."""

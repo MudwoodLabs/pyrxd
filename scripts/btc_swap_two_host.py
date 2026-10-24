@@ -1128,8 +1128,16 @@ async def _poll_btc_refund_to_terminal(args, coord, step, *, phase: str):
                 f"{stays}: a spend of the BTC HTLC by its claim leaf (tx {rec.counter_claim_tx}) opens this swap's "
                 f"hashlock, so p is public. Claim the RXD covenant before its CSV refund to the maker opens, {window}"
                 + (
-                    ". Your BTC refund is buried, and the record goes terminal once t_rxd has matured: run "
-                    f"--phase {phase} again then"
+                    (
+                        ". Your BTC refund is buried, and the record goes terminal once t_rxd has matured: run "
+                        f"--phase {phase} again then"
+                        if rec.radiant_covenant_outpoint is not None
+                        # No covenant pinned: the hold reads the covenant's age from the chain, cannot,
+                        # and holds for good (Mythos review of #850 PR 9a, F2). Say so, not "run again".
+                        else ". Your BTC refund is buried, so no BTC of yours is at risk. This record names no "
+                        "covenant, so its age cannot be read and the record stays held: a later run will not "
+                        "end it. If the maker locked a covenant, claim it with p"
+                    )
                     if held
                     else "; the claim is not yet buried, and nothing more was sent"
                 )

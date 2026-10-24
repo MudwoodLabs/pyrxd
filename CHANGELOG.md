@@ -125,9 +125,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `REFUND_REPLACE_AFTER_S` (600 s, chosen, not measured), even one only a single mempool holds, is replaced by BIP125 at twice its fee, or its
     fee plus 1 sat/vB of the larger of the two transactions if that is more
     (`BitcoinTaprootLeg.refund_bump_fee`; the doubling is chosen, not measured). A recorded refund
-    that the node has refused for its fee for as long, on reads that show the HTLC unspent, is
-    replaced the same way. Any other broadcast failure, a transport outage included, re-sends the
-    same bytes and never raises the fee.
+    that the node has refused for its fee for as long is replaced the same way, priced over the
+    refused one: on reads that show the HTLC unspent, and for a bump refused while the original is
+    still pending. Any other broadcast failure, a transport outage included, re-sends the same
+    bytes (or the same bump over the original) and never raises the fee. A record with no covenant
+    pinned (`--phase abort`) that has seen a claim stays held after the refund is buried; the runner
+    now says so instead of asking for another run.
   - New `FeeRejected` (a `NetworkError`, not a `PolicyRejection`): `MempoolSpaceBroadcaster` and
     `BitcoinCoreBroadcaster` raise it when the node's error names a fee refusal
     (`pyrxd.network.bitcoin.BTC_FEE_REJECTION_MARKERS`); every other failure is unchanged. A bump that
