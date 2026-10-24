@@ -27,13 +27,13 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, urljoin
 
 import aiohttp
 
 from ..hash import hash256
-from ..security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
+from ..security.errors import FeeRejected, InsufficientConfirmationsError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
 from ._guards import finite_int, merkle_branch, nonneg_int, require_bool
@@ -150,6 +150,11 @@ def _output_index(value: Any) -> int:
         return nonneg_int(value)
     except ValueError as exc:
         raise ValidationError("output index must be a non-negative int") from exc
+
+
+def _is_hex64(value: str) -> bool:
+    """Exactly 64 hex characters: a txid or block hash, and nothing that can escape a URL path."""
+    return len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
 
 
 def _esplora_status_height(status: Any) -> int | None:
@@ -1308,6 +1313,20 @@ class _MempoolHttpClient:
         return data
 
 
+#: Bitcoin Core's reject reasons for a transaction whose fee is too low to relay ("min relay fee not
+#: met", "mempool min fee not met", "mempool full": trimmed on arrival) or to replace another under
+#: BIP125 ("insufficient fee"). Matched
+#: in a broadcaster's error text to raise :class:`FeeRejected` (#850 PR 9a). From Bitcoin Core's
+#: reject strings; not checked against a pinned Core source here.
+BTC_FEE_REJECTION_MARKERS = ("min relay fee not met", "mempool min fee not met", "mempool full", "insufficient fee")
+
+
+def btc_fee_rejection(text: str) -> str | None:
+    """The :data:`BTC_FEE_REJECTION_MARKERS` entry *text* contains, case-insensitively, else ``None``."""
+    low = text.lower()
+    return next((m for m in BTC_FEE_REJECTION_MARKERS if m in low), None)
+
+
 class MempoolSpaceBroadcaster:
     """``BtcBroadcaster`` over mempool.space ``POST /api/tx`` (the value-moving edge).
 
@@ -1363,6 +1382,9 @@ class MempoolSpaceBroadcaster:
                 if any(m in low for m in ("txn-already-known", "already in block chain", "already in mempool")):
                     # Idempotent success — derive the txid locally (no node on mainnet).
                     return btc_txid_from_raw(raw)
+                fee = btc_fee_rejection(body)
+                if fee is not None:
+                    raise FeeRejected(f"broadcast rejected (HTTP {resp.status}): {fee}", reason=fee)
                 raise NetworkError(f"broadcast rejected (HTTP {resp.status})")
         except aiohttp.ClientError as exc:
             raise NetworkError("broadcast HTTP request failed") from exc
@@ -1481,6 +1503,42 @@ class MempoolSpaceFundingReader:
                 )
             raise NetworkError(f"output {str(tx)[:16]}…:{index} is already SPENT; fail-closed")
         return spk, value
+
+    async def outpoint_spender(self, txid: str, vout: int) -> RawTx | None:
+        """The transaction spending ``txid:vout`` as this Esplora sees it (mempool included), or
+        ``None`` while it is unspent (#850 PR 9a, the BTC disposition reader's discovery read).
+
+        ``/tx/{txid}/outspend/{vout}`` names the spender; its bytes come from ``/tx/{spender}/hex``
+        and must hash to that txid and spend the outpoint. A spend with no usable txid, or bytes
+        that fail either check, raise: only the boolean ``spent: false`` reads as unspent."""
+        tx = txid if isinstance(txid, Txid) else Txid(txid)
+        index = _output_index(vout)
+        spend = await self._http.outspend(tx, index)
+        if spend["spent"] is False:
+            return None
+        spender = spend.get("txid")
+        if not isinstance(spender, str) or not _is_hex64(spender):
+            raise NetworkError(f"outspend for {str(tx)[:16]}…:{index} says spent but names no usable txid; fail-closed")
+        s = await self._http.session()
+        raw = await _get_hex_bytes(s, self._http.url(f"tx/{_safe_txid_path(Txid(spender))}/hex"))
+        return BitcoinCoreRpcSource._spender_bytes(
+            {"hex": raw.hex()}, Txid(spender), bytes.fromhex(str(tx))[::-1] + index.to_bytes(4, "little")
+        )
+
+    async def tx_block(self, txid: str) -> tuple[int, str] | None:
+        """``(height, block hash)`` of the block holding *txid* per ``/tx/{txid}/status``, or ``None``
+        while it is unconfirmed."""
+        tx = txid if isinstance(txid, Txid) else Txid(txid)
+        status = await self._http.tx_status(tx)
+        height = _esplora_status_height(status)
+        if height is None:
+            return None
+        block_hash = status.get("block_hash")
+        if not isinstance(block_hash, str) or not _is_hex64(block_hash):
+            raise NetworkError(
+                f"tx status for {str(tx)[:16]}… is confirmed but names no usable block hash; fail-closed"
+            )
+        return height, block_hash.lower()
 
     async def txid_of(self, raw_tx: bytes) -> str:
         from ..btc_wallet.taproot import btc_txid_from_raw
@@ -1635,6 +1693,42 @@ class BitcoinCoreFundingReader:
             raise NetworkError("gettxout returned no value; fail-closed")
         return spk, self._btc_to_sats(res["value"])
 
+    async def outpoint_spender(self, txid: str, vout: int) -> RawTx | None:
+        """The transaction spending ``txid:vout`` as this node sees it, or ``None`` while it is
+        unspent (#850 PR 9a, the BTC disposition reader's discovery read).
+
+        :meth:`BitcoinCoreRpcSource.get_outpoint_spender` does the work, so this needs *rpc* to be
+        that source's bound ``_rpc`` (how every shipped caller builds this reader); otherwise it
+        raises rather than guess. Fails closed exactly as that method does."""
+        source = getattr(self._rpc, "__self__", None)
+        read = getattr(source, "get_outpoint_spender", None)
+        if read is None:
+            raise NetworkError(
+                "this BitcoinCoreFundingReader was not built on a BitcoinCoreRpcSource, so it cannot read "
+                "an outpoint's spender; fail-closed"
+            )
+        return cast("RawTx | None", await read(Txid(str(txid)), int(vout)))
+
+    async def tx_block(self, txid: str) -> tuple[int, str] | None:
+        """``(height, block hash)`` of the block holding *txid*, or ``None`` while it is in no block.
+        The height is read from that block's own header, as :meth:`BitcoinCoreRpcSource.
+        get_tx_block_height` reads it."""
+        data = await self._verbose_tx(txid)
+        block_hash = data.get("blockhash")
+        if block_hash is None:
+            return None
+        if not isinstance(block_hash, str) or not _is_hex64(block_hash):
+            raise NetworkError("getrawtransaction returned an unusable blockhash; fail-closed")
+        header = await self._rpc("getblockheader", [block_hash, True])
+        if not isinstance(header, dict) or header.get("hash") != block_hash:
+            raise NetworkError(
+                "getblockheader returned a header for another block than the tx's blockhash; fail-closed"
+            )
+        try:
+            return nonneg_int(header.get("height")), block_hash.lower()
+        except ValueError as exc:
+            raise NetworkError("getblockheader returned an unusable height; fail-closed") from exc
+
     async def txid_of(self, raw_tx: bytes) -> str:
         # Local, node-free (mirrors MempoolSpaceFundingReader): the reorg gate derives its own txid,
         # but the Protocol method exists for non-gate callers.
@@ -1756,6 +1850,12 @@ class MultiSourceBtcFundingReader:
     def default_mainnet(cls, *, quorum: int = 2, dust_cap_sats: int = 10_000) -> MultiSourceBtcFundingReader:
         """Wire the three default mainnet Esplora endpoints (three registered domains, 2-of-3)."""
         return cls.from_endpoints(cls.DEFAULT_MAINNET_ENDPOINTS, quorum=quorum, dust_cap_sats=dust_cap_sats)
+
+    def panel(self) -> tuple[tuple[Any, ...], int]:
+        """``(readers, quorum)``: the per-source readers and how many must agree, for a read that
+        asks each source itself (the BTC disposition reader, #850 PR 9a). One reader per source,
+        as the constructor enforces."""
+        return tuple(self._readers), self._quorum
 
     async def _gather(self, coro_fn) -> list:
         """Run ``coro_fn`` on every reader; return only the successful (non-Exception)

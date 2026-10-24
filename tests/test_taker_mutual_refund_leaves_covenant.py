@@ -16,14 +16,15 @@ leg        role    ``mutual_refund`` from BOTH_LOCKED
 ETH        TAKER   counter-leg refund only; record stays BOTH_LOCKED (changed in PR 1)
 ETH        MAKER   refused (PR 6)
 ETH        None    both refunds; MUTUAL_REFUND if both return (unchanged)
-BTC        any     both refunds; MUTUAL_REFUND if both return (unchanged — see below)
+BTC        TAKER   counter-leg refund only; record stays BOTH_LOCKED (#850 PR 9a)
+BTC        MAKER   both refunds; MUTUAL_REFUND if both return (unchanged)
+BTC        None    both refunds; MUTUAL_REFUND if both return (unchanged)
 =========  ======  ====================================================================
 
-BTC is deliberately unchanged in this PR. Leaving a taker's BTC record non-terminal would make the
-watchtower page the taker's OWN refund as a maker claim on every tick
-(``OutspendBtcClaimSource`` treats any spend of the HTLC as a claim), so the BTC half waits for
-spender classification (#850 plan, PR 9). The BTC tests below pin the unchanged behaviour on
-purpose: when BTC is fixed they must fail and be rewritten.
+BTC TAKER changed in #850 PR 9a; a BTC leg that reads its disposition is tested in
+``tests/test_btc_counter_refund_coordinator.py``. Until PR 9b the watchtower still reads any spend
+of the HTLC as a claim, so the taker's own refund on a BOTH_LOCKED record is paged (never acted
+on); the test below pins that.
 
 Every coordinator here is rebuilt from a record that went through ``JsonFileRecordSink`` — a
 fresh process, in effect — and the assertions are on the fake legs' calls and on the record read
@@ -198,7 +199,7 @@ async def test_a_makers_eth_mutual_refund_is_refused(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# BTC, any role: unchanged in this PR (pinned so the BTC fix has to rewrite it)
+# BTC, TAKER, a leg that reads no disposition: the counter leg only (#850 PR 9a)
 # ---------------------------------------------------------------------------
 
 
@@ -229,13 +230,14 @@ async def _btc_taker_after_mutual_refund(tmp_path):
     return sink, rec, btc, rxd2
 
 
-async def test_btc_taker_mutual_refund_is_unchanged_in_this_release(tmp_path):
-    """#850 interim: KNOWN OPEN on BTC. This pins the old behaviour so the BTC fix cannot land
-    without someone rewriting it."""
+async def test_btc_taker_mutual_refund_refunds_only_the_counter_leg(tmp_path):
+    """#850 PR 9a (F-A on BTC), rewriting the interim pin: a TAKER's mutual_refund on a BTC leg that
+    reads no disposition refunds the BTC HTLC and never the covenant, and the record stays
+    BOTH_LOCKED, as on ETH. (A leg that reads one: tests/test_btc_counter_refund_coordinator.py.)"""
     sink, rec, btc, rxd = await _btc_taker_after_mutual_refund(tmp_path)
-    assert btc.refunded and rxd.refunded
-    assert rec.state is SwapState.MUTUAL_REFUND
-    assert sink.load_record().state is SwapState.MUTUAL_REFUND
+    assert btc.refunded and not rxd.refunded, "the taker's process sent the maker's covenant refund"
+    assert rec.state is SwapState.BOTH_LOCKED
+    assert sink.load_record().state is SwapState.BOTH_LOCKED
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +293,11 @@ async def test_eth_tower_after_a_taker_only_refund_pages_refund_with_text_that_s
     assert d.recommended_action.startswith("taker_observed_reveal"), d.recommended_action
 
 
-async def test_btc_tower_after_a_taker_mutual_refund_retires_the_record(tmp_path):
-    """BTC is unchanged, so the taker's record is terminal and the tower stops watching it — it
-    never sees the taker's own refund spend and misreads it as a claim."""
+async def test_btc_tower_after_a_taker_mutual_refund_pages_and_does_not_act(tmp_path):
+    """KNOWN INTERIM until #850 PR 9b: the taker's record now stays BOTH_LOCKED, and the tower's
+    ``OutspendBtcClaimSource`` reports any spend of the HTLC as a claim, so the taker's own refund
+    is paged as a maker claim. It is a page, never an autonomous broadcast; 9b classifies the
+    spender first (design §6)."""
     sink, _rec, _btc, _rxd = await _btc_taker_after_mutual_refund(tmp_path)
     record = sink.load_record()
     d = decide(
@@ -302,4 +306,5 @@ async def test_btc_tower_after_a_taker_mutual_refund_retires_the_record(tmp_path
         policy=MarginPolicy.estimated(),
         safety_window_blocks=_SAFETY,
     )
-    assert d.intent is Intent.RETIRE
+    assert d.intent.value.startswith("page"), d
+    assert not d.autonomous_btc_refund

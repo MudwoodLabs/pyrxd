@@ -581,3 +581,39 @@ def test_scrape_secret_finds_preimage_in_adversarial_witness(preimage, decoys, n
     if other != h:
         with pytest.raises(ValidationError):
             t.scrape_secret(bytes(out), other)
+
+
+# ---------------------------------------------------------------------------
+# Amounts outside the signed 64-bit range (Mythos review of #850 PR 9a, F1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("where", ["spent", "output"])
+@pytest.mark.parametrize("amount", [2**63, -(2**63) - 1])
+def test_sighash_refuses_an_amount_outside_int64_with_a_validation_error(where, amount):
+    """struct.error escaped every caller's handler; it must be a ValidationError."""
+    spk = b"\x51\x20" + b"\x11" * 32
+    kw = {
+        "tx_version": 2,
+        "locktime": 0,
+        "inputs": [(b"\x00" * 36, 0xFFFFFFFD)],
+        "input_index": 0,
+        "spent_outputs": [(amount if where == "spent" else 10_000, spk)],
+        "outputs": [(amount if where == "output" else 9_000, spk)],
+    }
+    with pytest.raises(ValidationError, match="64-bit"):
+        t.taproot_sighash(**kw)
+    # Honest twin: the int64 edge itself serialises.
+    kw["spent_outputs"], kw["outputs"] = [(2**63 - 1, spk)], [(0, spk)]
+    assert len(t.taproot_sighash(**kw)) == 32
+
+
+def test_spend_fields_refuse_an_output_value_that_is_negative_as_int64():
+    raw = bytearray.fromhex("02000000000101" + "00" * 36 + "00" + "fdffffff01" + "00" * 8 + "01510000000000")
+    assert t.btc_spend_fields_from_raw(bytes(raw)).outputs == ((0, b"\x51"),)
+    value_at = 4 + 2 + 1 + 36 + 1 + 4 + 1
+    raw[value_at : value_at + 8] = (2**63).to_bytes(8, "little")
+    with pytest.raises(ValidationError, match="64-bit"):
+        t.btc_spend_fields_from_raw(bytes(raw))
+    raw[value_at : value_at + 8] = (2**63 - 1).to_bytes(8, "little")
+    assert t.btc_spend_fields_from_raw(bytes(raw)).outputs[0][0] == 2**63 - 1

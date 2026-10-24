@@ -177,7 +177,7 @@ async def test_a_role_written_later_does_not_hide_a_record_read_without_one(tmp_
     await first._persist_record(first.record)
     on_disk = json.loads(sink.path.read_text())
     assert on_disk["role"] == "taker" and on_disk["read_without_role"] is True
-    assert on_disk["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 9
+    assert on_disk["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 10
     fresh, _c, _leg = _setup(contract=False)
     fresh.record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms, role=RecordRole.TAKER)
     fresh._persist = sink
@@ -275,7 +275,7 @@ async def test_the_abandoned_record_round_trips_at_the_current_schema_version():
     coord, _c, _leg = _setup()
     rec = await coord.abandon_unfunded()
     d = rec.to_dict()
-    assert d["abort_reason"] == "taker_never_funds" and d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 9
+    assert d["abort_reason"] == "taker_never_funds" and d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 10
     assert SwapRecord.from_dict(d) == rec
 
 

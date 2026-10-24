@@ -21,7 +21,7 @@ from pyrxd.network.bitcoin import (
     MempoolSpaceFundingReader,
     _MempoolHttpClient,
 )
-from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
+from pyrxd.security.errors import FeeRejected, InsufficientConfirmationsError, NetworkError, ValidationError
 
 #: Committed, sanitized golden vector: a real Bitcoin mainnet segwit transaction and its
 #: canonical txid (public on-chain data — no key material, no HTLC preimage). This used to
@@ -111,6 +111,39 @@ async def test_broadcast_already_spent_conflict_is_fail_closed():
         b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, body)))
         with pytest.raises(NetworkError, match="broadcast rejected"):
             await b.broadcast(raw)
+
+
+async def test_broadcast_refused_for_its_fee_raises_fee_rejected_and_nothing_else_does():
+    """#850 PR 9a: only a fee refusal may let the coordinator re-sign at a higher fee. Its reason is
+    our marker, never the node's text."""
+    raw, _ = _mainnet_vec()
+    for body, marker in (
+        (
+            'sendrawtransaction RPC error: {"code":-26,"message":"min relay fee not met, 100 < 141"}',
+            "min relay fee not met",
+        ),
+        ("mempool min fee not met, 120 < 300", "mempool min fee not met"),
+        ("insufficient fee, rejecting replacement abc", "insufficient fee"),
+        ("mempool full", "mempool full"),
+    ):
+        b = MempoolSpaceBroadcaster()
+        b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, body)))
+        with pytest.raises(FeeRejected) as exc:
+            await b.broadcast(raw)
+        assert exc.value.reason == marker
+    for body in (
+        "non-mandatory-script-verify-flag (...)",
+        "non-BIP68-final",
+        "bad-txns-inputs-missingorspent",
+        "max-fee-exceeded",
+        "absurdly-high-fee",
+        "bad-txns-in-belowout",
+    ):
+        b = MempoolSpaceBroadcaster()
+        b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, body)))
+        with pytest.raises(NetworkError) as exc:
+            await b.broadcast(raw)
+        assert not isinstance(exc.value, FeeRejected), body
 
 
 async def test_broadcast_rejects_empty():

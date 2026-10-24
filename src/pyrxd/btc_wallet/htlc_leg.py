@@ -40,7 +40,7 @@ from typing import Protocol, runtime_checkable
 
 from pyrxd.btc_wallet import taproot as t
 from pyrxd.btc_wallet.keys import BtcKeypair
-from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
+from pyrxd.btc_wallet.payment import DUST_LIMIT, BtcUtxo, build_payment_tx
 from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import Txid
 
@@ -228,6 +228,12 @@ class BitcoinCoreBroadcaster:
                 # locally — segwit txid = hash256(non-witness), and the node already
                 # has a correct parser, so we don't ship a second one here.
                 return await self._txid_via_node(raw)
+            from pyrxd.network.bitcoin import btc_fee_rejection
+            from pyrxd.security.errors import FeeRejected
+
+            fee = btc_fee_rejection(str(exc))
+            if fee is not None:
+                raise FeeRejected(f"sendrawtransaction failed: {exc}", reason=fee) from exc
             raise NetworkError(f"sendrawtransaction failed: {exc}") from exc
         if not isinstance(result, str):
             raise NetworkError("sendrawtransaction did not return a txid")
@@ -239,6 +245,16 @@ class BitcoinCoreBroadcaster:
         if not isinstance(decoded, dict) or not isinstance(decoded.get("txid"), str):
             raise NetworkError("decoderawtransaction did not return a txid for an already-known tx")
         return str(decoded["txid"])
+
+
+#: Bitcoin Core's default incremental relay fee (``DEFAULT_INCREMENTAL_RELAY_FEE``), 1 sat/vB.
+_BIP125_INCREMENTAL_SATS_PER_VB = 1
+#: An automatic RBF bump of the BTC refund never pays more than this fraction of the locked amount
+#: (CHOSEN, not measured; #850 PR 9a). Past it the coordinator stops and the operator decides.
+REFUND_BUMP_MAX_FEE_FRACTION = (1, 10)
+#: Nor leaves the refund output below the BTC dust limit (``payment.DUST_LIMIT``, the P2PKH figure,
+#: which every output type clears).
+REFUND_BUMP_MIN_OUTPUT_SATS = DUST_LIMIT
 
 
 class BitcoinTaprootLeg:
@@ -526,6 +542,24 @@ class BitcoinTaprootLeg:
             )
         return self._htlc(terms).with_funding(outpoint, int(funded_sats))
 
+    # -- the counter leg's disposition, read from the chain (async, #850 PR 9a) ----
+    async def counter_disposition(self, locator: t.BtcHtlcLocator, *, hashlock: bytes, burial_blocks: int):
+        """What the chain shows about *locator*'s funding outpoint: unspent, or spent by a claim or
+        a refund, and whether that spend is buried *burial_blocks* deep
+        (:func:`pyrxd.btc_wallet.disposition.read_btc_counter_disposition`). Read only.
+
+        The sources are this leg's ``funding_reader``: each source of a quorum reader that exposes
+        ``panel()`` (:class:`pyrxd.network.bitcoin.MultiSourceBtcFundingReader`) with its quorum, or
+        the one reader alone (``single_source``). A reader without the spender read answers
+        UNKNOWN, never "unspent"."""
+        from .disposition import read_btc_counter_disposition
+
+        panel = getattr(self.funding_reader, "panel", None)
+        readers, quorum = panel() if callable(panel) else ((self.funding_reader,), 1)
+        return await read_btc_counter_disposition(
+            readers, locator, hashlock=hashlock, burial_blocks=burial_blocks, quorum=quorum
+        )
+
     # -- reorg gate: confirmation depth of the maker's claim (async) --------
     async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
         """Confirmation depth of the maker's BTC claim tx (the reorg gate's input).
@@ -723,7 +757,18 @@ class BitcoinTaprootLeg:
         """Build + idempotently broadcast the taker's CSV refund tx. Returns the txid.
 
         The refund leaf spends via the taker's refund key (held by this leg) after
-        the relative timelock matures. Idempotent broadcast tolerates a retry.
+        the relative timelock matures. Idempotent broadcast tolerates a retry. The coordinator's
+        refund path (#850 PR 9a) uses :meth:`sign_refund` and :meth:`broadcast_refund` instead, so
+        it can record the bytes between the two.
+        """
+        return await self.broadcast_refund(await self.sign_refund(locator, timeout))
+
+    async def sign_refund(
+        self, locator: t.BtcHtlcLocator, timeout: t.Timelock, *, fee_sats: int | None = None
+    ) -> bytes:
+        """Build and sign the taker's CSV refund tx, without broadcasting it (#850 PR 9a).
+
+        *fee_sats* defaults to the leg's flat fee; an RBF bump passes :meth:`refund_bump_fee`.
 
         P3 maturity self-check: the refund spends the CSV leaf (BIP68/112 relative-block
         timelock), final only once the FUNDING utxo is buried ``timeout`` deep (mature at
@@ -737,6 +782,9 @@ class BitcoinTaprootLeg:
             raise ValidationError("locator must be a BtcHtlcLocator")
         if not isinstance(timeout, t.Timelock):
             raise ValidationError("timeout must be a Timelock")
+        fee = self.fee_sats if fee_sats is None else fee_sats
+        if not isinstance(fee, int) or isinstance(fee, bool) or fee <= 0:
+            raise ValidationError("fee_sats must be a positive int")
         if timeout.unit is t.TimeUnit.BLOCKS:
             confs = await self.funding_reader.confirmations(locator.funding_outpoint.txid)
             if confs < timeout.value:
@@ -748,12 +796,49 @@ class BitcoinTaprootLeg:
                     f"({timeout.value - confs} block(s) to go) — refusing to broadcast a non-final refund "
                     "(P3 maturity self-check); poll and retry at maturity rather than relying on node rejection."
                 )
-        raw = t.build_refund_tx(
+        return t.build_refund_tx(
             locator=locator,
             refund_privkey=self.taker_keypair._privkey.unsafe_raw_bytes(),
             timeout=timeout,
             to_scriptpubkey=self.refund_to_scriptpubkey,
-            fee_sats=self.fee_sats,
+            fee_sats=fee,
             aux_rand=t.fresh_aux_rand(),
         )
-        return await self.broadcaster.broadcast(raw)
+
+    async def broadcast_refund(self, raw_tx: bytes) -> str:
+        """Broadcast a signed refund (idempotent at the broadcaster). Returns the txid."""
+        return await self.broadcaster.broadcast(bytes(raw_tx))
+
+    def refund_bump_fee(self, locator: t.BtcHtlcLocator, pending_raw: bytes) -> int:
+        """The fee for a refund that replaces *pending_raw* under BIP125 (#850 PR 9a, design §6).
+
+        BIP125 rule 4: the replacement pays at least the replaced fee plus the incremental relay
+        fee (Bitcoin Core's default, 1 sat/vB) times its own size. Ours has one input, one output
+        to :attr:`refund_to_scriptpubkey` and a 64-byte signature; the one it replaces may pay a
+        different script (the watchtower's pre-signed refund), so the size used is the larger of the
+        two (review of part 2, F5).
+        This takes the larger of that and twice the old fee (CHOSEN, not measured: a bump that
+        only clears the floor may not get mined sooner). Raises :class:`ValidationError` when the
+        bump would leave the refund output below :data:`REFUND_BUMP_MIN_OUTPUT_SATS` or pay more
+        than :data:`REFUND_BUMP_MAX_FEE_FRACTION` of the locked amount: the operator decides
+        then, not a loop."""
+        raw = bytes(pending_raw)
+        outputs = t.btc_spend_fields_from_raw(raw).outputs
+        paid = sum(v for v, _spk in outputs)
+        old_fee = locator.amount_sats - paid
+        if old_fee <= 0:
+            raise ValidationError(f"the pending refund pays out {paid} of {locator.amount_sats} sats; no fee to bump")
+        old_vsize = t.btc_vsize_from_raw(raw)
+        # Ours differs from it only in its outputs (value 8 bytes, a script length byte, the script;
+        # every script here is under 253 bytes, so its length is one byte).
+        ours_vsize = old_vsize - sum(9 + len(spk) for _v, spk in outputs) + 9 + len(self.refund_to_scriptpubkey)
+        new_fee = max(2 * old_fee, old_fee + _BIP125_INCREMENTAL_SATS_PER_VB * max(old_vsize, ours_vsize))
+        # floor-is-deliberate: the cap rounds down, so a bump never pays more than the fraction.
+        cap = locator.amount_sats * REFUND_BUMP_MAX_FEE_FRACTION[0] // REFUND_BUMP_MAX_FEE_FRACTION[1]
+        if new_fee > cap or locator.amount_sats - new_fee < REFUND_BUMP_MIN_OUTPUT_SATS:
+            raise ValidationError(
+                f"an RBF bump of the BTC refund from {old_fee} to {new_fee} sats would pay more than "
+                f"{REFUND_BUMP_MAX_FEE_FRACTION[0]}/{REFUND_BUMP_MAX_FEE_FRACTION[1]} of the {locator.amount_sats} "
+                "sats locked, or leave less than the dust floor; not bumped automatically"
+            )
+        return new_fee

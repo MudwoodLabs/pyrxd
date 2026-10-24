@@ -412,6 +412,7 @@ def _btc_scenario(
         asset_locked_at_height=0,
         resume_deadline_s=1.0,
         poll_interval_s=0.0,
+        abort_poll_timeout_s=0.0,  # one pass (#850 PR 9a)
     )
     for k, v in over.items():
         setattr(args, k, v)
@@ -1029,126 +1030,261 @@ def _funding_outpoint(io_dir: Path):
     ).funding_outpoint
 
 
-class TestTakerBtcRecoveryRefusesWhenTheBtcLegIsAlreadySpent:
-    """#850 PR 1c: the BTC sibling of the ETH runner pre-check. ``--phase refund`` and ``--phase
-    abort`` read the BTC HTLC's funding outpoint first and refuse if it is already spent. A spender
-    whose witness opens H is the maker's claim, and the refusal names ``--phase claim`` and t_rxd;
-    any other spender is most likely the taker's own refund. Nothing is broadcast either way. The
-    coordinator is unchanged (PR 9a), so a claim that lands after the check is not caught here."""
+def _refund_like(outpoint) -> bytes:
+    """A spend of *outpoint* shaped like a refund (no push opening any H)."""
+    return _btc_spend(outpoint, [os.urandom(64), os.urandom(40), b"\xc0" + os.urandom(32)])
 
-    @pytest.mark.parametrize("phase", ["refund", "abort"])
-    async def test_a_maker_claim_refuses_and_names_the_claim_phase(self, btc_mod, tmp_path, monkeypatch, phase):
-        p = os.urandom(32)
-        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True, preimage=p)
-        claim = _btc_spend(
-            _funding_outpoint(io_dir), [os.urandom(64), p, b"\x20" + terms.hashlock + b"\x87", b"\xc0" + os.urandom(32)]
+
+class _DispositionBtcLeg(_FakeCounterLeg):
+    """A BTC leg that reads its disposition (#850 PR 9a): ``answers`` are what each read returns, in
+    order (the last repeats); a raise is a read that fails. It signs refunds that spend the record's
+    outpoint and counts what it broadcasts."""
+
+    network = "bcrt"
+    min_confirmations = 1
+
+    def __init__(self, outpoint, answers, *, sign_error: Exception | None = None, confs: int = 10_000) -> None:
+        super().__init__(confs=confs)
+        self.outpoint = outpoint
+        self.answers = list(answers)
+        self.sign_error = sign_error
+        self.signed: list[bytes] = []
+        self.broadcasts: list[bytes] = []
+        self.reads = 0
+
+    async def counter_disposition(self, locator, *, hashlock, burial_blocks):
+        self.reads += 1
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def sign_refund(self, locator, timeout, *, fee_sats=None) -> bytes:
+        if self.sign_error is not None:
+            raise self.sign_error
+        raw = _refund_like(self.outpoint)
+        self.signed.append(raw)
+        return raw
+
+    async def broadcast_refund(self, raw) -> str:
+        self.broadcasts.append(bytes(raw))
+        return bt.btc_txid_from_raw(bytes(raw))
+
+    def refund_bump_fee(self, locator, pending_raw) -> int:
+        return 1_000
+
+
+def _btc_answer(kind: str, *, spender: bytes | None = None, path: str = "refund", confs: int | None = 0, buried=False):
+    """A ``BtcCounterDisposition`` as the reader returns it."""
+    from pyrxd.btc_wallet.disposition import (
+        BtcCounterDisposition,
+        BtcDispositionEvidence,
+        BtcDispositionKind,
+        BtcSpender,
+        SpendPath,
+    )
+
+    spenders: tuple = ()
+    evidence = None
+    if spender is not None:
+        txid = bt.btc_txid_from_raw(spender)
+        block = (160, "b1" * 32) if buried else None
+        spenders = (
+            BtcSpender(
+                txid=txid,
+                path=SpendPath(path),
+                raw=spender,
+                nominated_by=("node",),
+                confirmations=confs,
+                block=block,
+            ),
         )
-        built = _wire_btc(btc_mod, monkeypatch, spender=claim)
-        with pytest.raises(SystemExit) as raised:
-            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
-        msg = str(raised.value.code)
-        assert "maker CLAIMED" in msg and bt.btc_txid_from_raw(claim) in msg, msg
-        assert "--phase claim" in msg and "maker_claim.json" in msg and "t_rxd = 120" in msg, msg
-        assert f'{{"btc_claim_tx_hex": "{claim.hex()}"}}' in msg, "the claim's bytes are in hand: print them"
-        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
-        assert built["source"].closed
+        if buried:
+            evidence = BtcDispositionEvidence(
+                kind=BtcDispositionKind(kind),
+                block_number=160,
+                block_hash="b1" * 32,
+                txid=txid,
+                confirmations=confs or 1,
+                sources=("node",),
+                single_source=True,
+            )
+    return BtcCounterDisposition(
+        kind=BtcDispositionKind(kind),
+        reason=f"scripted {kind}",
+        evidence=evidence,
+        spenders=spenders,
+        sources=("node",),
+        single_source=True,
+    )
+
+
+def _btc_claim_of(outpoint, terms, p: bytes) -> bytes:
+    return _btc_spend(outpoint, [os.urandom(64), p, b"\x20" + terms.hashlock + b"\x87", b"\xc0" + os.urandom(32)])
+
+
+class TestTakerBtcRecoveryFollowsTheChain:
+    """#850 PR 9a, replacing PR 1c's pre-check: ``--phase abort`` and ``--phase refund`` drive the
+    coordinator, which reads the BTC HTLC's funding outpoint before it sends anything, records our
+    refund before it broadcasts, and moves the record only once a refund is buried. The phase
+    follows it (``_poll_btc_refund_to_terminal``). These run one pass (``--abort-poll-timeout-s 0``)
+    unless they say otherwise; the coordinator's own rules are tested on a fake chain in
+    ``tests/test_btc_counter_refund_coordinator.py``."""
 
     @pytest.mark.parametrize("phase", ["refund", "abort"])
-    @pytest.mark.parametrize("confs", [0, 5])
-    async def test_a_shallow_non_claim_spender_says_a_claim_can_still_replace_it(
-        self, btc_mod, tmp_path, monkeypatch, phase, confs
-    ):
-        """Hostile-review finding: "nothing more is owed" for an unconfirmed refund sent the taker
-        away while the maker could still replace it with a claim and keep both legs."""
-        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
-        refund = _btc_spend(_funding_outpoint(io_dir), [os.urandom(64), os.urandom(40), b"\xc0" + os.urandom(32)])
-        built = _wire_btc(btc_mod, monkeypatch, spender=refund, spender_confs=confs)
-        with pytest.raises(SystemExit) as raised:
-            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
-        msg = str(raised.value.code)
-        assert "already spent" in msg and "reveals no preimage" in msg and "your own refund" in msg, msg
-        assert f"{confs} confirmation(s)" in msg and "replace it with a claim" in msg and "t_rxd = 120" in msg, msg
-        assert "nothing more is owed" not in msg
-        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
-
-    @pytest.mark.parametrize("phase", ["refund", "abort"])
-    async def test_a_buried_non_claim_spender_says_nothing_more_is_owed(self, btc_mod, tmp_path, monkeypatch, phase):
-        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
-        refund = _btc_spend(_funding_outpoint(io_dir), [os.urandom(64), os.urandom(40), b"\xc0" + os.urandom(32)])
-        built = _wire_btc(btc_mod, monkeypatch, spender=refund, spender_confs=6)
-        with pytest.raises(SystemExit) as raised:
-            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
-        msg = str(raised.value.code)
-        assert "at least 6 blocks deep" in msg and "nothing more is owed" in msg, msg
-        assert "--phase claim" not in msg
-        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
-
-    @pytest.mark.parametrize("phase", ["refund", "abort"])
-    async def test_an_unreadable_spentness_refuses(self, btc_mod, tmp_path, monkeypatch, phase):
-        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
-        built = _wire_btc(btc_mod, monkeypatch, spender_error=NetworkError("node unreachable"))
-        with pytest.raises(SystemExit, match="could not read whether the BTC HTLC funding outpoint"):
-            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
-        assert built["counter"].refund_calls == [] and built["rxd"].refund_calls == []
-
-    @pytest.mark.parametrize("phase", ["refund", "abort"])
-    async def test_an_unspent_outpoint_lets_the_phase_run_and_reads_the_right_outpoint(
+    async def test_a_claim_seen_ends_the_phase_naming_the_claim_and_sends_nothing(
         self, btc_mod, tmp_path, monkeypatch, phase
     ):
-        """Honest path: an unspent HTLC outpoint refunds as before, and the read named it."""
-        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
-        built = _wire_btc(btc_mod, monkeypatch)
-        await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
+        p = os.urandom(32)
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True, preimage=p)
+        claim = _btc_claim_of(_funding_outpoint(io_dir), terms, p)
+        leg = _DispositionBtcLeg(_funding_outpoint(io_dir), [_btc_answer("claim_seen", spender=claim, path="claim")])
+        built = _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit) as raised:
+            await getattr(btc_mod, f"taker_phase_{phase}")(_with_fee(args))
+        msg = str(raised.value.code)
+        assert bt.btc_txid_from_raw(claim) in msg and "p is public" in msg, msg
+        assert "--phase claim" in msg and "t_rxd = 120" in msg, msg
+        assert f'{{"btc_claim_tx_hex": "{claim.hex()}"}}' in msg, "the claim's bytes are in hand: print them"
+        assert leg.broadcasts == [] and built["rxd"].refund_calls == []
+        assert _read_back(args).counter_claim_tx == bt.btc_txid_from_raw(claim)
+        assert built["source"].closed
+
+    async def test_a_held_abort_with_no_covenant_pinned_does_not_promise_a_later_run_ends_it(
+        self, btc_mod, tmp_path, monkeypatch
+    ):
+        """Mythos review of #850 PR 9a, F2: --phase abort pins no covenant, so the D14 hold cannot read
+        the covenant's age and holds for good. The message must not say a later run ends it."""
+        p = os.urandom(32)
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True, preimage=p)
         op = _funding_outpoint(io_dir)
-        assert built["source"].spender_reads == [(str(op.txid), op.vout)]
+        claim = _btc_claim_of(op, terms, p)
+        refunded = _btc_answer("refunded", spender=_refund_like(op), confs=3, buried=True)
+        leg = _DispositionBtcLeg(op, [_btc_answer("claim_seen", spender=claim, path="claim"), refunded])
+        _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit):
+            await btc_mod.taker_phase_abort(_with_fee(args))  # the claim is recorded
+        with pytest.raises(SystemExit) as raised:
+            await btc_mod.taker_phase_abort(_with_fee(args))
+        msg = str(raised.value.code)
+        back = _read_back(args)
+        assert back.state is SwapState.BTC_LOCKED and back.radiant_covenant_outpoint is None
+        assert back.counter_disposition.kind == "refunded"
+        assert "no BTC of yours is at risk" in msg and "the record stays held" in msg, msg
+        assert "run --phase abort again then" not in msg, msg
+
+    async def test_a_buried_claim_reveals_and_names_the_claim_phase(self, btc_mod, tmp_path, monkeypatch):
+        p = os.urandom(32)
+        args, terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True, preimage=p)
+        claim = _btc_claim_of(_funding_outpoint(io_dir), terms, p)
+        answer = _btc_answer("claimed", spender=claim, path="claim", confs=3, buried=True)
+        leg = _DispositionBtcLeg(_funding_outpoint(io_dir), [answer])
+        _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit, match="secret_revealed") as raised:
+            await btc_mod.taker_phase_refund(args)
+        assert f'{{"btc_claim_tx_hex": "{claim.hex()}"}}' in str(raised.value.code)
+        assert _read_back(args).state is SwapState.SECRET_REVEALED and leg.broadcasts == []
+
+    @pytest.mark.parametrize(("phase", "terminal"), [("abort", SwapState.ABORTED), ("refund", SwapState.MUTUAL_REFUND)])
+    async def test_an_unspent_outpoint_sends_a_recorded_refund_and_follows_it_to_burial(
+        self, btc_mod, tmp_path, monkeypatch, phase, terminal
+    ):
+        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        op = _funding_outpoint(io_dir)
+        leg = _DispositionBtcLeg(op, [_btc_answer("unspent")])
+        built = _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        # One pass: the refund is sent and recorded, and the phase stops saying it is not yet buried.
+        with pytest.raises(SystemExit, match="not yet buried"):
+            await getattr(btc_mod, f"taker_phase_{phase}")(args)
+        assert len(leg.broadcasts) == 1 and built["rxd"].refund_calls == []
+        recorded = _read_back(args).counter_refund_raw
+        assert bytes.fromhex(recorded) == leg.broadcasts[0]
+        # A second run follows that refund: pending, then buried. Nothing more is sent.
+        sent = leg.broadcasts[0]
+        leg2 = _DispositionBtcLeg(
+            op,
+            [_btc_answer("refund_pending", spender=sent), _btc_answer("refunded", spender=sent, confs=1, buried=True)],
+        )
+        built2 = _wire_btc(btc_mod, monkeypatch, counter_leg=leg2)
+        args.abort_poll_timeout_s = 60.0
+        await getattr(btc_mod, f"taker_phase_{phase}")(args)
+        assert leg2.broadcasts == [] and leg2.reads == 2 and built2["rxd"].refund_calls == []
+        back = _read_back(args)
+        assert back.state is terminal and back.counter_disposition.tx_hash == bt.btc_txid_from_raw(sent)
+
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
+    async def test_contradicting_sources_end_the_phase_and_send_nothing(self, btc_mod, tmp_path, monkeypatch, phase):
+        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        op = _funding_outpoint(io_dir)
+        leg = _DispositionBtcLeg(op, [_btc_answer("unknown", spender=_refund_like(op))])
+        _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit, match="UNKNOWN"):
+            await getattr(btc_mod, f"taker_phase_{phase}")(args)
+        assert leg.broadcasts == [] and leg.signed == []
+
+    @pytest.mark.parametrize("phase", ["refund", "abort"])
+    async def test_a_refund_that_cannot_be_signed_yet_ends_the_phase(self, btc_mod, tmp_path, monkeypatch, phase):
+        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        leg = _DispositionBtcLeg(
+            _funding_outpoint(io_dir),
+            [_btc_answer("unspent")],
+            sign_error=NetworkError("BTC CSV refund is not yet mature: needs 20 confirmations, has 19"),
+        )
+        _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit, match="not yet mature"):
+            await getattr(btc_mod, f"taker_phase_{phase}")(args)
+        assert leg.broadcasts == []
+
+    async def test_a_failed_read_while_following_our_refund_retries(self, btc_mod, tmp_path, monkeypatch):
+        args, _terms, io_dir = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        op = _funding_outpoint(io_dir)
+        leg = _DispositionBtcLeg(op, [_btc_answer("unspent")])
+        _wire_btc(btc_mod, monkeypatch, counter_leg=leg)
+        with pytest.raises(SystemExit):
+            await btc_mod.taker_phase_abort(args)
+        sent = leg.broadcasts[0]
+        leg2 = _DispositionBtcLeg(
+            op, [NetworkError("node unreachable"), _btc_answer("refunded", spender=sent, confs=1, buried=True)]
+        )
+        _wire_btc(btc_mod, monkeypatch, counter_leg=leg2)
+        args.abort_poll_timeout_s = 60.0
+        await btc_mod.taker_phase_abort(args)
+        assert _read_back(args).state is SwapState.ABORTED and leg2.reads == 2 and leg2.broadcasts == []
+
+
+class TestTakerRefundOnBtcRefundsOnlyTheTakersLeg:
+    """#850 PR 9a (F-A on BTC), rewriting the interim pins: the taker's ``--phase refund`` refunds
+    the BTC HTLC and never the covenant, whose CSV refund pays the MAKER and is the maker's to send.
+    The Radiant leg cannot dispense a fee, so no ``--fee-*`` is needed and none is used."""
+
+    async def test_btc_refund_refunds_the_counter_leg_and_not_the_covenant(self, btc_mod, tmp_path, monkeypatch):
+        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
+        built = _wire_btc(btc_mod, monkeypatch)  # a leg that reads no disposition: one refund, no follow
+        await btc_mod.taker_phase_refund(args)  # no --fee-*: it is not needed any more
         assert len(built["counter"].refund_calls) == 1
+        assert built["rxd"].refund_calls == [], "the taker's refund phase spent the maker's covenant"
+        assert built["source"].closed
 
-
-class TestTakerRefundOnBtcIsStillTheMutualUnwind:
-    """#850 interim, BTC: the coordinator is unchanged in this release, so these pin the OLD
-    behaviour on purpose. On BTC the taker's run still sends the covenant refund when the BTC
-    outpoint is unspent at the pre-check (PR 1c refuses only when it is ALREADY spent, above), so
-    the same race stays open until PR 9a. When that lands, the first test here must fail and be
-    rewritten to the ETH shape above."""
-
-    async def test_btc_refund_still_unwinds_both_legs(self, btc_mod, tmp_path, monkeypatch):
+    async def test_btc_refund_cannot_spend_the_covenant_even_with_a_fee_utxo(self, btc_mod, tmp_path, monkeypatch):
         args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
         built = _wire_btc(btc_mod, monkeypatch)
         await btc_mod.taker_phase_refund(_with_fee(args))
-        assert len(built["counter"].refund_calls) == 1
-        assert len(built["rxd"].refund_calls) == 1
-
-    async def test_an_immature_covenant_refuses_BEFORE_the_counter_leg_is_broadcast(
-        self, btc_mod, tmp_path, monkeypatch
-    ):
-        """mutual_refund broadcasts the counter leg FIRST. Calling it while the covenant's CSV is
-        immature refunds the counter leg, fails on the asset, and leaves the record stuck at
-        BOTH_LOCKED — so the shortfall has to be caught before anything is broadcast at all."""
-        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
-        built = _wire_btc(btc_mod, monkeypatch, covenant_confs=119)  # t_rxd is 120
-        with pytest.raises(SystemExit, match="NOT yet mature"):
-            await btc_mod.taker_phase_refund(_with_fee(args))
-        assert built["counter"].refund_calls == [], "nothing may broadcast before the shortfall check"
+        assert isinstance(built["rxd"].fee_source, btc_mod._NoFeeSource)
         assert built["rxd"].refund_calls == []
 
-    async def test_the_refusal_points_at_the_phase_that_still_works(self, btc_mod, tmp_path, monkeypatch):
+    async def test_an_immature_covenant_no_longer_blocks_the_takers_btc_refund(self, btc_mod, tmp_path, monkeypatch):
+        """The covenant's t_rxd gated the old "both legs" unwind; the taker's half needs only t_btc."""
         args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
-        _wire_btc(btc_mod, monkeypatch, covenant_confs=1)
-        with pytest.raises(SystemExit, match="--phase abort"):
-            await btc_mod.taker_phase_refund(_with_fee(args))
+        built = _wire_btc(btc_mod, monkeypatch, covenant_confs=1)
+        await btc_mod.taker_phase_refund(args)
+        assert len(built["counter"].refund_calls) == 1 and built["rxd"].refund_calls == []
 
     async def test_an_unverifiable_covenant_refuses_rather_than_guessing(self, btc_mod, tmp_path, monkeypatch):
         args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
         built = _wire_btc(btc_mod, monkeypatch, covenant_funded=False)
         with pytest.raises(SystemExit, match="cannot tell those apart"):
-            await btc_mod.taker_phase_refund(_with_fee(args))
-        assert built["counter"].refund_calls == []
-
-    async def test_without_a_fee_utxo_it_refuses_up_front_naming_the_flags(self, btc_mod, tmp_path, monkeypatch):
-        args, _terms, _io = _btc_scenario(btc_mod, tmp_path, role="taker", with_funding=True)
-        _wire_btc(btc_mod, monkeypatch)
-        with pytest.raises(SystemExit, match="--fee-txid"):
             await btc_mod.taker_phase_refund(args)
+        assert built["counter"].refund_calls == []
 
 
 class TestTheEthTimeoutIsCheckedTooNotOnlyTheCovenant:
@@ -1483,7 +1619,9 @@ _PERSISTING_PHASES = [
     ("eth_swap_two_host", "maker", "refund", SwapState.BOTH_LOCKED, SwapState.ASSET_REFUNDED_TAKER_ACTS),
     ("btc_swap_two_host", "taker", "claim", SwapState.BTC_LOCKED, SwapState.SECRET_REVEALED),
     ("btc_swap_two_host", "taker", "abort", SwapState.BTC_LOCKED, SwapState.ABORTED),
-    ("btc_swap_two_host", "taker", "refund", SwapState.BOTH_LOCKED, SwapState.MUTUAL_REFUND),
+    # No ("btc_swap_two_host", "taker", "refund") row since #850 PR 9a, as on ETH: the taker's refund
+    # with a leg that reads no disposition sends once and writes nothing; one that reads one is
+    # followed to a written terminal in TestTakerBtcRecoveryFollowsTheChain.
     ("btc_swap_two_host", "maker", "lock-claim", SwapState.BOTH_LOCKED, SwapState.BTC_LOCKED),
     ("btc_swap_two_host", "maker", "refund", SwapState.BOTH_LOCKED, SwapState.ASSET_REFUNDED_TAKER_ACTS),
 ]

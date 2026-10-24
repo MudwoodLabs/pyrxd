@@ -42,6 +42,7 @@ __all__ = [
     "CovenantError",
     "DmintError",
     "FeePoolExhaustedError",
+    "FeeRejected",
     "InsufficientConfirmationsError",
     "InsufficientFundsError",
     "InvalidFundingUtxoError",
@@ -712,6 +713,23 @@ class ServerInconsistencyError(NetworkError):
     A subclass of :class:`NetworkError`, so every existing ``except NetworkError`` handler
     still catches it.
     """
+
+
+class FeeRejected(NetworkError):
+    """A BTC node refused a broadcast because its fee is too low to relay or to replace
+    (#850 PR 9a). ``reason`` is the matched marker from
+    :data:`pyrxd.network.bitcoin.BTC_FEE_REJECTION_MARKERS`, our own string, never the node's text.
+
+    Only this lets the coordinator re-sign our BTC refund at a higher fee: a transport failure
+    (connection refused, a timeout, a 429) must not raise the fee. Deliberately not a
+    :class:`PolicyRejection`: the watchtower treats that as a pre-signed refund made permanently
+    unusable, and a fee that is too low today may relay tomorrow. A subclass of
+    :class:`NetworkError`, so every existing handler still catches it.
+    """
+
+    def __init__(self, *args: Any, reason: str) -> None:
+        super().__init__(*args)
+        self.reason = reason
 
 
 class CovenantError(RxdSdkError):

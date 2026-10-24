@@ -604,6 +604,36 @@ def _plant_disposition_panel(a: str, b: str, _mp) -> int:
     return _refused_as_one_host(build)
 
 
+def _plant_btc_disposition(a: str, b: str, _mp) -> int:
+    """The BTC disposition reader asks each source itself (#850 PR 9a), so it refuses one host twice
+    before reading anything."""
+    import asyncio
+    import concurrent.futures
+    from unittest.mock import AsyncMock
+
+    from pyrxd.btc_wallet import disposition
+    from pyrxd.network.bitcoin import MempoolSpaceFundingReader
+    from pyrxd.security.errors import NetworkError
+    from tests._fake_btc_chain import FakeBtcChain
+
+    chain = FakeBtcChain()
+    readers = [MempoolSpaceFundingReader(base_url=_https(a)), MempoolSpaceFundingReader(base_url=_https(b))]
+    for r in readers:
+        r._http.outspend = AsyncMock(side_effect=NetworkError("offline"))  # no socket is opened
+
+    def build() -> int:
+        # Past the identity check each read fails (offline): counted as two sources. Run
+        # on its own thread, because some callers of this planter already hold a running loop.
+        coro = disposition.read_btc_counter_disposition(
+            readers, chain.locator, hashlock=chain.hashlock, burial_blocks=1, quorum=1
+        )
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            pool.submit(asyncio.run, coro).result()
+        return len(readers)
+
+    return _refused_as_one_host(build)
+
+
 def _plant_build_funding_reader(a: str, b: str, _mp) -> int:
     from pyrxd.gravity.watch import run
 
@@ -806,6 +836,7 @@ PLANTERS: dict[str, Callable] = {
     "scripts.eth_swap_run:_eth_rpc": _plant_eth_swap_run_rpc,
     "scripts.swap_run_verify:_MultiEthFetcher.__init__": _plant_verify_eth_fetcher,
     "pyrxd.eth_wallet.disposition:_panel_of": _plant_disposition_panel,
+    "pyrxd.btc_wallet.disposition:read_btc_counter_disposition": _plant_btc_disposition,
 }
 
 

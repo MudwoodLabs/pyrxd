@@ -75,13 +75,28 @@ def _abandoned(case: AbandonCase, *, note: str = "ab" * 32) -> Callable[[], Swap
     return build
 
 
-def _raw_btc_tx() -> str:
-    """A structurally valid segwit transaction, which ``pending_btc_funding_tx`` requires."""
+def _raw_btc_tx(spends: t.BtcOutpoint | None = None) -> str:
+    """A structurally valid segwit transaction, which ``pending_btc_funding_tx`` requires, spending
+    *spends* (a random outpoint by default)."""
     body = (2).to_bytes(4, "little") + b"\x00\x01\x01"
-    body += t.BtcOutpoint(os.urandom(32).hex(), 0).prevout_bytes() + b"\x00" + (0xFFFFFFFD).to_bytes(4, "little")
+    body += (
+        (spends or t.BtcOutpoint(os.urandom(32).hex(), 0)).prevout_bytes()
+        + b"\x00"
+        + (0xFFFFFFFD).to_bytes(4, "little")
+    )
     body += b"\x01" + (90_000).to_bytes(8, "little") + b"\x01\x51"
     body += b"\x01\x40" + os.urandom(64)
     return (body + (0).to_bytes(4, "little")).hex()
+
+
+def _btc_locked() -> SwapRecord:
+    return _btc_base().with_counter_lock(_locator()).with_state(SwapState.BTC_LOCKED)
+
+
+def _btc_refund_recorded() -> SwapRecord:
+    """A BTC record with our refund recorded (#850 PR 9a): it must spend the locator's outpoint."""
+    record = _btc_locked()
+    return dataclasses.replace(record, counter_refund_raw=_raw_btc_tx(record.counterchain_locator.funding_outpoint))
 
 
 def _with(base: Callable[[], SwapRecord], **fields) -> Callable[[], SwapRecord]:
@@ -158,7 +173,10 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
     "read_without_role": [
         ("read-without-role", _with(_btc_base, role=RecordRole.TAKER, read_without_role=True), ()),
     ],
-    "counter_claim_tx": [("counter-claim-tx", _with(_eth_base, counter_claim_tx="0x" + "c1" * 32), ())],
+    "counter_claim_tx": [
+        ("counter-claim-tx", _with(_eth_base, counter_claim_tx="0x" + "c1" * 32), ()),
+        ("counter-claim-tx-btc", _with(_btc_locked, counter_claim_tx="c1" * 32), ()),
+    ],
     "counter_disposition": [
         (
             f"counter-disposition-{kind}",
@@ -176,6 +194,24 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
             (),
         )
         for kind, tx in (("refunded", "0x" + "d1" * 32), ("claimed", None))
+    ]
+    + [
+        (
+            f"counter-disposition-btc-{kind}",
+            _with(
+                _btc_locked,
+                counter_disposition=CounterDispositionRecord(
+                    kind=kind,
+                    block_number=90,
+                    block_hash="b1" * 32,
+                    tx_hash="d1" * 32,
+                    sources=("source-a.test", "source-b.test"),
+                    single_source=False,
+                ),
+            ),
+            (),
+        )
+        for kind in ("refunded", "claimed")
     ],
     "abort_reason": [
         (f"abort-reason-{r.value}", _with(_btc_base, state=SwapState.ABORTED, abort_reason=r), ())
@@ -220,6 +256,7 @@ SAMPLES: dict[str, list[tuple[str, Callable[[], SwapRecord], tuple]]] = {
         ("push-close-nonce", _with(_eth_base, push_close_tx_hash="0x" + "c7" * 32, push_close_nonce=0), ())
     ],
     "push_signer": [("push-signer", _with(_eth_base, pending_push_nonce=3, push_signer="0x" + "ab" * 20), ())],
+    "counter_refund_raw": [("counter-refund-raw", _btc_refund_recorded, ())],
     "pending_btc_funding_tx": [
         ("pending-btc-fund", lambda: dataclasses.replace(_btc_base(), pending_btc_funding_tx=_raw_btc_tx()), ())
     ],

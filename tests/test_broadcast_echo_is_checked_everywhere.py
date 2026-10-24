@@ -253,7 +253,7 @@ _EXEMPT = {
     # BitcoinCoreBroadcaster (htlc_leg.py) returns the node's reply unchecked.
     ("btc_wallet/htlc_leg.py", "BitcoinTaprootLeg.fund"): "BTC broadcaster",
     ("btc_wallet/htlc_leg.py", "BitcoinTaprootLeg.claim"): "BTC broadcaster",
-    ("btc_wallet/htlc_leg.py", "BitcoinTaprootLeg.refund"): "BTC broadcaster",
+    ("btc_wallet/htlc_leg.py", "BitcoinTaprootLeg.broadcast_refund"): "BTC broadcaster",
     ("gravity/watch/executor.py", "RefundExecutor.execute"): "BtcBroadcaster (isinstance-checked in __init__)",
     # An injected, duck-typed Radiant client. When it is a pyrxd ElectrumX client the funnel
     # checks it; any other client is not checked here.

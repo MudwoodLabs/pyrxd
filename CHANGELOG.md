@@ -8,6 +8,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd.btc_wallet.disposition.read_btc_counter_disposition`: what the chain says about a BTC
+  counter-leg HTLC's funding outpoint, read from every source rather than from what we broadcast
+  (#850 PR 9a, part 1).** It reports `UNSPENT`, `REFUND_PENDING`, `REFUNDED`, `CLAIM_SEEN`,
+  `CLAIMED` or `UNKNOWN` with a reason, and every spender any source named. Nothing in the
+  coordinator calls it yet; `BitcoinTaprootLeg.counter_disposition` wraps it for the leg's own
+  funding reader.
+  - Any one source naming a spender nominates it. Its bytes must hash to the txid it is filed under
+    and spend this outpoint, its witness must spend one of the HTLC's two leaves, and its BIP340
+    signature must verify for that leaf's key over the bytes served; otherwise that source counts
+    as failed. The txid binds only the witness-stripped bytes, so without the signature check one
+    source could serve a buried claim's txid with a refund witness. A 65-byte signature must carry
+    a hash type BIP341 defines. A claim whose signature cannot be checked (more than one input
+    without `ANYONECANPAY`) or does not verify is kept as liveness, because it carries `p`, and is
+    never terminal. "Unspent" needs the quorum saying so.
+  - A spender is classified by the leaf its witness spends, never by txid: the claim leaf with a
+    push that opens the hashlock is a claim, and the refund leaf is a refund (so the watchtower's
+    pre-signed refund is recognised as ours). One txid served with a refund and a claim whose
+    signatures both verify is `UNKNOWN`. A verified refund beside claim witnesses that do not
+    verify stays a refund, so once `p` is public no source can hold our refund off by writing a
+    claim witness over its txid; those claims are still reported. Every claim seen is reported on
+    every answer, `UNKNOWN` included.
+  - A spender is terminal (`REFUNDED` or `CLAIMED`) only when it is buried the given depth at the
+    quorum minimum and the sources that place it in a block agree on that block. Below that a
+    claim is `CLAIM_SEEN` and a refund `REFUND_PENDING`. Two different spenders both buried is
+    `UNKNOWN`.
+  - New reads: `outpoint_spender` and `tx_block` on `MempoolSpaceFundingReader` and
+    `BitcoinCoreFundingReader` (the Core one delegates to
+    `BitcoinCoreRpcSource.get_outpoint_spender`), and `MultiSourceBtcFundingReader.panel()`.
+  - With one source, every answer is marked `single_source`.
+
 - **`pyrxd.eth_wallet.disposition.read_counter_disposition`: what the chain says about an ETH
   counter-leg HTLC, read from the chain rather than from what we broadcast (#850 PR 4).** It
   reports `OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `SETTLED_UNFINAL`, `REFUNDED`, `CLAIMED` or
@@ -82,11 +112,65 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **On a BTC swap, `taker_refund_btc`, `mutual_refund` and `reconcile_counter_leg` follow the chain,
+  not our own refund's broadcast (#850 PR 9a, part 2) [Changed (breaking)].** With a
+  `BitcoinTaprootLeg` (which reads its disposition since part 1), each reads the HTLC funding
+  outpoint first with `read_btc_counter_disposition`, at the policy's `btc_claim_reorg_depth` when
+  measured, else the leg's `min_confirmations`. The record moves only when a refund or a verified
+  claim is buried. Call the step again to follow it; the two-host runner polls for you.
+  - Our refund is written to the record between signing and broadcasting (new
+    `SwapRecord.counter_refund_raw`, hex; `SWAP_RECORD_SCHEMA_VERSION` 10). If that write fails,
+    nothing is sent. A refund that was dropped is re-sent with the same bytes.
+  - A refund that any answering source still holds unmined (the quorum's minimum depth is 0) after
+    `REFUND_REPLACE_AFTER_S` (600 s, chosen, not measured), even one only a single mempool holds, is replaced by BIP125 at twice its fee, or its
+    fee plus 1 sat/vB of the larger of the two transactions if that is more
+    (`BitcoinTaprootLeg.refund_bump_fee`; the doubling is chosen, not measured). A recorded refund
+    that the node has refused for its fee for as long is replaced the same way, priced over the
+    refused one: on reads that show the HTLC unspent, and for a bump refused while the original is
+    still pending. A bump the node took is re-sent unchanged while the sources still show the
+    original: what the sources show never raises the fee. Any other broadcast failure, a transport
+    outage included, re-sends the same bytes (or the same bump over the original) and never raises
+    the fee. A record with no covenant
+    pinned (`--phase abort`) that has seen a claim stays held after the refund is buried; the runner
+    now says so instead of asking for another run.
+  - New `FeeRejected` (a `NetworkError`, not a `PolicyRejection`): `MempoolSpaceBroadcaster` and
+    `BitcoinCoreBroadcaster` raise it when the node's error names a fee refusal
+    (`pyrxd.network.bitcoin.BTC_FEE_REJECTION_MARKERS`); every other failure is unchanged. A bump that
+    would pay more than a tenth of the locked amount, or leave less than the dust limit, is not sent:
+    `CounterLegRefundNeedsOperator` with `cause` `"fee_cap"`. The watchtower's pre-signed refund is
+    followed and bumped the same way, because classification is by leaf.
+  - A claim seen, buried or not, verified or not, is recorded as `counter_claim_tx` (its txid) and
+    nothing is sent. Buried and verified, a taker's or single operator's record goes to
+    `SECRET_REVEALED` from `BTC_LOCKED` or `BOTH_LOCKED`. A buried refund goes to `ABORTED`
+    (`abort_reason` `counter_leg_refunded`) or, from `BOTH_LOCKED`, a taker's to `MUTUAL_REFUND`,
+    held while a recorded claim and an immature `t_rxd` say `p` may be public (D14), as on ETH.
+  - Contradicting sources (`UNKNOWN` with a spender named) raise `CounterLegDispositionUnknown` and
+    send nothing. A terminal answer from one source, or from a reader whose quorum is one, counts
+    only on `bcrt` and `tb` (`CounterLegSingleSourceAnswer` elsewhere).
+  - `mutual_refund` (F-A on BTC): a `TAKER` never sends the covenant refund, on a leg that reads its
+    disposition or not; on one that does not, it refunds the BTC HTLC and stays `BOTH_LOCKED`. A
+    single operator's covenant refund is sent only once the BTC refund is buried. A `MAKER`'s is
+    unchanged. `taker_refund_btc` on a leg that reads its disposition refuses a `MAKER`.
+  - `counter_claim_tx` and `counter_disposition` are allowed on a BTC record, in BTC's shapes (64
+    lower-case hex, no `0x`); a record of one chain refuses the other chain's shape.
+  - `BitcoinTaprootLeg.refund` is now `sign_refund` then `broadcast_refund`, both public; new
+    `taproot.btc_vsize_from_raw`.
+  - `scripts/btc_swap_two_host.py`: the taker's `--phase abort` and `--phase refund` follow our
+    refund until it is buried (`--abort-poll-timeout-s`, default 7200; 0 for one pass), replacing
+    the PR 1c pre-check. A claim seen ends the phase naming `--phase claim` with the claim's bytes.
+    `--phase refund` no longer sends the covenant refund, needs no `--fee-*`, and no longer waits
+    for the covenant's `t_rxd`.
+  - Known interim until #850 PR 9b: the watchtower still reads any spend of the BTC HTLC as a
+    claim, so a taker's own refund on a `BOTH_LOCKED` record is paged as one (a page, never an
+    autonomous broadcast).
+  - Do not drive one record from mixed versions: an older `taker_refund_btc` on a record with a
+    pending v10 refund sends another and advances on its broadcast.
+
 - **On an ETH swap, `taker_refund_btc` no longer moves the record on our own refund's broadcast
   (#850 PR 5b) [Changed (breaking)].** The record stays `BTC_LOCKED` (or `PARAMS_MISMATCH`) until
   the chain shows the counter-leg contract refunded at the finalized block, and only then goes to
-  `ABORTED`. Call `taker_refund_btc` again to follow it. A BTC counter leg is unchanged: it still
-  goes to `ABORTED` on broadcast (#850 PR 9a).
+  `ABORTED`. Call `taker_refund_btc` again to follow it. This entry left a BTC counter leg going to
+  `ABORTED` on broadcast; #850 PR 9a (above) makes it follow the chain too.
   - Our refund's hash and nonce are written to the record between signing and broadcasting, as
     `counter_refund_tx_hash` and `counter_refund_nonce`. If that write fails, nothing is sent.
   - A retry reads what happened to the recorded refund before it sends anything. A refund that
@@ -633,9 +717,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the ETH HTLC, cannot spend the covenant, and no longer needs `--fee-*`; `--phase claim` finds
   the maker's claim in the contract's logs when `maker_claim.json` is absent. The watchtower's
   ETH refund page says the situation does not clear after the taker's refund has run.
-  **The BTC counter leg is unchanged in this release and has the same race** (its claim leaf has
-  no timelock, so a maker can claim while the taker's refund is unconfirmed); fixing it first
-  needs the watchtower to tell the taker's own refund from a maker claim. Found in review of #850.
+  This entry left the BTC counter leg with the same race (its claim leaf has no timelock, so a
+  maker can claim while the taker's refund is unconfirmed). #850 PR 9a (above) makes the BTC
+  refund follow the chain; the watchtower telling the taker's own refund from a maker claim
+  follows in #850 PR 9b. Found in review of #850.
 - **The swap runners no longer overwrite the persisted swap record on every recovery phase (#850,
   PR R).** In `scripts/eth_swap_two_host.py`, and in `scripts/btc_swap_two_host.py` once it began
   keeping a record earlier in this release (see the BTC fund entry below), every phase after

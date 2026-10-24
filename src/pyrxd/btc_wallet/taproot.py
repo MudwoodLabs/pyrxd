@@ -774,6 +774,9 @@ def build_htlc(
 _hash256 = hash256  # Bitcoin SHA-256d, from the one definition in pyrxd.hash
 
 
+_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
+
+
 def taproot_sighash(
     *,
     tx_version: int,
@@ -802,6 +805,11 @@ def taproot_sighash(
     anyonecanpay = bool(hash_type & SIGHASH_ANYONECANPAY)
     if output_type not in (SIGHASH_DEFAULT, SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE):
         raise ValidationError(f"unsupported sighash output type: {hash_type:#x}")
+    # Every amount is serialised as a signed 64-bit int. One outside that range is not a valid
+    # transaction on any chain, and must surface as a ValidationError, not a struct.error that a
+    # caller's handler misses (Mythos review of #850 PR 9a, F1).
+    if any(not _INT64_MIN <= amt <= _INT64_MAX for amt, _spk in (*spent_outputs, *outputs)):
+        raise ValidationError("an amount is outside the signed 64-bit range")
 
     prevouts = b"".join(prevout for prevout, _seq in inputs)
     amounts = b"".join(struct.pack("<q", amt) for amt, _spk in spent_outputs)
@@ -1117,6 +1125,17 @@ def build_refund_tx(
 # ---------------------------------------------------------------------------
 
 
+def btc_vsize_from_raw(raw_tx: bytes) -> int:
+    """BIP141 virtual size of a SEGWIT transaction (#850 PR 9a, the refund's RBF bump): the
+    stripped form is the whole less the marker, flag and witness section. Raises
+    :class:`ValidationError` for a transaction without the segwit marker."""
+    raw = bytes(raw_tx)
+    if raw[4:6] != b"\x00\x01":
+        raise ValidationError("btc_vsize_from_raw needs a segwit transaction (marker and flag)")
+    witness = sum(len(_serialize_witness(stack)) for stack in _iter_witness_stack(raw))
+    return bitcoin_virtual_size(stripped_size=len(raw) - 2 - witness, total_size=len(raw))
+
+
 def btc_txid_from_raw(raw_tx: bytes) -> str:
     """Compute a BTC transaction's canonical txid (big-endian hex) from raw bytes.
 
@@ -1281,6 +1300,10 @@ def btc_spend_fields_from_raw(raw_tx: bytes) -> BtcSpendFields:
     outputs: list[tuple[int, bytes]] = []
     for _ in range(n_out):
         value = int.from_bytes(take(8), "little")
+        if value > _INT64_MAX:
+            # A negative nValue as consensus reads it (a signed 64-bit int): invalid on every chain
+            # (Mythos review of #850 PR 9a, F1). Chain supply caps are the caller's to apply.
+            raise ValidationError("btc_spend_fields_from_raw: output value is negative as a signed 64-bit int")
         slen = take_compact()
         if slen > n:
             raise ValidationError("btc_spend_fields_from_raw: scriptPubKey length out of range")
