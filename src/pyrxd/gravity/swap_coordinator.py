@@ -4900,8 +4900,9 @@ class SwapCoordinator:
           mined at the quorum's depth (its MIN), or placed in a block by a source when too few
           answered, it waits. At a quorum depth of 0 (any answering source holds it unmined, even if
           another says it is mined) for :data:`REFUND_REPLACE_AFTER_S` (counted by this
-          coordinator), it is replaced by BIP125 at a higher fee, priced over our own last bump
-          when that pays more and the node refused it for its fee or took it (each timed from then) (``BitcoinTaprootLeg.refund_bump_fee``), the new bytes recorded
+          coordinator), it is replaced by BIP125 at a higher fee. When our own last bump pays more
+          than what the sources show, it is re-sent unchanged if the node took it, and priced over
+          only once the node has refused it for its fee for :data:`REFUND_REPLACE_AFTER_S` (``BitcoinTaprootLeg.refund_bump_fee``), the new bytes recorded
           before the broadcast. A bump past the leg's cap raises
           :class:`CounterLegRefundNeedsOperator` (``cause`` ``"fee_cap"``) and sends nothing.
         * ``UNSPENT``, or ``UNKNOWN`` with no spender named (a read below quorum): the recorded refund
@@ -4964,26 +4965,38 @@ class SwapCoordinator:
             if waited < REFUND_REPLACE_AFTER_S:
                 logger.info("the BTC refund %s is in the mempool (%.0fs seen); waiting", pending.txid, waited)
                 return self.record
-            # Our last bump, when it pays more than the pending refund the sources show, is the base
-            # for the next one, timed from what became of it (Mythos review of #850 PR 9a, F3, and its
-            # re-review): refused for its fee (FeeRejected), from the refusal; accepted by the node but
-            # not yet seen by the sources, from the acceptance, so a lagging read never replaces it with
-            # a cheaper one. Pricing over the pending original again would re-sign the same refused fee
-            # for ever. A bump that failed any other way keeps the original as the base, so an outage
-            # never ratchets the fee.
+            # Our last bump, when it pays more than the pending refund the sources show (Mythos review
+            # of #850 PR 9a, F3, and two re-reviews). Only a node's refusal for its fee (FeeRejected)
+            # raises the fee over it, REFUND_REPLACE_AFTER_S after the refusal: pricing over the pending
+            # original again would re-sign the same refused fee for ever. A bump the node took while the
+            # sources still show the original is re-sent as it is, never re-priced: what the sources
+            # show must not raise the fee. A bump that failed any other way keeps the original as the
+            # base, so an outage never ratchets the fee either.
             recorded = self.record.counter_refund_raw
             if recorded is not None:
                 ours = bytes.fromhex(recorded)
                 ours_txid = btc_txid_from_raw(ours)
-                refused = self._refund_rejected_since.get(ours_txid)
-                accepted = self._refund_accepted_at.get(ours_txid)
-                if (refused is not None or accepted is not None) and _paid_out(ours) < _paid_out(pending.raw):
-                    what = "refused for its fee" if refused is not None else "accepted but not yet seen"
-                    since_ours = _monotonic() - (refused if refused is not None else accepted)
-                    if since_ours < REFUND_REPLACE_AFTER_S:
-                        logger.info("our BTC refund bump %s was %s %.0fs ago; waiting", ours_txid, what, since_ours)
+                if _paid_out(ours) < _paid_out(pending.raw):
+                    refused = self._refund_rejected_since.get(ours_txid)
+                    if refused is not None:
+                        refused_for = _monotonic() - refused
+                        if refused_for < REFUND_REPLACE_AFTER_S:
+                            logger.info(
+                                "our BTC refund bump %s was refused for its fee %.0fs ago; waiting",
+                                ours_txid,
+                                refused_for,
+                            )
+                            return self.record
+                        return await self._bump_btc_refund(
+                            ours, ours_txid, f"was refused for its fee for {refused_for:.0f}s"
+                        )
+                    if ours_txid in self._refund_accepted_at:
+                        logger.info(
+                            "the node took our BTC refund bump %s; the sources do not show it yet, re-sending it",
+                            ours_txid,
+                        )
+                        await self._rebroadcast_btc_refund(ours, ours_txid)
                         return self.record
-                    return await self._bump_btc_refund(ours, ours_txid, f"was {what} for {since_ours:.0f}s")
             return await self._bump_btc_refund(pending.raw, pending.txid, f"has been in the mempool {waited:.0f}s")
         # UNSPENT, or UNKNOWN with no spender named.
         recorded = self.record.counter_refund_raw
@@ -4992,16 +5005,26 @@ class SwapCoordinator:
             txid = btc_txid_from_raw(raw)
             logger.info("the BTC HTLC reads unspent; broadcasting our recorded refund again")
             try:
-                await self.counter_leg.broadcast_refund(raw)
+                await self._rebroadcast_btc_refund(raw, txid)
             except FeeRejected:
-                since = self._refund_rejected_since.setdefault(txid, _monotonic())
-                waited = _monotonic() - since
+                waited = _monotonic() - self._refund_rejected_since[txid]
                 if waited < REFUND_REPLACE_AFTER_S:
                     raise
-                return await self._bump_btc_refund(raw, txid, f"has failed to broadcast for {waited:.0f}s")
-            self._refund_rejected_since.pop(txid, None)
+                return await self._bump_btc_refund(raw, txid, f"has been refused for its fee for {waited:.0f}s")
             return self.record
         return await self._send_btc_refund(await self.counter_leg.sign_refund(locator, self.record.terms.t_btc))
+
+    async def _rebroadcast_btc_refund(self, raw: bytes, txid: str) -> None:
+        """Broadcast our recorded BTC refund *raw* again, the same bytes, and stamp what the node did
+        with it: a refusal for its fee (``_refund_rejected_since``, kept from the first), or taking it
+        (``_refund_accepted_at``, and the refusal cleared)."""
+        try:
+            await self.counter_leg.broadcast_refund(raw)
+        except FeeRejected:
+            self._refund_rejected_since.setdefault(txid, _monotonic())
+            raise
+        self._refund_rejected_since.pop(txid, None)
+        self._refund_accepted_at.setdefault(txid, _monotonic())
 
     async def _bump_btc_refund(self, raw: bytes, txid: str, why: str) -> SwapRecord:
         """Replace our BTC refund *raw* at a higher fee (``BitcoinTaprootLeg.refund_bump_fee``), the
@@ -5032,7 +5055,7 @@ class SwapCoordinator:
             # When the node first refused it for its fee: the clock a later bump over it waits on.
             self._refund_rejected_since.setdefault(btc_txid_from_raw(bytes(raw)), _monotonic())
             raise
-        self._refund_accepted_at.setdefault(txid, _monotonic())
+        self._refund_accepted_at.setdefault(btc_txid_from_raw(bytes(raw)), _monotonic())
         logger.info("our BTC refund %s is sent; the record moves once it is buried", txid)
         return self.record
 

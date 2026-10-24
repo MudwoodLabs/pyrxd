@@ -127,8 +127,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`BitcoinTaprootLeg.refund_bump_fee`; the doubling is chosen, not measured). A recorded refund
     that the node has refused for its fee for as long is replaced the same way, priced over the
     refused one: on reads that show the HTLC unspent, and for a bump refused while the original is
-    still pending. Any other broadcast failure, a transport outage included, re-sends the same
-    bytes (or the same bump over the original) and never raises the fee. A record with no covenant
+    still pending. A bump the node took is re-sent unchanged while the sources still show the
+    original: what the sources show never raises the fee. Any other broadcast failure, a transport
+    outage included, re-sends the same bytes (or the same bump over the original) and never raises
+    the fee. A record with no covenant
     pinned (`--phase abort`) that has seen a claim stays held after the refund is buried; the runner
     now says so instead of asking for another run.
   - New `FeeRejected` (a `NetworkError`, not a `PolicyRejection`): `MempoolSpaceBroadcaster` and

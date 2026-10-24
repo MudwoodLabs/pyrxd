@@ -339,8 +339,9 @@ async def test_a_refused_bump_escalates_only_on_a_fee_refusal_and_only_after_the
 
 
 async def test_an_accepted_bump_the_sources_do_not_show_yet_is_waited_on_not_replaced(tmp_path, monkeypatch):
-    """Re-review of the Mythos fixes: our node took the bump, the sources still show the original. The
-    next pass must not re-sign a cheaper bump over the original; after the wait it prices over ours."""
+    """Re-reviews of the Mythos fixes: our node took the bump, the sources still show the original.
+    No pass re-signs a cheaper bump over the original, and none raises the fee on what the sources show:
+    the bump is re-sent as it is, however long they lag."""
     s = _Swap(tmp_path)
     clock = [0.0]
     monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
@@ -357,9 +358,11 @@ async def test_an_accepted_bump_the_sources_do_not_show_yet_is_waited_on_not_rep
     clock[0] += 5
     await coord.taker_refund_btc()
     assert s.sent[-1] == bump and bytes.fromhex(s.on_disk().counter_refund_raw) == bump
-    clock[0] += sc.REFUND_REPLACE_AFTER_S
-    await coord.taker_refund_btc()
-    assert _fee(s.sent[-1]) == 2_000 and s.chain.mempool == t.btc_txid_from_raw(s.sent[-1])
+    for _ in range(4):
+        clock[0] += sc.REFUND_REPLACE_AFTER_S + 1
+        await coord.taker_refund_btc()
+    assert {_fee(r) for r in s.sent[1:]} == {1_000}, "what the sources show raised the fee"
+    assert bytes.fromhex(s.on_disk().counter_refund_raw) == bump
 
 
 async def test_a_broadcaster_outage_never_raises_the_fee(tmp_path, monkeypatch):
