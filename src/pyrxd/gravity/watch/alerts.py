@@ -113,8 +113,9 @@ def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
 #: What one swap's page is about, for dedup and ACK: its intent and the decision's ``situation`` tag.
 #: Two decisions with the same intent but a different tag are different situations (#850 PR 9b,
 #: Mythos F1). Severity is not part of it: a situation that once paged CRITICAL stays CRITICAL while it
-#: lasts, so an ``urgent`` flag that flips with a flaky read neither storms pages nor drops an ACK
-#: (re-review of the F3 fix).
+#: lasts, so one ``urgent`` tick keeps it CRITICAL, re-paged, until it is ACKed or changes, and a tick
+#: that reads it less urgent neither pages again nor drops the ACK (re-review of the F3 fix; second
+#: Mythos pass, L1). An ACK lasts until a different situation is delivered for the swap (L2).
 _Situation = tuple[Intent, "str | None"]
 
 
@@ -225,6 +226,10 @@ class DedupAlerter:
         # is retried next tick rather than silently swallowed.
         await self._channel.send(page)
         self._last[swap_id] = (situation, severity)
+        if self._acked.get(swap_id) not in (None, situation):
+            # A different situation was delivered: the ACK ended with the one it was made for, so
+            # that one pages again if it comes back (second Mythos pass, L2).
+            self._acked.pop(swap_id, None)
         self._critical_ticks[swap_id] = 0  # reset the re-page backoff after a successful (re)page
 
 

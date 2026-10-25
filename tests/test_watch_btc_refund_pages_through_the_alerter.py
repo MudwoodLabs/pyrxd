@@ -27,9 +27,11 @@ from pyrxd.gravity.swap_state import SwapState
 from pyrxd.gravity.watch.adapters import OutspendBtcClaimSource
 from pyrxd.gravity.watch.alerts import DedupAlerter, Severity
 from pyrxd.gravity.watch.decide import (
+    SITUATION_BOTH_LOCKED_REFUND_RUNNABLE,
     SITUATION_BTC_DISCOVERY_DISAGREES,
     SITUATION_BTC_REFUND_PENDING,
     SITUATION_BTC_SPENDER_CONTRADICTION,
+    SITUATION_CLAIM_RACE,
     Decision,
     Intent,
     decide,
@@ -95,7 +97,7 @@ async def test_an_ack_of_the_pending_refund_page_does_not_silence_the_claim_that
     w.chain.submit(w.chain.claim_tx(fee_sats=5_000))
     (race,) = await rec.tick()
     assert race.decision.intent is Intent.PAGE_SQUEEZED, race.decision.reason
-    assert race.decision.situation is None, "the claim race carries no refund tag"
+    assert race.decision.situation == SITUATION_CLAIM_RACE, "the claim race carries its own tag"
     assert len(ch.sent) == 2, "the ACK of the refund page silenced the claim race"
     assert alerter.unacked_critical_count() == 1
 
@@ -192,11 +194,17 @@ async def test_a_role_less_record_near_t_rxd_is_urgent_too(tmp_path):
     assert d.intent is Intent.PAGE_REFUND and d.urgent is True and d.autonomous_btc_refund is False
 
 
-async def test_both_locked_refund_due_is_urgent(tmp_path):
+async def test_both_locked_refund_due_is_urgent_once_t_rxd_has_matured(tmp_path):
+    """mutual_refund runs only once both timeouts have elapsed, so the page turns CRITICAL at t_rxd,
+    not at the start of the safety window (second Mythos pass, L4)."""
     w = _Tower(tmp_path, state=SwapState.BOTH_LOCKED)
-    _near(w)
+    _near(w, past=3)
     d = await w.decide()
     assert d.intent is Intent.PAGE_REFUND and d.recommended_action == "mutual_refund" and d.urgent is True
+    assert d.situation == SITUATION_BOTH_LOCKED_REFUND_RUNNABLE and "t_rxd has matured" in d.reason
+    _near(w, past=2)  # one block before t_rxd: due (inside the window) but not runnable
+    early = await w.decide()
+    assert early.intent is Intent.PAGE_REFUND and early.urgent is False and early.situation is None
 
 
 async def test_params_mismatch_matured_near_t_rxd_is_urgent(tmp_path):
@@ -418,7 +426,9 @@ async def test_an_ack_of_an_investigate_page_does_not_silence_the_claim_race(tag
     alerter, ch = _alerter()
     await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="investigate", situation=tag))
     assert alerter.ack(SWAP) is True
-    race = Decision(Intent.PAGE_SQUEEZED, reason="maker revealed p but t_rxd window closing")
+    race = Decision(
+        Intent.PAGE_SQUEEZED, reason="maker revealed p but t_rxd window closing", situation=SITUATION_CLAIM_RACE
+    )
     for _ in range(2):
         await alerter.handle(SWAP, race)
     assert len(ch.sent) == 3 and alerter.unacked_critical_count() == 1
@@ -466,7 +476,8 @@ async def test_one_sources_buried_refund_on_a_makers_record_is_not_its_covenant_
     w.chain.submit(w.chain.refund_tx())
     w.chain.mine(BURIAL)
     d = await w.decide()
-    assert " is buried" not in d.reason, d.reason
+    assert "BTC refund" not in d.reason, d.reason  # not the page for the taker's buried refund
+    assert d.intent is Intent.PAGE_REFUND and "funding is buried" in d.reason, "the maker's own page"
     honest = _corroborated(_Tower(tmp_path / "q2", role=RecordRole.MAKER))
     honest.chain.submit(honest.chain.refund_tx())
     honest.chain.mine(BURIAL)
@@ -487,3 +498,234 @@ async def test_both_locked_with_unevaluable_heights_is_urgent(tmp_path, monkeypa
     d = await w.decide()
     assert "un-evaluable" in d.reason
     assert d.intent is Intent.PAGE_REFUND and d.urgent is True
+
+
+# --------------------------------------------------------------------------- second Mythos pass (29f6f4f)
+
+
+def _critical_page_sites() -> list[tuple[str, int, set[str]]]:
+    """Every ``Decision(<intent>, ...)`` built in the watch package whose intent pages CRITICAL, with
+    its keyword names. The intents come from the alerter's own severity table."""
+    import ast
+    import importlib
+    import pathlib
+
+    from pyrxd.gravity.watch import alerts
+
+    critical = {i.name for i, sev in alerts._SEVERITY.items() if sev is Severity.CRITICAL}
+    assert critical, "the alerter pages nothing CRITICAL?"
+    root = pathlib.Path(importlib.import_module("pyrxd.gravity.watch.decide").__file__).parent
+    sites = []
+    for path in sorted(root.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if name != "Decision":
+                continue
+            intent = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "intent"), None)
+            if isinstance(intent, ast.Attribute) and intent.attr in critical:
+                sites.append((path.name, node.lineno, {k.arg for k in node.keywords if k.arg}))
+    return sites
+
+
+def test_every_critical_page_names_its_situation():
+    """H1: an untagged PAGE_SQUEEZED or PAGE_CLAIM shares one ACK key with every other untagged one,
+    so an ACK of a routine page (a reconcile error) silenced the claim race that followed."""
+    sites = _critical_page_sites()
+    assert len(sites) >= 20, sites  # decide.py and reconciler.py build at least this many today
+    assert {f for f, _, _ in sites} >= {"decide.py", "reconciler.py"}
+    untagged = [(f, line) for f, line, kws in sites if "situation" not in kws]
+    assert untagged == [], f"CRITICAL pages without a situation: {untagged}"
+
+
+class _FlakyObserver:
+    """The production observer, raising while ``fail`` is set (a source that times out)."""
+
+    def __init__(self, inner: ChainObserver) -> None:
+        self._inner = inner
+        self.fail = False
+
+    async def observe(self, swap_id, record):
+        if self.fail:
+            raise RuntimeError("source timed out")
+        return await self._inner.observe(swap_id, record)
+
+
+async def test_an_ack_of_a_reconcile_error_does_not_silence_the_claim_race(tmp_path):
+    w = _Tower(tmp_path)
+    flaky = _FlakyObserver(w.observer)
+    w.observer = flaky
+    alerter, ch = _alerter()
+    rec = w.reconciler(alerter=alerter)
+    flaky.fail = True
+    (err,) = await rec.tick()
+    assert err.decision.intent is Intent.PAGE_SQUEEZED and "reconcile error" in err.decision.reason
+    assert alerter.ack(SWAP) is True
+    flaky.fail = False
+    w.chain.submit(w.chain.claim_tx())
+    _near(w)
+    (race,) = await rec.tick()
+    assert race.decision.intent is Intent.PAGE_SQUEEZED and race.decision.situation == SITUATION_CLAIM_RACE
+    assert len(ch.sent) == 2, "the ACK of the reconcile error silenced the claim race"
+    assert alerter.unacked_critical_count() == 1
+
+
+async def test_an_ack_of_the_claim_race_does_not_silence_a_reconcile_error_then_the_race_again(tmp_path):
+    """The reverse, and L2: after the reconcile error is delivered, the claim race's ACK is over."""
+    w = _Tower(tmp_path)
+    flaky = _FlakyObserver(w.observer)
+    w.observer = flaky
+    w.chain.submit(w.chain.claim_tx())
+    _near(w)
+    alerter, ch = _alerter()
+    rec = w.reconciler(alerter=alerter)
+    await rec.tick()
+    assert alerter.ack(SWAP) is True
+    flaky.fail = True
+    await rec.tick()
+    assert len(ch.sent) == 2, "the ACK of the claim race silenced the reconcile error"
+    flaky.fail = False
+    await rec.tick()
+    assert len(ch.sent) == 3, "the claim race stayed ACKed across a different page"
+    assert alerter.unacked_critical_count() == 1
+
+
+async def test_an_ack_holds_while_the_reconcile_error_repeats(tmp_path):
+    """The honest twin: the same page, ACKed, is not sent again."""
+    w = _Tower(tmp_path)
+    flaky = _FlakyObserver(w.observer)
+    flaky.fail = True
+    w.observer = flaky
+    alerter, ch = _alerter()
+    rec = w.reconciler(alerter=alerter)
+    await rec.tick()
+    assert alerter.ack(SWAP) is True
+    for _ in range(3):
+        await rec.tick()
+    assert len(ch.sent) == 1 and alerter.unacked_critical_count() == 0
+
+
+def _squeeze(tag: str) -> Decision:
+    return Decision(Intent.PAGE_SQUEEZED, reason=tag, situation=tag)
+
+
+async def test_an_ack_ends_once_a_different_situation_is_delivered():
+    """L2: A ACKed, then B, then A again pages A again."""
+    alerter, ch = _alerter()
+    await alerter.handle(SWAP, _squeeze("a"))
+    assert alerter.ack(SWAP) is True
+    await alerter.handle(SWAP, _squeeze("b"))
+    await alerter.handle(SWAP, _squeeze("a"))
+    assert [p.message.split(": ", 1)[1] for p in ch.sent] == ["a", "b", "a"]
+    await alerter.handle(SWAP, _squeeze("a"))
+    assert len(ch.sent) == 4, "A came back un-ACKed but does not re-page"
+    assert alerter.unacked_critical_count() == 1
+
+
+async def test_an_ack_of_one_situation_holds_while_it_lasts():
+    """The honest twin."""
+    alerter, ch = _alerter()
+    await alerter.handle(SWAP, _squeeze("a"))
+    assert alerter.ack(SWAP) is True
+    for _ in range(3):
+        await alerter.handle(SWAP, _squeeze("a"))
+    assert len(ch.sent) == 1 and alerter.unacked_critical_count() == 0
+
+
+async def test_a_makers_record_with_the_takers_refund_pending_still_gets_its_covenant_page(tmp_path):
+    """M1: a WATCH for the taker's pending refund dropped the maker's own covenant refund page."""
+    from pyrxd.gravity.swap_state import RecordRole
+
+    w = _Tower(tmp_path, role=RecordRole.MAKER)
+    w.chain.submit(w.chain.refund_tx())
+    obs = await w.observe()
+    assert obs.btc_disposition is BtcDispositionKind.REFUND_PENDING
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND and "covenant is refundable to you" in d.reason, d.reason
+    b = _Tower(tmp_path / "both", role=RecordRole.MAKER, state=SwapState.BOTH_LOCKED)
+    b.chain.submit(b.chain.refund_tx())
+    _near(b)
+    assert (await b.decide()).intent is Intent.PAGE_REFUND
+
+
+async def test_a_takers_record_with_its_refund_pending_far_from_t_rxd_is_watched(tmp_path):
+    """The honest twin: on the taker's own record the pending refund is still watched."""
+    w = _Tower(tmp_path)
+    w.chain.submit(w.chain.refund_tx())
+    d = await w.decide()
+    assert d.intent is Intent.WATCH and "not yet buried" in d.reason
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH])
+async def test_an_unread_funding_depth_near_t_rxd_pages_critical(tmp_path, state):
+    """M2: with the covenant known and t_rxd near, an unread funding depth was a silent WATCH (and a
+    WARN at PARAMS_MISMATCH)."""
+    w = _Tower(tmp_path, state=state)
+    _near(w)
+    obs = dataclasses.replace(await w.observe(), btc_funding_confirmations=None)
+    d = decide(record=w.record(), observations=obs, policy=_policy(), safety_window_blocks=6)
+    assert d.intent is Intent.PAGE_REFUND and d.urgent is True, d.reason
+    assert d.autonomous_btc_refund is False
+    alerter, ch = _alerter()
+    for _ in range(2):
+        await alerter.handle(SWAP, d)
+    assert [p.severity for p in ch.sent] == [Severity.CRITICAL] * 2
+
+
+async def test_an_unread_funding_depth_far_from_t_rxd_is_not_urgent(tmp_path):
+    """The honest twin: far from t_rxd it waits for the depth, as before."""
+    w = _Tower(tmp_path)
+    obs = dataclasses.replace(await w.observe(), btc_funding_confirmations=None)
+    d = decide(record=w.record(), observations=obs, policy=_policy(), safety_window_blocks=6)
+    assert d.intent is Intent.WATCH, d.reason
+
+
+class _Outcomes:
+    """An executor that reports the given outcomes, one per armed refund, and sends nothing."""
+
+    def __init__(self, *outcomes: ExecOutcome) -> None:
+        self._outcomes = list(outcomes)
+
+    async def execute(self, swap_id, record, decision):
+        return self._outcomes.pop(0) if decision.autonomous_btc_refund else None
+
+
+async def test_a_failed_rebroadcast_after_a_broadcast_pages_again(tmp_path):
+    """M3: the page saying FAILED was deduped behind the first page, which said the tower broadcast."""
+    w = _Tower(tmp_path)
+    alerter, ch = _alerter()
+    rec = w.reconciler(alerter=alerter, executor=_Outcomes(ExecOutcome.BROADCAST, ExecOutcome.FAILED))
+    await rec.tick()
+    await rec.tick()
+    assert len(ch.sent) == 2, "the FAILED page was deduped"
+    assert "FAILED" in ch.sent[1].message and "FAILED" not in ch.sent[0].message
+
+
+async def test_the_same_executor_outcome_pages_once(tmp_path):
+    """The honest twin: a WARN that says the same thing is sent once."""
+    w = _Tower(tmp_path)
+    alerter, ch = _alerter()
+    rec = w.reconciler(alerter=alerter, executor=_Outcomes(*[ExecOutcome.DECLINED] * 3))
+    for _ in range(3):
+        await rec.tick()
+    assert len(ch.sent) == 1
+
+
+async def test_one_sources_buried_refund_beside_a_claim_on_record_still_says_refund_the_btc(tmp_path):
+    """L3: the D14 page read one source's "buried" as buried and dropped "refund the BTC"."""
+    w = _corroborated(_Tower(tmp_path, quorum=1))
+    w.write(dataclasses.replace(w.record(), counter_claim_tx=t.btc_txid_from_raw(w.chain.claim_tx())))
+    w.chain.submit(w.chain.refund_tx())
+    w.chain.mine(BURIAL)
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_CLAIM, d.reason
+    assert "not yet buried" in d.reason and "only one source" in d.reason
+    assert "refund the BTC if it is still unspent" in d.reason
+    h = _corroborated(_Tower(tmp_path / "q2"))
+    h.write(dataclasses.replace(h.record(), counter_claim_tx=t.btc_txid_from_raw(h.chain.claim_tx())))
+    h.chain.submit(h.chain.refund_tx())
+    h.chain.mine(BURIAL)
+    ok = await h.decide()
+    assert ok.intent is Intent.PAGE_CLAIM and " is buried" in ok.reason
+    assert "refund the BTC if" not in ok.reason

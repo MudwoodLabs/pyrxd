@@ -76,10 +76,14 @@ into the same app or receiver changes nothing.
   shipped non-mainnet setup is) marks the page low-corroboration, so the executor sends nothing
   unless `--auto-refund-on-single-source` is set, and one source's "buried" is read as still
   pending: such a tower never sends the `RECONCILE` page, and near t_rxd it pages the refund as
-  unburied. Run the coordinator step yourself once the refund is buried. The page says whether this tick's executor broadcast the refund: an
+  unburied. A `ClaimExecutor` you wire yourself declines on the same low-corroboration mark, so
+  on such a network it never claims the covenant either. Run the coordinator step yourself once the refund is buried. The page says whether this tick's executor broadcast the refund: an
   alert-only or dormant tower says it did not, and the refund is then yours to send. A refund page
   for an unspent HTLC is CRITICAL, re-paged until you ACK it, once t_rxd is within
-  `--safety-window-blocks` or past it (also from BOTH_LOCKED and PARAMS_MISMATCH). The shipped
+  `--safety-window-blocks` or past it (also from PARAMS_MISMATCH; from BOTH_LOCKED only once t_rxd
+  has matured, since `mutual_refund` runs only after both timeouts). So is the page when the
+  funding depth cannot be read (or `t_btc` is not in blocks) with t_rxd that near: the tower cannot
+  tell whether your refund leaf has matured, so read the depth elsewhere. The shipped
   `pyrxd-watchtower` classifies; a third-party claim source without `spend_disposition` keeps the
   earlier rule (paged, never sent).
 - **After a refund.** While a refund of ours is unburied the tower watches silently (the maker can
@@ -147,7 +151,12 @@ pyrxd-watchtower-escalate \
 Acknowledging a CRITICAL page is a one-liner — it is what stops the re-paging *and* the escalation.
 An ACK covers the situation it was paged for. The pending-refund, contradicting-sources and
 discovery-disagreement pages are each their own situation, so the claim race still pages after an ACK
-of one of them; a page that turns less urgent for a tick stays CRITICAL, and stays ACKed:
+of one of them. Every CRITICAL page is its own situation in the same way (the claim race, a reconcile
+error, an unreadable record, and the others), and an ACK ends once the tower delivers a different
+page for that swap, so the earlier one pages again if it comes back. A situation that paged CRITICAL
+once stays CRITICAL, re-paged, until you ACK it, even on a tick that reads it less urgent; the ACK
+holds across such ticks. On an armed refund page the situation includes what the executor did, so a
+re-broadcast that FAILED after one that went out pages again:
 
 ```bash
 echo <swap_id> >> /run/wt/acks

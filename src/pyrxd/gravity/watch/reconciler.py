@@ -28,7 +28,15 @@ from typing import Protocol, runtime_checkable
 
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import SwapRecord
-from pyrxd.gravity.watch.decide import Decision, Intent, LegacyCheck, Observations, decide, decide_legacy
+from pyrxd.gravity.watch.decide import (
+    SITUATION_ARMED_BTC_REFUND,
+    Decision,
+    Intent,
+    LegacyCheck,
+    Observations,
+    decide,
+    decide_legacy,
+)
 from pyrxd.gravity.watch.executor import ExecOutcome, Executor, NullExecutor
 from pyrxd.security.errors import ValidationError
 
@@ -94,6 +102,13 @@ class ReconcileResult:
     legacy: bool = False
 
 
+#: ``Decision.situation`` of the reconciler's own CRITICAL pages (second Mythos pass, H1): an ACK of a
+#: "tower blind" page must not silence the claim race that follows on the same swap, nor the reverse.
+SITUATION_STORE_UNREADABLE = "store_unreadable"
+SITUATION_RECORD_UNREADABLE = "record_unreadable"
+SITUATION_RECONCILE_ERROR = "reconcile_error"
+
+
 def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
     """What this tick's executor did with an armed refund page, appended to the page (#850 PR 9b,
     Mythos F2). ``None`` means no executor acted (the alert-only default)."""
@@ -156,6 +171,7 @@ class Reconciler:
                 Intent.PAGE_SQUEEZED,
                 reason=f"records store unreadable — the tower may be watching NOTHING (investigate): {err}",
                 recommended_action="check the records dir exists/is mounted/readable; manually watch in-flight swaps",
+                situation=SITUATION_STORE_UNREADABLE,
             )
             delivered = await self._safe_handle(_STORE, decision)
             return [ReconcileResult(_STORE, decision, error=err, alert_delivered=delivered)]
@@ -169,6 +185,7 @@ class Reconciler:
                 Intent.PAGE_SQUEEZED,
                 reason=f"swap record {swap_id} is NOT being watched: {why}",
                 recommended_action="read the record with a pyrxd that can, and watch this swap manually until then",
+                situation=SITUATION_RECORD_UNREADABLE,
             )
             delivered = await self._safe_handle(swap_id, decision)
             results.append(ReconcileResult(swap_id, decision, error=why, alert_delivered=delivered))
@@ -239,6 +256,7 @@ class Reconciler:
                     Intent.PAGE_SQUEEZED,
                     reason=f"reconcile error, fail-closed (investigate manually): {err}",
                     recommended_action="investigate",
+                    situation=SITUATION_RECONCILE_ERROR,
                 )
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, error=err, alert_delivered=delivered)
@@ -249,7 +267,13 @@ class Reconciler:
                 if decision.autonomous_btc_refund:
                     # decide() cannot know whether this tower broadcasts; the page says what it did
                     # (#850 PR 9b, Mythos F2), so an alert-only or dormant tower never claims a broadcast.
-                    decision = dataclasses.replace(decision, reason=decision.reason + _executor_outcome_note(executed))
+                    # The situation names the outcome too, so a FAILED broadcast after a BROADCAST is a new
+                    # page, not a deduped repeat of the first (second Mythos pass, M3).
+                    decision = dataclasses.replace(
+                        decision,
+                        reason=decision.reason + _executor_outcome_note(executed),
+                        situation=f"{SITUATION_ARMED_BTC_REFUND}:{executed.value if executed is not None else 'none'}",
+                    )
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, alert_delivered=delivered, executed=executed)
             logger.debug("swap %s: %s (%s)", swap_id, decision.intent.value, decision.reason)
