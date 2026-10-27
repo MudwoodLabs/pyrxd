@@ -669,9 +669,11 @@ def _btc_spend_decision(
         else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
     )
     txid = obs.btc_refund_txid
-    if obs.btc_refund_outvoted:
-        # A refund only a minority of sources hold, beside a quorum that reads the outpoint unspent:
-        # unspent, for every page here (register R12). The refund pages below say so.
+    if obs.btc_refund_outvoted and not _t_rxd_near(record, obs, policy, safety_window_blocks):
+        # A refund only a minority of sources hold, beside a quorum that reads the outpoint unspent: read
+        # as unspent, so the refund page and the pre-signed refund are not stood down (register R12). Only
+        # while t_rxd is not near: there the pending-refund squeeze below is CRITICAL, and reading the
+        # refund as unspent would lower it (at BOTH_LOCKED to a WARN naming a step not yet runnable).
         kind = BtcDispositionKind.UNSPENT
     if kind is BtcDispositionKind.UNKNOWN and obs.btc_spenders_named:
         return Decision(
@@ -772,6 +774,7 @@ def _btc_spend_decision(
                 f"our BTC refund {txid} is still not buried and t_rxd is near or past: once t_rxd matures the "
                 "maker can refund the covenant by its CSV leg AND still claim the BTC by replacing our refund "
                 f"(the claim leaf has no timelock). Get the refund buried now ({obs.btc_disposition_reason}{single})"
+                + _outvoted_note(obs)
             ),
             recommended_action=f"{step}: {_BUMP_HOW}; or bump it from a wallet that holds the refund key",
             deadline_rxd_height=deadline,
@@ -800,7 +803,10 @@ def _both_locked_lock_height_unread(record: SwapRecord, obs: Observations, corr:
     Without the lock height the tower cannot tell where t_rxd is, and a WATCH here held for as long
     as the RXD sources could not read the covenant, past t_rxd too. The BTC funding depth is the clock
     instead, as at BTC_LOCKED: the swap was gated so the BTC refund opens before the covenant refund,
-    so while the BTC refund leaf has provably not matured, t_rxd has not either. Once it has matured,
+    so while the BTC refund leaf has not matured, t_rxd should not be near either. That rests on the
+    gate's nominal wall-clock margin, not on a proof: a slow BTC chain or a funding tx that waited in
+    the mempool can leave t_rxd nearer than the funding depth suggests. The WATCH is no worse than
+    before, and the taker cannot refund the BTC before t_btc anyway. Once it has matured,
     or its maturity cannot be read, this pages, urgent for the taker: the maker may be able to refund
     the covenant and still claim the BTC. A record with no covenant pinned keeps the WATCH (nothing
     says a covenant exists)."""
@@ -814,7 +820,7 @@ def _both_locked_lock_height_unread(record: SwapRecord, obs: Observations, corr:
             reason=(
                 "both legs locked; the covenant's lock height could not be read this tick, but the BTC refund leaf "
                 f"has not matured (funding {obs.btc_funding_confirmations} conf < t_btc {terms.t_btc.value} blocks), "
-                "and the swap was gated so the covenant refund opens after it: t_rxd is not near"
+                "and the swap was gated so the covenant refund opens after it: t_rxd should not be near yet"
             ),
             low_corroboration=corr,
         )
@@ -1128,7 +1134,8 @@ def decide(
             # Urgent once t_rxd has matured: mutual_refund runs only after both timeouts, so a CRITICAL
             # page earlier would name a step the operator cannot run yet (second Mythos pass, L4). From
             # then the maker can refund the covenant and still claim the BTC (Mythos F3). t_btc is not
-            # read here (the observer reads no funding depth at BOTH_LOCKED): the swap was gated so the
+            # read here (the observer reads the funding depth at BOTH_LOCKED only when the lock height
+            # is unread, _both_locked_lock_height_unread): the swap was gated so the
             # BTC refund opens first in wall-clock time, and the page text says to run the step once
             # both have elapsed (third Mythos pass, F7).
             runnable = obs.now_rxd_height >= deadline

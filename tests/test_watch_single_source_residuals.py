@@ -28,6 +28,7 @@ from pyrxd.gravity.swap_state import RecordRole, SwapState
 from pyrxd.gravity.watch.decide import (
     SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD,
     SITUATION_BTC_REFUND_DUE,
+    SITUATION_BTC_REFUND_PENDING,
     SITUATION_CLAIM_RACE,
     SITUATION_MAKER_REFUND_LOCK_HEIGHT_UNREAD,
     Intent,
@@ -68,6 +69,19 @@ async def test_one_stale_refund_beside_a_quorum_of_unspent_neither_disarms_nor_q
     assert d.intent is Intent.PAGE_REFUND, d.reason
     assert d.autonomous_btc_refund is True
     assert d.situation == SITUATION_BTC_REFUND_DUE == honest.situation
+    assert stale in d.reason and "not on the chain" in d.reason
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+async def test_near_t_rxd_a_stale_refund_keeps_the_critical_pending_refund_page(tmp_path, state):
+    """Review F1: read as unspent near t_rxd, the BOTH_LOCKED page fell from the CRITICAL pending-refund
+    squeeze to a WARN naming a step not yet runnable. Near t_rxd the squeeze stays."""
+    w = _Tower(tmp_path, state=state)
+    w.rxd.tip = T_RXD_OPENS - 3
+    w.rxd.cov_confs = w.rxd.tip - LOCKED_AT + 1
+    stale = _stale_refund(w)
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == SITUATION_BTC_REFUND_PENDING, d.reason
     assert stale in d.reason and "not on the chain" in d.reason
 
 

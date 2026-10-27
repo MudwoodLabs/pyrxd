@@ -686,12 +686,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     that was dropped, replaced, or never relayed) made the read `REFUND_PENDING`. The tower then
     watched that refund, armed no pre-signed refund, and paged only near `t_rxd`, naming a refund
     that was on no chain. The read now reports `refund_outvoted`, and the tower (the legacy net
-    too) treats it as unspent: it pages the refund and may arm the pre-signed one. Re-sending our
-    own refund costs nothing.
+    too) treats it as unspent while `t_rxd` is not near: it pages the refund and may arm the
+    pre-signed one. Re-sending our own refund costs nothing. Near `t_rxd` the CRITICAL
+    pending-refund page stays.
   - A `BOTH_LOCKED` BTC swap whose covenant lock height the RXD sources could not read got `WATCH`
     on every tick, past `t_rxd` too. The tower now reads the BTC funding depth there and uses it
-    as the clock, as it does at `BTC_LOCKED`: it watches while the BTC refund leaf has provably not
-    matured, and otherwise pages (urgent for the taker, `both_locked_lock_height_unread`; the
+    as the clock, as it does at `BTC_LOCKED`: it watches while the BTC refund leaf has not matured
+    (the swap's timelock gate opens the BTC refund first, by a nominal wall-clock margin), and otherwise pages (urgent for the taker, `both_locked_lock_height_unread`; the
     maker gets its covenant-refund page). A record with no covenant pinned still watches.
   - The claim page no longer waits on one source under-reporting a claim's depth (see "Changed
     (breaking)").
