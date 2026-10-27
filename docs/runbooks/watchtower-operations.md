@@ -130,9 +130,10 @@ into the same app or receiver changes nothing.
   maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`
   (a maker's record: `reconcile_counter_leg` alone, which only records the claim). The claim scan
   asks every endpoint; a log it counts as a claim that the reader does not count as one (and that no
-  claim on record explains) pages CRITICAL "investigate" on a taker's or no-role record. Once ACKed,
-  that page stays quiet while the log is served, so watch the counter leg's timeout yourself. A claim kept on the record (`counter_claim_tx`) that no read shows this turn
-  pages the covenant claim and the refund, on every turn until your refund is final.
+  claim on record explains) pages CRITICAL "investigate" (a maker's record is told to refund its
+  covenant if no log opens H). Once ACKed, that page stays quiet while the log is served, so watch
+  the counter leg's timeout yourself. A claim kept on the record (`counter_claim_tx`) that no read
+  shows this turn pages the covenant claim and the refund, on every turn until your refund is final.
   Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
   ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the
   timeout; it pays the refundee) and is read again every turn; a claim, or one on record, pages the

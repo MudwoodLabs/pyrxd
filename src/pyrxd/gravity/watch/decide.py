@@ -1606,16 +1606,16 @@ def _decide_eth(
     # count as one that opens H, on an answer that is not UNKNOWN: an endpoint served an odd or forged
     # log. It pages "investigate" rather than a claim race whose WAIT on a transaction that never mines
     # would hold back the refund page (re-review of the fix round, F-B). A record that holds a claim gets
-    # the D14 page, which names it; a maker's record keeps its own refund pages.
+    # the D14 page, which names it; a maker's record is told to check, then refund its covenant.
     if (
         obs.eth_claim_detected
         and not obs.eth_claim_seen
         and not refund_final
-        and record.role is not RecordRole.MAKER
         and obs.eth_disposition in _ETH_CLEAN_UNCLAIMED
         and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED)
     ):
-        if claim_on_record:
+        maker = record.role is RecordRole.MAKER
+        if claim_on_record and not maker:
             return _eth_claim_on_record_page(record, obs, policy)
         return Decision(
             Intent.PAGE_SQUEEZED,
@@ -1626,9 +1626,12 @@ def _decide_eth(
                 + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
             ),
             recommended_action=(
-                "investigate — read the contract's logs on another endpoint; if a Claimed log opens H, p is public: "
-                "claim the covenant before t_rxd (pyrxd swap build-claim); if none does, the counter-leg refund is "
-                "due once its timeout has passed"
+                "investigate — read the contract's logs on another endpoint; if none opens H, refund your covenant "
+                "by its CSV leg at t_rxd (two-host runner: maker --phase refund)"
+                if maker
+                else "investigate — read the contract's logs on another endpoint; if a Claimed log opens H, p is "
+                "public: claim the covenant before t_rxd (pyrxd swap build-claim); if none does, the counter-leg "
+                "refund is due once its timeout has passed"
             ),
             deadline_rxd_height=(
                 None

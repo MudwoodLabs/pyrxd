@@ -133,8 +133,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     taken as `FINAL`. A claim whose finality read fails because the endpoints disagree is paged as a
     claim race with finality un-assessable, where it raised a reconcile error before. A log the scan
     counts as a claim beside a reader answer that found no claim opening H (`OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `EXPIRED_EMPTY_*`) pages `PAGE_SQUEEZED` "investigate" at
-    `BTC_LOCKED` or `BOTH_LOCKED` on a taker's or no-role record with no claim on record, not a claim
-    race.
+    `BTC_LOCKED` or `BOTH_LOCKED` (on a taker's or no-role record that holds a claim, the D14 page),
+    not a claim race.
   - `--eth-rpc-url` on `pyrxd-watchtower` may be repeated: two or more endpoints (distinct operators)
     build a `MultiSourceEthRpc`. With one endpoint every read is single-source: it may page, never
     stops a page, never marks a legacy record, and every ETH page is now marked `low_corroboration`
