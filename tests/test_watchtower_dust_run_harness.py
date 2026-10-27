@@ -238,3 +238,29 @@ def test_state_file_stays_0600_through_record_and_presign(tmp_path):
         == 0
     )
     assert (state_path.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.parametrize("network", ["bc", "bcrt"])
+def test_the_plan_prints_a_command_the_tower_accepts(tmp_path, capsys, network):
+    """Whole-component Mythos pass of the watchtower, F4: ``plan`` printed ``--measured`` with no
+    burial-cost input, and the tower refused to start ("a --measured watchtower must set ...")."""
+    import shlex
+
+    from pyrxd.gravity.watch import run
+
+    state = {"network": network, "refund_spk": _REFUND_SPK_HEX, "btc_sats": 2000, "t_btc_blocks": 1}
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+    args = harness._parse_args(["plan", "--state-file", str(state_file), "--records-dir", str(tmp_path)])
+    assert harness.cmd_plan(args) == 0
+    out = capsys.readouterr().out
+    command = out.split("python scripts/watchtower_run.py \\", 1)[1].split("\n\n", 1)[0]
+    for placeholder, value in (
+        ("<your node host>", "node"),
+        ("<your node container>", "radiant"),
+        ("<measured p10 RXD interval s>", "36"),
+    ):
+        command = command.replace(placeholder, value)
+    argv = shlex.split(command.replace("\\\n", " "))
+    policy = run._policy_from_args(run._parse_args(argv))
+    assert policy is not None

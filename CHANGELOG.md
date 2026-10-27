@@ -667,6 +667,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An ACK written as the watchtower runbook said was dropped (whole-component Mythos pass of the
+  watchtower, F1).** `FileAckInbox.drain` renames the inbox away to read it, so the operator's next
+  `echo ... >> $ACKS` created the file under their umask (0644 or 0664 by default) and the owner-only
+  gate refused it: the page kept firing and escalation followed. The drain now puts an empty 0600
+  inbox back at once (never through a link), and creates a missing one. An append in the instant
+  between the rename and the re-create still lands under the writer's umask and is refused, so the
+  runbook's ACK command is now `(umask 077; echo ... >> $ACKS)`. The gate itself is unchanged.
+- **`DedupAlerter`: an ACK of a page that did not go out (F2, F6).** An ACK written while the page
+  channel was down never took the swap off `unacked_critical_count`, so the second channel fired on
+  an acknowledged page; and a CRITICAL whose first send failed counted toward escalation but could
+  not be ACKed by either form. An undelivered CRITICAL is now an open situation: its own key ACKs
+  it (the tower logs the line to append when the send fails; a bare swap id does not, so one re-run
+  from shell history cannot switch off escalation for a page nobody saw), and an ACKed one does not
+  count. The escalation page now says how to ACK.
+- **`EscalationMonitor`: one blind heartbeat used up the episode's escalation (F3).** A `-1` or
+  missing count escalated at once and set the same edge real escalations use, so with the default
+  `re_escalate_every_s=0` an un-ACKed CRITICAL after it never escalated. The blind page now has its
+  own persisted edge (`blind_fired`, read as false from an older state file); blindness still starts
+  the escalation clock. A state file an earlier version wrote during a blind episode still holds
+  `fired`, so that episode does not escalate again until the count returns to 0.
+- **A page for a record whose file name the ACK inbox cannot carry could never be ACKed (F5).** The
+  records store names a swap by its file stem and accepts any name; a stem with a space, `+`,
+  non-ASCII or more than 128 characters was printed on the `ack:` line and the inbox dropped the line
+  as malformed. Such a page now prints `ack: id-<hash> <key>` (`alerts.ack_id`), which
+  `DedupAlerter.ack` resolves to the swap.
+- **`scripts/watchtower_dust_run.py plan` printed a command the tower refused (F4).** It now adds
+  `--accept-flat-burial` (a dust run) and a placeholder for the measured fast-tail RXD block
+  interval, which a `--measured` tower requires.
 - **`BitcoinCoreRpcSource.get_tx_block_height` failed for every mined transaction on a real
   Bitcoin Core node.** It read a `blockheight` key that Core's `getrawtransaction` does not send,
   so it raised "unconfirmed" whenever the transaction was mined. It now reads the transaction's

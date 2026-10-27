@@ -25,6 +25,7 @@ changes or the swap retires). WARN/INFO intents keep the once-per-situation dedu
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -105,6 +106,20 @@ def _situation_key(intent: Intent, situation: str | None) -> str:
     return intent.value if situation is None else f"{intent.value}:{situation}"
 
 
+#: A swap id the ACK line can carry as it is. The records store names a swap by its file stem and
+#: accepts any name, so a stem outside this (a space, ``+``, non-ASCII, over 128 characters) is
+#: printed on the ``ack:`` line as :func:`ack_id` instead (tower Mythos pass, F5).
+_ACKABLE_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
+
+
+def ack_id(swap_id: str) -> str:
+    """The id the ``ack:`` line names for *swap_id*: the id itself, or ``id-`` and a hash of it
+    when the inbox grammar cannot carry it. :meth:`DedupAlerter.ack` takes either."""
+    if _ACKABLE_ID_RE.match(swap_id) or swap_id == "<records-store>":
+        return swap_id
+    return "id-" + hashlib.sha256(swap_id.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
 def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
     parts = [f"[{severity.value.upper()}] swap {swap_id}: {decision.reason}"]
     if decision.recommended_action:
@@ -114,7 +129,7 @@ def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
     if decision.low_corroboration:
         parts.append("(LOW CORROBORATION — single-source RXD or BTC read; verify before acting)")
     if severity is Severity.CRITICAL:
-        parts.append(f"ack: {swap_id} {_situation_key(decision.intent, decision.situation)}")
+        parts.append(f"ack: {ack_id(swap_id)} {_situation_key(decision.intent, decision.situation)}")
     return " | ".join(parts)
 
 
@@ -206,18 +221,24 @@ class DedupAlerter:
 
     @staticmethod
     def _open_critical(st: _SwapPages) -> list[_Situation]:
-        return [x for x, sev in st.paged.items() if sev is Severity.CRITICAL]
+        # An undelivered CRITICAL is open too: escalation counts it, so the operator the second
+        # channel reaches must be able to ACK it (tower Mythos pass, F6).
+        opened = [x for x, sev in st.paged.items() if sev is Severity.CRITICAL]
+        return opened + [x for x in st.undelivered if x not in opened]
 
     def ack(self, swap_id: str, situation_key: str | None = None) -> bool:
         """Operator acknowledgement of one of a swap's open CRITICAL pages.
 
         With ``situation_key`` (the text after the swap id on the page's ``ack:`` line) it ACKs that
         situation if it is open. A bare swap id ACKs only when the swap has exactly one open, un-ACKed
-        CRITICAL situation and no ACK yet; otherwise the operator may have meant another page, so nothing is
-        recorded and the pages keep firing (third Mythos pass, F2). Returns True if an ACK was
+        CRITICAL situation that was delivered at CRITICAL and no ACK yet; otherwise the operator may have meant another page, so nothing is
+        recorded and the pages keep firing (third Mythos pass, F2). ``swap_id`` may also be the
+        :func:`ack_id` the page printed for a name the inbox cannot carry. Returns True if an ACK was
         recorded.
         """
         st = self._swaps.get(swap_id)
+        if st is None:
+            st = next((v for k, v in self._swaps.items() if ack_id(k) == swap_id), None)
         if st is None:
             return False
         if situation_key is not None:
@@ -226,7 +247,10 @@ class DedupAlerter:
                     st.acked.add(situation)
                     return True
             return False
-        pending = [x for x in self._open_critical(st) if x not in st.acked]
+        # A page that never went out at CRITICAL (new, or a delivered WARN turning urgent) takes only
+        # its own key, logged by the tower when the send failed: a bare id from shell history would
+        # otherwise switch off escalation for a page nobody saw (re-review of the tower Mythos fixes).
+        pending = [x for x in self._open_critical(st) if x not in st.acked and st.paged.get(x) is Severity.CRITICAL]
         if st.acked or len(pending) != 1:
             # A swap with an ACK already: the same bare line appended again (shell history) would
             # otherwise land on a page that opened after it was written (re-review, finding 2a).
@@ -247,11 +271,9 @@ class DedupAlerter:
         means time-critical claim/squeeze pages are outstanding and unacknowledged, so an external
         monitor / second channel can escalate beyond the primary page channel.
         """
-        return sum(
-            1
-            for st in self._swaps.values()
-            if st.undelivered or any(x not in st.acked for x in self._open_critical(st))
-        )
+        # An ACK takes an undelivered page off the count too: one written while the channel is
+        # down otherwise counted until the situation closed (tower Mythos pass, F2).
+        return sum(1 for st in self._swaps.values() if any(x not in st.acked for x in self._open_critical(st)))
 
     async def handle(self, swap_id: str, decision: Decision) -> None:
         if not isinstance(decision, Decision):
@@ -303,14 +325,21 @@ class DedupAlerter:
             low_corroboration=decision.low_corroboration,
         )
         # Send first; record the page only on success so a transient channel failure is retried
-        # next tick rather than silently swallowed, and a page that never went out changes nothing
-        # the escalation count reads.
+        # next tick rather than silently swallowed. A CRITICAL that never went out is kept apart
+        # (``undelivered``) so escalation still counts it.
         try:
             await self._channel.send(page)
         except BaseException:
             if severity is Severity.CRITICAL:  # new, or a WARN escalating: counts while undelivered
                 st.undelivered.add(situation)
                 st.seen[situation] = st.tick
+                logger.error(
+                    "CRITICAL page for swap %r was not delivered; it counts toward escalation until "
+                    "ACKed. To ACK it, append this line to the ACK inbox: %s %s",
+                    swap_id,
+                    ack_id(swap_id),
+                    _situation_key(intent, decision.situation),
+                )
             raise
         st.undelivered.discard(situation)
         st.paged[situation] = severity
@@ -339,14 +368,16 @@ class FileAckInbox:
 
     The operator acknowledges a paged CRITICAL situation by appending the page's ``ack:`` line
     (the swap id and the situation key, one per line) to a file — e.g.
-    ``echo "<swap_id> <key>" >> $WATCHTOWER_ACKS``. A bare swap id still works when it is
+    ``(umask 077; echo "<swap_id> <key>" >> $WATCHTOWER_ACKS)``. A bare swap id still works when it is
     unambiguous (:meth:`DedupAlerter.ack`). The daemon shell drains this inbox once per tick
     (wire it as ``run_loop(on_tick_start=...)``) and calls :meth:`DedupAlerter.ack` for each
     line, so re-paging for that situation stops and the un-ACK'd CRITICAL count drops.
 
     :meth:`drain` is atomic against a concurrent appender: it renames the inbox aside before
-    reading, so ids appended during the read land in a fresh file and are consumed next tick
-    (an ACK is never lost or double-consumed).
+    reading and puts an empty 0600 inbox back at once, so ids appended during the read land in
+    that file and are consumed next tick (an ACK is never double-consumed; one appended in the
+    instant between the rename and the re-create lands in a file made under the writer's umask,
+    which the gate below refuses unless the writer used ``umask 077``).
 
     **This inbox is a control channel, not a log.** An ACK suppresses CRITICAL re-pages and
     zeroes ``unacked_critical_count`` — the external escalation signal — so anyone who can
@@ -382,10 +413,15 @@ class FileAckInbox:
         try:
             os.replace(self._path, tmp)  # atomically claim the current inbox contents
         except FileNotFoundError:
+            self._recreate()
             return []
         except OSError as exc:  # e.g. EACCES/EISDIR on a hostile path — never crash the tick
             logger.error("ACK inbox %s could not be claimed for draining: %s", self._path, exc)
             return []
+        # Put an empty 0600 inbox back at once. Without it the operator's next ``echo ... >>``
+        # created the file under their umask (0644 or 0664 by default), the gate below refused it,
+        # and every ACK written as the runbook says was dropped (tower Mythos pass, F1).
+        self._recreate()
         try:
             content = self._read_checked(tmp)
         finally:
@@ -402,6 +438,19 @@ class FileAckInbox:
                 continue
             ids.append(candidate)
         return ids
+
+    def _recreate(self) -> None:
+        """Create the inbox empty, owner-only, unless something is already there. An append that
+        lands between the claim and this create makes the file under the writer's umask; such a
+        file is refused at the next drain and replaced here, so that ACK is dropped (the page keeps
+        firing) and the next one works. The runbook's ``umask 077`` closes that window."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            os.close(os.open(str(self._path), flags, 0o600))
+        except (FileExistsError, FileNotFoundError):  # already there, or no directory (nothing to fix here)
+            pass
+        except OSError as exc:
+            logger.error("ACK inbox %s could not be recreated (%s) — create it with mode 600", self._path, exc)
 
     def _read_checked(self, tmp: Path) -> str | None:
         """Read the claimed inbox under the mode/owner/size gate. ``None`` = refused."""
