@@ -13,10 +13,12 @@ The invariants are the alert-path contract, checked after every tick:
 * **No silent CRITICAL.** A CRITICAL situation pages on every tick it is live, unless the operator
   ACKed that exact situation while it was open. An ACK of one situation never silences another.
 * **An ACK is honoured.** An ACKed situation does not page again while it stays open.
-* **An ACK binds to a page that was sent.** ``ack`` records nothing for a situation that never paged
-  CRITICAL, and a bare ACK binds only when exactly one CRITICAL situation is open and un-ACKed.
-* **The escalation signal follows.** A CRITICAL decision that was not delivered, or is open and
-  un-ACKed, keeps ``unacked_critical_count`` above zero.
+* **An ACK binds to an open CRITICAL.** A keyed ACK records exactly when its situation is open at
+  CRITICAL, delivered or not (the tower logs the line of an undelivered page). A bare ACK binds only
+  when no ACK is held and exactly one open CRITICAL went out at CRITICAL and is un-ACKed. An ACK held
+  for a page that never went out does not stop that page going out once the channel is back.
+* **The escalation signal follows.** ``unacked_critical_count`` is 1 exactly when an open CRITICAL
+  situation, delivered or not, is un-ACKed.
 * **One source cannot lower a page, but for two known ways.** With at most one faulty source, the
   decision is at least as severe as the one the same tower takes over three honest sources of the
   same chain. The two exceptions this machine found, both left as they are pending a decision:
@@ -174,7 +176,8 @@ class AlertPathMachine(RuleBasedStateMachine):
         self.tick_no = 0
         self.open: dict[str, list] = {}
         self.acked: set[str] = set()
-        self.critical_paged: set[str] = set()  # every key that ever paged CRITICAL
+        self.undelivered: dict[str, int] = {}  # CRITICAL pages that failed to send -> last live tick
+        self.critical_paged: set[str] = set()  # every key that ever paged CRITICAL or was logged undelivered
 
     # ------------------------------------------------------------------ the chain
 
@@ -248,21 +251,24 @@ class AlertPathMachine(RuleBasedStateMachine):
         """The operator appends a page's ``ack:`` line, possibly late or after the page closed."""
         key = data.draw(st.sampled_from(sorted(self.critical_paged)))
         recorded = self.alerter.ack(SWAP, key)
+        open_critical = key in self.undelivered or (key in self.open and self.open[key][1] is Severity.CRITICAL)
+        assert recorded == open_critical, (
+            f"ACK of {key} recorded={recorded} while open CRITICAL={open_critical}"
+            f" (open={self.open}, undelivered={sorted(self.undelivered)})"
+        )
         if recorded:
-            assert key in self.open and self.open[key][1] is Severity.CRITICAL, (
-                f"ACK of {key} recorded while that situation is not open CRITICAL"
-            )
             self.acked.add(key)
             event("keyed ACK recorded")
         self._maybe_tick(then_tick)
 
     @rule(then_tick=st.booleans())
     def ack_bare(self, then_tick: bool) -> None:
-        """A bare swap id binds only when exactly one CRITICAL situation is open and un-ACKed."""
+        """A bare swap id binds only when no ACK is held and exactly one delivered CRITICAL is un-ACKed."""
         pending = [k for k, (_, sev) in self.open.items() if sev is Severity.CRITICAL and k not in self.acked]
         recorded = self.alerter.ack(SWAP)
+        expected = not self.acked and len(pending) == 1
+        assert recorded == expected, f"a bare ACK recorded={recorded} with ACKed={self.acked} pending={pending}"
         if recorded:
-            assert not self.acked and len(pending) == 1, f"a bare ACK bound with ACKed={self.acked} pending={pending}"
             self.acked.add(pending[0])
             event("bare ACK recorded")
         self._maybe_tick(then_tick)
@@ -285,8 +291,21 @@ class AlertPathMachine(RuleBasedStateMachine):
         self.tick_no += 1
         for k in [k for k, (last, _) in self.open.items() if self.tick_no - last > HOLD]:
             del self.open[k]
-            self.acked.discard(k)
+        for k in [k for k, last in self.undelivered.items() if self.tick_no - last > HOLD]:
+            del self.undelivered[k]
+        self.acked &= set(self.open) | set(self.undelivered)
         self._check_sources(decision)
+        self._tick_pages(decision, sent)
+        unacked = [
+            k
+            for k in set(self.undelivered) | {k for k, (_, sev) in self.open.items() if sev is Severity.CRITICAL}
+            if k not in self.acked
+        ]
+        assert self.alerter.unacked_critical_count() == (1 if unacked else 0), (
+            f"escalation count {self.alerter.unacked_critical_count()} with un-ACKed open CRITICAL {sorted(unacked)}"
+        )
+
+    def _tick_pages(self, decision: Decision, sent: list) -> None:
         sev = _severity(decision)
         if sev is None:
             assert not sent, f"a quiet decision paged: {sent}"
@@ -295,7 +314,9 @@ class AlertPathMachine(RuleBasedStateMachine):
         assert all(p.swap_id == SWAP for p in sent)
         was = self.open.get(key)
         effective = Severity.CRITICAL if (was is not None and was[1] is Severity.CRITICAL) else sev
-        if was is None:
+        # A page that never went out at this severity goes out, ACKed or not; an open one re-pages
+        # only at CRITICAL and only un-ACKed.
+        if was is None or (effective is Severity.CRITICAL and was[1] is not Severity.CRITICAL):
             expect_page = True
         elif effective is Severity.CRITICAL:
             expect_page = key not in self.acked
@@ -303,13 +324,18 @@ class AlertPathMachine(RuleBasedStateMachine):
             expect_page = False
         if not self.channel.up:
             assert not sent
-            if effective is Severity.CRITICAL and key not in self.acked:
-                assert self.alerter.unacked_critical_count() >= 1, (
-                    f"undelivered CRITICAL {key} is not counted for escalation"
-                )
             if was is not None:
                 was[0] = self.tick_no
+                if key in self.undelivered:
+                    self.undelivered[key] = self.tick_no
+            if expect_page and effective is Severity.CRITICAL:
+                self.undelivered[key] = self.tick_no
+                self.critical_paged.add(key)
             return
+        if expect_page:
+            self.undelivered.pop(key, None)
+        elif key in self.undelivered:
+            self.undelivered[key] = self.tick_no
         if expect_page:
             assert len(sent) == 1, f"{key} ({effective.value}) did not page; ACKed={sorted(self.acked)}"
             assert sent[0].severity is effective
@@ -320,8 +346,6 @@ class AlertPathMachine(RuleBasedStateMachine):
         else:
             assert not sent, f"{key} paged again while open ({'ACKed' if key in self.acked else effective.value})"
         self.open[key] = [self.tick_no, effective]
-        if effective is Severity.CRITICAL and key not in self.acked:
-            assert self.alerter.unacked_critical_count() >= 1
 
     def _check_sources(self, decision: Decision) -> None:
         healthy = self.faults.count("ok")
