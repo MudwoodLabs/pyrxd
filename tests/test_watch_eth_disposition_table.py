@@ -504,6 +504,35 @@ def test_one_odd_log_on_a_makers_mismatched_record_keeps_the_covenant_refund():
     assert "does not count as a claim" in d.reason
 
 
+@pytest.mark.parametrize(
+    "kw",
+    [
+        # p is public: the reader saw a Claimed log that opens H.
+        {"eth_claim_seen": True},
+        # The record kept a claim: the gated exit names it, whatever this tick's odd log.
+        {},
+    ],
+)
+def test_a_credible_claim_after_a_params_mismatch_is_not_set_aside(kw):
+    """F2's carve-out sets aside only a scan hit nothing else backs: a claim the reader saw, or one
+    on the record, still pages the gated exit."""
+    rec = _record(SwapState.PARAMS_MISMATCH, **({} if kw else {"counter_claim_tx": "0x" + "c1" * 32}))
+    d = _d(rec, _obs(eth_claim_detected=True, eth_disposition=DispositionKind.F_EXPIRED, **kw))
+    assert d.situation == decide_mod.SITUATION_ETH_CLAIMED_AFTER_MISMATCH
+
+
+async def test_any_final_claim_verdict_wins_whatever_the_read_order(tmp_path):
+    """F1: over several unverified claims, a FINAL verdict (which needs the endpoints to agree on its
+    receipt) wins even when a "not yet final" one is read first."""
+    w = _EthTower(tmp_path)
+    claim = w.chain.claim(CLAIM_BLOCK)
+    fake = "0x" + "fa" * 32
+    best = await w.observer._eth_best_verdict([fake, claim])
+    assert best is not None and best.state is CounterClaimState.FINAL
+    only_fake = await w.observer._eth_best_verdict([fake])
+    assert only_fake is not None and only_fake.state is CounterClaimState.NOT_YET_FINAL_LIVE
+
+
 async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):
     """One endpoint that fails drops out of the scan; the primary failing still raises (the reconciler
     pages a decision-required), as before the union."""
