@@ -138,9 +138,10 @@ into the same app or receiver changes nothing.
   shows this turn pages the covenant claim, on every turn until your refund is final; its text also
   says to refund the ETH leg once its timeout passes, but once ACKed the refund coming due does not
   page again, so watch that timeout yourself. One endpoint can add a page (an "investigate" page, or a
-  fail-closed claim race when it withholds a claim's receipt), but it does not choose which claim's
-  finality is read: with no claim verified, every claim an endpoint served is read, and any final one
-  counts. It cannot stop a page or mark a legacy record.
+  fail-closed claim race when it withholds a claim's receipt or serves a log on a transaction no
+  endpoint holds), but it cannot stop a page or mark a legacy record. A claim's finality counts only
+  for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
+  contract's `Claimed` event that opens H.
   Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
   ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the
   timeout; it pays the refundee) and is read again every turn; a claim, or one on record, pages the

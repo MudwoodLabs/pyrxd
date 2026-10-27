@@ -38,9 +38,9 @@ from pyrxd.gravity.watch.reconciler import Observer
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight, Confirmations, Seconds
 
-#: At most this many unverified ETH claims have their verdict read per tick. The most-nominated are
-#: read first, so a liar that serves many fake logs (one nomination each) cannot push the claim the
-#: other endpoints serve past the cap.
+#: At most this many unverified ETH claims are checked per tick, the most-nominated first. A liar that
+#: pushes the real claim past the cap (with two endpoints every nomination ties) gets a fail-closed
+#: page, not a silence: what it served in its place is either held by no endpoint or no claim.
 _MAX_ETH_VERDICT_READS = 8
 
 __all__ = [
@@ -446,7 +446,7 @@ class ChainObserver(Observer):
                 ranked = sorted(claims, key=lambda c: -len(c.nominated_by))
                 candidates = list(dict.fromkeys([c.tx_hash for c in ranked] + ([scanned] if scanned else [])))
                 if candidates:
-                    finality = await self._eth_best_verdict(candidates[:_MAX_ETH_VERDICT_READS])
+                    finality = await self._eth_best_verdict(locator, candidates[:_MAX_ETH_VERDICT_READS])
                     if finality is None or finality.state is CounterClaimState.FINAL:
                         state = None if finality is None else finality.state
                         return {"eth_claim_detected": True, "eth_claim_finality": state, **fields}
@@ -472,18 +472,32 @@ class ChainObserver(Observer):
         verdict = await self._upgrade_eth_stall(swap_id, verdict)
         return {"eth_claim_detected": True, "eth_claim_finality": verdict.state, **fields}
 
-    async def _eth_best_verdict(self, claim_txs: list[str]) -> CounterClaimFinality | None:
-        """The verdict over several candidate claims, none of them verified: FINAL if any one reads FINAL
-        (a verdict needs the endpoints to agree on its receipt, so one endpoint cannot make it), else
-        ``None`` if any one's read failed (finality un-assessable, which pages fail-closed), else NOT
-        YET FINAL. The order of ``claim_txs`` decides nothing but which reads run first."""
+    async def _eth_best_verdict(self, locator: EthHtlcLocator, claim_txs: list[str]) -> CounterClaimFinality | None:
+        """The verdict over several candidate claims, none of them verified: FINAL if any one is a claim
+        of this contract (its receipt, logs included, agreed by every endpoint, carries our ``Claimed``
+        event that opens H) and reads FINAL; else ``None`` (finality un-assessable, which pages
+        fail-closed) if any read failed or any candidate is a log on a transaction no endpoint holds;
+        else NOT YET FINAL. A candidate whose agreed receipt is not such a claim counts for nothing.
+
+        One endpoint's log therefore neither picks the verdict nor makes one: a decoy on a transaction
+        nobody holds is a lie to page on, never "not yet final" (Mythos F1 and the re-review's N1), and
+        a log naming some other final transaction is no claim (N2). The order of ``claim_txs`` only
+        decides which reads run first."""
         eth = self._eth
         if eth is None:
             raise ValidationError("ChainObserver has no EthChainSource for an ETH swap")
+        is_claim = getattr(eth, "claim_receipt_opens_h", None)
         failed = False
         best: CounterClaimFinality | None = None
         for tx in claim_txs:
             try:
+                if callable(is_claim):
+                    opens = await is_claim(locator, tx)
+                    if opens is None:
+                        failed = True  # served as a log, held by no endpoint
+                        continue
+                    if not opens:
+                        continue
                 verdict = await eth.claim_finality_verdict(tx)
             except NetworkError:
                 failed = True

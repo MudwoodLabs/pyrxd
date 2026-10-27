@@ -18,6 +18,9 @@ The tower is ALERT-ONLY: these reads hold no key, sign nothing, and never read t
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+
 import pytest
 
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
@@ -34,6 +37,9 @@ _CONTRACT = "0x" + "ab" * 20
 _DEPLOY = "0x" + "cd" * 32
 _CLAIM_HASH = "0x" + "12" * 32
 _OTHER_HASH = "0x" + "99" * 32
+#: The preimage the fake claim reveals; :func:`_claim_record` locks the contract to its hash, so the fake
+#: receipt is a claim of this contract that opens H (the observer checks that before a verdict counts).
+_P = b"\x5a" * 32
 
 
 # ─────────────────────────────────────────────────────────── fakes ──
@@ -86,7 +92,8 @@ class _FakeEthRpc:
         return list(self._logs)
 
     def _receipt(self) -> dict:
-        r: dict = {"status": self._status, "blockNumber": self._block}
+        claimed = {"address": _CONTRACT, "topics": [CLAIMED_TOPIC0], "data": "0x" + _P.hex()}
+        r: dict = {"status": self._status, "blockNumber": self._block, "logs": [claimed]}
         if self._bh is not None:
             r["blockHash"] = self._bh
         return r
@@ -177,6 +184,13 @@ def _log(topic0: str | None, tx_hash: object = _CLAIM_HASH) -> dict:
     if topic0 is not None:
         log["topics"] = [topic0]
     return log
+
+
+def _claim_record(state: SwapState):
+    """``_eth_record`` with its contract locked to ``sha256(_P)``, so the fake receipt's claim opens H."""
+    rec = _eth_record(state=state)
+    locator = dataclasses.replace(rec.counterchain_locator, hashlock="0x" + hashlib.sha256(_P).hexdigest())
+    return dataclasses.replace(rec, counterchain_locator=locator)
 
 
 # ───────────────────────────────────────────────────── pinned selectors ──
@@ -389,7 +403,7 @@ async def test_real_adapter_through_chain_observer_final_pages_claim():
     # FINAL ETH counter-leg, observed at a safe RXD window, must PAGE_CLAIM (mirrors the FakeEth
     # routing test, but through the production adapter wiring).
     fake = _FakeEthRpc(deploy_block=10, logs=[_log(CLAIMED_TOPIC0, _CLAIM_HASH)], block=100, finalized=120)
-    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    rec = _claim_record(SwapState.SECRET_REVEALED)
     obs = await ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=150, cov_confs=51)).observe("s", rec)
     assert obs.eth_claim_detected is True
     assert obs.eth_claim_finality is CounterClaimState.FINAL
@@ -401,7 +415,7 @@ async def test_real_adapter_through_chain_observer_final_pages_claim():
 
 async def test_real_adapter_through_chain_observer_not_final_waits():
     fake = _FakeEthRpc(deploy_block=10, logs=[_log(CLAIMED_TOPIC0, _CLAIM_HASH)], block=100, finalized=0)
-    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    rec = _claim_record(SwapState.SECRET_REVEALED)
     obs = await ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=150, cov_confs=51)).observe("s", rec)
     assert obs.eth_claim_detected is True
     assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
@@ -443,7 +457,7 @@ async def test_real_adapter_sustained_stall_upgrades_to_not_finalizing_across_ti
     # NOT_YET_FINAL_LIVE every tick and only the across-time stall can upgrade it.
     fake = _FakeEthRpc(deploy_block=10, logs=[_log(CLAIMED_TOPIC0, _CLAIM_HASH)], block=100, finalized=50, head=60)
     observer = ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=150, cov_confs=51))
-    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    rec = _claim_record(SwapState.SECRET_REVEALED)
 
     obs = await observer.observe("s", rec)  # establish the frozen-finalized run (gap 10, head 60)
     assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE

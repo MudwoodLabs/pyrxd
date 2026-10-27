@@ -130,11 +130,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     no-role record at `BTC_LOCKED` or `BOTH_LOCKED`, a claim the record kept (`counter_claim_tx`) that
     this tick's reads do not show pages the covenant claim, its text also naming the refund (D14, as
     on the BTC branch), even when one endpoint makes the read return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
-    taken as `FINAL`. With no claim verified, the finality verdict is read for every claim an endpoint
-    served (the most-nominated first, at most 8) and the scan's, not for the first log the scan met:
-    `FINAL` if any reads final, un-assessable if any read fails; before, a primary serving a fake
-    `Claimed` log held a final claim at "not yet final" and the tower watched until the window
-    squeezed (Mythos F1; on `main` the scan read the primary alone). A claim race whose gate waits,
+    taken as `FINAL`. With no claim verified, every claim an endpoint served (the most-nominated
+    first, at most 8) and the scan's are checked, not the first log the scan met: a candidate counts
+    only when every endpoint returns the same receipt, logs included, carrying this contract's
+    `Claimed` event that opens H; then `FINAL` if any reads final. A log on a transaction no endpoint
+    holds, or a failed read, makes finality un-assessable (a fail-closed page). Before, a primary
+    serving a fake `Claimed` log held a final claim at "not yet final" and the tower watched until
+    the window squeezed (Mythos F1; on `main` the scan read the primary alone). A claim race whose gate waits,
     beside a contract the reader finds settled at the finalized block, pages the reader's
     contradiction instead of watching. A claim whose finality read fails because the endpoints
     disagree is paged as a claim race with finality un-assessable, where it raised a reconcile error

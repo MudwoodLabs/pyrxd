@@ -42,6 +42,7 @@ Two reads back the port:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -181,6 +182,40 @@ class RpcEthChainSource:
                 if status.claimed and canonical is wanted_canonical:
                     return status
         return EthClaimStatus(claimed=False)
+
+    async def claim_receipt_opens_h(self, locator: EthHtlcLocator, claim_tx_hash: str) -> bool | None:
+        """Whether *claim_tx_hash* is a claim of this contract, read on EVERY endpoint (#850 PR 10, the
+        re-review of Mythos F1): ``True`` when every endpoint returns the same receipt (status, block
+        and logs, normalised) and it is a success carrying OUR contract's ``Claimed`` event whose data
+        opens H; ``False`` when they agree on a receipt that does not; ``None`` when every endpoint
+        agrees there is no receipt. Raises :class:`NetworkError` when one fails or they disagree.
+
+        A finality verdict says only where a transaction is, not what it did, and
+        ``MultiSourceEthRpc.get_transaction_receipt`` leaves the logs out of its agreement, so the
+        claim itself is checked here before a candidate's verdict may count."""
+        from pyrxd.eth_wallet.htlc_leg import _addr, _b, _receipt_facts
+
+        endpoints = self._rpc.sources if isinstance(self._rpc, MultiSourceEthRpc) else [self._rpc]
+        facts = []
+        for endpoint in endpoints:
+            facts.append(_receipt_facts(await endpoint.get_transaction_receipt(claim_tx_hash)))
+        if any(f != facts[0] for f in facts[1:]):
+            raise NetworkError(f"receipt({claim_tx_hash}): endpoints disagree")
+        agreed = facts[0]
+        if agreed is None:
+            return None
+        status, _block_hash, _block_number, logs = agreed
+        if status != 1:
+            return False
+        contract, topic0, hashlock = _addr(locator.contract_address), _b(CLAIMED_TOPIC0), locator.hashlock_bytes
+        return any(
+            address == contract
+            and topics
+            and topics[0] == topic0
+            and len(data) == 32
+            and hashlib.sha256(data).digest() == hashlock
+            for address, topics, data in logs
+        )
 
     async def finality_checkpoint(self) -> tuple[int, int]:
         """The current ``(head_block, finalized_block)`` checkpoint — the across-time stall input.

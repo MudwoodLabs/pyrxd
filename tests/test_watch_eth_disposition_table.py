@@ -28,7 +28,7 @@ from pyrxd.eth_wallet.disposition import DispositionKind
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.gravity.eth_counter_disposition import eth_counter_disposition_kwargs
-from pyrxd.gravity.finality import CounterClaimState
+from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.swap_state import (
     AbortReason,
     CounterDispositionRecord,
@@ -384,23 +384,25 @@ async def test_a_lying_primarys_fake_claim_cannot_hold_a_final_claim_in_watch(tm
     assert [s for s, _ in w.pages.got] == [SWAP]
 
 
-async def test_a_lying_primarys_fake_claim_beside_an_honest_pending_claim_still_waits(tmp_path):
-    """The honest twin: the primary serves the fake log but not the withheld receipt, and the real claim
-    is mined but not yet final. Every claim read is "not yet final", so the tower WATCHes for the
-    finalized checkpoint, as it should. (A primary that also withholds the real receipt makes the read
-    fail, and the claim race pages fail-closed: one endpoint may add a page, never stop one.)"""
-    w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True}, {}, {}])
+async def test_a_pending_claim_waits_and_a_decoy_beside_it_pages(tmp_path):
+    """The honest twin: the real claim is mined but not yet final and every endpoint is honest, so the
+    tower WATCHes for the finalized checkpoint, then sees it FINAL. A primary that adds a decoy (a
+    Claimed log on a transaction no endpoint holds) beside it makes the claim race page fail-closed:
+    one endpoint may add a page, never stop one or pick the verdict."""
+    w = _EthTower(tmp_path)
     w.chain.finalized = CLAIM_BLOCK - 5
-    claim = w.chain.claim(CLAIM_BLOCK)
-    w.endpoints[0].extra_logs = (_fake_claim_log(w.chain.preimage),)
+    w.chain.claim(CLAIM_BLOCK)
     obs = await w.observe()
     assert obs.eth_claim_detected is True
     assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
     assert (await w.decide()).intent is Intent.WATCH
-    # Once it is final, the fake log beside it does not hold it back.
+    w.endpoints[0].extra_logs = (_fake_claim_log(w.chain.preimage),)
+    assert (await w.observe()).eth_claim_finality is None
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE
+    # Once the real claim is final, the decoy beside it does not hold it back.
     w.chain.finalized = CLAIM_BLOCK
     assert (await w.observe()).eth_claim_finality is CounterClaimState.FINAL
-    del claim
 
 
 async def test_many_fake_claims_from_one_endpoint_cannot_crowd_out_the_real_one(tmp_path):
@@ -521,16 +523,95 @@ def test_a_credible_claim_after_a_params_mismatch_is_not_set_aside(kw):
     assert d.situation == decide_mod.SITUATION_ETH_CLAIMED_AFTER_MISMATCH
 
 
-async def test_any_final_claim_verdict_wins_whatever_the_read_order(tmp_path):
-    """F1: over several unverified claims, a FINAL verdict (which needs the endpoints to agree on its
-    receipt) wins even when a "not yet final" one is read first."""
+async def test_the_best_verdict_counts_only_claims_and_any_final_one_wins(tmp_path, monkeypatch):
+    """F1: over several unverified candidates, a claim that reads FINAL wins even when one that reads
+    "not yet final" comes first; a transaction no endpoint holds makes it un-assessable; a receipt that
+    is no claim of this contract counts for nothing."""
+    w = _EthTower(tmp_path)
+    eth = w.observer._eth
+    kinds = {"pending": True, "final": True, "ghost": None, "other": False}
+    states = {"pending": CounterClaimState.NOT_YET_FINAL_LIVE, "final": CounterClaimState.FINAL}
+
+    async def _is_claim(_locator, tx):
+        return kinds[tx]
+
+    async def _verdict(tx):
+        return CounterClaimFinality(state=states[tx])
+
+    monkeypatch.setattr(eth, "claim_receipt_opens_h", _is_claim)
+    monkeypatch.setattr(eth, "claim_finality_verdict", _verdict)
+    loc = w.chain.locator()
+    best = w.observer._eth_best_verdict
+    assert (await best(loc, ["pending", "final"])).state is CounterClaimState.FINAL
+    assert (await best(loc, ["pending", "other"])).state is CounterClaimState.NOT_YET_FINAL_LIVE
+    assert await best(loc, ["pending", "ghost"]) is None
+    assert (await best(loc, ["ghost", "final"])).state is CounterClaimState.FINAL
+    assert await best(loc, ["other"]) is None
+
+
+async def test_the_claim_check_reads_every_endpoints_receipt_logs_included(tmp_path):
+    """``claim_receipt_opens_h`` (N2): the real claim is one; the deploy transaction, final and
+    agreed, is not; a hash no endpoint holds is ``None``; and an endpoint that forges the receipt's logs
+    makes the read raise, since the multi-source receipt read leaves logs out of its agreement."""
     w = _EthTower(tmp_path)
     claim = w.chain.claim(CLAIM_BLOCK)
-    fake = "0x" + "fa" * 32
-    best = await w.observer._eth_best_verdict([fake, claim])
-    assert best is not None and best.state is CounterClaimState.FINAL
-    only_fake = await w.observer._eth_best_verdict([fake])
-    assert only_fake is not None and only_fake.state is CounterClaimState.NOT_YET_FINAL_LIVE
+    eth, loc = w.observer._eth, w.chain.locator()
+    assert await eth.claim_receipt_opens_h(loc, claim) is True
+    assert await eth.claim_receipt_opens_h(loc, w.chain.deploy_tx) is False
+    assert await eth.claim_receipt_opens_h(loc, "0x" + "fa" * 32) is None
+    honest = w.endpoints[1].get_transaction_receipt
+
+    async def _forged(tx):
+        r = await honest(tx)
+        return r if r is None else {**r, "logs": []}
+
+    w.endpoints[1].get_transaction_receipt = _forged
+    with pytest.raises(NetworkError):
+        await eth.claim_receipt_opens_h(loc, claim)
+
+
+@pytest.mark.parametrize("endpoints", [2, 3])
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+async def test_a_lying_primary_that_breaks_the_read_and_serves_a_decoy_cannot_hold_a_final_claim(
+    tmp_path, endpoints, state
+):
+    """Re-review N1: the primary also reads the contract unsettled at every block, so the reader stops
+    at UNKNOWN before it collects any claim, and the only candidate is the scan's first log: the
+    primary's decoy, whose transaction no endpoint has. That is not "not yet final"."""
+    kw: list[dict] = [{"hide_claimed": True}] + [{} for _ in range(endpoints - 1)]
+    w = _EthTower(tmp_path, state=state, endpoint_kw=kw)
+    claim = w.chain.claim(CLAIM_BLOCK)
+    liar = w.endpoints[0]
+    liar.extra_logs = (_fake_claim_log(w.chain.preimage),)
+    liar.hide_receipts = (claim,)
+
+    async def _unsettled(address, slot, block_identifier):
+        return bytes(32)
+
+    liar.get_storage_at = _unsettled
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
+    d = await w.decide()
+    assert d.intent is not Intent.WATCH, d
+    assert d.situation == decide_mod.SITUATION_CLAIM_RACE
+
+
+@pytest.mark.parametrize("liar", [0, 1, 2])
+async def test_a_decoy_on_a_real_final_transaction_does_not_make_an_unfinal_claim_final(tmp_path, liar):
+    """Re-review N2: one endpoint serves a Claimed log on the deploy transaction (real, final, and
+    holding no Claimed event). Its verdict must not count: the claim that opens H is not yet final."""
+    w = _EthTower(tmp_path)
+    w.chain.finalized = CLAIM_BLOCK - 5
+    w.chain.claim(CLAIM_BLOCK)
+    w.endpoints[liar].extra_logs = (
+        {
+            **_fake_claim_log(w.chain.preimage, block=w.chain.deploy_block),
+            "transactionHash": w.chain.deploy_tx,
+        },
+    )
+    obs = await w.observe()
+    assert obs.eth_claim_finality is not CounterClaimState.FINAL
+    assert (await w.decide()).intent is not Intent.PAGE_CLAIM
 
 
 async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):
