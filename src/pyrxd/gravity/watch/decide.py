@@ -35,6 +35,7 @@ from enum import Enum
 
 from pyrxd.btc_wallet.disposition import BtcDispositionKind
 from pyrxd.btc_wallet.taproot import TimeUnit
+from pyrxd.eth_wallet.disposition import DispositionKind
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.swap_coordinator import (
     ClaimFinality,
@@ -147,6 +148,24 @@ class Observations:
     #: ``low_corroboration``, and a single-source REFUNDED is read as still pending (Mythos F6; design
     #: §5.1, "a single endpoint's Refunded() never stops a page").
     btc_single_source: bool = False
+    # ETH counter-leg disposition (#850 PR 10, design §5.1): the shared reader the coordinator uses
+    # (``pyrxd.eth_wallet.disposition.read_counter_disposition``) over the ETH source's endpoints.
+    # ``eth_disposition`` is its kind, set exactly when this tick read one; ``None`` (the default, and
+    # every source that cannot read one) keeps the pre-10 rules. ``eth_claim_seen``: a ``Claimed(p)``
+    # log that opens H was nominated, or a claim the record kept, so p is public; the observer then also
+    # sets ``eth_claim_detected``. ``eth_single_source``: the read is one endpoint's; it may page, never
+    # stop a page, and it marks the decision ``low_corroboration`` (design §5.1). ``eth_disposition_tx``
+    # is the transaction a terminal answer rests on (``None`` for Gap B or a non-terminal answer).
+    # ``eth_settled_at_finalized`` is the reader's flag on an UNKNOWN that read the contract settled at
+    # the finalized block. ``eth_nonce_at_finalized`` is the push key's count there, on an
+    # ``EXPIRED_EMPTY_*`` answer that read it (the nonce ``close_push_nonce`` consumes).
+    eth_disposition: DispositionKind | None = None
+    eth_disposition_reason: str | None = None
+    eth_disposition_tx: str | None = None
+    eth_claim_seen: bool = False
+    eth_single_source: bool = False
+    eth_settled_at_finalized: bool = False
+    eth_nonce_at_finalized: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.maker_has_claimed_btc, bool):
@@ -190,6 +209,40 @@ class Observations:
             and not self.maker_has_claimed_btc
         ):
             raise ValidationError("a claim read must set maker_has_claimed_btc (the claim trigger)")
+        if self.eth_disposition is not None and not isinstance(self.eth_disposition, DispositionKind):
+            raise ValidationError("Observations.eth_disposition must be a DispositionKind or None")
+        for label, flag in (
+            ("eth_claim_seen", self.eth_claim_seen),
+            ("eth_single_source", self.eth_single_source),
+            ("eth_settled_at_finalized", self.eth_settled_at_finalized),
+        ):
+            if not isinstance(flag, bool):
+                raise ValidationError(f"Observations.{label} must be bool")
+        if self.eth_disposition is None and (
+            self.eth_claim_seen
+            or self.eth_single_source
+            or self.eth_settled_at_finalized
+            or self.eth_disposition_reason is not None
+            or self.eth_disposition_tx is not None
+            or self.eth_nonce_at_finalized is not None
+        ):
+            raise ValidationError("the eth_disposition_* fields need an ETH disposition read (eth_disposition)")
+        if self.eth_disposition_reason is not None and not isinstance(self.eth_disposition_reason, str):
+            raise ValidationError("Observations.eth_disposition_reason must be a str or None")
+        if self.eth_disposition_tx is not None and (
+            not isinstance(self.eth_disposition_tx, str) or not self.eth_disposition_tx.startswith("0x")
+        ):
+            raise ValidationError("Observations.eth_disposition_tx must be a 0x-prefixed hash or None")
+        if self.eth_nonce_at_finalized is not None and (
+            not isinstance(self.eth_nonce_at_finalized, int)
+            or isinstance(self.eth_nonce_at_finalized, bool)
+            or self.eth_nonce_at_finalized < 0
+        ):
+            raise ValidationError("Observations.eth_nonce_at_finalized must be a non-negative int or None")
+        if (self.eth_claim_seen or self.eth_disposition is DispositionKind.CLAIMED) and not self.eth_claim_detected:
+            raise ValidationError("an ETH claim read must set eth_claim_detected (the claim trigger)")
+        if self.eth_settled_at_finalized and self.eth_disposition is not DispositionKind.UNKNOWN:
+            raise ValidationError("Observations.eth_settled_at_finalized is the reader's flag on an UNKNOWN answer")
 
 
 @dataclass(frozen=True)
@@ -383,6 +436,7 @@ def _btc_refund_matured(terms: NegotiatedTerms, obs: Observations) -> bool:
 _STEP_TO_SECRET_REVEALED = "taker_observed_reveal"  # nosec B105
 _STEP_FROM_SECRET_REVEALED = "taker_scrape_and_claim_asset"  # nosec B105
 _STEP_FROM_VULNERABLE = "taker_claim_asset_from_vulnerable"
+_STEP_RECONCILE = "reconcile_counter_leg"
 
 # The BOTH_LOCKED maker-stall page, per counter chain (#850). The two differ because mutual_refund
 # does: on an ETH counter leg it reads the HTLC from the chain and keeps the record BOTH_LOCKED until
@@ -481,6 +535,12 @@ _CLAIM_PATH: dict[SwapState, tuple[str, ...]] = {
     # re-verifies the reveal (sha256(p) == H + the per-swap provenance gate) and does NOT claim,
     # so the gated claim still runs its own finality gate afterwards.
     SwapState.BOTH_LOCKED: (_STEP_TO_SECRET_REVEALED, _STEP_FROM_SECRET_REVEALED),
+    # A record at BTC_LOCKED lags a claim the chain already shows (#850 PR 10, design §5.1).
+    # ``reconcile_counter_leg`` takes BTC_LOCKED -> SECRET_REVEALED on a CLAIMED disposition (verified at
+    # the finalized block on ETH, buried at the coordinator's depth on BTC) for a taker's or single
+    # operator's record that pins the covenant outpoint; on a claim not yet final it only records the
+    # claim, and the operator runs it again. It sends nothing.
+    SwapState.BTC_LOCKED: (_STEP_RECONCILE, _STEP_FROM_SECRET_REVEALED),
     SwapState.SECRET_REVEALED: (_STEP_FROM_SECRET_REVEALED,),
     SwapState.ASSET_VULNERABLE: (_STEP_FROM_VULNERABLE,),
 }
@@ -505,7 +565,8 @@ def _claim_action(state: SwapState, *, winner_take_all: bool = False, note: str 
             f"investigate — no coordinator claim step is valid from {state.value} "
             f"({_STEP_FROM_SECRET_REVEALED} requires secret_revealed, "
             f"{_STEP_FROM_VULNERABLE} requires asset_vulnerable, "
-            f"{_STEP_TO_SECRET_REVEALED} requires both_locked)"
+            f"{_STEP_TO_SECRET_REVEALED} requires both_locked, "
+            f"{_STEP_RECONCILE} leads to secret_revealed only from btc_locked)"
         )
     if winner_take_all and path[-1] != _STEP_FROM_VULNERABLE:
         # The gated claim re-runs the finality gate against a FRESH read: it claims outright if the
@@ -639,6 +700,16 @@ SITUATION_MAKER_REFUND_TAKER_TIMEOUT = "maker_refund_taker_timeout"
 #: Prefix of an armed refund page's situation; the reconciler appends this tick's executor outcome,
 #: so a FAILED broadcast after a BROADCAST pages again (second Mythos pass, M3).
 SITUATION_ARMED_BTC_REFUND = "armed_btc_refund"
+#: The ETH disposition pages (#850 PR 10, design §5.1), each its own situation so no two share an ACK.
+SITUATION_ETH_DISCOVERY_DISAGREES = "eth_discovery_disagrees"
+SITUATION_ETH_DISPOSITION_CONTRADICTION = "eth_disposition_contradiction"
+SITUATION_ETH_CLAIMED_AFTER_MISMATCH = "eth_claimed_after_mismatch"
+SITUATION_ETH_EXPIRED_EMPTY_MISMATCH = "eth_expired_empty_mismatch"
+SITUATION_ETH_EXPIRED_EMPTY_BOTH_LOCKED = "eth_expired_empty_both_locked"
+SITUATION_ETH_EXPIRED_EMPTY_OPEN = "eth_expired_empty_open"
+SITUATION_ETH_EXPIRED_EMPTY_CLOSED = "eth_expired_empty_closed"
+SITUATION_LEGACY_ETH_UNSETTLED = "legacy_eth_unsettled"
+SITUATION_LEGACY_UNCLASSIFIED_CLAIM = "legacy_unclassified_claim"
 
 
 def _btc_spend_decision(
@@ -1219,6 +1290,200 @@ def decide(
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
 
 
+def _eth_corroboration(obs: Observations) -> bool:
+    """``low_corroboration`` for an ETH decision: a single-source RXD read, or a disposition read from
+    one ETH endpoint (#850 PR 10)."""
+    return obs.low_corroboration or obs.eth_single_source
+
+
+def _eth_refund_final(obs: Observations) -> bool:
+    """A refund of the contract verified at the finalized block, on a read of more than one endpoint.
+    One endpoint's REFUNDED decides nothing here (design §5.1: "a single endpoint's Refunded() never
+    stops a page")."""
+    return obs.eth_disposition is DispositionKind.REFUNDED and not obs.eth_single_source
+
+
+def _eth_disposition_decision(record: SwapRecord, obs: Observations, policy: MarginPolicy) -> Decision | None:
+    """The page for what the shared reader says about the counter-leg contract (#850 PR 10, design
+    §5.1), on a record at BTC_LOCKED, PARAMS_MISMATCH or BOTH_LOCKED once the claim race (run first)
+    has nothing to say. ``None`` when the read changes nothing: no read, OPEN, TIP_EXPIRED,
+    F_EXPIRED, SETTLED_UNFINAL, a single-source answer that would stop a page, or an UNKNOWN from a
+    failed read (the rules after this page those as before)."""
+    kind = obs.eth_disposition
+    if kind is None:
+        return None
+    corr = _eth_corroboration(obs)
+    state = record.state
+    maker = record.role is RecordRole.MAKER
+    deadline = (
+        None
+        if obs.asset_locked_at_height is None
+        else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
+    )
+    tx = obs.eth_disposition_tx
+    why = f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else ""
+    if _eth_refund_final(obs):
+        if maker:
+            return _maker_covenant_refund(
+                f"the taker's ETH refund {tx} is final at the finalized block",
+                deadline=deadline,
+                corr=corr,
+                situation=SITUATION_MAKER_REFUND_AFTER_TAKER_REFUND,
+            )
+        if obs.eth_claim_seen or record.counter_claim_tx is not None:
+            # D14: a Claimed(p) that opens H was seen, so p is public, whatever settled the contract. The
+            # covenant is still ours to claim until the maker's CSV refund at t_rxd. The coordinator
+            # holds the record off its terminal until t_rxd matures, so this page stays up until then.
+            where = (
+                "a Claimed log that opens H was served"
+                if obs.eth_claim_seen
+                else f"tx {record.counter_claim_tx}, on record"
+            )
+            return Decision(
+                Intent.PAGE_CLAIM,
+                reason=(
+                    f"our ETH refund {tx} is final at the finalized block, but a claim that opens H was seen ({where}), "
+                    "so p is public: claim the covenant before t_rxd"
+                ),
+                recommended_action=(
+                    "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant (pyrxd swap "
+                    "build-claim) before t_rxd"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
+            )
+        if obs.eth_claim_detected:
+            # The detection scan names a log the reader does not count as a claim that opens H (an
+            # unrecognised event, or a Claimed log whose data does not open H). Nothing proves p public,
+            # and nothing proves it is not: say so, and name no step that needs a claim.
+            return Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=(
+                    f"our ETH refund {tx} is final at the finalized block, but the detection scan names another log "
+                    "on the contract that the reader does not count as a claim that opens H; the tower cannot tell "
+                    "whether p is public"
+                ),
+                recommended_action=(
+                    "investigate — read the contract's logs on another endpoint; if a Claimed log opens H, p is "
+                    "public: claim the covenant before t_rxd (pyrxd swap build-claim)"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_ETH_DISCOVERY_DISAGREES,
+            )
+        step = "mutual_refund" if state is SwapState.BOTH_LOCKED else _STEP_RECONCILE
+        return Decision(
+            Intent.RECONCILE,
+            reason=(
+                f"our ETH refund {tx} is verified at the finalized block; the record still reads {state.value}. Run "
+                f"{step} to bring it up to the chain"
+                + (
+                    " (with no role it also sends the covenant refund)"
+                    if step == "mutual_refund" and record.role is not RecordRole.TAKER
+                    else ""
+                )
+            ),
+            recommended_action=step,
+            low_corroboration=corr,
+        )
+    if kind in (DispositionKind.EXPIRED_EMPTY_OPEN, DispositionKind.EXPIRED_EMPTY_CLOSED) and not obs.eth_single_source:
+        # Only on a read of more than one endpoint: these pages replace the refund page, and one
+        # endpoint's "the contract holds nothing" must not.
+        if state is SwapState.PARAMS_MISMATCH:
+            # §3.2: no EXPIRED_EMPTY edge from PARAMS_MISMATCH (a maker-process population); the exit is
+            # the gated abandon, after the covenant refund.
+            return Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    "the ETH counter-leg contract expired EMPTY at the finalized block after a covenant params "
+                    f"mismatch{why}. Refund your covenant by its CSV leg at t_rxd, then end the record with the "
+                    "gated abandon"
+                ),
+                recommended_action=(
+                    "refund your covenant by its CSV leg at t_rxd, then abandon_counter_leg (reason_code expired_empty)"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_ETH_EXPIRED_EMPTY_MISMATCH,
+            )
+        if maker:
+            return None
+        if state is SwapState.BOTH_LOCKED:
+            # N2: no claim can succeed after F_EXPIRED, and an empty contract has nothing to refund.
+            return Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    "the ETH counter-leg contract expired EMPTY at the finalized block (no claim can succeed, and "
+                    f"there is nothing to refund){why}. End the record with the gated abandon"
+                    + (
+                        ""
+                        if record.role is RecordRole.TAKER
+                        else "; with no role, refund the covenant by its CSV leg at t_rxd too (the abandon does not)"
+                    )
+                ),
+                recommended_action="abandon_counter_leg (reason_code expired_empty)",
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_ETH_EXPIRED_EMPTY_BOTH_LOCKED,
+            )
+        if kind is DispositionKind.EXPIRED_EMPTY_OPEN:
+            nonce = (
+                f"nonce {obs.eth_nonce_at_finalized} (the key's count at the finalized block)"
+                if obs.eth_nonce_at_finalized is not None
+                else "the key's count at the finalized block (not read this tick)"
+            )
+            push = (
+                f"; the recorded push is {record.pending_push_tx_hash}"
+                if record.pending_push_tx_hash is not None
+                else ""
+            )
+            return Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    "the ETH token counter-leg contract expired EMPTY at the finalized block, but a token push signed "
+                    f"for it may still land{why}. Close the push nonce: a 0-value transaction from the funding key "
+                    f"{record.push_signer or '(not named on this record)'} at {nonce}{push}"
+                ),
+                recommended_action="close_push_nonce",
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_ETH_EXPIRED_EMPTY_OPEN,
+            )
+        return Decision(
+            Intent.PAGE_REFUND,
+            reason=(
+                "the ETH token counter-leg contract expired EMPTY at the finalized block, and the funding key's nonce "
+                f"there is past every push it signed for it{why}. Nothing is left to refund: run the step, which "
+                "ends the record ABORTED"
+            ),
+            recommended_action="taker_refund_btc",
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+            situation=SITUATION_ETH_EXPIRED_EMPTY_CLOSED,
+        )
+    if maker:
+        return None
+    if kind is DispositionKind.UNKNOWN and obs.eth_settled_at_finalized:
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                "the ETH counter-leg contract is settled at the finalized block, but the reader cannot say how "
+                f"({obs.eth_disposition_reason}); nothing proves whether p is public"
+            ),
+            recommended_action=(
+                "investigate — read the contract's Claimed/Refunded logs and receipts on other endpoints; if a "
+                "Claimed log opens H, p is public: claim the covenant before t_rxd (pyrxd swap build-claim)"
+            ),
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+            situation=SITUATION_ETH_DISPOSITION_CONTRADICTION,
+        )
+    # SETTLED_UNFINAL stops nothing: the reader returns it when ANY endpoint reads the contract settled
+    # at its tip (a delay is cheap for the coordinator), so one endpoint would otherwise silence a page.
+    return None
+
+
 def _decide_eth(
     *,
     record: SwapRecord,
@@ -1246,14 +1511,40 @@ def _decide_eth(
     Alert-only: like the BTC branch it broadcasts nothing and only names the coordinator step.
     """
     obs = observations
-    corr = obs.low_corroboration
+    corr = _eth_corroboration(obs)
     terms = record.terms
     state = record.state
+
+    # A claim after a params mismatch (#850 PR 10, design §3.2): there is deliberately no way into the
+    # taker's claim flow from PARAMS_MISMATCH, so the claim race below could only name "investigate".
+    if state is SwapState.PARAMS_MISMATCH and obs.eth_claim_detected and not _eth_refund_final(obs):
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                "the ETH counter leg is claimed (or a claim is seen) after a covenant params mismatch: there is no "
+                "coordinator path into the claim flow from params_mismatch. Refund your covenant by its CSV leg at "
+                "t_rxd, then end the record with the gated abandon once the claim is final at the finalized block"
+                + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
+            ),
+            recommended_action=(
+                "refund your covenant by its CSV leg at t_rxd (two-host runner: maker --phase refund), then "
+                "abandon_counter_leg (reason_code claimed_after_mismatch)"
+            ),
+            deadline_rxd_height=(
+                None
+                if obs.asset_locked_at_height is None
+                else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
+            ),
+            low_corroboration=corr,
+            situation=SITUATION_ETH_CLAIMED_AFTER_MISMATCH,
+        )
 
     # Claim race. p is (becoming) public if EITHER the chain shows the maker's ETH claim OR the
     # record already advanced to SECRET_REVEALED — OR'd so a suppressed single-source claim DETECTION
     # cannot drop a known-revealed swap into the silent WATCH catch-all (mirrors the BTC branch).
-    if obs.eth_claim_detected or state is SwapState.SECRET_REVEALED:
+    # A claim beside our refund final at the finalized block is not a race: the contract paid us, so
+    # no claim of it can be mined. It is paged below, as the covenant claim when p is public (D14).
+    if (obs.eth_claim_detected and not _eth_refund_final(obs)) or state is SwapState.SECRET_REVEALED:
         if obs.eth_claim_finality is None or obs.asset_locked_at_height is None:
             # Claim indicated but finality un-assessable (no finalized-checkpoint verdict or no
             # asset-lock height) → fail closed to a decision-required page.
@@ -1321,6 +1612,12 @@ def _decide_eth(
             low_corroboration=corr,
             situation=SITUATION_ASSET_VULNERABLE,
         )
+    # What the shared reader says about the contract (#850 PR 10): refunded, empty, settled, or a
+    # contradiction. ``None`` leaves the rules below (OPEN, TIP_EXPIRED, F_EXPIRED, a failed read).
+    if state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
+        seen = _eth_disposition_decision(record, obs, policy)
+        if seen is not None:
+            return seen
     if state is SwapState.PARAMS_MISMATCH:
         # The maker locked the wrong covenant; the taker only needs to recover its own ETH HTLC.
         # `taker_refund_btc` is the state-valid step (coordinator allows it from PARAMS_MISMATCH and it
@@ -1507,15 +1804,16 @@ def _decide_eth(
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
 
 
-# -- legacy terminal records: the D9 net (#850 PR 9b for BTC; design §5.2) ----------------------
+# -- legacy terminal records: the D9 net (#850 PR 9b for BTC, PR 10 for ETH; design §5.2) --------
 #
 # Before 0.27 a BTC taker refund ended its record on BROADCAST (ABORTED or MUTUAL_REFUND), and the
 # store dropped terminal records, so a refund that lost to the maker's claim left ``p`` public with
-# nobody told to claim the covenant before t_rxd. Records 0.27 ends carry ``counter_disposition`` (the
-# chain read that ended them); a terminal BTC record without one, and without the tower's marker, is
-# read once here.
+# nobody told to claim the covenant before t_rxd. An ETH taker refund ended its record on broadcast the
+# same way until PR 5b, so a refund that never landed, or a claim that beat it, went unseen too.
+# Records 0.27 ends carry ``counter_disposition`` (the chain read that ended them); a terminal record
+# without one, and without the tower's marker, is read once here.
 
-#: The terminal states an old BTC refund ended a record in on its broadcast.
+#: The terminal states an old counter-leg refund ended a record in on its broadcast.
 LEGACY_TERMINAL_STATES = frozenset({SwapState.ABORTED, SwapState.MUTUAL_REFUND})
 
 
@@ -1557,8 +1855,12 @@ def decide_legacy(
     obs = observations
     corr = _corroboration(obs)
     state = record.state
+    if record.terms.counter_chain == "eth":
+        return _decide_legacy_eth(record=record, observations=obs, policy=policy)
     if record.terms.counter_chain != "btc":
-        return LegacyCheck(Decision(Intent.WATCH, reason="legacy net: only a BTC counter leg is read here"), "skipped")
+        return LegacyCheck(
+            Decision(Intent.WATCH, reason="legacy net: only a BTC or ETH counter leg is read here"), "skipped"
+        )
     if not obs.btc_spend_classified:
         return LegacyCheck(
             Decision(
@@ -1716,4 +2018,164 @@ def decide_legacy(
             low_corroboration=corr,
         ),
         kind.value if kind else "unknown",
+    )
+
+
+def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy: MarginPolicy) -> LegacyCheck:
+    """:func:`decide_legacy` for an ETH counter leg (#850 PR 10, design §5.2 item 3). Pure, never
+    autonomous. The verdicts, from the shared reader:
+
+    * a claim that opens H seen, or CLAIMED → PAGE_CLAIM naming the covenant claim: the refund lost, or
+      p is public beside it. Conclusive once the page is delivered after t_rxd has matured.
+    * a log the detection scan counts as a claim and the reader does not → PAGE_SQUEEZED "investigate".
+    * unsettled (OPEN, TIP_EXPIRED, F_EXPIRED) → PAGE_REFUND: the recorded refund never landed, and
+      ``refund()`` on the contract (anyone may call it after the timeout; it pays the refundee) is
+      still due. Never conclusive, like an unspent BTC HTLC. Not urgent: before the timeout a refund
+      cannot be sent yet, and from the timeout on the contract refuses a claim, so nothing races it.
+    * REFUNDED, or empty (``EXPIRED_EMPTY_*``), on a read of more than one endpoint → agrees;
+      conclusive. One endpoint's answer, SETTLED_UNFINAL, or an UNKNOWN from a failed read → retried,
+      nothing written. An UNKNOWN that read the contract settled → PAGE_SQUEEZED, retried.
+    """
+    obs = observations
+    corr = _eth_corroboration(obs)
+    if obs.eth_disposition is None:
+        return LegacyCheck(
+            Decision(
+                Intent.WATCH,
+                reason="legacy net: this tower's ETH source does not read dispositions",
+                low_corroboration=corr,
+            ),
+            "unclassified",
+        )
+    locator = record.counterchain_locator
+    contract = getattr(locator, "contract_address", "(no locator)")
+    deadline = (
+        None
+        if obs.asset_locked_at_height is None
+        else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
+    )
+    past = deadline is not None and obs.now_rxd_height >= deadline
+    ended = (
+        f"this record ended at {record.state.value} when its ETH refund was sent (pyrxd before 0.27 did not follow "
+        "a refund to the finalized block)"
+    )
+    kind = obs.eth_disposition
+    why = f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else ""
+    if obs.eth_claim_seen or kind is DispositionKind.CLAIMED:
+        refunded = _eth_refund_final(obs)
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_CLAIM,
+                reason=(
+                    f"{ended}. "
+                    + (
+                        f"The refund {obs.eth_disposition_tx} is final, but a Claimed log that opens H was served, so p "
+                        "is public"
+                        if refunded
+                        else "The contract was CLAIMED (or a Claimed log that opens H was served): the refund lost and "
+                        "p is public"
+                    )
+                    + ". Claim the covenant before t_rxd, if it is still unspent"
+                    + (" (t_rxd has matured: the maker may already have refunded it)" if past else "")
+                    + (
+                        ""
+                        if deadline is not None
+                        else " (the tower cannot say when t_rxd matures: ACK this page once the covenant is claimed "
+                        "or gone)"
+                    )
+                ),
+                recommended_action=(
+                    "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant with it "
+                    "(pyrxd swap build-claim) — not a refund"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
+            ),
+            "refunded_p_public" if refunded else "claimed",
+            conclusive_once_delivered=past,
+        )
+    if obs.eth_claim_detected:
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=(
+                    f"{ended}, and the detection scan names a log on the contract that the reader does not count as a "
+                    f"claim that opens H{why}"
+                ),
+                recommended_action=(
+                    "investigate — read the contract's logs on other endpoints; if a Claimed log opens H, p is "
+                    "public: claim the covenant before t_rxd (pyrxd swap build-claim)"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_LEGACY_UNCLASSIFIED_CLAIM,
+            ),
+            "unclassified_claim",
+        )
+    if kind in (DispositionKind.OPEN, DispositionKind.TIP_EXPIRED, DispositionKind.F_EXPIRED):
+        timeout = record.terms.eth_timeout_unix_s
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    f"{ended}, but the contract {contract} is not settled: the recorded refund never landed{why}"
+                    + (
+                        f". It can be refunded once its timeout {timeout} has passed; until then the maker can still "
+                        "claim it, which makes p public"
+                        if kind is DispositionKind.OPEN
+                        else ". Its timeout has passed, so it can no longer be claimed; refund it"
+                    )
+                ),
+                recommended_action=(
+                    f"call refund() on the contract {contract} from any account once its timeout has passed (it pays "
+                    "the refundee; no coordinator step runs on a terminal record), and watch until it is final"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_LEGACY_ETH_UNSETTLED,
+            ),
+            kind.value,
+        )
+    agreeing = (DispositionKind.REFUNDED, DispositionKind.EXPIRED_EMPTY_OPEN, DispositionKind.EXPIRED_EMPTY_CLOSED)
+    if kind in agreeing and obs.eth_single_source:
+        return LegacyCheck(
+            Decision(
+                Intent.WATCH,
+                reason=f"legacy net: only one endpoint reads the contract {kind.value}; read again later",
+                low_corroboration=corr,
+            ),
+            f"{kind.value}_single_source",
+        )
+    if kind in agreeing:
+        return LegacyCheck(
+            Decision(
+                Intent.WATCH,
+                reason=f"legacy net: the contract reads {kind.value} at the finalized block{why}; the record agrees",
+            ),
+            kind.value,
+            conclusive=True,
+        )
+    if kind is DispositionKind.UNKNOWN and obs.eth_settled_at_finalized:
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=f"{ended}; the contract is settled at the finalized block, but the reader cannot say how{why}",
+                recommended_action=(
+                    "investigate — read the contract's Claimed/Refunded logs and receipts on other endpoints; if a "
+                    "Claimed log opens H, p is public: claim the covenant before t_rxd (pyrxd swap build-claim)"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_ETH_DISPOSITION_CONTRADICTION,
+            ),
+            "contradiction",
+        )
+    return LegacyCheck(
+        Decision(
+            Intent.WATCH,
+            reason=f"legacy net: the contract reads {kind.value}{why}; read again later",
+            low_corroboration=corr,
+        ),
+        kind.value,
     )

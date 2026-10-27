@@ -4465,38 +4465,9 @@ class SwapCoordinator:
         locator = self.record.counterchain_locator
         if read is None or self.record.terms.counter_chain != "eth" or not isinstance(locator, EthHtlcLocator):
             return None
-        # Our own recorded refund is nominated alongside the logs, and the expiry anchor offered as
-        # a proof of refund (#850 PR 5b). Passed only when set, so a leg without them still reads.
-        # The token arguments below (PR 7a) are passed for every token record that needs them: a leg
-        # that does not take them fails (TypeError) rather than reading without them.
-        kwargs: dict[str, Any] = {}
-        if self.record.counter_refund_tx_hash is not None:
-            # Every refund we signed, not only the newest: an earlier one at the same nonce may be the
-            # one that mined, and with no log returned its hash is the only proof (Mythos, #894 F1).
-            kwargs["recorded_refund_hashes"] = (
-                self.record.counter_refund_tx_hash,
-                *self.record.counter_refund_replaced_tx_hashes,
-            )
-        if self.record.counter_expiry_anchor is not None:
-            from .swap_state import parse_expiry_anchor
+        from .eth_counter_disposition import eth_counter_disposition_kwargs
 
-            kwargs["expiry_anchor"] = parse_expiry_anchor(self.record.counter_expiry_anchor)
-        if self.record.counter_claim_tx is not None:
-            # A claim seen earlier is nominated by its hash, so it is verified by its receipt when its log
-            # is no longer served (Mythos review of #850 PR 7b, F1).
-            kwargs["recorded_claim_hashes"] = (self.record.counter_claim_tx,)
-        if isinstance(locator, Erc20HtlcLocator):
-            # #850 PR 7a: the highest nonce a push for this contract (or our close of it) was signed
-            # at, and the key that signed the push. With no push nonce recorded the close is the only
-            # bound, and closing needs the key idle at every endpoint (design §2.7).
-            bound = self._push_nonce_bound()
-            if bound is not None:
-                kwargs["push_nonce_bound"] = bound
-            if self.record.push_signer is not None:
-                kwargs["push_signer"] = self.record.push_signer
-            if self.record.pending_push_nonce is None:
-                kwargs["nonce_less"] = True
-        return await read(locator, **kwargs)
+        return await read(locator, **eth_counter_disposition_kwargs(self.record))
 
     def _counter_signer(self) -> str | None:
         """The counter leg's key's address (lower-case), or ``None`` when the leg does not say."""
@@ -4504,11 +4475,10 @@ class SwapCoordinator:
         return str(signer()).lower() if callable(signer) else None
 
     def _push_nonce_bound(self) -> int | None:
-        """The highest nonce at which this record's key signed a token push for the counter-leg
-        contract, or a transaction closing that nonce (design §2.7): ``None`` when neither is
-        recorded (a record from before the push nonce was kept)."""
-        nonces = [n for n in (self.record.pending_push_nonce, self.record.push_close_nonce) if n is not None]
-        return max(nonces) if nonces else None
+        """:func:`~pyrxd.gravity.eth_counter_disposition.push_nonce_bound` of this record."""
+        from .eth_counter_disposition import push_nonce_bound
+
+        return push_nonce_bound(self.record)
 
     @staticmethod
     def _single_source_may_decide(chain_id: int) -> bool:

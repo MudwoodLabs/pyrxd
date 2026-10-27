@@ -8,7 +8,7 @@ operational entrypoint (arg parsing, real-client construction, the poll loop) st
 * :class:`JsonDirRecordStore` — discovers the operator's in-flight swaps from a
   directory of ``SwapRecord`` JSON files (the same JSON the coordinator persists),
   skipping terminal swaps and unreadable files, and lists a bounded number of legacy
-  terminal BTC records for the D9 net (#850 PR 9b).
+  terminal BTC and ETH records for the D9 net (#850 PR 9b, PR 10).
 * :class:`ElectrumRxdChainSource` — ``RxdChainSource`` over any client exposing
   ``get_tip_height()`` + ``get_transaction_verbose(txid)`` (ElectrumXClient, or a thin
   ssh-tr shim). RXD is single-source in v1 (the ``ChainObserver`` flags it).
@@ -34,6 +34,7 @@ from typing import Any
 
 from pyrxd.btc_wallet.disposition import BtcCounterDisposition, read_btc_counter_disposition
 from pyrxd.btc_wallet.taproot import BtcHtlcLocator
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.swap_state import AbortReason, RecordFromNewerPyrxd, RecordRole, SwapRecord, is_terminal
 from pyrxd.gravity.watch.alerts import Page, Severity
@@ -85,19 +86,24 @@ LEGACY_MARKER_SUFFIX = ".legacy-checked.json"
 
 
 def is_legacy_candidate(record: SwapRecord) -> bool:
-    """A terminal BTC record that an old pyrxd ended on its refund's broadcast (D9, design §5.2).
+    """A terminal record that an old pyrxd ended on its counter-leg refund's broadcast (D9, design
+    §5.2): BTC since PR 9b, ETH since PR 10.
 
-    ABORTED or MUTUAL_REFUND, a BTC counter leg that was funded (a locator), no ``counter_disposition``
-    (a 0.27 coordinator records the chain read that ends a record), not a maker's record (the counter
-    leg is the taker's), and not an operator's explicit abandon. Whether the marker exists is the
-    store's question."""
+    ABORTED or MUTUAL_REFUND, a counter leg that was funded (a BTC or ETH locator for its chain), no
+    ``counter_disposition`` (a 0.27 coordinator records the chain read that ends a record), not a
+    maker's record (the counter leg is the taker's), and not ended by an explicit 0.27 step that
+    reads no refund: the operator's abandon, or the taker's ``abandon_unfunded``. Whether the marker
+    exists is the store's question."""
+    locator = record.counterchain_locator
+    funded = (record.terms.counter_chain == "btc" and isinstance(locator, BtcHtlcLocator)) or (
+        record.terms.counter_chain == "eth" and isinstance(locator, EthHtlcLocator)
+    )
     return (
         record.state in LEGACY_TERMINAL_STATES
-        and record.terms.counter_chain == "btc"
-        and isinstance(record.counterchain_locator, BtcHtlcLocator)
+        and funded
         and record.counter_disposition is None
         and record.role is not RecordRole.MAKER
-        and record.abort_reason is not AbortReason.OPERATOR_ABANDONED
+        and record.abort_reason not in (AbortReason.OPERATOR_ABANDONED, AbortReason.TAKER_NEVER_FUNDS)
     )
 
 
@@ -121,7 +127,7 @@ class JsonDirRecordStore:
         #: reconciler pages each one by name (#850 PR 3): a skipped record is a swap the tower is not
         #: watching, and a log line alone left that silent unless EVERY record failed.
         self.unreadable: list[tuple[str, str]] = []
-        #: Legacy terminal BTC records to read this tick (D9): at most :data:`LEGACY_CHECKS_PER_TICK`,
+        #: Legacy terminal records to read this tick (D9): at most :data:`LEGACY_CHECKS_PER_TICK`,
         #: in turn, so a record whose read never concludes cannot hold the others out.
         self.legacy: list[tuple[str, SwapRecord]] = []
         self._legacy_after: str | None = None

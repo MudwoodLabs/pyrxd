@@ -29,6 +29,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.disposition import BtcCounterDisposition, BtcDispositionKind
 from pyrxd.btc_wallet.taproot import BtcHtlcLocator
+from pyrxd.eth_wallet.disposition import CounterDisposition, DispositionKind
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState, FinalityStallTracker
 from pyrxd.gravity.swap_state import SwapRecord, SwapState
@@ -281,18 +282,17 @@ class ChainObserver(Observer):
         low_corr = not self._rxd_corroborated
 
         if record.terms.counter_chain == "eth":
-            eth_detected, eth_finality = await self._observe_eth_claim(swap_id, record)
+            eth_fields = await self._observe_eth(swap_id, record)
             return Observations(
                 maker_has_claimed_btc=False,
                 now_rxd_height=tip,
                 asset_locked_at_height=asset_locked,
-                eth_claim_detected=eth_detected,
-                eth_claim_finality=eth_finality,
                 # The ETH analogue of btc_funding_confirmations: what lets decide()'s
                 # maker-never-locks branch prove the taker's counter-leg refund is due. Read only
                 # on the ETH path; the BTC arm's deadline is a depth and needs no clock.
                 now_unix_s=Seconds(int(self._clock())),
                 low_corroboration=low_corr,
+                **eth_fields,
             )
 
         # BTC counter-leg (default). record.btc_locator is None until the BTC leg is funded.
@@ -371,14 +371,22 @@ class ChainObserver(Observer):
         }
         return claimed, claim_txid, fields
 
-    async def _observe_eth_claim(self, swap_id: str, record: SwapRecord) -> tuple[bool, CounterClaimState | None]:
-        """Detect the maker's ETH claim + its finalized-checkpoint verdict STATE. Returns
-        ``(detected, finality_state)``. ``(False, None)`` when no ETH locator is present yet
-        (pre-fund) or the contract is unclaimed; fails closed (raises) if no ETH source was injected
-        — the reconciler turns that into a decision-required page rather than a silent all-clear.
+    async def _observe_eth(self, swap_id: str, record: SwapRecord) -> dict[str, Any]:
+        """The ETH ``Observations`` fields: the maker's claim and its finalized-checkpoint verdict STATE
+        (``eth_claim_detected``, ``eth_claim_finality``), and, when the source reads one, the contract's
+        disposition from the shared reader (#850 PR 10, design §5.1). Empty when no ETH locator is
+        present yet (pre-fund); fails closed (raises) if no ETH source was injected — the reconciler
+        turns that into a decision-required page rather than a silent all-clear.
 
-        A8 / RF-06 across-time stall: the point-in-time ``verdict`` is the fast path and unchanged;
-        when the source exposes the optional ``finality_checkpoint()`` capability, the per-``swap_id``
+        The detection scan (``claim_status``, selector-agnostic) stays the claim trigger. The
+        disposition read adds to it, never takes from it: a ``Claimed`` log that opens H on any endpoint
+        (or a claim the record kept), or a CLAIMED answer, is a claim even when the scan missed it. The
+        verdict is read for the claim the reader verified first, else the scan's, else the first one
+        nominated. A CLAIMED answer from more than one endpoint is FINAL as it stands: it was verified at
+        the agreed finalized block. Gap B (CLAIMED with no transaction) has no other verdict to read.
+
+        A8 / RF-06 across-time stall: the point-in-time verdict is the fast path and unchanged; when the
+        source exposes the optional ``finality_checkpoint()`` capability, the per-``swap_id``
         :class:`FinalityStallTracker` may UPGRADE a ``NOT_YET_FINAL_LIVE`` to
         ``COUNTER_CHAIN_NOT_FINALIZING`` once a sustained stall is judged across ticks (a ``FINAL``
         verdict is never touched; a single non-advance never trips). Alert-only — the only effect is
@@ -387,13 +395,48 @@ class ChainObserver(Observer):
             raise ValidationError("ChainObserver has no EthChainSource for an ETH swap")
         locator = record.counterchain_locator
         if not isinstance(locator, EthHtlcLocator):
-            return False, None  # ETH swap not yet funded → nothing claimed
+            return {}  # ETH swap not yet funded → nothing claimed
         status = await self._eth.claim_status(locator.contract_address, locator.deploy_tx_hash)
-        if not status.claimed or status.claim_tx_hash is None:
-            return False, None
-        verdict = await self._eth.claim_finality_verdict(status.claim_tx_hash)
+        scanned = status.claim_tx_hash if status.claimed else None
+        fields: dict[str, Any] = {}
+        claim_tx = scanned
+        read = getattr(self._eth, "counter_disposition", None)
+        if callable(read):
+            # The coordinator's own arguments for this record (one builder), so both read one thing.
+            from pyrxd.gravity.eth_counter_disposition import eth_counter_disposition_kwargs
+
+            disposition: CounterDisposition = await read(locator, **eth_counter_disposition_kwargs(record))
+            claims = disposition.claims_seen
+            evidence = disposition.evidence
+            fields = {
+                "eth_disposition": disposition.kind,
+                "eth_disposition_reason": disposition.reason,
+                "eth_disposition_tx": evidence.tx_hash if evidence is not None else None,
+                "eth_claim_seen": bool(claims),
+                "eth_single_source": disposition.single_source,
+                "eth_settled_at_finalized": disposition.kind is DispositionKind.UNKNOWN
+                and disposition.settled_at_finalized,
+                "eth_nonce_at_finalized": disposition.nonce_at_finalized,
+            }
+            claimed = disposition.kind is DispositionKind.CLAIMED
+            verified = [c.tx_hash for c in claims if c.verified]
+            if claimed and evidence is not None and evidence.tx_hash is not None:
+                verified.insert(0, evidence.tx_hash)
+            if verified:
+                claim_tx = verified[0]
+            elif scanned is None and claims:
+                claim_tx = claims[0].tx_hash
+            if claimed and not disposition.single_source:
+                return {"eth_claim_detected": True, "eth_claim_finality": CounterClaimState.FINAL, **fields}
+            if claimed and claim_tx is None:
+                # Gap B from one endpoint: no transaction to read a verdict for, and one endpoint's
+                # CLAIMED is not final on its own. The gate then fails closed (finality un-assessable).
+                return {"eth_claim_detected": True, "eth_claim_finality": None, **fields}
+        if claim_tx is None:
+            return {"eth_claim_detected": False, "eth_claim_finality": None, **fields}
+        verdict = await self._eth.claim_finality_verdict(claim_tx)
         verdict = await self._upgrade_eth_stall(swap_id, verdict)
-        return True, verdict.state
+        return {"eth_claim_detected": True, "eth_claim_finality": verdict.state, **fields}
 
     async def _upgrade_eth_stall(self, swap_id: str, verdict: CounterClaimFinality) -> CounterClaimFinality:
         """Feed the per-``swap_id`` :class:`FinalityStallTracker` this tick's ``(head, finalized)`` and

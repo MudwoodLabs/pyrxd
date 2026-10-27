@@ -55,7 +55,11 @@ into the same app or receiver changes nothing.
   Neither lets the autonomous refund broadcast on a single-source read: that takes its own flag,
   `--auto-refund-on-single-source`.
 - BTC depth + claim detection: defaults to mempool.space / Esplora (`--mempool-base-url`, `--quorum`).
-- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). The finality gate also needs the
+- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). Give `--eth-rpc-url` more than once,
+  for endpoints of distinct operators, and the tower reads the counter-leg contract's disposition
+  from all of them (the coordinator's reader). With one endpoint every ETH page is marked low
+  corroboration, and that endpoint's word never stops a page or marks a legacy record checked: a
+  refund it alone reads as final leaves the refund page up. The finality gate also needs the
   chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes
   from its own vetted registry for the given chain id (768 s Ethereum/Sepolia, 900 s Base/Optimism,
   1200 s Arbitrum, 6000 s Linea). On a chain id the registry does not know, it logs an `ERROR` and
@@ -115,6 +119,19 @@ into the same app or receiver changes nothing.
   On a conclusive verdict (refunded, or a claim page delivered after t_rxd) the tower writes
   `<swap_id>.legacy-checked.json` beside the record (mode 600, atomic). It never writes a record.
   Delete the marker to have the record read again.
+- **ETH counter legs (#850 PR 10).** On a read of more than one endpoint: your refund verified at
+  the finalized block sends an INFO `RECONCILE` page naming `reconcile_counter_leg` (`mutual_refund`
+  from BOTH_LOCKED); a `Claimed` log that opens H beside it, or a claim on record, pages the covenant
+  claim instead (`p` is public). A contract settled at the finalized block that the reader cannot
+  explain pages CRITICAL "investigate". An empty token contract past its timeout pages
+  `close_push_nonce` (a push may still land) or `taker_refund_btc` (none can), the gated abandon from
+  BOTH_LOCKED, and from PARAMS_MISMATCH the covenant refund then the abandon. A claim after a params
+  mismatch pages the covenant refund then `abandon_counter_leg`. A record still at BTC_LOCKED when the
+  maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`.
+  Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
+  ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the
+  timeout; it pays the refundee) and is read again every turn; a claim pages the covenant claim; a
+  refund or an empty contract agrees and is marked.
 - **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,
   whether or not the maker's covenant is on chain. A maker's record is paged to refund its covenant
   at t_rxd, never to run the taker's `taker_refund_btc` or `mutual_refund`.

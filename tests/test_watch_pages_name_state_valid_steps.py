@@ -396,9 +396,7 @@ def test_secret_revealed_safe_page_still_names_the_plain_step():
     assert d.autonomous_asset_claim is True
 
 
-@pytest.mark.parametrize(
-    "state", [SwapState.PARAMS_MISMATCH, SwapState.MAKER_STALLS, SwapState.BTC_LOCKED, SwapState.NEGOTIATED]
-)
+@pytest.mark.parametrize("state", [SwapState.PARAMS_MISMATCH, SwapState.MAKER_STALLS, SwapState.NEGOTIATED])
 def test_no_step_states_page_investigate_and_say_why(state):
     """States with no valid claim step get a REPORT, not a step name and not silence.
 
@@ -416,6 +414,27 @@ def test_no_step_states_page_investigate_and_say_why(state):
     assert state.value in action
     for step in _CLAIM_STEP_NAMES:
         assert step in action, f"the investigate page must say what {step} needs"
+
+
+@pytest.mark.parametrize("eth", [False, True], ids=["btc", "eth"])
+def test_a_btc_locked_record_is_told_to_reconcile_then_claim(eth):
+    """#850 PR 10 (design §5.1, ``_CLAIM_PATH[BTC_LOCKED]``): a record still at BTC_LOCKED when the
+    chain shows the maker's final claim. ``reconcile_counter_leg`` takes it to SECRET_REVEALED on that
+    CLAIMED disposition, so the page names it first instead of "investigate"."""
+    obs = (
+        _eth_claim_shapes()[0][1]
+        if eth
+        else Observations(
+            maker_has_claimed_btc=True, now_rxd_height=150, asset_locked_at_height=LOCK, btc_claim_confirmations=6
+        )
+    )
+    d = _decide(SwapState.BTC_LOCKED, obs, eth=eth)
+    assert d.intent is Intent.PAGE_CLAIM
+    assert d.recommended_action == "reconcile_counter_leg, then taker_scrape_and_claim_asset"
+    guards = _state_guards()
+    assert SwapState.BTC_LOCKED in guards["reconcile_counter_leg"]
+    # The coordinator's edge the page leans on: BTC_LOCKED -> SECRET_REVEALED on an observed claim.
+    assert can_transition(SwapState.BTC_LOCKED, SwapState.SECRET_REVEALED)
 
 
 def test_eth_branch_gets_the_same_treatment():

@@ -44,7 +44,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from pyrxd.eth_wallet.disposition import CounterDisposition, read_counter_disposition
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
+from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.watch.quorum import EthClaimStatus
@@ -81,10 +84,44 @@ def _topic0(log: dict[str, Any]) -> str | None:
 
 
 class RpcEthChainSource:
-    """``EthChainSource`` over a keyless :class:`EthRpc` (read-only, no key, never touches ``p``)."""
+    """``EthChainSource`` over a keyless :class:`EthRpc`, or a :class:`MultiSourceEthRpc` of several
+    (read-only, no key, never touches ``p``)."""
 
-    def __init__(self, rpc: EthRpc) -> None:
+    def __init__(self, rpc: EthRpc | MultiSourceEthRpc) -> None:
         self._rpc = rpc
+
+    async def counter_disposition(
+        self,
+        locator: EthHtlcLocator,
+        *,
+        recorded_refund_hashes: tuple[str, ...] = (),
+        expiry_anchor: tuple[int, str] | None = None,
+        recorded_claim_hashes: tuple[str, ...] = (),
+        push_nonce_bound: int | None = None,
+        push_signer: str | None = None,
+        nonce_less: bool = False,
+    ) -> CounterDisposition:
+        """What the chain says about this swap's HTLC: the coordinator's reader and arguments
+        (``EthCounterLeg.counter_disposition``, built by
+        :func:`pyrxd.gravity.eth_counter_disposition.eth_counter_disposition_kwargs`), read-only. Never raises
+        for a chain read (an unreadable chain is ``UNKNOWN``).
+
+        One deliberate difference: this source holds no key, so a token record that does not name its
+        push key (``push_signer``, written before 0.27) is read without a nonce, and its empty contract
+        can read ``EXPIRED_EMPTY_OPEN`` but never ``EXPIRED_EMPTY_CLOSED``. The coordinator would read
+        its own key's nonce when that key deployed the contract."""
+        token = locator.token_address if isinstance(locator, Erc20HtlcLocator) else None
+        return await read_counter_disposition(
+            self._rpc,
+            locator,
+            recorded_refund_hashes=recorded_refund_hashes,
+            expiry_anchor=expiry_anchor,
+            recorded_claim_hashes=recorded_claim_hashes,
+            token_address=token,
+            funding_account=push_signer if token is not None else None,
+            push_nonce_bound=push_nonce_bound if token is not None else None,
+            nonce_less=nonce_less if token is not None else False,
+        )
 
     async def claim_status(self, contract_address: str, deploy_tx_hash: str) -> EthClaimStatus:
         # Bound the log scan to the contract's lifetime. A pending/unmined deploy (no blockNumber)
