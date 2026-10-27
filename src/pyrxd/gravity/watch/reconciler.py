@@ -215,6 +215,8 @@ class Reconciler:
         delivered: bool | None = None
         if decision.intent in _ROUTED_INTENTS:
             delivered = await self._safe_handle(swap_id, decision)
+        else:
+            self._safe_resolve(swap_id)
         if check.conclusive or (check.conclusive_once_delivered and delivered):
             mark = getattr(self._store, "mark_legacy_checked", None)
             if callable(mark):
@@ -277,6 +279,7 @@ class Reconciler:
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, alert_delivered=delivered, executed=executed)
             logger.debug("swap %s: %s (%s)", swap_id, decision.intent.value, decision.reason)
+            self._safe_resolve(swap_id)
             return ReconcileResult(swap_id, decision)
         finally:
             self._inflight.discard(swap_id)
@@ -295,6 +298,18 @@ class Reconciler:
         except Exception:
             logger.exception("autonomous executor FAILED for swap %s — alerter will still page", swap_id)
             return ExecOutcome.FAILED
+
+    def _safe_resolve(self, swap_id: str) -> None:
+        """Tell an alerter that can hear it that the swap's decision is quiet this tick (WATCH or NOOP
+        from ``decide``), so a CRITICAL it paged earlier leaves the escalation count and its ACKs end
+        (third Mythos pass, F3). Optional: a minimal alerter has no ``resolve``."""
+        resolve = getattr(self._alerter, "resolve", None)
+        if not callable(resolve):
+            return
+        try:
+            resolve(swap_id)
+        except Exception:
+            logger.exception("alerter.resolve FAILED for swap %s", swap_id)
 
     async def _safe_handle(self, swap_id: str, decision: Decision) -> bool:
         """Route to the alerter; an alert-channel failure must not crash the loop. Returns True iff

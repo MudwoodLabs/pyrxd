@@ -151,11 +151,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Fixes from the Mythos review of the PR (F1 to F6). `Decision` gains `situation` and `urgent`.
     `DedupAlerter` dedups and ACKs by intent and situation, so an ACK of the pending-refund page, the
     contradicting-sources page or the discovery-disagreement page no longer silences the claim race
-    (all are `PAGE_SQUEEZED`). After a second Mythos pass, every `PAGE_SQUEEZED` and `PAGE_CLAIM`
-    page carries a situation (claim race, reconcile error, unreadable record and the others), and an
-    ACK ends once a different situation is delivered. A situation keeps the highest severity it
-    paged at: one `urgent` tick keeps it CRITICAL, re-paged, until it is ACKed, and a tick that
-    reads it less urgent does not drop the ACK. The
+    (all are `PAGE_SQUEEZED`). After two more Mythos passes, every `PAGE_SQUEEZED`, `PAGE_CLAIM` and
+    `urgent` refund page carries a situation (claim race, reconcile error, unreadable record and the
+    others). `DedupAlerter` remembers each situation a swap paged: WARN and INFO page once per
+    situation, and an ACK holds for its situation until the swap's decision is quiet again
+    (`DedupAlerter.resolve`, called by the reconciler on WATCH and NOOP) or it retires, so a
+    one-tick read failure in between no longer ends it. Each CRITICAL page prints an `ack:` line;
+    the ACK inbox takes `<swap_id> <situation key>`, and a bare swap id ACKs only when the swap
+    paged a single CRITICAL situation since the drain before the last (`run.apply_acks`,
+    `DedupAlerter.end_ack_drain`). A situation keeps the highest severity it paged at: one
+    `urgent` tick keeps it CRITICAL, re-paged, until it is ACKed. The
     armed refund page no longer says the tower broadcasts: the reconciler appends what this tick's
     executor did. A refund page for an unspent HTLC near or past t_rxd is `urgent` (CRITICAL,
     re-paged) at `BTC_LOCKED`, `PARAMS_MISMATCH` and `BOTH_LOCKED`, and on a legacy record also when

@@ -149,14 +149,24 @@ pyrxd-watchtower-escalate \
 ```
 
 Acknowledging a CRITICAL page is a one-liner — it is what stops the re-paging *and* the escalation.
-An ACK covers the situation it was paged for. The pending-refund, contradicting-sources and
-discovery-disagreement pages are each their own situation, so the claim race still pages after an ACK
-of one of them. Every CRITICAL page is its own situation in the same way (the claim race, a reconcile
-error, an unreadable record, and the others), and an ACK ends once the tower delivers a different
-page for that swap, so the earlier one pages again if it comes back. A situation that paged CRITICAL
-once stays CRITICAL, re-paged, until you ACK it, even on a tick that reads it less urgent; the ACK
-holds across such ticks. On an armed refund page the situation includes what the executor did, so a
-re-broadcast that FAILED after one that went out pages again:
+An ACK covers the situation it was paged for. Every page that can be CRITICAL is its own situation
+(the claim race, the pending refund, a reconcile error, an unreadable record, each urgent refund page,
+and the others), so an ACK of one never silences another. Each CRITICAL page ends with an `ack:` line
+naming the swap and the situation; append that line to the inbox:
+
+```bash
+echo "<swap_id> <situation key>" >> /run/wt/acks   # copy it from the page's "ack:" line
+```
+
+A bare swap id also works, but only when that swap has paged a single CRITICAL situation since the
+drain before the last one. Otherwise the tower cannot tell which page you meant, so it logs the ACK as
+ignored and keeps paging. An ACK holds while the swap stays in paged situations: a one-tick read
+failure or a different page in between does not end it. It ends once the swap's decision is quiet
+again (nothing to page) or the swap retires, so the same danger coming back later pages again. A
+situation that paged CRITICAL once stays CRITICAL, re-paged, until you ACK it, even on a tick that
+reads it less urgent. WARN and INFO pages go out once per situation for the swap. On an armed refund
+page the situation includes what the executor did, so a re-broadcast that FAILED after one that went
+out pages once more:
 
 ```bash
 echo <swap_id> >> /run/wt/acks
@@ -400,7 +410,7 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
 
   | Page | Meaning | What to do |
   |---|---|---|
-  | `CRITICAL … UNACKNOWLEDGED for Ns` | The tower is alive and paging; nobody has ACK'd. | Check the primary channel, act on the swap, `echo <swap_id> >> $ACK_INBOX`. |
+  | `CRITICAL … UNACKNOWLEDGED for Ns` | The tower is alive and paging; nobody has ACK'd. | Check the primary channel, act on the swap, append the page's `ack:` line (`echo "<swap_id> <situation key>" >> $ACK_INBOX`). |
   | `CRITICAL (blind) …` | The heartbeat carries no usable count (`-1` sentinel, missing key, or an unknown `schema_version`). | Fix the tower's wiring. Until then the escalation path is **not** protecting you — watch in-flight swaps by hand. |
   | `WARN … monitor is BLIND` | The heartbeat is stale/absent/future-dated. Sent **once** per episode. | Nothing new: the dead-man's-switch owns this alarm. The WARN doubles as proof this channel still works. |
   | `INFO escalation cleared` | `unacked_critical` is back to zero. | Nothing. |

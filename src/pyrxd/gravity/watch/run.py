@@ -892,8 +892,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # would latch on forever. See FileAckInbox in gravity/watch/alerts.py.
     p.add_argument(
         "--ack-inbox",
-        help="operator ACK inbox: append a swap_id per line (e.g. `echo <swap_id> >> FILE`) to "
-        "acknowledge its CRITICAL page. Drained once per tick; suppresses re-paging for that "
+        help="operator ACK inbox: append the CRITICAL page's ack: line, the swap_id and its situation "
+        "key (e.g. `echo '<swap_id> <key>' >> FILE`); a bare swap_id works only when that swap paged "
+        "one CRITICAL situation lately. Drained once per tick; suppresses re-paging for that "
         "exact situation and drops it from the heartbeat's unacked_critical count. MUST be a "
         "0600 regular file you own (create it with `install -m 600 /dev/null FILE`) — anyone "
         "who can write it can silence a claim-race page.",
@@ -987,6 +988,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = _build_parser().parse_args(argv)
     setattr(args, _SUPPLIED_ATTR, _supplied_policy_flags(argv))
     return args
+
+
+def apply_acks(alerter: AckingAlerter, lines: list[str]) -> None:
+    """Apply drained ACK-inbox lines (``<swap_id>`` or ``<swap_id> <situation key>``), then mark the
+    drain so the alerter's bare-id rule starts a new interval (third Mythos pass, F2)."""
+    for line in lines:
+        swap_id, _, key = line.partition(" ")
+        if not alerter.ack(swap_id, key or None):
+            # ACKs are inert for an unknown/uncritical swap, and a bare id is refused when the swap
+            # paged more than one CRITICAL situation lately (DedupAlerter.ack records nothing), but say
+            # so: it is an operator typo, an ambiguous ACK on a time-critical page, or someone probing
+            # the inbox to silence one.
+            logger.warning(
+                "ACK %r ignored — no CRITICAL situation it names unambiguously; "
+                "write the page's ack: line (swap id and situation key)",
+                line,
+            )
+    end = getattr(alerter, "end_ack_drain", None)
+    if callable(end):
+        end()
 
 
 def _require_acking_alerter(alerter: object, ack_inbox: str) -> AckingAlerter:
@@ -1131,12 +1152,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
             ack_inbox = FileAckInbox(args.ack_inbox)
 
             def _drain_acks() -> None:
-                for swap_id in ack_inbox.drain():
-                    if not acking_alerter.ack(swap_id):
-                        # ACKs are inert for an unknown/uncritical swap (DedupAlerter.ack records
-                        # nothing), but say so: it is either an operator typo on a time-critical
-                        # page, or someone probing the inbox to silence one.
-                        logger.warning("ACK for %r ignored — no live CRITICAL situation with that swap id", swap_id)
+                apply_acks(acking_alerter, ack_inbox.drain())
 
             on_tick_start = _drain_acks
 

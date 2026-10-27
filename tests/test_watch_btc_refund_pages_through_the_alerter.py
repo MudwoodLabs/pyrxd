@@ -27,6 +27,7 @@ from pyrxd.gravity.swap_state import SwapState
 from pyrxd.gravity.watch.adapters import OutspendBtcClaimSource
 from pyrxd.gravity.watch.alerts import DedupAlerter, Severity
 from pyrxd.gravity.watch.decide import (
+    SITUATION_BOTH_LOCKED_REFUND_DUE,
     SITUATION_BOTH_LOCKED_REFUND_RUNNABLE,
     SITUATION_BTC_DISCOVERY_DISAGREES,
     SITUATION_BTC_REFUND_PENDING,
@@ -204,7 +205,8 @@ async def test_both_locked_refund_due_is_urgent_once_t_rxd_has_matured(tmp_path)
     assert d.situation == SITUATION_BOTH_LOCKED_REFUND_RUNNABLE and "t_rxd has matured" in d.reason
     _near(w, past=2)  # one block before t_rxd: due (inside the window) but not runnable
     early = await w.decide()
-    assert early.intent is Intent.PAGE_REFUND and early.urgent is False and early.situation is None
+    assert early.intent is Intent.PAGE_REFUND and early.urgent is False
+    assert early.situation == SITUATION_BOTH_LOCKED_REFUND_DUE
 
 
 async def test_params_mismatch_matured_near_t_rxd_is_urgent(tmp_path):
@@ -571,8 +573,9 @@ async def test_an_ack_of_a_reconcile_error_does_not_silence_the_claim_race(tmp_p
     assert alerter.unacked_critical_count() == 1
 
 
-async def test_an_ack_of_the_claim_race_does_not_silence_a_reconcile_error_then_the_race_again(tmp_path):
-    """The reverse, and L2: after the reconcile error is delivered, the claim race's ACK is over."""
+async def test_an_ack_of_the_claim_race_does_not_silence_a_reconcile_error_and_holds_across_it(tmp_path):
+    """The reverse. The claim race's ACK holds across the one-tick error (third Mythos pass, F1, F4),
+    which reverses the second pass's L2 rule: that one let a blip re-arm escalation."""
     w = _Tower(tmp_path)
     flaky = _FlakyObserver(w.observer)
     w.observer = flaky
@@ -587,8 +590,8 @@ async def test_an_ack_of_the_claim_race_does_not_silence_a_reconcile_error_then_
     assert len(ch.sent) == 2, "the ACK of the claim race silenced the reconcile error"
     flaky.fail = False
     await rec.tick()
-    assert len(ch.sent) == 3, "the claim race stayed ACKed across a different page"
-    assert alerter.unacked_critical_count() == 1
+    assert len(ch.sent) == 2, "the ACK of the claim race ended at a one-tick error"
+    assert alerter.unacked_critical_count() == 0
 
 
 async def test_an_ack_holds_while_the_reconcile_error_repeats(tmp_path):
@@ -610,16 +613,22 @@ def _squeeze(tag: str) -> Decision:
     return Decision(Intent.PAGE_SQUEEZED, reason=tag, situation=tag)
 
 
-async def test_an_ack_ends_once_a_different_situation_is_delivered():
-    """L2: A ACKed, then B, then A again pages A again."""
+async def test_an_ack_holds_across_other_pages_and_ends_when_the_swap_is_quiet():
+    """Third Mythos pass, F1 and F4: A ACKed, then B, then A is still ACKed, and alternating A and B
+    page only B until B is ACKed. Once the swap's decision is quiet (a WATCH), A's ACK is over."""
     alerter, ch = _alerter()
     await alerter.handle(SWAP, _squeeze("a"))
     assert alerter.ack(SWAP) is True
-    await alerter.handle(SWAP, _squeeze("b"))
+    for tag in ["b", "a", "b", "a"]:
+        await alerter.handle(SWAP, _squeeze(tag))
+    assert [p.message.split(": ", 1)[1].split(" |")[0] for p in ch.sent] == ["a", "b", "b"]
+    assert alerter.ack(SWAP, "page_squeezed:b") is True
+    for tag in ["b", "a", "b", "a"]:
+        await alerter.handle(SWAP, _squeeze(tag))
+    assert len(ch.sent) == 3 and alerter.unacked_critical_count() == 0
+    alerter.resolve(SWAP)  # the reconciler's WATCH
     await alerter.handle(SWAP, _squeeze("a"))
-    assert [p.message.split(": ", 1)[1] for p in ch.sent] == ["a", "b", "a"]
-    await alerter.handle(SWAP, _squeeze("a"))
-    assert len(ch.sent) == 4, "A came back un-ACKed but does not re-page"
+    assert len(ch.sent) == 4, "the danger came back after a quiet tick, and its old ACK silenced it"
     assert alerter.unacked_critical_count() == 1
 
 
@@ -729,3 +738,156 @@ async def test_one_sources_buried_refund_beside_a_claim_on_record_still_says_ref
     ok = await h.decide()
     assert ok.intent is Intent.PAGE_CLAIM and " is buried" in ok.reason
     assert "refund the BTC if" not in ok.reason
+
+
+# --------------------------------------------------------------------------- third Mythos pass (3b99919)
+
+
+class _Degrading:
+    """The production observer; while ``degraded`` the funding depth reads as unknown (2 of 3 BTC
+    sources timed out for a tick)."""
+
+    def __init__(self, inner: ChainObserver) -> None:
+        self._inner = inner
+        self.degraded = False
+
+    async def observe(self, swap_id, record):
+        obs = await self._inner.observe(swap_id, record)
+        return dataclasses.replace(obs, btc_funding_confirmations=None) if self.degraded else obs
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH])
+@pytest.mark.parametrize("blip", [True, False], ids=["blip", "control"])
+async def test_one_degraded_read_does_not_end_the_ack_of_the_urgent_refund_page(tmp_path, state, blip):
+    """F1: the ACKed refund page came back un-ACKed after one tick with the funding depth unread,
+    re-paged every tick, and re-armed escalation."""
+    w = _Tower(tmp_path, state=state)
+    _near(w)
+    deg = _Degrading(w.observer)
+    w.observer = deg
+    alerter, ch = _alerter()
+    rec = w.reconciler(alerter=alerter)
+    (first,) = await rec.tick()
+    assert first.decision.urgent is True and ch.sent[0].severity is Severity.CRITICAL
+    assert alerter.ack(SWAP) is True
+    deg.degraded = blip
+    await rec.tick()
+    deg.degraded = False
+    for _ in range(3):
+        await rec.tick()
+    assert alerter.unacked_critical_count() == 0, "the operator's ACK was dropped by a one-tick read failure"
+    # The blip changes the page (the refund is no longer armed while the depth is unread), so it is
+    # news and sent once; the ACKed page is not sent again after it.
+    assert len(ch.sent) == (2 if blip else 1)
+
+
+async def test_a_bare_ack_written_for_an_earlier_page_does_not_land_on_a_newer_one():
+    """F2: a reconcile error paged, the operator wrote a bare ACK, the claim race paged before the
+    drain, and the drain ACKed the claim race."""
+    alerter, ch = _alerter()
+    error = Decision(Intent.PAGE_SQUEEZED, reason="reconcile error", situation="reconcile_error")
+    race = Decision(Intent.PAGE_SQUEEZED, reason="maker revealed p", situation=SITUATION_CLAIM_RACE)
+    await alerter.handle(SWAP, error)
+    alerter.end_ack_drain()  # a drain with nothing in the inbox
+    await alerter.handle(SWAP, race)
+    assert alerter.ack(SWAP) is False, "a bare id bound to a page the operator may not have seen"
+    alerter.end_ack_drain()
+    await alerter.handle(SWAP, race)
+    assert len(ch.sent) == 3 and alerter.unacked_critical_count() == 1
+    # The ack: line the page printed names the situation, so it ACKs exactly that one.
+    assert ch.sent[1].message.endswith(f"ack: {SWAP} page_squeezed:claim_race")
+    assert alerter.ack(SWAP, "page_squeezed:reconcile_error") is True
+    assert alerter.unacked_critical_count() == 1, "an ACK of the error silenced the race"
+    assert alerter.ack(SWAP, "page_squeezed:claim_race") is True
+    assert alerter.unacked_critical_count() == 0
+    assert alerter.ack(SWAP, "page_claim:claim_race") is False, "a key the swap never paged ACKs nothing"
+
+
+async def test_a_bare_ack_of_the_only_page_still_works():
+    """The honest twin: one page, a bare ACK at the next drain."""
+    alerter, ch = _alerter()
+    race = Decision(Intent.PAGE_SQUEEZED, reason="maker revealed p", situation=SITUATION_CLAIM_RACE)
+    await alerter.handle(SWAP, race)
+    from pyrxd.gravity.watch.run import apply_acks
+
+    apply_acks(alerter, [SWAP])
+    for _ in range(3):
+        await alerter.handle(SWAP, race)
+    assert len(ch.sent) == 1 and alerter.unacked_critical_count() == 0
+
+
+async def test_the_inbox_line_with_a_key_reaches_the_alerter(tmp_path):
+    """The shipped drain splits ``<swap_id> <key>`` and passes both."""
+    from pyrxd.gravity.watch.alerts import FileAckInbox
+    from pyrxd.gravity.watch.run import apply_acks
+
+    alerter, _ = _alerter()
+    await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="e", situation="reconcile_error"))
+    await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="r", situation=SITUATION_CLAIM_RACE))
+    path = tmp_path / "acks"
+    path.write_text(f"{SWAP}\n{SWAP} page_squeezed:claim_race\n")
+    path.chmod(0o600)
+    apply_acks(alerter, FileAckInbox(path).drain())
+    assert alerter.unacked_critical_count() == 0
+
+
+async def test_a_quiet_tick_takes_a_page_off_the_escalation_count(tmp_path):
+    """F3: after a one-tick outage paged CRITICAL and the swap went back to WATCH, the count stayed 1."""
+    w = _Tower(tmp_path)
+    _near(w)
+    deg = _Degrading(w.observer)
+    w.observer = deg
+    alerter, _ = _alerter()
+    rec = w.reconciler(alerter=alerter)
+    w.rxd.cov_confs = None  # the covenant's lock height unread too: only the record's pin is known
+    deg.degraded = True
+    (res,) = await rec.tick()
+    assert res.decision.situation == "btc_refund_maturity_unread" and "could not be read" in res.decision.reason
+    assert "t_rxd is near or past" not in res.decision.reason
+    assert alerter.unacked_critical_count() == 1
+    # Both reads back, far from t_rxd: the swap is not urgent, its funding not yet matured.
+    _at(w, LOCKED_AT + 5)
+    deg.degraded = False
+    w.write(dataclasses.replace(w.record(), state=SwapState.BOTH_LOCKED))
+    (quiet,) = await rec.tick()
+    assert quiet.decision.intent is Intent.WATCH, quiet.decision.reason
+    assert alerter.unacked_critical_count() == 0
+
+
+async def test_alternating_outcomes_page_each_warn_once(tmp_path):
+    """F5: BROADCAST and FAILED alternating paged a WARN every tick."""
+    w = _Tower(tmp_path)
+    alerter, ch = _alerter()
+    outcomes = [ExecOutcome.BROADCAST, ExecOutcome.FAILED] * 3
+    rec = w.reconciler(alerter=alerter, executor=_Outcomes(*outcomes))
+    for _ in outcomes:
+        await rec.tick()
+    assert len(ch.sent) == 2
+
+
+def test_every_refund_page_that_can_turn_critical_names_its_situation():
+    """F6: four urgent refund pages were CRITICAL with no situation, and the scan took its intents
+    from ``_SEVERITY``, which has PAGE_REFUND as WARN. Any ``urgent=`` that is not a literal False
+    counts, and a tag that can be None does not."""
+    import ast
+    import importlib
+    import pathlib
+
+    root = pathlib.Path(importlib.import_module("pyrxd.gravity.watch.decide").__file__).parent
+    urgent_sites, bad = [], []
+    for path in sorted(root.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (
+                isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) == "Decision"
+            ):
+                continue
+            kws = {k.arg: k.value for k in node.keywords if k.arg}
+            urgent = kws.get("urgent")
+            if urgent is None or (isinstance(urgent, ast.Constant) and urgent.value is False):
+                continue
+            urgent_sites.append((path.name, node.lineno))
+            tag = kws.get("situation")
+            if tag is None or any(isinstance(n, ast.Constant) and n.value is None for n in ast.walk(tag)):
+                bad.append((path.name, node.lineno))
+    assert len(urgent_sites) >= 6, urgent_sites
+    assert bad == [], f"urgent refund pages without a definite situation: {bad}"

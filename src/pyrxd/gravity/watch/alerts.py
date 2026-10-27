@@ -11,8 +11,9 @@ daemon shell's job — the :class:`AlertChannel` port is where the shell plugs t
 (authenticated) channel in. v1 never broadcasts a transaction; a Page is a
 notification to the operator, who runs the named step.
 
-Dedup is by ``(swap_id, intent)``: ``_last`` is updated only AFTER a successful send,
-so a transient channel failure is retried on the next tick rather than silently lost.
+Dedup is by swap and situation (the intent and the decision's ``situation`` tag); a page is
+recorded only AFTER a successful send, so a transient channel failure is retried on the next
+tick rather than silently lost.
 
 Time-critical CRITICAL intents (``PAGE_CLAIM`` / ``PAGE_SQUEEZED``) are the exception to
 "page once per situation": a single missed page on a claim/squeeze race silently loses
@@ -96,7 +97,12 @@ class AckingAlerter(Protocol):
     :class:`DedupAlerter` satisfies it.
     """
 
-    def ack(self, swap_id: str) -> bool: ...
+    def ack(self, swap_id: str, situation_key: str | None = None) -> bool: ...
+
+
+def _situation_key(intent: Intent, situation: str | None) -> str:
+    """The text an operator writes after the swap id to ACK one situation (third Mythos pass, F2)."""
+    return intent.value if situation is None else f"{intent.value}:{situation}"
 
 
 def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
@@ -107,15 +113,16 @@ def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
         parts.append(f"by RXD height {decision.deadline_rxd_height}")
     if decision.low_corroboration:
         parts.append("(LOW CORROBORATION — single-source RXD or BTC read; verify before acting)")
+    if severity is Severity.CRITICAL:
+        parts.append(f"ack: {swap_id} {_situation_key(decision.intent, decision.situation)}")
     return " | ".join(parts)
 
 
 #: What one swap's page is about, for dedup and ACK: its intent and the decision's ``situation`` tag.
 #: Two decisions with the same intent but a different tag are different situations (#850 PR 9b,
-#: Mythos F1). Severity is not part of it: a situation that once paged CRITICAL stays CRITICAL while it
-#: lasts, so one ``urgent`` tick keeps it CRITICAL, re-paged, until it is ACKed or changes, and a tick
-#: that reads it less urgent neither pages again nor drops the ACK (re-review of the F3 fix; second
-#: Mythos pass, L1). An ACK lasts until a different situation is delivered for the swap (L2).
+#: Mythos F1). Severity is not part of it: a situation that once paged CRITICAL stays CRITICAL for the
+#: swap, so one ``urgent`` tick keeps it CRITICAL, re-paged, until it is ACKed, and a tick that reads it
+#: less urgent neither pages again nor drops the ACK (re-review of the F3 fix; second Mythos pass, L1).
 _Situation = tuple[Intent, "str | None"]
 
 
@@ -128,8 +135,19 @@ def _severity(decision: Decision) -> Severity | None:
 
 class DedupAlerter:
     """Routes actionable Decisions to an :class:`AlertChannel`, de-duplicated by swap and
-    situation (intent, ``situation`` tag, severity). Satisfies the reconciler's ``Alerter``
-    port structurally."""
+    situation (intent and ``situation`` tag). Satisfies the reconciler's ``Alerter`` port
+    structurally.
+
+    Per swap it remembers every situation it has paged and the highest severity each paged at
+    (third Mythos pass, F4 and F5):
+
+    * a WARN or INFO situation pages once, even when the swap alternates between two of them;
+    * a CRITICAL situation re-pages on the backoff while it is live, unless the operator ACKed it;
+    * an ACK holds for its situation while the swap stays in paged situations, so a different page
+      in between (a one-tick read failure, an alternating error) neither ends it nor re-arms
+      escalation (F1, F4). It ends when the swap's decision is quiet again (:meth:`resolve`, a WATCH)
+      or the swap retires, so the same danger coming back later pages again.
+    """
 
     def __init__(self, *, channel: AlertChannel, repage_critical_every_ticks: int = 1) -> None:
         if (
@@ -139,31 +157,66 @@ class DedupAlerter:
         ):
             raise ValidationError("repage_critical_every_ticks must be an int >= 1")
         self._channel = channel
-        # swap_id -> (its live situation, the highest severity that situation has paged at).
-        self._last: dict[str, tuple[_Situation, Severity]] = {}
+        # swap_id -> its live situation (the last one handed to handle(); None after resolve()).
+        self._live: dict[str, _Situation] = {}
+        # swap_id -> {situation: the highest severity it has paged at}.
+        self._paged: dict[str, dict[_Situation, Severity]] = {}
         # Ticks (handle() calls) a CRITICAL situation has persisted since its last successful
-        # page — the re-page backoff counter (review MEDIUM). Keyed by swap_id because a swap
-        # has exactly one live intent per tick. Reset to 0 after each (re)page.
+        # page — the re-page backoff counter (review MEDIUM). Reset to 0 after each (re)page.
         self._critical_ticks: dict[str, int] = {}
-        # Operator-ACK'd CRITICAL situations: swap_id -> the exact CRITICAL situation acknowledged.
-        # An ACK suppresses re-paging for THAT situation (the operator is handling it) and drops
-        # it from unacked_critical_count(); a DIFFERENT/escalated situation re-arms paging.
-        self._acked: dict[str, _Situation] = {}
+        # Operator-ACK'd CRITICAL situations per swap. An ACK suppresses re-paging for THAT
+        # situation and drops it from unacked_critical_count().
+        self._acked: dict[str, set[_Situation]] = {}
+        # CRITICAL situations sent per swap since the previous inbox drain, and in the interval
+        # before it: a bare-id ACK binds only when they name one situation (F2).
+        self._sent_now: dict[str, set[_Situation]] = {}
+        self._sent_before: dict[str, set[_Situation]] = {}
         self._repage_every = repage_critical_every_ticks
 
-    def ack(self, swap_id: str) -> bool:
-        """Operator acknowledgement of a swap's current CRITICAL page (claim/squeeze race).
+    def _live_critical(self, swap_id: str) -> _Situation | None:
+        live = self._live.get(swap_id)
+        if live is None or self._paged.get(swap_id, {}).get(live) is not Severity.CRITICAL:
+            return None
+        return live
 
-        Suppresses further re-pages for that exact situation and removes it from
-        :meth:`unacked_critical_count`. Only a live CRITICAL situation is ack-able (WARN/INFO
-        page once anyway). Returns True if an ACK was recorded, False if there was nothing
-        CRITICAL to ack. An escalation to a different CRITICAL intent re-arms paging.
+    def ack(self, swap_id: str, situation_key: str | None = None) -> bool:
+        """Operator acknowledgement of one of a swap's CRITICAL pages.
+
+        With ``situation_key`` (the text after the swap id on the page's ``ack:`` line) it ACKs
+        that situation, if the swap has paged it CRITICAL. A bare swap id ACKs the live CRITICAL
+        situation only when it is the only CRITICAL situation the swap has paged since the drain
+        before the previous one; otherwise the operator may have meant an earlier page, so nothing
+        is recorded and the pages keep firing (third Mythos pass, F2). Returns True if an ACK was
+        recorded.
         """
-        last = self._last.get(swap_id)
-        if last is not None and last[1] is Severity.CRITICAL:
-            self._acked[swap_id] = last[0]
-            return True
-        return False
+        paged = self._paged.get(swap_id, {})
+        if situation_key is not None:
+            for situation, severity in paged.items():
+                if severity is Severity.CRITICAL and _situation_key(*situation) == situation_key:
+                    self._acked.setdefault(swap_id, set()).add(situation)
+                    return True
+            return False
+        live = self._live_critical(swap_id)
+        if live is None:
+            return False
+        recent = self._sent_now.get(swap_id, set()) | self._sent_before.get(swap_id, set())
+        if recent - {live}:
+            return False
+        self._acked.setdefault(swap_id, set()).add(live)
+        return True
+
+    def end_ack_drain(self) -> None:
+        """Mark an ACK-inbox drain (call it after applying the drained ACKs): starts a new interval
+        for the bare-id rule in :meth:`ack`."""
+        self._sent_before = self._sent_now
+        self._sent_now = {}
+
+    def resolve(self, swap_id: str) -> None:
+        """The swap's decision is quiet this tick (WATCH or NOOP): nothing is live for it, so it
+        leaves the escalation count, and its ACKs end with the dangers they covered (F1, F3)."""
+        self._live.pop(swap_id, None)
+        self._acked.pop(swap_id, None)
+        self._critical_ticks.pop(swap_id, None)
 
     def unacked_critical_count(self) -> int:
         """Number of swaps currently in a paged CRITICAL situation the operator has NOT ACK'd.
@@ -172,11 +225,12 @@ class DedupAlerter:
         means time-critical claim/squeeze pages are outstanding and unacknowledged, so an external
         monitor / second channel can escalate beyond the primary page channel.
         """
-        return sum(
-            1
-            for sid, (situation, severity) in self._last.items()
-            if severity is Severity.CRITICAL and self._acked.get(sid) != situation
-        )
+        count = 0
+        for sid in self._live:
+            live = self._live_critical(sid)
+            if live is not None and live not in self._acked.get(sid, set()):
+                count += 1
+        return count
 
     async def handle(self, swap_id: str, decision: Decision) -> None:
         if not isinstance(decision, Decision):
@@ -187,32 +241,34 @@ class DedupAlerter:
             # WATCH / NOOP — not an alertable event (the reconciler shouldn't route these,
             # but stay defensive rather than paging noise).
             return
+        situation: _Situation = (intent, decision.situation)
         if intent is Intent.RETIRE:
-            # The swap is done — clear its re-page backoff + ACK state so they cannot leak or
-            # mis-count a future swap reusing the id. The INFO "done" page still dedups via _last.
+            # The swap is done — clear its state so it cannot leak or mis-count a future swap
+            # reusing the id. The INFO "done" page still dedups below.
+            done = self._paged.get(swap_id, {}).get(situation)
             self._critical_ticks.pop(swap_id, None)
             self._acked.pop(swap_id, None)
-        situation: _Situation = (intent, decision.situation)
-        last = self._last.get(swap_id)
-        if (
-            last is not None
-            and last[0] == situation
-            and not (severity is Severity.CRITICAL and last[1] is not Severity.CRITICAL)
-        ):
-            # Same situation still live, at no higher severity than it paged at (an escalation to
-            # CRITICAL pages at once). WARN/INFO page once. A CRITICAL (claim/squeeze) race
-            # RE-PAGES on the tick-count backoff so a single missed page cannot silently lose
-            # funds (review MEDIUM), and stays CRITICAL on a tick that reads it less urgent —
-            # unless the operator ACK'd this exact situation (they are handling it), then stay
-            # quiet until it changes.
-            severity = last[1]
+            self._sent_now.pop(swap_id, None)
+            self._sent_before.pop(swap_id, None)
+            self._paged[swap_id] = {} if done is None else {situation: done}
+        before = self._paged.get(swap_id, {}).get(situation)
+        was_live = self._live.get(swap_id) == situation
+        self._live[swap_id] = situation
+        if before is not None and not (severity is Severity.CRITICAL and before is not Severity.CRITICAL):
+            # Paged before, at no lower severity (an escalation to CRITICAL pages at once). WARN/INFO
+            # page once per situation. A CRITICAL (claim/squeeze) race RE-PAGES on the tick-count
+            # backoff so a single missed page cannot silently lose funds (review MEDIUM), unless the
+            # operator ACK'd it (they are handling it); one that comes back from another situation
+            # re-pages at once.
+            severity = before
             if severity is not Severity.CRITICAL:
                 return
-            if self._acked.get(swap_id) == situation:
+            if situation in self._acked.get(swap_id, set()):
                 return
-            self._critical_ticks[swap_id] = self._critical_ticks.get(swap_id, 0) + 1
-            if self._critical_ticks[swap_id] < self._repage_every:
-                return
+            if was_live:
+                self._critical_ticks[swap_id] = self._critical_ticks.get(swap_id, 0) + 1
+                if self._critical_ticks[swap_id] < self._repage_every:
+                    return
         page = Page(
             swap_id=swap_id,
             intent=intent,
@@ -225,18 +281,17 @@ class DedupAlerter:
         # Send first; record dedup state only on success so a transient channel failure
         # is retried next tick rather than silently swallowed.
         await self._channel.send(page)
-        self._last[swap_id] = (situation, severity)
-        if self._acked.get(swap_id) not in (None, situation):
-            # A different situation was delivered: the ACK ended with the one it was made for, so
-            # that one pages again if it comes back (second Mythos pass, L2).
-            self._acked.pop(swap_id, None)
+        self._paged.setdefault(swap_id, {})[situation] = severity
+        if severity is Severity.CRITICAL:
+            self._sent_now.setdefault(swap_id, set()).add(situation)
         self._critical_ticks[swap_id] = 0  # reset the re-page backoff after a successful (re)page
 
 
-#: A drained ACK id must look like a swap id — the records store keys swaps by a JSON file
-#: stem, so this is deliberately filename-shaped. Anything else is a typo or a probe, and is
-#: dropped before it ever reaches :meth:`DedupAlerter.ack`.
-_ACK_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
+#: A drained ACK line: a swap id, optionally followed by the situation key the page printed on its
+#: ``ack:`` line (third Mythos pass, F2). The records store keys swaps by a JSON file stem, so the
+#: id is deliberately filename-shaped. Anything else is a typo or a probe, and is dropped before it
+#: ever reaches :meth:`DedupAlerter.ack`.
+_ACK_LINE_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}(?: [a-z_]{1,32}(?::[A-Za-z0-9._:-]{1,96})?)?\Z")
 
 #: Ceiling on one drain. The drain runs on the daemon's ``on_tick_start`` hook, which fires
 #: OUTSIDE the per-tick watchdog (``daemon.run_loop`` calls it before ``asyncio.wait_for``),
@@ -248,11 +303,12 @@ MAX_ACK_INBOX_BYTES = 64 * 1024
 class FileAckInbox:
     """Operator → watchtower ACK transport (the mirror of :class:`FileHeartbeat`).
 
-    The operator acknowledges a paged CRITICAL situation by appending the swap_id (one per
-    line) to a file — e.g. ``echo <swap_id> >> $WATCHTOWER_ACKS``. The daemon shell drains
-    this inbox once per tick (wire it as ``run_loop(on_tick_start=...)``) and calls
-    :meth:`DedupAlerter.ack` for each id, so re-paging for that situation stops and the
-    un-ACK'd CRITICAL count drops.
+    The operator acknowledges a paged CRITICAL situation by appending the page's ``ack:`` line
+    (the swap id and the situation key, one per line) to a file — e.g.
+    ``echo "<swap_id> <key>" >> $WATCHTOWER_ACKS``. A bare swap id still works when it is
+    unambiguous (:meth:`DedupAlerter.ack`). The daemon shell drains this inbox once per tick
+    (wire it as ``run_loop(on_tick_start=...)``) and calls :meth:`DedupAlerter.ack` for each
+    line, so re-paging for that situation stops and the un-ACK'd CRITICAL count drops.
 
     :meth:`drain` is atomic against a concurrent appender: it renames the inbox aside before
     reading, so ids appended during the read land in a fresh file and are consumed next tick
@@ -274,10 +330,10 @@ class FileAckInbox:
     * **lossy decode** — decoded with ``errors="replace"``. A strict decode would raise
       *after* the ``os.replace`` had already claimed the file, and the ``finally: unlink``
       would then destroy every pending ACK because of one bad byte. The mangled line simply
-      fails :data:`_ACK_ID_RE` and is dropped.
+      fails :data:`_ACK_LINE_RE` and is dropped.
 
-    Ids that do not match :data:`_ACK_ID_RE` are dropped here; ids that match but name no
-    live CRITICAL situation are already inert (:meth:`DedupAlerter.ack` returns ``False``
+    Lines that do not match :data:`_ACK_LINE_RE` are dropped here; lines that match but name no
+    CRITICAL situation are already inert (:meth:`DedupAlerter.ack` returns ``False``
     without recording anything).
     """
 
@@ -304,10 +360,10 @@ class FileAckInbox:
             return []
         ids: list[str] = []
         for line in content.splitlines():
-            candidate = line.strip()
+            candidate = " ".join(line.split())
             if not candidate:
                 continue
-            if not _ACK_ID_RE.match(candidate):
+            if not _ACK_LINE_RE.match(candidate):
                 logger.warning("ACK inbox %s: dropping malformed swap id (%d chars)", self._path, len(candidate))
                 continue
             ids.append(candidate)

@@ -617,6 +617,14 @@ SITUATION_LEGACY_UNCLASSIFIED_SPEND = "legacy_unclassified_spend"
 #: t_rxd has matured, and an HTLC near t_rxd whose refund maturity the tower could not read.
 SITUATION_BOTH_LOCKED_REFUND_RUNNABLE = "both_locked_refund_runnable"
 SITUATION_BTC_REFUND_MATURITY_UNREAD = "btc_refund_maturity_unread"
+#: The other refund pages that can turn CRITICAL (``urgent``): each names its own situation too, so no
+#: two of them share an ACK (third Mythos pass, F6), and the BOTH_LOCKED page inside the window is
+#: distinct from an earlier refund page on the same record (F7).
+SITUATION_BTC_REFUND_DUE = "btc_refund_due"
+SITUATION_PARAMS_MISMATCH_REFUND = "params_mismatch_refund"
+SITUATION_BOTH_LOCKED_REFUND_DUE = "both_locked_refund_due"
+SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE = "both_locked_refund_unevaluable"
+SITUATION_LEGACY_BTC_UNSPENT = "legacy_btc_unspent"
 #: Prefix of an armed refund page's situation; the reconciler appends this tick's executor outcome,
 #: so a FAILED broadcast after a BROADCAST pages again (second Mythos pass, M3).
 SITUATION_ARMED_BTC_REFUND = "armed_btc_refund"
@@ -947,6 +955,7 @@ def decide(
             # A maturity the tower cannot read fails closed toward urgent (second Mythos pass, M2).
             urgent=(matured or _btc_refund_maturity_unread(terms, obs))
             and _t_rxd_near(record, obs, policy, safety_window_blocks),
+            situation=SITUATION_PARAMS_MISMATCH_REFUND,
         )
     # 3c. Maker stall (FSM finding #2, 2026-06-09). Recovery is mutual_refund, NOT the asset-only
     #     maybe_refund_asset_on_maker_stall — IDENTICALLY to the ETH branch (_decide_eth). The maker
@@ -997,7 +1006,10 @@ def decide(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
-                urgent=True,  # un-evaluable heights: fail closed toward urgent, as _t_rxd_near does
+                # Un-evaluable heights: fail closed toward urgent, as _t_rxd_near does. Deliberately
+                # without the t_rxd maturity check below, which needs the same heights (third pass, F7).
+                urgent=True,
+                situation=SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE,
             )
         if refund_due and record.role is RecordRole.MAKER:
             return _maker_covenant_refund(
@@ -1008,7 +1020,10 @@ def decide(
         if refund_due:
             # Urgent once t_rxd has matured: mutual_refund runs only after both timeouts, so a CRITICAL
             # page earlier would name a step the operator cannot run yet (second Mythos pass, L4). From
-            # then the maker can refund the covenant and still claim the BTC (Mythos F3).
+            # then the maker can refund the covenant and still claim the BTC (Mythos F3). t_btc is not
+            # read here (the observer reads no funding depth at BOTH_LOCKED): the swap was gated so the
+            # BTC refund opens first in wall-clock time, and the page text says to run the step once
+            # both have elapsed (third Mythos pass, F7).
             runnable = obs.now_rxd_height >= deadline
             return Decision(
                 Intent.PAGE_REFUND,
@@ -1022,7 +1037,7 @@ def decide(
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
                 urgent=runnable,
-                situation=SITUATION_BOTH_LOCKED_REFUND_RUNNABLE if runnable else None,
+                situation=SITUATION_BOTH_LOCKED_REFUND_RUNNABLE if runnable else SITUATION_BOTH_LOCKED_REFUND_DUE,
             )
         return Decision(
             Intent.WATCH,
@@ -1108,6 +1123,7 @@ def decide(
                 autonomous_btc_refund=armed,
                 low_corroboration=corr,
                 urgent=_t_rxd_near(record, obs, policy, safety_window_blocks),
+                situation=SITUATION_BTC_REFUND_DUE,
             )
         if matured:
             armed = _autonomy_allowed(record) and _btc_spend_permits_autonomy(obs)
@@ -1141,8 +1157,13 @@ def decide(
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=(
-                    "the maker's covenant is known and t_rxd is near or past, but this tower cannot tell whether "
-                    "the BTC refund leaf has matured ("
+                    (
+                        "the maker's covenant is known and t_rxd is near or past"
+                        if obs.asset_locked_at_height is not None
+                        else "the maker's covenant is pinned on the record, but its lock height could not be read "
+                        "this tick, so t_rxd may be near or past (failing toward this page)"
+                    )
+                    + ", and this tower cannot tell whether the BTC refund leaf has matured ("
                     + (
                         "the funding depth could not be read this tick"
                         if obs.btc_funding_confirmations is None
@@ -1623,6 +1644,7 @@ def decide_legacy(
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
                 urgent=not _covenant_known(record, obs) or _t_rxd_near(record, obs, policy, safety_window_blocks),
+                situation=SITUATION_LEGACY_BTC_UNSPENT,
             ),
             "unspent",
         )
