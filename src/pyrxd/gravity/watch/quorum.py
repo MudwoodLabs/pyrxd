@@ -38,6 +38,11 @@ from pyrxd.gravity.watch.reconciler import Observer
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight, Confirmations, Seconds
 
+#: At most this many unverified ETH claims have their verdict read per tick. The most-nominated are
+#: read first, so a liar that serves many fake logs (one nomination each) cannot push the claim the
+#: other endpoints serve past the cap.
+_MAX_ETH_VERDICT_READS = 8
+
 __all__ = [
     "BtcClaimSource",
     "BtcClaimStatus",
@@ -385,7 +390,9 @@ class ChainObserver(Observer):
         the record kept (``counter_claim_tx``) is not observed here: ``decide()`` reads it off the
         record on every tick, because the reader can return UNKNOWN before it collects any claim when
         one endpoint disagrees on an identity read. The verdict is read for the claim the reader
-        verified first, else the scan's, else the first one the read collected. A CLAIMED answer from
+        verified first; with none verified, for every claim an endpoint served and the scan's (FINAL if
+        any reads FINAL, un-assessable if any read fails), so no one endpoint's log picks the claim
+        whose verdict decides (Mythos F1). A CLAIMED answer from
         more than one endpoint is FINAL as it stands: it was verified at the agreed finalized block. Gap B (CLAIMED with no transaction) has no other verdict to read.
 
         A8 / RF-06 across-time stall: the point-in-time verdict is the fast path and unchanged; when the
@@ -431,6 +438,20 @@ class ChainObserver(Observer):
                 verified.insert(0, evidence.tx_hash)
             if verified:
                 claim_tx = verified[0]
+            elif not claimed:
+                # Nothing verified: no one endpoint's log may choose the claim whose verdict is read. A
+                # lying primary that serves a Claimed log of its own on a transaction no chain holds,
+                # first in the scan, used to hold a final claim at "not yet final" (Mythos F1, PR 10).
+                # Read every claim an endpoint served, the most-nominated first, then the scan's.
+                ranked = sorted(claims, key=lambda c: -len(c.nominated_by))
+                candidates = list(dict.fromkeys([c.tx_hash for c in ranked] + ([scanned] if scanned else [])))
+                if candidates:
+                    finality = await self._eth_best_verdict(candidates[:_MAX_ETH_VERDICT_READS])
+                    if finality is None or finality.state is CounterClaimState.FINAL:
+                        state = None if finality is None else finality.state
+                        return {"eth_claim_detected": True, "eth_claim_finality": state, **fields}
+                    verdict = await self._upgrade_eth_stall(swap_id, finality)
+                    return {"eth_claim_detected": True, "eth_claim_finality": verdict.state, **fields}
             elif scanned is None and claims:
                 claim_tx = claims[0].tx_hash
             if claimed and not disposition.single_source:
@@ -450,6 +471,25 @@ class ChainObserver(Observer):
             return {"eth_claim_detected": True, "eth_claim_finality": None, **fields}
         verdict = await self._upgrade_eth_stall(swap_id, verdict)
         return {"eth_claim_detected": True, "eth_claim_finality": verdict.state, **fields}
+
+    async def _eth_best_verdict(self, claim_txs: list[str]) -> CounterClaimFinality | None:
+        """The verdict over several candidate claims, none of them verified: FINAL if any one reads FINAL
+        (a verdict needs the endpoints to agree on its receipt, so one endpoint cannot make it), else
+        ``None`` if any one's read failed (finality un-assessable, which pages fail-closed), else NOT
+        YET FINAL. The order of ``claim_txs`` decides nothing but which reads run first."""
+        assert self._eth is not None
+        failed = False
+        best: CounterClaimFinality | None = None
+        for tx in claim_txs:
+            try:
+                verdict = await self._eth.claim_finality_verdict(tx)
+            except NetworkError:
+                failed = True
+                continue
+            if verdict.state is CounterClaimState.FINAL:
+                return verdict
+            best = best or verdict
+        return None if failed else best
 
     async def _upgrade_eth_stall(self, swap_id: str, verdict: CounterClaimFinality) -> CounterClaimFinality:
         """Feed the per-``swap_id`` :class:`FinalityStallTracker` this tick's ``(head, finalized)`` and

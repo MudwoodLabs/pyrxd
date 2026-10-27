@@ -50,6 +50,7 @@ from tests.test_watch_pages_name_state_valid_steps import _named_steps, _state_g
 
 #: The module, not the ``decide`` function the package re-exports under the same name.
 decide_mod = importlib.import_module("pyrxd.gravity.watch.decide")
+quorum_mod = importlib.import_module("pyrxd.gravity.watch.quorum")
 
 SWAP = "e1"
 #: The contract times out at this block; the fake chain's head is 100 and its finalized block 64, so a
@@ -340,6 +341,169 @@ async def test_a_forged_claimed_log_on_one_secondary_pages_investigate_not_a_cla
     assert d.recommended_action.startswith("investigate")
 
 
+def _fake_claim_log(p: bytes, *, block: int = 45) -> dict:
+    """A Claimed log that opens H (p is public once the real claim mined) on a transaction that
+    exists on no chain: what one lying endpoint can serve."""
+    return {
+        "address": CONTRACT,
+        "topics": [CLAIMED_TOPIC0],
+        "data": "0x" + p.hex(),
+        "transactionHash": "0x" + "fa" * 32,
+        "blockNumber": block,
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "role"),
+    [
+        (SwapState.BTC_LOCKED, RecordRole.TAKER),
+        (SwapState.BOTH_LOCKED, RecordRole.TAKER),
+        (SwapState.BTC_LOCKED, None),
+    ],
+)
+@pytest.mark.parametrize("endpoints", [2, 3])
+async def test_a_lying_primarys_fake_claim_cannot_hold_a_final_claim_in_watch(tmp_path, state, role, endpoints):
+    """Mythos F1 (PR 10): the maker's claim is mined and final. The primary hides its log and receipt
+    and serves a Claimed log of its own on a transaction no chain holds. The scan named the primary's
+    log first and the verdict was read for it alone: "not yet final", so the claim race WAITed and the
+    tower WATCHed until the window squeezed. The verdict is now read for every claim an endpoint served,
+    so the real claim is not hidden behind the fake one."""
+    kw: list[dict] = [{"hide_claimed": True}] + [{} for _ in range(endpoints - 1)]
+    w = _EthTower(tmp_path, state=state, role=role, endpoint_kw=kw)
+    claim = w.chain.claim(CLAIM_BLOCK)
+    w.endpoints[0].extra_logs = (_fake_claim_log(w.chain.preimage),)
+    w.endpoints[0].hide_receipts = (claim,)
+    obs = await w.observe()
+    assert obs.eth_claim_detected is True
+    d = await w.decide()
+    assert d.intent is not Intent.WATCH, d
+    assert d.situation == decide_mod.SITUATION_CLAIM_RACE, d
+    assert "taker_refund_btc" not in (d.recommended_action or "")
+    # Through the production reconciler and alerter, the first tick pages.
+    await w.reconciler().tick()
+    assert [s for s, _ in w.pages.got] == [SWAP]
+
+
+async def test_a_lying_primarys_fake_claim_beside_an_honest_pending_claim_still_waits(tmp_path):
+    """The honest twin: the primary serves the fake log but not the withheld receipt, and the real claim
+    is mined but not yet final. Every claim read is "not yet final", so the tower WATCHes for the
+    finalized checkpoint, as it should. (A primary that also withholds the real receipt makes the read
+    fail, and the claim race pages fail-closed: one endpoint may add a page, never stop one.)"""
+    w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True}, {}, {}])
+    w.chain.finalized = CLAIM_BLOCK - 5
+    claim = w.chain.claim(CLAIM_BLOCK)
+    w.endpoints[0].extra_logs = (_fake_claim_log(w.chain.preimage),)
+    obs = await w.observe()
+    assert obs.eth_claim_detected is True
+    assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+    assert (await w.decide()).intent is Intent.WATCH
+    # Once it is final, the fake log beside it does not hold it back.
+    w.chain.finalized = CLAIM_BLOCK
+    assert (await w.observe()).eth_claim_finality is CounterClaimState.FINAL
+    del claim
+
+
+async def test_many_fake_claims_from_one_endpoint_cannot_crowd_out_the_real_one(tmp_path):
+    """Mythos F1: the verdict reads are capped per tick, and the claims more endpoints serve are read
+    first. A primary serving ten fake Claimed logs (one nomination each) still has the real claim read,
+    so its withheld receipt makes finality un-assessable (a fail-closed page), never "not yet final"."""
+    w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True}, {}, {}])
+    claim = w.chain.claim(CLAIM_BLOCK)
+    fakes = tuple(
+        {**_fake_claim_log(w.chain.preimage, block=41 + i), "transactionHash": "0x" + f"{i:02x}" * 32}
+        for i in range(10)
+    )
+    w.endpoints[0].extra_logs = fakes
+    w.endpoints[0].hide_receipts = (claim,)
+    obs = await w.observe()
+    assert len(fakes) > quorum_mod._MAX_ETH_VERDICT_READS
+    assert obs.eth_claim_detected is True and obs.eth_claim_finality is None
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+def test_a_claim_race_wait_beside_a_contract_settled_at_finalized_pages(state):
+    """Mythos F1, the decide() half: a claim still waiting for the finalized block cannot explain a
+    contract settled at it. The gate's WAIT is not a reason to WATCH; the reader's contradiction pages."""
+    d = _d(
+        _record(state),
+        _obs(
+            eth_claim_detected=True,
+            eth_claim_finality=CounterClaimState.NOT_YET_FINAL_LIVE,
+            eth_disposition=DispositionKind.UNKNOWN,
+            eth_disposition_reason="settled, but a nominated transaction could not be checked",
+            eth_settled_at_finalized=True,
+        ),
+    )
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert d.situation == decide_mod.SITUATION_ETH_DISPOSITION_CONTRADICTION
+
+
+def test_a_claim_race_wait_on_an_unsettled_contract_still_watches():
+    """The honest twin: a claim not yet final, on a contract not settled at the finalized block, is
+    the ordinary wait for the checkpoint."""
+    d = _d(
+        _record(SwapState.BTC_LOCKED),
+        _obs(
+            eth_claim_detected=True,
+            eth_claim_finality=CounterClaimState.NOT_YET_FINAL_LIVE,
+            eth_disposition=DispositionKind.SETTLED_UNFINAL,
+        ),
+    )
+    assert d.intent is Intent.WATCH
+
+
+def _odd_claimed_log() -> dict:
+    """A Claimed log whose data does not open H, on a transaction no chain holds."""
+    return {
+        "address": CONTRACT,
+        "topics": [CLAIMED_TOPIC0],
+        "data": "0x" + "00" * 32,
+        "transactionHash": "0x" + "ab" * 32,
+        "blockNumber": 45,
+    }
+
+
+@pytest.mark.parametrize("liar", [0, 1, 2])
+async def test_one_odd_log_after_a_params_mismatch_keeps_the_refund_page(tmp_path, liar):
+    """Mythos F2 (PR 10): a taker's record at PARAMS_MISMATCH, the contract past its timeout and
+    unsettled. One endpoint's odd Claimed log turned the refund page into the gated exit, whose abandon
+    the coordinator refuses without a CLAIMED answer, and the refund that was due went unnamed."""
+    kw: list[dict] = [{}, {}, {}]
+    kw[liar] = {"extra_logs": (_odd_claimed_log(),)}
+    w = _EthTower(tmp_path, state=SwapState.PARAMS_MISMATCH, endpoint_kw=kw)
+    obs = await w.observe()
+    assert obs.eth_claim_detected is True and obs.eth_claim_seen is False
+    assert obs.eth_disposition is DispositionKind.F_EXPIRED
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND, d
+    assert d.recommended_action == "taker_refund_btc"
+    assert d.situation == decide_mod.SITUATION_PARAMS_MISMATCH_REFUND
+    assert "does not count as a claim" in d.reason
+
+
+async def test_a_real_claim_after_a_params_mismatch_still_pages_the_gated_exit(tmp_path):
+    """The honest twin: a claim every endpoint serves, read CLAIMED, is the gated exit."""
+    w = _EthTower(tmp_path, state=SwapState.PARAMS_MISMATCH)
+    w.chain.claim(CLAIM_BLOCK)
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.CLAIMED
+    d = await w.decide()
+    assert d.situation == decide_mod.SITUATION_ETH_CLAIMED_AFTER_MISMATCH
+    assert "abandon_counter_leg" in d.recommended_action
+
+
+def test_one_odd_log_on_a_makers_mismatched_record_keeps_the_covenant_refund():
+    """F2 on a maker's record: the odd log is set aside and the maker's covenant refund pages."""
+    d = _d(
+        _record(SwapState.PARAMS_MISMATCH, role=RecordRole.MAKER),
+        _obs(eth_claim_detected=True, eth_claim_finality=None, eth_disposition=DispositionKind.OPEN),
+    )
+    assert d.situation == decide_mod.SITUATION_MAKER_REFUND_PARAMS_MISMATCH
+    assert "does not count as a claim" in d.reason
+
+
 async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):
     """One endpoint that fails drops out of the scan; the primary failing still raises (the reconciler
     pages a decision-required), as before the union."""
@@ -623,6 +787,15 @@ def test_a_claim_on_record_beside_our_final_refund_pages_the_covenant_claim():
     d = _d(rec, _obs(eth_disposition=DispositionKind.REFUNDED, eth_disposition_tx="0x" + "a1" * 32))
     assert d.intent is Intent.PAGE_CLAIM
     assert d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+
+
+def test_a_claim_beside_our_final_refund_after_a_params_mismatch_is_not_the_gated_exit():
+    """Mythos plant P9: with our refund final at the finalized block nothing of the contract is left to
+    claim, so a claim the record kept pages the covenant claim (D14), not the gated exit."""
+    rec = _record(SwapState.PARAMS_MISMATCH, counter_claim_tx="0x" + "c1" * 32)
+    d = _d(rec, _obs(eth_disposition=DispositionKind.REFUNDED, eth_disposition_tx="0x" + "a1" * 32))
+    assert d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+    assert d.intent is Intent.PAGE_CLAIM
 
 
 @pytest.mark.parametrize("kind", [DispositionKind.UNKNOWN, DispositionKind.F_EXPIRED, None])

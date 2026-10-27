@@ -30,6 +30,7 @@ coordinator step (alert-only, outside the autonomy audit gate).
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from enum import Enum
 
@@ -1573,6 +1574,30 @@ def _decide_eth(
     # claim, and the detection scan can miss a log no endpoint serves (#850 PR 10, review F1).
     claim_on_record = record.counter_claim_tx is not None
 
+    # A log the scan counts as a claim that the reader, on a clean answer, does not count as one that
+    # opens H, on a record at PARAMS_MISMATCH: one endpoint's odd log must not replace the refund page
+    # with the gated exit below, whose abandon the coordinator refuses unless the reader says CLAIMED
+    # (Mythos F2, PR 10). Decide without it, and say what was set aside.
+    if (
+        state is SwapState.PARAMS_MISMATCH
+        and obs.eth_claim_detected
+        and not obs.eth_claim_seen
+        and not claim_on_record
+        and obs.eth_disposition in _ETH_CLEAN_UNCLAIMED
+    ):
+        base = _decide_eth(
+            record=record,
+            observations=dataclasses.replace(obs, eth_claim_detected=False, eth_claim_finality=None),
+            policy=policy,
+            safety_window_blocks=safety_window_blocks,
+        )
+        return dataclasses.replace(
+            base,
+            reason=base.reason
+            + "; the detection scan also names a log on the ETH contract that the reader does not count as a "
+            "claim that opens H (read the contract's logs on another endpoint)",
+        )
+
     # A claim after a params mismatch (#850 PR 10, design §3.2): there is deliberately no way into the
     # taker's claim flow from PARAMS_MISMATCH, so the claim race below could only name "investigate".
     if state is SwapState.PARAMS_MISMATCH and (obs.eth_claim_detected or claim_on_record) and not refund_final:
@@ -1688,6 +1713,13 @@ def _decide_eth(
                 situation=SITUATION_CLAIM_RACE,
             )
         if finality is ClaimFinality.WAIT:
+            if obs.eth_settled_at_finalized and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED):
+                # The contract is settled at the finalized block, so no claim still waiting for that
+                # block explains it: waiting on one would hold a page back for as long as the
+                # endpoints that keep it unfinal like (Mythos F1, PR 10). Page what the reader says.
+                seen = _eth_disposition_decision(record, obs, policy)
+                if seen is not None:
+                    return seen
             return Decision(
                 Intent.WATCH,
                 reason="maker revealed p on ETH; awaiting the finalized checkpoint (gate=WAIT)",
