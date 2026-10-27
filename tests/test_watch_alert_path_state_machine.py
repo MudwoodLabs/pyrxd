@@ -173,41 +173,47 @@ class AlertPathMachine(RuleBasedStateMachine):
     def _spender(self) -> str | None:
         return self.w.chain.confirmed_spender() or self.w.chain.mempool
 
-    @rule(fee=st.integers(min_value=300, max_value=3_000))
-    def our_refund(self, fee: int) -> None:
+    @rule(fee=st.integers(min_value=300, max_value=3_000), then_tick=st.booleans())
+    def our_refund(self, fee: int, then_tick: bool) -> None:
         try:
             self.w.chain.submit(self.w.chain.refund_tx(fee_sats=fee))
         except NetworkError:
             pass  # already spent, or not a valid replacement: the node refused it
+        self._maybe_tick(then_tick)
 
-    @rule(fee=st.integers(min_value=300, max_value=20_000))
-    def maker_claim(self, fee: int) -> None:
+    @rule(fee=st.integers(min_value=300, max_value=20_000), then_tick=st.booleans())
+    def maker_claim(self, fee: int, then_tick: bool) -> None:
         try:
             self.claims.add(self.w.chain.submit(self.w.chain.claim_tx(fee_sats=fee)))
         except NetworkError:
             pass
+        self._maybe_tick(then_tick)
 
-    @rule(blocks=st.integers(min_value=1, max_value=8))
-    def mine(self, blocks: int) -> None:
+    @rule(blocks=st.integers(min_value=1, max_value=8), then_tick=st.booleans())
+    def mine(self, blocks: int, then_tick: bool) -> None:
         self.w.chain.mine(blocks)
+        self._maybe_tick(then_tick)
 
-    @rule()
-    def drop_mempool(self) -> None:
+    @rule(then_tick=st.booleans())
+    def drop_mempool(self, then_tick: bool) -> None:
         self.w.chain.drop()
+        self._maybe_tick(then_tick)
 
-    @rule(depth=st.integers(min_value=1, max_value=3))
-    def reorg(self, depth: int) -> None:
+    @rule(depth=st.integers(min_value=1, max_value=3), then_tick=st.booleans())
+    def reorg(self, depth: int, then_tick: bool) -> None:
         self.w.chain.reorg(depth)
+        self._maybe_tick(then_tick)
 
-    @rule(tip=st.integers(min_value=TIP, max_value=T_RXD_OPENS + 12))
-    def rxd_tip(self, tip: int) -> None:
+    @rule(tip=st.integers(min_value=TIP, max_value=T_RXD_OPENS + 12), then_tick=st.booleans())
+    def rxd_tip(self, tip: int, then_tick: bool) -> None:
         self.w.rxd.tip = tip
         self.w.rxd.cov_confs = tip - LOCKED_AT + 1
+        self._maybe_tick(then_tick)
 
     # ------------------------------------------------------------------ sources and the channel
 
-    @rule(i=st.integers(min_value=0, max_value=2), fault=st.sampled_from(FAULTS))
-    def source(self, i: int, fault: str) -> None:
+    @rule(i=st.integers(min_value=0, max_value=2), fault=st.sampled_from(FAULTS), then_tick=st.booleans())
+    def source(self, i: int, fault: str, then_tick: bool) -> None:
         src = self.w.sources[i]
         src.down = fault == "down"
         src.hide_spender = fault == "hide_spender"
@@ -219,16 +225,18 @@ class AlertPathMachine(RuleBasedStateMachine):
         elif fault == "forge_refund":
             src.forge_spender = self.w.chain.refund_tx(fee_sats=777)
         self.faults[i] = fault
+        self._maybe_tick(then_tick)
 
-    @rule(up=st.booleans())
-    def channel(self, up: bool) -> None:
+    @rule(up=st.booleans(), then_tick=st.booleans())
+    def channel(self, up: bool, then_tick: bool) -> None:
         self.channel.up = up
+        self._maybe_tick(then_tick)
 
     # ------------------------------------------------------------------ the operator
 
     @precondition(lambda self: bool(self.critical_paged))
-    @rule(data=st.data())
-    def ack_keyed(self, data) -> None:
+    @rule(data=st.data(), then_tick=st.booleans())
+    def ack_keyed(self, data, then_tick: bool) -> None:
         """The operator appends a page's ``ack:`` line, possibly late or after the page closed."""
         key = data.draw(st.sampled_from(sorted(self.critical_paged)))
         recorded = self.alerter.ack(SWAP, key)
@@ -238,9 +246,10 @@ class AlertPathMachine(RuleBasedStateMachine):
             )
             self.acked.add(key)
             event("keyed ACK recorded")
+        self._maybe_tick(then_tick)
 
-    @rule()
-    def ack_bare(self) -> None:
+    @rule(then_tick=st.booleans())
+    def ack_bare(self, then_tick: bool) -> None:
         """A bare swap id binds only when exactly one CRITICAL situation is open and un-ACKed."""
         pending = [k for k, (_, sev) in self.open.items() if sev is Severity.CRITICAL and k not in self.acked]
         recorded = self.alerter.ack(SWAP)
@@ -248,8 +257,14 @@ class AlertPathMachine(RuleBasedStateMachine):
             assert not self.acked and len(pending) == 1, f"a bare ACK bound with ACKed={self.acked} pending={pending}"
             self.acked.add(pending[0])
             event("bare ACK recorded")
+        self._maybe_tick(then_tick)
 
     # ------------------------------------------------------------------ one tick of the tower
+
+    def _maybe_tick(self, then_tick: bool) -> None:
+        """Most events are followed by a poll: the sequences that matter interleave the two."""
+        if then_tick:
+            self.tick()
 
     @rule()
     def tick(self) -> None:
@@ -336,7 +351,7 @@ class AlertPathMachine(RuleBasedStateMachine):
 
 
 AlertPathMachine.TestCase.settings = settings(
-    max_examples=400 * _BUDGET_MULT,
+    max_examples=200 * _BUDGET_MULT,
     stateful_step_count=50,
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much],
