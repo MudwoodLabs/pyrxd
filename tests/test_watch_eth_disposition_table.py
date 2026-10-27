@@ -570,6 +570,30 @@ async def test_the_claim_check_reads_every_endpoints_receipt_logs_included(tmp_p
         await eth.claim_receipt_opens_h(loc, claim)
 
 
+@pytest.mark.parametrize(
+    ("change", "status"),
+    [
+        ({"data": "0x" + "00" * 32}, 1),  # a Claimed event whose data does not open H
+        ({"address": "0x" + "99" * 20}, 1),  # our event's shape, from another contract
+        ({}, 0),  # a reverted transaction
+    ],
+)
+async def test_a_receipt_is_a_claim_only_with_our_event_that_opens_h_and_success(tmp_path, change, status):
+    """``claim_receipt_opens_h``: each part of "a claim of this contract" is checked, with an honest
+    twin (the unchanged receipt) in the test above."""
+    w = _EthTower(tmp_path)
+    event = {
+        "address": CONTRACT,
+        "topics": [CLAIMED_TOPIC0],
+        "data": "0x" + w.chain.preimage.hex(),
+        "transactionHash": "0x" + "c7" * 32,
+        "blockNumber": CLAIM_BLOCK,
+        **change,
+    }
+    w.chain.receipts[event["transactionHash"]] = w.chain._receipt(CLAIM_BLOCK, logs=[event], status=status)
+    assert await w.observer._eth.claim_receipt_opens_h(w.chain.locator(), event["transactionHash"]) is False
+
+
 @pytest.mark.parametrize("endpoints", [2, 3])
 @pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
 async def test_a_lying_primary_that_breaks_the_read_and_serves_a_decoy_cannot_hold_a_final_claim(
