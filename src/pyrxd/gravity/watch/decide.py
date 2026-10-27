@@ -434,13 +434,14 @@ _MAKER_COVENANT_REFUND_ACTION = (
 )
 
 
-def _maker_covenant_refund(why: str, *, deadline: ChainHeight | None, corr: bool) -> Decision:
+def _maker_covenant_refund(why: str, *, deadline: ChainHeight | None, corr: bool, situation: str) -> Decision:
     return Decision(
         Intent.PAGE_REFUND,
         reason=f"{why}; your covenant is refundable to you at t_rxd (the deadline shown, when known)",
         recommended_action=_MAKER_COVENANT_REFUND_ACTION,
         deadline_rxd_height=deadline,
         low_corroboration=corr,
+        situation=situation,
     )
 
 
@@ -625,6 +626,16 @@ SITUATION_PARAMS_MISMATCH_REFUND = "params_mismatch_refund"
 SITUATION_BOTH_LOCKED_REFUND_DUE = "both_locked_refund_due"
 SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE = "both_locked_refund_unevaluable"
 SITUATION_LEGACY_BTC_UNSPENT = "legacy_btc_unspent"
+#: Every other refund page names its own situation too, so two different refund pages on one swap
+#: are never one WARN, paged once (re-review of the third pass's fixes, finding 6).
+SITUATION_BTC_REFUND_NEVER_LOCKED = "btc_refund_never_locked"
+SITUATION_ETH_REFUND_TIMEOUT_PASSED = "eth_refund_timeout_passed"
+SITUATION_MAKER_REFUND_AFTER_TAKER_REFUND = "maker_refund_after_taker_refund"
+SITUATION_MAKER_REFUND_PARAMS_MISMATCH = "maker_refund_params_mismatch"
+SITUATION_MAKER_REFUND_UNEVALUABLE = "maker_refund_unevaluable"
+SITUATION_MAKER_REFUND_T_RXD_NEAR = "maker_refund_t_rxd_near"
+SITUATION_MAKER_REFUND_T_RXD_MATURED = "maker_refund_t_rxd_matured"
+SITUATION_MAKER_REFUND_TAKER_TIMEOUT = "maker_refund_taker_timeout"
 #: Prefix of an armed refund page's situation; the reconciler appends this tick's executor outcome,
 #: so a FAILED broadcast after a BROADCAST pages again (second Mythos pass, M3).
 SITUATION_ARMED_BTC_REFUND = "armed_btc_refund"
@@ -667,7 +678,12 @@ def _btc_spend_decision(
         kind = BtcDispositionKind.REFUND_PENDING
         single = "; only one source reads it buried, which this tower does not act on"
     if _btc_refund_buried(obs) and record.role is RecordRole.MAKER:
-        return _maker_covenant_refund(f"the taker's BTC refund {txid} is buried", deadline=deadline, corr=corr)
+        return _maker_covenant_refund(
+            f"the taker's BTC refund {txid} is buried",
+            deadline=deadline,
+            corr=corr,
+            situation=SITUATION_MAKER_REFUND_AFTER_TAKER_REFUND,
+        )
     claim_on_record = record.counter_claim_tx is not None and record.role is not RecordRole.MAKER
     if claim_on_record or _btc_refund_lost_claim_seen(record, obs):
         # D14: a claim that opens H was seen, so p is public, whatever the outpoint shows now (our
@@ -937,6 +953,7 @@ def decide(
                 if obs.asset_locked_at_height is None
                 else _refund_opens_at(policy, terms, obs.asset_locked_at_height),
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_PARAMS_MISMATCH,
             )
         matured = _btc_refund_matured(terms, obs)
         armed = matured and _autonomy_allowed(record) and _btc_spend_permits_autonomy(obs)
@@ -999,6 +1016,7 @@ def decide(
                     f"maker-stall predicate un-evaluable, fail-closed to a refund page: {exc}",
                     deadline=deadline,
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_UNEVALUABLE,
                 )
             return Decision(
                 Intent.PAGE_REFUND,
@@ -1016,6 +1034,7 @@ def decide(
                 "you have not claimed the BTC counter leg and t_rxd is near; the taker refunds its BTC",
                 deadline=deadline,
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_T_RXD_NEAR,
             )
         if refund_due:
             # Urgent once t_rxd has matured: mutual_refund runs only after both timeouts, so a CRITICAL
@@ -1069,6 +1088,7 @@ def decide(
                     "t_rxd has matured and you have not claimed",
                     deadline=_refund_opens_at(policy, terms, obs.asset_locked_at_height),
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_T_RXD_MATURED,
                 )
             if matured:
                 return _maker_covenant_refund(
@@ -1080,6 +1100,7 @@ def decide(
                         else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
                     ),
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_TAKER_TIMEOUT,
                 )
             return Decision(
                 Intent.WATCH,
@@ -1138,6 +1159,7 @@ def decide(
                     recommended_action="taker_refund_btc",
                     autonomous_btc_refund=True,
                     low_corroboration=corr,
+                    situation=SITUATION_BTC_REFUND_NEVER_LOCKED,
                 )
                 if armed
                 else Decision(
@@ -1149,6 +1171,7 @@ def decide(
                     ),
                     recommended_action="taker_refund_btc",
                     low_corroboration=corr,
+                    situation=SITUATION_BTC_REFUND_NEVER_LOCKED,
                 )
             )
         if _btc_refund_maturity_unread(terms, obs) and _t_rxd_near(record, obs, policy, safety_window_blocks):
@@ -1310,12 +1333,14 @@ def _decide_eth(
                 if obs.asset_locked_at_height is None
                 else _refund_opens_at(policy, terms, obs.asset_locked_at_height),
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_PARAMS_MISMATCH,
             )
         return Decision(
             Intent.PAGE_REFUND,
             reason="covenant params mismatch on the ETH swap — refund the ETH counter-leg HTLC (taker_refund_btc)",
             recommended_action="taker_refund_btc",
             low_corroboration=corr,
+            situation=SITUATION_PARAMS_MISMATCH_REFUND,
         )
     if state is SwapState.MAKER_STALLS:
         # Unreachable on the coordinator-driven ETH path (the only entry to MAKER_STALLS is
@@ -1349,6 +1374,7 @@ def _decide_eth(
                     f"maker-stall predicate un-evaluable, fail-closed to a refund page: {exc}",
                     deadline=deadline,
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_UNEVALUABLE,
                 )
             return Decision(
                 Intent.PAGE_REFUND,
@@ -1356,12 +1382,14 @@ def _decide_eth(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE,
             )
         if refund_due and record.role is RecordRole.MAKER:
             return _maker_covenant_refund(
                 "you have not claimed the ETH counter leg and t_rxd is near; the taker refunds its ETH",
                 deadline=deadline,
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_T_RXD_NEAR,
             )
         if refund_due:
             return Decision(
@@ -1370,6 +1398,7 @@ def _decide_eth(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_BOTH_LOCKED_REFUND_DUE,
             )
         return Decision(
             Intent.WATCH,
@@ -1417,6 +1446,7 @@ def _decide_eth(
                         else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
                     ),
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_TAKER_TIMEOUT,
                 )
             return Decision(
                 Intent.WATCH,
@@ -1444,6 +1474,7 @@ def _decide_eth(
                 ),
                 recommended_action="taker_refund_btc",
                 low_corroboration=corr,
+                situation=SITUATION_ETH_REFUND_TIMEOUT_PASSED,
             )
         if covenant_seen and refused is None:
             return Decision(

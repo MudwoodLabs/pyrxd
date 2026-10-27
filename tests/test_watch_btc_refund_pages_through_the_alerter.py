@@ -65,9 +65,10 @@ class _Channel:
         self.sent.append(page)
 
 
-def _alerter() -> tuple[DedupAlerter, _Channel]:
+def _alerter(hold: int = 2) -> tuple[DedupAlerter, _Channel]:
+    """The production alerter; a short hold window (``situation_hold_ticks``) keeps the tests short."""
     ch = _Channel()
-    return DedupAlerter(channel=ch), ch
+    return DedupAlerter(channel=ch, situation_hold_ticks=hold), ch
 
 
 def _at(w: _Tower, tip: int) -> None:
@@ -591,7 +592,10 @@ async def test_an_ack_of_the_claim_race_does_not_silence_a_reconcile_error_and_h
     flaky.fail = False
     await rec.tick()
     assert len(ch.sent) == 2, "the ACK of the claim race ended at a one-tick error"
-    assert alerter.unacked_critical_count() == 0
+    assert alerter.unacked_critical_count() == 1, "the error page was sent and nobody ACKed it"
+    for _ in range(3):  # the error page closes after the hold window; the race stays ACKed
+        await rec.tick()
+    assert len(ch.sent) == 2 and alerter.unacked_critical_count() == 0
 
 
 async def test_an_ack_holds_while_the_reconcile_error_repeats(tmp_path):
@@ -613,9 +617,10 @@ def _squeeze(tag: str) -> Decision:
     return Decision(Intent.PAGE_SQUEEZED, reason=tag, situation=tag)
 
 
-async def test_an_ack_holds_across_other_pages_and_ends_when_the_swap_is_quiet():
+async def test_an_ack_holds_across_other_pages_and_ends_when_its_situation_closes():
     """Third Mythos pass, F1 and F4: A ACKed, then B, then A is still ACKed, and alternating A and B
-    page only B until B is ACKed. Once the swap's decision is quiet (a WATCH), A's ACK is over."""
+    page only B until B is ACKed. Once A has been absent for the hold window, its ACK is over, and an
+    ACK written after that records nothing (re-review of 80c16a1, finding 1)."""
     alerter, ch = _alerter()
     await alerter.handle(SWAP, _squeeze("a"))
     assert alerter.ack(SWAP) is True
@@ -626,9 +631,13 @@ async def test_an_ack_holds_across_other_pages_and_ends_when_the_swap_is_quiet()
     for tag in ["b", "a", "b", "a"]:
         await alerter.handle(SWAP, _squeeze(tag))
     assert len(ch.sent) == 3 and alerter.unacked_critical_count() == 0
-    alerter.resolve(SWAP)  # the reconciler's WATCH
+    alerter.resolve(SWAP)  # one quiet tick (the reconciler's WATCH) does not close anything
+    assert alerter.unacked_critical_count() == 0
+    for _ in range(2):
+        alerter.resolve(SWAP)
+    assert alerter.ack(SWAP, "page_squeezed:a") is False, "a late ACK of a closed page was recorded"
     await alerter.handle(SWAP, _squeeze("a"))
-    assert len(ch.sent) == 4, "the danger came back after a quiet tick, and its old ACK silenced it"
+    assert len(ch.sent) == 4, "the danger came back after it closed, and its old ACK silenced it"
     assert alerter.unacked_critical_count() == 1
 
 
@@ -773,7 +782,7 @@ async def test_one_degraded_read_does_not_end_the_ack_of_the_urgent_refund_page(
     deg.degraded = blip
     await rec.tick()
     deg.degraded = False
-    for _ in range(3):
+    for _ in range(3):  # past the hold window: the blip's own page closes
         await rec.tick()
     assert alerter.unacked_critical_count() == 0, "the operator's ACK was dropped by a one-tick read failure"
     # The blip changes the page (the refund is no longer armed while the depth is unread), so it is
@@ -784,14 +793,12 @@ async def test_one_degraded_read_does_not_end_the_ack_of_the_urgent_refund_page(
 async def test_a_bare_ack_written_for_an_earlier_page_does_not_land_on_a_newer_one():
     """F2: a reconcile error paged, the operator wrote a bare ACK, the claim race paged before the
     drain, and the drain ACKed the claim race."""
-    alerter, ch = _alerter()
+    alerter, ch = _alerter(hold=10)
     error = Decision(Intent.PAGE_SQUEEZED, reason="reconcile error", situation="reconcile_error")
     race = Decision(Intent.PAGE_SQUEEZED, reason="maker revealed p", situation=SITUATION_CLAIM_RACE)
     await alerter.handle(SWAP, error)
-    alerter.end_ack_drain()  # a drain with nothing in the inbox
     await alerter.handle(SWAP, race)
     assert alerter.ack(SWAP) is False, "a bare id bound to a page the operator may not have seen"
-    alerter.end_ack_drain()
     await alerter.handle(SWAP, race)
     assert len(ch.sent) == 3 and alerter.unacked_critical_count() == 1
     # The ack: line the page printed names the situation, so it ACKs exactly that one.
@@ -825,14 +832,15 @@ async def test_the_inbox_line_with_a_key_reaches_the_alerter(tmp_path):
     await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="e", situation="reconcile_error"))
     await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="r", situation=SITUATION_CLAIM_RACE))
     path = tmp_path / "acks"
-    path.write_text(f"{SWAP}\n{SWAP} page_squeezed:claim_race\n")
+    path.write_text(f"{SWAP}\n{SWAP} page_squeezed:claim_race\n{SWAP} page_squeezed:reconcile_error\n")
     path.chmod(0o600)
     apply_acks(alerter, FileAckInbox(path).drain())
     assert alerter.unacked_critical_count() == 0
 
 
-async def test_a_quiet_tick_takes_a_page_off_the_escalation_count(tmp_path):
-    """F3: after a one-tick outage paged CRITICAL and the swap went back to WATCH, the count stayed 1."""
+async def test_quiet_ticks_take_a_page_off_the_escalation_count(tmp_path):
+    """F3: after a one-tick outage paged CRITICAL and the swap went back to WATCH, the count stayed 1
+    for good. It now drops once the page has been absent for the hold window."""
     w = _Tower(tmp_path)
     _near(w)
     deg = _Degrading(w.observer)
@@ -851,6 +859,9 @@ async def test_a_quiet_tick_takes_a_page_off_the_escalation_count(tmp_path):
     w.write(dataclasses.replace(w.record(), state=SwapState.BOTH_LOCKED))
     (quiet,) = await rec.tick()
     assert quiet.decision.intent is Intent.WATCH, quiet.decision.reason
+    assert alerter.unacked_critical_count() == 1, "one quiet tick is not enough to close a page"
+    for _ in range(2):  # the hold window (2 here)
+        await rec.tick()
     assert alerter.unacked_critical_count() == 0
 
 
@@ -865,16 +876,18 @@ async def test_alternating_outcomes_page_each_warn_once(tmp_path):
     assert len(ch.sent) == 2
 
 
-def test_every_refund_page_that_can_turn_critical_names_its_situation():
+def test_every_refund_page_names_a_definite_situation():
     """F6: four urgent refund pages were CRITICAL with no situation, and the scan took its intents
-    from ``_SEVERITY``, which has PAGE_REFUND as WARN. Any ``urgent=`` that is not a literal False
-    counts, and a tag that can be None does not."""
+    from ``_SEVERITY``, which has PAGE_REFUND as WARN. The re-review of the fix found seven more
+    untagged refund pages, two of which (a maker's) were one WARN, paged once (finding 6). Every
+    PAGE_REFUND, and any other ``urgent=`` that is not a literal False, now needs a tag that cannot
+    be None."""
     import ast
     import importlib
     import pathlib
 
     root = pathlib.Path(importlib.import_module("pyrxd.gravity.watch.decide").__file__).parent
-    urgent_sites, bad = [], []
+    sites, bad = [], []
     for path in sorted(root.glob("*.py")):
         for node in ast.walk(ast.parse(path.read_text())):
             if not (
@@ -882,12 +895,194 @@ def test_every_refund_page_that_can_turn_critical_names_its_situation():
             ):
                 continue
             kws = {k.arg: k.value for k in node.keywords if k.arg}
+            intent = node.args[0] if node.args else kws.get("intent")
             urgent = kws.get("urgent")
-            if urgent is None or (isinstance(urgent, ast.Constant) and urgent.value is False):
+            refund = isinstance(intent, ast.Attribute) and intent.attr == "PAGE_REFUND"
+            may_be_urgent = urgent is not None and not (isinstance(urgent, ast.Constant) and urgent.value is False)
+            if not (refund or may_be_urgent):
                 continue
-            urgent_sites.append((path.name, node.lineno))
+            sites.append((path.name, node.lineno))
             tag = kws.get("situation")
             if tag is None or any(isinstance(n, ast.Constant) and n.value is None for n in ast.walk(tag)):
                 bad.append((path.name, node.lineno))
-    assert len(urgent_sites) >= 6, urgent_sites
-    assert bad == [], f"urgent refund pages without a definite situation: {bad}"
+    assert len(sites) >= 13, sites  # decide.py builds 13 today
+    assert bad == [], f"refund pages without a definite situation: {bad}"
+
+
+# --------------------------------------------------------------------------- Opus re-review of 80c16a1
+
+
+@pytest.mark.parametrize("acked", [True, False], ids=["acked", "unacked"])
+async def test_one_quiet_tick_from_a_failed_read_neither_ends_an_ack_nor_zeroes_escalation(tmp_path, acked):
+    """Finding 2: at BOTH_LOCKED a failed covenant-depth read decides WATCH (residual R1). One such
+    tick ended the ACK of the CRITICAL page, and read 0 on an un-ACKed one, resetting escalation."""
+    w = _Tower(tmp_path, state=SwapState.BOTH_LOCKED)
+    _near(w, past=3)  # t_rxd matured: mutual_refund page, CRITICAL
+    alerter, ch = _alerter()
+    rec = w.reconciler(alerter=alerter)
+    (first,) = await rec.tick()
+    assert first.decision.urgent is True
+    if acked:
+        assert alerter.ack(SWAP) is True
+    w.rxd.cov_confs = None
+    (blind,) = await rec.tick()
+    assert blind.decision.intent is Intent.WATCH, blind.decision.reason
+    assert alerter.unacked_critical_count() == (0 if acked else 1), "one failed read moved the escalation count"
+    _near(w, past=4)
+    await rec.tick()
+    assert len(ch.sent) == (1 if acked else 2), "the ACK ended at one failed read"
+
+
+class _DownChannel(_Channel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.down = False
+
+    async def send(self, page) -> None:
+        if self.down:
+            raise ConnectionError("channel down")
+        await super().send(page)
+
+
+async def test_a_page_that_never_went_out_changes_nothing_escalation_reads():
+    """Finding 3: a new CRITICAL that failed to send replaced the live situation, and the count of
+    an un-ACKed claim race dropped to 0 while nothing reached the operator."""
+    ch = _DownChannel()
+    alerter = DedupAlerter(channel=ch)
+    race = Decision(Intent.PAGE_SQUEEZED, reason="race", situation=SITUATION_CLAIM_RACE)
+    await alerter.handle(SWAP, race)
+    ch.down = True
+    with pytest.raises(ConnectionError):
+        await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="e", situation="reconcile_error"))
+    assert alerter.unacked_critical_count() == 1
+    ch.down = False
+    await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="e", situation="reconcile_error"))
+    assert len(ch.sent) == 2, "the failed page was not retried"
+
+
+async def test_a_critical_alternating_with_a_paged_warn_keeps_its_count():
+    """Finding 3, second part: an un-ACKed CRITICAL alternating with a WARN read 1, 0, 1, 0."""
+    alerter, _ = _alerter()
+    race = Decision(Intent.PAGE_SQUEEZED, reason="race", situation=SITUATION_CLAIM_RACE)
+    warn = Decision(Intent.PAGE_REFUND, reason="refund", situation="btc_refund_due")
+    counts = []
+    for d in [race, warn] * 3:
+        await alerter.handle(SWAP, d)
+        counts.append(alerter.unacked_critical_count())
+    assert counts == [1] * 6
+
+
+async def test_an_ack_does_not_outlive_its_danger_while_a_warn_persists():
+    """Finding 4: a claim-race ACK held for as long as the swap sat in a once-paged WARN."""
+    alerter, ch = _alerter()
+    race = Decision(Intent.PAGE_SQUEEZED, reason="race", situation=SITUATION_CLAIM_RACE)
+    warn = Decision(Intent.PAGE_REFUND, reason="refund", situation="btc_refund_due")
+    await alerter.handle(SWAP, race)
+    assert alerter.ack(SWAP) is True
+    for _ in range(50):
+        await alerter.handle(SWAP, warn)
+    await alerter.handle(SWAP, race)
+    assert len(ch.sent) == 3 and alerter.unacked_critical_count() == 1, "an old ACK silenced the race"
+
+
+async def test_a_warn_pages_again_once_it_has_closed():
+    """Finding 6: a WARN situation was swallowed for the rest of the swap's life once it had paged
+    (the maker's covenant refund page, untagged, at BTC_LOCKED and again near t_rxd)."""
+    alerter, ch = _alerter()
+    warn = Decision(Intent.PAGE_REFUND, reason="refund your covenant at t_rxd")
+    await alerter.handle(SWAP, warn)
+    alerter.resolve(SWAP)
+    await alerter.handle(SWAP, warn)
+    assert len(ch.sent) == 1, "the honest twin: inside the hold window it is the same page"
+    for _ in range(3):
+        alerter.resolve(SWAP)
+    await alerter.handle(SWAP, warn)
+    assert len(ch.sent) == 2
+
+
+class _Store:
+    """A records store that can fail to list."""
+
+    def __init__(self) -> None:
+        self.fail = False
+
+    async def list_active(self):
+        if self.fail:
+            raise OSError("records dir unmounted")
+        return []
+
+
+async def test_the_store_page_can_be_acked_and_closes_when_the_store_is_back(tmp_path):
+    """Finding 5: the store page's ack: line was refused by the inbox, and nothing ever closed it, so
+    the escalation count stayed 1 after the store came back."""
+    from pyrxd.gravity.watch.alerts import FileAckInbox
+    from pyrxd.gravity.watch.reconciler import Reconciler
+    from pyrxd.gravity.watch.run import apply_acks
+
+    store = _Store()
+    alerter, ch = _alerter()
+    rec = Reconciler(
+        store=store, observer=_Tower(tmp_path).observer, alerter=alerter, policy=_policy(), safety_window_blocks=6
+    )
+    store.fail = True
+    await rec.tick()
+    line = ch.sent[0].message.rsplit("ack: ", 1)[1]
+    path = tmp_path / "acks"
+    path.write_text(line + "\n")
+    path.chmod(0o600)
+    assert FileAckInbox(path).drain() == [line]
+    path.write_text(line + "\n")
+    path.chmod(0o600)
+    apply_acks(alerter, FileAckInbox(path).drain())
+    assert alerter.unacked_critical_count() == 0
+    # Un-ACKed, the page closes once the store has read for the hold window.
+    alerter2, _ = _alerter()
+    rec2 = Reconciler(
+        store=store,
+        observer=_Tower(tmp_path / "b").observer,
+        alerter=alerter2,
+        policy=_policy(),
+        safety_window_blocks=6,
+    )
+    await rec2.tick()
+    assert alerter2.unacked_critical_count() == 1
+    store.fail = False
+    for _ in range(3):
+        await rec2.tick()
+    assert alerter2.unacked_critical_count() == 0
+
+
+@pytest.mark.parametrize("earlier_page", [True, False], ids=["after-a-refund-page", "control"])
+async def test_a_makers_t_rxd_near_page_is_not_swallowed_by_its_earlier_refund_page(tmp_path, earlier_page):
+    """Finding 6, through the tower: a maker's "taker funding buried, you have not claimed" WARN at
+    BTC_LOCKED, then BOTH_LOCKED, then "t_rxd is near": the last page never went out."""
+    from pyrxd.gravity.swap_state import RecordRole
+
+    w = _Tower(tmp_path, role=RecordRole.MAKER)
+    alerter, ch = _alerter(hold=10)
+    rec = w.reconciler(alerter=alerter)
+    _at(w, LOCKED_AT + 5)
+    if earlier_page:
+        (first,) = await rec.tick()
+        assert first.decision.intent is Intent.PAGE_REFUND
+    w.write(dataclasses.replace(w.record(), state=SwapState.BOTH_LOCKED))
+    await rec.tick()
+    _near(w)
+    (near,) = await rec.tick()
+    assert near.decision.intent is Intent.PAGE_REFUND and "t_rxd is near" in near.decision.reason
+    assert "t_rxd is near" in ch.sent[-1].message, "the t_rxd page never went out"
+    assert len(ch.sent) == (2 if earlier_page else 1)
+
+
+async def test_a_warn_that_failed_to_send_is_sent_next_tick():
+    """Finding 3, the other half: a page is recorded only once it is sent, so a WARN whose send
+    failed is not taken as already paged."""
+    ch = _DownChannel()
+    alerter = DedupAlerter(channel=ch)
+    warn = Decision(Intent.PAGE_REFUND, reason="refund", situation="btc_refund_due")
+    ch.down = True
+    with pytest.raises(ConnectionError):
+        await alerter.handle(SWAP, warn)
+    ch.down = False
+    await alerter.handle(SWAP, warn)
+    assert len(ch.sent) == 1, "the WARN was recorded as paged although it never went out"

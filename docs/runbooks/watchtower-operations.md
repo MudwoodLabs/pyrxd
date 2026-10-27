@@ -158,15 +158,19 @@ naming the swap and the situation; append that line to the inbox:
 echo "<swap_id> <situation key>" >> /run/wt/acks   # copy it from the page's "ack:" line
 ```
 
-A bare swap id also works, but only when that swap has paged a single CRITICAL situation since the
-drain before the last one. Otherwise the tower cannot tell which page you meant, so it logs the ACK as
-ignored and keeps paging. An ACK holds while the swap stays in paged situations: a one-tick read
-failure or a different page in between does not end it. It ends once the swap's decision is quiet
-again (nothing to page) or the swap retires, so the same danger coming back later pages again. A
-situation that paged CRITICAL once stays CRITICAL, re-paged, until you ACK it, even on a tick that
-reads it less urgent. WARN and INFO pages go out once per situation for the swap. On an armed refund
-page the situation includes what the executor did, so a re-broadcast that FAILED after one that went
-out pages once more:
+A bare swap id also works, but only when that swap has exactly one open, un-ACKed CRITICAL page.
+Otherwise the tower cannot tell which page you meant, so it logs the ACK as ignored and keeps paging.
+
+A page stays open until it has been absent for 10 ticks in a row (`DEFAULT_SITUATION_HOLD_TICKS`,
+chosen, not measured: 5 minutes at the default 30 s poll), whether another page or a quiet tick
+replaced it. While it is open, a CRITICAL page counts toward escalation until you ACK it, your ACK
+holds (a one- or two-tick read failure in between neither ends it nor resets escalation), and a WARN
+or INFO page is not sent again. Once it closes, its ACK ends and an ACK written after that records
+nothing, so the same danger coming back later pages again. A CRITICAL page that comes back within the
+window after you ACKed it stays quiet: it is treated as the danger you acknowledged. A situation that
+paged CRITICAL stays CRITICAL, re-paged, until you ACK it, even on a tick that reads it less urgent.
+On an armed refund page the situation includes what the executor did, so a re-broadcast that FAILED
+after one that went out pages once more. A bare swap id, for a swap with one open page:
 
 ```bash
 echo <swap_id> >> /run/wt/acks

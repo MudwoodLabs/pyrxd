@@ -893,8 +893,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ack-inbox",
         help="operator ACK inbox: append the CRITICAL page's ack: line, the swap_id and its situation "
-        "key (e.g. `echo '<swap_id> <key>' >> FILE`); a bare swap_id works only when that swap paged "
-        "one CRITICAL situation lately. Drained once per tick; suppresses re-paging for that "
+        "key (e.g. `echo '<swap_id> <key>' >> FILE`); a bare swap_id works only when that swap has "
+        "one open, un-ACKed CRITICAL situation. Drained once per tick; suppresses re-paging for that "
         "exact situation and drops it from the heartbeat's unacked_critical count. MUST be a "
         "0600 regular file you own (create it with `install -m 600 /dev/null FILE`) — anyone "
         "who can write it can silence a claim-race page.",
@@ -991,13 +991,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def apply_acks(alerter: AckingAlerter, lines: list[str]) -> None:
-    """Apply drained ACK-inbox lines (``<swap_id>`` or ``<swap_id> <situation key>``), then mark the
-    drain so the alerter's bare-id rule starts a new interval (third Mythos pass, F2)."""
+    """Apply drained ACK-inbox lines, ``<swap_id>`` or ``<swap_id> <situation key>`` (third Mythos
+    pass, F2)."""
     for line in lines:
         swap_id, _, key = line.partition(" ")
         if not alerter.ack(swap_id, key or None):
             # ACKs are inert for an unknown/uncritical swap, and a bare id is refused when the swap
-            # paged more than one CRITICAL situation lately (DedupAlerter.ack records nothing), but say
+            # has more than one open, un-ACKed CRITICAL situation (DedupAlerter.ack records nothing), but say
             # so: it is an operator typo, an ambiguous ACK on a time-critical page, or someone probing
             # the inbox to silence one.
             logger.warning(
@@ -1005,9 +1005,6 @@ def apply_acks(alerter: AckingAlerter, lines: list[str]) -> None:
                 "write the page's ack: line (swap id and situation key)",
                 line,
             )
-    end = getattr(alerter, "end_ack_drain", None)
-    if callable(end):
-        end()
 
 
 def _require_acking_alerter(alerter: object, ack_inbox: str) -> AckingAlerter:

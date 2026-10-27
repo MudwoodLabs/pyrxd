@@ -175,6 +175,7 @@ class Reconciler:
             )
             delivered = await self._safe_handle(_STORE, decision)
             return [ReconcileResult(_STORE, decision, error=err, alert_delivered=delivered)]
+        self._safe_resolve(_STORE)  # the store read: its unreadable page, if any, starts to close
         results: list[ReconcileResult] = []
         # Each record the store could not read pages BY NAME (#850 PR 3). The store skips it so one
         # bad file cannot blind the tower to the rest, but a skipped record is a swap nobody is
@@ -301,8 +302,8 @@ class Reconciler:
 
     def _safe_resolve(self, swap_id: str) -> None:
         """Tell an alerter that can hear it that the swap's decision is quiet this tick (WATCH or NOOP
-        from ``decide``), so a CRITICAL it paged earlier leaves the escalation count and its ACKs end
-        (third Mythos pass, F3). Optional: a minimal alerter has no ``resolve``."""
+        from ``decide``), so a page it sent earlier moves toward closing (third Mythos pass, F3).
+        Optional: a minimal alerter has no ``resolve``."""
         resolve = getattr(self._alerter, "resolve", None)
         if not callable(resolve):
             return
