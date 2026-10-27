@@ -336,8 +336,8 @@ class AlertPathMachine(RuleBasedStateMachine):
 
 
 AlertPathMachine.TestCase.settings = settings(
-    max_examples=40 * _BUDGET_MULT,
-    stateful_step_count=40,
+    max_examples=400 * _BUDGET_MULT,
+    stateful_step_count=50,
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much],
 )
