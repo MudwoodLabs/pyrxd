@@ -127,11 +127,14 @@ into the same app or receiver changes nothing.
   `close_push_nonce` (a push may still land) or `taker_refund_btc` (none can), the gated abandon from
   BOTH_LOCKED, and from PARAMS_MISMATCH the covenant refund then the abandon. A claim after a params
   mismatch pages the covenant refund then `abandon_counter_leg`. A record still at BTC_LOCKED when the
-  maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`.
+  maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`
+  (a maker's record: `reconcile_counter_leg` alone, which only records the claim). The claim scan
+  asks every endpoint, and a claim kept on the record (`counter_claim_tx`) is paged on every turn.
   Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
   ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the
-  timeout; it pays the refundee) and is read again every turn; a claim pages the covenant claim; a
-  refund or an empty contract agrees and is marked.
+  timeout; it pays the refundee) and is read again every turn; a claim, or one on record, pages the
+  covenant claim; a refund, or an empty contract no signed push can still fill, agrees and is marked.
+  An empty contract a push may still fill is read again every turn.
 - **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,
   whether or not the maker's covenant is on chain. A maker's record is paged to refund its covenant
   at t_rxd, never to run the taker's `taker_refund_btc` or `mutual_refund`.

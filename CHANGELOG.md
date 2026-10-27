@@ -122,10 +122,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     funded ETH swap when the source has it. `Observations` gains `eth_disposition`,
     `eth_disposition_reason`, `eth_disposition_tx`, `eth_claim_seen`, `eth_single_source`,
     `eth_settled_at_finalized` and `eth_nonce_at_finalized`.
-  - The detection scan (primary endpoint only) stays the claim trigger, and the read only adds to
-    it: a `Claimed` log that opens H on any endpoint, a claim the record kept, or a `CLAIMED` answer
-    is a claim even when the scan missed it. A `CLAIMED` answer from more than one endpoint is taken
-    as `FINAL`.
+  - `RpcEthChainSource.claim_status`, the detection scan, now scans every endpoint of a
+    `MultiSourceEthRpc` (before, the primary alone, through `get_logs`), and a claim any endpoint
+    serves is the answer; the primary's failure still raises, another endpoint's drops it from the
+    scan. The scan stays the claim trigger, and the read only adds to it: a `Claimed` log that opens
+    H the read collected, or a `CLAIMED` answer, is a claim even when the scan missed it. A claim the
+    record kept (`counter_claim_tx`) is a claim on every tick, even when one endpoint makes the read
+    return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
+    taken as `FINAL`. A claim whose finality read fails because the endpoints disagree is paged as a
+    claim race with finality un-assessable, where it raised a reconcile error before.
   - `--eth-rpc-url` on `pyrxd-watchtower` may be repeated: two or more endpoints (distinct operators)
     build a `MultiSourceEthRpc`. With one endpoint every read is single-source: it may page, never
     stops a page, never marks a legacy record, and every ETH page is now marked `low_corroboration`
@@ -142,12 +147,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `abandon_counter_leg` (design §3.2), where it named "investigate" before. `SETTLED_UNFINAL` and an
     `UNKNOWN` from a failed read change no page.
   - `_CLAIM_PATH[BTC_LOCKED]`: a claim race on a record still at `BTC_LOCKED` (BTC or ETH) names
-    `reconcile_counter_leg, then taker_scrape_and_claim_asset` instead of "investigate".
+    `reconcile_counter_leg, then taker_scrape_and_claim_asset` instead of "investigate". On a maker's
+    record it names `reconcile_counter_leg` alone, which only records the claim there.
   - The D9 net for ETH (design §5.2 item 3): `is_legacy_candidate` also lists a terminal ETH record
     with an ETH locator and no `counter_disposition`, and no longer lists a record ended by
     `abandon_unfunded`. An unsettled contract pages "call `refund()` on the contract" and is never
-    marked; a claim pages the covenant claim (marked once delivered after t_rxd); a refund or empty
-    contract on a read of more than one endpoint agrees and is marked.
+    marked; a claim, or a claim on record, pages the covenant claim (marked once delivered after
+    t_rxd); a refund, or an empty contract no signed push can still fill (`EXPIRED_EMPTY_CLOSED`), on
+    a read of more than one endpoint agrees and is marked. An empty contract a push may still fill
+    (`EXPIRED_EMPTY_OPEN`) is read again, so a push that lands pages the refund.
   - Not built from the §5.1 table: the page for a pending refund older than a threshold (the record
     keeps no send time) and `PAYOUT_REVERTS` (the coordinator's reading of its own refund, not of the
     contract).

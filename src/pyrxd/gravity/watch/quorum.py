@@ -35,7 +35,7 @@ from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState, Fina
 from pyrxd.gravity.swap_state import SwapRecord, SwapState
 from pyrxd.gravity.watch.decide import Observations
 from pyrxd.gravity.watch.reconciler import Observer
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight, Confirmations, Seconds
 
 __all__ = [
@@ -378,11 +378,13 @@ class ChainObserver(Observer):
         present yet (pre-fund); fails closed (raises) if no ETH source was injected — the reconciler
         turns that into a decision-required page rather than a silent all-clear.
 
-        The detection scan (``claim_status``, selector-agnostic) stays the claim trigger. The
-        disposition read adds to it, never takes from it: a ``Claimed`` log that opens H on any endpoint
-        (or a claim the record kept), or a CLAIMED answer, is a claim even when the scan missed it. The
-        verdict is read for the claim the reader verified first, else the scan's, else the first one
-        nominated. A CLAIMED answer from more than one endpoint is FINAL as it stands: it was verified at
+        The detection scan (``claim_status``, selector-agnostic, over every endpoint) stays the claim
+        trigger. The disposition read adds to it, never takes from it: a ``Claimed`` log that opens H
+        that the read collected, or a CLAIMED answer, is a claim even when the scan missed it. A claim
+        the record kept (``counter_claim_tx``) is a claim on every tick, read or no read: the reader
+        can return UNKNOWN before it collects any claim when one endpoint disagrees on an identity read,
+        and that must not clear it. The verdict is read for the claim the reader verified first, else
+        the scan's, else the first one the read collected, else the one on record. A CLAIMED answer from more than one endpoint is FINAL as it stands: it was verified at
         the agreed finalized block. Gap B (CLAIMED with no transaction) has no other verdict to read.
 
         A8 / RF-06 across-time stall: the point-in-time verdict is the fast path and unchanged; when the
@@ -432,9 +434,18 @@ class ChainObserver(Observer):
                 # Gap B from one endpoint: no transaction to read a verdict for, and one endpoint's
                 # CLAIMED is not final on its own. The gate then fails closed (finality un-assessable).
                 return {"eth_claim_detected": True, "eth_claim_finality": None, **fields}
+        # A claim the record kept stays a claim when this tick names none: a read that failed before
+        # it looked at any claim (one endpoint's disagreement) clears nothing (review F1).
+        claim_tx = claim_tx or record.counter_claim_tx
         if claim_tx is None:
             return {"eth_claim_detected": False, "eth_claim_finality": None, **fields}
-        verdict = await self._eth.claim_finality_verdict(claim_tx)
+        try:
+            verdict = await self._eth.claim_finality_verdict(claim_tx)
+        except NetworkError:
+            # Endpoints that disagree on the claim's block (one forked or lying) leave its finality
+            # un-assessable. The claim is still detected, so decide() pages the claim race fail-closed
+            # rather than a generic reconcile error that names no claim (review F1).
+            return {"eth_claim_detected": True, "eth_claim_finality": None, **fields}
         verdict = await self._upgrade_eth_stall(swap_id, verdict)
         return {"eth_claim_detected": True, "eth_claim_finality": verdict.state, **fields}
 

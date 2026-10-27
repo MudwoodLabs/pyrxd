@@ -236,13 +236,17 @@ async def test_an_unsettled_contract_past_its_timeout_still_pages_the_refund(tmp
 
 
 async def test_a_claim_the_primary_hides_is_seen_through_the_union_read(tmp_path):
-    """The detection scan reads the PRIMARY endpoint only (``MultiSourceEthRpc.get_logs``). A primary
-    that hides the Claimed log used to leave the tower blind; the union read nominates it from the
-    others, and the claim race pages, naming the step a BTC_LOCKED record can run first."""
+    """``MultiSourceEthRpc.get_logs`` reads the PRIMARY endpoint only, so a primary that hides the
+    Claimed log used to leave the tower blind. The detection scan now asks every endpoint, and the
+    claim race pages, naming the step a BTC_LOCKED record can run first."""
     w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True}, {}, {}])
     claim = w.chain.claim(CLAIM_BLOCK)
+    primary_only = await RpcEthChainSource(w.endpoints[0]).claim_status(
+        w.chain.locator().contract_address, w.chain.deploy_tx
+    )
+    assert primary_only.claimed is False  # the primary alone misses it
     status = await w.observer._eth.claim_status(w.chain.locator().contract_address, w.chain.deploy_tx)
-    assert status.claimed is False  # the scan alone misses it
+    assert status.claimed is True and status.claim_tx_hash == claim
     obs = await w.observe()
     assert obs.eth_claim_detected is True and obs.eth_claim_seen is True
     assert obs.eth_disposition is DispositionKind.CLAIMED and obs.eth_disposition_tx == claim
@@ -251,6 +255,110 @@ async def test_a_claim_the_primary_hides_is_seen_through_the_union_read(tmp_path
     assert d.intent is Intent.PAGE_CLAIM
     assert d.situation == decide_mod.SITUATION_CLAIM_RACE
     assert d.recommended_action == "reconcile_counter_leg, then taker_scrape_and_claim_asset"
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+async def test_a_lying_primary_that_also_forks_cannot_hide_a_final_claim(tmp_path, state):
+    """Review F1: the primary hides the Claimed log AND serves a forked block at F, so the reader
+    returns UNKNOWN before it collects any claim. The scan over every endpoint still finds the claim
+    the honest two serve; before, this paged the refund at BTC_LOCKED and watched at BOTH_LOCKED."""
+    w = _EthTower(tmp_path, state=state, endpoint_kw=[{"hide_claimed": True, "fork": "x"}, {}, {}])
+    claim = w.chain.claim(CLAIM_BLOCK)
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
+    assert obs.eth_claim_detected is True
+    d = await w.decide()
+    assert d.situation == decide_mod.SITUATION_CLAIM_RACE, d
+    assert d.intent in (Intent.PAGE_CLAIM, Intent.PAGE_SQUEEZED)
+    assert "taker_refund_btc" not in (d.recommended_action or "")
+    del claim
+
+
+async def test_a_claim_on_record_survives_a_read_one_endpoint_breaks(tmp_path):
+    """Review F1: no endpoint serves the claim's log and one non-primary endpoint forks, so the read is
+    UNKNOWN before it looks at the claim the record kept. That claim is still the trigger."""
+    w = _EthTower(
+        tmp_path, endpoint_kw=[{"hide_all_logs": True}, {"hide_all_logs": True, "fork": "x"}, {"hide_all_logs": True}]
+    )
+    claim = w.chain.claim(CLAIM_BLOCK)
+    w.write(dataclasses.replace(w.record(), counter_claim_tx=claim))
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
+    assert obs.eth_claim_detected is True
+    # The forked endpoint disagrees on the claim's block too, so its finality cannot be assessed: the
+    # claim race pages fail-closed, naming the claim, not a refund and not a generic reconcile error.
+    assert obs.eth_claim_finality is None
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE
+
+
+async def test_a_claim_on_record_with_every_endpoint_honest_reads_claimed(tmp_path):
+    """The honest twin: the same record, no endpoint forked, reads CLAIMED and pages the claim."""
+    w = _EthTower(tmp_path, endpoint_kw=[{"hide_all_logs": True}] * 3)
+    claim = w.chain.claim(CLAIM_BLOCK)
+    w.write(dataclasses.replace(w.record(), counter_claim_tx=claim))
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.CLAIMED
+    assert (await w.decide()).intent is Intent.PAGE_CLAIM
+
+
+async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):
+    """One endpoint that fails drops out of the scan; the primary failing still raises (the reconciler
+    pages a decision-required), as before the union."""
+    w = _EthTower(tmp_path)
+    claim = w.chain.claim(CLAIM_BLOCK)
+    addr, deploy = w.chain.locator().contract_address, w.chain.deploy_tx
+
+    async def _boom(*_a, **_kw):
+        raise NetworkError("endpoint down")
+
+    w.endpoints[1].get_logs = _boom
+    status = await w.observer._eth.claim_status(addr, deploy)
+    assert status.claimed is True and status.claim_tx_hash == claim
+    w.endpoints[0].get_logs = _boom
+    with pytest.raises(NetworkError):
+        await w.observer._eth.claim_status(addr, deploy)
+
+
+async def test_the_scan_over_every_endpoint_finds_nothing_on_an_unclaimed_contract(tmp_path):
+    """The honest twin: no endpoint serves a claim, so the union is no claim."""
+    w = _EthTower(tmp_path)
+    w.chain.refund(REFUND_BLOCK)
+    status = await w.observer._eth.claim_status(w.chain.locator().contract_address, w.chain.deploy_tx)
+    assert status.claimed is False
+
+
+async def test_a_claimed_answer_from_several_endpoints_is_final_without_a_verdict_read(tmp_path):
+    """Review F3: CLAIMED from more than one endpoint was verified at the agreed finalized block, so it
+    is FINAL as it stands, whatever one endpoint's receipt read would say."""
+    w = _EthTower(tmp_path)
+    w.chain.claim(CLAIM_BLOCK)
+
+    async def _not_final(_tx):
+        from pyrxd.gravity.finality import CounterClaimFinality
+
+        return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+    w.observer._eth.claim_finality_verdict = _not_final
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.CLAIMED and obs.eth_single_source is False
+    assert obs.eth_claim_finality is CounterClaimState.FINAL
+
+
+async def test_one_endpoints_claimed_answer_still_reads_the_verdict(tmp_path):
+    """The twin: one endpoint's CLAIMED is not final on its own; the verdict read decides."""
+    w = _EthTower(tmp_path, endpoints=1)
+    w.chain.claim(CLAIM_BLOCK)
+
+    async def _not_final(_tx):
+        from pyrxd.gravity.finality import CounterClaimFinality
+
+        return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+    w.observer._eth.claim_finality_verdict = _not_final
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.CLAIMED and obs.eth_single_source is True
+    assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
 
 
 async def test_a_refund_no_endpoint_logs_is_found_by_the_hash_on_record(tmp_path):
@@ -265,9 +373,10 @@ async def test_a_refund_no_endpoint_logs_is_found_by_the_hash_on_record(tmp_path
 
 
 async def test_the_verdict_is_read_for_the_verified_claim_not_the_scans_odd_log(tmp_path):
-    """The primary hides the Claimed log and serves an odd one, which the scan (primary only) takes for
-    the claim. A refund and the claim both verify, so the answer is UNKNOWN, not CLAIMED: the finality
-    verdict must be read for the claim the reader verified, not for the odd log's transaction."""
+    """Every endpoint hides the Claimed log and serves an odd one, which the scan takes for the claim;
+    the record kept the real claim, so the reader verifies it. A refund and the claim both verify, so
+    the answer is UNKNOWN, not CLAIMED: the finality verdict must be read for the claim the reader
+    verified, not for the odd log's transaction."""
     odd = {
         "address": "0x" + "c0" * 20,
         "topics": ["0x" + "ee" * 32],
@@ -275,9 +384,12 @@ async def test_the_verdict_is_read_for_the_verified_claim_not_the_scans_odd_log(
         "transactionHash": "0x" + "e1" * 32,
         "blockNumber": 45,
     }
-    w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True, "extra_logs": (odd,)}, {}, {}])
-    w.chain.claim(CLAIM_BLOCK)
+    w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True, "extra_logs": (odd,)}] * 3)
+    claim = w.chain.claim(CLAIM_BLOCK)
+    w.write(dataclasses.replace(w.record(), counter_claim_tx=claim))
     w.chain.force_receipt(REFUND_BLOCK, topic0=REFUNDED_TOPIC0, label="refund")
+    status = await w.observer._eth.claim_status(w.chain.locator().contract_address, w.chain.deploy_tx)
+    assert status.claim_tx_hash == odd["transactionHash"]
     obs = await w.observe()
     assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is True
     assert obs.eth_claim_finality is CounterClaimState.FINAL
@@ -475,6 +587,41 @@ def test_a_claim_on_record_beside_our_final_refund_pages_the_covenant_claim():
     assert d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
 
 
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+def test_a_claim_on_record_is_a_claim_when_the_tick_detects_none(state):
+    """Review F1, in pure decide: the record kept a claim and this tick's reads name none. The claim
+    race runs (fail closed on its missing verdict); no refund page, no WATCH."""
+    rec = _record(state, counter_claim_tx="0x" + "c1" * 32)
+    d = _d(rec, _obs(eth_disposition=DispositionKind.UNKNOWN))
+    assert d.situation == decide_mod.SITUATION_CLAIM_RACE
+    assert d.intent is Intent.PAGE_SQUEEZED
+    # The honest twin: no claim on record, the same read, pages the refund at BTC_LOCKED.
+    d_none = _d(_record(state), _obs(eth_disposition=DispositionKind.UNKNOWN))
+    assert d_none.situation != decide_mod.SITUATION_CLAIM_RACE
+
+
+def test_a_claim_on_record_after_a_params_mismatch_pages_the_gated_exit():
+    rec = _record(SwapState.PARAMS_MISMATCH, role=RecordRole.MAKER, counter_claim_tx="0x" + "c1" * 32)
+    d = _d(rec, _obs(eth_disposition=DispositionKind.UNKNOWN))
+    assert d.situation == decide_mod.SITUATION_ETH_CLAIMED_AFTER_MISMATCH
+
+
+def test_a_makers_btc_locked_record_is_not_told_to_run_a_taker_step():
+    """Review F4: on a maker's record ``reconcile_counter_leg`` only records the claim, so the page names
+    it alone; the taker's twin names the claim that follows it."""
+    obs = _obs(
+        eth_disposition=DispositionKind.CLAIMED,
+        eth_claim_detected=True,
+        eth_claim_seen=True,
+        eth_claim_finality=CounterClaimState.FINAL,
+    )
+    d = _d(_record(SwapState.BTC_LOCKED, role=RecordRole.MAKER), obs)
+    assert d.recommended_action.startswith("reconcile_counter_leg")
+    assert "taker_" not in d.recommended_action
+    d_taker = _d(_record(SwapState.BTC_LOCKED, role=RecordRole.TAKER), obs)
+    assert d_taker.recommended_action == "reconcile_counter_leg, then taker_scrape_and_claim_asset"
+
+
 def test_settled_at_the_tip_stops_no_page():
     """SETTLED_UNFINAL is read when ANY endpoint sees the contract settled at its tip: it must not
     silence the refund page."""
@@ -542,6 +689,9 @@ def test_every_eth_table_page_names_a_step_its_record_can_run(state, role):
         steps = _named_steps(d.recommended_action or "", guards)
         if steps:
             assert state in guards[steps[0]], (state, role, kw, d.recommended_action)
+        if role is RecordRole.MAKER and state is SwapState.BTC_LOCKED:
+            # Review F4: a maker's reconcile only records the claim, so no taker step can follow it.
+            assert not [s for s in steps if s.startswith("taker_")], (kw, d.recommended_action)
 
 
 # --------------------------------------------------------------------------- the legacy net (D9) for ETH
@@ -644,6 +794,34 @@ async def test_the_legacy_claim_page_is_marked_once_delivered_after_t_rxd(tmp_pa
     assert w.marker() is None  # not delivered, not marked
     await w.reconciler().tick()
     assert w.marker()["verdict"] == "claimed"
+
+
+def _legacy_check(kind, **kw):
+    rec = _record(SwapState.ABORTED, role=None, **kw.pop("record_kw", {}))
+    return decide_mod.decide_legacy(
+        record=rec, observations=_obs(eth_disposition=kind, **kw), policy=_policy(), safety_window_blocks=SAFETY
+    )
+
+
+def test_a_legacy_empty_contract_a_push_may_still_fill_is_read_again():
+    """Review F2: EXPIRED_EMPTY_OPEN means a signed push may still land. A marker would stop every later
+    read, so it is never conclusive; the honest twin, EXPIRED_EMPTY_CLOSED from several endpoints, is."""
+    open_ = _legacy_check(DispositionKind.EXPIRED_EMPTY_OPEN)
+    assert open_.decision.intent is Intent.WATCH
+    assert not open_.conclusive and not open_.conclusive_once_delivered
+    closed = _legacy_check(DispositionKind.EXPIRED_EMPTY_CLOSED)
+    assert closed.conclusive is True
+
+
+def test_a_legacy_record_with_a_claim_on_record_pages_the_covenant_claim():
+    """Review F1 on the legacy net: a claim the record kept pages the covenant claim even when this
+    tick's read failed; the twin without one is retried quietly."""
+    got = _legacy_check(DispositionKind.UNKNOWN, record_kw={"counter_claim_tx": "0x" + "c1" * 32})
+    assert got.decision.intent is Intent.PAGE_CLAIM
+    assert got.decision.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+    assert "on record" in got.decision.reason
+    quiet = _legacy_check(DispositionKind.UNKNOWN)
+    assert quiet.decision.intent is Intent.WATCH and not quiet.conclusive
 
 
 async def test_a_legacy_eth_record_never_reaches_the_executor(tmp_path):

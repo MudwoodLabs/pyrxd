@@ -546,7 +546,9 @@ _CLAIM_PATH: dict[SwapState, tuple[str, ...]] = {
 }
 
 
-def _claim_action(state: SwapState, *, winner_take_all: bool = False, note: str = "") -> str:
+def _claim_action(
+    state: SwapState, *, role: RecordRole | None = None, winner_take_all: bool = False, note: str = ""
+) -> str:
     """The claim step(s) the coordinator will ACCEPT from ``state``, as an alert-payload string.
 
     ``winner_take_all`` names the SQUEEZED decision, whose endpoint is always
@@ -559,6 +561,13 @@ def _claim_action(state: SwapState, *, winner_take_all: bool = False, note: str 
     out at the same severity with the same deadline, and it states which step needs which state so
     the operator can act instead of discovering it from a ValidationError.
     """
+    if role is RecordRole.MAKER and state is SwapState.BTC_LOCKED:
+        # On a maker's record ``reconcile_counter_leg`` only records the claim and leaves the state, so
+        # no claim step follows it; the covenant claim is the taker's (#850 PR 10, review F4).
+        return (
+            f"{_STEP_RECONCILE} (on a maker's record it records the claim and leaves btc_locked; "
+            "no covenant claim step follows, that claim is the taker's)" + (f" ({note})" if note else "")
+        )
     path = _CLAIM_PATH.get(state)
     if path is None:
         return (
@@ -938,7 +947,7 @@ def decide(
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason="maker claim observed but finality un-assessable (missing claim depth or asset-lock height) — fail-closed",
-                recommended_action=_claim_action(state, note="verify finality manually"),
+                recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 low_corroboration=corr,
                 situation=SITUATION_CLAIM_RACE,
             )
@@ -958,7 +967,7 @@ def decide(
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason=f"maker claim observed but finality gate un-assessable, fail-closed: {exc}",
-                recommended_action=_claim_action(state, note="verify finality manually"),
+                recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
                 situation=SITUATION_CLAIM_RACE,
@@ -970,7 +979,7 @@ def decide(
                     f"maker revealed p; BTC claim reorg-safe ({obs.btc_claim_confirmations} conf) and burial fits "
                     "the window" + ("" if _autonomy_allowed(record) else "." + _no_autonomy_note(record))
                 ),
-                recommended_action=_claim_action(state),
+                recommended_action=_claim_action(state, role=record.role),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
                 # BTC↔RXD SAFE claim race → arm the autonomous ClaimExecutor (BTC branch ONLY; the ETH
@@ -990,7 +999,7 @@ def decide(
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason="maker revealed p but t_rxd window closing (gate=SQUEEZED) — ASSET_VULNERABLE, decision required",
-            recommended_action=_claim_action(state, winner_take_all=True),
+            recommended_action=_claim_action(state, role=record.role, winner_take_all=True),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
             situation=SITUATION_CLAIM_RACE,
@@ -1515,9 +1524,14 @@ def _decide_eth(
     terms = record.terms
     state = record.state
 
+    # A claim the record kept (``counter_claim_tx``, which no step clears) is a claim whatever this
+    # tick's reads say: one endpoint can make the disposition read fail before it looks at any claim,
+    # and the detection scan can miss a log no endpoint serves (#850 PR 10, review F1).
+    claim_indicated = (obs.eth_claim_detected or record.counter_claim_tx is not None) and not _eth_refund_final(obs)
+
     # A claim after a params mismatch (#850 PR 10, design §3.2): there is deliberately no way into the
     # taker's claim flow from PARAMS_MISMATCH, so the claim race below could only name "investigate".
-    if state is SwapState.PARAMS_MISMATCH and obs.eth_claim_detected and not _eth_refund_final(obs):
+    if state is SwapState.PARAMS_MISMATCH and claim_indicated:
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason=(
@@ -1544,14 +1558,14 @@ def _decide_eth(
     # cannot drop a known-revealed swap into the silent WATCH catch-all (mirrors the BTC branch).
     # A claim beside our refund final at the finalized block is not a race: the contract paid us, so
     # no claim of it can be mined. It is paged below, as the covenant claim when p is public (D14).
-    if (obs.eth_claim_detected and not _eth_refund_final(obs)) or state is SwapState.SECRET_REVEALED:
+    if claim_indicated or state is SwapState.SECRET_REVEALED:
         if obs.eth_claim_finality is None or obs.asset_locked_at_height is None:
             # Claim indicated but finality un-assessable (no finalized-checkpoint verdict or no
             # asset-lock height) → fail closed to a decision-required page.
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason="maker ETH claim observed but finality un-assessable (missing finalized verdict or asset-lock height) — fail-closed",
-                recommended_action=_claim_action(state, note="verify finality manually"),
+                recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 low_corroboration=corr,
                 situation=SITUATION_CLAIM_RACE,
             )
@@ -1572,7 +1586,7 @@ def _decide_eth(
             return Decision(
                 Intent.PAGE_SQUEEZED,
                 reason=f"maker ETH claim observed but finality gate un-assessable, fail-closed: {exc}",
-                recommended_action=_claim_action(state, note="verify finality manually"),
+                recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
                 situation=SITUATION_CLAIM_RACE,
@@ -1581,7 +1595,7 @@ def _decide_eth(
             return Decision(
                 Intent.PAGE_CLAIM,
                 reason="maker revealed p on ETH; claim finalized and burial fits the window",
-                recommended_action=_claim_action(state),
+                recommended_action=_claim_action(state, role=record.role),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
                 situation=SITUATION_CLAIM_RACE,
@@ -1597,7 +1611,7 @@ def _decide_eth(
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason="maker revealed p on ETH but t_rxd window closing (gate=SQUEEZED) — ASSET_VULNERABLE, decision required",
-            recommended_action=_claim_action(state, winner_take_all=True),
+            recommended_action=_claim_action(state, role=record.role, winner_take_all=True),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
             situation=SITUATION_CLAIM_RACE,
@@ -2025,16 +2039,17 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
     """:func:`decide_legacy` for an ETH counter leg (#850 PR 10, design §5.2 item 3). Pure, never
     autonomous. The verdicts, from the shared reader:
 
-    * a claim that opens H seen, or CLAIMED → PAGE_CLAIM naming the covenant claim: the refund lost, or
+    * a claim that opens H seen, a claim on record (``counter_claim_tx``), or CLAIMED → PAGE_CLAIM naming
+      the covenant claim: the refund lost, or
       p is public beside it. Conclusive once the page is delivered after t_rxd has matured.
     * a log the detection scan counts as a claim and the reader does not → PAGE_SQUEEZED "investigate".
     * unsettled (OPEN, TIP_EXPIRED, F_EXPIRED) → PAGE_REFUND: the recorded refund never landed, and
       ``refund()`` on the contract (anyone may call it after the timeout; it pays the refundee) is
       still due. Never conclusive, like an unspent BTC HTLC. Not urgent: before the timeout a refund
       cannot be sent yet, and from the timeout on the contract refuses a claim, so nothing races it.
-    * REFUNDED, or empty (``EXPIRED_EMPTY_*``), on a read of more than one endpoint → agrees;
-      conclusive. One endpoint's answer, SETTLED_UNFINAL, or an UNKNOWN from a failed read → retried,
-      nothing written. An UNKNOWN that read the contract settled → PAGE_SQUEEZED, retried.
+    * REFUNDED, or EXPIRED_EMPTY_CLOSED, on a read of more than one endpoint → agrees; conclusive. One
+      endpoint's answer, EXPIRED_EMPTY_OPEN (a signed push may still land), SETTLED_UNFINAL, or an
+      UNKNOWN from a failed read → retried, nothing written. An UNKNOWN that read the contract settled → PAGE_SQUEEZED, retried.
     """
     obs = observations
     corr = _eth_corroboration(obs)
@@ -2061,19 +2076,22 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
     )
     kind = obs.eth_disposition
     why = f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else ""
-    if obs.eth_claim_seen or kind is DispositionKind.CLAIMED:
+    if obs.eth_claim_seen or kind is DispositionKind.CLAIMED or record.counter_claim_tx is not None:
         refunded = _eth_refund_final(obs)
+        seen = (
+            "a Claimed log that opens H was served"
+            if obs.eth_claim_seen or kind is DispositionKind.CLAIMED
+            else f"a claim is on record (tx {record.counter_claim_tx})"
+        )
         return LegacyCheck(
             Decision(
                 Intent.PAGE_CLAIM,
                 reason=(
                     f"{ended}. "
                     + (
-                        f"The refund {obs.eth_disposition_tx} is final, but a Claimed log that opens H was served, so p "
-                        "is public"
+                        f"The refund {obs.eth_disposition_tx} is final, but {seen}, so p is public"
                         if refunded
-                        else "The contract was CLAIMED (or a Claimed log that opens H was served): the refund lost and "
-                        "p is public"
+                        else f"The contract was CLAIMED (or {seen}): the refund lost and p is public"
                     )
                     + ". Claim the covenant before t_rxd, if it is still unspent"
                     + (" (t_rxd has matured: the maker may already have refunded it)" if past else "")
@@ -2137,7 +2155,23 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
             ),
             kind.value,
         )
-    agreeing = (DispositionKind.REFUNDED, DispositionKind.EXPIRED_EMPTY_OPEN, DispositionKind.EXPIRED_EMPTY_CLOSED)
+    if kind is DispositionKind.EXPIRED_EMPTY_OPEN:
+        # Empty now, but a token push signed for the contract may still land (the funding key's nonce at
+        # the finalized block has not passed it). A marker would stop every later read, and a push that
+        # lands would leave value in the contract with no one told; read again, so a landed push reads
+        # F_EXPIRED and pages the refund (review F2).
+        return LegacyCheck(
+            Decision(
+                Intent.WATCH,
+                reason=(
+                    f"legacy net: the contract reads {kind.value}{why}: empty, but a signed push may still land; "
+                    "read again later"
+                ),
+                low_corroboration=corr,
+            ),
+            kind.value,
+        )
+    agreeing = (DispositionKind.REFUNDED, DispositionKind.EXPIRED_EMPTY_CLOSED)
     if kind in agreeing and obs.eth_single_source:
         return LegacyCheck(
             Decision(
