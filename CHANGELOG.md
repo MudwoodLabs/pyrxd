@@ -687,8 +687,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     watched that refund, armed no pre-signed refund, and paged only near `t_rxd`, naming a refund
     that was on no chain. The read now reports `refund_outvoted`, and the tower (the legacy net
     too) treats it as unspent: it pages the refund and may arm the pre-signed one. Re-sending our
-    own refund costs nothing. At `BOTH_LOCKED` near `t_rxd`, where nothing arms, the CRITICAL
-    pending-refund page stays.
+    own refund costs nothing. At `BOTH_LOCKED` with `t_rxd` known to be near, where nothing
+    arms, the CRITICAL pending-refund page stays.
   - A `BOTH_LOCKED` BTC swap whose covenant lock height the RXD sources could not read got `WATCH`
     on every tick, past `t_rxd` too. The tower now reads the BTC funding depth there and uses it
     as the clock, as it does at `BTC_LOCKED`: it watches while the BTC refund leaf has not matured

@@ -89,6 +89,25 @@ async def test_at_both_locked_near_t_rxd_a_stale_refund_keeps_the_critical_pendi
     assert stale in d.reason and "not on the chain" in d.reason
 
 
+@pytest.mark.parametrize("role", [RecordRole.TAKER, RecordRole.NONE, None])
+async def test_at_both_locked_with_the_lock_height_unread_a_stale_refund_decides_as_the_honest_tower(tmp_path, role):
+    """Re-review 2, L1: with the lock height unread, _t_rxd_near fails toward True, so the F1 guard
+    paged a CRITICAL squeeze where the honest tower WATCHes on the funding-depth clock."""
+    w = _Tower(tmp_path, state=SwapState.BOTH_LOCKED, role=role)
+    w.rxd.cov_confs = None
+    record = w.record()
+    for depth in (3, 51):  # immature: WATCH; matured: the urgent refund page
+        obs = dataclasses.replace(await w.observe(), btc_funding_confirmations=Confirmations(depth))
+        honest = _decide(record, obs)
+        w.sources[2].forge_spender = None
+        _stale_refund(w)
+        stale_obs = dataclasses.replace(await w.observe(), btc_funding_confirmations=Confirmations(depth))
+        w.sources[2].forge_spender = None
+        assert stale_obs.btc_refund_outvoted
+        d = _decide(record, stale_obs)
+        assert (d.intent, d.urgent, d.situation) == (honest.intent, honest.urgent, honest.situation), d.reason
+
+
 @pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH])
 async def test_near_t_rxd_a_stale_refund_still_lets_the_pre_signed_refund_go_out(tmp_path, state):
     """Re-review G1: limiting the override to "t_rxd not near" kept the squeeze here too, and the
