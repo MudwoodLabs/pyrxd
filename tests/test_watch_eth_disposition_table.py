@@ -25,7 +25,7 @@ import os
 import pytest
 
 from pyrxd.eth_wallet.disposition import DispositionKind
-from pyrxd.eth_wallet.events import CLAIMED_TOPIC0
+from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.gravity.eth_counter_disposition import eth_counter_disposition_kwargs
 from pyrxd.gravity.finality import CounterClaimState
@@ -251,6 +251,37 @@ async def test_a_claim_the_primary_hides_is_seen_through_the_union_read(tmp_path
     assert d.intent is Intent.PAGE_CLAIM
     assert d.situation == decide_mod.SITUATION_CLAIM_RACE
     assert d.recommended_action == "reconcile_counter_leg, then taker_scrape_and_claim_asset"
+
+
+async def test_a_refund_no_endpoint_logs_is_found_by_the_hash_on_record(tmp_path):
+    """The tower nominates the refund the record kept, as the coordinator does (one builder): with no
+    endpoint serving its log, the hash on record is the only thing that names it."""
+    w = _EthTower(tmp_path, endpoint_kw=[{"hide_all_logs": True}] * 3)
+    refund = w.chain.refund(REFUND_BLOCK)
+    w.write(dataclasses.replace(w.record(), counter_refund_tx_hash=refund, counter_refund_nonce=0))
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.REFUNDED and obs.eth_disposition_tx == refund
+    assert (await w.decide()).intent is Intent.RECONCILE
+
+
+async def test_the_verdict_is_read_for_the_verified_claim_not_the_scans_odd_log(tmp_path):
+    """The primary hides the Claimed log and serves an odd one, which the scan (primary only) takes for
+    the claim. A refund and the claim both verify, so the answer is UNKNOWN, not CLAIMED: the finality
+    verdict must be read for the claim the reader verified, not for the odd log's transaction."""
+    odd = {
+        "address": "0x" + "c0" * 20,
+        "topics": ["0x" + "ee" * 32],
+        "data": "0x",
+        "transactionHash": "0x" + "e1" * 32,
+        "blockNumber": 45,
+    }
+    w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True, "extra_logs": (odd,)}, {}, {}])
+    w.chain.claim(CLAIM_BLOCK)
+    w.chain.force_receipt(REFUND_BLOCK, topic0=REFUNDED_TOPIC0, label="refund")
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is True
+    assert obs.eth_claim_finality is CounterClaimState.FINAL
+    assert (await w.decide()).situation == decide_mod.SITUATION_CLAIM_RACE
 
 
 async def test_a_claim_the_scan_sees_still_pages_without_the_reader(tmp_path):
