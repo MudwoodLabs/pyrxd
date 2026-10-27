@@ -30,8 +30,14 @@ The invariants are the alert-path contract, checked after every tick:
 
   Neither exception may lower a squeeze: a decision the honest tower takes as PAGE_SQUEEZED is
   CRITICAL here too.
-* **Autonomy needs a corroborated unspent read.** The pre-signed refund is armed only while the
-  outpoint is unspent on the chain and at least a quorum of sources are healthy.
+* **Autonomy needs a quorum of "unspent".** The pre-signed refund is armed only when at least a
+  quorum of sources answer that the outpoint is unspent and none names a spender (the reader's rule,
+  ``pyrxd.btc_wallet.disposition``). A source that is down or fails its read is never a vote for
+  "unspent".
+* **An unburied refund of ours near t_rxd is CRITICAL.** With every source honest, our refund on the
+  chain short of burial while the taker's refund window is open (``taker_refund_window_open``, the
+  coordinator's own predicate) pages CRITICAL: the maker can then refund the covenant and still claim
+  the BTC.
 
 The model below restates the rules ``DedupAlerter`` documents (a situation is open from its first
 delivered page until it has been absent for ``situation_hold_ticks`` ticks; it keeps the highest
@@ -57,6 +63,7 @@ from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 
 import tests.test_watch_btc_spender_classification as spender_tests
+from pyrxd.gravity.swap_coordinator import taker_refund_window_open
 from pyrxd.gravity.watch.adapters import OutspendBtcClaimSource
 from pyrxd.gravity.watch.alerts import DedupAlerter, Severity
 from pyrxd.gravity.watch.decide import Decision, Intent, decide
@@ -69,6 +76,7 @@ from tests.test_watch_btc_spender_classification import BURIAL, COV_CONFS, SWAP,
 LOCKED_AT = TIP - COV_CONFS + 1
 T_RXD_OPENS = LOCKED_AT + T_RXD
 HOLD = 3
+SAFETY = 6  # the reconciler's safety_window_blocks in _Tower
 QUORUM = 2
 
 _BUDGET_MULT = int(os.environ.get("FUZZ_BUDGET_MULTIPLIER", "1"))
@@ -321,7 +329,7 @@ class AlertPathMachine(RuleBasedStateMachine):
         if healthy >= len(self.faults) - 1:
             record = self.w.record()
             obs = self._loop.run_until_complete(self.honest.observe(SWAP, record))
-            reference = decide(record=record, observations=obs, policy=_policy(), safety_window_blocks=6)
+            reference = decide(record=record, observations=obs, policy=_policy(), safety_window_blocks=SAFETY)
             if _RANK[_severity(decision)] < _RANK[_severity(reference)]:
                 lowered = f"faults {self.faults} lowered {_key(reference)} ({reference.reason}) to {decision.intent.value} ({decision.reason})"
                 assert reference.intent is not Intent.PAGE_SQUEEZED, lowered
@@ -335,15 +343,36 @@ class AlertPathMachine(RuleBasedStateMachine):
                         lowered
                     )
         if decision.autonomous_btc_refund:
-            # A source answers "unspent" truthfully when it is up, reads the spender, serves no forged
-            # one, and (for a source that hides spenders) there is nothing to hide. Two lying sources
-            # can outvote one honest one at quorum 2 of 3: that is the quorum's stated limit, not checked.
-            truthful = sum(f in ("ok", "lie_depth") or (f == "hide_spender" and spender is None) for f in self.faults)
-            assert truthful >= QUORUM or len(self.faults) - healthy >= 2, (
-                f"refund armed on faults {self.faults}: {decision.reason}"
+            # What each source answers to "who spends the outpoint": an honest or depth-lying source the
+            # chain's spender, a hiding one "unspent", a forging one its forgery; a source that is down or
+            # fails the read answers nothing. Two hiding sources outvote one honest one at quorum 2 of 3,
+            # and the machine allows that: it is the quorum's stated limit.
+            says_unspent = sum(
+                f == "hide_spender" or (f in ("ok", "lie_depth") and spender is None) for f in self.faults
             )
-            if len(self.faults) - healthy <= 1:
-                assert spender is None, f"refund armed with spender {spender} on the chain: {decision.reason}"
+            names_one = sum(
+                f.startswith("forge_") or (f in ("ok", "lie_depth") and spender is not None) for f in self.faults
+            )
+            assert says_unspent >= QUORUM and names_one == 0, (
+                f"refund armed on faults {self.faults} with spender {spender}: {decision.reason}"
+            )
+        refund_unburied = (
+            spender is not None
+            and spender not in self.claims
+            and self.w.chain.mined.get(spender, self.w.chain.head + 1) > self.w.chain.head - BURIAL + 1
+        )
+        window_open = taker_refund_window_open(
+            now_block_height=self.w.rxd.tip,
+            asset_locked_at_height=LOCKED_AT,
+            t_rxd=self.w.record().terms.t_rxd,
+            safety_window_blocks=SAFETY,
+            maker_has_claimed_btc=False,
+            block_interval_s=_policy().block_interval_s,
+        )
+        if healthy == len(self.faults) and refund_unburied and window_open:
+            assert _severity(decision) is Severity.CRITICAL, (
+                f"our unburied refund near t_rxd decided {decision.intent.value}: {decision.reason}"
+            )
 
     @invariant()
     def count_never_negative(self) -> None:
