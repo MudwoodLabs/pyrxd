@@ -205,4 +205,5 @@ def test_file_ack_inbox_drain(tmp_path):
     path.chmod(0o600)  # the inbox is a control channel: owner-only or it is refused
     assert inbox.drain() == ["s1", "s2", "s3"]
     assert inbox.drain() == []  # drained: consumed exactly once
-    assert not path.exists()
+    # An empty owner-only inbox is put back, so the operator's next append keeps mode 0600.
+    assert path.read_text() == "" and path.stat().st_mode & 0o777 == 0o600
