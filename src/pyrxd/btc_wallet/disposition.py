@@ -24,13 +24,15 @@ anything, and in this PR nothing in the coordinator calls it yet.
   signatures both verify read :attr:`BtcDispositionKind.UNKNOWN`. A claim witness that does not
   verify beside a verified refund does not hold the refund off (anyone who knows ``p`` can write
   one over our refund's txid); it is still reported in ``claims_seen``.
-* **Burial decides.** A spender changes nothing until it is ``burial_blocks`` deep at the quorum
-  MINIMUM of its depth, with at least ``quorum`` sources answering the depth and every source that
-  places it in a block placing it in the SAME block. Below that a claim is
+* **Burial decides.** A spender changes nothing until it is ``burial_blocks`` deep at the depth a
+  quorum of sources vouches for (:func:`~pyrxd.network.quorum_depth.depth_vouched_by_quorum`), with
+  at least ``quorum`` sources answering the depth and every source that places it in a block placing
+  it in the SAME block. Below that a claim is
   :attr:`BtcDispositionKind.CLAIM_SEEN` and a refund :attr:`BtcDispositionKind.REFUND_PENDING`: the
   claim leaf has no timelock and the refund signals BIP125, so an unburied refund can still be
-  replaced by a claim, and either can be reorged out. The minimum is the safe direction, and its
-  cost is liveness: one source that never reports the spender deep, or places it in another block,
+  replaced by a claim, and either can be reorged out. One source that over-reports cannot raise
+  that depth, and one that under-reports cannot hold it down while a quorum of others answers (it
+  was the minimum until register R13). One source that places the spender in another block still
   holds every terminal answer back.
 * **Unspent** needs ``quorum`` sources saying so and none naming a spender that passes the checks:
   a source that cannot answer is never a vote for "unspent". ``unspent_by`` lists who said so on
@@ -59,6 +61,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ..network.quorum_depth import depth_vouched_by_quorum
 from ..network.source_identity import require_distinct_sources
 from ..security.errors import ValidationError
 from . import taproot as t
@@ -99,8 +102,9 @@ class BtcSpender:
     """One transaction some source names as spending the outpoint, checked and classified.
 
     ``verified``: its leaf signature verifies over the bytes served (always, for a refund).
-    ``confirmations`` is the MINIMUM depth across the sources that answered, or ``None`` when fewer
-    than the quorum did; ``deepest`` is the MAXIMUM any source answered (``None`` when none did), so
+    ``confirmations`` is the depth a quorum of the sources that answered vouches for
+    (:func:`~pyrxd.network.quorum_depth.depth_vouched_by_quorum`), or ``None`` when fewer than the
+    quorum did; ``deepest`` is the MAXIMUM any source answered (``None`` when none did), so
     a caller can tell "mined, depth below quorum" from "no source has it mined". ``block`` is ``(height, block hash)`` when every source that places the
     transaction in a block agrees on it and at least the quorum do, else ``None``. ``contested``:
     sources served this txid with witnesses that classify differently; ``raw`` is then a claim's
@@ -151,6 +155,8 @@ class BtcCounterDisposition:
     #: The sources that answered "unspent", on every answer.
     unspent_by: tuple[str, ...] = ()
     single_source: bool = False
+    #: How many sources each read a decision rests on needed (the reader's ``quorum``).
+    quorum: int = 1
 
     @property
     def claims_seen(self) -> tuple[BtcSpender, ...]:
@@ -167,6 +173,22 @@ class BtcCounterDisposition:
     @property
     def refunds_seen(self) -> tuple[BtcSpender, ...]:
         return tuple(s for s in self.spenders if s.path is SpendPath.REFUND)
+
+    @property
+    def refund_outvoted(self) -> bool:
+        """A :attr:`BtcDispositionKind.REFUND_PENDING` read whose refunds a quorum does not hold: every
+        refund-leaf spend is named by fewer than ``quorum`` sources, at least ``quorum`` sources hold
+        the outpoint unspent, and no claim is seen. One stale source still serving a refund that was
+        dropped or never relayed reads this way, and so does a refund that has reached only one
+        source's mempool so far. The kind stays REFUND_PENDING (the coordinator follows that refund);
+        a consumer that would stand down on a pending refund of ours reads this as unspent instead,
+        since sending our refund again costs nothing (the watchtower, register R12)."""
+        return (
+            self.kind is BtcDispositionKind.REFUND_PENDING
+            and len(self.unspent_by) >= self.quorum
+            and not self.claims_seen
+            and all(len(set(r.nominated_by)) < self.quorum for r in self.refunds_seen)
+        )
 
 
 # --------------------------------------------------------------------------- classification
@@ -394,6 +416,7 @@ async def read_btc_counter_disposition(
             single_source=single,
             failed=tuple(failed.items()),
             unspent_by=tuple(unspent_by),
+            quorum=quorum,
             **kw,
         )
 
@@ -456,7 +479,7 @@ async def read_btc_counter_disposition(
         good_depths = [
             d for d in (_depth_or_none(x) for x in depths if not isinstance(x, BaseException)) if d is not None
         ]
-        confirmations = min(good_depths) if len(good_depths) >= quorum else None
+        confirmations = depth_vouched_by_quorum(good_depths, quorum) if len(good_depths) >= quorum else None
         placed = [_block_or_none(b) for b in blocks if not isinstance(b, BaseException)]
         in_blocks = {b for b in placed if isinstance(b, tuple)}
         block = (

@@ -147,6 +147,11 @@ class Observations:
     #: ``low_corroboration``, and a single-source REFUNDED is read as still pending (Mythos F6; design
     #: §5.1, "a single endpoint's Refunded() never stops a page").
     btc_single_source: bool = False
+    #: Whether the read is REFUND_PENDING only because fewer than a quorum of sources name our refund
+    #: while a quorum holds the outpoint unspent (``BtcCounterDisposition.refund_outvoted``). Read as
+    #: unspent here: one stale source must not stand the refund page and the pre-signed refund down
+    #: (register R12).
+    btc_refund_outvoted: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.maker_has_claimed_btc, bool):
@@ -173,6 +178,10 @@ class Observations:
             raise ValidationError("Observations.btc_single_source must be bool, and needs a classified read")
         if not isinstance(self.btc_claim_witness_seen, bool):
             raise ValidationError("Observations.btc_claim_witness_seen must be bool")
+        if not isinstance(self.btc_refund_outvoted, bool):
+            raise ValidationError("Observations.btc_refund_outvoted must be bool")
+        if self.btc_refund_outvoted and self.btc_disposition is not BtcDispositionKind.REFUND_PENDING:
+            raise ValidationError("Observations.btc_refund_outvoted needs a REFUND_PENDING read")
         if self.btc_claim_witness_seen and not (self.btc_spend_classified and self.maker_has_claimed_btc):
             raise ValidationError("Observations.btc_claim_witness_seen needs a classified read and the claim trigger")
         if self.btc_disposition is not None and not isinstance(self.btc_disposition, BtcDispositionKind):
@@ -625,6 +634,10 @@ SITUATION_BTC_REFUND_DUE = "btc_refund_due"
 SITUATION_PARAMS_MISMATCH_REFUND = "params_mismatch_refund"
 SITUATION_BOTH_LOCKED_REFUND_DUE = "both_locked_refund_due"
 SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE = "both_locked_refund_unevaluable"
+#: BOTH_LOCKED with the covenant pinned but its lock height unread, once the BTC refund leaf is open or
+#: its maturity cannot be read (register R1 with R8).
+SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD = "both_locked_lock_height_unread"
+SITUATION_MAKER_REFUND_LOCK_HEIGHT_UNREAD = "maker_refund_lock_height_unread"
 SITUATION_LEGACY_BTC_UNSPENT = "legacy_btc_unspent"
 #: Every other refund page names its own situation too, so two different refund pages on one swap
 #: are never one WARN, paged once (re-review of the third pass's fixes, finding 6).
@@ -656,6 +669,10 @@ def _btc_spend_decision(
         else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
     )
     txid = obs.btc_refund_txid
+    if obs.btc_refund_outvoted:
+        # A refund only a minority of sources hold, beside a quorum that reads the outpoint unspent:
+        # unspent, for every page here (register R12). The refund pages below say so.
+        kind = BtcDispositionKind.UNSPENT
     if kind is BtcDispositionKind.UNKNOWN and obs.btc_spenders_named:
         return Decision(
             Intent.PAGE_SQUEEZED,
@@ -777,13 +794,83 @@ def _btc_spend_decision(
     return None
 
 
+def _both_locked_lock_height_unread(record: SwapRecord, obs: Observations, corr: bool) -> Decision:
+    """BOTH_LOCKED on a BTC counter leg, with no covenant lock height this tick (register R1 with R8).
+
+    Without the lock height the tower cannot tell where t_rxd is, and a WATCH here held for as long
+    as the RXD sources could not read the covenant, past t_rxd too. The BTC funding depth is the clock
+    instead, as at BTC_LOCKED: the swap was gated so the BTC refund opens before the covenant refund,
+    so while the BTC refund leaf has provably not matured, t_rxd has not either. Once it has matured,
+    or its maturity cannot be read, this pages, urgent for the taker: the maker may be able to refund
+    the covenant and still claim the BTC. A record with no covenant pinned keeps the WATCH (nothing
+    says a covenant exists)."""
+    terms = record.terms
+    if not _covenant_known(record, obs):
+        return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
+    unread = _btc_refund_maturity_unread(terms, obs)
+    if not unread and not _btc_refund_matured(terms, obs):
+        return Decision(
+            Intent.WATCH,
+            reason=(
+                "both legs locked; the covenant's lock height could not be read this tick, but the BTC refund leaf "
+                f"has not matured (funding {obs.btc_funding_confirmations} conf < t_btc {terms.t_btc.value} blocks), "
+                "and the swap was gated so the covenant refund opens after it: t_rxd is not near"
+            ),
+            low_corroboration=corr,
+        )
+    why = (
+        "the BTC funding depth could not be read this tick"
+        if obs.btc_funding_confirmations is None
+        else (
+            f"t_btc is in {terms.t_btc.unit.value}, not blocks"
+            if terms.t_btc.unit is not TimeUnit.BLOCKS
+            else f"the BTC refund leaf has matured (funding {obs.btc_funding_confirmations} conf >= t_btc "
+            f"{terms.t_btc.value} blocks)"
+        )
+    )
+    if record.role is RecordRole.MAKER:
+        return _maker_covenant_refund(
+            f"the covenant's lock height could not be read this tick and {why}, so t_rxd may be near or past; "
+            "the taker refunds its BTC if you have not claimed it",
+            deadline=None,
+            corr=corr,
+            situation=SITUATION_MAKER_REFUND_LOCK_HEIGHT_UNREAD,
+        )
+    return Decision(
+        Intent.PAGE_REFUND,
+        reason=(
+            "both legs locked and the maker has not claimed, but the covenant pinned on the record could not be "
+            f"read on the RXD sources this tick, so this tower cannot tell where t_rxd is; {why}, and the swap was "
+            "gated so the covenant refund opens after the BTC refund. Failing toward this page: once t_rxd matures "
+            "the maker can refund the covenant and still claim the BTC (the claim leaf has no timelock). Read the "
+            "covenant on another RXD source; run mutual_refund once both timeouts have elapsed."
+        ),
+        recommended_action="mutual_refund",
+        low_corroboration=corr,
+        urgent=True,
+        situation=SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD,
+    )
+
+
 def _btc_spend_permits_autonomy(obs: Observations) -> bool:
     """Whether the spender read lets an autonomous refund go out: a classified read must hold the
     outpoint UNSPENT at its quorum (a read below quorum, or one that names a spender, never arms).
     A single-source read arms only as the executor allows any single-source read: it marks the
     decision ``low_corroboration`` (:func:`_corroboration`; Mythos F6). An unclassified read keeps
-    the pre-9b rule, decided by the caller."""
-    return not obs.btc_spend_classified or obs.btc_disposition is BtcDispositionKind.UNSPENT
+    the pre-9b rule, decided by the caller. A refund of ours that fewer than a quorum of sources
+    name, beside a quorum that reads the outpoint unspent, arms too: sending our refund again costs
+    nothing, and one stale source must not stand it down (register R12)."""
+    return not obs.btc_spend_classified or obs.btc_disposition is BtcDispositionKind.UNSPENT or obs.btc_refund_outvoted
+
+
+def _outvoted_note(obs: Observations) -> str:
+    """Said on a page that reads the outpoint unspent over a refund a minority of sources hold."""
+    if not obs.btc_refund_outvoted:
+        return ""
+    return (
+        " A quorum of sources reads the BTC HTLC unspent; fewer than a quorum name a refund of ours "
+        f"({obs.btc_refund_txid}), which is read as not on the chain ({obs.btc_disposition_reason})."
+    )
 
 
 def _corroboration(obs: Observations) -> bool:
@@ -965,7 +1052,8 @@ def decide(
                 _spend_read_note(obs)
                 if matured and _autonomy_allowed(record) and not armed and obs.btc_disposition is not None
                 else ""
-            ),
+            )
+            + _outvoted_note(obs),
             recommended_action="taker_refund_btc",
             autonomous_btc_refund=armed,
             low_corroboration=corr,
@@ -998,7 +1086,7 @@ def decide(
         )
     if state is SwapState.BOTH_LOCKED:
         if obs.asset_locked_at_height is None:
-            return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
+            return _both_locked_lock_height_unread(record, obs, corr)
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
         try:
             refund_due = taker_refund_window_open(
@@ -1139,6 +1227,7 @@ def decide(
                     + ("" if obs.asset_locked_at_height is not None else " (its depth could not be read this tick)")
                     + "."
                     + note
+                    + _outvoted_note(obs)
                 ),
                 recommended_action="taker_refund_btc",
                 autonomous_btc_refund=armed,
@@ -1155,6 +1244,7 @@ def decide(
                         f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
                         f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg"
                         + ("." + _autonomous_refund_note() if obs.btc_spend_classified else "")
+                        + _outvoted_note(obs)
                     ),
                     recommended_action="taker_refund_btc",
                     autonomous_btc_refund=True,
@@ -1211,6 +1301,7 @@ def decide(
             reason=(
                 f"BTC_LOCKED; awaiting t_btc maturity (funding {obs.btc_funding_confirmations} conf)"
                 + ("; the maker's covenant is observed" if covenant_seen else " or an asset lock")
+                + _outvoted_note(obs)
             ),
             low_corroboration=corr,
         )
@@ -1577,6 +1668,8 @@ def decide_legacy(
         "follow a refund to burial)"
     )
     kind = obs.btc_disposition
+    if obs.btc_refund_outvoted:
+        kind = BtcDispositionKind.UNSPENT  # a refund only a minority of sources hold (register R12)
     if obs.maker_has_claimed_btc and kind is BtcDispositionKind.REFUNDED and not obs.btc_claim_witness_seen:
         # A spender only discovery names, beside our buried refund (Mythos F4): never marked.
         return LegacyCheck(
@@ -1666,7 +1759,7 @@ def decide_legacy(
                 Intent.PAGE_REFUND,
                 reason=(
                     f"{ended}, but the BTC HTLC is unspent: the recorded refund never confirmed. The maker can claim "
-                    "it at any time while it is unspent"
+                    "it at any time while it is unspent." + _outvoted_note(obs)
                 ),
                 recommended_action=(
                     "refund by address (pyrxd swap build-refund, then broadcast it), and watch until the refund is "

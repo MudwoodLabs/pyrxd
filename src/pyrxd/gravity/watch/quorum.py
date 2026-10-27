@@ -2,10 +2,10 @@
 
 Turns chain reads into the :class:`Observations` that :func:`decide` consumes. The
 safety-critical input — the maker's BTC-claim *depth* — must be quorum-agreed
-(conservative ``min`` across sources of distinct operators, fail-closed below quorum); the
+(across sources of distinct operators, fail-closed below quorum); the
 shell backs :class:`BtcClaimSource.confirmations` with
-``network.bitcoin.MultiSourceBtcFundingReader`` (already built: ``min(depth)``,
-2-of-3, fail-closed). The RXD side is now **multi-source** too:
+``network.bitcoin.MultiSourceBtcFundingReader`` (already built: the depth a quorum vouches for,
+``pyrxd.network.quorum_depth.depth_vouched_by_quorum``, 2-of-3, fail-closed). The RXD side is now **multi-source** too:
 :class:`pyrxd.gravity.watch.adapters.MultiSourceRxdChainSource` composes >= 2 distinct-operator
 Radiant readers (the operator's node + public ElectrumX), and the daemon shell wires it by
 default (``pyrxd.gravity.watch.run``, 2-of-2 public ElectrumX) — passing
@@ -69,8 +69,8 @@ class BtcClaimStatus:
 class BtcClaimSource(Protocol):
     """Detects the maker's counter-leg claim and reads its quorum-agreed depth.
 
-    ``confirmations`` MUST be quorum-backed (conservative ``min`` across sources on distinct
-    hosts) — it is the reorg-safety input to the gate. The shell satisfies it with
+    ``confirmations`` MUST be quorum-backed (the depth a quorum of sources on distinct hosts
+    vouches for, ``pyrxd.network.quorum_depth.depth_vouched_by_quorum``) — it is the reorg-safety input to the gate. The shell satisfies it with
     ``MultiSourceBtcFundingReader``.
     """
 
@@ -84,7 +84,7 @@ class BtcClaimSource(Protocol):
 
     async def funding_confirmations(self, funding_txid: str) -> Confirmations | None:
         """Quorum-agreed confirmation depth of the taker's BTC FUNDING tx — the relative-CSV refund
-        maturity input — or ``None`` if unread/unmined. Same conservative-``min`` quorum as
+        maturity input — or ``None`` if unread/unmined. Same quorum depth as
         :meth:`confirmations` (a forged over-report still fails consensus BIP68; an under-report only
         delays the refund)."""
         ...
@@ -322,8 +322,12 @@ class ChainObserver(Observer):
                 btc_confs = await self._btc.confirmations(claim_txid)
             # BTC-refund maturity: read the FUNDING outpoint depth ONLY when heading toward a BTC refund
             # (avoids a per-tick quorum round-trip for every swap on every tick). decide() gates the
-            # autonomous refund on funding >= t_btc; a None here keeps decide() fail-closed.
-            if record.state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
+            # autonomous refund on funding >= t_btc; a None here keeps decide() fail-closed. At
+            # BOTH_LOCKED it is read only when the covenant's lock height was not: decide() then uses
+            # it as the clock for t_rxd (register R1 with R8).
+            if record.state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH) or (
+                record.state is SwapState.BOTH_LOCKED and asset_locked is None
+            ):
                 funding_confs = await self._btc.funding_confirmations(locator.funding_outpoint.txid)
         return Observations(
             maker_has_claimed_btc=maker_claimed,
@@ -368,6 +372,7 @@ class ChainObserver(Observer):
             "btc_spenders_named": bool(disposition.spenders),
             "btc_claim_witness_seen": bool(claims),
             "btc_single_source": disposition.single_source,
+            "btc_refund_outvoted": disposition.refund_outvoted,
         }
         return claimed, claim_txid, fields
 

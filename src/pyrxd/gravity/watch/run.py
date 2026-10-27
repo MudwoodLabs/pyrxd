@@ -11,7 +11,7 @@ Backends:
 * RXD       — an ElectrumX URL (``--rxd-electrumx-url``). For an ssh-tr radiant-cli
               backend, pass any client exposing ``get_tip_height()`` +
               ``get_transaction_verbose(txid)`` via :func:`build_reconciler`.
-* BTC depth — ``MultiSourceBtcFundingReader`` (2-of-3 Esplora, conservative min depth).
+* BTC depth — ``MultiSourceBtcFundingReader`` (2-of-3 Esplora, the depth a quorum vouches for).
 * BTC claim — mempool.space ``/outspend`` (detect the maker's claim of the HTLC outpoint).
 * ETH       — optional ``--eth-rpc-url`` (+ ``--eth-chain-id``): a keyless, read-only RPC to watch
               RXD<->ETH swaps (detect the maker's ``Claimed`` event, finalized-checkpoint verdict).

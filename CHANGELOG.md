@@ -110,6 +110,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spender, a longer span, a spender not found) raises `NetworkError`; it never answers "unspent"
   by default.
 
+### Changed (breaking)
+
+- **A multi-source BTC depth is now the depth a quorum of sources vouches for, not the minimum.**
+  `MultiSourceBtcFundingReader.confirmations` and the counter-leg disposition reader
+  (`read_btc_counter_disposition`) take the deepest depth that at least `quorum` of the answering
+  sources report (`pyrxd.network.quorum_depth.depth_vouched_by_quorum`). Under the minimum, one
+  source that under-reported held every depth down: a buried maker claim read as shallow, so the
+  claim gate (the coordinator's and the watchtower's) waited until the `t_rxd` window closed and then
+  named the winner-take-all path. One source that over-reports still cannot raise the depth when the
+  quorum is 2 or more: another answering source must report that depth too. With exactly `quorum`
+  answers, a quorum of 1, or fewer answers than the quorum (a below-dust read), the result is the
+  minimum, as before. The same rule now decides when the coordinator bumps a pending BTC refund (it
+  bumps once fewer than a quorum of sources hold it mined), and when a refund or claim is buried.
+
 ### Changed
 
 - **The watchtower tells a taker's BTC refund from the maker's claim, re-arms the pre-signed refund
@@ -666,6 +680,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (#729, below). The old field is kept, with the same value, for one minor release.
 
 ### Fixed
+
+- **The watchtower no longer lets one BTC source, or an unreadable covenant, lower a page.**
+  - One source still serving a refund of ours that a quorum of sources reads as unspent (a refund
+    that was dropped, replaced, or never relayed) made the read `REFUND_PENDING`. The tower then
+    watched that refund, armed no pre-signed refund, and paged only near `t_rxd`, naming a refund
+    that was on no chain. The read now reports `refund_outvoted`, and the tower (the legacy net
+    too) treats it as unspent: it pages the refund and may arm the pre-signed one. Re-sending our
+    own refund costs nothing.
+  - A `BOTH_LOCKED` BTC swap whose covenant lock height the RXD sources could not read got `WATCH`
+    on every tick, past `t_rxd` too. The tower now reads the BTC funding depth there and uses it
+    as the clock, as it does at `BTC_LOCKED`: it watches while the BTC refund leaf has provably not
+    matured, and otherwise pages (urgent for the taker, `both_locked_lock_height_unread`; the
+    maker gets its covenant-refund page). A record with no covenant pinned still watches.
+  - The claim page no longer waits on one source under-reporting a claim's depth (see "Changed
+    (breaking)").
 
 - **An ACK written as the watchtower runbook said was dropped (whole-component Mythos pass of the
   watchtower, F1).** `FileAckInbox.drain` renames the inbox away to read it, so the operator's next
