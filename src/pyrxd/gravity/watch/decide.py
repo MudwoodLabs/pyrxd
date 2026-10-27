@@ -1626,8 +1626,12 @@ def _decide_eth(
                 + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
             ),
             recommended_action=(
-                "investigate — read the contract's logs on another endpoint; if none opens H, refund your covenant "
-                "by its CSV leg at t_rxd (two-host runner: maker --phase refund)"
+                f"investigate — your claim on record ({record.counter_claim_tx}) is not among the logs read this "
+                "tick; if it is not on the canonical chain, re-send it before the ETH timeout (two-host runner: maker "
+                "--phase lock-claim); refund your covenant by its CSV leg at t_rxd only if no claim of yours lands"
+                if maker and claim_on_record
+                else "investigate — read the contract's logs on another endpoint; if none opens H, refund your "
+                "covenant by its CSV leg at t_rxd (two-host runner: maker --phase refund)"
                 if maker
                 else "investigate — read the contract's logs on another endpoint; if a Claimed log opens H, p is "
                 "public: claim the covenant before t_rxd (pyrxd swap build-claim); if none does, the counter-leg "

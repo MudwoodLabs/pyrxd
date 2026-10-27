@@ -680,18 +680,28 @@ def test_an_odd_log_beside_a_claim_on_record_pages_d14_not_investigate():
     assert d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
 
 
+@pytest.mark.parametrize("kind", [DispositionKind.OPEN, DispositionKind.TIP_EXPIRED])
 @pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
-def test_an_odd_log_on_a_makers_record_pages_investigate_with_the_makers_refund(state):
+def test_an_odd_log_on_a_makers_record_pages_investigate_with_the_makers_refund(state, kind):
     """Third review 2, fourth review F1: a maker's record is paged "investigate" too (never the claim
     race's silent WAIT), with the maker's own exit, the covenant refund, not the taker's covenant claim."""
-    rec = _record(state, role=RecordRole.MAKER, counter_claim_tx="0x" + "c1" * 32)
-    d = _d(rec, _obs(eth_disposition=DispositionKind.TIP_EXPIRED, **_ODD))
+    rec = _record(state, role=RecordRole.MAKER)
+    d = _d(rec, _obs(eth_disposition=kind, **_ODD))
     assert d.intent is Intent.PAGE_SQUEEZED
     assert d.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
     assert "maker --phase refund" in d.recommended_action and "build-claim" not in d.recommended_action
-    d_taker = _d(_record(state), _obs(eth_disposition=DispositionKind.TIP_EXPIRED, **_ODD))
+    d_taker = _d(_record(state), _obs(eth_disposition=kind, **_ODD))
     assert d_taker.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
     assert "build-claim" in d_taker.recommended_action
+
+
+def test_a_maker_whose_claim_is_on_record_is_told_to_resend_it_before_refunding():
+    """Fifth review F1: the maker's own claim on record means p was public. If that claim left the chain,
+    its exit is to re-send it before the ETH timeout, not to wait for t_rxd."""
+    rec = _record(SwapState.BOTH_LOCKED, role=RecordRole.MAKER, counter_claim_tx="0x" + "c1" * 32)
+    d = _d(rec, _obs(eth_disposition=DispositionKind.OPEN, **_ODD))
+    assert d.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
+    assert "lock-claim" in d.recommended_action and "0x" + "c1" * 32 in d.recommended_action
 
 
 def test_the_d14_page_carries_the_eth_corroboration_and_the_t_rxd_deadline():
