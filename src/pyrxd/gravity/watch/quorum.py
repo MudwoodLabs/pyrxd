@@ -477,12 +477,14 @@ class ChainObserver(Observer):
         (a verdict needs the endpoints to agree on its receipt, so one endpoint cannot make it), else
         ``None`` if any one's read failed (finality un-assessable, which pages fail-closed), else NOT
         YET FINAL. The order of ``claim_txs`` decides nothing but which reads run first."""
-        assert self._eth is not None
+        eth = self._eth
+        if eth is None:
+            raise ValidationError("ChainObserver has no EthChainSource for an ETH swap")
         failed = False
         best: CounterClaimFinality | None = None
         for tx in claim_txs:
             try:
-                verdict = await self._eth.claim_finality_verdict(tx)
+                verdict = await eth.claim_finality_verdict(tx)
             except NetworkError:
                 failed = True
                 continue
