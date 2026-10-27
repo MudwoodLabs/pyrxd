@@ -178,7 +178,8 @@ class BtcCounterDisposition:
     def refund_outvoted(self) -> bool:
         """A :attr:`BtcDispositionKind.REFUND_PENDING` read whose refunds a quorum does not hold: every
         refund-leaf spend is named by fewer than ``quorum`` sources, at least ``quorum`` sources hold
-        the outpoint unspent (a REFUND_PENDING read never has a claim seen). One stale source still serving a refund that was
+        the outpoint unspent, and no claim is seen (a refund spender can carry a claim witness served
+        for its txid, ``claim_raw``). One stale source still serving a refund that was
         dropped or never relayed reads this way, and so does a refund that has reached only one
         source's mempool so far. The kind stays REFUND_PENDING (the coordinator follows that refund);
         a consumer that would stand down on a pending refund of ours reads this as unspent instead,
@@ -186,6 +187,7 @@ class BtcCounterDisposition:
         return (
             self.kind is BtcDispositionKind.REFUND_PENDING
             and len(self.unspent_by) >= self.quorum
+            and not self.claims_seen
             and all(len(set(r.nominated_by)) < self.quorum for r in self.refunds_seen)
         )
 

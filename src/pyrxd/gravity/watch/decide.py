@@ -669,11 +669,15 @@ def _btc_spend_decision(
         else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
     )
     txid = obs.btc_refund_txid
-    if obs.btc_refund_outvoted and not _t_rxd_near(record, obs, policy, safety_window_blocks):
+    if obs.btc_refund_outvoted and not (
+        record.state is SwapState.BOTH_LOCKED and _t_rxd_near(record, obs, policy, safety_window_blocks)
+    ):
         # A refund only a minority of sources hold, beside a quorum that reads the outpoint unspent: read
-        # as unspent, so the refund page and the pre-signed refund are not stood down (register R12). Only
-        # while t_rxd is not near: there the pending-refund squeeze below is CRITICAL, and reading the
-        # refund as unspent would lower it (at BOTH_LOCKED to a WARN naming a step not yet runnable).
+        # as unspent, so the refund page and the pre-signed refund are not stood down (register R12). Not
+        # at BOTH_LOCKED near t_rxd: nothing arms there, and its refund page is a WARN naming a step not
+        # yet runnable, so reading the refund as unspent would lower the CRITICAL squeeze below (review
+        # F1). At BTC_LOCKED and PARAMS_MISMATCH near t_rxd the refund page is urgent and may arm, as the
+        # honest tower's is (re-review G1).
         kind = BtcDispositionKind.UNSPENT
     if kind is BtcDispositionKind.UNKNOWN and obs.btc_spenders_named:
         return Decision(

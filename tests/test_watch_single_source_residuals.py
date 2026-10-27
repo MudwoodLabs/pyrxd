@@ -40,6 +40,7 @@ from pyrxd.network.quorum_depth import depth_vouched_by_quorum
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.units import ChainHeight, Confirmations
 from tests._fake_btc_chain import FakeBtcChain, FakeBtcSource
+from tests.test_btc_counter_disposition import _with_witness_of
 from tests.test_watch_btc_spender_classification import BURIAL, COV_CONFS, T_RXD, TIP, _policy, _Tower
 from tests.test_watch_legacy_btc_net import _legacy
 
@@ -72,17 +73,36 @@ async def test_one_stale_refund_beside_a_quorum_of_unspent_neither_disarms_nor_q
     assert stale in d.reason and "not on the chain" in d.reason
 
 
-@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
-async def test_near_t_rxd_a_stale_refund_keeps_the_critical_pending_refund_page(tmp_path, state):
-    """Review F1: read as unspent near t_rxd, the BOTH_LOCKED page fell from the CRITICAL pending-refund
-    squeeze to a WARN naming a step not yet runnable. Near t_rxd the squeeze stays."""
-    w = _Tower(tmp_path, state=state)
+def _near_t_rxd(w: _Tower) -> None:
     w.rxd.tip = T_RXD_OPENS - 3
     w.rxd.cov_confs = w.rxd.tip - LOCKED_AT + 1
+
+
+async def test_at_both_locked_near_t_rxd_a_stale_refund_keeps_the_critical_pending_refund_page(tmp_path):
+    """Review F1: read as unspent near t_rxd, the BOTH_LOCKED page fell from the CRITICAL pending-refund
+    squeeze to a WARN naming a step not yet runnable. Nothing arms at BOTH_LOCKED; the squeeze stays."""
+    w = _Tower(tmp_path, state=SwapState.BOTH_LOCKED)
+    _near_t_rxd(w)
     stale = _stale_refund(w)
     d = await w.decide()
     assert d.intent is Intent.PAGE_SQUEEZED and d.situation == SITUATION_BTC_REFUND_PENDING, d.reason
     assert stale in d.reason and "not on the chain" in d.reason
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH])
+async def test_near_t_rxd_a_stale_refund_still_lets_the_pre_signed_refund_go_out(tmp_path, state):
+    """Re-review G1: limiting the override to "t_rxd not near" kept the squeeze here too, and the
+    pre-signed refund the honest tower sends near t_rxd stayed home."""
+    w = _Tower(tmp_path, state=state)
+    _near_t_rxd(w)
+    honest = await w.decide()
+    assert honest.intent is Intent.PAGE_REFUND and honest.urgent and honest.autonomous_btc_refund
+    w.presign()
+    _stale_refund(w)
+    (res,) = await w.reconciler(executor=w.executor()).tick()
+    d = res.decision
+    assert d.intent is Intent.PAGE_REFUND and d.urgent and d.autonomous_btc_refund, d.reason
+    assert w.chain.mempool is not None, "the pre-signed refund was not broadcast"
 
 
 async def test_one_stale_refund_does_not_stop_the_pre_signed_refund_going_out(tmp_path):
@@ -128,6 +148,24 @@ async def test_a_stale_refund_beside_a_claim_is_not_outvoted():
         sources, chain.locator, hashlock=chain.hashlock, burial_blocks=BURIAL, quorum=2
     )
     assert d.claims_seen and not d.refund_outvoted
+
+
+async def test_a_claim_witness_served_over_a_minority_refund_is_not_outvoted():
+    """Re-review G2: a refund spender can carry a claim witness served for its txid (``claim_raw``);
+    that read is REFUND_PENDING with a claim seen, and is never read as unspent."""
+    chain = FakeBtcChain()
+    refund = chain.refund_tx(fee_sats=777)
+    claim_witness = _with_witness_of(refund, chain.claim_tx())
+    sources = [
+        FakeBtcSource(chain, forge_spender=refund),
+        FakeBtcSource(chain, forge_spender=claim_witness),
+        *[FakeBtcSource(chain) for _ in range(3)],
+    ]
+    d = await read_btc_counter_disposition(
+        sources, chain.locator, hashlock=chain.hashlock, burial_blocks=BURIAL, quorum=3
+    )
+    assert d.kind is K.REFUND_PENDING and d.claims_seen
+    assert not d.refund_outvoted
 
 
 @pytest.mark.parametrize("quorum", [1, 2, 3])
