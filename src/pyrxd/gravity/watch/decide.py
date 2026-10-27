@@ -1299,6 +1299,19 @@ def decide(
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
 
 
+#: Reader answers that examined every endpoint's logs for a claim that opens H and found none it could
+#: count: a scan's log beside one of these is not a claim the reader saw.
+_ETH_CLEAN_UNCLAIMED = frozenset(
+    {
+        DispositionKind.OPEN,
+        DispositionKind.TIP_EXPIRED,
+        DispositionKind.F_EXPIRED,
+        DispositionKind.EXPIRED_EMPTY_OPEN,
+        DispositionKind.EXPIRED_EMPTY_CLOSED,
+    }
+)
+
+
 def _eth_corroboration(obs: Observations) -> bool:
     """``low_corroboration`` for an ETH decision: a single-source RXD read, or a disposition read from
     one ETH endpoint (#850 PR 10)."""
@@ -1559,6 +1572,37 @@ def _decide_eth(
     # cannot drop a known-revealed swap into the silent WATCH catch-all (mirrors the BTC branch).
     # A claim beside our refund final at the finalized block is not a race: the contract paid us, so
     # no claim of it can be mined. It is paged below, as the covenant claim when p is public (D14).
+    # A log the scan counts as a claim that the reader, reading every endpoint's logs, did not count as
+    # one that opens H, on an answer that is not UNKNOWN: an endpoint served an odd or forged log. It
+    # pages "investigate" rather than a claim race whose WAIT on a transaction that never mines would
+    # hold back the refund page (re-review of the fix round, F-B).
+    if (
+        obs.eth_claim_detected
+        and not obs.eth_claim_seen
+        and not refund_final
+        and obs.eth_disposition in _ETH_CLEAN_UNCLAIMED
+        and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED)
+    ):
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                f"the detection scan names a log on the ETH counter-leg contract that the reader, over every "
+                f"endpoint, does not count as a claim that opens H; it reads the contract {obs.eth_disposition.value}"
+                + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
+            ),
+            recommended_action=(
+                "investigate — read the contract's logs on another endpoint; if a Claimed log opens H, p is public: "
+                "claim the covenant before t_rxd (pyrxd swap build-claim); if none does, the counter-leg refund is "
+                "due once its timeout has passed"
+            ),
+            deadline_rxd_height=(
+                None
+                if obs.asset_locked_at_height is None
+                else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
+            ),
+            low_corroboration=corr,
+            situation=SITUATION_ETH_DISCOVERY_DISAGREES,
+        )
     if (obs.eth_claim_detected and not refund_final) or state is SwapState.SECRET_REVEALED:
         if obs.eth_claim_finality is None or obs.asset_locked_at_height is None:
             # Claim indicated but finality un-assessable (no finalized-checkpoint verdict or no

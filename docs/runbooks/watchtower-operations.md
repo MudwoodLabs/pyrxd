@@ -129,7 +129,8 @@ into the same app or receiver changes nothing.
   mismatch pages the covenant refund then `abandon_counter_leg`. A record still at BTC_LOCKED when the
   maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`
   (a maker's record: `reconcile_counter_leg` alone, which only records the claim). The claim scan
-  asks every endpoint. A claim kept on the record (`counter_claim_tx`) that no read shows this turn
+  asks every endpoint; a log it counts as a claim that the reader, over every endpoint, does not
+  count as one pages CRITICAL "investigate". A claim kept on the record (`counter_claim_tx`) that no read shows this turn
   pages the covenant claim and the refund, on every turn until your refund is final.
   Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
   ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the

@@ -43,7 +43,7 @@ from pyrxd.gravity.watch.quorum import ChainObserver
 from pyrxd.gravity.watch.reconciler import Reconciler
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight, Confirmations
-from tests._fake_evm_chain import FakeEvmChain, FakeEvmEndpoint
+from tests._fake_evm_chain import CONTRACT, FakeEvmChain, FakeEvmEndpoint
 from tests._source_hosts import distinct_host
 from tests.test_swap_coordinator import _eth_finality_policy, _eth_terms
 from tests.test_watch_pages_name_state_valid_steps import _named_steps, _state_guards
@@ -302,6 +302,42 @@ async def test_a_claim_on_record_with_every_endpoint_honest_reads_claimed(tmp_pa
     obs = await w.observe()
     assert obs.eth_disposition is DispositionKind.CLAIMED
     assert (await w.decide()).intent is Intent.PAGE_CLAIM
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
+async def test_a_recorded_claim_that_never_mined_pages_d14_not_a_waiting_claim_race(tmp_path, state):
+    """Re-review F-A: the reader adds the record's claim to ``claims_seen`` unverified. Taken as the
+    trigger, its receipt-less verdict held the gate at WAIT and the tower WATCHed past the refund's
+    due time. It pages the covenant claim and the refund instead."""
+    w = _EthTower(tmp_path, state=state)
+    w.write(dataclasses.replace(w.record(), counter_claim_tx="0x" + "c1" * 32))
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.F_EXPIRED
+    assert obs.eth_claim_detected is False and obs.eth_claim_seen is False
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_CLAIM and d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+    assert "refund the ETH leg" in d.reason
+
+
+async def test_a_forged_claimed_log_on_one_secondary_pages_investigate_not_a_claim_race(tmp_path):
+    """Re-review F-B: one secondary serves a Claimed log whose data does not open H. The reader, over
+    every endpoint, reads the contract F_EXPIRED with no claim, so the page is "investigate" (still a
+    page), never a claim race that WATCHes on a transaction that never mines."""
+    forged = {
+        "address": CONTRACT,
+        "topics": [CLAIMED_TOPIC0],
+        "data": "0x" + "00" * 32,
+        "transactionHash": "0x" + "ab" * 32,
+        "blockNumber": 45,
+    }
+    w = _EthTower(tmp_path, endpoint_kw=[{}, {"extra_logs": (forged,)}, {}])
+    obs = await w.observe()
+    assert obs.eth_claim_detected is True and obs.eth_claim_seen is False
+    assert obs.eth_disposition is DispositionKind.F_EXPIRED and obs.eth_single_source is False
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert d.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
+    assert d.recommended_action.startswith("investigate")
 
 
 async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):

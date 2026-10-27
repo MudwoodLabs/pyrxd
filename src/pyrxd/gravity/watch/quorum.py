@@ -380,7 +380,8 @@ class ChainObserver(Observer):
 
         The detection scan (``claim_status``, selector-agnostic, over every endpoint) stays the claim
         trigger. The disposition read adds to it, never takes from it: a ``Claimed`` log that opens H
-        that the read collected, or a CLAIMED answer, is a claim even when the scan missed it. A claim
+        that an endpoint served and the read collected, or a CLAIMED answer, is a claim even when the scan
+        missed it. A claim
         the record kept (``counter_claim_tx``) is not observed here: ``decide()`` reads it off the
         record on every tick, because the reader can return UNKNOWN before it collects any claim when
         one endpoint disagrees on an identity read. The verdict is read for the claim the reader
@@ -408,7 +409,11 @@ class ChainObserver(Observer):
             from pyrxd.gravity.eth_counter_disposition import eth_counter_disposition_kwargs
 
             disposition: CounterDisposition = await read(locator, **eth_counter_disposition_kwargs(record))
-            claims = disposition.claims_seen
+            # A claim the record kept is nominated by the record itself and joins ``claims_seen``
+            # unverified; that is not a log any endpoint served, so it is no trigger here. decide()
+            # pages it off the record (D14) instead of a claim race whose WAIT on a claim that never
+            # mined would hold the refund page (re-review of the fix round, F-A).
+            claims = tuple(c for c in disposition.claims_seen if c.verified or c.nominated_by != ("record",))
             evidence = disposition.evidence
             fields = {
                 "eth_disposition": disposition.kind,
