@@ -231,7 +231,7 @@ class DedupAlerter:
 
         With ``situation_key`` (the text after the swap id on the page's ``ack:`` line) it ACKs that
         situation if it is open. A bare swap id ACKs only when the swap has exactly one open, un-ACKed
-        CRITICAL situation that was delivered and no ACK yet; otherwise the operator may have meant another page, so nothing is
+        CRITICAL situation that was delivered at CRITICAL and no ACK yet; otherwise the operator may have meant another page, so nothing is
         recorded and the pages keep firing (third Mythos pass, F2). ``swap_id`` may also be the
         :func:`ack_id` the page printed for a name the inbox cannot carry. Returns True if an ACK was
         recorded.
@@ -247,10 +247,10 @@ class DedupAlerter:
                     st.acked.add(situation)
                     return True
             return False
-        # A page that never went out takes only its own key (logged by the tower when the send
-        # failed): a bare id from shell history would otherwise switch off escalation for a page
-        # nobody saw (re-review of the tower Mythos fixes, finding 1).
-        pending = [x for x in self._open_critical(st) if x not in st.acked and x in st.paged]
+        # A page that never went out at CRITICAL (new, or a delivered WARN turning urgent) takes only
+        # its own key, logged by the tower when the send failed: a bare id from shell history would
+        # otherwise switch off escalation for a page nobody saw (re-review of the tower Mythos fixes).
+        pending = [x for x in self._open_critical(st) if x not in st.acked and st.paged.get(x) is Severity.CRITICAL]
         if st.acked or len(pending) != 1:
             # A swap with an ACK already: the same bare line appended again (shell history) would
             # otherwise land on a page that opened after it was written (re-review, finding 2a).
@@ -334,7 +334,7 @@ class DedupAlerter:
                 st.undelivered.add(situation)
                 st.seen[situation] = st.tick
                 logger.error(
-                    "CRITICAL page for swap %s was not delivered; it counts toward escalation until "
+                    "CRITICAL page for swap %r was not delivered; it counts toward escalation until "
                     "ACKed. To ACK it, append this line to the ACK inbox: %s %s",
                     swap_id,
                     ack_id(swap_id),

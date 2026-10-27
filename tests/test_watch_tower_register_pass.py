@@ -281,6 +281,23 @@ async def test_an_ackable_record_name_is_printed_as_it_is():
 # --------------------------------------------------------------------------- test gaps from the pass's mutant matrix
 
 
+async def test_a_bare_ack_does_not_take_a_warn_that_turned_critical_unseen_off_escalation():
+    """Re-check of the fix above: the WARN for a situation went out, the channel went down, the same
+    situation turned urgent; a bare id ACKed the CRITICAL nobody saw, because the WARN was on record."""
+    ch = _Channel()
+    alerter = DedupAlerter(channel=ch)
+    due = Decision(Intent.PAGE_REFUND, reason="refund due", situation="btc_refund_due")
+    urgent = Decision(Intent.PAGE_REFUND, reason="refund now", situation="btc_refund_due", urgent=True)
+    await alerter.handle(SWAP, due)
+    ch.down = True
+    with pytest.raises(ConnectionError):
+        await alerter.handle(SWAP, urgent)
+    assert alerter.ack(SWAP) is False, "a bare id ACKed a CRITICAL that never went out"
+    assert alerter.unacked_critical_count() == 1
+    assert alerter.ack(SWAP, "page_refund:btc_refund_due") is True, "the honest twin: the logged key ACKs it"
+    assert alerter.unacked_critical_count() == 0
+
+
 async def test_a_keyed_ack_of_a_warn_does_not_pre_ack_its_later_critical():
     """A04: a keyed ACK names a CRITICAL page. A WARN situation that turns urgent must still count."""
     ch = _Channel()

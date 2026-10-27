@@ -166,8 +166,8 @@ dropped; write them again. A CRITICAL page whose send failed counts toward escal
 log prints the line that ACKs it, and only that keyed line does (a bare swap id never ACKs a page
 that did not reach you).
 
-A bare swap id also works, but only when that swap has exactly one open, un-ACKed CRITICAL page and
-no ACK yet. Otherwise the tower cannot tell which page you meant, so it logs the ACK as ignored and keeps paging.
+A bare swap id also works, but only when that swap has exactly one open, un-ACKed CRITICAL page that
+reached you as CRITICAL, and no ACK yet. Otherwise the tower cannot tell which page you meant, so it logs the ACK as ignored and keeps paging.
 
 Prefer the keyed line: a bare id appended after its page closed lands on whatever page is open then.
 
