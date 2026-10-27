@@ -275,8 +275,13 @@ def test_ack_inbox_survives_one_bad_byte(tmp_path):
 
 def test_malformed_ack_ids_are_dropped(tmp_path, caplog):
     caplog.set_level("WARNING")
-    _, inbox = _inbox(tmp_path, "swap-1\n../../etc/passwd\nhas space\n" + "x" * 500 + "\nswap-2\n")
-    assert inbox.drain() == ["swap-1", "swap-2"]
+    _, inbox = _inbox(
+        tmp_path,
+        "swap-1\n../../etc/passwd\nhas two spaces\nswap-3 NOT_A_KEY\n"
+        + "x" * 500
+        + "\nswap-2\n  swap-4   page_squeezed:claim_race \n",
+    )
+    assert inbox.drain() == ["swap-1", "swap-2", "swap-4 page_squeezed:claim_race"]
     assert "malformed swap id" in caplog.text
 
 

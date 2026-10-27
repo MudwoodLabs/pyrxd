@@ -80,6 +80,7 @@ from pyrxd.gravity.watch import (
     run_loop,
 )
 from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
+from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
 from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
@@ -128,7 +129,15 @@ def build_reconciler(
     btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
     # RXD corroboration is ``rxd_corroborated`` (True only behind a real >= quorum MultiSourceRxdChainSource).
     # The single ETH RPC, if any, is still single-source → its pages stay low-corroboration.
-    observer = ChainObserver(btc=btc_source, eth=eth_source, rxd=rxd_source, rxd_corroborated=rxd_corroborated)
+    observer = ChainObserver(
+        btc=btc_source,
+        eth=eth_source,
+        rxd=rxd_source,
+        rxd_corroborated=rxd_corroborated,
+        # The depth our refund must be buried before it counts (#850 PR 9b): the policy's BTC reorg
+        # depth, the same number the claim gate requires of the maker's claim.
+        btc_burial_blocks=int(_required_btc_depth_blocks(policy)),
+    )
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
         store=store,
@@ -883,8 +892,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # would latch on forever. See FileAckInbox in gravity/watch/alerts.py.
     p.add_argument(
         "--ack-inbox",
-        help="operator ACK inbox: append a swap_id per line (e.g. `echo <swap_id> >> FILE`) to "
-        "acknowledge its CRITICAL page. Drained once per tick; suppresses re-paging for that "
+        help="operator ACK inbox: append the CRITICAL page's ack: line, the swap_id and its situation "
+        "key (e.g. `echo '<swap_id> <key>' >> FILE`); a bare swap_id works only when that swap has "
+        "one open, un-ACKed CRITICAL situation. Drained once per tick; suppresses re-paging for that "
         "exact situation and drops it from the heartbeat's unacked_critical count. MUST be a "
         "0600 regular file you own (create it with `install -m 600 /dev/null FILE`) — anyone "
         "who can write it can silence a claim-race page.",
@@ -959,8 +969,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--auto-refund-on-single-source",
         action="store_true",
         help="permit the autonomous refund (--refund-spk) to broadcast on a single-source (low-corroboration) "
-        "RXD read. Off by default: a single source's 'not locked' then pages instead of broadcasting. "
-        "Separate from --accept-single-source, which only lets the tower start",
+        "RXD read, or a single-source BTC spender read (--quorum 1, or one Esplora). Off by default: a single "
+        "source's 'not locked' or 'unspent' then pages instead of broadcasting. Separate from "
+        "--accept-single-source, which only lets the tower start",
     )
     return p
 
@@ -977,6 +988,23 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = _build_parser().parse_args(argv)
     setattr(args, _SUPPLIED_ATTR, _supplied_policy_flags(argv))
     return args
+
+
+def apply_acks(alerter: AckingAlerter, lines: list[str]) -> None:
+    """Apply drained ACK-inbox lines, ``<swap_id>`` or ``<swap_id> <situation key>`` (third Mythos
+    pass, F2)."""
+    for line in lines:
+        swap_id, _, key = line.partition(" ")
+        if not alerter.ack(swap_id, key or None):
+            # ACKs are inert for an unknown/uncritical swap, and a bare id is refused when the swap
+            # has more than one open, un-ACKed CRITICAL situation (DedupAlerter.ack records nothing), but say
+            # so: it is an operator typo, an ambiguous ACK on a time-critical page, or someone probing
+            # the inbox to silence one.
+            logger.warning(
+                "ACK %r ignored — no CRITICAL situation it names unambiguously; "
+                "write the page's ack: line (swap id and situation key)",
+                line,
+            )
 
 
 def _require_acking_alerter(alerter: object, ack_inbox: str) -> AckingAlerter:
@@ -1121,12 +1149,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
             ack_inbox = FileAckInbox(args.ack_inbox)
 
             def _drain_acks() -> None:
-                for swap_id in ack_inbox.drain():
-                    if not acking_alerter.ack(swap_id):
-                        # ACKs are inert for an unknown/uncritical swap (DedupAlerter.ack records
-                        # nothing), but say so: it is either an operator typo on a time-critical
-                        # page, or someone probing the inbox to silence one.
-                        logger.warning("ACK for %r ignored — no live CRITICAL situation with that swap id", swap_id)
+                apply_acks(acking_alerter, ack_inbox.drain())
 
             on_tick_start = _drain_acks
 

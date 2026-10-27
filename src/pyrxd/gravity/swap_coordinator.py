@@ -5981,8 +5981,7 @@ class SwapCoordinator:
         (raw bytes recorded before the broadcast, re-sent unchanged, replaced by BIP125 after
         :data:`REFUND_REPLACE_AFTER_S`). A buried refund takes a ``TAKER`` record to MUTUAL_REFUND
         without touching the covenant; a single operator's covenant refund is sent only then. The
-        D14 hold applies as on ETH. Until #850 PR 9b the watchtower still reads the taker's own
-        refund as a claim and pages it.
+        D14 hold applies as on ETH. The watchtower reads this refund as ours by its leaf (#850 PR 9b).
 
         **A leg that cannot read its disposition** (written before 0.27), or a ``MAKER`` on BTC:
         unchanged, except that ``MAKER`` on ETH is refused. ``TAKER`` refunds the counter leg only

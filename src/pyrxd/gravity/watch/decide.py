@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from pyrxd.btc_wallet.disposition import BtcDispositionKind
 from pyrxd.btc_wallet.taproot import TimeUnit
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.swap_coordinator import (
@@ -45,7 +46,7 @@ from pyrxd.gravity.swap_state import NegotiatedTerms, RecordRole, SwapRecord, Sw
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.units import BlockSpan, ChainHeight, Confirmations, PhotonValue, Seconds
 
-__all__ = ["Decision", "Intent", "Observations", "decide"]
+__all__ = ["Decision", "Intent", "LegacyCheck", "Observations", "decide", "decide_legacy"]
 
 
 class Intent(Enum):
@@ -64,6 +65,9 @@ class Intent(Enum):
     * ``PAGE_SQUEEZED`` — a decision is required (gate SQUEEZED / ASSET_VULNERABLE,
       or finality un-assessable): winner-take-all claim vs accept loss. Never
       auto-resolved in v1.
+    * ``RECONCILE`` — the chain has settled the counter leg (our refund is buried) and the record
+      has not caught up; the operator runs the named step to bring it up to the chain (low
+      severity: nothing is at risk, #850 PR 9b, design §5.1).
     * ``RETIRE`` — the swap reached a terminal state; stop watching it.
     * ``NOOP`` — an unsupported counter_chain (BTC and ETH are both handled).
     """
@@ -72,6 +76,7 @@ class Intent(Enum):
     PAGE_CLAIM = "page_claim"
     PAGE_REFUND = "page_refund"
     PAGE_SQUEEZED = "page_squeezed"
+    RECONCILE = "reconcile"
     RETIRE = "retire"
     NOOP = "noop"
 
@@ -120,6 +125,28 @@ class Observations:
     # watches on an unread funding depth — so an absent clock can never manufacture a page.
     now_unix_s: Seconds | None = None
     low_corroboration: bool = False
+    # BTC spender classification (#850 PR 9b, design §6). ``btc_spend_classified`` is True only when
+    # this tick read the funding outpoint's spenders through the shared disposition reader, which
+    # tells a spend by the refund leaf (ours, the operator's or the tower's pre-signed one: by
+    # script path, never by txid) from a claim. False (the default, and every source that cannot
+    # classify) keeps the pre-9b rules: any spend is a claim, and autonomy stays off while the
+    # covenant is observed. ``btc_disposition`` is that read's kind; ``btc_refund_txid`` names a
+    # refund-leaf spend it saw, buried or not; ``btc_disposition_reason`` is its reason, for the page.
+    # ``maker_has_claimed_btc`` stays the claim trigger: the observer sets it on any claim seen, and
+    # on any spend the read could not prove is a refund.
+    btc_spend_classified: bool = False
+    btc_disposition: BtcDispositionKind | None = None
+    btc_refund_txid: str | None = None
+    btc_disposition_reason: str | None = None
+    #: Whether the read names any spender at all (an UNKNOWN with one is a contradiction, not a lag).
+    btc_spenders_named: bool = False
+    #: Whether a source SERVED a claim witness (one that opens H). ``maker_has_claimed_btc`` is also set
+    #: by a spender only discovery named, which proves nothing about ``p`` (Mythos F4).
+    btc_claim_witness_seen: bool = False
+    #: Whether the read is one source's answer (quorum 1, or one source): it marks the decision
+    #: ``low_corroboration``, and a single-source REFUNDED is read as still pending (Mythos F6; design
+    #: §5.1, "a single endpoint's Refunded() never stops a page").
+    btc_single_source: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.maker_has_claimed_btc, bool):
@@ -140,6 +167,29 @@ class Observations:
             raise ValidationError("Observations.eth_claim_finality must be a CounterClaimState or None")
         if not isinstance(self.low_corroboration, bool):
             raise ValidationError("Observations.low_corroboration must be bool")
+        if not isinstance(self.btc_spend_classified, bool) or not isinstance(self.btc_spenders_named, bool):
+            raise ValidationError("Observations.btc_spend_classified and btc_spenders_named must be bool")
+        if not isinstance(self.btc_single_source, bool) or (self.btc_single_source and not self.btc_spend_classified):
+            raise ValidationError("Observations.btc_single_source must be bool, and needs a classified read")
+        if not isinstance(self.btc_claim_witness_seen, bool):
+            raise ValidationError("Observations.btc_claim_witness_seen must be bool")
+        if self.btc_claim_witness_seen and not (self.btc_spend_classified and self.maker_has_claimed_btc):
+            raise ValidationError("Observations.btc_claim_witness_seen needs a classified read and the claim trigger")
+        if self.btc_disposition is not None and not isinstance(self.btc_disposition, BtcDispositionKind):
+            raise ValidationError("Observations.btc_disposition must be a BtcDispositionKind or None")
+        if self.btc_spend_classified != (self.btc_disposition is not None):
+            raise ValidationError("Observations.btc_disposition is set exactly when btc_spend_classified")
+        if self.btc_refund_txid is not None and (
+            not isinstance(self.btc_refund_txid, str) or len(self.btc_refund_txid) != 64
+        ):
+            raise ValidationError("Observations.btc_refund_txid must be a 64-char txid or None")
+        if self.btc_refund_txid is not None and not self.btc_spend_classified:
+            raise ValidationError("Observations.btc_refund_txid needs a classified read")
+        if (
+            self.btc_disposition in (BtcDispositionKind.CLAIM_SEEN, BtcDispositionKind.CLAIMED)
+            and not self.maker_has_claimed_btc
+        ):
+            raise ValidationError("a claim read must set maker_has_claimed_btc (the claim trigger)")
 
 
 @dataclass(frozen=True)
@@ -174,6 +224,14 @@ class Decision:
     # p-scrape source + finality model are out of scope here. The executor additionally re-asserts SAFE
     # against a FRESH read before broadcasting (a tick-open verdict is stale on a cheap-reorg chain).
     autonomous_asset_claim: bool = False
+    # Tells two situations with the same intent apart for the alerter's dedup and operator ACK (#850 PR
+    # 9b, Mythos F1): an ACK of "our refund is pending near t_rxd" must not silence the claim race that
+    # replaces it, which is a PAGE_SQUEEZED too. ``None`` for every decision that needs no such tag.
+    situation: str | None = None
+    # A refund page that is as time-critical as a race (#850 PR 9b, Mythos F3): the HTLC is still the
+    # taker's to refund while t_rxd is near or past, so the alerter pages it CRITICAL and re-pages it,
+    # rather than once as WARN. Only valid on PAGE_REFUND, which keeps its autonomy discriminator.
+    urgent: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, Intent):
@@ -192,6 +250,12 @@ class Decision:
             raise ValidationError("autonomous_btc_refund is only valid on a PAGE_REFUND decision")
         if self.autonomous_asset_claim and self.intent is not Intent.PAGE_CLAIM:
             raise ValidationError("autonomous_asset_claim is only valid on a PAGE_CLAIM decision")
+        if self.situation is not None and (not isinstance(self.situation, str) or not self.situation):
+            raise ValidationError("Decision.situation must be a non-empty str or None")
+        if not isinstance(self.urgent, bool):
+            raise ValidationError("Decision.urgent must be bool")
+        if self.urgent and self.intent is not Intent.PAGE_REFUND:
+            raise ValidationError("Decision.urgent is only valid on a PAGE_REFUND decision")
 
 
 def _value_at_risk_photons(terms: NegotiatedTerms) -> PhotonValue | None:
@@ -370,13 +434,14 @@ _MAKER_COVENANT_REFUND_ACTION = (
 )
 
 
-def _maker_covenant_refund(why: str, *, deadline: ChainHeight | None, corr: bool) -> Decision:
+def _maker_covenant_refund(why: str, *, deadline: ChainHeight | None, corr: bool, situation: str) -> Decision:
     return Decision(
         Intent.PAGE_REFUND,
         reason=f"{why}; your covenant is refundable to you at t_rxd (the deadline shown, when known)",
         recommended_action=_MAKER_COVENANT_REFUND_ACTION,
         deadline_rxd_height=deadline,
         low_corroboration=corr,
+        situation=situation,
     )
 
 
@@ -458,6 +523,295 @@ def _claim_action(state: SwapState, *, winner_take_all: bool = False, note: str 
     return action
 
 
+# -- the BTC funding outpoint's spender, classified (#850 PR 9b, design §6, D12) ----------------
+#
+# Before 9b the tower's claim source reported ANY spend of the funding outpoint as the maker's claim
+# (``OutspendBtcClaimSource.claim_status``). Our own refund spends that outpoint too, so the tower
+# could not broadcast the pre-signed refund while the maker's covenant was observed (PR 1b): it would
+# then have read its own refund as a claim, and a refund that lost to a real claim would have looked
+# the same as one that won. With the spender classified by the leaf it spends, the refund leaf is
+# ours whoever sent it, and a claim that replaces it pages the covenant claim, so the autonomy is
+# re-armed on a classified read that holds the outpoint unspent.
+
+
+#: How to bump our pending BTC refund, said wherever the tower tells the operator to (D12). The
+#: coordinator recognises any refund-leaf spend as ours, and replaces it by BIP125 only once that one
+#: process has seen it in the mempool for ``REFUND_REPLACE_AFTER_S``; a single call may only wait.
+_BUMP_HOW = (
+    "it follows our refund (the tower's pre-signed one too) and replaces it at a higher fee once it has been "
+    "in the mempool for REFUND_REPLACE_AFTER_S in that one process, so keep it running (the two-host "
+    "runner's --phase refund polls)"
+)
+
+
+def _btc_refund_maturity_unread(terms: NegotiatedTerms, obs: Observations) -> bool:
+    """Whether the tower cannot tell if the BTC refund leaf has matured: the funding depth was not
+    read, or ``t_btc`` is not in blocks (second Mythos pass, M2)."""
+    return obs.btc_funding_confirmations is None or terms.t_btc.unit is not TimeUnit.BLOCKS
+
+
+def _btc_refund_buried(obs: Observations) -> bool:
+    """Our refund is buried on a corroborated read. One source's "buried" decides nothing here: it is
+    read as still pending (design §5.1; Mythos F6 and its re-review)."""
+    return obs.btc_disposition is BtcDispositionKind.REFUNDED and not obs.btc_single_source
+
+
+def _btc_refunded_beside_claim_trigger(record: SwapRecord, obs: Observations) -> bool:
+    """Our refund is buried and the claim trigger is set beside it: not a claim race on a claim that
+    will never be mined (review of PR 9b, M1). Paged below as a covenant claim when a claim witness
+    was served (:func:`_btc_refund_lost_claim_seen`), else as a disagreement to investigate."""
+    return (
+        obs.btc_spend_classified
+        and _btc_refund_buried(obs)
+        and obs.maker_has_claimed_btc
+        and record.state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED)
+    )
+
+
+def _btc_refund_lost_claim_seen(record: SwapRecord, obs: Observations) -> bool:
+    """Our refund is buried and a claim witness was SERVED beside it (D14 seen on the chain): the
+    claim lost, but ``p`` is public. A spender that only discovery named is not this (Mythos F4)."""
+    return _btc_refunded_beside_claim_trigger(record, obs) and obs.btc_claim_witness_seen
+
+
+def _t_rxd_near(record: SwapRecord, obs: Observations, policy: MarginPolicy, safety_window_blocks: int) -> bool:
+    """Whether the maker's covenant exists and t_rxd is within the safety window, or past it: once t_rxd
+    matures the maker can refund the covenant by its CSV leg AND still claim the BTC (the claim leaf has
+    no timelock), so a BTC HTLC still the taker's to refund is then as urgent as a race (#850 PR 9b,
+    Mythos F3). The predicate the BOTH_LOCKED maker-stall page uses. A known covenant whose lock height
+    could not be read, or heights the predicate cannot evaluate, fail closed toward urgent."""
+    if not _covenant_known(record, obs):
+        return False
+    if obs.asset_locked_at_height is None:
+        return True
+    try:
+        return taker_refund_window_open(
+            now_block_height=obs.now_rxd_height,
+            asset_locked_at_height=obs.asset_locked_at_height,
+            t_rxd=record.terms.t_rxd,
+            safety_window_blocks=safety_window_blocks,
+            maker_has_claimed_btc=False,
+            block_interval_s=policy.block_interval_s,
+        )
+    except ValidationError:
+        return True
+
+
+#: The ``Decision.situation`` of the page for our pending refund near t_rxd (Mythos F1). It is a
+#: PAGE_SQUEEZED like the claim race that replaces the refund, and an ACK of one must not silence the
+#: other.
+SITUATION_BTC_REFUND_PENDING = "btc_refund_pending"
+#: The ``situation`` of the page for sources that contradict each other on the spender, and of the
+#: page for a spender only discovery names beside our buried refund: an ACK of either must not
+#: silence the claim race (re-review of the F1 fix).
+SITUATION_BTC_SPENDER_CONTRADICTION = "btc_spender_contradiction"
+SITUATION_BTC_DISCOVERY_DISAGREES = "btc_discovery_disagrees"
+#: The other CRITICAL page families (second Mythos pass, H1): every PAGE_SQUEEZED and PAGE_CLAIM names
+#: one, so no two dangers share an ACK. ``tests/test_watch_btc_refund_pages_through_the_alerter.py``
+#: derives the construction sites from the source and fails on one without a tag.
+SITUATION_CLAIM_RACE = "claim_race"
+SITUATION_CLAIM_SEEN_P_PUBLIC = "claim_seen_p_public"
+SITUATION_ASSET_VULNERABLE = "asset_vulnerable"
+SITUATION_UNEXPECTED_STATE = "unexpected_state"
+SITUATION_LEGACY_UNCLASSIFIED_SPEND = "legacy_unclassified_spend"
+#: A refund page whose step the record can run now (second Mythos pass, L4, M2): BOTH_LOCKED once
+#: t_rxd has matured, and an HTLC near t_rxd whose refund maturity the tower could not read.
+SITUATION_BOTH_LOCKED_REFUND_RUNNABLE = "both_locked_refund_runnable"
+SITUATION_BTC_REFUND_MATURITY_UNREAD = "btc_refund_maturity_unread"
+#: The other refund pages that can turn CRITICAL (``urgent``): each names its own situation too, so no
+#: two of them share an ACK (third Mythos pass, F6), and the BOTH_LOCKED page inside the window is
+#: distinct from an earlier refund page on the same record (F7).
+SITUATION_BTC_REFUND_DUE = "btc_refund_due"
+SITUATION_PARAMS_MISMATCH_REFUND = "params_mismatch_refund"
+SITUATION_BOTH_LOCKED_REFUND_DUE = "both_locked_refund_due"
+SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE = "both_locked_refund_unevaluable"
+SITUATION_LEGACY_BTC_UNSPENT = "legacy_btc_unspent"
+#: Every other refund page names its own situation too, so two different refund pages on one swap
+#: are never one WARN, paged once (re-review of the third pass's fixes, finding 6).
+SITUATION_BTC_REFUND_NEVER_LOCKED = "btc_refund_never_locked"
+SITUATION_ETH_REFUND_TIMEOUT_PASSED = "eth_refund_timeout_passed"
+SITUATION_MAKER_REFUND_AFTER_TAKER_REFUND = "maker_refund_after_taker_refund"
+SITUATION_MAKER_REFUND_PARAMS_MISMATCH = "maker_refund_params_mismatch"
+SITUATION_MAKER_REFUND_UNEVALUABLE = "maker_refund_unevaluable"
+SITUATION_MAKER_REFUND_T_RXD_NEAR = "maker_refund_t_rxd_near"
+SITUATION_MAKER_REFUND_T_RXD_MATURED = "maker_refund_t_rxd_matured"
+SITUATION_MAKER_REFUND_TAKER_TIMEOUT = "maker_refund_taker_timeout"
+#: Prefix of an armed refund page's situation; the reconciler appends this tick's executor outcome,
+#: so a FAILED broadcast after a BROADCAST pages again (second Mythos pass, M3).
+SITUATION_ARMED_BTC_REFUND = "armed_btc_refund"
+
+
+def _btc_spend_decision(
+    record: SwapRecord, obs: Observations, policy: MarginPolicy, safety_window_blocks: int
+) -> Decision | None:
+    """The page for a spend of the funding outpoint by OUR refund leaf, a claim on record that is
+    no longer on the chain, or a read whose sources contradict each other. ``None`` when the read
+    changes nothing here: unclassified (and no claim on record), unspent, a read below quorum, or a
+    claim on the chain (the claim race, run before this, pages that)."""
+    corr = _corroboration(obs)
+    kind = obs.btc_disposition
+    deadline = (
+        None
+        if obs.asset_locked_at_height is None
+        else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
+    )
+    txid = obs.btc_refund_txid
+    if kind is BtcDispositionKind.UNKNOWN and obs.btc_spenders_named:
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                "the sources contradict each other on what spends the BTC HTLC funding outpoint "
+                f"({obs.btc_disposition_reason}); nothing is autonomous"
+            ),
+            recommended_action=(
+                "investigate — read the funding outpoint's spender on other sources; if it was claimed, p is "
+                "public: claim the covenant before t_rxd"
+            ),
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+            situation=SITUATION_BTC_SPENDER_CONTRADICTION,
+        )
+    single = ""
+    if kind is BtcDispositionKind.REFUNDED and obs.btc_single_source:
+        # One source's "buried" stops no page (Mythos F6): read it as still pending, here before the
+        # D14 page too, which then still says to refund the BTC (second Mythos pass, L3).
+        kind = BtcDispositionKind.REFUND_PENDING
+        single = "; only one source reads it buried, which this tower does not act on"
+    if _btc_refund_buried(obs) and record.role is RecordRole.MAKER:
+        return _maker_covenant_refund(
+            f"the taker's BTC refund {txid} is buried",
+            deadline=deadline,
+            corr=corr,
+            situation=SITUATION_MAKER_REFUND_AFTER_TAKER_REFUND,
+        )
+    claim_on_record = record.counter_claim_tx is not None and record.role is not RecordRole.MAKER
+    if claim_on_record or _btc_refund_lost_claim_seen(record, obs):
+        # D14: a claim that opens H was seen, so p is public, whatever the outpoint shows now (our
+        # refund buried, pending, or the claim gone from the chain). The covenant is still ours to
+        # claim until the maker's CSV refund at t_rxd. Never autonomous here.
+        where = f"tx {record.counter_claim_tx}, on record" if claim_on_record else "a claim witness a source served"
+        now = {
+            BtcDispositionKind.REFUNDED: f"our BTC refund {txid} is buried",
+            BtcDispositionKind.REFUND_PENDING: f"our BTC refund {txid} is not yet buried{single}",
+            BtcDispositionKind.UNSPENT: "the BTC HTLC reads unspent",
+        }.get(kind, "the BTC HTLC's spender is not known this tick" if kind else "the spender is not classified")  # type: ignore[arg-type]
+        return Decision(
+            Intent.PAGE_CLAIM,
+            reason=(
+                f"{now}, but a claim of the HTLC that opens H was seen ({where}), so p is public: claim the "
+                "covenant before t_rxd"
+                + ("" if kind is BtcDispositionKind.REFUNDED else ", and refund the BTC if it is still unspent")
+            ),
+            recommended_action=(
+                "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant (pyrxd swap "
+                "build-claim) before t_rxd"
+            ),
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+            situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
+        )
+    if _btc_refunded_beside_claim_trigger(record, obs):
+        # A discovery source names a spender the disposition panel served no bytes for (a lagging
+        # source still naming a replaced refund, or a different host set). Nothing proves p public,
+        # and nothing proves it is not: say so, and name no step that needs a claim tx (Mythos F4).
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                f"our BTC refund {txid} is buried, but a discovery source names a different spender of the HTLC "
+                "funding outpoint that no source served the bytes of; the tower cannot tell whether p is public"
+            ),
+            recommended_action=(
+                "investigate — look up the spender the discovery source names; if it is a claim (its witness "
+                "opens H), p is public: claim the covenant before t_rxd (pyrxd swap build-claim); if it is our "
+                f"replaced refund, run {'mutual_refund' if record.state is SwapState.BOTH_LOCKED else 'reconcile_counter_leg'}"
+            ),
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+            situation=SITUATION_BTC_DISCOVERY_DISAGREES,
+        )
+    if not obs.btc_spend_classified:
+        return None
+    if kind is BtcDispositionKind.REFUNDED:
+        step = "mutual_refund" if record.state is SwapState.BOTH_LOCKED else "reconcile_counter_leg"
+        return Decision(
+            Intent.RECONCILE,
+            reason=(
+                f"our BTC refund {txid} (a spend by the refund leaf: the operator's, or the tower's pre-signed "
+                f"one) is buried at the policy's BTC reorg depth; the record still reads {record.state.value}. "
+                "The coordinator buries at its own depth; if it still reads the refund as pending, run it again later"
+            ),
+            recommended_action=step,
+            low_corroboration=corr,
+        )
+    if kind is BtcDispositionKind.REFUND_PENDING:
+        if record.role is RecordRole.MAKER:
+            # The taker's refund changes nothing a maker can do: its covenant refund pages as it would
+            # without it (second Mythos pass, M1; a WATCH here dropped that page).
+            return None
+        step = "mutual_refund" if record.state is SwapState.BOTH_LOCKED else "taker_refund_btc"
+        squeeze = Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                f"our BTC refund {txid} is still not buried and t_rxd is near or past: once t_rxd matures the "
+                "maker can refund the covenant by its CSV leg AND still claim the BTC by replacing our refund "
+                f"(the claim leaf has no timelock). Get the refund buried now ({obs.btc_disposition_reason}{single})"
+            ),
+            recommended_action=f"{step}: {_BUMP_HOW}; or bump it from a wallet that holds the refund key",
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+            situation=SITUATION_BTC_REFUND_PENDING,
+        )
+        if _t_rxd_near(record, obs, policy, safety_window_blocks):
+            return squeeze
+        return Decision(
+            Intent.WATCH,
+            reason=(
+                f"our BTC refund {txid} spends the HTLC by the refund leaf and is not yet buried: the maker can still "
+                "claim until it is (the claim leaf has no timelock), and a claim pages; so does t_rxd coming near. "
+                f"A pre-signed refund has a fixed fee: to bump it run {step}; {_BUMP_HOW} "
+                f"({obs.btc_disposition_reason}{single})"
+            ),
+            deadline_rxd_height=deadline,
+            low_corroboration=corr,
+        )
+    return None
+
+
+def _btc_spend_permits_autonomy(obs: Observations) -> bool:
+    """Whether the spender read lets an autonomous refund go out: a classified read must hold the
+    outpoint UNSPENT at its quorum (a read below quorum, or one that names a spender, never arms).
+    A single-source read arms only as the executor allows any single-source read: it marks the
+    decision ``low_corroboration`` (:func:`_corroboration`; Mythos F6). An unclassified read keeps
+    the pre-9b rule, decided by the caller."""
+    return not obs.btc_spend_classified or obs.btc_disposition is BtcDispositionKind.UNSPENT
+
+
+def _corroboration(obs: Observations) -> bool:
+    """``low_corroboration`` for a BTC decision: a single-source RXD read, or a single-source BTC
+    spender read (quorum 1). The executor refuses to broadcast on either unless the operator accepted
+    single-source reads (Mythos F6)."""
+    return obs.low_corroboration or obs.btc_single_source
+
+
+def _spend_read_note(obs: Observations) -> str:
+    """Why a classified spender read did not arm the refund, for the page."""
+    kind = obs.btc_disposition.value if obs.btc_disposition is not None else None
+    return f" Not autonomous: the spender read is {kind} ({obs.btc_disposition_reason})."
+
+
+def _autonomous_refund_note() -> str:
+    """Said on a page whose pre-signed refund MAY go out (D12). ``decide()`` cannot know the executor:
+    the shipped tower is alert-only unless it is given a refund script, and dormant on mainnet unless
+    audit-cleared, so the note is conditional, and the reconciler appends what this tick's executor did
+    (``reconciler._executor_outcome_note``; Mythos F2)."""
+    return (
+        " If this tower is armed it broadcasts the pre-signed refund (this page says below whether it did). Its "
+        f"fee is fixed: if it does not confirm, bump it with taker_refund_btc ({_BUMP_HOW}). The tower keeps "
+        "reading the spender by its leaf, so a claim that replaces the refund pages the claim race, and a refund "
+        "still unburied near t_rxd pages too."
+    )
+
+
 def decide(
     *,
     record: SwapRecord,
@@ -482,7 +836,7 @@ def decide(
 
     state = record.state
     obs = observations
-    corr = obs.low_corroboration
+    corr = _corroboration(obs)
 
     # 1. Terminal → stop watching.
     if is_terminal(state):
@@ -504,7 +858,10 @@ def decide(
     #    suppressed single-source claim DETECTION cannot drop a known-revealed swap into the silent
     #    WATCH catch-all (red-team LOW: record-truth and chain-truth are independent; whichever
     #    indicates the reveal arms the gate). Assess regardless of whether record.state caught up.
-    if obs.maker_has_claimed_btc or state is SwapState.SECRET_REVEALED:
+    #    A claim that lost to our buried refund is not a race: it is paged below (D14, review M1).
+    if (
+        obs.maker_has_claimed_btc and not _btc_refunded_beside_claim_trigger(record, obs)
+    ) or state is SwapState.SECRET_REVEALED:
         if obs.btc_claim_confirmations is None or obs.asset_locked_at_height is None:
             # Cannot assess finality — fail closed to a decision-required page.
             return Decision(
@@ -512,6 +869,7 @@ def decide(
                 reason="maker claim observed but finality un-assessable (missing claim depth or asset-lock height) — fail-closed",
                 recommended_action=_claim_action(state, note="verify finality manually"),
                 low_corroboration=corr,
+                situation=SITUATION_CLAIM_RACE,
             )
         verdict = CounterClaimFinality.from_btc_depth(obs.btc_claim_confirmations, _required_btc_depth_blocks(policy))
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
@@ -532,6 +890,7 @@ def decide(
                 recommended_action=_claim_action(state, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_CLAIM_RACE,
             )
         if finality is ClaimFinality.SAFE:
             return Decision(
@@ -547,6 +906,7 @@ def decide(
                 # SAFE branch below must NOT set this). The executor re-asserts SAFE fresh before firing.
                 # Only for a record that says it is the taker's (or the single operator's) (#850 PR 1b).
                 autonomous_asset_claim=_autonomy_allowed(record),
+                situation=SITUATION_CLAIM_RACE,
             )
         if finality is ClaimFinality.WAIT:
             return Decision(
@@ -562,6 +922,7 @@ def decide(
             recommended_action=_claim_action(state, winner_take_all=True),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
+            situation=SITUATION_CLAIM_RACE,
         )
 
     # 3. Maker has NOT revealed p.
@@ -572,7 +933,13 @@ def decide(
             reason="ASSET_VULNERABLE: winner-take-all decision required",
             recommended_action="taker_claim_asset_from_vulnerable vs accept loss",
             low_corroboration=corr,
+            situation=SITUATION_ASSET_VULNERABLE,
         )
+    # 3a'. Our refund spends the funding outpoint, by the refund leaf (#850 PR 9b): it is not a claim.
+    if state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
+        seen = _btc_spend_decision(record, obs, policy, safety_window_blocks)
+        if seen is not None:
+            return seen
     # 3b. Maker locked the asset with wrong params — refund the BTC counter-leg. The page ALWAYS goes
     #     out (the swap is definitively broken); autonomous IFF the CSV refund has matured (else the
     #     operator refunds manually once it does — never an autonomous broadcast of an immature refund).
@@ -586,15 +953,26 @@ def decide(
                 if obs.asset_locked_at_height is None
                 else _refund_opens_at(policy, terms, obs.asset_locked_at_height),
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_PARAMS_MISMATCH,
             )
         matured = _btc_refund_matured(terms, obs)
+        armed = matured and _autonomy_allowed(record) and _btc_spend_permits_autonomy(obs)
         return Decision(
             Intent.PAGE_REFUND,
             reason="covenant params mismatch — refund the BTC counter-leg via the timelock leg"
-            + (_no_autonomy_note(record) if matured else ""),
+            + (_no_autonomy_note(record) if matured else "")
+            + (
+                _spend_read_note(obs)
+                if matured and _autonomy_allowed(record) and not armed and obs.btc_disposition is not None
+                else ""
+            ),
             recommended_action="taker_refund_btc",
-            autonomous_btc_refund=matured and _autonomy_allowed(record),
+            autonomous_btc_refund=armed,
             low_corroboration=corr,
+            # A maturity the tower cannot read fails closed toward urgent (second Mythos pass, M2).
+            urgent=(matured or _btc_refund_maturity_unread(terms, obs))
+            and _t_rxd_near(record, obs, policy, safety_window_blocks),
+            situation=SITUATION_PARAMS_MISMATCH_REFUND,
         )
     # 3c. Maker stall (FSM finding #2, 2026-06-09). Recovery is mutual_refund, NOT the asset-only
     #     maybe_refund_asset_on_maker_stall — IDENTICALLY to the ETH branch (_decide_eth). The maker
@@ -616,6 +994,7 @@ def decide(
             reason="unexpected MAKER_STALLS on a BTC swap — no clean coordinator refund from here; recover via mutual_refund once both timeouts elapse",
             recommended_action="investigate (mutual_refund is only valid from BOTH_LOCKED)",
             low_corroboration=corr,
+            situation=SITUATION_UNEXPECTED_STATE,
         )
     if state is SwapState.BOTH_LOCKED:
         if obs.asset_locked_at_height is None:
@@ -637,6 +1016,7 @@ def decide(
                     f"maker-stall predicate un-evaluable, fail-closed to a refund page: {exc}",
                     deadline=deadline,
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_UNEVALUABLE,
                 )
             return Decision(
                 Intent.PAGE_REFUND,
@@ -644,20 +1024,39 @@ def decide(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                # Un-evaluable heights: fail closed toward urgent, as _t_rxd_near does. Deliberately
+                # without the t_rxd maturity check below, which needs the same heights (third pass, F7).
+                urgent=True,
+                situation=SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE,
             )
         if refund_due and record.role is RecordRole.MAKER:
             return _maker_covenant_refund(
                 "you have not claimed the BTC counter leg and t_rxd is near; the taker refunds its BTC",
                 deadline=deadline,
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_T_RXD_NEAR,
             )
         if refund_due:
+            # Urgent once t_rxd has matured: mutual_refund runs only after both timeouts, so a CRITICAL
+            # page earlier would name a step the operator cannot run yet (second Mythos pass, L4). From
+            # then the maker can refund the covenant and still claim the BTC (Mythos F3). t_btc is not
+            # read here (the observer reads no funding depth at BOTH_LOCKED): the swap was gated so the
+            # BTC refund opens first in wall-clock time, and the page text says to run the step once
+            # both have elapsed (third Mythos pass, F7).
+            runnable = obs.now_rxd_height >= deadline
             return Decision(
                 Intent.PAGE_REFUND,
-                reason=_BOTH_LOCKED_REFUND_REASON_BTC,
+                reason=_BOTH_LOCKED_REFUND_REASON_BTC
+                + (
+                    " t_rxd has matured: the maker can now refund the covenant and still claim the BTC."
+                    if runnable
+                    else ""
+                ),
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                urgent=runnable,
+                situation=SITUATION_BOTH_LOCKED_REFUND_RUNNABLE if runnable else SITUATION_BOTH_LOCKED_REFUND_DUE,
             )
         return Decision(
             Intent.WATCH,
@@ -689,6 +1088,7 @@ def decide(
                     "t_rxd has matured and you have not claimed",
                     deadline=_refund_opens_at(policy, terms, obs.asset_locked_at_height),
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_T_RXD_MATURED,
                 )
             if matured:
                 return _maker_covenant_refund(
@@ -700,6 +1100,7 @@ def decide(
                         else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
                     ),
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_TAKER_TIMEOUT,
                 )
             return Decision(
                 Intent.WATCH,
@@ -711,6 +1112,22 @@ def decide(
                 low_corroboration=corr,
             )
         if matured and covenant_seen:
+            # Autonomous only on a CLASSIFIED read that holds the outpoint unspent (#850 PR 9b, D12).
+            # Before 9b this was never autonomous (design §5.1, H3): the pre-signed refund could lose to
+            # a claim, and a tower that reads any spend as a claim could not tell. With the spender
+            # classified by its leaf, a claim replacing our refund pages the covenant claim.
+            armed = _autonomy_allowed(record) and obs.btc_spend_classified and _btc_spend_permits_autonomy(obs)
+            if armed:
+                note = _autonomous_refund_note()
+            elif not _autonomy_allowed(record):
+                note = _no_autonomy_note(record)
+            elif not obs.btc_spend_classified:
+                note = (
+                    " Not autonomous: this tower does not classify the outpoint's spender, so it could not tell "
+                    "its own refund from a claim."
+                )
+            else:
+                note = _spend_read_note(obs)
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=(
@@ -720,35 +1137,74 @@ def decide(
                     "leaf has no timelock), and a claim makes p public, so check whether the covenant is "
                     "still yours to claim before the maker's CSV refund at t_rxd"
                     + ("" if obs.asset_locked_at_height is not None else " (its depth could not be read this tick)")
+                    + "."
+                    + note
                 ),
                 recommended_action="taker_refund_btc",
-                # Not autonomous while the covenant is observed (design §5.1, H3): the pre-signed refund
-                # could lose to a claim, and only the operator then knows to claim the covenant.
+                autonomous_btc_refund=armed,
                 low_corroboration=corr,
+                urgent=_t_rxd_near(record, obs, policy, safety_window_blocks),
+                situation=SITUATION_BTC_REFUND_DUE,
             )
         if matured:
+            armed = _autonomy_allowed(record) and _btc_spend_permits_autonomy(obs)
             return (
                 Decision(
                     Intent.PAGE_REFUND,
                     reason=(
                         f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
                         f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg"
+                        + ("." + _autonomous_refund_note() if obs.btc_spend_classified else "")
                     ),
                     recommended_action="taker_refund_btc",
-                    autonomous_btc_refund=_autonomy_allowed(record),
+                    autonomous_btc_refund=True,
                     low_corroboration=corr,
+                    situation=SITUATION_BTC_REFUND_NEVER_LOCKED,
                 )
-                if _autonomy_allowed(record)
+                if armed
                 else Decision(
                     Intent.PAGE_REFUND,
                     reason=(
                         f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
                         f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg."
-                        + _no_autonomy_note(record)
+                        + (_no_autonomy_note(record) if not _autonomy_allowed(record) else _spend_read_note(obs))
                     ),
                     recommended_action="taker_refund_btc",
                     low_corroboration=corr,
+                    situation=SITUATION_BTC_REFUND_NEVER_LOCKED,
                 )
+            )
+        if _btc_refund_maturity_unread(terms, obs) and _t_rxd_near(record, obs, policy, safety_window_blocks):
+            # The covenant is known and t_rxd is near or past, but the refund leaf's maturity cannot be
+            # read: fail closed toward the page, never autonomous (second Mythos pass, M2).
+            return Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    (
+                        "the maker's covenant is known and t_rxd is near or past"
+                        if obs.asset_locked_at_height is not None
+                        else "the maker's covenant is pinned on the record, but its lock height could not be read "
+                        "this tick, so t_rxd may be near or past (failing toward this page)"
+                    )
+                    + ", and this tower cannot tell whether the BTC refund leaf has matured ("
+                    + (
+                        "the funding depth could not be read this tick"
+                        if obs.btc_funding_confirmations is None
+                        else f"t_btc is in {terms.t_btc.unit.value}, not blocks"
+                    )
+                    + "). Read the funding outpoint's depth on another source and refund the BTC once t_btc has "
+                    "passed: once t_rxd matures the maker can refund the covenant and still claim the BTC (the "
+                    "claim leaf has no timelock). Not autonomous."
+                ),
+                recommended_action="taker_refund_btc",
+                deadline_rxd_height=(
+                    None
+                    if obs.asset_locked_at_height is None
+                    else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
+                ),
+                low_corroboration=corr,
+                urgent=True,
+                situation=SITUATION_BTC_REFUND_MATURITY_UNREAD,
             )
         return Decision(
             Intent.WATCH,
@@ -806,6 +1262,7 @@ def _decide_eth(
                 reason="maker ETH claim observed but finality un-assessable (missing finalized verdict or asset-lock height) — fail-closed",
                 recommended_action=_claim_action(state, note="verify finality manually"),
                 low_corroboration=corr,
+                situation=SITUATION_CLAIM_RACE,
             )
         # Depth-less verdict (ETH finalized checkpoint): assess_claim_finality takes the no-depth path.
         verdict = CounterClaimFinality(state=obs.eth_claim_finality)
@@ -827,6 +1284,7 @@ def _decide_eth(
                 recommended_action=_claim_action(state, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_CLAIM_RACE,
             )
         if finality is ClaimFinality.SAFE:
             return Decision(
@@ -835,6 +1293,7 @@ def _decide_eth(
                 recommended_action=_claim_action(state),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_CLAIM_RACE,
             )
         if finality is ClaimFinality.WAIT:
             return Decision(
@@ -850,6 +1309,7 @@ def _decide_eth(
             recommended_action=_claim_action(state, winner_take_all=True),
             deadline_rxd_height=deadline,
             low_corroboration=corr,
+            situation=SITUATION_CLAIM_RACE,
         )
 
     # Maker has NOT revealed p.
@@ -859,6 +1319,7 @@ def _decide_eth(
             reason="ASSET_VULNERABLE: winner-take-all decision required",
             recommended_action="taker_claim_asset_from_vulnerable vs accept loss",
             low_corroboration=corr,
+            situation=SITUATION_ASSET_VULNERABLE,
         )
     if state is SwapState.PARAMS_MISMATCH:
         # The maker locked the wrong covenant; the taker only needs to recover its own ETH HTLC.
@@ -872,12 +1333,14 @@ def _decide_eth(
                 if obs.asset_locked_at_height is None
                 else _refund_opens_at(policy, terms, obs.asset_locked_at_height),
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_PARAMS_MISMATCH,
             )
         return Decision(
             Intent.PAGE_REFUND,
             reason="covenant params mismatch on the ETH swap — refund the ETH counter-leg HTLC (taker_refund_btc)",
             recommended_action="taker_refund_btc",
             low_corroboration=corr,
+            situation=SITUATION_PARAMS_MISMATCH_REFUND,
         )
     if state is SwapState.MAKER_STALLS:
         # Unreachable on the coordinator-driven ETH path (the only entry to MAKER_STALLS is
@@ -890,6 +1353,7 @@ def _decide_eth(
             reason="unexpected MAKER_STALLS on an ETH swap — no clean coordinator refund from here; recover the ETH HTLC manually",
             recommended_action="investigate (mutual_refund is only valid from BOTH_LOCKED)",
             low_corroboration=corr,
+            situation=SITUATION_UNEXPECTED_STATE,
         )
     if state is SwapState.BOTH_LOCKED:
         if obs.asset_locked_at_height is None:
@@ -910,6 +1374,7 @@ def _decide_eth(
                     f"maker-stall predicate un-evaluable, fail-closed to a refund page: {exc}",
                     deadline=deadline,
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_UNEVALUABLE,
                 )
             return Decision(
                 Intent.PAGE_REFUND,
@@ -917,12 +1382,14 @@ def _decide_eth(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_BOTH_LOCKED_REFUND_UNEVALUABLE,
             )
         if refund_due and record.role is RecordRole.MAKER:
             return _maker_covenant_refund(
                 "you have not claimed the ETH counter leg and t_rxd is near; the taker refunds its ETH",
                 deadline=deadline,
                 corr=corr,
+                situation=SITUATION_MAKER_REFUND_T_RXD_NEAR,
             )
         if refund_due:
             return Decision(
@@ -931,6 +1398,7 @@ def _decide_eth(
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                situation=SITUATION_BOTH_LOCKED_REFUND_DUE,
             )
         return Decision(
             Intent.WATCH,
@@ -978,6 +1446,7 @@ def _decide_eth(
                         else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
                     ),
                     corr=corr,
+                    situation=SITUATION_MAKER_REFUND_TAKER_TIMEOUT,
                 )
             return Decision(
                 Intent.WATCH,
@@ -1005,6 +1474,7 @@ def _decide_eth(
                 ),
                 recommended_action="taker_refund_btc",
                 low_corroboration=corr,
+                situation=SITUATION_ETH_REFUND_TIMEOUT_PASSED,
             )
         if covenant_seen and refused is None:
             return Decision(
@@ -1035,3 +1505,215 @@ def _decide_eth(
 
     # Pre-lock states (NEGOTIATED): nothing time-critical.
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
+
+
+# -- legacy terminal records: the D9 net (#850 PR 9b for BTC; design §5.2) ----------------------
+#
+# Before 0.27 a BTC taker refund ended its record on BROADCAST (ABORTED or MUTUAL_REFUND), and the
+# store dropped terminal records, so a refund that lost to the maker's claim left ``p`` public with
+# nobody told to claim the covenant before t_rxd. Records 0.27 ends carry ``counter_disposition`` (the
+# chain read that ended them); a terminal BTC record without one, and without the tower's marker, is
+# read once here.
+
+#: The terminal states an old BTC refund ended a record in on its broadcast.
+LEGACY_TERMINAL_STATES = frozenset({SwapState.ABORTED, SwapState.MUTUAL_REFUND})
+
+
+@dataclass(frozen=True)
+class LegacyCheck:
+    """:func:`decide_legacy`'s answer for one legacy terminal record.
+
+    ``decision`` is what to page (``WATCH``: nothing). ``verdict`` is the word the marker records.
+    ``conclusive``: write the marker now. ``conclusive_once_delivered``: write it once this page is
+    delivered. Neither: write nothing, and the record is read again on a later tick."""
+
+    decision: Decision
+    verdict: str
+    conclusive: bool = False
+    conclusive_once_delivered: bool = False
+
+
+def decide_legacy(
+    *, record: SwapRecord, observations: Observations, policy: MarginPolicy, safety_window_blocks: int
+) -> LegacyCheck:
+    """What a legacy terminal BTC record's funding outpoint says about how it really ended (D9).
+
+    Pure, and never autonomous (no decision here sets an autonomy flag). The verdicts:
+
+    * spent by a CLAIM (its witness opens H) → PAGE_CLAIM naming the covenant claim
+      (``pyrxd swap build-claim``), not a refund: the refund lost and ``p`` is public. Conclusive
+      once the page is delivered after t_rxd has matured (the claim window is then closed).
+    * spent by a transaction this read could not classify → PAGE_SQUEEZED "investigate".
+    * UNSPENT → PAGE_REFUND: the recorded refund never confirmed; refund by address
+      (``pyrxd swap build-refund``) and watch for a claim. NEVER conclusive, a deliberate divergence
+      from design §5.2 item 4 ("or the swap's last deadline has passed"): an unspent HTLC is the
+      taker's BTC, the maker can claim it at any time, and past t_rxd the maker can also refund the
+      covenant, so it is the taker's loss for as long as nobody refunds. The page is urgent (CRITICAL,
+      re-paged until ACKed) inside the safety window of t_rxd or past it, and whenever this tower
+      cannot say where t_rxd is (no covenant pin or lock height); otherwise a WARN once per tower run
+      (Mythos F3). The check costs one of the per-tick slots.
+    * our refund buried → agrees; conclusive. Pending, or UNKNOWN → retried, nothing written.
+    """
+    obs = observations
+    corr = _corroboration(obs)
+    state = record.state
+    if record.terms.counter_chain != "btc":
+        return LegacyCheck(Decision(Intent.WATCH, reason="legacy net: only a BTC counter leg is read here"), "skipped")
+    if not obs.btc_spend_classified:
+        return LegacyCheck(
+            Decision(
+                Intent.WATCH, reason="legacy net: this tower does not classify BTC spenders", low_corroboration=corr
+            ),
+            "unclassified",
+        )
+    deadline = (
+        None
+        if obs.asset_locked_at_height is None
+        else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
+    )
+    past = deadline is not None and obs.now_rxd_height >= deadline
+    ended = (
+        f"this record ended at {state.value} when its BTC refund was broadcast (pyrxd before 0.27 did not "
+        "follow a refund to burial)"
+    )
+    kind = obs.btc_disposition
+    if obs.maker_has_claimed_btc and kind is BtcDispositionKind.REFUNDED and not obs.btc_claim_witness_seen:
+        # A spender only discovery names, beside our buried refund (Mythos F4): never marked.
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=(
+                    f"{ended}. The refund {obs.btc_refund_txid} is buried, but a discovery source names a different "
+                    "spender of the HTLC that no source served the bytes of; the tower cannot tell whether p is public"
+                ),
+                recommended_action=(
+                    "investigate — look up the spender the discovery source names; if it is a claim (its witness "
+                    "opens H), p is public: claim the covenant before t_rxd (pyrxd swap build-claim)"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_BTC_DISCOVERY_DISAGREES,
+            ),
+            "discovery_disagrees",
+        )
+    if obs.maker_has_claimed_btc and _btc_refund_buried(obs):
+        # D14 on the chain: our refund won, but a claim witness that opens H was served beside it.
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_CLAIM,
+                reason=(
+                    f"{ended}. The refund {obs.btc_refund_txid} is buried, but a claim witness that opens H was "
+                    "served for the HTLC, so p is public: claim the covenant before t_rxd if it is still unspent"
+                ),
+                recommended_action=(
+                    "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant with it "
+                    "(pyrxd swap build-claim) if it is still unspent"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
+            ),
+            "refunded_p_public",
+            conclusive_once_delivered=past,
+        )
+    if obs.maker_has_claimed_btc:
+        if kind in (BtcDispositionKind.CLAIM_SEEN, BtcDispositionKind.CLAIMED):
+            return LegacyCheck(
+                Decision(
+                    Intent.PAGE_CLAIM,
+                    reason=(
+                        f"{ended}, but the BTC HTLC was spent by the maker's CLAIM (its witness opens H): the "
+                        "refund lost and p is public. Claim the covenant before t_rxd, if it is still unspent"
+                        + (" (t_rxd has matured: the maker may already have refunded it)" if past else "")
+                        + (
+                            ""
+                            if deadline is not None
+                            else " (this record pins no covenant, so the tower cannot say when t_rxd matures: ACK "
+                            "this page once the covenant is claimed or gone)"
+                        )
+                    ),
+                    recommended_action=(
+                        "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant with "
+                        "it (pyrxd swap build-claim) — not a refund"
+                    ),
+                    deadline_rxd_height=deadline,
+                    low_corroboration=corr,
+                    situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
+                ),
+                "claimed",
+                conclusive_once_delivered=past,
+            )
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=(
+                    f"{ended}, and the BTC HTLC is spent by a transaction this tower could not classify "
+                    f"({obs.btc_disposition_reason})"
+                ),
+                recommended_action=(
+                    "investigate — read the spender of the HTLC funding outpoint; if it is a claim, p is public: "
+                    "claim the covenant before t_rxd (pyrxd swap build-claim)"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_LEGACY_UNCLASSIFIED_SPEND,
+            ),
+            "unclassified_spend",
+        )
+    if kind is BtcDispositionKind.UNSPENT:
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    f"{ended}, but the BTC HTLC is unspent: the recorded refund never confirmed. The maker can claim "
+                    "it at any time while it is unspent"
+                ),
+                recommended_action=(
+                    "refund by address (pyrxd swap build-refund, then broadcast it), and watch until the refund is "
+                    "buried; a claim makes p public"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                urgent=not _covenant_known(record, obs) or _t_rxd_near(record, obs, policy, safety_window_blocks),
+                situation=SITUATION_LEGACY_BTC_UNSPENT,
+            ),
+            "unspent",
+        )
+    if kind is BtcDispositionKind.REFUNDED and obs.btc_single_source:
+        return LegacyCheck(
+            Decision(
+                Intent.WATCH,
+                reason=f"legacy net: only one source reads our refund {obs.btc_refund_txid} buried; read again later",
+                low_corroboration=corr,
+            ),
+            "refunded_single_source",
+        )
+    if kind is BtcDispositionKind.REFUNDED:
+        return LegacyCheck(
+            Decision(Intent.WATCH, reason=f"legacy net: our refund {obs.btc_refund_txid} is buried; the record agrees"),
+            "refunded",
+            conclusive=True,
+        )
+    if kind is BtcDispositionKind.UNKNOWN and obs.btc_spenders_named:
+        return LegacyCheck(
+            Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=f"{ended}, and the sources contradict each other on its spender ({obs.btc_disposition_reason})",
+                recommended_action=(
+                    "investigate — read the spender of the HTLC funding outpoint on other sources; if it is a claim, "
+                    "p is public: claim the covenant before t_rxd"
+                ),
+                deadline_rxd_height=deadline,
+                low_corroboration=corr,
+                situation=SITUATION_BTC_SPENDER_CONTRADICTION,
+            ),
+            "contradiction",
+        )
+    return LegacyCheck(
+        Decision(
+            Intent.WATCH,
+            reason=f"legacy net: the spender read is {kind.value if kind else None} ({obs.btc_disposition_reason}); read again later",
+            low_corroboration=corr,
+        ),
+        kind.value if kind else "unknown",
+    )

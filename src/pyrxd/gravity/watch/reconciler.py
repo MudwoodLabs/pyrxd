@@ -21,13 +21,22 @@ Design (mirrors the brainstorm/plan):
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import SwapRecord
-from pyrxd.gravity.watch.decide import Decision, Intent, Observations, decide
+from pyrxd.gravity.watch.decide import (
+    SITUATION_ARMED_BTC_REFUND,
+    Decision,
+    Intent,
+    LegacyCheck,
+    Observations,
+    decide,
+    decide_legacy,
+)
 from pyrxd.gravity.watch.executor import ExecOutcome, Executor, NullExecutor
 from pyrxd.security.errors import ValidationError
 
@@ -40,12 +49,19 @@ _STORE = "<records-store>"
 
 # Intents that the alerter is told about: the actionable pages + the terminal RETIRE
 # (so it can emit an INFO "done" and clear its dedup state). WATCH/NOOP are silent.
-_ROUTED_INTENTS = frozenset({Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.RETIRE})
+_ROUTED_INTENTS = frozenset(
+    {Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.RECONCILE, Intent.RETIRE}
+)
 
 
 @runtime_checkable
 class RecordStore(Protocol):
-    """Read-only view of the operator's in-flight swaps (v1 never writes)."""
+    """View of the operator's in-flight swaps. It never writes a record.
+
+    A store MAY also expose ``legacy`` (``(swap_id, record)`` for the legacy terminal records to read
+    this tick) and ``mark_legacy_checked(swap_id, verdict, *, rxd_height, evidence)``, the D9 net (#850
+    PR 9b): :class:`~pyrxd.gravity.watch.adapters.JsonDirRecordStore` does. A store without them has
+    no legacy net."""
 
     async def list_active(self) -> list[tuple[str, SwapRecord]]:
         """Return ``(swap_id, record)`` for every non-terminal swap to watch."""
@@ -82,6 +98,28 @@ class ReconcileResult:
     # otherwise BROADCAST / DECLINED / FAILED — surfaced so the heartbeat counts BROADCAST/FAILED and a
     # swallowed broadcast failure cannot look healthy (same discipline as ``alert_delivered``).
     executed: ExecOutcome | None = None
+    #: A legacy terminal record read by the D9 net (#850 PR 9b): never executed, only paged.
+    legacy: bool = False
+
+
+#: ``Decision.situation`` of the reconciler's own CRITICAL pages (second Mythos pass, H1): an ACK of a
+#: "tower blind" page must not silence the claim race that follows on the same swap, nor the reverse.
+SITUATION_STORE_UNREADABLE = "store_unreadable"
+SITUATION_RECORD_UNREADABLE = "record_unreadable"
+SITUATION_RECONCILE_ERROR = "reconcile_error"
+
+
+def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
+    """What this tick's executor did with an armed refund page, appended to the page (#850 PR 9b,
+    Mythos F2). ``None`` means no executor acted (the alert-only default)."""
+    if outcome is ExecOutcome.BROADCAST:
+        return " This tick the tower broadcast the pre-signed refund."
+    if outcome is ExecOutcome.FAILED:
+        return " This tick the tower's refund broadcast FAILED: refund the BTC yourself (taker_refund_btc)."
+    return (
+        " This tick the tower did NOT broadcast a refund (no executor, dormant, or one of its gates refused): "
+        "refund the BTC yourself (taker_refund_btc)."
+    )
 
 
 class Reconciler:
@@ -133,9 +171,11 @@ class Reconciler:
                 Intent.PAGE_SQUEEZED,
                 reason=f"records store unreadable — the tower may be watching NOTHING (investigate): {err}",
                 recommended_action="check the records dir exists/is mounted/readable; manually watch in-flight swaps",
+                situation=SITUATION_STORE_UNREADABLE,
             )
             delivered = await self._safe_handle(_STORE, decision)
             return [ReconcileResult(_STORE, decision, error=err, alert_delivered=delivered)]
+        self._safe_resolve(_STORE)  # the store read: its unreadable page, if any, starts to close
         results: list[ReconcileResult] = []
         # Each record the store could not read pages BY NAME (#850 PR 3). The store skips it so one
         # bad file cannot blind the tower to the rest, but a skipped record is a swap nobody is
@@ -146,12 +186,55 @@ class Reconciler:
                 Intent.PAGE_SQUEEZED,
                 reason=f"swap record {swap_id} is NOT being watched: {why}",
                 recommended_action="read the record with a pyrxd that can, and watch this swap manually until then",
+                situation=SITUATION_RECORD_UNREADABLE,
             )
             delivered = await self._safe_handle(swap_id, decision)
             results.append(ReconcileResult(swap_id, decision, error=why, alert_delivered=delivered))
         for swap_id, record in active:
             results.append(await self._reconcile_one(swap_id, record))
+        for swap_id, record in list(getattr(self._store, "legacy", ()) or ()):
+            results.append(await self._check_legacy(swap_id, record))
         return results
+
+    async def _check_legacy(self, swap_id: str, record: SwapRecord) -> ReconcileResult:
+        """The D9 net for one legacy terminal record (#850 PR 9b, design §5.2). One observation, the
+        pure :func:`decide_legacy`, a page when it names one, and the marker only on a conclusive
+        verdict. Never the executor: nothing here is autonomous. A read that fails writes nothing
+        and pages nothing: the record is read again on a later tick (``UNKNOWN`` writes nothing)."""
+        try:
+            obs = await self._observer.observe(swap_id, record)
+            check: LegacyCheck = decide_legacy(
+                record=record, observations=obs, policy=self._policy, safety_window_blocks=self._safety
+            )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            logger.warning("legacy check of swap %s failed; read again later: %s", swap_id, err)
+            return ReconcileResult(
+                swap_id, Decision(Intent.WATCH, reason=f"legacy check failed: {err}"), error=err, legacy=True
+            )
+        decision = check.decision
+        delivered: bool | None = None
+        if decision.intent in _ROUTED_INTENTS:
+            delivered = await self._safe_handle(swap_id, decision)
+        else:
+            self._safe_resolve(swap_id)
+        if check.conclusive or (check.conclusive_once_delivered and delivered):
+            mark = getattr(self._store, "mark_legacy_checked", None)
+            if callable(mark):
+                try:
+                    mark(
+                        swap_id,
+                        check.verdict,
+                        rxd_height=int(obs.now_rxd_height),
+                        evidence={
+                            "btc_disposition": obs.btc_disposition.value if obs.btc_disposition else None,
+                            "btc_refund_txid": obs.btc_refund_txid,
+                            "reason": obs.btc_disposition_reason,
+                        },
+                    )
+                except Exception:
+                    logger.exception("could not write the legacy-checked marker for %s; read again later", swap_id)
+        return ReconcileResult(swap_id, decision, alert_delivered=delivered, legacy=True)
 
     async def _reconcile_one(self, swap_id: str, record: SwapRecord) -> ReconcileResult:
         if swap_id in self._inflight:
@@ -176,6 +259,7 @@ class Reconciler:
                     Intent.PAGE_SQUEEZED,
                     reason=f"reconcile error, fail-closed (investigate manually): {err}",
                     recommended_action="investigate",
+                    situation=SITUATION_RECONCILE_ERROR,
                 )
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, error=err, alert_delivered=delivered)
@@ -183,9 +267,20 @@ class Reconciler:
                 # Autonomy (v2) runs FIRST but is ADDITIVE — the alerter ALWAYS still fires, so a
                 # dormant/declined/failed broadcast never silences the operator.
                 executed = await self._safe_execute(swap_id, record, decision)
+                if decision.autonomous_btc_refund:
+                    # decide() cannot know whether this tower broadcasts; the page says what it did
+                    # (#850 PR 9b, Mythos F2), so an alert-only or dormant tower never claims a broadcast.
+                    # The situation names the outcome too, so a FAILED broadcast after a BROADCAST is a new
+                    # page, not a deduped repeat of the first (second Mythos pass, M3).
+                    decision = dataclasses.replace(
+                        decision,
+                        reason=decision.reason + _executor_outcome_note(executed),
+                        situation=f"{SITUATION_ARMED_BTC_REFUND}:{executed.value if executed is not None else 'none'}",
+                    )
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, alert_delivered=delivered, executed=executed)
             logger.debug("swap %s: %s (%s)", swap_id, decision.intent.value, decision.reason)
+            self._safe_resolve(swap_id)
             return ReconcileResult(swap_id, decision)
         finally:
             self._inflight.discard(swap_id)
@@ -204,6 +299,18 @@ class Reconciler:
         except Exception:
             logger.exception("autonomous executor FAILED for swap %s — alerter will still page", swap_id)
             return ExecOutcome.FAILED
+
+    def _safe_resolve(self, swap_id: str) -> None:
+        """Tell an alerter that can hear it that the swap's decision is quiet this tick (WATCH or NOOP
+        from ``decide``), so a page it sent earlier moves toward closing (third Mythos pass, F3).
+        Optional: a minimal alerter has no ``resolve``."""
+        resolve = getattr(self._alerter, "resolve", None)
+        if not callable(resolve):
+            return
+        try:
+            resolve(swap_id)
+        except Exception:
+            logger.exception("alerter.resolve FAILED for swap %s", swap_id)
 
     async def _safe_handle(self, swap_id: str, decision: Decision) -> bool:
         """Route to the alerter; an alert-channel failure must not crash the loop. Returns True iff

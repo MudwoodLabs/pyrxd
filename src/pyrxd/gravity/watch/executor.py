@@ -28,6 +28,13 @@ It gates on the TYPED ``Decision.autonomous_btc_refund`` discriminator (set by `
 matured BTC keyless-refund), never on the ``recommended_action`` display string (the ETH branch also
 emits ``"taker_refund_btc"``). Maturity is ``decide()``'s job (it owns the BTC funding-depth gate); the
 executor trusts the discriminator, and consensus BIP68 is the final backstop against a premature spend.
+
+While the maker's covenant is observed, ``decide()`` sets that discriminator only on a CLASSIFIED spender
+read that holds the funding outpoint unspent at its quorum (#850 PR 9b, design D12). The read classifies a
+spender by the leaf it spends, so this executor's own broadcast is read back as our refund, never as the
+maker's claim, and a claim that replaces it pages the covenant claim. Once a refund of ours is seen, buried
+or not, nothing more is armed: the blob's fee is fixed, so a refund that does not confirm is the operator's
+to bump through the coordinator (``taker_refund_btc``), which recognises this refund as its own.
 """
 
 from __future__ import annotations
