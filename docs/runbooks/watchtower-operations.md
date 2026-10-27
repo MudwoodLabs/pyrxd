@@ -168,6 +168,9 @@ no ACK yet. Otherwise the tower cannot tell which page you meant, so it logs the
 
 Prefer the keyed line: a bare id appended after its page closed lands on whatever page is open then.
 
+A swap is named by its record's file name. A name the inbox cannot carry (a space, `+`, non-ASCII,
+more than 128 characters) appears on the `ack:` line as `id-<hash>`; copy the line as printed.
+
 A page stays open until it has been absent for 10 of that swap's ticks in a row
 (`DEFAULT_SITUATION_HOLD_TICKS`, chosen, not measured); it is closed when the next tick starts, so the
 same danger on the 11th tick pages again. Another page or a quiet tick both count as absent. Ticks are counted per swap: an active swap gets one each poll, about 5

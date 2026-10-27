@@ -243,13 +243,17 @@ class EscalationState:
     last_escalated_ts: float | None = None
     fired: bool = False
     blind_warned: bool = False
+    # The blind-count escalation's own edge. It used to share ``fired``, so one blind beat used up
+    # the episode's escalation and real un-ACKed pages after it never escalated (tower Mythos
+    # pass, F3).
+    blind_fired: bool = False
 
     def __post_init__(self) -> None:
         for name in ("first_unacked_ts", "last_escalated_ts"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
                 raise ValidationError(f"EscalationState {name} must be a number or None")
-        for name in ("fired", "blind_warned"):
+        for name in ("fired", "blind_warned", "blind_fired"):
             if not isinstance(getattr(self, name), bool):
                 raise ValidationError(f"EscalationState {name} must be a bool")
         if self.fired and self.first_unacked_ts is None and self.last_escalated_ts is None:
@@ -261,6 +265,7 @@ class EscalationState:
             "last_escalated_ts": self.last_escalated_ts,
             "fired": self.fired,
             "blind_warned": self.blind_warned,
+            "blind_fired": self.blind_fired,
         }
 
 
@@ -326,6 +331,7 @@ def _load_state(path: Path) -> EscalationState:
             last_escalated_ts=parsed.get("last_escalated_ts"),
             fired=bool(parsed.get("fired", False)),
             blind_warned=bool(parsed.get("blind_warned", False)),
+            blind_fired=bool(parsed.get("blind_fired", False)),
         )
     except (UnicodeDecodeError, ValueError, AttributeError, ValidationError) as exc:
         logger.error("escalation state %s is corrupt (%s) — starting FRESH", path, exc)
@@ -590,8 +596,11 @@ class EscalationMonitor:
 
     async def _escalate_blind_count(self, beat: BeatReading, beat_ts: float) -> EscalationVerdict:
         escalated = False
-        if not self._state.fired and await self._try_send(self._blind_count_page(beat)):
-            self._state = replace(self._state, fired=True, last_escalated_ts=beat_ts, first_unacked_ts=beat_ts)
+        if not self._state.blind_fired and await self._try_send(self._blind_count_page(beat)):
+            # Blindness still starts the escalation clock, so real pages that follow escalate once
+            # the threshold has passed since it began.
+            first = self._state.first_unacked_ts if self._state.first_unacked_ts is not None else beat_ts
+            self._state = replace(self._state, blind_fired=True, first_unacked_ts=first)
             escalated = True
         return EscalationVerdict(
             unacked=beat.unacked,
@@ -607,7 +616,7 @@ class EscalationMonitor:
         dead-man's-switch's recovery notification — an escalation with no visible end leaves the
         operator unsure whether it is still live)."""
         recovered = False
-        if self._state.fired:
+        if self._state.fired or self._state.blind_fired:
             if not await self._try_send(self._recovered_page()):
                 # Do NOT clear the state on a failed send: the next check re-sends the recovery
                 # rather than silently leaving the operator on a CRITICAL that has already passed.
@@ -615,7 +624,9 @@ class EscalationMonitor:
                     unacked=0, fresh=True, unacked_for_s=None, escalated=False, blind_warned=False, recovered=False
                 )
             recovered = True
-        self._state = replace(self._state, first_unacked_ts=None, last_escalated_ts=None, fired=False)
+        self._state = replace(
+            self._state, first_unacked_ts=None, last_escalated_ts=None, fired=False, blind_fired=False
+        )
         return EscalationVerdict(
             unacked=0, fresh=True, unacked_for_s=None, escalated=False, blind_warned=False, recovered=recovered
         )

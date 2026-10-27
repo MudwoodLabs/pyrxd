@@ -25,6 +25,7 @@ changes or the swap retires). WARN/INFO intents keep the once-per-situation dedu
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -105,6 +106,20 @@ def _situation_key(intent: Intent, situation: str | None) -> str:
     return intent.value if situation is None else f"{intent.value}:{situation}"
 
 
+#: A swap id the ACK line can carry as it is. The records store names a swap by its file stem and
+#: accepts any name, so a stem outside this (a space, ``+``, non-ASCII, over 128 characters) is
+#: printed on the ``ack:`` line as :func:`ack_id` instead (tower Mythos pass, F5).
+_ACKABLE_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
+
+
+def ack_id(swap_id: str) -> str:
+    """The id the ``ack:`` line names for *swap_id*: the id itself, or ``id-`` and a hash of it
+    when the inbox grammar cannot carry it. :meth:`DedupAlerter.ack` takes either."""
+    if _ACKABLE_ID_RE.match(swap_id) or swap_id == "<records-store>":
+        return swap_id
+    return "id-" + hashlib.sha256(swap_id.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
 def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
     parts = [f"[{severity.value.upper()}] swap {swap_id}: {decision.reason}"]
     if decision.recommended_action:
@@ -114,7 +129,7 @@ def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
     if decision.low_corroboration:
         parts.append("(LOW CORROBORATION — single-source RXD or BTC read; verify before acting)")
     if severity is Severity.CRITICAL:
-        parts.append(f"ack: {swap_id} {_situation_key(decision.intent, decision.situation)}")
+        parts.append(f"ack: {ack_id(swap_id)} {_situation_key(decision.intent, decision.situation)}")
     return " | ".join(parts)
 
 
@@ -217,10 +232,13 @@ class DedupAlerter:
         With ``situation_key`` (the text after the swap id on the page's ``ack:`` line) it ACKs that
         situation if it is open. A bare swap id ACKs only when the swap has exactly one open, un-ACKed
         CRITICAL situation and no ACK yet; otherwise the operator may have meant another page, so nothing is
-        recorded and the pages keep firing (third Mythos pass, F2). Returns True if an ACK was
+        recorded and the pages keep firing (third Mythos pass, F2). ``swap_id`` may also be the
+        :func:`ack_id` the page printed for a name the inbox cannot carry. Returns True if an ACK was
         recorded.
         """
         st = self._swaps.get(swap_id)
+        if st is None:
+            st = next((v for k, v in self._swaps.items() if ack_id(k) == swap_id), None)
         if st is None:
             return False
         if situation_key is not None:

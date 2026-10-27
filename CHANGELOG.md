@@ -680,6 +680,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not be ACKed by either form. An undelivered CRITICAL is now an open situation: its own key, or an
   unambiguous bare swap id, ACKs it, and an ACKed one does not count. The escalation page now says
   how to ACK.
+- **`EscalationMonitor`: one blind heartbeat used up the episode's escalation (F3).** A `-1` or
+  missing count escalated at once and set the same edge real escalations use, so with the default
+  `re_escalate_every_s=0` an un-ACKed CRITICAL after it never escalated. The blind page now has its
+  own persisted edge (`blind_fired`, read as false from an older state file); blindness still starts
+  the escalation clock.
+- **A page for a record whose file name the ACK inbox cannot carry could never be ACKed (F5).** The
+  records store names a swap by its file stem and accepts any name; a stem with a space, `+`,
+  non-ASCII or more than 128 characters was printed on the `ack:` line and the inbox dropped the line
+  as malformed. Such a page now prints `ack: id-<hash> <key>` (`alerts.ack_id`), which
+  `DedupAlerter.ack` resolves to the swap.
+- **`scripts/watchtower_dust_run.py plan` printed a command the tower refused (F4).** It now adds
+  `--accept-flat-burial` (a dust run) and a placeholder for the measured fast-tail RXD block
+  interval, which a `--measured` tower requires.
 - **`BitcoinCoreRpcSource.get_tx_block_height` failed for every mined transaction on a real
   Bitcoin Core node.** It read a `blockheight` key that Core's `getrawtransaction` does not send,
   so it raised "unconfirmed" whenever the transaction was mined. It now reads the transaction's
