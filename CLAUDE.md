@@ -64,6 +64,7 @@ This repo is public and published to PyPI. Each rule below exists because the op
 - A relative timelock is enforced by the spending transaction's BIP68 fields (`nVersion >= 2`, `nSequence`), not by the covenant opcode alone.
 - HTLC: the secret-holder's locked leg has the longest timelock, and the leg they claim the shortest.
 - A value that decides where funds go must not come from one endpoint without derivation. Count sources by operator, not by host (`src/pyrxd/network/source_identity.py`).
+- One endpoint must not choose what the others verify. A candidate one source nominates (a log, a tx hash, the first match, a tie-break) is a claim, not the subject of the check. Test a lying primary that both adds a decoy and withholds the real item; a liar at a later index does not exercise the primary's privileges. A wait that rests on one source's nomination pages, it never stays silent.
 - WAVE label rules live in `src/pyrxd/glyph/wave_rules.py`.
 
 ## Upstream parity, specs and published artifacts
