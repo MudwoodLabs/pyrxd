@@ -149,6 +149,9 @@ class _SwapPages:
     paged: dict[_Situation, Severity] = field(default_factory=dict)  # open situations, highest severity
     seen: dict[_Situation, int] = field(default_factory=dict)  # the last tick each was live
     acked: set[_Situation] = field(default_factory=set)
+    # CRITICAL situations whose page failed to send: open and counted for escalation (the second
+    # channel exists for a primary that is down), and sent as new once the channel is back.
+    undelivered: set[_Situation] = field(default_factory=set)
     critical_ticks: int = 0  # ticks since the live CRITICAL last (re)paged: the re-page backoff
 
 
@@ -196,6 +199,7 @@ class DedupAlerter:
             st.seen.pop(situation, None)
             st.paged.pop(situation, None)
             st.acked.discard(situation)
+            st.undelivered.discard(situation)
             if st.live == situation:
                 st.live = None
         return st
@@ -209,7 +213,7 @@ class DedupAlerter:
 
         With ``situation_key`` (the text after the swap id on the page's ``ack:`` line) it ACKs that
         situation if it is open. A bare swap id ACKs only when the swap has exactly one open, un-ACKed
-        CRITICAL situation; otherwise the operator may have meant another page, so nothing is
+        CRITICAL situation and no ACK yet; otherwise the operator may have meant another page, so nothing is
         recorded and the pages keep firing (third Mythos pass, F2). Returns True if an ACK was
         recorded.
         """
@@ -223,7 +227,9 @@ class DedupAlerter:
                     return True
             return False
         pending = [x for x in self._open_critical(st) if x not in st.acked]
-        if len(pending) != 1:
+        if st.acked or len(pending) != 1:
+            # A swap with an ACK already: the same bare line appended again (shell history) would
+            # otherwise land on a page that opened after it was written (re-review, finding 2a).
             return False
         st.acked.add(pending[0])
         return True
@@ -241,7 +247,11 @@ class DedupAlerter:
         means time-critical claim/squeeze pages are outstanding and unacknowledged, so an external
         monitor / second channel can escalate beyond the primary page channel.
         """
-        return sum(1 for st in self._swaps.values() if any(x not in st.acked for x in self._open_critical(st)))
+        return sum(
+            1
+            for st in self._swaps.values()
+            if st.undelivered or any(x not in st.acked for x in self._open_critical(st))
+        )
 
     async def handle(self, swap_id: str, decision: Decision) -> None:
         if not isinstance(decision, Decision):
@@ -295,7 +305,14 @@ class DedupAlerter:
         # Send first; record the page only on success so a transient channel failure is retried
         # next tick rather than silently swallowed, and a page that never went out changes nothing
         # the escalation count reads.
-        await self._channel.send(page)
+        try:
+            await self._channel.send(page)
+        except BaseException:
+            if severity is Severity.CRITICAL:  # new, or a WARN escalating: counts while undelivered
+                st.undelivered.add(situation)
+                st.seen[situation] = st.tick
+            raise
+        st.undelivered.discard(situation)
         st.paged[situation] = severity
         st.live, st.seen[situation] = situation, st.tick
         st.critical_ticks = 0  # reset the re-page backoff after a successful (re)page

@@ -1086,3 +1086,63 @@ async def test_a_warn_that_failed_to_send_is_sent_next_tick():
     ch.down = False
     await alerter.handle(SWAP, warn)
     assert len(ch.sent) == 1, "the WARN was recorded as paged although it never went out"
+
+
+# --------------------------------------------------------------------------- second re-check of the hold window
+
+
+@pytest.mark.parametrize("escalation", [False, True], ids=["new-critical", "warn-escalates"])
+async def test_a_critical_that_never_went_out_counts_for_as_long_as_the_channel_is_down(escalation):
+    """Re-check MEDIUM: a CRITICAL whose first send failed was never recorded, so through a channel
+    outage the escalation count (the second channel's whole input) read 0."""
+    ch = _DownChannel()
+    alerter = DedupAlerter(channel=ch, situation_hold_ticks=2)
+    refund = Decision(Intent.PAGE_REFUND, reason="refund", situation="btc_refund_due")
+    if escalation:
+        await alerter.handle(SWAP, refund)
+        assert alerter.unacked_critical_count() == 0, "the honest twin: a WARN does not count"
+    critical = (
+        Decision(Intent.PAGE_REFUND, reason="refund now", situation="btc_refund_due", urgent=True)
+        if escalation
+        else Decision(Intent.PAGE_SQUEEZED, reason="race", situation=SITUATION_CLAIM_RACE)
+    )
+    ch.down = True
+    for _ in range(10):  # well past the hold window
+        with pytest.raises(ConnectionError):
+            await alerter.handle(SWAP, critical)
+        assert alerter.unacked_critical_count() == 1, "an undelivered CRITICAL dropped out of escalation"
+    ch.down = False
+    await alerter.handle(SWAP, critical)
+    assert ch.sent[-1].severity is Severity.CRITICAL and alerter.unacked_critical_count() == 1
+    assert alerter.ack(SWAP) is True
+    assert alerter.unacked_critical_count() == 0
+
+
+async def test_an_undelivered_critical_that_went_away_closes_after_the_hold():
+    """The honest twin: a CRITICAL that never went out and is no longer live stops counting once its
+    hold window has passed, as a delivered one would."""
+    ch = _DownChannel()
+    alerter = DedupAlerter(channel=ch, situation_hold_ticks=2)
+    ch.down = True
+    with pytest.raises(ConnectionError):
+        await alerter.handle(SWAP, Decision(Intent.PAGE_SQUEEZED, reason="race", situation=SITUATION_CLAIM_RACE))
+    for _ in range(3):
+        alerter.resolve(SWAP)
+    assert alerter.unacked_critical_count() == 0
+
+
+async def test_a_repeated_bare_ack_does_not_land_on_a_newer_page():
+    """Re-check 2a: the bare line ``<swap_id>`` appended again (shell history) after the first ACK
+    landed on a page that opened after it was written."""
+    alerter, ch = _alerter(hold=10)
+    race = Decision(Intent.PAGE_SQUEEZED, reason="race", situation=SITUATION_CLAIM_RACE)
+    error = Decision(Intent.PAGE_SQUEEZED, reason="reconcile error", situation="reconcile_error")
+    await alerter.handle(SWAP, race)
+    assert alerter.ack(SWAP) is True
+    await alerter.handle(SWAP, error)
+    assert alerter.ack(SWAP) is False, "a repeated bare ACK silenced a page the operator had not seen"
+    assert alerter.unacked_critical_count() == 1
+    # The honest twin: the key the new page printed still ACKs it.
+    assert ch.sent[-1].message.endswith(f"ack: {SWAP} page_squeezed:reconcile_error")
+    assert alerter.ack(SWAP, "page_squeezed:reconcile_error") is True
+    assert alerter.unacked_critical_count() == 0

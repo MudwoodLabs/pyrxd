@@ -161,7 +161,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     resets escalation; once closed, the ACK ends and a late ACK records nothing. A page records
     nothing until it is sent. Each CRITICAL page prints an `ack:` line; the ACK inbox takes
     `<swap_id> <situation key>` (`run.apply_acks`), and a bare swap id ACKs only when the swap has
-    one open, un-ACKed CRITICAL page. The store-unreadable page closes once the store reads again.
+    one open, un-ACKed CRITICAL page and no ACK yet. A CRITICAL page that failed to send counts
+    toward escalation until it goes out. The store-unreadable page closes once the store reads again.
     A situation keeps the highest severity it paged at: one
     `urgent` tick keeps it CRITICAL, re-paged, until it is ACKed. The
     armed refund page no longer says the tower broadcasts: the reconciler appends what this tick's
