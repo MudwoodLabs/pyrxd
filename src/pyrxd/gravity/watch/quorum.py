@@ -381,11 +381,11 @@ class ChainObserver(Observer):
         The detection scan (``claim_status``, selector-agnostic, over every endpoint) stays the claim
         trigger. The disposition read adds to it, never takes from it: a ``Claimed`` log that opens H
         that the read collected, or a CLAIMED answer, is a claim even when the scan missed it. A claim
-        the record kept (``counter_claim_tx``) is a claim on every tick, read or no read: the reader
-        can return UNKNOWN before it collects any claim when one endpoint disagrees on an identity read,
-        and that must not clear it. The verdict is read for the claim the reader verified first, else
-        the scan's, else the first one the read collected, else the one on record. A CLAIMED answer from more than one endpoint is FINAL as it stands: it was verified at
-        the agreed finalized block. Gap B (CLAIMED with no transaction) has no other verdict to read.
+        the record kept (``counter_claim_tx``) is not observed here: ``decide()`` reads it off the
+        record on every tick, because the reader can return UNKNOWN before it collects any claim when
+        one endpoint disagrees on an identity read. The verdict is read for the claim the reader
+        verified first, else the scan's, else the first one the read collected. A CLAIMED answer from
+        more than one endpoint is FINAL as it stands: it was verified at the agreed finalized block. Gap B (CLAIMED with no transaction) has no other verdict to read.
 
         A8 / RF-06 across-time stall: the point-in-time verdict is the fast path and unchanged; when the
         source exposes the optional ``finality_checkpoint()`` capability, the per-``swap_id``
@@ -434,9 +434,6 @@ class ChainObserver(Observer):
                 # Gap B from one endpoint: no transaction to read a verdict for, and one endpoint's
                 # CLAIMED is not final on its own. The gate then fails closed (finality un-assessable).
                 return {"eth_claim_detected": True, "eth_claim_finality": None, **fields}
-        # A claim the record kept stays a claim when this tick names none: a read that failed before
-        # it looked at any claim (one endpoint's disagreement) clears nothing (review F1).
-        claim_tx = claim_tx or record.counter_claim_tx
         if claim_tx is None:
             return {"eth_claim_detected": False, "eth_claim_finality": None, **fields}
         try:

@@ -267,9 +267,12 @@ async def test_a_lying_primary_that_also_forks_cannot_hide_a_final_claim(tmp_pat
     obs = await w.observe()
     assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
     assert obs.eth_claim_detected is True
+    # The forked primary disagrees on the claim's block, so the verdict read fails: finality is
+    # un-assessable and the claim race pages fail-closed, not a reconcile error that names no claim.
+    assert obs.eth_claim_finality is None
     d = await w.decide()
     assert d.situation == decide_mod.SITUATION_CLAIM_RACE, d
-    assert d.intent in (Intent.PAGE_CLAIM, Intent.PAGE_SQUEEZED)
+    assert d.intent is Intent.PAGE_SQUEEZED
     assert "taker_refund_btc" not in (d.recommended_action or "")
     del claim
 
@@ -284,12 +287,11 @@ async def test_a_claim_on_record_survives_a_read_one_endpoint_breaks(tmp_path):
     w.write(dataclasses.replace(w.record(), counter_claim_tx=claim))
     obs = await w.observe()
     assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
-    assert obs.eth_claim_detected is True
-    # The forked endpoint disagrees on the claim's block too, so its finality cannot be assessed: the
-    # claim race pages fail-closed, naming the claim, not a refund and not a generic reconcile error.
-    assert obs.eth_claim_finality is None
+    assert obs.eth_claim_detected is False  # nothing on chain this tick names it
     d = await w.decide()
-    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE
+    # D14 off the record: the covenant claim, and the refund if the leg is still funded.
+    assert d.intent is Intent.PAGE_CLAIM and d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+    assert claim in d.reason and "refund the ETH leg" in d.reason
 
 
 async def test_a_claim_on_record_with_every_endpoint_honest_reads_claimed(tmp_path):
@@ -587,17 +589,27 @@ def test_a_claim_on_record_beside_our_final_refund_pages_the_covenant_claim():
     assert d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
 
 
+@pytest.mark.parametrize("kind", [DispositionKind.UNKNOWN, DispositionKind.F_EXPIRED, None])
 @pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
-def test_a_claim_on_record_is_a_claim_when_the_tick_detects_none(state):
-    """Review F1, in pure decide: the record kept a claim and this tick's reads name none. The claim
-    race runs (fail closed on its missing verdict); no refund page, no WATCH."""
+def test_a_claim_on_record_pages_d14_when_the_tick_detects_none(state, kind):
+    """Review F1, in pure decide: the record kept a claim and this tick's reads name none (a broken
+    read, an expired contract whose claim never mined, or no read). It pages the covenant claim AND the
+    refund, never the claim race, whose WAIT on a claim that never mines would hold the refund page."""
     rec = _record(state, counter_claim_tx="0x" + "c1" * 32)
-    d = _d(rec, _obs(eth_disposition=DispositionKind.UNKNOWN))
-    assert d.situation == decide_mod.SITUATION_CLAIM_RACE
-    assert d.intent is Intent.PAGE_SQUEEZED
-    # The honest twin: no claim on record, the same read, pages the refund at BTC_LOCKED.
-    d_none = _d(_record(state), _obs(eth_disposition=DispositionKind.UNKNOWN))
-    assert d_none.situation != decide_mod.SITUATION_CLAIM_RACE
+    d = _d(rec, _obs(eth_disposition=kind))
+    assert d.intent is Intent.PAGE_CLAIM
+    assert d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+    assert "refund the ETH leg" in d.reason
+    # The honest twin: no claim on record, the same read, is not this page.
+    d_none = _d(_record(state), _obs(eth_disposition=kind))
+    assert d_none.situation != decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+
+
+def test_a_makers_own_claim_on_record_is_not_paged_as_the_takers_covenant_claim():
+    """A maker's ``counter_claim_tx`` is its own claim: no covenant claim is the maker's to make."""
+    rec = _record(SwapState.BTC_LOCKED, role=RecordRole.MAKER, counter_claim_tx="0x" + "c1" * 32)
+    d = _d(rec, _obs(eth_disposition=DispositionKind.F_EXPIRED))
+    assert d.situation != decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
 
 
 def test_a_claim_on_record_after_a_params_mismatch_pages_the_gated_exit():

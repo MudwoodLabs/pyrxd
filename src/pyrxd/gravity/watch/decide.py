@@ -1524,14 +1524,15 @@ def _decide_eth(
     terms = record.terms
     state = record.state
 
-    # A claim the record kept (``counter_claim_tx``, which no step clears) is a claim whatever this
-    # tick's reads say: one endpoint can make the disposition read fail before it looks at any claim,
-    # and the detection scan can miss a log no endpoint serves (#850 PR 10, review F1).
-    claim_indicated = (obs.eth_claim_detected or record.counter_claim_tx is not None) and not _eth_refund_final(obs)
+    refund_final = _eth_refund_final(obs)
+    # A claim the record kept (``counter_claim_tx``, which no step clears) says p may be public whatever
+    # this tick's reads say: one endpoint can make the disposition read fail before it looks at any
+    # claim, and the detection scan can miss a log no endpoint serves (#850 PR 10, review F1).
+    claim_on_record = record.counter_claim_tx is not None
 
     # A claim after a params mismatch (#850 PR 10, design §3.2): there is deliberately no way into the
     # taker's claim flow from PARAMS_MISMATCH, so the claim race below could only name "investigate".
-    if state is SwapState.PARAMS_MISMATCH and claim_indicated:
+    if state is SwapState.PARAMS_MISMATCH and (obs.eth_claim_detected or claim_on_record) and not refund_final:
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason=(
@@ -1558,7 +1559,7 @@ def _decide_eth(
     # cannot drop a known-revealed swap into the silent WATCH catch-all (mirrors the BTC branch).
     # A claim beside our refund final at the finalized block is not a race: the contract paid us, so
     # no claim of it can be mined. It is paged below, as the covenant claim when p is public (D14).
-    if claim_indicated or state is SwapState.SECRET_REVEALED:
+    if (obs.eth_claim_detected and not refund_final) or state is SwapState.SECRET_REVEALED:
         if obs.eth_claim_finality is None or obs.asset_locked_at_height is None:
             # Claim indicated but finality un-assessable (no finalized-checkpoint verdict or no
             # asset-lock height) → fail closed to a decision-required page.
@@ -1628,6 +1629,37 @@ def _decide_eth(
         )
     # What the shared reader says about the contract (#850 PR 10): refunded, empty, settled, or a
     # contradiction. ``None`` leaves the rules below (OPEN, TIP_EXPIRED, F_EXPIRED, a failed read).
+    if (
+        claim_on_record
+        and not refund_final
+        and record.role is not RecordRole.MAKER
+        and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED)
+    ):
+        # D14, as on the BTC branch: a claim on record that this tick's reads do not show (a read one
+        # endpoint broke, a log no endpoint serves, or a claim that never mined). Not the claim race,
+        # whose WAIT would hold back the refund page for a claim that never finalises: this page names
+        # both the covenant claim and the refund, and stays up until the refund is final (review F1).
+        return Decision(
+            Intent.PAGE_CLAIM,
+            reason=(
+                f"a claim of the ETH counter leg that opens H is on record (tx {record.counter_claim_tx}), and this "
+                "tick's reads do not show it"
+                + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
+                + ", so p may be public: claim the covenant before t_rxd, and refund the ETH leg once its timeout "
+                "has passed if it is still funded"
+            ),
+            recommended_action=(
+                "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant (pyrxd swap "
+                "build-claim) before t_rxd"
+            ),
+            deadline_rxd_height=(
+                None
+                if obs.asset_locked_at_height is None
+                else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
+            ),
+            low_corroboration=corr,
+            situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
+        )
     if state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
         seen = _eth_disposition_decision(record, obs, policy)
         if seen is not None:

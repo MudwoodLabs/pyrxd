@@ -126,9 +126,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `MultiSourceEthRpc` (before, the primary alone, through `get_logs`), and a claim any endpoint
     serves is the answer; the primary's failure still raises, another endpoint's drops it from the
     scan. The scan stays the claim trigger, and the read only adds to it: a `Claimed` log that opens
-    H the read collected, or a `CLAIMED` answer, is a claim even when the scan missed it. A claim the
-    record kept (`counter_claim_tx`) is a claim on every tick, even when one endpoint makes the read
-    return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
+    H the read collected, or a `CLAIMED` answer, is a claim even when the scan missed it. On a taker's or
+    no-role record at `BTC_LOCKED` or `BOTH_LOCKED`, a claim the record kept (`counter_claim_tx`) that
+    this tick's reads do not show pages the covenant claim and the refund (D14, as on the BTC
+    branch), even when one endpoint makes the read return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
     taken as `FINAL`. A claim whose finality read fails because the endpoints disagree is paged as a
     claim race with finality un-assessable, where it raised a reconcile error before.
   - `--eth-rpc-url` on `pyrxd-watchtower` may be repeated: two or more endpoints (distinct operators)
