@@ -155,17 +155,22 @@ and the others), so an ACK of one never silences another. Each CRITICAL page end
 naming the swap and the situation; append that line to the inbox:
 
 ```bash
-echo "<swap_id> <situation key>" >> /run/wt/acks   # copy it from the page's "ack:" line
+(umask 077; echo "<swap_id> <situation key>" >> /run/wt/acks)   # copy it from the page's "ack:" line
 ```
+
+The tower reads the inbox only if it is owner-only (mode 600), and after each read it puts an empty
+mode-600 inbox back, so a plain `echo ... >>` appends to that file. The `umask 077` covers the
+instant between the read and the re-create: an append that lands there creates the file under your
+umask, the tower refuses it and logs an error, and that ACK must be written again.
 
 A bare swap id also works, but only when that swap has exactly one open, un-ACKed CRITICAL page and
 no ACK yet. Otherwise the tower cannot tell which page you meant, so it logs the ACK as ignored and keeps paging.
 
 Prefer the keyed line: a bare id appended after its page closed lands on whatever page is open then.
 
-A page stays open until it has been absent for more than 10 of that swap's ticks in a row
-(`DEFAULT_SITUATION_HOLD_TICKS`, chosen, not measured; it closes on the 11th), whether another page or
-a quiet tick replaced it. Ticks are counted per swap: an active swap gets one each poll, about 5
+A page stays open until it has been absent for 10 of that swap's ticks in a row
+(`DEFAULT_SITUATION_HOLD_TICKS`, chosen, not measured); it is closed when the next tick starts, so the
+same danger on the 11th tick pages again. Another page or a quiet tick both count as absent. Ticks are counted per swap: an active swap gets one each poll, about 5
 minutes at the default 30 s poll; a legacy record, which the tower does not visit every poll, holds
 its pages longer. A swap the tower stops visiting without retiring it (its record removed, or marked
 legacy) keeps its open pages until you ACK them or restart the tower. A CRITICAL page that failed to
@@ -416,7 +421,7 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
 
   | Page | Meaning | What to do |
   |---|---|---|
-  | `CRITICAL … UNACKNOWLEDGED for Ns` | The tower is alive and paging; nobody has ACK'd. | Check the primary channel, act on the swap, append the page's `ack:` line (`echo "<swap_id> <situation key>" >> $ACK_INBOX`). |
+  | `CRITICAL … UNACKNOWLEDGED for Ns` | The tower is alive and paging; nobody has ACK'd. | Check the primary channel, act on the swap, append the page's `ack:` line (`(umask 077; echo "<swap_id> <situation key>" >> $ACK_INBOX)`). |
   | `CRITICAL (blind) …` | The heartbeat carries no usable count (`-1` sentinel, missing key, or an unknown `schema_version`). | Fix the tower's wiring. Until then the escalation path is **not** protecting you — watch in-flight swaps by hand. |
   | `WARN … monitor is BLIND` | The heartbeat is stale/absent/future-dated. Sent **once** per episode. | Nothing new: the dead-man's-switch owns this alarm. The WARN doubles as proof this channel still works. |
   | `INFO escalation cleared` | `unacked_critical` is back to zero. | Nothing. |

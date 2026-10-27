@@ -667,6 +667,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An ACK written as the watchtower runbook said was dropped (whole-component Mythos pass of the
+  watchtower, F1).** `FileAckInbox.drain` renames the inbox away to read it, so the operator's next
+  `echo ... >> $ACKS` created the file under their umask (0644 or 0664 by default) and the owner-only
+  gate refused it: the page kept firing and escalation followed. The drain now puts an empty 0600
+  inbox back at once (never through a link), and creates a missing one. An append in the instant
+  between the rename and the re-create still lands under the writer's umask and is refused, so the
+  runbook's ACK command is now `(umask 077; echo ... >> $ACKS)`. The gate itself is unchanged.
+- **`DedupAlerter`: an ACK of a page that did not go out (F2, F6).** An ACK written while the page
+  channel was down never took the swap off `unacked_critical_count`, so the second channel fired on
+  an acknowledged page; and a CRITICAL whose first send failed counted toward escalation but could
+  not be ACKed by either form. An undelivered CRITICAL is now an open situation: its own key, or an
+  unambiguous bare swap id, ACKs it, and an ACKed one does not count. The escalation page now says
+  how to ACK.
 - **`BitcoinCoreRpcSource.get_tx_block_height` failed for every mined transaction on a real
   Bitcoin Core node.** It read a `blockheight` key that Core's `getrawtransaction` does not send,
   so it raised "unconfirmed" whenever the transaction was mined. It now reads the transaction's
