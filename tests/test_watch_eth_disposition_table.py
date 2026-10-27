@@ -670,6 +670,42 @@ def test_a_makers_btc_locked_record_is_not_told_to_run_a_taker_step():
     assert d_taker.recommended_action == "reconcile_counter_leg, then taker_scrape_and_claim_asset"
 
 
+_ODD = {"eth_claim_detected": True, "eth_claim_finality": CounterClaimState.NOT_YET_FINAL_LIVE}
+
+
+def test_an_odd_log_beside_a_claim_on_record_pages_d14_not_investigate():
+    """Third review, 1: the record's claim explains p; the page names it, not "the refund is due"."""
+    rec = _record(SwapState.BTC_LOCKED, counter_claim_tx="0x" + "c1" * 32)
+    d = _d(rec, _obs(eth_disposition=DispositionKind.F_EXPIRED, **_ODD))
+    assert d.situation == decide_mod.SITUATION_CLAIM_SEEN_P_PUBLIC
+
+
+def test_an_odd_log_on_a_makers_record_is_not_told_to_claim_the_covenant():
+    """Third review, 2: the investigate page is the taker's; a maker's record keeps its own pages."""
+    rec = _record(SwapState.BTC_LOCKED, role=RecordRole.MAKER)
+    d = _d(rec, _obs(eth_disposition=DispositionKind.F_EXPIRED, **_ODD))
+    assert d.situation != decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
+    d_taker = _d(_record(SwapState.BTC_LOCKED), _obs(eth_disposition=DispositionKind.F_EXPIRED, **_ODD))
+    assert d_taker.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
+
+
+def test_a_claim_the_reader_saw_beside_a_clean_answer_is_still_the_claim_race():
+    """Third review, 5: the guard takes only logs the reader did NOT count as a claim that opens H."""
+    obs = _obs(eth_disposition=DispositionKind.TIP_EXPIRED, eth_claim_seen=True, **_ODD)
+    d = _d(_record(SwapState.BTC_LOCKED), obs)
+    # The claim race: its gate WAITs on a claim not yet final.
+    assert d.intent is Intent.WATCH and d.reason.startswith("maker revealed p on ETH")
+
+
+def test_an_odd_log_beside_a_tip_settlement_is_still_the_claim_race():
+    """Third review, 5: SETTLED_UNFINAL is read when any endpoint sees the contract settled at its tip,
+    which a real claim does; it is not a clean answer, so the claim race runs."""
+    obs = _obs(eth_disposition=DispositionKind.SETTLED_UNFINAL, **_ODD)
+    d = _d(_record(SwapState.BTC_LOCKED), obs)
+    # The claim race: its gate WAITs on a claim not yet final.
+    assert d.intent is Intent.WATCH and d.reason.startswith("maker revealed p on ETH")
+
+
 def test_settled_at_the_tip_stops_no_page():
     """SETTLED_UNFINAL is read when ANY endpoint sees the contract settled at its tip: it must not
     silence the refund page."""

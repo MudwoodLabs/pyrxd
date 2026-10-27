@@ -1299,8 +1299,8 @@ def decide(
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
 
 
-#: Reader answers that examined every endpoint's logs for a claim that opens H and found none it could
-#: count: a scan's log beside one of these is not a claim the reader saw.
+#: Reader answers that read the contract unsettled on every endpoint in the quorum and found no log
+#: that opens H among the logs it read: a scan's log beside one of these is not a claim the reader saw.
 _ETH_CLEAN_UNCLAIMED = frozenset(
     {
         DispositionKind.OPEN,
@@ -1506,6 +1506,36 @@ def _eth_disposition_decision(record: SwapRecord, obs: Observations, policy: Mar
     return None
 
 
+def _eth_claim_on_record_page(record: SwapRecord, obs: Observations, policy: MarginPolicy) -> Decision:
+    """D14 off the record (#850 PR 10, review F1): the covenant claim and the refund, for a taker's or
+    no-role record that holds ``counter_claim_tx`` while this tick's reads do not show that claim."""
+    # D14, as on the BTC branch: a claim on record that this tick's reads do not show (a read one
+    # endpoint broke, a log no endpoint serves, or a claim that never mined). Not the claim race,
+    # whose WAIT would hold back the refund page for a claim that never finalises: this page names
+    # both the covenant claim and the refund, and stays up until the refund is final (review F1).
+    return Decision(
+        Intent.PAGE_CLAIM,
+        reason=(
+            f"a claim of the ETH counter leg that opens H is on record (tx {record.counter_claim_tx}), and this "
+            "tick's reads do not show it"
+            + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
+            + ", so p may be public: claim the covenant before t_rxd, and refund the ETH leg once its timeout "
+            "has passed if it is still funded"
+        ),
+        recommended_action=(
+            "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant (pyrxd swap "
+            "build-claim) before t_rxd"
+        ),
+        deadline_rxd_height=(
+            None
+            if obs.asset_locked_at_height is None
+            else _refund_opens_at(policy, record.terms, obs.asset_locked_at_height)
+        ),
+        low_corroboration=_eth_corroboration(obs),
+        situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
+    )
+
+
 def _decide_eth(
     *,
     record: SwapRecord,
@@ -1572,22 +1602,27 @@ def _decide_eth(
     # cannot drop a known-revealed swap into the silent WATCH catch-all (mirrors the BTC branch).
     # A claim beside our refund final at the finalized block is not a race: the contract paid us, so
     # no claim of it can be mined. It is paged below, as the covenant claim when p is public (D14).
-    # A log the scan counts as a claim that the reader, reading every endpoint's logs, did not count as
-    # one that opens H, on an answer that is not UNKNOWN: an endpoint served an odd or forged log. It
-    # pages "investigate" rather than a claim race whose WAIT on a transaction that never mines would
-    # hold back the refund page (re-review of the fix round, F-B).
+    # A log the scan counts as a claim that the reader, over the endpoints whose logs it read, did not
+    # count as one that opens H, on an answer that is not UNKNOWN: an endpoint served an odd or forged
+    # log. It pages "investigate" rather than a claim race whose WAIT on a transaction that never mines
+    # would hold back the refund page (re-review of the fix round, F-B). A record that holds a claim gets
+    # the D14 page, which names it; a maker's record keeps its own refund pages.
     if (
         obs.eth_claim_detected
         and not obs.eth_claim_seen
         and not refund_final
+        and record.role is not RecordRole.MAKER
         and obs.eth_disposition in _ETH_CLEAN_UNCLAIMED
         and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED)
     ):
+        if claim_on_record:
+            return _eth_claim_on_record_page(record, obs, policy)
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason=(
-                f"the detection scan names a log on the ETH counter-leg contract that the reader, over every "
-                f"endpoint, does not count as a claim that opens H; it reads the contract {obs.eth_disposition.value}"
+                f"the detection scan names a log on the ETH counter-leg contract that the reader, over the endpoints "
+                f"whose logs it read, does not count as a claim that opens H; it reads the contract "
+                f"{obs.eth_disposition.value}"
                 + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
             ),
             recommended_action=(
@@ -1679,31 +1714,7 @@ def _decide_eth(
         and record.role is not RecordRole.MAKER
         and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED)
     ):
-        # D14, as on the BTC branch: a claim on record that this tick's reads do not show (a read one
-        # endpoint broke, a log no endpoint serves, or a claim that never mined). Not the claim race,
-        # whose WAIT would hold back the refund page for a claim that never finalises: this page names
-        # both the covenant claim and the refund, and stays up until the refund is final (review F1).
-        return Decision(
-            Intent.PAGE_CLAIM,
-            reason=(
-                f"a claim of the ETH counter leg that opens H is on record (tx {record.counter_claim_tx}), and this "
-                "tick's reads do not show it"
-                + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
-                + ", so p may be public: claim the covenant before t_rxd, and refund the ETH leg once its timeout "
-                "has passed if it is still funded"
-            ),
-            recommended_action=(
-                "recover p from the claim tx (pyrxd swap recover-preimage), then claim the covenant (pyrxd swap "
-                "build-claim) before t_rxd"
-            ),
-            deadline_rxd_height=(
-                None
-                if obs.asset_locked_at_height is None
-                else _refund_opens_at(policy, terms, obs.asset_locked_at_height)
-            ),
-            low_corroboration=corr,
-            situation=SITUATION_CLAIM_SEEN_P_PUBLIC,
-        )
+        return _eth_claim_on_record_page(record, obs, policy)
     if state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
         seen = _eth_disposition_decision(record, obs, policy)
         if seen is not None:
