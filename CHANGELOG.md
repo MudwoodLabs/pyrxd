@@ -128,10 +128,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     scan. The scan stays the claim trigger, and the read only adds to it: a `Claimed` log that opens
     H the read collected, or a `CLAIMED` answer, is a claim even when the scan missed it. On a taker's or
     no-role record at `BTC_LOCKED` or `BOTH_LOCKED`, a claim the record kept (`counter_claim_tx`) that
-    this tick's reads do not show pages the covenant claim and the refund (D14, as on the BTC
-    branch), even when one endpoint makes the read return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
-    taken as `FINAL`. A claim whose finality read fails because the endpoints disagree is paged as a
-    claim race with finality un-assessable, where it raised a reconcile error before. A log the scan
+    this tick's reads do not show pages the covenant claim, its text also naming the refund (D14, as
+    on the BTC branch), even when one endpoint makes the read return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
+    taken as `FINAL`. With no claim verified, the finality verdict is read for every claim an endpoint
+    served (the most-nominated first, at most 8) and the scan's, not for the first log the scan met:
+    `FINAL` if any reads final, un-assessable if any read fails; before, a primary serving a fake
+    `Claimed` log held a final claim at "not yet final" and the tower watched until the window
+    squeezed (Mythos F1; on `main` the scan read the primary alone). A claim race whose gate waits,
+    beside a contract the reader finds settled at the finalized block, pages the reader's
+    contradiction instead of watching. A claim whose finality read fails because the endpoints
+    disagree is paged as a claim race with finality un-assessable, where it raised a reconcile error
+    before. A log the scan
     counts as a claim beside a reader answer that found no claim opening H (`OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `EXPIRED_EMPTY_*`) pages `PAGE_SQUEEZED` "investigate" at
     `BTC_LOCKED` or `BOTH_LOCKED` (on a taker's or no-role record that holds a claim, the D14 page),
     not a claim race.
@@ -148,7 +155,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`EXPIRED_EMPTY_CLOSED`) from `BTC_LOCKED`, the gated abandon from `BOTH_LOCKED`, and the covenant
     refund then the gated abandon from `PARAMS_MISMATCH`, only on a read of more than one endpoint. A
     claim after a params mismatch → `PAGE_SQUEEZED` naming the covenant refund and
-    `abandon_counter_leg` (design §3.2), where it named "investigate" before. `SETTLED_UNFINAL` and an
+    `abandon_counter_leg` (design §3.2), where it named "investigate" before; a log only the scan
+    counts, beside a clean reader answer, is named on the refund page instead (Mythos F2: the abandon
+    needs a `CLAIMED` answer, so one endpoint's odd log replaced the due refund with a step the
+    coordinator refuses). `SETTLED_UNFINAL` and an
     `UNKNOWN` from a failed read change no page.
   - `_CLAIM_PATH[BTC_LOCKED]`: a claim race on a record still at `BTC_LOCKED` (BTC or ETH) names
     `reconcile_counter_leg, then taker_scrape_and_claim_asset` instead of "investigate". On a maker's

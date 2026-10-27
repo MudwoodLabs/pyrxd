@@ -198,7 +198,7 @@ Settlement happens once, so a proven refund excludes a claim, and absence is nev
   `NotYetExpired` with no state change. This keeps today's timing.
 - **`F`** decides every state change.
 - One lagging endpoint delays tip decisions (MIN), which is the safe direction (Mythos L3). The
-  tower's deadline page uses the wall clock (`quorum.py:255`). That is fine for a page and is not
+  tower's deadline page uses the wall clock (`quorum.py:261`). That is fine for a page and is not
   an input to any terminal decision.
 
 ### 2.3 Dispositions (ETH counter leg)
