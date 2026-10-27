@@ -139,7 +139,9 @@ into the same app or receiver changes nothing.
   says to refund the ETH leg once its timeout passes, but once ACKed the refund coming due does not
   page again, so watch that timeout yourself. One endpoint can add a page (an "investigate" page, or a
   fail-closed claim race when it withholds a claim's receipt or serves a log on a transaction no
-  endpoint holds), but it cannot stop a page or mark a legacy record. A claim's finality counts only
+  endpoint holds), and it cannot mark a legacy record. It can delay one page: the finalized block is
+  the lowest any endpoint reports, so an endpoint that lags its head and finalized block together
+  holds a final claim at "not yet final" until the claim race squeezes. A claim's finality counts only
   for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
   contract's `Claimed` event that opens H.
   Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
