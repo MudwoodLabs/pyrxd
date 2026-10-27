@@ -665,8 +665,8 @@ class EscalationMonitor:
             ),
             recommended_action=(
                 "check the primary alert channel, then act on the outstanding swap(s) and ACK them "
-                "(append each page's `ack:` line to the tower's --ack-inbox under umask 077; a page that "
-                "never reached you is ACKed by its swap_id alone when that swap has one open page)"
+                "(append each page's `ack:` line to the tower's --ack-inbox under umask 077; for a page "
+                "that never reached you, the tower's log prints the line to append)"
             ),
             deadline_rxd_height=None,
             low_corroboration=False,

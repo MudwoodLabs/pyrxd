@@ -161,7 +161,10 @@ naming the swap and the situation; append that line to the inbox:
 The tower reads the inbox only if it is owner-only (mode 600), and after each read it puts an empty
 mode-600 inbox back, so a plain `echo ... >>` appends to that file. The `umask 077` covers the
 instant between the read and the re-create: an append that lands there creates the file under your
-umask, the tower refuses it and logs an error, and that ACK must be written again.
+umask, the tower refuses it and logs an error, and every ACK appended to it before the next read is
+dropped; write them again. A CRITICAL page whose send failed counts toward escalation; the tower's
+log prints the line that ACKs it, and only that keyed line does (a bare swap id never ACKs a page
+that did not reach you).
 
 A bare swap id also works, but only when that swap has exactly one open, un-ACKed CRITICAL page and
 no ACK yet. Otherwise the tower cannot tell which page you meant, so it logs the ACK as ignored and keeps paging.

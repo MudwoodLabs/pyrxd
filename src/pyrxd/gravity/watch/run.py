@@ -1142,7 +1142,8 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
         if args.heartbeat_file:
             heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file, unacked_critical=unacked))
         # Drain the operator ACK inbox once per tick, before the reconciler decides. An ACK is
-        # never lost or double-consumed (FileAckInbox.drain renames the inbox aside atomically).
+        # never double-consumed (FileAckInbox.drain renames the inbox aside atomically); one written
+        # in the instant around the rename can be dropped, and its page keeps firing (see drain).
         on_tick_start: Callable[[], None] | None = None
         if args.ack_inbox:
             acking_alerter = _require_acking_alerter(alerter, args.ack_inbox)

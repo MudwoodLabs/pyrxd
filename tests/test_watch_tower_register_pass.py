@@ -101,6 +101,17 @@ def test_an_inbox_others_can_write_is_still_refused(tmp_path):
 
 
 @posix_only
+def test_the_re_create_keeps_an_inbox_already_there(tmp_path):
+    """An ACK appended in the instant between the claim and the re-create is kept, not truncated
+    (re-review, finding 5)."""
+    path = tmp_path / "acks"
+    inbox = FileAckInbox(path)
+    _append_as_operator(path, SWAP, 0o077)
+    inbox._recreate()
+    assert inbox.drain() == [SWAP]
+
+
+@posix_only
 def test_the_inbox_is_not_recreated_through_a_symlink(tmp_path):
     """A link planted at the inbox path between the claim and the re-create is not followed: the
     re-create leaves it alone, and the next drain claims and refuses it."""
@@ -144,16 +155,37 @@ async def test_an_unacked_page_still_counts_while_the_channel_is_down():
         assert alerter.unacked_critical_count() == 1
 
 
-@pytest.mark.parametrize("key", [RACE_KEY, None], ids=["keyed", "bare"])
-async def test_a_critical_that_never_went_out_can_be_acked(key):
-    """F6: the escalation page tells the operator to ACK; a page whose first send failed could not be."""
+async def test_a_critical_that_never_went_out_can_be_acked_by_the_logged_line(caplog):
+    """F6: the escalation page tells the operator to ACK; a page whose first send failed could not be.
+    The tower logs the line to append, since the page itself never arrived."""
     ch = _Channel()
     alerter = DedupAlerter(channel=ch)
     ch.down = True
+    with caplog.at_level("ERROR"), pytest.raises(ConnectionError):
+        await alerter.handle(SWAP, RACE)
+    assert f"{SWAP} {RACE_KEY}" in caplog.text, "the log does not give the line to append"
+    assert alerter.unacked_critical_count() == 1
+    assert alerter.ack(SWAP, RACE_KEY) is True
+    assert alerter.unacked_critical_count() == 0
+
+
+async def test_a_bare_ack_from_shell_history_does_not_switch_off_escalation_for_an_unseen_page():
+    """Re-review, finding 1: the swap was paged and ACKed, the page closed; with the channel down the
+    claim race came back, and a bare ``echo <swap_id>`` re-run from history zeroed the count."""
+    ch = _Channel()
+    alerter = DedupAlerter(channel=ch, situation_hold_ticks=2)
+    await alerter.handle(SWAP, RACE)
+    assert alerter.ack(SWAP) is True
+    for _ in range(3):
+        alerter.resolve(SWAP)  # the race closes
+    ch.down = True
     with pytest.raises(ConnectionError):
         await alerter.handle(SWAP, RACE)
+    assert alerter.ack(SWAP) is False, "a bare id ACKed a page that never went out"
     assert alerter.unacked_critical_count() == 1
-    assert alerter.ack(SWAP, key) is True
+    ch.down = False
+    await alerter.handle(SWAP, RACE)
+    assert alerter.ack(SWAP) is True, "the honest twin: once delivered, the bare id works"
     assert alerter.unacked_critical_count() == 0
 
 
@@ -190,7 +222,8 @@ async def test_one_blind_beat_does_not_use_up_the_escalation_of_real_pages(tmp_p
     assert verdicts[0].escalated is True, "the honest twin: blind still escalates at once"
     later = [i for i, v in enumerate(verdicts) if v.escalated and i > 0]
     assert later, "real un-ACKed pages never escalated after one blind beat"
-    assert later[0] * 30.0 >= 900.0, "the real escalation did not wait for the threshold"
+    # The blind beat started the clock: the first beat 900 s after it escalates (re-review, 4).
+    assert later[0] == 30, f"escalated at beat {later[0]}, not 900 s after the blind beat"
     assert len(channel.pages) == 2
 
 
