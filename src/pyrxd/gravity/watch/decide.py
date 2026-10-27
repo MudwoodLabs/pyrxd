@@ -1582,9 +1582,9 @@ def _decide_eth(
         state is SwapState.PARAMS_MISMATCH
         and obs.eth_claim_detected
         and not obs.eth_claim_seen
-        and not claim_on_record
         and obs.eth_disposition in _ETH_CLEAN_UNCLAIMED
     ):
+        # A claim on record still reaches the gated exit below, in the call without the scan's hit.
         base = _decide_eth(
             record=record,
             observations=dataclasses.replace(obs, eth_claim_detected=False, eth_claim_finality=None),
