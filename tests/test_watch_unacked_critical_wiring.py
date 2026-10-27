@@ -171,5 +171,5 @@ def test_the_hook_would_have_destroyed_acks_rather_than_deferring_them(tmp_path:
     drained = inbox.drain()
 
     assert drained == ["swap-1", "swap-2"]
-    assert not inbox_path.exists()  # already consumed — an AttributeError here loses them
+    assert inbox_path.read_text() == ""  # already consumed — an AttributeError here loses them
     assert inbox.drain() == []
