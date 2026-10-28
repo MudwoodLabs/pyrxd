@@ -1662,7 +1662,7 @@ def _decide_eth(
                     "no endpoint holds as a claim the others agree on, and the reader could not read the contract"
                     if obs.eth_disposition is DispositionKind.UNKNOWN
                     else "the reader, over the endpoints whose logs it read, does not count as a claim that opens H; "
-                    f"it reads the contract {obs.eth_disposition.value}"
+                    f"it reads the contract {obs.eth_disposition.value if obs.eth_disposition is not None else 'unread'}"
                 )
                 + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
             ),
