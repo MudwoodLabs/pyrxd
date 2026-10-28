@@ -89,6 +89,9 @@ class FakeBtc:
     async def confirmations(self, claim_txid):
         return self._confs
 
+    async def funding_confirmations(self, funding_txid):
+        return None  # unread: decide() fails closed on it
+
 
 class FakeRxd:
     def __init__(self, tip: int, cov_confs: int | None = None, *, corroborated: bool = False):

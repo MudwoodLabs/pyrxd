@@ -235,6 +235,11 @@ _UNDERIVED_SITES = frozenset(
 #: in both directions: each must still be derived (or the entry is stale and must go).
 _NOT_COUNTING_SITES: dict[str, str] = {
     "pyrxd.script.type:BareMultisig.lock": "`threshold` is the m of an m-of-n multisig: signatures, not sources",
+    "pyrxd.network.quorum_depth:depth_vouched_by_quorum": (
+        "reduces answers its callers already counted one per source (MultiSourceBtcFundingReader and "
+        "read_btc_counter_disposition, both behind require_distinct_sources, and both planted here); it "
+        "sees depths, never sources"
+    ),
 }
 
 

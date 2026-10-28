@@ -817,10 +817,16 @@ class TestMultiSourceBtcFundingReader:
         assert reader._dust_cap_sats == 10_000
 
     @pytest.mark.asyncio
-    async def test_confirmations_returns_minimum_across_sources(self):
-        # All three respond with different depths -> the conservative MINIMUM is used.
+    async def test_confirmations_returns_the_depth_a_quorum_vouches_for(self):
+        # All three respond with different depths -> the deepest that 2 of them reach (register R13):
+        # one under-reporter (3) cannot hold it down, and 5 is vouched for by one source only.
         reader = MultiSourceBtcFundingReader(
             [_fake_reader(confs=5), _fake_reader(confs=3), _fake_reader(confs=4)], quorum=2
+        )
+        assert await reader.confirmations(self.TXID) == 4
+        # At 3 of 3 every source must reach it: the minimum.
+        reader = MultiSourceBtcFundingReader(
+            [_fake_reader(confs=5), _fake_reader(confs=3), _fake_reader(confs=4)], quorum=3
         )
         assert await reader.confirmations(self.TXID) == 3
 

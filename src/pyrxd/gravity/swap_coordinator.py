@@ -4867,9 +4867,9 @@ class SwapCoordinator:
 
         * ``CLAIM_SEEN``: nothing is sent; the claim is on record (:meth:`_apply_btc_counter_disposition`).
         * ``REFUND_PENDING`` (ours, or the watchtower's pre-signed one: both spend the refund leaf):
-          mined at the quorum's depth (its MIN), or placed in a block by a source when too few
-          answered, it waits. At a quorum depth of 0 (any answering source holds it unmined, even if
-          another says it is mined) for :data:`REFUND_REPLACE_AFTER_S` (counted by this
+          mined at the depth a quorum of sources vouches for (``depth_vouched_by_quorum``), or placed
+          in a block by a source when too few answered, it waits. At a quorum depth of 0 (fewer than a
+          quorum of the answering sources hold it mined, however deep one says it is) for :data:`REFUND_REPLACE_AFTER_S` (counted by this
           coordinator), it is replaced by BIP125 at a higher fee. When our own last bump pays more
           than what the sources show, it is re-sent unchanged if the node took it, and priced over
           only once the node has refused it for its fee for :data:`REFUND_REPLACE_AFTER_S` (``BitcoinTaprootLeg.refund_bump_fee``), the new bytes recorded
@@ -4912,8 +4912,9 @@ class SwapCoordinator:
             refunds = disposition.refunds_seen
             # Mined: the quorum's depth is above zero, or too few sources answered and one of them has
             # it in a block. A quorum that answers 0 is pending however deep one source says it is: one
-            # lying source must not stop the bump for good (third review, F1). The cost: while any
-            # source lags behind a just-mined refund, each pass after the wait re-signs a bump, records
+            # lying source must not stop the bump for good (third review, F1). The cost: while too few
+            # sources have caught up with a just-mined refund (with exactly a quorum answering, one
+            # lagging source is enough), each pass after the wait re-signs a bump, records
             # it and has it refused for spent inputs, until the lag clears (re-review R2, accepted:
             # the recorded bump is a valid refund of the same outpoint, and burial needs that source
             # anyway). With no source placing it in a block it is pending, even if only one mempool

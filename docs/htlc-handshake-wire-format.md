@@ -817,13 +817,14 @@ observed refund, `abort_reason`.
 A BTC counter leg is read the same way since #850 PR 9a (`pyrxd.btc_wallet.disposition`): the
 spender of the HTLC's funding outpoint, named by any one source, classified by the leaf its witness
 spends (never by txid), with its BIP340 signature verified for that leaf's key. It is terminal only
-when buried to the quorum-minimum depth (the policy's `btc_claim_reorg_depth` when measured, else
+when buried at the depth a quorum of sources vouches for (the deepest that at least a quorum of
+the answering sources report; the policy's `btc_claim_reorg_depth` when measured, else
 the leg's `min_confirmations`) in a block every source that places it agrees on. Every claim seen,
 verified or not, is recorded as `counter_claim_tx` (its txid) and holds an observed refund exactly
 as on ETH. One source, or a reader whose quorum is one, decides only on `bcrt` and `tb`. The taker's own refund is recorded before it
 is broadcast (`counter_refund_raw`), re-sent with the same bytes if it is dropped, and replaced by
-BIP125 at a higher fee once any answering source has held it unmined (the quorum's minimum depth
-is 0) for `REFUND_REPLACE_AFTER_S`, or
+BIP125 at a higher fee once fewer than a quorum of the answering sources have held it mined (the
+quorum's depth is 0) for `REFUND_REPLACE_AFTER_S`, or
 once the node has refused it for its fee (`FeeRejected`) for as long; `taker_refund_btc`
 no longer advances on its broadcast. A BTC leg written before 0.27 (no `counter_disposition`) keeps
 the old behaviour.

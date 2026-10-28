@@ -388,7 +388,7 @@ class OutspendBtcClaimSource:
     Pass several outspend backends of distinct operators (the same Esplora set used for depth): detection then
     fails TOWARD paging — if ANY source sees the outpoint spent (with a txid) we treat it as claimed
     (a missed claim is the real harm; a false page is cheap — the operator just verifies, and the
-    DEPTH read below is still the conservative quorum-min, so a single lying "spent" cannot fake
+    DEPTH read below is still the depth a quorum vouches for, so a single lying "spent" cannot fake
     reorg-safety into a SAFE auto-claim). If EVERY detection source errors we fail closed (raise →
     the reconciler pages a decision-required), never a silent "unspent". One source still works
     (degrades to v1 behaviour)."""
@@ -433,7 +433,7 @@ class OutspendBtcClaimSource:
         )
 
     async def funding_confirmations(self, funding_txid: str) -> Confirmations | None:
-        """Funding-tx depth via the SAME quorum reader (conservative min). Returns ``None`` if the read
+        """Funding-tx depth via the SAME quorum reader (the depth a quorum vouches for). Returns ``None`` if the read
         fails (down/unknown) so decide() fails closed (no autonomous refund) instead of guessing — a
         genuine 0 (unconfirmed) is returned as 0 and the maturity gate keeps watching."""
         try:
