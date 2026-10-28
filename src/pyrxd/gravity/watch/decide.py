@@ -124,7 +124,9 @@ class Observations:
     # ETH analogue of ``btc_funding_confirmations``: the one reading that lets the maker-never-locks
     # branch prove the taker's counter-leg refund is DUE. ``None`` (the default, and every
     # pre-existing caller) keeps that branch fail-closed to WATCH — exactly as the BTC branch
-    # watches on an unread funding depth — so an absent clock can never manufacture a page.
+    # watches on an unread funding depth — so there an absent clock never manufactures a page. At
+    # BOTH_LOCKED with the covenant pinned but unread it pages instead: no clock is left to place
+    # t_rxd (:func:`_eth_both_locked_lock_height_unread`, as the BTC twin pages on an unread depth).
     now_unix_s: Seconds | None = None
     low_corroboration: bool = False
     # BTC spender classification (#850 PR 9b, design §6). ``btc_spend_classified`` is True only when
@@ -962,7 +964,8 @@ def _eth_both_locked_lock_height_unread(record: SwapRecord, obs: Observations, c
     BTC side's funding depth does. Once the deadline has passed, or the clock cannot be read, this
     pages. Not urgent: past the deadline the contract refuses a claim, so the taker's ETH is not open
     to the maker, and the refund that is due is the taker's own (mutual_refund sends it from
-    BOTH_LOCKED). A record with no covenant pinned keeps the WATCH (nothing says a covenant exists)."""
+    BOTH_LOCKED). With the clock unread nothing says the deadline has passed, but a claim before it
+    is the claim race's to page, which runs first and pages un-assessable with no lock height. A record with no covenant pinned keeps the WATCH (nothing says a covenant exists)."""
     deadline_s = record.terms.eth_timeout_unix_s
     if not _covenant_known(record, obs):
         return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
@@ -978,7 +981,9 @@ def _eth_both_locked_lock_height_unread(record: SwapRecord, obs: Observations, c
         )
     why = (
         "the ETH clock could not be read this tick"
-        if obs.now_unix_s is None or deadline_s is None
+        if obs.now_unix_s is None
+        else "the terms carry no ETH HTLC deadline"
+        if deadline_s is None
         else f"the ETH HTLC deadline {deadline_s} has passed (now {obs.now_unix_s})"
     )
     if record.role is RecordRole.MAKER:

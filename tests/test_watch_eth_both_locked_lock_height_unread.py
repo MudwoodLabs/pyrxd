@@ -40,6 +40,7 @@ async def test_an_unreadable_covenant_past_the_eth_deadline_pages_the_refund(tmp
     assert d.intent is Intent.PAGE_REFUND, d.reason
     assert d.situation == SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD
     assert d.recommended_action == "mutual_refund" and not d.autonomous_btc_refund
+    assert not d.urgent
     assert "has passed" in d.reason
     guards = _state_guards()
     steps = _named_steps(d.recommended_action, guards)
@@ -81,7 +82,7 @@ async def test_an_unreadable_covenant_before_the_eth_deadline_watches(tmp_path):
 
 async def test_an_unreadable_covenant_and_clock_pages(tmp_path):
     d = _decide(_record(tmp_path), _obs())
-    assert d.intent is Intent.PAGE_REFUND and "could not be read" in d.reason
+    assert d.intent is Intent.PAGE_REFUND and "the ETH clock could not be read this tick" in d.reason
     assert d.recommended_action == "mutual_refund"
 
 
