@@ -291,7 +291,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             raise NetworkError(
                 f"the contract at {contract_address} names {candidate} as its deployer, and no nonce in the "
                 f"windows the answering endpoints opened ({windows}) creates this address, but {silent} of "
-                f"{len(answers)} endpoints did not report the account's transaction count. The window that "
+                f"{len(answers)} endpoints did not report a usable transaction count for it. The window that "
                 "would match may be theirs, so the deployer is unknown. Nothing was concluded; retry."
             )
         raise ValidationError(
