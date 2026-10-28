@@ -55,11 +55,16 @@ into the same app or receiver changes nothing.
   Neither lets the autonomous refund broadcast on a single-source read: that takes its own flag,
   `--auto-refund-on-single-source`.
 - BTC depth + claim detection: defaults to mempool.space / Esplora (`--mempool-base-url`, `--quorum`).
-- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). The finality gate also needs the
+- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). Give `--eth-rpc-url` more than once,
+  for endpoints of distinct operators, and the tower reads the counter-leg contract's disposition
+  from all of them (the coordinator's reader). With one endpoint every ETH page is marked low
+  corroboration, and that endpoint's word never stops a page or marks a legacy record checked: a
+  refund it alone reads as final leaves the refund page up. The finality gate also needs the
   chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes
   from its own vetted registry for the given chain id (768 s Ethereum/Sepolia, 900 s Base/Optimism,
   1200 s Arbitrum, 6000 s Linea). On a chain id the registry does not know, it logs an `ERROR` and
-  leaves the gate un-assessable, which pages `SQUEEZED` "verify finality manually" *every tick* —
+  leaves the gate un-assessable, which pages `SQUEEZED` "verify finality manually" *every tick*
+  (situation `claim_race_unassessable`, so an ACK of it does not silence the winner-take-all page) —
   pass `--eth-finalization-window-s` with a sourced figure for that chain. Do not shrink it to
   quieten a page: the reserve is compared against the room left before the maker's refund opens, so
   a smaller window makes the gate say WAIT with less margin than the chain actually needs.
@@ -115,6 +120,37 @@ into the same app or receiver changes nothing.
   On a conclusive verdict (refunded, or a claim page delivered after t_rxd) the tower writes
   `<swap_id>.legacy-checked.json` beside the record (mode 600, atomic). It never writes a record.
   Delete the marker to have the record read again.
+- **ETH counter legs (#850 PR 10).** On a read of more than one endpoint: your refund verified at
+  the finalized block sends an INFO `RECONCILE` page naming `reconcile_counter_leg` (`mutual_refund`
+  from BOTH_LOCKED); a `Claimed` log that opens H beside it, or a claim on record, pages the covenant
+  claim instead (`p` is public). A contract settled at the finalized block that the reader cannot
+  explain pages CRITICAL "investigate". An empty token contract past its timeout pages
+  `close_push_nonce` (a push may still land) or `taker_refund_btc` (none can), the gated abandon from
+  BOTH_LOCKED, and from PARAMS_MISMATCH the covenant refund then the abandon. A claim after a params
+  mismatch (one the reader saw or answered CLAIMED, or one on record) pages the covenant refund then
+  `abandon_counter_leg`; a log only the scan counts is named on the refund page instead. A record still at BTC_LOCKED when the
+  maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`
+  (a maker's record: `reconcile_counter_leg` alone, which only records the claim, so the record stays
+  at BTC_LOCKED and the page repeats until ACKed). The claim scan
+  asks every endpoint; a log it counts as a claim that the reader does not count as one, or that no
+  endpoint agrees is our claim when the reader cannot read the contract (and that no claim on record
+  explains), pages CRITICAL "investigate" (a maker's record is told to refund its
+  covenant if no log opens H). Once ACKed, that page stays quiet while the log is served, so watch
+  the counter leg's timeout yourself. A claim kept on the record (`counter_claim_tx`) that no read
+  shows this turn pages the covenant claim, on every turn until your refund is final; its text also
+  says to refund the ETH leg once its timeout passes, but once ACKed the refund coming due does not
+  page again, so watch that timeout yourself. One endpoint can add a page (an "investigate" page, or a
+  fail-closed claim race when it withholds a claim's receipt or serves a log on a transaction no
+  endpoint holds), and it cannot mark a legacy record. It can delay one page: the finalized block is
+  the lowest any endpoint reports, so an endpoint that lags its head and finalized block together
+  holds a final claim at "not yet final" until the claim race squeezes. A claim's finality counts only
+  for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
+  contract's `Claimed` event that opens H.
+  Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
+  ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the
+  timeout; it pays the refundee) and is read again every turn; a claim, or one on record, pages the
+  covenant claim; a refund, or an empty contract no signed push can still fill, agrees and is marked.
+  An empty contract a push may still fill is read again every turn.
 - **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,
   whether or not the maker's covenant is on chain. A maker's record is paged to refund its covenant
   at t_rxd, never to run the taker's `taker_refund_btc` or `mutual_refund`.

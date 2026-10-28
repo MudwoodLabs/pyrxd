@@ -29,13 +29,19 @@ from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.disposition import BtcCounterDisposition, BtcDispositionKind
 from pyrxd.btc_wallet.taproot import BtcHtlcLocator
+from pyrxd.eth_wallet.disposition import CounterDisposition, DispositionKind
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState, FinalityStallTracker
 from pyrxd.gravity.swap_state import SwapRecord, SwapState
 from pyrxd.gravity.watch.decide import Observations
 from pyrxd.gravity.watch.reconciler import Observer
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight, Confirmations, Seconds
+
+#: At most this many unverified ETH claims are checked per tick, the most-nominated first. A liar that
+#: pushes the real claim past the cap (with two endpoints every nomination ties) gets a fail-closed
+#: page, not a silence: what it served in its place is either held by no endpoint or no claim.
+_MAX_ETH_VERDICT_READS = 8
 
 __all__ = [
     "BtcClaimSource",
@@ -281,18 +287,17 @@ class ChainObserver(Observer):
         low_corr = not self._rxd_corroborated
 
         if record.terms.counter_chain == "eth":
-            eth_detected, eth_finality = await self._observe_eth_claim(swap_id, record)
+            eth_fields = await self._observe_eth(swap_id, record)
             return Observations(
                 maker_has_claimed_btc=False,
                 now_rxd_height=tip,
                 asset_locked_at_height=asset_locked,
-                eth_claim_detected=eth_detected,
-                eth_claim_finality=eth_finality,
                 # The ETH analogue of btc_funding_confirmations: what lets decide()'s
                 # maker-never-locks branch prove the taker's counter-leg refund is due. Read only
                 # on the ETH path; the BTC arm's deadline is a depth and needs no clock.
                 now_unix_s=Seconds(int(self._clock())),
                 low_corroboration=low_corr,
+                **eth_fields,
             )
 
         # BTC counter-leg (default). record.btc_locator is None until the BTC leg is funded.
@@ -376,14 +381,27 @@ class ChainObserver(Observer):
         }
         return claimed, claim_txid, fields
 
-    async def _observe_eth_claim(self, swap_id: str, record: SwapRecord) -> tuple[bool, CounterClaimState | None]:
-        """Detect the maker's ETH claim + its finalized-checkpoint verdict STATE. Returns
-        ``(detected, finality_state)``. ``(False, None)`` when no ETH locator is present yet
-        (pre-fund) or the contract is unclaimed; fails closed (raises) if no ETH source was injected
-        — the reconciler turns that into a decision-required page rather than a silent all-clear.
+    async def _observe_eth(self, swap_id: str, record: SwapRecord) -> dict[str, Any]:
+        """The ETH ``Observations`` fields: the maker's claim and its finalized-checkpoint verdict STATE
+        (``eth_claim_detected``, ``eth_claim_finality``), and, when the source reads one, the contract's
+        disposition from the shared reader (#850 PR 10, design §5.1). Empty when no ETH locator is
+        present yet (pre-fund); fails closed (raises) if no ETH source was injected — the reconciler
+        turns that into a decision-required page rather than a silent all-clear.
 
-        A8 / RF-06 across-time stall: the point-in-time ``verdict`` is the fast path and unchanged;
-        when the source exposes the optional ``finality_checkpoint()`` capability, the per-``swap_id``
+        The detection scan (``claim_status``, selector-agnostic, over every endpoint) stays the claim
+        trigger. The disposition read adds to it, never takes from it: a ``Claimed`` log that opens H
+        that an endpoint served and the read collected, or a CLAIMED answer, is a claim even when the scan
+        missed it. A claim
+        the record kept (``counter_claim_tx``) is not observed here: ``decide()`` reads it off the
+        record on every tick, because the reader can return UNKNOWN before it collects any claim when
+        one endpoint disagrees on an identity read. The verdict is read for the claim the reader
+        verified first; with none verified, for every claim an endpoint served and the scan's (FINAL if
+        any reads FINAL, un-assessable if any read fails), so no one endpoint's log picks the claim
+        whose verdict decides (Mythos F1). A CLAIMED answer from
+        more than one endpoint is FINAL as it stands: it was verified at the agreed finalized block. Gap B (CLAIMED with no transaction) has no other verdict to read.
+
+        A8 / RF-06 across-time stall: the point-in-time verdict is the fast path and unchanged; when the
+        source exposes the optional ``finality_checkpoint()`` capability, the per-``swap_id``
         :class:`FinalityStallTracker` may UPGRADE a ``NOT_YET_FINAL_LIVE`` to
         ``COUNTER_CHAIN_NOT_FINALIZING`` once a sustained stall is judged across ticks (a ``FINAL``
         verdict is never touched; a single non-advance never trips). Alert-only — the only effect is
@@ -392,13 +410,107 @@ class ChainObserver(Observer):
             raise ValidationError("ChainObserver has no EthChainSource for an ETH swap")
         locator = record.counterchain_locator
         if not isinstance(locator, EthHtlcLocator):
-            return False, None  # ETH swap not yet funded → nothing claimed
+            return {}  # ETH swap not yet funded → nothing claimed
         status = await self._eth.claim_status(locator.contract_address, locator.deploy_tx_hash)
-        if not status.claimed or status.claim_tx_hash is None:
-            return False, None
-        verdict = await self._eth.claim_finality_verdict(status.claim_tx_hash)
+        scanned = status.claim_tx_hash if status.claimed else None
+        fields: dict[str, Any] = {}
+        claim_tx = scanned
+        read = getattr(self._eth, "counter_disposition", None)
+        if callable(read):
+            # The coordinator's own arguments for this record (one builder), so both read one thing.
+            from pyrxd.gravity.eth_counter_disposition import eth_counter_disposition_kwargs
+
+            disposition: CounterDisposition = await read(locator, **eth_counter_disposition_kwargs(record))
+            # A claim the record kept is nominated by the record itself and joins ``claims_seen``
+            # unverified; that is not a log any endpoint served, so it is no trigger here. decide()
+            # pages it off the record (D14) instead of a claim race whose WAIT on a claim that never
+            # mined would hold the refund page (re-review of the fix round, F-A).
+            claims = tuple(c for c in disposition.claims_seen if c.verified or c.nominated_by != ("record",))
+            evidence = disposition.evidence
+            fields = {
+                "eth_disposition": disposition.kind,
+                "eth_disposition_reason": disposition.reason,
+                "eth_disposition_tx": evidence.tx_hash if evidence is not None else None,
+                "eth_claim_seen": bool(claims),
+                "eth_single_source": disposition.single_source,
+                "eth_settled_at_finalized": disposition.kind is DispositionKind.UNKNOWN
+                and disposition.settled_at_finalized,
+                "eth_nonce_at_finalized": disposition.nonce_at_finalized,
+            }
+            claimed = disposition.kind is DispositionKind.CLAIMED
+            verified = [c.tx_hash for c in claims if c.verified]
+            if claimed and evidence is not None and evidence.tx_hash is not None:
+                verified.insert(0, evidence.tx_hash)
+            if verified:
+                claim_tx = verified[0]
+            elif not claimed:
+                # Nothing verified: no one endpoint's log may choose the claim whose verdict is read. A
+                # lying primary that serves a Claimed log of its own on a transaction no chain holds,
+                # first in the scan, used to hold a final claim at "not yet final" (Mythos F1, PR 10).
+                # Read every claim an endpoint served, the most-nominated first, then the scan's.
+                ranked = sorted(claims, key=lambda c: -len(c.nominated_by))
+                candidates = list(dict.fromkeys([c.tx_hash for c in ranked] + ([scanned] if scanned else [])))
+                if candidates:
+                    finality = await self._eth_best_verdict(locator, candidates[:_MAX_ETH_VERDICT_READS])
+                    if finality is None or finality.state is CounterClaimState.FINAL:
+                        state = None if finality is None else finality.state
+                        return {"eth_claim_detected": True, "eth_claim_finality": state, **fields}
+                    verdict = await self._upgrade_eth_stall(swap_id, finality)
+                    return {"eth_claim_detected": True, "eth_claim_finality": verdict.state, **fields}
+            elif scanned is None and claims:
+                claim_tx = claims[0].tx_hash
+            if claimed and not disposition.single_source:
+                return {"eth_claim_detected": True, "eth_claim_finality": CounterClaimState.FINAL, **fields}
+            if claimed and claim_tx is None:
+                # Gap B from one endpoint: no transaction to read a verdict for, and one endpoint's
+                # CLAIMED is not final on its own. The gate then fails closed (finality un-assessable).
+                return {"eth_claim_detected": True, "eth_claim_finality": None, **fields}
+        if claim_tx is None:
+            return {"eth_claim_detected": False, "eth_claim_finality": None, **fields}
+        try:
+            verdict = await self._eth.claim_finality_verdict(claim_tx)
+        except NetworkError:
+            # Endpoints that disagree on the claim's block (one forked or lying) leave its finality
+            # un-assessable. The claim is still detected, so decide() pages the claim race fail-closed
+            # rather than a generic reconcile error that names no claim (review F1).
+            return {"eth_claim_detected": True, "eth_claim_finality": None, **fields}
         verdict = await self._upgrade_eth_stall(swap_id, verdict)
-        return True, verdict.state
+        return {"eth_claim_detected": True, "eth_claim_finality": verdict.state, **fields}
+
+    async def _eth_best_verdict(self, locator: EthHtlcLocator, claim_txs: list[str]) -> CounterClaimFinality | None:
+        """The verdict over several candidate claims, none of them verified: FINAL if any one is a claim
+        of this contract (its receipt, logs included, agreed by every endpoint, carries our ``Claimed``
+        event that opens H) and reads FINAL; else ``None`` (finality un-assessable, which pages
+        fail-closed) if any read failed or any candidate is a log on a transaction no endpoint holds;
+        else NOT YET FINAL. A candidate whose agreed receipt is not such a claim counts for nothing.
+
+        One endpoint's log therefore neither picks the verdict nor makes one: a decoy on a transaction
+        nobody holds is a lie to page on, never "not yet final" (Mythos F1 and the re-review's N1), and
+        a log naming some other final transaction is no claim (N2). The order of ``claim_txs`` only
+        decides which reads run first."""
+        eth = self._eth
+        if eth is None:
+            raise ValidationError("ChainObserver has no EthChainSource for an ETH swap")
+        is_claim = getattr(eth, "claim_receipt_opens_h", None)
+        failed = False
+        best: CounterClaimFinality | None = None
+        for tx in claim_txs:
+            try:
+                if callable(is_claim):
+                    opens = await is_claim(locator, tx)
+                    if opens is None:
+                        failed = True  # served as a log, held by no endpoint
+                        continue
+                    if not opens:
+                        continue
+                verdict = await eth.claim_finality_verdict(tx)
+            except NetworkError:
+                failed = True
+                continue
+            if verdict.state is CounterClaimState.FINAL:
+                return verdict
+            best = best or verdict
+        return None if failed else best
 
     async def _upgrade_eth_stall(self, swap_id: str, verdict: CounterClaimFinality) -> CounterClaimFinality:
         """Feed the per-``swap_id`` :class:`FinalityStallTracker` this tick's ``(head, finalized)`` and

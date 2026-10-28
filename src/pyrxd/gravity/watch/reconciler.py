@@ -24,7 +24,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import SwapRecord
@@ -107,6 +107,23 @@ class ReconcileResult:
 SITUATION_STORE_UNREADABLE = "store_unreadable"
 SITUATION_RECORD_UNREADABLE = "record_unreadable"
 SITUATION_RECONCILE_ERROR = "reconcile_error"
+
+
+def _legacy_evidence(record: SwapRecord, obs: Observations) -> dict[str, Any]:
+    """What a D9 marker records its verdict rests on: the counter leg's disposition read (#850 PR 9b
+    for BTC, PR 10 for ETH)."""
+    if record.terms.counter_chain == "eth":
+        return {
+            "eth_disposition": obs.eth_disposition.value if obs.eth_disposition else None,
+            "eth_disposition_tx": obs.eth_disposition_tx,
+            "eth_single_source": obs.eth_single_source,
+            "reason": obs.eth_disposition_reason,
+        }
+    return {
+        "btc_disposition": obs.btc_disposition.value if obs.btc_disposition else None,
+        "btc_refund_txid": obs.btc_refund_txid,
+        "reason": obs.btc_disposition_reason,
+    }
 
 
 def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
@@ -226,11 +243,7 @@ class Reconciler:
                         swap_id,
                         check.verdict,
                         rxd_height=int(obs.now_rxd_height),
-                        evidence={
-                            "btc_disposition": obs.btc_disposition.value if obs.btc_disposition else None,
-                            "btc_refund_txid": obs.btc_refund_txid,
-                            "reason": obs.btc_disposition_reason,
-                        },
+                        evidence=_legacy_evidence(record, obs),
                     )
                 except Exception:
                     logger.exception("could not write the legacy-checked marker for %s; read again later", swap_id)

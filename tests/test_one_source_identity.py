@@ -639,6 +639,38 @@ def _plant_btc_disposition(a: str, b: str, _mp) -> int:
     return _refused_as_one_host(build)
 
 
+async def _plant_build_eth_source(a: str, b: str, mp) -> int:
+    """The tower's ETH source (#850 PR 10): two ``--eth-rpc-url`` values build a ``MultiSourceEthRpc``.
+    ``assert_chain`` and ``close`` are stubbed, so no socket is opened."""
+    pytest.importorskip("web3")
+    from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
+    from pyrxd.eth_wallet.rpc import EthRpc
+    from pyrxd.gravity.watch import run
+
+    async def _noop(self) -> None:
+        return None
+
+    mp.setattr(EthRpc, "assert_chain", _noop)
+    mp.setattr(MultiSourceEthRpc, "assert_chain", _noop)
+    mp.setattr(EthRpc, "close", _noop)
+    args = run._parse_args(
+        ["--records-dir", "/nonexistent", "--eth-rpc-url", _https(a), "--eth-rpc-url", _https(b), "--eth-chain-id", "1"]
+    )
+
+    async def build() -> int:
+        async with contextlib.AsyncExitStack() as stack:
+            src = await run._build_eth_source(args, stack)
+        assert src is not None
+        return len(src._rpc.sources) if isinstance(src._rpc, MultiSourceEthRpc) else 1
+
+    try:
+        return await build()
+    except ValidationError as exc:
+        if "same source" not in str(exc):
+            raise
+        return 1
+
+
 def _plant_build_funding_reader(a: str, b: str, _mp) -> int:
     from pyrxd.gravity.watch import run
 
@@ -832,6 +864,7 @@ PLANTERS: dict[str, Callable] = {
     "pyrxd.gravity.watch.adapters:MultiSourceRxdChainSource.__init__": _plant_rxd_quorum,
     "pyrxd.eth_wallet.multi_rpc:MultiSourceEthRpc.__init__": _plant_eth_quorum,
     "pyrxd.gravity.watch.run:_build_funding_reader": _plant_build_funding_reader,
+    "pyrxd.gravity.watch.run:_build_eth_source": _plant_build_eth_source,
     "pyrxd.gravity.watch.run:_build_rxd_source": _plant_build_rxd_source,
     "pyrxd.gravity.watch.run:build_reconciler": _plant_build_reconciler,
     "pyrxd.gravity.watch.quorum:ChainObserver.__init__": _plant_chain_observer,

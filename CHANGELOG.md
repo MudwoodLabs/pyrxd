@@ -126,6 +126,75 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The watchtower reads an ETH counter leg's disposition with the coordinator's reader, pages the
+  rest of the design §5.1 table, and checks legacy ETH records once (#850 PR 10) [Changed (breaking)].**
+  - `RpcEthChainSource.counter_disposition` runs `read_counter_disposition` over the source's RPC,
+    with the arguments the coordinator builds for the same record (new
+    `pyrxd.gravity.eth_counter_disposition.eth_counter_disposition_kwargs`, now also used by
+    `SwapCoordinator`). The source holds no key, so a token record that does not name its push key
+    can read `EXPIRED_EMPTY_OPEN` but not `EXPIRED_EMPTY_CLOSED`. `ChainObserver` reads it for every
+    funded ETH swap when the source has it. `Observations` gains `eth_disposition`,
+    `eth_disposition_reason`, `eth_disposition_tx`, `eth_claim_seen`, `eth_single_source`,
+    `eth_settled_at_finalized` and `eth_nonce_at_finalized`.
+  - `RpcEthChainSource.claim_status`, the detection scan, now scans every endpoint of a
+    `MultiSourceEthRpc` (before, the primary alone, through `get_logs`), and a claim any endpoint
+    serves is the answer; the primary's failure still raises, another endpoint's drops it from the
+    scan. The scan stays the claim trigger, and the read only adds to it: a `Claimed` log that opens
+    H the read collected, or a `CLAIMED` answer, is a claim even when the scan missed it. On a taker's or
+    no-role record at `BTC_LOCKED` or `BOTH_LOCKED`, a claim the record kept (`counter_claim_tx`) that
+    this tick's reads do not show pages the covenant claim, its text also naming the refund (D14, as
+    on the BTC branch), even when one endpoint makes the read return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
+    taken as `FINAL`. With no claim verified, every claim an endpoint served (the most-nominated
+    first, at most 8) and the scan's are checked, not the first log the scan met: a candidate counts
+    only when every endpoint returns the same receipt, logs included, carrying this contract's
+    `Claimed` event that opens H; then `FINAL` if any reads final. A log on a transaction no endpoint
+    holds, or a failed read, makes finality un-assessable (a fail-closed page). Before, a primary
+    serving a fake `Claimed` log held a final claim at "not yet final" and the tower watched until
+    the window squeezed (Mythos F1; on `main` the scan read the primary alone). A claim race whose gate waits,
+    beside a contract the reader finds settled at the finalized block, pages the reader's
+    contradiction instead of watching (on a taker's or no-role record; a maker's still watches). A claim whose finality read fails because the endpoints
+    disagree is paged as a claim race with finality un-assessable, where it raised a reconcile error
+    before. A log the scan
+    counts as a claim beside a reader answer that found no claim opening H (`OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `EXPIRED_EMPTY_*`),
+    or beside an `UNKNOWN` read where no candidate is a claim the endpoints agree on, pages
+    `PAGE_SQUEEZED` "investigate" at `BTC_LOCKED` or `BOTH_LOCKED` (on a taker's or no-role record
+    that holds a claim, the D14 page), not a claim race whose steps the coordinator refuses on an
+    `UNKNOWN` read (Mythos pass 2, N-A); at `PARAMS_MISMATCH` the same hit gives the refund page,
+    whose text says p may be public when the read failed. An un-assessable claim race (BTC or ETH) now carries its
+    own `situation`, `claim_race_unassessable`, so its ACK no longer silences the winner-take-all
+    page the race later squeezes into (N-B; an existing ACK of the shared key pages once more).
+  - `--eth-rpc-url` on `pyrxd-watchtower` may be repeated: two or more endpoints (distinct operators)
+    build a `MultiSourceEthRpc`. With one endpoint every read is single-source: it may page, never
+    stops a page, never marks a legacy record, and every ETH page is now marked `low_corroboration`
+    (before, only a single-source RXD read set it, although the flag's help said ETH pages were).
+  - New ETH pages, each with its own `situation`: our refund verified at the finalized block →
+    `Intent.RECONCILE` naming `reconcile_counter_leg` (`mutual_refund` from `BOTH_LOCKED`); beside it,
+    a claim that opens H or one on record → the covenant claim (D14), a log the scan counts as a claim
+    and the reader does not → `PAGE_SQUEEZED` "investigate", a maker's record → refund its covenant.
+    Settled at the finalized block with nothing that explains it → `PAGE_SQUEEZED` "investigate". An
+    empty token contract → `close_push_nonce` (`EXPIRED_EMPTY_OPEN`) or `taker_refund_btc`
+    (`EXPIRED_EMPTY_CLOSED`) from `BTC_LOCKED`, the gated abandon from `BOTH_LOCKED`, and the covenant
+    refund then the gated abandon from `PARAMS_MISMATCH`, only on a read of more than one endpoint. A
+    claim after a params mismatch → `PAGE_SQUEEZED` naming the covenant refund and
+    `abandon_counter_leg` (design §3.2), where it named "investigate" before; a log only the scan
+    counts, beside a clean reader answer, is named on the refund page instead (Mythos F2: the abandon
+    needs a `CLAIMED` answer, so one endpoint's odd log replaced the due refund with a step the
+    coordinator refuses). `SETTLED_UNFINAL` and an
+    `UNKNOWN` from a failed read change no page.
+  - `_CLAIM_PATH[BTC_LOCKED]`: a claim race on a record still at `BTC_LOCKED` (BTC or ETH) names
+    `reconcile_counter_leg, then taker_scrape_and_claim_asset` instead of "investigate". On a maker's
+    record it names `reconcile_counter_leg` alone, which only records the claim there.
+  - The D9 net for ETH (design §5.2 item 3): `is_legacy_candidate` also lists a terminal ETH record
+    with an ETH locator and no `counter_disposition`, and no longer lists a record ended by
+    `abandon_unfunded`. An unsettled contract pages "call `refund()` on the contract" and is never
+    marked; a claim, or a claim on record, pages the covenant claim (marked once delivered after
+    t_rxd); a refund, or an empty contract no signed push can still fill (`EXPIRED_EMPTY_CLOSED`), on
+    a read of more than one endpoint agrees and is marked. An empty contract a push may still fill
+    (`EXPIRED_EMPTY_OPEN`) is read again, so a push that lands pages the refund.
+  - Not built from the §5.1 table: the page for a pending refund older than a threshold (the record
+    keeps no send time) and `PAYOUT_REVERTS` (the coordinator's reading of its own refund, not of the
+    contract).
+
 - **The watchtower tells a taker's BTC refund from the maker's claim, re-arms the pre-signed refund
   on that read, and checks legacy BTC records once (#850 PR 9b) [Changed (breaking)].**
   - `OutspendBtcClaimSource.spend_disposition` runs the shared BTC disposition reader (PR 9a) over

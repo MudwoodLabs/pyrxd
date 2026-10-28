@@ -203,6 +203,7 @@ class FakeEvmEndpoint:
         nonce_reads_fail: bool = False,
         lie_nonce: int | None = None,
         pending_extra: int = 0,
+        hide_receipts: tuple[str, ...] = (),
     ) -> None:
         self.chain = chain
         self.lag = lag
@@ -225,6 +226,8 @@ class FakeEvmEndpoint:
         self.lie_nonce = lie_nonce
         #: Transactions of the funding key in THIS endpoint's pool only, on top of the chain's.
         self.pending_extra = pending_extra
+        #: Transactions this endpoint answers "no receipt" for, whatever the chain holds.
+        self.hide_receipts = hide_receipts
         self.source_key = distinct_host()
         self.expected_chain_id = CHAIN_ID
         self.log_requests: list[tuple[int, int | str]] = []
@@ -318,7 +321,7 @@ class FakeEvmEndpoint:
                 "logs": [{"address": CONTRACT, "topics": [REFUNDED_TOPIC0], "data": "0x"}],
             }
         r = self.chain.receipts.get(tx_hash)
-        if r is None or r["blockNumber"] > self.head:
+        if r is None or r["blockNumber"] > self.head or tx_hash in self.hide_receipts:
             return None
         return dict(r)
 

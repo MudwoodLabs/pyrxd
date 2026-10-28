@@ -13,8 +13,9 @@ Backends:
               ``get_transaction_verbose(txid)`` via :func:`build_reconciler`.
 * BTC depth — ``MultiSourceBtcFundingReader`` (2-of-3 Esplora, the depth a quorum vouches for).
 * BTC claim — mempool.space ``/outspend`` (detect the maker's claim of the HTLC outpoint).
-* ETH       — optional ``--eth-rpc-url`` (+ ``--eth-chain-id``): a keyless, read-only RPC to watch
-              RXD<->ETH swaps (detect the maker's ``Claimed`` event, finalized-checkpoint verdict).
+* ETH       — optional ``--eth-rpc-url`` (+ ``--eth-chain-id``), repeatable: keyless, read-only RPCs to
+              watch RXD<->ETH swaps (detect the maker's ``Claimed`` event, finalized-checkpoint verdict,
+              and the contract's disposition from the coordinator's shared reader, #850 PR 10).
 
 Example (console script, installed with the package):
     pyrxd-watchtower \
@@ -128,7 +129,8 @@ def build_reconciler(
     outspend_fns = [_make_outspend(u) for u in mempool_base_urls]
     btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
     # RXD corroboration is ``rxd_corroborated`` (True only behind a real >= quorum MultiSourceRxdChainSource).
-    # The single ETH RPC, if any, is still single-source → its pages stay low-corroboration.
+    # A single ETH RPC, if any, is single-source → its pages stay low-corroboration (#850 PR 10: the
+    # disposition read marks them, and a repeated --eth-rpc-url builds a MultiSourceEthRpc).
     observer = ChainObserver(
         btc=btc_source,
         eth=eth_source,
@@ -363,24 +365,43 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
 
 async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> RpcEthChainSource | None:
     """Optional ETH counter-leg source (alert-only v3): a keyless, read-only ``RpcEthChainSource``
-    over ``EthRpc``. Returns ``None`` when ``--eth-rpc-url`` is unset (a BTC-only tower). Fails closed
-    on a wrong network (``assert_chain``) so the tower never watches the wrong chain, and registers
-    the RPC's ``close()`` on the exit stack. No key, no broadcast — read-only observation only."""
-    if not args.eth_rpc_url:
+    over ``EthRpc``, or over a ``MultiSourceEthRpc`` when ``--eth-rpc-url`` is given more than once
+    (distinct operators, refused otherwise; #850 PR 10). Returns ``None`` when ``--eth-rpc-url`` is
+    unset (a BTC-only tower). Fails closed on a wrong network (``assert_chain``) so the tower never
+    watches the wrong chain, and registers the RPC's ``close()`` on the exit stack. No key, no
+    broadcast — read-only observation only.
+
+    With one endpoint every disposition read is single-source: it can page, but it never stops a
+    page, never marks a legacy record checked, and every ETH page is low-corroboration."""
+    urls = _eth_rpc_urls(args)
+    if not urls:
         return None
     if not args.eth_chain_id:
         raise ValidationError("--eth-chain-id is required with --eth-rpc-url")
+    from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
     from pyrxd.eth_wallet.rpc import EthRpc
 
-    rpc = EthRpc(args.eth_rpc_url, expected_chain_id=args.eth_chain_id)
-    stack.push_async_callback(rpc.close)
-    await rpc.assert_chain()  # fail closed if the endpoint is not the negotiated chain
+    endpoints = [EthRpc(url, expected_chain_id=args.eth_chain_id) for url in urls]
+    for endpoint in endpoints:
+        stack.push_async_callback(endpoint.close)
+    rpc: EthRpc | MultiSourceEthRpc = endpoints[0] if len(endpoints) == 1 else MultiSourceEthRpc(endpoints)
+    await rpc.assert_chain()  # fail closed if an endpoint is not the negotiated chain
     logger.info(
-        "ETH counter-leg watch ENABLED: rpc=%s chain_id=%d (read-only, no key, single-source → low-corroboration)",
-        redacted_url(args.eth_rpc_url),
+        "ETH counter-leg watch ENABLED: rpc=%s chain_id=%d (read-only, no key, %s)",
+        ", ".join(redacted_url(u) for u in urls),
         args.eth_chain_id,
+        "single-source → low-corroboration" if len(endpoints) == 1 else f"{len(endpoints)} endpoints",
     )
     return RpcEthChainSource(rpc)
+
+
+def _eth_rpc_urls(args: argparse.Namespace) -> list[str]:
+    """The ``--eth-rpc-url`` values, in order, blanks dropped (the flag repeats)."""
+    raw = args.eth_rpc_url
+    if raw is None:
+        return []
+    values = [raw] if isinstance(raw, str) else list(raw)
+    return [u for u in values if u]
 
 
 def _reorg_cost_from_args(args: argparse.Namespace) -> ReorgCostMeasurement | None:
@@ -499,7 +520,7 @@ def _eth_finalization_window_s_from_args(args: argparse.Namespace) -> int | None
     """
     if args.eth_finalization_window_s is not None:
         return int(args.eth_finalization_window_s)
-    if not args.eth_rpc_url or args.eth_chain_id is None:
+    if not _eth_rpc_urls(args) or args.eth_chain_id is None:
         # No ETH leg, or no chain id yet — `_build_eth_source` is the one that refuses the
         # second case, with the message that names --eth-chain-id.
         return None
@@ -902,8 +923,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # ETH counter-leg (alert-only v3): watch RXD↔ETH swaps too. Read-only, no key, never touches p.
     p.add_argument(
         "--eth-rpc-url",
+        action="append",
         help="Ethereum RPC URL to watch RXD<->ETH swaps (read-only; enables the ETH counter-leg source). "
-        "Single-source in v1 → ETH pages are low-corroboration. Requires --eth-chain-id.",
+        "Repeat it for endpoints of distinct operators: the counter-leg disposition is then read from all of "
+        "them, and only an answer they agree on stops a page or marks a legacy record checked. With one, ETH "
+        "pages are low-corroboration. Requires --eth-chain-id.",
     )
     p.add_argument(
         "--eth-chain-id",

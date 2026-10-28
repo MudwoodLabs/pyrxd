@@ -21,9 +21,9 @@ Two reads back the port:
   so a just-mined claim is not missed; reorg-safety lives in the finality verdict, not detection.
   KNOWN LIMITATION: a non-canonical contract that emits NO event at all on ``claim()`` cannot be
   detected from logs (the canonical ``EthHtlc.sol`` DOES emit ``Claimed(bytes32)`` — deploy a
-  Claimed-emitting model). DETECTION is also single-source in v1, exactly like the verdict below —
-  a lagging/withholding sole RPC can DELAY a page (the per-tick re-scan recovers it); a multi-source
-  ETH detection+finality quorum is an audit-gated v2 requirement.
+  Claimed-emitting model). With one ``--eth-rpc-url`` DETECTION is single-source, like the verdict
+  below: a lagging/withholding sole RPC can DELAY a page (the per-tick re-scan recovers it). With
+  several, every endpoint is scanned and a claim any one serves is a claim (#850 PR 10).
 
 * ``claim_finality_verdict`` — the post-Merge ``finalized``-checkpoint verdict. Its VERDICT LOGIC
   (status → canonical-chain binding (fail-closed) → ``finalized`` checkpoint) is **identical** to the
@@ -42,15 +42,22 @@ Two reads back the port:
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from typing import Any
 
+from pyrxd.eth_wallet.disposition import CounterDisposition, read_counter_disposition
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
+from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.watch.quorum import EthClaimStatus
 from pyrxd.security.errors import NetworkError
 
 __all__ = ["CLAIMED_TOPIC0", "REFUNDED_TOPIC0", "RpcEthChainSource"]
+
+logger = logging.getLogger(__name__)
 
 # EthHtlc.sol / Erc20Htlc.sol event topic0s, DERIVED in pyrxd.eth_wallet.events as keccak256 of the
 # signature (one source, shared with scripts/swap_run_verify.py) and re-exported here:
@@ -80,39 +87,135 @@ def _topic0(log: dict[str, Any]) -> str | None:
     return _to_0x_hash(topics[0]).lower()
 
 
-class RpcEthChainSource:
-    """``EthChainSource`` over a keyless :class:`EthRpc` (read-only, no key, never touches ``p``)."""
+async def _scan_for_claim(rpc: EthRpc, contract_address: str, deploy_tx_hash: str) -> tuple[EthClaimStatus, bool]:
+    """One endpoint's selector-agnostic scan: ``(status, canonical)``, ``canonical`` True when the claim
+    is a ``Claimed(bytes32)`` log rather than an unrecognised one."""
+    # Bound the log scan to the contract's lifetime. A pending/unmined deploy (no blockNumber)
+    # means the HTLC contract is not on-chain yet, so nothing can have claimed it → unclaimed.
+    # On the WRONG chain the deploy tx is not found → get_transaction raises → fail-closed page.
+    deploy = await rpc.get_transaction(deploy_tx_hash)
+    deploy_block = deploy.get("blockNumber")
+    if deploy_block is None:
+        return EthClaimStatus(claimed=False), False
+    # Selector-AGNOSTIC scan of every log from this per-swap-unique contract (NO topic filter),
+    # bounded [deploy_block, latest]. A claim can only occur at/after the contract exists, so
+    # from_block can never exclude the claim; reading to latest catches a just-mined claim.
+    logs = await rpc.get_logs(address=contract_address, from_block=int(deploy_block), to_block="latest")
+    if not logs:
+        return EthClaimStatus(claimed=False), False
+    claimed_logs = [lg for lg in logs if _topic0(lg) == CLAIMED_TOPIC0]
+    if claimed_logs:
+        chosen = claimed_logs[-1]  # canonical Claimed(bytes32) — the precise claim tx
+    elif all(_topic0(lg) == REFUNDED_TOPIC0 for lg in logs):
+        return EthClaimStatus(claimed=False), False  # only Refunded() — the maker did NOT reveal p
+    else:
+        # An unrecognised event from OUR per-swap contract. Fail TOWARD paging: a differently
+        # shaped claim event must never be silently missed (over-paging is a false alarm only).
+        chosen = logs[-1]
+    tx_hash = chosen.get("transactionHash")
+    if tx_hash is None:
+        raise NetworkError("a log from the HTLC contract is missing transactionHash; cannot identify the claim")
+    return EthClaimStatus(claimed=True, claim_tx_hash=_to_0x_hash(tx_hash)), bool(claimed_logs)
 
-    def __init__(self, rpc: EthRpc) -> None:
+
+class RpcEthChainSource:
+    """``EthChainSource`` over a keyless :class:`EthRpc`, or a :class:`MultiSourceEthRpc` of several
+    (read-only, no key, never touches ``p``)."""
+
+    def __init__(self, rpc: EthRpc | MultiSourceEthRpc) -> None:
         self._rpc = rpc
 
+    async def counter_disposition(
+        self,
+        locator: EthHtlcLocator,
+        *,
+        recorded_refund_hashes: tuple[str, ...] = (),
+        expiry_anchor: tuple[int, str] | None = None,
+        recorded_claim_hashes: tuple[str, ...] = (),
+        push_nonce_bound: int | None = None,
+        push_signer: str | None = None,
+        nonce_less: bool = False,
+    ) -> CounterDisposition:
+        """What the chain says about this swap's HTLC: the coordinator's reader and arguments
+        (``EthCounterLeg.counter_disposition``, built by
+        :func:`pyrxd.gravity.eth_counter_disposition.eth_counter_disposition_kwargs`), read-only. Never raises
+        for a chain read (an unreadable chain is ``UNKNOWN``).
+
+        One deliberate difference: this source holds no key, so a token record that does not name its
+        push key (``push_signer``, written before 0.27) is read without a nonce, and its empty contract
+        can read ``EXPIRED_EMPTY_OPEN`` but never ``EXPIRED_EMPTY_CLOSED``. The coordinator would read
+        its own key's nonce when that key deployed the contract."""
+        token = locator.token_address if isinstance(locator, Erc20HtlcLocator) else None
+        return await read_counter_disposition(
+            self._rpc,
+            locator,
+            recorded_refund_hashes=recorded_refund_hashes,
+            expiry_anchor=expiry_anchor,
+            recorded_claim_hashes=recorded_claim_hashes,
+            token_address=token,
+            funding_account=push_signer if token is not None else None,
+            push_nonce_bound=push_nonce_bound if token is not None else None,
+            nonce_less=nonce_less if token is not None else False,
+        )
+
     async def claim_status(self, contract_address: str, deploy_tx_hash: str) -> EthClaimStatus:
-        # Bound the log scan to the contract's lifetime. A pending/unmined deploy (no blockNumber)
-        # means the HTLC contract is not on-chain yet, so nothing can have claimed it → unclaimed.
-        # On the WRONG chain the deploy tx is not found → get_transaction raises → fail-closed page.
-        deploy = await self._rpc.get_transaction(deploy_tx_hash)
-        deploy_block = deploy.get("blockNumber")
-        if deploy_block is None:
-            return EthClaimStatus(claimed=False)
-        # Selector-AGNOSTIC scan of every log from this per-swap-unique contract (NO topic filter),
-        # bounded [deploy_block, latest]. A claim can only occur at/after the contract exists, so
-        # from_block can never exclude the claim; reading to latest catches a just-mined claim.
-        logs = await self._rpc.get_logs(address=contract_address, from_block=int(deploy_block), to_block="latest")
-        if not logs:
-            return EthClaimStatus(claimed=False)
-        claimed_logs = [lg for lg in logs if _topic0(lg) == CLAIMED_TOPIC0]
-        if claimed_logs:
-            chosen = claimed_logs[-1]  # canonical Claimed(bytes32) — the precise claim tx
-        elif all(_topic0(lg) == REFUNDED_TOPIC0 for lg in logs):
-            return EthClaimStatus(claimed=False)  # only Refunded() — the maker did NOT reveal p
-        else:
-            # An unrecognised event from OUR per-swap contract. Fail TOWARD paging: a differently
-            # shaped claim event must never be silently missed (over-paging is a false alarm only).
-            chosen = logs[-1]
-        tx_hash = chosen.get("transactionHash")
-        if tx_hash is None:
-            raise NetworkError("a log from the HTLC contract is missing transactionHash; cannot identify the claim")
-        return EthClaimStatus(claimed=True, claim_tx_hash=_to_0x_hash(tx_hash))
+        """The detection scan, over EVERY endpoint when the source holds several (#850 PR 10, review F1).
+
+        ``MultiSourceEthRpc.get_logs`` reads the primary alone, so a primary that hides the claim's log
+        would hide it from the tower however many endpoints were configured. Each endpoint is scanned
+        on its own instead, and a claim any one of them serves is the answer: a ``Claimed`` log first,
+        else an unrecognised log (fail toward paging). The primary's failure still raises, as before;
+        another endpoint's failure only drops that endpoint from the union."""
+        endpoints = self._rpc.sources if isinstance(self._rpc, MultiSourceEthRpc) else [self._rpc]
+        results: list[tuple[EthClaimStatus, bool]] = []
+        for index, endpoint in enumerate(endpoints):
+            try:
+                results.append(await _scan_for_claim(endpoint, contract_address, deploy_tx_hash))
+            except Exception:
+                if index == 0:
+                    raise  # the primary was required before the union and still is
+                logger.warning(
+                    "ETH claim scan: endpoint %d of %d failed; scanned without it", index + 1, len(endpoints)
+                )
+        for wanted_canonical in (True, False):
+            for status, canonical in results:
+                if status.claimed and canonical is wanted_canonical:
+                    return status
+        return EthClaimStatus(claimed=False)
+
+    async def claim_receipt_opens_h(self, locator: EthHtlcLocator, claim_tx_hash: str) -> bool | None:
+        """Whether *claim_tx_hash* is a claim of this contract, read on EVERY endpoint (#850 PR 10, the
+        re-review of Mythos F1): ``True`` when every endpoint returns the same receipt (status, block
+        and logs, normalised) and it is a success carrying OUR contract's ``Claimed`` event whose data
+        opens H; ``False`` when they agree on a receipt that does not; ``None`` when every endpoint
+        agrees there is no receipt. Raises :class:`NetworkError` when one fails or they disagree.
+
+        A finality verdict says only where a transaction is, not what it did, and
+        ``MultiSourceEthRpc.get_transaction_receipt`` leaves the logs out of its agreement, so the
+        claim itself is checked here before a candidate's verdict may count."""
+        from pyrxd.eth_wallet.htlc_leg import _addr, _b, _receipt_facts
+
+        endpoints = self._rpc.sources if isinstance(self._rpc, MultiSourceEthRpc) else [self._rpc]
+        facts = []
+        for endpoint in endpoints:
+            facts.append(_receipt_facts(await endpoint.get_transaction_receipt(claim_tx_hash)))
+        if any(f != facts[0] for f in facts[1:]):
+            raise NetworkError(f"receipt({claim_tx_hash}): endpoints disagree")
+        agreed = facts[0]
+        if agreed is None:
+            return None
+        status, _block_hash, _block_number, logs = agreed
+        if status != 1:
+            return False
+        contract, topic0, hashlock = _addr(locator.contract_address), _b(CLAIMED_TOPIC0), locator.hashlock_bytes
+        return any(
+            address == contract
+            and topics
+            and topics[0] == topic0
+            and len(data) == 32
+            and hashlib.sha256(data).digest() == hashlock
+            for address, topics, data in logs
+        )
 
     async def finality_checkpoint(self) -> tuple[int, int]:
         """The current ``(head_block, finalized_block)`` checkpoint — the across-time stall input.
