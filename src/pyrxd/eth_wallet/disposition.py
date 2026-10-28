@@ -70,6 +70,7 @@ from .locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator
 
 __all__ = [
     "LOG_CHUNK_BLOCKS",
+    "MAX_NOMINATIONS_PER_ENDPOINT",
     "ClaimSeen",
     "CounterDisposition",
     "DispositionEvidence",
@@ -99,6 +100,17 @@ _RANGE_LIMIT_MARKERS = ("range", "query returned more than", "too large", "too w
 #: sends a rate-limited endpoint a dozen more requests before it is recorded as failed.
 #: A regex, not substrings: a bare "429" matched inside block numbers such as 0x1429ab.
 _RATE_LIMIT = re.compile(r"\b429\b|too many requests|rate[ -]?limit")
+
+#: The most distinct transactions one endpoint's log scan may nominate for verification (sandbox
+#: review N-C). CHOSEN, not measured. An honest ``EthHtlc``/``Erc20Htlc`` emits at most ONE ``Claimed``
+#: or ``Refunded`` log in its life (``claim()`` and ``refund()`` both revert once ``settled`` is set), so
+#: an honest endpoint nominates at most one; the margin is for an endpoint serving a log a reorg has
+#: since replaced. Each nomination costs a receipt read and a canonical-hash read on EVERY endpoint,
+#: so without this one endpoint serving N ghost logs forced about 3N reads per endpoint per tick.
+#: An endpoint over it is recorded as a failed scan and NONE of its nominations are used: verifying
+#: "the first" few would let that endpoint choose which are verified (its ghost hashes are its own to
+#: pick). Its silence is then unknown, never "no logs", exactly as for any other failed scan.
+MAX_NOMINATIONS_PER_ENDPOINT = 8
 
 
 class DispositionKind(Enum):
@@ -358,6 +370,45 @@ async def union_logs(rpc: Any, *, address: str, topics: list[Any], from_block: i
     return LogUnion(logs=logs, answered=frozenset(answered), failed=failed, from_block=from_block, to_block=to_block)
 
 
+def _nominates(log: dict[str, Any], contract: str, hashlock: bytes) -> bool:
+    """Whether a union log names a transaction the reader verifies: a ``Refunded`` log from our
+    contract, or a ``Claimed`` log from it whose data opens ``H``. The one predicate behind both the
+    per-endpoint cap and the nominations, so the cap counts exactly what would be verified."""
+    if log["address"] != contract or not log["topics"]:
+        return False
+    if log["topics"][0] == _b(REFUNDED_TOPIC0):
+        return True
+    return bool(log["topics"][0] == _b(CLAIMED_TOPIC0) and _opens(log["data"], hashlock))
+
+
+def _drop_overflowing(union: LogUnion, contract: str, hashlock: bytes) -> LogUnion:
+    """*union* without the endpoints that nominated more than :data:`MAX_NOMINATIONS_PER_ENDPOINT`
+    distinct transactions (sandbox review N-C). Such an endpoint moves from ``answered`` to
+    ``failed`` and is taken off every log's ``nominated_by``; a log no other endpoint served goes.
+    Every endpoint at or under the cap keeps every nomination, so no endpoint chooses which of
+    another's are verified, and the reads one endpoint can cause stay bounded."""
+    per_endpoint: dict[str, set[str]] = {}
+    for log in union.logs:
+        if _nominates(log, contract, hashlock):
+            for who in log["nominated_by"]:
+                per_endpoint.setdefault(who, set()).add(log["transactionHash"])
+    over = {who: len(txs) for who, txs in per_endpoint.items() if len(txs) > MAX_NOMINATIONS_PER_ENDPOINT}
+    if not over:
+        return union
+    logs = []
+    for log in union.logs:
+        kept = tuple(who for who in log["nominated_by"] if who not in over)
+        if kept:
+            logs.append({**log, "nominated_by": kept})
+    failed = dict(union.failed)
+    for who, count in over.items():
+        failed[who] = (
+            f"its log scan nominated {count} transactions, more than {MAX_NOMINATIONS_PER_ENDPOINT}; an honest "
+            "contract emits at most one Claimed or Refunded log, so none of them were used"
+        )
+    return dataclasses.replace(union, logs=tuple(logs), answered=union.answered - set(over), failed=failed)
+
+
 # --------------------------------------------------------------------------- verify
 
 
@@ -457,6 +508,12 @@ async def read_counter_disposition(
     transaction-history limit, say) beside one that has not. UNKNOWN pages and moves nothing, so this costs time, never funds; the
     alternative, letting a majority overrule a disagreeing endpoint, is a majority read the design
     forbids for identity facts (§2.2).
+
+    BOUNDED READS. An endpoint whose log scan nominates more than
+    :data:`MAX_NOMINATIONS_PER_ENDPOINT` distinct transactions is recorded in ``logs_failed`` and
+    none of its nominations are verified (sandbox review N-C); the other endpoints' are all verified,
+    so it can neither hide what they serve nor pick what is read. Like any failed scan, its silence
+    clears ``settled_unexplained``, and with no other endpoint answering the result is UNKNOWN.
     """
     if not isinstance(locator, EthHtlcLocator):
         raise ValidationError("read_counter_disposition requires an EthHtlcLocator")
@@ -538,6 +595,7 @@ async def read_counter_disposition(
         # silence would read as "no claim" (re-review of #850 PR 7b). Such an endpoint fails its scan.
         to_block=max(int(from_block), int(head), int(finalized)),
     )
+    union = _drop_overflowing(union, contract, hashlock)
     common: dict[str, Any] = {
         "logs_answered": union.answered,
         "logs_failed": union.failed,
@@ -557,11 +615,11 @@ async def read_counter_disposition(
     refunds = {h.lower() for h in recorded_refund_hashes}
     claims: dict[str, dict[str, Any]] = {}
     for log in union.logs:
-        if log["address"] != contract or not log["topics"]:
+        if not _nominates(log, contract, hashlock):
             continue
         if log["topics"][0] == refunded_topic:
             refunds.add(log["transactionHash"])
-        elif log["topics"][0] == claimed_topic and _opens(log["data"], hashlock):
+        else:
             claims.setdefault(log["transactionHash"], log)
     for h in recorded_claim_hashes:
         # A claim the record kept, nominated by the record itself: verified by its receipt like any other
