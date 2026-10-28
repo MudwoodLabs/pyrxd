@@ -144,12 +144,19 @@ def create_address(sender: str, nonce: int) -> str:
 
 
 def _int_or_none(v: Any) -> int | None:
-    """Normalise a receipt integer that may arrive as an int or as a '0x'-prefixed string."""
+    """Normalise a receipt integer that may arrive as an int or as a '0x'-prefixed string.
+
+    A value that is not an integer raises a TYPED NetworkError, as :func:`_b` does: these values
+    come from an RPC, and a bare ValueError escaped the callers that catch NetworkError (sandbox
+    review N-D)."""
     if v is None:
         return None
-    if isinstance(v, str):
-        return int(v, 16) if v.startswith("0x") else int(v)
-    return int(v)
+    try:
+        if isinstance(v, str):
+            return int(v, 16) if v.startswith("0x") else int(v)
+        return int(v)
+    except (TypeError, ValueError) as exc:
+        raise NetworkError(f"RPC returned a non-integer field: {str(v)[:34]!r}") from exc
 
 
 def _receipt_facts(receipt: Any) -> Any:
@@ -171,20 +178,25 @@ def _receipt_facts(receipt: Any) -> Any:
     """
     if receipt is None:
         return None
-    logs = sorted(
-        (
-            _addr(log.get("address")),
-            tuple(_b(t) for t in (log.get("topics") or [])),
-            _b(log.get("data")),
+    try:
+        logs = sorted(
+            (
+                _addr(log.get("address")),
+                tuple(_b(t) for t in (log.get("topics") or [])),
+                _b(log.get("data")),
+            )
+            for log in (receipt.get("logs") or [])
         )
-        for log in (receipt.get("logs") or [])
-    )
-    return (
-        _int_or_none(receipt.get("status")),
-        _b(receipt.get("blockHash")),
-        _int_or_none(receipt.get("blockNumber")),
-        tuple(logs),
-    )
+        return (
+            _int_or_none(receipt.get("status")),
+            _b(receipt.get("blockHash")),
+            _int_or_none(receipt.get("blockNumber")),
+            tuple(logs),
+        )
+    except (AttributeError, TypeError) as exc:
+        # A receipt, or a log in it, that is not a mapping (or topics that are not a list): the
+        # endpoint's answer is unreadable, which is that endpoint's failure, typed (sandbox review N-D).
+        raise NetworkError(f"RPC returned a malformed receipt: {type(exc).__name__}") from exc
 
 
 def _agree_receipt_facts(answers: list[Any]) -> Any:

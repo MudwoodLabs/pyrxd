@@ -188,7 +188,8 @@ class RpcEthChainSource:
         re-review of Mythos F1): ``True`` when every endpoint returns the same receipt (status, block
         and logs, normalised) and it is a success carrying OUR contract's ``Claimed`` event whose data
         opens H; ``False`` when they agree on a receipt that does not; ``None`` when every endpoint
-        agrees there is no receipt. Raises :class:`NetworkError` when one fails or they disagree.
+        agrees there is no receipt. Raises :class:`NetworkError` when one fails, answers with a malformed
+        receipt, or they disagree.
 
         A finality verdict says only where a transaction is, not what it did, and
         ``MultiSourceEthRpc.get_transaction_receipt`` leaves the logs out of its agreement, so the
@@ -197,8 +198,19 @@ class RpcEthChainSource:
 
         endpoints = self._rpc.sources if isinstance(self._rpc, MultiSourceEthRpc) else [self._rpc]
         facts = []
-        for endpoint in endpoints:
-            facts.append(_receipt_facts(await endpoint.get_transaction_receipt(claim_tx_hash)))
+        for index, endpoint in enumerate(endpoints):
+            try:
+                facts.append(_receipt_facts(await endpoint.get_transaction_receipt(claim_tx_hash)))
+            except NetworkError:
+                raise
+            except Exception as exc:
+                # One endpoint's malformed answer is that endpoint's failure, typed: an untyped error
+                # escaped observe() and replaced the claim race with a generic reconcile-error page
+                # (sandbox review N-D). The disposition reader's ``_identity`` treats it the same way.
+                raise NetworkError(
+                    f"receipt({claim_tx_hash}): endpoint {index + 1} of {len(endpoints)} gave an unreadable "
+                    f"answer ({type(exc).__name__})"
+                ) from exc
         if any(f != facts[0] for f in facts[1:]):
             raise NetworkError(f"receipt({claim_tx_hash}): endpoints disagree")
         agreed = facts[0]
@@ -246,9 +258,15 @@ class RpcEthChainSource:
         receipt = await self._rpc.get_transaction_receipt(claim_tx_hash)
         if receipt is None:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
-        if int(receipt.get("status", 0)) != 1:
+        try:
+            status = int(receipt.get("status", 0))
+            tx_block = int(receipt["blockNumber"]) if status == 1 else 0
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            # A malformed receipt (one endpoint's, with a single --eth-rpc-url) is a typed read
+            # failure, never an untyped error out of observe() (sandbox review N-D).
+            raise NetworkError(f"receipt({claim_tx_hash}) is malformed ({type(exc).__name__})") from exc
+        if status != 1:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
-        tx_block = int(receipt["blockNumber"])
         # Bind the receipt to the canonical chain, FAIL-CLOSED: a lying receipt blockNumber is caught
         # when its blockHash != the canonical hash at that height; a MISSING receipt blockHash or an
         # EMPTY canonical hash means "cannot prove canonicality" → NOT_YET_FINAL_LIVE, never FINAL.

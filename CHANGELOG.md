@@ -750,6 +750,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **One ETH endpoint can no longer multiply the counter-leg reader's reads, or turn a malformed
+  receipt into a generic reconcile error.**
+  - `read_counter_disposition` verified every transaction any endpoint's log scan nominated, each by
+    a receipt and a canonical-hash read on every endpoint, with no cap. One endpoint serving N ghost
+    `Refunded` logs (no preimage needed) cost about 3N reads per endpoint, per swap, per tick, in
+    the watchtower and the coordinator alike. An endpoint that nominates more than
+    `MAX_NOMINATIONS_PER_ENDPOINT` (8) distinct transactions is now a failed scan (`logs_failed`)
+    and none of its nominations are used. Every other endpoint's are verified, so it can neither
+    hide a real claim or refund nor choose what is read; with no endpoint left the answer is
+    `UNKNOWN`, never "no logs". An honest `EthHtlc` or `Erc20Htlc` emits at most one `Claimed` or
+    `Refunded` log.
+  - `RpcEthChainSource.claim_receipt_opens_h` let one endpoint's malformed receipt field escape as an
+    untyped `ValueError`, so the watchtower's observe raised and paged a reconcile error instead of
+    the claim race. That endpoint's answer is now a `NetworkError`, and the claim race pages
+    fail-closed. `_int_or_none` and `_receipt_facts` (`pyrxd.eth_wallet.htlc_leg`) raise
+    `NetworkError` on a malformed field, as `_b` already did, and `claim_finality_verdict` does the
+    same for a malformed receipt from a sole endpoint.
 - **The watchtower no longer lets one BTC source, or an unreadable covenant, lower a page.**
   - One source still serving a refund of ours that a quorum of sources reads as unspent (a refund
     that was dropped, replaced, or never relayed) made the read `REFUND_PENDING`. The tower then
