@@ -750,6 +750,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An ETH counter-leg record keeps its deploy transaction through `post_asset_lock_revalidate`.**
+  The lock-time re-verify replaced the record's locator with one rebuilt from config, whose
+  `deploy_tx_hash` is the all-zero placeholder. The counter-leg disposition reader starts its log
+  scan at the deploy transaction's block, so on every taker or single-operator ETH record that
+  reached BOTH_LOCKED it answered `UNKNOWN`, and `mutual_refund` sent our refund but never moved the
+  record to MUTUAL_REFUND (nor sent a single operator's covenant refund). The nightly ETH e2e had
+  failed on this since #850 PR 6. Records already written at BOTH_LOCKED still carry the
+  placeholder.
+
 - **The watchtower no longer lets one BTC source, or an unreadable covenant, lower a page.**
   - One source still serving a refund of ours that a quorum of sources reads as unspent (a refund
     that was dropped, replaced, or never relayed) made the read `REFUND_PENDING`. The tower then

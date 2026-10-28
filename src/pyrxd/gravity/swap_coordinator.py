@@ -58,7 +58,7 @@ from pyrxd.btc_wallet.taproot import (
     btc_txid_from_raw,
 )
 from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
-from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy
+from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH, Erc20HtlcLocator, EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD, ReorgCostMeasurement
@@ -3737,6 +3737,16 @@ class SwapCoordinator:
         block_id = "finalized" if self.config.margin_policy.is_measured else None
         try:
             reverified = await verify(locator.contract_address, self.record.terms, block_identifier=block_id)
+            # The re-verified locator is rebuilt from config and the terms, so it names no deploy
+            # transaction. Keep the one on record: the counter-leg disposition reader starts its log
+            # scan at that transaction's block, and without it every later read is UNKNOWN, so
+            # mutual_refund and reconcile_counter_leg could never see our refund land.
+            if (
+                str(reverified.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH
+                and str(locator.deploy_tx_hash).lower() != UNKNOWN_DEPLOY_TX_HASH
+                and str(reverified.contract_address).lower() == str(locator.contract_address).lower()
+            ):
+                reverified = dataclasses.replace(reverified, deploy_tx_hash=locator.deploy_tx_hash)
             self.record = self.record.with_counter_lock(reverified)
             # THE COVENANT'S REAL DEPTH, read here rather than assumed (#564). NetworkError joins
             # the caught set because this read touches the chain and a failure must persist for

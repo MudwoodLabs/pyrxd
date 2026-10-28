@@ -2777,6 +2777,41 @@ async def test_eth_full_lifecycle_negotiated_to_completed():
     assert rxd.claimed_with == p_bytes  # RXD asset claimed with the scraped p
 
 
+async def test_eth_revalidate_keeps_the_recorded_deploy_tx():
+    # The lock-time re-verify returns a locator rebuilt from config, which names no deploy tx
+    # (FakeEthLeg.verify_counterparty_funded, like EthLeg.expected_locator). The record must keep
+    # the deploy tx the fund recorded: the disposition reader's log scan starts at its block, and
+    # with the placeholder every read was UNKNOWN, so mutual_refund never finished (nightly e2e).
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd)
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    funded = rec.counterchain_locator.deploy_tx_hash
+    assert funded == "0x" + "cd" * 32
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED and "verify_counterparty" in leg.calls
+    assert leg.last_locator.deploy_tx_hash == "0x" + "00" * 32, "the fake re-verify names no deploy tx"
+    assert rec.counterchain_locator.deploy_tx_hash == funded
+    assert coord.persisted[-1].counterchain_locator.deploy_tx_hash == funded
+
+
+async def test_eth_revalidate_without_a_recorded_deploy_tx_stays_unknown():
+    # The honest path for a record that never knew the deploy tx (a maker's): nothing is invented.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    unknown = dataclasses.replace(coord.record.counterchain_locator, deploy_tx_hash="0x" + "00" * 32)
+    coord.record = dataclasses.replace(coord.record, counterchain_locator=unknown)
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED
+    assert rec.counterchain_locator.deploy_tx_hash == "0x" + "00" * 32
+
+
 async def test_eth_fund_rejects_wrong_wei_amount():
     # The funded-amount bind runs in the ETH wei unit (mirrors the BTC sats bind).
     secret, h = generate_secret()
