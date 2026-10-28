@@ -337,12 +337,39 @@ async def test_a_source_that_withholds_the_refund_holds_the_record():
 
 
 async def test_one_source_over_reporting_depth_does_not_bury_the_refund():
+    """One source reports a mempool refund 50 deep: not buried, and the spread is reported, not waited out."""
     swap = _Swap()
     swap.chain.add(swap.refund_tx())  # in the mempool
     swap.sources[0].depth_bonus = 50
     coord = swap.coordinator(pin=True)
+    with pytest.raises(NetworkError, match="not at the depth a quorum vouches for"):
+        await coord.reconcile_covenant()
+    assert coord.record.state is SwapState.NEGOTIATED and coord.persisted == []
+
+
+@pytest.mark.parametrize("index", [0, 2])
+async def test_one_source_under_reporting_depth_does_not_hold_a_buried_refund(index):
+    """Mythos A-1: with three sources, one that reports a 100-deep refund as unconfirmed (at index 0 or
+    N) does not hold the record open: the depth is the one a quorum vouches for."""
+    swap = _Swap()
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 99)
+    swap.sources[index].depth_bonus = -1000
+    coord = swap.coordinator(state=SwapState.BTC_LOCKED, pin=True)
     rec = await coord.reconcile_covenant()
-    assert rec.state is SwapState.NEGOTIATED and coord.persisted == []
+    assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.COVENANT_REFUNDED
+
+
+async def test_with_two_sources_an_under_reporter_holds_the_record_loudly():
+    """Mythos A-1, the quorum's limit: with two answers the depth is the least, so one under-reporter
+    holds the refund; the step then raises naming the spread rather than returning in silence."""
+    swap = _Swap(sources=2)
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 99)
+    swap.sources[1].depth_bonus = -1000
+    coord = swap.coordinator(pin=True)
+    for step in (coord.reconcile_covenant, coord.maker_refund_covenant):
+        with pytest.raises(NetworkError, match="buried at some sources but not at the depth a quorum vouches for"):
+            await step()
+    assert coord.record.state is SwapState.NEGOTIATED and coord.persisted == [] and _broadcasts(swap) == 0
 
 
 async def test_a_spend_that_matches_neither_leaf_is_unknown():
@@ -561,3 +588,95 @@ async def test_a_recorded_txid_that_does_not_spend_the_covenant_reads_unread_pas
     src = FakeRadiantSource(swap.chain, "https://a.example-a.org")
     answer = await RadiantChainIO._spender_from_one("s", src, swap.cov.funded_spk, swap.outpoint, spam[0])
     assert answer.unread is not None and answer.spender_txid is None
+
+
+# --------------------------------------------------------------------------- Mythos run (A-2, A-3)
+
+
+async def test_below_the_cap_the_records_own_refund_is_read_first_and_alone():
+    """Mythos A-2: spam below the cap must not make a source fetch every payment when the record's own
+    refund already spends the covenant there (a few dozen sequential fetches can time a source out)."""
+    swap = _Swap()
+    refund = swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 3)
+    _spam(swap, MAX_COVENANT_HISTORY - 1)
+    src = _CountingSource(swap.chain, "https://a.example-a.org")
+    answer = await RadiantChainIO._spender_from_one("s", src, swap.cov.funded_spk, swap.outpoint, refund)
+    assert answer.spender_txid == refund and src.fetched == [refund]
+
+
+async def test_HONEST_below_the_cap_without_a_recorded_refund_every_payment_is_read():
+    swap = _Swap()
+    refund = swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 3)
+    spam = _spam(swap, 5)
+    src = _CountingSource(swap.chain, "https://a.example-a.org")
+    answer = await RadiantChainIO._spender_from_one("s", src, swap.cov.funded_spk, swap.outpoint)
+    assert answer.spender_txid == refund and set(src.fetched) == {refund, *spam}
+
+
+class _WrongBytes(FakeRadiantSource):
+    """Serves another transaction's bytes for the spender."""
+
+    def __init__(self, *a, swap_for: str, other: bytes, **kw):
+        super().__init__(*a, **kw)
+        self.swap_for, self.other = swap_for, other
+
+    async def get_transaction(self, txid):
+        return self.other if txid == self.swap_for else await super().get_transaction(txid)
+
+
+async def test_a_source_serving_bytes_that_do_not_hash_to_the_txid_gives_no_answer():
+    """Mythos A-3 (plant A3)."""
+    swap = _Swap()
+    refund = swap.chain.add(swap.refund_tx(), height=swap.chain.tip)
+    src = _WrongBytes(swap.chain, "https://a.example-a.org", swap_for=refund, other=swap.refund_tx())
+    with pytest.raises(NetworkError, match="do not hash"):
+        await _one(swap, src)
+
+
+def _with_script_sig(swap: _Swap, raw: bytes, script_sig: bytes) -> bytes:
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+
+    tx = Transaction.from_hex(raw)
+    for i in tx.inputs:
+        if f"{i.source_txid}:{i.source_output_index}" == swap.outpoint:
+            i.unlocking_script = Script(script_sig)
+    return tx.serialize()
+
+
+async def test_a_spend_paying_the_maker_by_another_script_sig_is_not_a_refund():
+    """Mythos A-3 (plant A7): the refund leaf is its scriptSig AND its output, not the output alone."""
+    swap = _Swap()
+    swap.chain.add(_with_script_sig(swap, swap.refund_tx(), b"\x52"), height=swap.chain.tip - 3)
+    coord = swap.coordinator(state=SwapState.BTC_LOCKED, pin=True)
+    with pytest.raises(NetworkError, match="neither leaf"):
+        await coord.reconcile_covenant()
+    assert coord.record.state is SwapState.BTC_LOCKED
+
+
+async def test_a_claim_shaped_spend_without_the_preimage_is_not_a_claim():
+    """Mythos A-3 (plant A26): a "claim" opening 32 random bytes instead of p reads UNKNOWN, so one source
+    cannot make the maker's own refund refuse with "p is public"."""
+    swap = _Swap()
+    forged = _with_script_sig(swap, swap.claim_tx(), b"\x20" + os.urandom(32) + b"\x00")
+    swap.chain.add(forged, height=swap.chain.tip - 3)
+    coord = swap.coordinator(state=SwapState.BTC_LOCKED, pin=True)
+    with pytest.raises(NetworkError, match="neither leaf"):
+        await coord.reconcile_covenant()
+    # The honest pair: the real claim reads CLAIMED (raises, p is public).
+    honest = _Swap()
+    honest.chain.add(honest.claim_tx(), height=honest.chain.tip - 3)
+    with pytest.raises(ValidationError, match="CLAIMED"):
+        await honest.coordinator(state=SwapState.BTC_LOCKED, pin=True).reconcile_covenant()
+
+
+async def test_an_unidentified_source_does_not_count_as_an_operator(monkeypatch):
+    """Mythos A-3 (plant A27): a source with a hand-chosen key, not one derived from its URL, answers but
+    never counts toward the two operators a value-bearing network needs."""
+    swap = _Swap(sources=2)
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip)
+    swap.sources[1].source_key = "b"
+    coord = swap.coordinator(pin=True)
+    monkeypatch.setattr(sc, "_leg_is_value_bearing", lambda leg: True)
+    with pytest.raises(NetworkError, match="fewer than 2 operators"):
+        await coord.reconcile_covenant()

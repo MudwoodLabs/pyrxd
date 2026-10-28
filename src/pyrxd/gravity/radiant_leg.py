@@ -61,7 +61,12 @@ from pyrxd.gravity.fee_policy import (
     DeadlineFeePolicy,
     assert_fee_covers,
 )
-from pyrxd.gravity.funding_spv import UNIDENTIFIED_SOURCE_PREFIX, MakerFundingEvidence, counted_operators
+from pyrxd.gravity.funding_spv import (
+    MIN_REPORTING_OPERATORS,
+    UNIDENTIFIED_SOURCE_PREFIX,
+    MakerFundingEvidence,
+    counted_operators,
+)
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
     build_htlc_covenant_ft,
@@ -78,6 +83,7 @@ from pyrxd.gravity.htlc_spend import (
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
 from pyrxd.network._guards import finite_int
+from pyrxd.network.quorum_depth import depth_vouched_by_quorum
 from pyrxd.network.source_identity import SourceKey, source_key_of
 from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20, Txid
@@ -793,20 +799,32 @@ class RadiantChainIO:
                 f"its history of the covenant script holds {len(candidates)} other transactions, more than the "
                 f"{MAX_COVENANT_HISTORY} read"
             )
-            known = known_spender.lower() if known_spender else None
-            if known is None or known not in candidates:
+            if not known_spender or known_spender.lower() not in candidates:
                 return CovenantSpendAnswer(source=label, spender_txid=None, raw_tx=None, depth=0, unread=unread)
-            candidates = [known]
-        spenders: list[tuple[str, bytes]] = []
-        for txid in candidates:
+            candidates = [known_spender.lower()]
+
+        async def spends(txid: str) -> bytes | None:
             raw = bytes(await src.get_transaction(txid))
             if hash256(raw)[::-1].hex() != txid:
                 raise NetworkError(f"the source served bytes for {txid} that do not hash to it")
             tx = Transaction.from_hex(raw)
             if tx is None:
                 raise NetworkError(f"the source served bytes for {txid} that do not parse")
-            if any(str(i.source_txid).lower() == funding_txid and i.source_output_index == vout for i in tx.inputs):
-                spenders.append((txid, raw))
+            hit = any(str(i.source_txid).lower() == funding_txid and i.source_output_index == vout for i in tx.inputs)
+            return raw if hit else None
+
+        spenders: list[tuple[str, bytes]] = []
+        known = known_spender.lower() if known_spender else None
+        if known is not None and known in candidates:
+            # The record's own refund first: if it spends the outpoint here, no other transaction in
+            # this source's view can, so the rest of the history need not be fetched (review A-2).
+            raw = await spends(known)
+            candidates = [] if raw is not None else [t for t in candidates if t != known]
+            if raw is not None:
+                spenders.append((known, raw))
+        if candidates:
+            raws = await asyncio.gather(*(spends(t) for t in candidates))
+            spenders.extend((t, r) for t, r in zip(candidates, raws) if r is not None)
         if len(spenders) > 1:
             raise NetworkError(f"two transactions in this source's history spend {outpoint}")
         if not spenders and unread is not None:
@@ -866,10 +884,15 @@ class CovenantSpendKind(Enum):
 class CovenantSpend:
     """:meth:`RadiantCovenantLeg.covenant_spend`'s answer. Read only; the coordinator decides.
 
-    ``depth`` is the LEAST depth an answering source reports for the spender, so one source that
-    over-reports cannot bury it. ``operators`` counts the distinct identified operators among the
-    answering sources (:func:`pyrxd.gravity.funding_spv.counted_operators`); ``failed`` names the
-    sources that gave no answer."""
+    ``depth`` is the depth a quorum of the answering sources vouch for
+    (:func:`pyrxd.network.quorum_depth.depth_vouched_by_quorum` at
+    :data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`), so one source that over-reports
+    cannot bury the spend and, among three or more, one that under-reports cannot hold it down; with
+    fewer answers it is the least. ``disputed`` is a spend not buried at that depth that some source
+    reports buried: the sources disagree by more than the burial, which the caller must not wait out
+    in silence. ``operators`` counts the distinct identified operators among the answering sources
+    (:func:`pyrxd.gravity.funding_spv.counted_operators`); ``failed`` names the sources that gave no
+    answer."""
 
     kind: CovenantSpendKind
     reason: str
@@ -879,6 +902,7 @@ class CovenantSpend:
     sources: tuple[str, ...] = ()
     operators: int = 0
     failed: tuple[str, ...] = ()
+    disputed: bool = False
 
 
 def _covenant_leaf(cov: HtlcCovenant, raw: bytes, outpoint: str) -> tuple[CovenantSpendKind, str]:
@@ -1540,7 +1564,8 @@ class RadiantCovenantLeg:
         bytes by the leaf it took, never by its txid: the refund leaf's scriptSig is the selector
         ``OP_1`` alone and its single output pays the maker's holder script; the claim leaf's opens
         ``H`` and pays the taker's. Consensus binds each leaf to its output, so a spend that matches
-        neither is ``UNKNOWN``. ``buried`` is the least reported depth at or above *burial_blocks*.
+        neither is ``UNKNOWN``. ``buried`` is the depth a quorum vouches for at or above *burial_blocks*
+        (:class:`CovenantSpend`).
         A source whose history of the covenant script is too long to read
         (:data:`MAX_COVENANT_HISTORY`) makes the answer ``UNKNOWN`` too; the record's own refund
         (``asset_refund_txid``) is still checked at such a source. Never raises for a chain that
@@ -1595,16 +1620,23 @@ class RadiantCovenantLeg:
                 failed=failed,
             )
         kind, why = _covenant_leaf(cov, bytes(answers[0].raw_tx or b""), outpoint)
-        depth = min(a.depth for a in answers)
+        depth = depth_vouched_by_quorum([a.depth for a in answers], MIN_REPORTING_OPERATORS)
+        known = kind is not CovenantSpendKind.UNKNOWN
+        buried = known and depth >= burial_blocks
+        disputed = known and not buried and max(a.depth for a in answers) >= burial_blocks
+        said = f"at depth {depth} (vouched by a quorum of the answering sources)"
+        if len({a.depth for a in answers}) > 1:
+            said += " of " + ", ".join(f"{a.source}: {a.depth}" for a in answers)
         return CovenantSpend(
             kind,
-            f"{outpoint} is spent by {txid}: {why}, at depth {depth} (least reported)",
+            f"{outpoint} is spent by {txid}: {why}, {said}",
             txid=txid,
             depth=depth,
-            buried=kind is not CovenantSpendKind.UNKNOWN and depth >= burial_blocks,
+            buried=buried,
             sources=sources,
             operators=operators,
             failed=failed,
+            disputed=disputed,
         )
 
     async def _broadcast(self, tx: Any) -> str:

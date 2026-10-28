@@ -4541,7 +4541,8 @@ class SwapCoordinator:
     async def _apply_covenant_spend(self, spend: Any) -> str:
         """Apply what spent the maker's covenant to the record (#850 PR 11). No broadcast. Returns
         ``"refunded"`` (the record went terminal and was persisted), ``"pending"`` (a refund not yet
-        buried), ``"single_source"`` (buried, but too few operators on a chain that carries value),
+        buried), ``"disputed"`` (not buried at the depth a quorum vouches for, though some source
+        reports it buried), ``"single_source"`` (buried, but too few operators on a chain that carries value),
         ``"unspent"`` or ``"unknown"``.
 
         * ``REFUNDED`` and buried: NEGOTIATED, BTC_LOCKED and PARAMS_MISMATCH go to ABORTED
@@ -4567,7 +4568,7 @@ class SwapCoordinator:
         if kind is not CovenantSpendKind.REFUNDED:
             return "unknown"
         if not spend.buried:
-            return "pending"
+            return "disputed" if getattr(spend, "disputed", False) else "pending"
         if spend.operators < MIN_REPORTING_OPERATORS and _leg_is_value_bearing(self.radiant_leg):
             return "single_source"
         state = self.record.state
@@ -4608,12 +4609,24 @@ class SwapCoordinator:
         outcome = await self._apply_covenant_spend(spend)
         if outcome == "unknown":
             raise NetworkError(f"what spent the covenant is unknown: {spend.reason}")
+        if outcome == "disputed":
+            raise self._covenant_depth_dispute(spend)
         if outcome == "single_source":
             raise NetworkError(
                 f"the covenant reads refunded ({spend.reason}) from fewer than {MIN_REPORTING_OPERATORS} operators, "
                 "on a Radiant network that carries value; nothing changes until more sources agree (design D4)"
             )
         return self.record
+
+    @staticmethod
+    def _covenant_depth_dispute(spend: Any) -> NetworkError:
+        """The refusal for a covenant refund whose sources disagree about its depth by more than the
+        burial (review A-1): one source holding it down must not hold the record in silence."""
+        return NetworkError(
+            f"the covenant refund {spend.txid} is buried at some sources but not at the depth a quorum vouches for "
+            f"({spend.reason}). The record is unchanged and nothing was sent; a source that lags or under-reports "
+            "holds it, so check or replace that source."
+        )
 
     @_serialized_step
     async def maker_refund_covenant(self) -> SwapRecord:
@@ -4656,6 +4669,8 @@ class SwapCoordinator:
         if outcome == "pending":
             logger.info("the covenant refund %s is not yet buried (%s); nothing sent", spend.txid, spend.reason)
             return self.record
+        if outcome == "disputed":
+            raise self._covenant_depth_dispute(spend)
         if outcome == "single_source":
             raise NetworkError(
                 f"the covenant reads refunded ({spend.reason}) from fewer than {MIN_REPORTING_OPERATORS} operators, "

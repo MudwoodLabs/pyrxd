@@ -145,12 +145,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `depth_sources`, a multi-operator client once per operator) names the spender of the pinned outpoint
     from its own history, by bytes that hash to the txid, or holds the outpoint in its UTXO set. They
     must all agree, or the answer is `UNKNOWN`. The spender is classified by the leaf it took, from
-    its bytes. Its depth is the least any answering source reports. On a Radiant network that carries
-    value, fewer than two identified operators change nothing. Anyone can pay the covenant's script:
-    a source whose history of it holds more than 64 other transactions does not fetch them and
-    answers "unread", which makes the read `UNKNOWN` rather than leaving the other sources to decide;
-    the record's own refund (`asset_refund_txid`) is still checked at such a source, so it can still
-    end the record. The refund is sent either way.
+    its bytes. Its depth is the one a quorum of two answering sources vouches for (the least, with
+    fewer than three), so one source can neither bury it nor, among three, hold it down; a refund some
+    source reports buried but the quorum does not raises, naming each source's depth. On a Radiant
+    network that carries value, fewer than two identified operators change nothing. Anyone can pay
+    the covenant's script, so each source reads the record's own refund (`asset_refund_txid`) first
+    and stops there when it spends the covenant; otherwise it fetches the other transactions in its
+    history at once. A source whose history holds more than 64 other transactions does not fetch
+    them and answers "unread", which makes the read `UNKNOWN` rather than leaving the other sources
+    to decide. The refund is sent either way.
   - An `UNKNOWN` read does not stop the refund: the leg's own checks (the outpoint live at the
     primary source, the CSV mature) decide, and a refund of a spent covenant fails at the node.
   - The two-host runners' maker `--phase abort` now drives `maker_refund_covenant`: run it again once
