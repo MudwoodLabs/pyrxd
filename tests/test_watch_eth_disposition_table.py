@@ -1400,3 +1400,76 @@ async def test_a_repeated_eth_rpc_url_builds_a_multi_source_reader(monkeypatch):
     async with contextlib.AsyncExitStack() as stack:
         assert isinstance((await run._build_eth_source(one, stack))._rpc, _FakeEthRpc)
     assert await run._build_eth_source(argparse.Namespace(eth_rpc_url=None, eth_chain_id=None), stack) is None
+
+
+# --------------------------------------------------------------------------- BOTH_LOCKED, covenant unread (register R1, ETH)
+
+
+def _unread_covenant(w: _EthTower, *, head: int) -> None:
+    w.rxd.cov_confs = None
+    w.chain.head = head
+
+
+@pytest.mark.parametrize("role", [RecordRole.TAKER, None])
+async def test_both_locked_with_an_unreadable_covenant_pages_once_the_eth_timeout_has_passed(tmp_path, role):
+    """The ETH twin of #912's R1 fix: with the covenant pinned but unread, the tower WATCHed every tick,
+    past t_rxd too. Past the ETH timeout it now pages mutual_refund, through the production reconciler."""
+    w = _EthTower(tmp_path, state=SwapState.BOTH_LOCKED, role=role)
+    _unread_covenant(w, head=100)
+    obs = await w.observe()
+    assert obs.asset_locked_at_height is None and obs.now_unix_s >= w.chain.timeout
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.situation == decide_mod.SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD
+    assert d.recommended_action == "mutual_refund"
+    assert not d.urgent
+    assert "t_rxd maturity approaching" not in d.reason
+    await w.reconciler().tick()
+    assert [dec.situation for _, dec in w.pages.got] == [decide_mod.SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD]
+
+
+async def test_both_locked_with_an_unreadable_covenant_watches_before_the_eth_timeout(tmp_path):
+    w = _EthTower(tmp_path, state=SwapState.BOTH_LOCKED)
+    _unread_covenant(w, head=TIMEOUT_BLOCK - 10)
+    d = await w.decide()
+    assert d.intent is Intent.WATCH
+    assert "has not passed" in d.reason
+
+
+async def test_a_maker_with_an_unreadable_covenant_gets_its_covenant_refund_page_on_eth(tmp_path):
+    w = _EthTower(tmp_path, state=SwapState.BOTH_LOCKED, role=RecordRole.MAKER)
+    _unread_covenant(w, head=100)
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.situation == decide_mod.SITUATION_MAKER_REFUND_LOCK_HEIGHT_UNREAD
+    assert d.recommended_action != "mutual_refund"
+
+
+async def test_both_locked_with_a_readable_covenant_keeps_its_t_rxd_clock_on_eth(tmp_path):
+    """Honest-path twin: with the covenant read, past the ETH timeout but t_rxd far off, the tower still
+    WATCHes on t_rxd, and pages BOTH_LOCKED_REFUND_DUE once t_rxd is near."""
+    w = _EthTower(tmp_path, state=SwapState.BOTH_LOCKED)
+    d = await w.decide()
+    assert d.intent is Intent.WATCH and d.situation != decide_mod.SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD
+    w.rxd.cov_confs = 40
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND and d.situation == decide_mod.SITUATION_BOTH_LOCKED_REFUND_DUE
+
+
+async def test_both_locked_with_an_unreadable_covenant_and_no_clock_pages(tmp_path):
+    w = _EthTower(tmp_path, state=SwapState.BOTH_LOCKED)
+    _unread_covenant(w, head=TIMEOUT_BLOCK - 10)
+    obs = dataclasses.replace(await w.observe(), now_unix_s=None)
+    d = decide(record=w.record(), observations=obs, policy=_policy(), safety_window_blocks=SAFETY)
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.situation == decide_mod.SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD
+    assert "clock could not be read" in d.reason
+
+
+async def test_both_locked_with_no_covenant_pinned_still_watches_on_eth(tmp_path):
+    w = _EthTower(tmp_path, state=SwapState.BOTH_LOCKED)
+    _unread_covenant(w, head=100)
+    w.write(dataclasses.replace(w.record(), radiant_covenant_outpoint=None))
+    d = await w.decide()
+    assert d.intent is Intent.WATCH
+    assert d.reason == "asset lock height not yet observed"
