@@ -1473,3 +1473,13 @@ async def test_both_locked_with_no_covenant_pinned_still_watches_on_eth(tmp_path
     d = await w.decide()
     assert d.intent is Intent.WATCH
     assert d.reason == "asset lock height not yet observed"
+
+
+async def test_both_locked_with_an_unreadable_covenant_pages_at_the_eth_timeout_itself(tmp_path):
+    """At ``now == eth_timeout_unix_s`` the contract already refuses a claim, as the BTC_LOCKED branch reads it."""
+    w = _EthTower(tmp_path, state=SwapState.BOTH_LOCKED)
+    _unread_covenant(w, head=TIMEOUT_BLOCK)
+    assert (await w.observe()).now_unix_s == w.chain.timeout
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.situation == decide_mod.SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD
