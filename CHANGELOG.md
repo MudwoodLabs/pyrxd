@@ -780,6 +780,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     as the clock, as it does at `BTC_LOCKED`: it watches while the BTC refund leaf has not matured
     (the swap's timelock gate opens the BTC refund first, by a nominal wall-clock margin), and otherwise pages (urgent for the taker, `both_locked_lock_height_unread`; the
     maker gets its covenant-refund page). A record with no covenant pinned still watches.
+  - The same held on an ETH counter leg. A `BOTH_LOCKED` ETH swap whose covenant lock height could
+    not be read now uses the ETH HTLC's absolute deadline (`eth_timeout_unix_s`) as the clock, as
+    at `BTC_LOCKED`: it watches before the deadline (the swap's timelock gate opens the covenant
+    refund after it, plus a margin) and pages `mutual_refund` from it, or when the clock cannot be
+    read (`both_locked_lock_height_unread`, not urgent: past the deadline the contract refuses a
+    claim). The maker gets its covenant-refund page; a record with no covenant pinned still watches.
   - The claim page no longer waits on one source under-reporting a claim's depth (see "Changed
     (breaking)").
 
