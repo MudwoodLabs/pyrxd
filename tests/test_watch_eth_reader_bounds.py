@@ -276,6 +276,8 @@ async def test_the_honest_twin_of_a_malformed_receipt_waits_for_finality(tmp_pat
         {"status": float("inf")},
         {"blockNumber": float("inf")},
         {"blockHash": "zz"},
+        {"blockHash": 2**63},
+        {"blockHash": 64},
     ],
 )
 async def test_a_sole_endpoints_malformed_receipt_is_a_typed_verdict_failure(tmp_path, change):

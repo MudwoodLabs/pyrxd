@@ -273,10 +273,11 @@ class RpcEthChainSource:
         receipt_hash = receipt.get("blockHash")
         if receipt_hash is None:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
-        try:
-            receipt_hash_bytes = bytes(receipt_hash)
-        except (TypeError, ValueError) as exc:
-            raise NetworkError(f"receipt({claim_tx_hash}) has a malformed blockHash ({type(exc).__name__})") from exc
+        if not isinstance(receipt_hash, (bytes, bytearray)):
+            # web3 returns HexBytes (a bytes subclass); anything else is one endpoint's malformed answer,
+            # and bytes(int) would raise OverflowError or allocate that many zero bytes.
+            raise NetworkError(f"receipt({claim_tx_hash}) has a malformed blockHash ({type(receipt_hash).__name__})")
+        receipt_hash_bytes = bytes(receipt_hash)
         canonical = await self._rpc.canonical_block_hash(tx_block)
         if not canonical or receipt_hash_bytes != canonical:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
