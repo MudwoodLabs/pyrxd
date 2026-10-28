@@ -225,12 +225,12 @@ Source: `scripts/btc_swap_two_host.py:944`, `scripts/eth_swap_two_host.py:936`.
 
 This message is a **convenience pointer, not a channel**. `p` is public on chain the moment the
 claim confirms; the taker can and should find it by watching the counter chain. A conforming taker
-MUST verify, before acting on it (`swap_coordinator.py:4197-4202`):
+MUST verify, before acting on it (`swap_coordinator.py:4207-4212`):
 
 1. `SHA256(scraped p) == terms.hashlock` — scraping is by hash over all candidate pushes, **never
    by byte offset** (`counter_chain_leg.py:45-48`);
 2. **provenance** — BTC: the transaction spends *this swap's* funding outpoint
-   (`swap_coordinator.py:4076-4098`); ETH: the transaction targets *this swap's* contract instance
+   (`swap_coordinator.py:4086-4108`); ETH: the transaction targets *this swap's* contract instance
    and emits `Claimed(p)` from it (`eth_leg.py:485-491`). Without this, a claim transaction from a
    different swap that happens to share `H` would be accepted.
 
@@ -543,7 +543,7 @@ published. Consensus permits the claim, and on a BTC swap the FSM has no edge fo
 the `SECRET_REVEALED` edge added in #850 PR 5a is taken only on an ETH counter-leg claim observed at a
 finalized block), and
 `maker_claims_btc` refuses it only for an *honest* maker driving its own coordinator
-(`swap_coordinator.py:3816-3817`). A hostile maker does not use a coordinator.
+(`swap_coordinator.py:3826-3827`). A hostile maker does not use a coordinator.
 
 **Normative:** a taker MUST NOT fund the counter leg until it has confirmed the maker's asset lock
 on chain, at the agreed scriptPubKey, for the agreed value, at a depth the taker chose. The FSM's
@@ -892,11 +892,11 @@ Notes a second implementation needs:
 
 - The reorg gate's `WAIT` verdict is **not** a transition. The record stays `SECRET_REVEALED` and
   the caller retries; no state is stranded because the gate runs before any advance
-  (`swap_coordinator.py:4223-4229`).
+  (`swap_coordinator.py:4233-4239`).
 - `ASSET_REFUNDED_TAKER_ACTS` is reached by a **maker-only** primitive. The covenant's CSV refund
   pays the *maker* in both directions, so a taker that runs it gifts the asset back and destroys
   its only recourse; the coordinator forbids it for a `TAKER`-role instance
-  (`swap_coordinator.py:4401-4406`). **The taker's stall recovery is `mutual_refund`.**
+  (`swap_coordinator.py:4411-4416`). **The taker's stall recovery is `mutual_refund`.**
 - Durable state MUST be persisted before an awaited broadcast and the post-broadcast write
   shielded from cancellation, or a retry double-funds (`swap_coordinator.py:2997-3000, 3343-3345`).
 
