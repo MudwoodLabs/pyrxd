@@ -35,7 +35,7 @@ from pyrxd.gravity import funding_spv
 from pyrxd.gravity.funding_spv import DEFAULT_ELAPSED_BOUND_POLICY, ElapsedBoundPolicy, MakerFundingNotVerified
 from pyrxd.gravity.reorg_cost import PHOTONS_PER_RXD
 from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times, taker_gate_early_bound
-from pyrxd.gravity.swap_state import SwapState
+from pyrxd.gravity.swap_state import AbortReason, SwapState
 from pyrxd.network.bitcoin import MempoolSpaceSource
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight
@@ -243,7 +243,8 @@ _TAKER_P_PUBLIC = (
 _MAKER_ABORT = (
     "allow",
     "the phase refuses on its own whenever taker_funding.json is present or the merged record holds a "
-    "counter-leg locator; with no funded counter leg the covenant is the maker's to recover",
+    "counter-leg locator, except at params_mismatch (the maker never reached both_locked, so it never "
+    "revealed p); the coordinator's maker_refund_covenant then decides (#850 PR 11)",
 )
 _MAKER_REFUND = (
     "allow",
@@ -498,8 +499,8 @@ def refuse_by_persisted_state(sink: Any, *, terms: Any, role: str, phase: str) -
 #: What the maker's ``--phase abort`` confirms before it sends the covenant refund. It states what
 #: the phase checked, not what it cannot know: the taker may have funded a leg this host never saw.
 MAKER_ABORT_CONFIRM = (
-    "refund_asset: CSV-refund the RXD covenant to the maker (no taker_funding.json here and no counter "
-    "leg in this host's record)"
+    "maker_refund_covenant: CSV-refund the RXD covenant to the maker (no taker_funding.json here and no "
+    "counter leg in this host's record, or the record is at params_mismatch)"
 )
 
 
@@ -507,14 +508,52 @@ def refuse_maker_abort_with_a_counter_leg(record: Any, *, path: Any) -> None:
     """The maker's ``--phase abort`` is for a taker that never funded. A record holding a counter-leg
     locator says the taker DID fund (this host verified it in lock-claim), whatever the exchange
     directory holds now: the covenant refund then belongs to ``--phase refund``, whose coordinator
-    checks whether this maker has claimed the counter leg."""
-    if record.counterchain_locator is not None:
+    checks whether this maker has claimed the counter leg. A record at PARAMS_MISMATCH holds the
+    locator and is the exception: the maker's own revalidation failed, so it never reached
+    BOTH_LOCKED and never revealed p, and ``--phase refund`` (BOTH_LOCKED only) cannot end it
+    (#850 PR 11)."""
+    if record.counterchain_locator is not None and record.state is not SwapState.PARAMS_MISMATCH:
         raise SystemExit(
             f"REFUSING maker --phase abort: this host's record holds a funded counter leg ({path}), so the "
             "taker did fund one; abort is only for a taker that never funded. Nothing was sent. Use --phase "
             "refund (it checks whether you have claimed the counter leg), with taker_funding.json restored "
             "to the exchange directory."
         )
+
+
+def maker_abort_rebuild_state(persisted: Any) -> SwapState | None:
+    """The state the maker's ``--phase abort`` rebuilds its record at, from the record this host
+    persisted (read after :func:`refuse_by_persisted_state` accepted it), or ``None`` when that record
+    is already closed by this phase, which it says. PARAMS_MISMATCH is kept (the merge keeps the
+    rebuild's state, and the coordinator must judge the real one); anything else rebuilds NEGOTIATED,
+    and :func:`refuse_maker_abort_with_a_counter_leg` refuses a record that holds a counter leg."""
+    if persisted is None:
+        return SwapState.NEGOTIATED
+    if persisted.state is SwapState.ABORTED and persisted.abort_reason is AbortReason.COVENANT_REFUNDED:
+        print(
+            f"  the record is already closed: the covenant refund {persisted.asset_refund_txid} is buried. "
+            "Nothing was sent."
+        )
+        return None
+    return SwapState.PARAMS_MISMATCH if persisted.state is SwapState.PARAMS_MISMATCH else SwapState.NEGOTIATED
+
+
+async def drive_maker_abort(coord: Any) -> None:
+    """The maker's ``--phase abort`` through the coordinator (#850 PR 11): ``maker_refund_covenant``
+    sends the covenant's CSV refund, or, once that refund reads buried, ends the record at ABORTED. A
+    record already ended that way says so and sends nothing; a refusal is a ``SystemExit``. A
+    covenant not yet mature raises the leg's ``NetworkError`` as before (retry at maturity)."""
+    try:
+        rec = await coord.maker_refund_covenant()
+    except ValidationError as exc:
+        raise SystemExit(f"REFUSING maker --phase abort: {exc}") from None
+    if rec.state is SwapState.ABORTED:
+        print(f"  -> aborted: the covenant refund {rec.asset_refund_txid} is buried; the record is closed.")
+        return
+    print(
+        f"  -> covenant CSV refund sent or pending: {rec.asset_refund_txid}. The record stays "
+        f"{rec.state.value} until the refund is buried: run --phase abort again then to close it."
+    )
 
 
 def prior_fund_record(sink: Any, *, terms: Any) -> Any:

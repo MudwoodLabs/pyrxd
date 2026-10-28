@@ -49,6 +49,7 @@ import math
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
@@ -60,17 +61,29 @@ from pyrxd.gravity.fee_policy import (
     DeadlineFeePolicy,
     assert_fee_covers,
 )
-from pyrxd.gravity.funding_spv import UNIDENTIFIED_SOURCE_PREFIX, MakerFundingEvidence
+from pyrxd.gravity.funding_spv import (
+    MIN_REPORTING_OPERATORS,
+    UNIDENTIFIED_SOURCE_PREFIX,
+    MakerFundingEvidence,
+    counted_operators,
+)
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
     build_htlc_covenant_ft,
     build_htlc_covenant_nft,
     build_htlc_covenant_rxd,
 )
-from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
+from pyrxd.gravity.htlc_spend import (
+    _CLAIM_SELECTOR,
+    _REFUND_SELECTOR,
+    FeeInput,
+    build_htlc_claim_tx,
+    build_htlc_refund_tx,
+)
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
 from pyrxd.network._guards import finite_int
+from pyrxd.network.quorum_depth import depth_vouched_by_quorum
 from pyrxd.network.source_identity import SourceKey, source_key_of
 from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20, Txid
@@ -79,6 +92,9 @@ from pyrxd.security.units import ChainHeight, Confirmations, PhotonValue
 _LOG = logging.getLogger(__name__)
 
 __all__ = [
+    "CovenantSpend",
+    "CovenantSpendAnswer",
+    "CovenantSpendKind",
     "FeeUtxoSource",
     "RadiantBroadcaster",
     "RadiantChainIO",
@@ -700,6 +716,231 @@ class RadiantChainIO:
         txid, vout = _split_outpoint(outpoint)
         return bool(await fn(txid, vout))
 
+    async def covenant_spend_answers(
+        self, spk: bytes, outpoint: str, *, known_spender: str | None = None
+    ) -> tuple[tuple[CovenantSpendAnswer, ...], tuple[str, ...]]:
+        """What each configured source says spent the covenant ``outpoint`` (#850 PR 11), and the
+        sources that could not say.
+
+        Every source with the reads this needs is asked ON ITS OWN (``client``, ``proof_client`` and
+        each ``depth_sources`` reader, a client over several operators' URLs once per operator, as
+        :meth:`depth_reports` does): its history of the covenant scriptPubKey, then each transaction
+        in it, parsed from bytes that hash to the txid asked for, for an input that spends
+        ``outpoint``. So no source picks the transaction another one is asked about. A source that
+        finds no spender must also hold ``outpoint`` in its UTXO set, or it has answered nothing.
+        Returns ``(answers, failed)``: ``failed`` names each source that errored, timed out or could
+        not account for the outpoint. Nothing here is judged; see
+        :meth:`RadiantCovenantLeg.covenant_spend`.
+
+        Anyone can pay the covenant's public script, so a history longer than
+        :data:`MAX_COVENANT_HISTORY` is not fetched. A source in that case still answers, as
+        ``unread`` (dissent, not absence: a source that trims its history must not decide alone
+        while the honest ones fall silent), unless *known_spender* (the record's own refund, a txid
+        no source nominated) is in its history: then only that transaction is checked, and if it
+        spends the outpoint no other transaction can."""
+        asked: list[tuple[int, Any]] = []
+        made: list[Any] = []
+        for index, src in enumerate(self._distinct_sources()):
+            if not all(callable(getattr(src, m, None)) for m in _SPEND_READS):
+                continue
+            if self._splits(src):
+                parts = tuple(src.per_source_clients())
+                made.extend(parts)
+                asked.extend((index, part) for part in parts)
+            else:
+                asked.append((index, src))
+
+        async def one(index: int, src: Any) -> CovenantSpendAnswer | str:
+            label = self._operator_label(index, src)
+            try:
+                return await asyncio.wait_for(
+                    self._spender_from_one(label, src, bytes(spk), outpoint, known_spender),
+                    self._depth_timeout_s,
+                )
+            except Exception as exc:  # a timeout, an error or an answer that does not add up
+                logger.debug("covenant spend source %s gave no answer: %s", label, exc)
+                return label
+
+        try:
+            results = await asyncio.gather(*(one(index, src) for index, src in asked))
+        finally:
+            for part in made:
+                with contextlib.suppress(Exception):
+                    await part.close()
+        answers = tuple(r for r in results if isinstance(r, CovenantSpendAnswer))
+        failed = tuple(r for r in results if isinstance(r, str))
+        return answers, failed
+
+    @staticmethod
+    async def _spender_from_one(
+        label: str, src: Any, spk: bytes, outpoint: str, known_spender: str | None = None
+    ) -> CovenantSpendAnswer:
+        """One source's answer for :meth:`covenant_spend_answers`, or an exception."""
+        import hashlib
+
+        from pyrxd.hash import hash256
+        from pyrxd.transaction.transaction import Transaction
+
+        funding_txid, vout = _split_outpoint(outpoint)
+        funding_txid = funding_txid.lower()
+        register = getattr(src, "register_spk", None)
+        if callable(register):
+            register(spk)
+        script_hash = hashlib.sha256(spk).digest()[::-1]
+        history = [str(h["tx_hash"]).lower() for h in await src.get_history(script_hash)]
+        if funding_txid not in history:
+            raise NetworkError("the covenant's funding transaction is not in this source's history of its script")
+        candidates = [t for t in dict.fromkeys(history) if t != funding_txid]
+        unread: str | None = None
+        if len(candidates) > MAX_COVENANT_HISTORY:
+            # Anyone can pay a covenant's public script; past this many the read does not fetch them.
+            # It checks the record's own refund if the source lists it, and otherwise answers unread.
+            unread = (
+                f"its history of the covenant script holds {len(candidates)} other transactions, more than the "
+                f"{MAX_COVENANT_HISTORY} read"
+            )
+            if not known_spender or known_spender.lower() not in candidates:
+                return CovenantSpendAnswer(source=label, spender_txid=None, raw_tx=None, depth=0, unread=unread)
+            candidates = [known_spender.lower()]
+
+        async def spends(txid: str) -> bytes | None:
+            raw = bytes(await src.get_transaction(txid))
+            if hash256(raw)[::-1].hex() != txid:
+                raise NetworkError(f"the source served bytes for {txid} that do not hash to it")
+            tx = Transaction.from_hex(raw)
+            if tx is None:
+                raise NetworkError(f"the source served bytes for {txid} that do not parse")
+            hit = any(str(i.source_txid).lower() == funding_txid and i.source_output_index == vout for i in tx.inputs)
+            return raw if hit else None
+
+        spenders: list[tuple[str, bytes]] = []
+        known = known_spender.lower() if known_spender else None
+        if known is not None and known in candidates:
+            # The record's own refund first: if it spends the outpoint here, no other transaction in
+            # this source's view can, so the rest of the history need not be fetched (review A-2).
+            raw = await spends(known)
+            candidates = [] if raw is not None else [t for t in candidates if t != known]
+            if raw is not None:
+                spenders.append((known, raw))
+        if candidates:
+            raws = await asyncio.gather(*(spends(t) for t in candidates))
+            spenders.extend((t, r) for t, r in zip(candidates, raws) if r is not None)
+        if len(spenders) > 1:
+            raise NetworkError(f"two transactions in this source's history spend {outpoint}")
+        if not spenders and unread is not None:
+            # The record's refund does not spend the outpoint here, and the rest was not read.
+            return CovenantSpendAnswer(source=label, spender_txid=None, raw_tx=None, depth=0, unread=unread)
+        if not spenders:
+            utxos = await src.get_utxos(script_hash)
+            if any(f"{str(u.tx_hash).lower()}:{u.tx_pos}" == f"{funding_txid}:{vout}" for u in utxos):
+                return CovenantSpendAnswer(source=label, spender_txid=None, raw_tx=None, depth=0)
+            raise NetworkError(f"{outpoint} is not in this source's UTXO set, and it names no spender")
+        txid, raw = spenders[0]
+        info = await src.get_transaction_verbose(txid)
+        if not isinstance(info, dict) or not _names_txid(info.get("txid"), txid):
+            raise NetworkError(f"the source's verbose reply does not name {txid}")
+        depth = finite_int(info.get("confirmations", 0) or 0)
+        return CovenantSpendAnswer(source=label, spender_txid=txid, raw_tx=raw, depth=max(0, depth))
+
+
+#: The reads :meth:`RadiantChainIO.covenant_spend_answers` needs of a source.
+_SPEND_READS = ("get_history", "get_transaction", "get_transaction_verbose", "get_utxos")
+
+#: How many other transactions in a covenant script's history the spend read fetches before it gives
+#: up (CHOSEN: an honest covenant has one, its spender; the rest are payments anyone can make).
+MAX_COVENANT_HISTORY = 64
+
+
+@dataclass(frozen=True)
+class CovenantSpendAnswer:
+    """One source's answer about a covenant outpoint (:meth:`RadiantChainIO.covenant_spend_answers`):
+    the transaction that spends it and that transaction's verified bytes, or ``None`` with the
+    outpoint still in the source's UTXO set. ``depth`` is the confirmations the source reports for the
+    spender (0 in its mempool). ``unread`` says why a source could not read its history."""
+
+    source: str
+    spender_txid: str | None
+    raw_tx: bytes | None
+    depth: int
+    #: Why this source's history was not read (too long to fetch); such an answer decides nothing
+    #: and blocks every other answer from deciding.
+    unread: str | None = None
+
+
+class CovenantSpendKind(Enum):
+    """What spent a swap's Radiant covenant (#850 PR 11), by the leaf the spend took."""
+
+    #: Every answering source holds the outpoint unspent.
+    UNSPENT = "unspent"
+    #: The CSV refund leaf: no preimage, the single output pays the maker's holder script.
+    REFUNDED = "refunded"
+    #: The claim leaf: the scriptSig opens ``H``, the single output pays the taker's holder script.
+    CLAIMED = "claimed"
+    #: No source answered, the sources disagree, or the spender is neither leaf.
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CovenantSpend:
+    """:meth:`RadiantCovenantLeg.covenant_spend`'s answer. Read only; the coordinator decides.
+
+    ``depth`` is the depth a quorum of identified operators vouch for
+    (:func:`pyrxd.network.quorum_depth.depth_vouched_by_quorum` at
+    :data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`, one depth per operator, the least it
+    reports), so one operator that over-reports, through however many hosts, cannot bury the spend
+    and, among three or more operators, one that under-reports cannot hold it down; with fewer
+    operators it is the least any source reports. ``disputed`` is a spend not buried at that depth
+    that some source reports buried, the reports differing by more than the burial: the caller must
+    not wait that out in silence. ``operators`` counts the distinct identified operators among the answering sources
+    (:func:`pyrxd.gravity.funding_spv.counted_operators`); ``failed`` names the sources that gave no
+    answer."""
+
+    kind: CovenantSpendKind
+    reason: str
+    txid: str | None = None
+    depth: int | None = None
+    buried: bool = False
+    sources: tuple[str, ...] = ()
+    operators: int = 0
+    failed: tuple[str, ...] = ()
+    disputed: bool = False
+
+
+def _covenant_leaf(cov: HtlcCovenant, raw: bytes, outpoint: str) -> tuple[CovenantSpendKind, str]:
+    """Which leaf of *cov* the transaction *raw* spends *outpoint* by, from its own bytes."""
+    import hashlib
+
+    from pyrxd.transaction.transaction import Transaction
+
+    tx = Transaction.from_hex(raw)
+    funding_txid, vout = _split_outpoint(outpoint)
+    if tx is None or not tx.outputs:
+        return CovenantSpendKind.UNKNOWN, "its bytes do not parse"
+    spending = [
+        i for i in tx.inputs if str(i.source_txid).lower() == funding_txid.lower() and i.source_output_index == vout
+    ]
+    if len(spending) != 1:
+        return CovenantSpendKind.UNKNOWN, "it does not spend the covenant exactly once"
+    script_sig = spending[0].unlocking_script.serialize() if spending[0].unlocking_script else b""
+    out0 = tx.outputs[0].locking_script.serialize()
+    if script_sig == _REFUND_SCRIPT_SIG and out0 == cov.maker_holder_script:
+        return CovenantSpendKind.REFUNDED, "the CSV refund leaf, paying the maker"
+    if (
+        len(script_sig) == 34
+        and script_sig[0] == 0x20
+        and script_sig[-1:] == _CLAIM_SELECTOR_BYTE
+        and hashlib.sha256(script_sig[1:33]).digest() == cov.hashlock
+        and out0 == cov.taker_holder_script
+    ):
+        return CovenantSpendKind.CLAIMED, "the claim leaf, opening H and paying the taker"
+    return CovenantSpendKind.UNKNOWN, "a spend that matches neither leaf of the covenant the terms build"
+
+
+#: The refund leaf's whole scriptSig (``build_htlc_refund_tx``: its selector alone), and the claim
+#: leaf's selector, last after the 32-byte preimage push (``build_htlc_claim_tx``). The builders' own.
+_REFUND_SCRIPT_SIG = _REFUND_SELECTOR
+_CLAIM_SELECTOR_BYTE = _CLAIM_SELECTOR
+
 
 class _AlreadyKnown(Exception):
     """Internal sentinel: a broadcast hit an already-known tx (idempotent success)."""
@@ -1313,6 +1554,104 @@ class RadiantCovenantLeg:
             # only help this refund beat that claim. The floor itself still binds.
             self._assert_affordable(tx, fee, blocks_to_deadline=None, kind="refund")
         return await self._broadcast(tx)
+
+    async def covenant_spend(self, record: SwapRecord, *, burial_blocks: int) -> CovenantSpend:
+        """What spent this swap's covenant, read from every configured source (#850 PR 11).
+
+        The covenant is the one the terms build, at the outpoint the record pins (the outpoint
+        :meth:`refund_asset` spends). Each source names the spender from its own history
+        (:meth:`RadiantChainIO.covenant_spend_answers`); they must all name the same one, or all hold
+        the outpoint unspent, or the answer is ``UNKNOWN``. The spender is classified from its own
+        bytes by the leaf it took, never by its txid: the refund leaf's scriptSig is the selector
+        ``OP_1`` alone and its single output pays the maker's holder script; the claim leaf's opens
+        ``H`` and pays the taker's. Consensus binds each leaf to its output, so a spend that matches
+        neither is ``UNKNOWN``. ``buried`` is the depth a quorum vouches for at or above *burial_blocks*
+        (:class:`CovenantSpend`).
+        A source whose history of the covenant script is too long to read
+        (:data:`MAX_COVENANT_HISTORY`) makes the answer ``UNKNOWN`` too; the record's own refund
+        (``asset_refund_txid``) is still checked at such a source. Never raises for a chain that
+        cannot be read: that is ``UNKNOWN`` with the reason."""
+        if not isinstance(record, SwapRecord):
+            raise ValidationError("record must be a SwapRecord")
+        if not isinstance(burial_blocks, int) or isinstance(burial_blocks, bool) or burial_blocks < 1:
+            raise ValidationError("burial_blocks must be an int >= 1")
+        outpoint = record.radiant_covenant_outpoint
+        if outpoint is None:
+            return CovenantSpend(CovenantSpendKind.UNKNOWN, "the record pins no covenant outpoint")
+        cov = self._build_covenant(record.terms)
+        try:
+            answers, failed = await self.chain_io.covenant_spend_answers(
+                cov.funded_spk, outpoint, known_spender=record.asset_refund_txid
+            )
+        except Exception as exc:
+            return CovenantSpend(CovenantSpendKind.UNKNOWN, f"the covenant could not be read: {exc}")
+        if not answers:
+            why = f" ({', '.join(failed)} failed)" if failed else " (no source can read a script's history)"
+            return CovenantSpend(CovenantSpendKind.UNKNOWN, f"no source answered{why}", failed=failed)
+        sources = tuple(a.source for a in answers)
+        operators = len(counted_operators(sources))
+        unread = [a for a in answers if a.unread is not None]
+        if unread:
+            said = "; ".join(f"{a.source}: {a.unread}" for a in unread)
+            return CovenantSpend(
+                CovenantSpendKind.UNKNOWN,
+                f"what spent {outpoint} cannot be read from every answering source ({said}); anyone can pay the "
+                "covenant's script, so such a source counts against a decision, not as absent",
+                sources=sources,
+                operators=operators,
+                failed=failed,
+            )
+        named = {a.spender_txid for a in answers}
+        if len(named) > 1:
+            said = "; ".join(f"{a.source}: {a.spender_txid or 'unspent'}" for a in answers)
+            return CovenantSpend(
+                CovenantSpendKind.UNKNOWN,
+                f"the sources disagree about what spent {outpoint} ({said})",
+                sources=sources,
+                operators=operators,
+                failed=failed,
+            )
+        txid = named.pop()
+        if txid is None:
+            return CovenantSpend(
+                CovenantSpendKind.UNSPENT,
+                f"{outpoint} is unspent at every answering source",
+                sources=sources,
+                operators=operators,
+                failed=failed,
+            )
+        kind, why = _covenant_leaf(cov, bytes(answers[0].raw_tx or b""), outpoint)
+        # One depth per identified operator (the least it reports through any of its hosts); only
+        # those vouch, so one operator with two hosts, or unidentified sources, cannot bury a spend.
+        # With fewer operators than the quorum the depth is the least any source reports.
+        counted = set(counted_operators(sources))
+        per_operator: dict[str, int] = {}
+        for a in answers:
+            if a.source in counted:
+                per_operator[a.source] = min(a.depth, per_operator.get(a.source, a.depth))
+        if len(per_operator) >= MIN_REPORTING_OPERATORS:
+            depth = depth_vouched_by_quorum(list(per_operator.values()), MIN_REPORTING_OPERATORS)
+            said = f"at depth {depth} (vouched by {MIN_REPORTING_OPERATORS} operators)"
+        else:
+            depth = min(a.depth for a in answers)
+            said = f"at depth {depth} (least reported)"
+        known = kind is not CovenantSpendKind.UNKNOWN
+        buried = known and depth >= burial_blocks
+        deepest = max(a.depth for a in answers)
+        disputed = known and not buried and deepest >= burial_blocks and deepest - depth > burial_blocks
+        if len({a.depth for a in answers}) > 1:
+            said += " of " + ", ".join(f"{a.source}: {a.depth}" for a in answers)
+        return CovenantSpend(
+            kind,
+            f"{outpoint} is spent by {txid}: {why}, {said}",
+            txid=txid,
+            depth=depth,
+            buried=buried,
+            sources=sources,
+            operators=operators,
+            failed=failed,
+            disputed=disputed,
+        )
 
     async def _broadcast(self, tx: Any) -> str:
         raw = tx.serialize()
