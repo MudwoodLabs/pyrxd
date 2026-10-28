@@ -58,7 +58,8 @@ from pyrxd.security.units import PhotonValue, TokenUnits
 # v9 (#850 PR 8) adds ``read_without_role``.
 # v10 (#850 PR 9a) adds ``counter_refund_raw`` (BTC), and allows ``counter_claim_tx`` and
 # ``counter_disposition`` on a BTC record, with BTC txid and block hash shapes.
-SWAP_RECORD_SCHEMA_VERSION = 10
+# v11 (#850 PR 11) adds the ``abort_reason`` value ``covenant_refunded``.
+SWAP_RECORD_SCHEMA_VERSION = 11
 #: How many earlier refunds at one nonce a record keeps (``counter_refund_replaced_tx_hashes``).
 #: CHOSEN: a replacement every ``REFUND_REPLACE_AFTER_S`` for over two hours. The coordinator keeps
 #: the oldest and the newest: when replacements never reach the node, the oldest is the one it holds.
@@ -176,6 +177,9 @@ class AbortReason(Enum):
     #: held nothing that may hold value (no BTC funding transaction, no native contract, and a token
     #: contract only if it was never pushed into and holds no tokens). Nothing was sent.
     TAKER_NEVER_FUNDS = "taker_never_funds"
+    #: The maker's own covenant CSV refund was observed buried (#850 PR 11), on a maker's record that
+    #: never revealed ``p``: the asset is back with the maker. ``asset_refund_txid`` names the refund.
+    COVENANT_REFUNDED = "covenant_refunded"
 
 
 class AbandonCase(Enum):
@@ -334,6 +338,8 @@ class SwapEvent(Enum):
     COUNTER_LEG_EXPIRED_EMPTY = "counter_leg_expired_empty"
     # #850 PR 7b: the operator ends the record on a case with no automatic end (design §3.6).
     OPERATOR_ABANDONED = "operator_abandoned"
+    # #850 PR 11: the maker's covenant CSV refund is observed buried, on the maker's own record.
+    MAKER_COVENANT_REFUND_OBSERVED = "maker_covenant_refund_observed"
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +415,13 @@ _TRANSITION_TABLE: frozenset[tuple[SwapState, SwapEvent, SwapState]] = frozenset
         (SwapState.BTC_LOCKED, SwapEvent.OPERATOR_ABANDONED, SwapState.ABORTED),
         (SwapState.PARAMS_MISMATCH, SwapEvent.OPERATOR_ABANDONED, SwapState.ABORTED),
         (SwapState.BOTH_LOCKED, SwapEvent.OPERATOR_ABANDONED, SwapState.ABORTED),
+        # #850 PR 11 (design §8, D10): a MAKER's record ends when its own covenant CSV refund is seen
+        # buried, from every state in which it has not revealed p. The asset is back with the maker;
+        # the counter leg, if any, is the taker's. Every pair already exists.
+        (SwapState.NEGOTIATED, SwapEvent.MAKER_COVENANT_REFUND_OBSERVED, SwapState.ABORTED),
+        (SwapState.BTC_LOCKED, SwapEvent.MAKER_COVENANT_REFUND_OBSERVED, SwapState.ABORTED),
+        (SwapState.PARAMS_MISMATCH, SwapEvent.MAKER_COVENANT_REFUND_OBSERVED, SwapState.ABORTED),
+        (SwapState.BOTH_LOCKED, SwapEvent.MAKER_COVENANT_REFUND_OBSERVED, SwapState.MUTUAL_REFUND),
     }
 )
 

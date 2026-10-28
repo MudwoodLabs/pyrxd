@@ -494,7 +494,8 @@ _BOTH_LOCKED_REFUND_REASON_ETH = _BOTH_LOCKED_REFUND_COMMON + (
 # money the step would move.
 _MAKER_COVENANT_REFUND_ACTION = (
     "refund your covenant by its CSV leg once t_rxd matures: it is the maker's to send and pays the "
-    "maker (two-host runners: maker --phase abort if the taker never funded, --phase refund otherwise)"
+    "maker (two-host runners: maker --phase abort if the taker never funded or the record is at "
+    "params_mismatch, run again once the refund is buried to close the record; --phase refund otherwise)"
 )
 
 

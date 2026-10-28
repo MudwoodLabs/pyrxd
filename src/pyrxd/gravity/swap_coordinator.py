@@ -88,6 +88,7 @@ from .finality import CounterClaimFinality, CounterClaimState
 from .funding_spv import (
     DEFAULT_ELAPSED_BOUND_POLICY,
     MIN_FUNDING_CONFIRMATIONS,
+    MIN_REPORTING_OPERATORS,
     EarlyElapsedBound,
     ElapsedBoundPolicy,
     MakerFundingNotVerified,
@@ -1686,6 +1687,15 @@ def _serialized_step(method):
             return await method(self, *args, **kwargs)
 
     return _wrapper
+
+
+#: Where a MAKER's covenant refund may be SENT from (#850 PR 11): the states in which the maker has not
+#: revealed ``p`` and has not reached BOTH_LOCKED, whose maker refund is
+#: ``maybe_refund_asset_on_maker_stall``.
+_MAKER_COVENANT_SEND_STATES = frozenset({SwapState.NEGOTIATED, SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH})
+#: Where a MAKER's record may be ended on its covenant's observed refund: every state in which the maker
+#: has not revealed ``p``.
+_MAKER_COVENANT_READ_STATES = _MAKER_COVENANT_SEND_STATES | {SwapState.BOTH_LOCKED}
 
 
 def _leg_is_value_bearing(leg: object) -> bool:
@@ -4456,6 +4466,209 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
+    # -- the maker's own covenant (#850 PR 11, design §8, D10) --------------------------------------
+
+    def _require_maker_role(self, step: str) -> None:
+        """The maker's covenant steps are the MAKER's: the CSV refund pays the maker, so a taker that
+        sent it would strand itself (P3), and a single operator's covenant refund is
+        :meth:`mutual_refund`'s."""
+        if self.config.role is not SwapRole.MAKER:
+            raise ValidationError(
+                f"{step} is a MAKER-side step: the covenant's CSV refund pays the maker. A taker that sends it "
+                "gifts the asset back and loses its only recourse (P3); a single operator's covenant refund is "
+                "mutual_refund's."
+            )
+
+    def _maker_covenant_state_error(self, step: str, states: frozenset[SwapState]) -> ValidationError:
+        """The refusal for a maker covenant step called from a state it does not accept. Each step
+        spells its accepted states out in its own guard, so the watch tower's page sweep can read them
+        (``tests/test_watch_pages_name_state_valid_steps.py``); the module sets pin the same states."""
+        names = ", ".join(sorted(s.value for s in states))
+        hint = (
+            " From both_locked the maker's refund is maybe_refund_asset_on_maker_stall, which checks whether "
+            "you claimed the counter leg; reconcile_covenant records a refund already made."
+            if self.record.state is SwapState.BOTH_LOCKED
+            else ""
+        )
+        return ValidationError(f"{step} is valid from {names}, not {self.record.state.value}.{hint}")
+
+    def _counter_leg_claim_on_record(self) -> str | None:
+        """The counter-leg claim this record holds, if any (``counter_claim_tx``, or the transaction
+        of a recorded ``claimed`` disposition)."""
+        if self.record.counter_claim_tx is not None:
+            return str(self.record.counter_claim_tx)
+        cd = self.record.counter_disposition
+        if cd is not None and cd.kind == "claimed":
+            return str(cd.tx_hash)
+        return None
+
+    async def _pin_maker_covenant(self) -> None:
+        """Pin the covenant outpoint before the maker's refund is sent, so the read that ends the record
+        finds the same output the refund spends. Persisted first. A covenant no longer in the UTXO set
+        cannot be pinned this way."""
+        terms = self.record.terms
+        try:
+            outpoint = await self.radiant_leg.covenant_outpoint(terms)
+        except NetworkError as exc:
+            raise NetworkError(
+                f"the covenant cannot be pinned: {exc}. Nothing was sent and the record is unchanged. If the "
+                "covenant was already spent before this record pinned it, its spend cannot be read from the "
+                "record; check the covenant address yourself."
+            ) from exc
+        spk = bytes(await self.radiant_leg.expected_covenant_scriptpubkey(terms)).hex()
+        self.record = self.record.with_radiant_lock(outpoint, spk)
+        await self._persist_record(self.record, shield=True)
+
+    async def _read_covenant_spend(self) -> Any:
+        """What spent the covenant (:meth:`RadiantCovenantLeg.covenant_spend`), at the burial the
+        maker's funding needed (:meth:`_funding_burial_blocks`): the same reorg depth, now of the spend."""
+        read = getattr(self.radiant_leg, "covenant_spend", None)
+        if not callable(read):
+            raise ValidationError("this Radiant leg cannot read what spent the covenant (a leg written before 0.27)")
+        chain = radiant_chain_for_leg(self.radiant_leg, counter_leg=self.counter_leg)
+        burial = self._funding_burial_blocks(chain, self._funding_value_at_stake_photons(self.record.terms))
+        return await read(self.record, burial_blocks=max(1, int(burial)))
+
+    async def _apply_covenant_spend(self, spend: Any) -> str:
+        """Apply what spent the maker's covenant to the record (#850 PR 11). No broadcast. Returns
+        ``"refunded"`` (the record went terminal and was persisted), ``"pending"`` (a refund not yet
+        buried), ``"single_source"`` (buried, but too few operators on a chain that carries value),
+        ``"unspent"`` or ``"unknown"``.
+
+        * ``REFUNDED`` and buried: NEGOTIATED, BTC_LOCKED and PARAMS_MISMATCH go to ABORTED
+          (``abort_reason`` ``covenant_refunded``); BOTH_LOCKED goes to MUTUAL_REFUND unless the record
+          holds a counter-leg claim, which would make it the maker's second leg (raises). The refund's
+          txid is recorded as ``asset_refund_txid``.
+        * ``CLAIMED``, at any depth: ``p`` is public and the taker took the asset. No edge here; this
+          raises naming the counter-leg claim, which is the maker's to make.
+        * One source, or fewer than :data:`MIN_REPORTING_OPERATORS` operators, decides only on a
+          Radiant network that carries no value (design D4, as on the counter legs).
+        """
+        from .radiant_leg import CovenantSpendKind
+
+        kind = spend.kind
+        if kind is CovenantSpendKind.CLAIMED:
+            raise ValidationError(
+                f"the covenant was CLAIMED by {spend.txid} ({spend.reason}): p is public and the taker has the asset. "
+                "Nothing was sent and the record is unchanged. Claim the counter leg with p if you have not "
+                "(maker_claims_btc from both_locked); if your counter-leg claim was already sent, check it confirmed."
+            )
+        if kind is CovenantSpendKind.UNSPENT:
+            return "unspent"
+        if kind is not CovenantSpendKind.REFUNDED:
+            return "unknown"
+        if not spend.buried:
+            return "pending"
+        if spend.operators < MIN_REPORTING_OPERATORS and _leg_is_value_bearing(self.radiant_leg):
+            return "single_source"
+        state = self.record.state
+        if state is SwapState.BOTH_LOCKED and self._counter_leg_claim_on_record() is not None:
+            raise ValidationError(
+                f"the covenant is refunded to the maker ({spend.txid}), but this record holds a counter-leg claim "
+                f"({self._counter_leg_claim_on_record()}): the maker has both legs, which MUTUAL_REFUND does not "
+                "say. The record is unchanged."
+            )
+        updates: dict[str, Any] = {"asset_refund_txid": str(spend.txid).lower()}
+        if state is not SwapState.BOTH_LOCKED:
+            updates["abort_reason"] = AbortReason.COVENANT_REFUNDED
+        self.record = dataclasses.replace(self.record, **updates)
+        self._advance(SwapEvent.MAKER_COVENANT_REFUND_OBSERVED)
+        await self._persist_record(self.record, shield=True)
+        return "refunded"
+
+    @_serialized_step
+    async def reconcile_covenant(self) -> SwapRecord:
+        """Bring a MAKER's record up to what spent its covenant (#850 PR 11). No broadcast.
+
+        Valid from NEGOTIATED, BTC_LOCKED, PARAMS_MISMATCH and BOTH_LOCKED: the states in which the
+        maker has not revealed ``p``. A buried refund of the covenant ends the record (see
+        :meth:`_apply_covenant_spend`); a refund not yet buried, or a covenant still unspent, changes
+        nothing. A claim of the covenant raises. A read that cannot decide raises
+        :class:`NetworkError` with the reason, the record unchanged. Needs the covenant outpoint
+        pinned on the record."""
+        self._require_maker_role("reconcile_covenant")
+        state = self.record.state
+        if state not in (SwapState.NEGOTIATED, SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
+            raise self._maker_covenant_state_error("reconcile_covenant", _MAKER_COVENANT_READ_STATES)
+        if self.record.radiant_covenant_outpoint is None:
+            raise ValidationError(
+                "reconcile_covenant needs the covenant outpoint pinned on the record; maker_refund_covenant pins "
+                "it before it sends"
+            )
+        spend = await self._read_covenant_spend()
+        outcome = await self._apply_covenant_spend(spend)
+        if outcome == "unknown":
+            raise NetworkError(f"what spent the covenant is unknown: {spend.reason}")
+        if outcome == "single_source":
+            raise NetworkError(
+                f"the covenant reads refunded ({spend.reason}) from fewer than {MIN_REPORTING_OPERATORS} operators, "
+                "on a Radiant network that carries value; nothing changes until more sources agree (design D4)"
+            )
+        return self.record
+
+    @_serialized_step
+    async def maker_refund_covenant(self) -> SwapRecord:
+        """The MAKER's exit from a swap in which it never revealed ``p`` (#850 PR 11, design §8, D10).
+
+        Valid from NEGOTIATED (the taker never funded), BTC_LOCKED (the maker never reached
+        BOTH_LOCKED) and PARAMS_MISMATCH (the maker's own revalidation failed). What spent the
+        covenant is read first (:meth:`RadiantCovenantLeg.covenant_spend`):
+
+        * refunded and buried: the record ends (ABORTED, ``abort_reason`` ``covenant_refunded``,
+          ``asset_refund_txid``), and nothing is sent;
+        * refunded, not yet buried: nothing is sent; call again;
+        * claimed: raises (``p`` is public; see :meth:`_apply_covenant_spend`);
+        * unspent, or a read that cannot decide: the covenant's CSV refund is sent, and the leg itself
+          refuses a covenant that is not live or not yet mature (``NetworkError``, retry at maturity). A
+          refund sent to a covenant that turns out spent fails at the node, harmlessly, so one source
+          that answers wrongly can delay this step, never stop it. The txid is recorded as
+          ``asset_refund_txid``, and the record stays where it is until a later call reads it buried.
+
+        Refused while the record holds a counter-leg claim: ``p`` is then public, and refunding the
+        covenant as well would take both legs. The covenant outpoint is pinned (and persisted) before
+        the first refund, so the read that ends the record finds the output the refund spent.
+        """
+        self._require_maker_role("maker_refund_covenant")
+        state = self.record.state
+        if state not in (SwapState.NEGOTIATED, SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
+            raise self._maker_covenant_state_error("maker_refund_covenant", _MAKER_COVENANT_SEND_STATES)
+        claim = self._counter_leg_claim_on_record()
+        if claim is not None:
+            raise ValidationError(
+                f"this record holds a counter-leg claim ({claim}), so p is public and the counter leg was paid to "
+                "the maker: refunding the covenant as well would take both legs. Nothing was sent."
+            )
+        if self.record.radiant_covenant_outpoint is None:
+            await self._pin_maker_covenant()
+        spend = await self._read_covenant_spend()
+        outcome = await self._apply_covenant_spend(spend)
+        if outcome == "refunded":
+            return self.record
+        if outcome == "pending":
+            logger.info("the covenant refund %s is not yet buried (%s); nothing sent", spend.txid, spend.reason)
+            return self.record
+        if outcome == "single_source":
+            raise NetworkError(
+                f"the covenant reads refunded ({spend.reason}) from fewer than {MIN_REPORTING_OPERATORS} operators, "
+                "on a Radiant network that carries value; nothing changes until more sources agree (design D4). "
+                "Nothing was sent."
+            )
+        try:
+            txid = await self.radiant_leg.refund_asset(self.record)
+        except Exception as exc:
+            if outcome == "unknown":
+                raise NetworkError(
+                    f"what spent the covenant is unknown ({spend.reason}), and the refund was not sent: {exc}"
+                ) from exc
+            raise
+        try:
+            self.record = dataclasses.replace(self.record, asset_refund_txid=str(txid).lower())
+        except ValidationError:
+            logger.warning("the covenant refund returned %r, not a txid; not recorded", txid)
+            return self.record
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
     # -- the counter leg's disposition, read from the chain (#850 PR 5a) --------------------
 
     async def _read_counter_disposition(self) -> Any:
@@ -5214,7 +5427,7 @@ class SwapCoordinator:
     @_serialized_step
     async def abandon_unfunded(self, *, confirm_btc_htlc_empty: bool = False) -> SwapRecord:
         """End a NEGOTIATED record that holds nothing that may hold value (``TAKER_NEVER_FUNDS``;
-        #850 PR 8, design §3.5). The taker's step; a maker's NEGOTIATED exit is #850 PR 11.
+        #850 PR 8, design §3.5). The taker's step; a maker's NEGOTIATED exit is :meth:`maker_refund_covenant` (#850 PR 11).
 
         Refused, with nothing recorded, when the record holds:
 
