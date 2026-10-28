@@ -339,7 +339,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             # answer leaves the diagnosis to `verify_funded`, which refuses anything not exact.
             try:
                 creator = await self.derive_deployer(address)
-            except (NetworkError, ValidationError):
+            except Exception:  # diagnosis only: any failure leaves the gate to `verify_funded`
                 creator = None
             if creator is not None and creator.lower() != self._account_address().lower():
                 raise ValidationError(
