@@ -267,7 +267,17 @@ async def test_the_honest_twin_of_a_malformed_receipt_waits_for_finality(tmp_pat
     assert (await w.decide()).intent is Intent.WATCH
 
 
-@pytest.mark.parametrize("change", [{"blockNumber": "0xzz"}, {"status": "yes"}, {"blockNumber": None}])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"blockNumber": "0xzz"},
+        {"status": "yes"},
+        {"blockNumber": None},
+        {"status": float("inf")},
+        {"blockNumber": float("inf")},
+        {"blockHash": "zz"},
+    ],
+)
 async def test_a_sole_endpoints_malformed_receipt_is_a_typed_verdict_failure(tmp_path, change):
     """``claim_finality_verdict`` over one endpoint (no quorum to catch the field) raises NetworkError,
     which the observer reads as finality un-assessable; the unchanged receipt reads a verdict."""
