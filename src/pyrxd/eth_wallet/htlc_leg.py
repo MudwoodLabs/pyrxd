@@ -392,7 +392,7 @@ CLOSE_NONCE_GAS = 21_000
 
 #: Revert names :meth:`EthHtlcContractLeg.refund_revert_reason` recognises, both contracts' custom
 #: errors that ``refund()`` can raise. Matched by 4-byte selector in the node's error text.
-_REFUND_REVERTS = ("AlreadySettled", "NotYetExpired", "NothingToRefund", "TransferFailed", "SendFailed")
+_REFUND_REVERTS = ("AlreadySettled", "NotYetExpired", "NotRefunder", "NothingToRefund", "TransferFailed", "SendFailed")
 
 
 @dataclass(frozen=True)

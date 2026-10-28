@@ -112,6 +112,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed (breaking)
 
+- **`Erc20Htlc.refund()` is callable by the refundee or the deployer only (#850 PR C).** The
+  contract gains a `deployer` immutable (`msg.sender` of the constructor) and a `NotRefunder` error;
+  `refund()` checks, in order, `AlreadySettled`, `NotYetExpired`, `NotRefunder`, `NothingToRefund`.
+  It still pays the refundee. Before, anyone could refund a matured contract: a third party could
+  refund one holding a first small part of the push, setting `settled`, and the rest of the push,
+  arriving later, could then be moved by nobody. `tests/fixtures/Erc20Htlc.json` is rebuilt, so a
+  contract deployed from an earlier artifact is not one these runners accept, and an older pyrxd
+  verifying a new contract fails closed. `EthHtlc` is unchanged, and so refundable by anyone.
+  - `Erc20HtlcLocator` gains `deployer` (wire key `deployer`, omitted when absent). The taker's leg
+    writes its own key. The maker derives it from the chain
+    (`Erc20HtlcLeg.derive_deployer`): the contract's `deployer()` is accepted only when CREATE from
+    that account at one of its nonces is the contract's address. A locator without it (a record
+    written before this change) fails the runtime compare closed.
+  - `Erc20HtlcLeg.refund` refuses, before signing, a key that is neither the refundee nor the
+    locator's deployer. `refund_revert_reason` names `NotRefunder`.
+  - Refunding an ERC-20 contract by address now needs the refundee's key or the deploying key; the
+    watchtower's legacy page and the two-host runner's interrupted-fund message say so.
+
 - **A multi-source BTC depth is now the depth a quorum of sources vouches for, not the minimum.**
   `MultiSourceBtcFundingReader.confirmations` and the counter-leg disposition reader
   (`read_btc_counter_disposition`) take the deepest depth that at least `quorum` of the answering

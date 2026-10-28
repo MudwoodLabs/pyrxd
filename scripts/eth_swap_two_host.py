@@ -553,9 +553,16 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
             "Nothing was sent. This two-host runner does not resume a fund (it holds no fund lock).\n"
             f"  The contract may hold value. Its deadline is unix {terms.eth_timeout_unix_s} "
             f"({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(int(terms.eth_timeout_unix_s)))}); from then "
-            "on ANY account can call its refund(), which pays the contract's whole balance to its refundee "
-            "(your refund address), from any wallet or, for example:\n"
-            f"    cast send {prior.pending_counter_contract} 'refund()' --rpc-url <your RPC> --interactive\n"
+            + (
+                # A token contract's refund() is callable by its refundee or deployer only (#850 PR C).
+                "on its refundee (your refund address) or the key that deployed it (this runner's ETH key) can "
+                "call its refund(), which pays the contract's whole balance to the refundee, from a wallet "
+                "holding either key or, for example:\n"
+                if terms.token_address
+                else "on ANY account can call its refund(), which pays the contract's whole balance to its refundee "
+                "(your refund address), from any wallet or, for example:\n"
+            )
+            + f"    cast send {prior.pending_counter_contract} 'refund()' --rpc-url <your RPC> --interactive\n"
             "  A token contract whose push was never sent holds nothing, and its refund() reverts "
             "(NothingToRefund)."
         )

@@ -115,10 +115,10 @@ v1 §1 stands. Corrections and additions:
   timelock (`:334-356`). The refund fee is fixed (`btc_wallet/htlc_leg.py:750-757`). A *dropped*
   refund needs no race at all (A7, Mythos M1).
 - **The runners rebuild the record on every recovery phase.**
-  - Each phase builds a fresh record: `scripts/eth_swap_two_host.py:997`, `:1083-1089`,
+  - Each phase builds a fresh record: `scripts/eth_swap_two_host.py:1004`, `:1083-1089`,
     `:1155`; `scripts/btc_swap_two_host.py:1020`, `:1104-1109`, `:1187`.
   - `_coordinator` then persists it to `<keys_out>.swaprec.json`
-    (`scripts/eth_swap_two_host.py:1245-1262`), overwriting what an earlier phase saved.
+    (`scripts/eth_swap_two_host.py:1252-1269`), overwriting what an earlier phase saved.
   - Some paths do load the record: the BTC fund resume (`scripts/btc_swap_two_host.py:640-646`),
     `scripts/eth_swap_run.py:1576-1582` under `--resume`, and
     `scripts/dust_swap_resume.py:79`. The recovery phases do not.
@@ -132,7 +132,7 @@ v1 §1 stands. Corrections and additions:
   thing keeping it disarmed while the maker can still claim (Mythos H3).
 - **Runners set `radiant_covenant_outpoint` too.** It is not only `post_asset_lock_revalidate`:
   the two-host refund phases fabricate it with `with_radiant_lock`
-  (`scripts/eth_swap_two_host.py:1087`, `scripts/btc_swap_two_host.py:1108`) (Mythos I1).
+  (`scripts/eth_swap_two_host.py:1094`, `scripts/btc_swap_two_host.py:1108`) (Mythos I1).
 - **The taker discards the covenant outpoint it verified.** `taker_funds_btc` binds
   `_rerun_outpoint` and drops it (`swap_coordinator.py:2871`). A taker record at `BTC_LOCKED`
   therefore has no outpoint, and re-discovery by scan can be steered by anyone paying the
@@ -169,7 +169,7 @@ Role comes from `CoordinatorConfig.role`, which is not persisted. Still open, an
 | BTC F-A (taker `mutual_refund` still pushes the covenant refund) | PR 1c (runner pre-check, interim); PR 9a (coordinator fix) |
 | Runners that set no role (`eth_swap_run.py`, `eth_swap_grief_run.py`, `dust_swap_run.py`, `dust_swap_resume.py`) | PR R (explicit role), D11 |
 | Runner pre-check "counter leg settled or claimed → refuse `--phase refund`" (Mythos M1) | ETH: PR 1's failure-time read covers the coordinator, and PR R adds the pre-check. BTC: PR 1c |
-| PR 1's claim/settled reads are single-endpoint: `_explain_failed_taker_eth_refund` (#851 `swap_coordinator.py:4236`), called only from `mutual_refund` (#851 `:4384`), and `EthLeg.observed_claim_tx` / `is_settled` (#851 `eth_leg.py:323`, `:338`) | replaced by the shared reader (PR 4) in **PR 6**, which reworks `mutual_refund`; the runner's `--phase claim` discovery (#851 `scripts/eth_swap_two_host.py:677`) is switched to the union read in the same PR. Until then they are used only for refusals and pages (PR R pre-check) |
+| PR 1's claim/settled reads are single-endpoint: `_explain_failed_taker_eth_refund` (#851 `swap_coordinator.py:4247`), called only from `mutual_refund` (#851 `:4384`), and `EthLeg.observed_claim_tx` / `is_settled` (#851 `eth_leg.py:338`, `:338`) | replaced by the shared reader (PR 4) in **PR 6**, which reworks `mutual_refund`; the runner's `--phase claim` discovery (#851 `scripts/eth_swap_two_host.py:684`) is switched to the union read in the same PR. Until then they are used only for refusals and pages (PR R pre-check) |
 
 ## 2. The model
 
@@ -552,7 +552,7 @@ Validators follow the push-field pattern (`swap_state.py:667-679`):
   (M5).
 - **Runner state checks change.** The checks that `SystemExit` on anything but ABORTED or
   MUTUAL_REFUND must poll to terminal:
-  - `scripts/eth_swap_two_host.py:1018-1020` changes in PR 5b;
+  - `scripts/eth_swap_two_host.py:1025-1027` changes in PR 5b;
   - `scripts/btc_swap_two_host.py:1041-1043` and `:1118` change in PR 9a.
 - **Between PR 5b and PR 9a, the two legs behave differently, and that is intended:** ETH refunds
   are pending/no-advance, BTC still advances on broadcast. The BTC runner checks stay valid in
@@ -642,7 +642,7 @@ Mechanism (PR 9b for BTC, PR 10 for ETH; both touch `src/pyrxd/gravity/watch/ada
 ## 6. BTC leg
 
 The weakness is the same as on ETH, and worse:
-- `taker_refund_btc` advances on broadcast (`swap_coordinator.py:4228-4234`);
+- `taker_refund_btc` advances on broadcast (`swap_coordinator.py:4239-4245`);
 - the store drops terminal records (§1);
 - the refund signals BIP125 and has a fixed fee (§1);
 - a dropped refund needs no race.

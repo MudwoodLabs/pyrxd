@@ -3994,7 +3994,18 @@ class SwapCoordinator:
         may_hold_value = not terms.token_address or rec.pending_push_nonce is not None
         build = getattr(self.counter_leg, "expected_locator", None)
         if may_hold_value and callable(build):
-            locator = build(terms, contract_address=address, deploy_tx_hash=deploy_tx)
+            # A token contract's `deployer` (#850 PR C): this leg's key, when the chain shows that key
+            # created it (CREATE at the deploy's nonce). Otherwise none is recorded; the refund then
+            # skips its caller pre-check and the contract still enforces the rule.
+            deployer = None
+            created = getattr(self.counter_leg, "created_by_this_key", None)
+            if terms.token_address and callable(created) and await created(address, deploy_tx):
+                deployer = self.counter_leg.signer_address()
+            locator = (
+                build(terms, contract_address=address, deploy_tx_hash=deploy_tx, deployer=deployer)
+                if deployer is not None
+                else build(terms, contract_address=address, deploy_tx_hash=deploy_tx)
+            )
             self.record = dataclasses.replace(rec.with_counter_lock(locator), fund_refusal=why)
             self._advance(SwapEvent.TAKER_FUNDS_BTC)
             if not await self._save_tracked(sink):

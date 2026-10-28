@@ -2396,8 +2396,15 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
                     )
                 ),
                 recommended_action=(
-                    f"call refund() on the contract {contract} from any account once its timeout has passed (it pays "
-                    "the refundee; no coordinator step runs on a terminal record), and watch until it is final"
+                    f"call refund() on the contract {contract} "
+                    # A token contract's refund() is callable by its refundee or deployer only (#850 PR C).
+                    + (
+                        "from the refundee's key or the key that deployed it"
+                        if record.terms.token_address
+                        else "from any account"
+                    )
+                    + " once its timeout has passed (it pays the refundee; no coordinator step runs on a terminal "
+                    "record), and watch until it is final"
                 ),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,

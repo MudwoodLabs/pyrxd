@@ -64,6 +64,25 @@ _TRANSFER_ABI = [
 ]
 
 
+#: How many of a candidate deployer's nonces :meth:`Erc20HtlcLeg.derive_deployer` searches, newest
+#: first. A bound on local work (one keccak per nonce), not a measurement; a deployer key with more
+#: transactions than this is refused rather than searched.
+DEPLOYER_NONCE_SEARCH = 100_000
+
+
+def _create_rlp(addr: bytes, nonce: int) -> bytes:
+    """``rlp([addr, nonce])`` for a 20-byte ``addr``: the preimage of a CREATE address."""
+    if nonce == 0:
+        n = b"\x80"
+    elif nonce < 0x80:
+        n = bytes([nonce])
+    else:
+        b = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
+        n = bytes([0x80 + len(b)]) + b
+    payload = b"\x94" + addr + n
+    return bytes([0xC0 + len(payload)]) + payload
+
+
 def _create_address(sender: str, nonce: int) -> str:
     """The CREATE address for ``sender`` at ``nonce`` — keccak(rlp([sender, nonce]))[12:].
 
@@ -77,15 +96,7 @@ def _create_address(sender: str, nonce: int) -> str:
     addr = bytes.fromhex(sender[2:] if sender.startswith("0x") else sender)
     if len(addr) != 20:
         raise ValidationError(f"sender must be a 20-byte address, got {len(addr)}")
-    if nonce == 0:
-        n = b"\x80"
-    elif nonce < 0x80:
-        n = bytes([nonce])
-    else:
-        b = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
-        n = bytes([0x80 + len(b)]) + b
-    payload = b"\x94" + addr + n
-    return to_checksum_address(keccak(bytes([0xC0 + len(payload)]) + payload)[12:])
+    return to_checksum_address(keccak(_create_rlp(addr, nonce))[12:])
 
 
 def _fee_fields_of(tx: dict) -> dict[str, int]:
@@ -156,7 +167,65 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         values = super()._immutable_values(locator)
         values["token"] = _addr_word(self._token.address)
         values["amount"] = int(locator.amount_wei).to_bytes(32, "big")
+        # The `deployer` immutable (#850 PR C): `refund` is callable by the refundee or the deployer.
+        # No value without a derived deployer on the locator, so `_expected_runtime` fails closed on a
+        # record written before the field existed rather than masking the slot.
+        deployer = getattr(locator, "deployer", None)
+        if deployer is not None:
+            values["deployer"] = _addr_word(deployer)
         return values
+
+    async def derive_deployer(self, contract_address: str, *, block_identifier: Any = None) -> str:
+        """The account that created the contract at ``contract_address``, from the chain, checked by CREATE.
+
+        The ``deployer`` immutable is set to ``msg.sender`` by the constructor, so the contract names
+        its creator — but a contract whose creation code was not ours could name anyone, so the value
+        read is a candidate, not the answer. It is accepted only when a nonce of the candidate
+        produces this address: ``keccak(rlp([candidate, n]))[12:] == contract_address`` for some ``n``
+        below the candidate's transaction count. That equation is checked here, locally, and no
+        endpoint can make it true for an account that did not create the address.
+
+        The candidate is read through :func:`read_contract` (an identity read, every endpoint's
+        answer at ``block_identifier``), and the transaction count is the MAX over every endpoint at
+        ``latest``: a higher count only widens the search, while a lower one could hide the nonce.
+        An endpoint that does not answer leaves the deployer unknown (a retryable
+        :class:`NetworkError`).
+
+        Divergence from the design text (D1 condition 2), deliberate: it named the sender recovered
+        from the deploy transaction's signature, with the transaction's hash taken from the locator.
+        The maker's locator carries no deploy hash (``UNKNOWN_DEPLOY_TX_HASH``; the taker's word for
+        it is not used), and recovering a signature adds nothing the CREATE equation does not already
+        bind: the equation alone ties the candidate to the address. The search is bounded by
+        :data:`DEPLOYER_NONCE_SEARCH`; a deployer with more transactions than that is refused.
+        """
+        from eth_utils import keccak, to_checksum_address
+
+        _bid = "latest" if block_identifier is None else block_identifier
+
+        def _call(r):
+            c = r.w3.eth.contract(address=contract_address, abi=self._artifact["abi"])
+            return c.functions.deployer().call(block_identifier=_bid)
+
+        candidate = str(await read_contract(self._rpc, _call, label=f"{contract_address}.deployer()"))
+        counts = await self._read_every_endpoint(
+            lambda r: r.get_transaction_count(candidate, "latest"),
+            label=f"transaction count of {candidate}",
+        )
+        count = max(int(c) for c in counts)
+        target = bytes.fromhex(contract_address[2:].lower())
+        sender = bytes.fromhex(candidate[2:])
+        if len(sender) != 20:
+            raise ValidationError(f"{contract_address}.deployer() is not a 20-byte address: {candidate!r}")
+        # Newest first: a swap's deploy is usually among the deployer's latest transactions.
+        for nonce in range(count - 1, max(count - DEPLOYER_NONCE_SEARCH, 0) - 1, -1):
+            if keccak(_create_rlp(sender, nonce))[12:] == target:
+                return to_checksum_address(sender)
+        searched = "every nonce" if count <= DEPLOYER_NONCE_SEARCH else f"its latest {DEPLOYER_NONCE_SEARCH} nonces"
+        raise ValidationError(
+            f"the contract at {contract_address} names {candidate} as its deployer, but no nonce of that "
+            f"account ({searched}, of {count}) creates this address. Refusing: the deployer is derived "
+            "from the chain, and this contract was not created the way an Erc20Htlc deploy creates one."
+        )
 
     async def fund(
         self,
@@ -587,6 +656,9 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             timeout=int(timeout),
             amount_wei=int(amount_wei),
             token_address=self._token.address,
+            # This leg's own key: it sent the deploy (fresh), or the contract is refused by the exact
+            # runtime compare (a resume of a contract another key created).
+            deployer=self._account_address(),
         )
 
     async def refund(
@@ -610,6 +682,9 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         * settled: no early answer here; the parent's preflight reports the revert as before (a
           retry after a refund that already succeeded lands there, not in "nothing to refund").
         * not yet mature: the parent's transient :class:`NetworkError`, unchanged.
+        * matured, unsettled, and this key is neither the refundee nor the locator's deployer:
+          :class:`ValidationError`, before anything is signed (the contract would revert
+          ``NotRefunder``, #850 PR C).
         * matured, unsettled, zero balance: :class:`NothingToRefund`, before anything is signed.
 
         The balance is read from EVERY configured endpoint and the MAX is taken. "Empty" needs every
@@ -621,6 +696,19 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         await self._rpc.assert_chain()
         now_ts = await self._rpc.latest_block_timestamp_min()
         if now_ts >= int(locator.timeout) and not any(await self._settled_word(locator, None)):
+            # The caller check comes next in the contract's order (#850 PR C): only the refundee or
+            # the deployer may refund. From the record's derived deployer; a record without one is
+            # for a contract built before the rule, which any account may refund.
+            deployer = getattr(locator, "deployer", None)
+            if deployer is not None:
+                me = self._account_address().lower()
+                if me not in (locator.refundee.lower(), deployer.lower()):
+                    raise ValidationError(
+                        f"this key ({me}) cannot refund the HTLC at {locator.contract_address}: refund() "
+                        f"is callable by its refundee ({locator.refundee}) or its deployer ({deployer}) "
+                        "only, and reverts NotRefunder for any other account. Nothing was sent. Refund "
+                        "with one of those keys."
+                    )
             answers = await self._read_every_endpoint(
                 lambda r: balance_of(r, self._token, locator.contract_address),
                 label=f"{self._token.symbol}.balanceOf({locator.contract_address})",
