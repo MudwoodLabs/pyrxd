@@ -952,22 +952,27 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
 
     # WHILE THE PUSH IS PENDING the resume REPLACES it (#850 PR 3): one transaction in flight, at the
     # pinned nonce, under the recorded hash, is provably our own push, so the resume re-sends at that
-    # nonce, priced past the pending one. Only one transaction per nonce can mine. Mining resumes for
-    # the replacement, so whichever of the two lands, the value moves once.
+    # nonce, priced past the pending one. Only one transaction per nonce can mine. The replacement is
+    # sent while mining is still off, so it displaces the push in the pool; mining resumes after it.
+    # (Turning automine on first mines the pending push, and the replacement then fails "nonce too low".)
     leg2 = coord2._token_leg
     real_send2 = leg2._sign_and_send
     resent: list[tuple[int, str]] = []
 
     async def _send_and_mine(tx, **kw):
-        _rpc(url, "evm_setAutomine", [True])
         sent = await real_send2(tx, **kw)
         resent.append((int(tx["nonce"]), str(sent).lower()))
+        _rpc(url, "evm_setAutomine", [True])
+        _rpc(url, "evm_mine", [])
         return sent
 
     leg2._sign_and_send = _send_and_mine
     rec = await coord2.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
     assert [n for n, _h in resent] == [int(pinned)], f"the resume did not re-send once at the pinned nonce: {resent}"
     assert resent[0][1] != pinned_hash.lower(), "the re-send was not a new (bumped) transaction"
+    mined = _rpc(url, "eth_getTransactionReceipt", [resent[0][1]])["result"]
+    assert mined is not None and int(mined["status"], 16) == 1, "the replacement did not mine"
+    assert _rpc(url, "eth_getTransactionReceipt", [pinned_hash])["result"] is None, "the replaced push mined too"
 
     # THE property, end to end: crash mid-broadcast, resume, and the value is delivered EXACTLY once.
     assert rec.state is SwapState.BTC_LOCKED, f"the resumed fund did not complete: {rec.state}"
