@@ -145,9 +145,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `depth_sources`, a multi-operator client once per operator) names the spender of the pinned outpoint
     from its own history, by bytes that hash to the txid, or holds the outpoint in its UTXO set. They
     must all agree, or the answer is `UNKNOWN`. The spender is classified by the leaf it took, from
-    its bytes. Its depth is the one a quorum of two answering sources vouches for (the least, with
-    fewer than three), so one source can neither bury it nor, among three, hold it down; a refund some
-    source reports buried but the quorum does not raises, naming each source's depth. On a Radiant
+    its bytes. Its depth is the one two identified operators vouch for (one depth per operator, the
+    least it reports; the least any source reports when fewer than two operators answer), so one
+    operator, through however many hosts, cannot bury it, and among three operators one cannot hold
+    it down. A refund some source reports buried, with the reports differing by more than the burial,
+    raises, naming each source's depth. On a Radiant
     network that carries value, fewer than two identified operators change nothing. Anyone can pay
     the covenant's script, so each source reads the record's own refund (`asset_refund_txid`) first
     and stops there when it spends the covenant; otherwise it fetches the other transactions in its

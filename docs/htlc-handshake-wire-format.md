@@ -437,7 +437,7 @@ the covenant; they are bound only transitively, by recomputing
 `holder_hash(pkh, variant=…, genesis_ref=…)` and comparing it to the dest hash baked into the
 covenant bytecode (`holder_hash`, `htlc_covenant.py:202-222`; the same mechanism proves a credential's owner is the
 payout recipient at `swap_coordinator.py:3588-3592`). A pkh that does not reproduce the dest hash
-is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:1184-1187`).
+is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:1185-1188`).
 Holder-script layouts, from `htlc_covenant.py:190-199`:
 
 | variant | holder script | bytes |
@@ -494,7 +494,7 @@ The values a second implementation should know about:
 | **ETH finalization window floor** | **768 s** (2 post-Merge epochs) | **not a knob** | `swap_coordinator.py:280, 552-557` |
 | `min_ref_confirmations` | 6 | policy | `swap_coordinator.py:1606` |
 | `min_credential_confirmations` | 6 | policy | `swap_coordinator.py:1633` |
-| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:1117` |
+| `RadiantCovenantLeg.min_confirmations` | **1** | policy — see **HZ-8** | `radiant_leg.py:1118` |
 | `maker_stall_safety_window_blocks` (`N`) | 6 | policy | `swap_coordinator.py:1602` |
 
 The gate that consumes them, `assess_claim_finality` (`swap_coordinator.py:1349-1504`), returns
@@ -508,7 +508,7 @@ hashrate feed in the stack.
 
 **No fee parameter crosses the wire.** `NegotiatedTerms` has no fee field, and `DeadlineFeePolicy`
 has no `to_dict`/`from_dict` — it is only ever constructor-injected (`fee_policy.py:157-311`;
-`radiant_leg.py:1118`; `htlc_spend.py:313, 371`). Fees are node policy, not protocol.
+`radiant_leg.py:1120`; `htlc_spend.py:313, 371`). Fees are node policy, not protocol.
 
 This is worth stating explicitly because on Radiant it is unusually consequential: the chain
 supports **neither RBF nor CPFP**, so an under-fee'd time-critical spend is not slow, it is
@@ -767,7 +767,7 @@ say "I will require 6 confirmations", and no message with which to renegotiate.
 
 ### HZ-8: The library default accepts a 1-confirmation covenant
 
-`RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:1116`). The
+`RadiantCovenantLeg(min_confirmations=1)` is the constructor default (`radiant_leg.py:1118`). The
 harness threads an operator flag into it and defaults that to 1 as well, with the flag's own help
 text warning that real value must set it deep (`scripts/btc_swap_two_host.py:1706-1713`). A
 shallow or mempool-only covenant funding is replaceable/reorgable: a maker who double-spends it

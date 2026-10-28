@@ -4624,8 +4624,8 @@ class SwapCoordinator:
         burial (review A-1): one source holding it down must not hold the record in silence."""
         return NetworkError(
             f"the covenant refund {spend.txid} is buried at some sources but not at the depth a quorum vouches for "
-            f"({spend.reason}). The record is unchanged and nothing was sent; a source that lags or under-reports "
-            "holds it, so check or replace that source."
+            f"({spend.reason}). The record is unchanged and nothing was sent. The sources disagree about its depth "
+            "by more than the burial: one lags, under-reports or over-reports. Check them against a node you run."
         )
 
     @_serialized_step

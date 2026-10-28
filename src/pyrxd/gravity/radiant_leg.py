@@ -884,13 +884,14 @@ class CovenantSpendKind(Enum):
 class CovenantSpend:
     """:meth:`RadiantCovenantLeg.covenant_spend`'s answer. Read only; the coordinator decides.
 
-    ``depth`` is the depth a quorum of the answering sources vouch for
+    ``depth`` is the depth a quorum of identified operators vouch for
     (:func:`pyrxd.network.quorum_depth.depth_vouched_by_quorum` at
-    :data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`), so one source that over-reports
-    cannot bury the spend and, among three or more, one that under-reports cannot hold it down; with
-    fewer answers it is the least. ``disputed`` is a spend not buried at that depth that some source
-    reports buried: the sources disagree by more than the burial, which the caller must not wait out
-    in silence. ``operators`` counts the distinct identified operators among the answering sources
+    :data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`, one depth per operator, the least it
+    reports), so one operator that over-reports, through however many hosts, cannot bury the spend
+    and, among three or more operators, one that under-reports cannot hold it down; with fewer
+    operators it is the least any source reports. ``disputed`` is a spend not buried at that depth
+    that some source reports buried, the reports differing by more than the burial: the caller must
+    not wait that out in silence. ``operators`` counts the distinct identified operators among the answering sources
     (:func:`pyrxd.gravity.funding_spv.counted_operators`); ``failed`` names the sources that gave no
     answer."""
 
@@ -1620,11 +1621,24 @@ class RadiantCovenantLeg:
                 failed=failed,
             )
         kind, why = _covenant_leaf(cov, bytes(answers[0].raw_tx or b""), outpoint)
-        depth = depth_vouched_by_quorum([a.depth for a in answers], MIN_REPORTING_OPERATORS)
+        # One depth per identified operator (the least it reports through any of its hosts); only
+        # those vouch, so one operator with two hosts, or unidentified sources, cannot bury a spend.
+        # With fewer operators than the quorum the depth is the least any source reports.
+        counted = set(counted_operators(sources))
+        per_operator: dict[str, int] = {}
+        for a in answers:
+            if a.source in counted:
+                per_operator[a.source] = min(a.depth, per_operator.get(a.source, a.depth))
+        if len(per_operator) >= MIN_REPORTING_OPERATORS:
+            depth = depth_vouched_by_quorum(list(per_operator.values()), MIN_REPORTING_OPERATORS)
+            said = f"at depth {depth} (vouched by {MIN_REPORTING_OPERATORS} operators)"
+        else:
+            depth = min(a.depth for a in answers)
+            said = f"at depth {depth} (least reported)"
         known = kind is not CovenantSpendKind.UNKNOWN
         buried = known and depth >= burial_blocks
-        disputed = known and not buried and max(a.depth for a in answers) >= burial_blocks
-        said = f"at depth {depth} (vouched by a quorum of the answering sources)"
+        deepest = max(a.depth for a in answers)
+        disputed = known and not buried and deepest >= burial_blocks and deepest - depth > burial_blocks
         if len({a.depth for a in answers}) > 1:
             said += " of " + ", ".join(f"{a.source}: {a.depth}" for a in answers)
         return CovenantSpend(

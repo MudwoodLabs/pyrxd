@@ -680,3 +680,51 @@ async def test_an_unidentified_source_does_not_count_as_an_operator(monkeypatch)
     monkeypatch.setattr(sc, "_leg_is_value_bearing", lambda leg: True)
     with pytest.raises(NetworkError, match="fewer than 2 operators"):
         await coord.reconcile_covenant()
+
+
+# --------------------------------------------------------------------------- re-review of the Mythos round
+
+
+async def test_one_operator_with_two_hosts_cannot_bury_a_mempool_refund(monkeypatch):
+    """Re-review M: depths are counted one per operator, so an operator answering through two hosts is
+    one vote; with one honest operator at 0 the refund is not buried, and the spread is reported."""
+    swap = _Swap(sources=1)
+    swap.chain.add(swap.refund_tx())  # in the mempool
+    liars = [FakeRadiantSource(swap.chain, f"https://a{i}.evil-op.org", depth_bonus=100) for i in (1, 2)]
+    coord = swap.coordinator(pin=True, leg=swap.leg(sources=[*swap.sources, *liars]))
+    monkeypatch.setattr(sc, "_leg_is_value_bearing", lambda leg: True)
+    with pytest.raises(NetworkError, match="not at the depth a quorum vouches for"):
+        await coord.reconcile_covenant()
+    assert coord.record.state is SwapState.NEGOTIATED and coord.persisted == []
+
+
+async def test_unidentified_sources_cannot_vouch_for_a_burial(monkeypatch):
+    swap = _Swap(sources=2)
+    swap.chain.add(swap.refund_tx())  # in the mempool
+    liars = [FakeRadiantSource(swap.chain, f"https://u{i}.example-u{i}.org", depth_bonus=100) for i in (1, 2)]
+    for liar in liars:
+        liar.source_key = "unlabelled"
+    coord = swap.coordinator(pin=True, leg=swap.leg(sources=[*swap.sources, *liars]))
+    monkeypatch.setattr(sc, "_leg_is_value_bearing", lambda leg: True)
+    with pytest.raises(NetworkError, match="not at the depth a quorum vouches for"):
+        await coord.reconcile_covenant()
+    assert coord.record.state is SwapState.NEGOTIATED and coord.persisted == []
+
+
+async def test_HONEST_two_operators_at_their_own_depth_vouch_for_a_burial(monkeypatch):
+    swap = _Swap(sources=1)
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 9)
+    other = [FakeRadiantSource(swap.chain, f"https://b{i}.other-op.org") for i in (1, 2)]
+    coord = swap.coordinator(pin=True, leg=swap.leg(sources=[*swap.sources, *other]))
+    monkeypatch.setattr(sc, "_leg_is_value_bearing", lambda leg: True)
+    assert (await coord.reconcile_covenant()).state is SwapState.ABORTED
+
+
+async def test_HONEST_a_one_block_lag_is_pending_not_a_dispute():
+    """Re-review L: a source one block behind at burial 1 holds the record quietly (pending)."""
+    swap = _Swap(sources=1)
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip)  # 1 deep
+    lagging = FakeRadiantSource(swap.chain, "https://c.example-c.org", depth_bonus=-1)  # reports 0
+    coord = swap.coordinator(pin=True, leg=swap.leg(sources=[swap.sources[0], lagging]))
+    rec = await coord.reconcile_covenant()
+    assert rec.state is SwapState.NEGOTIATED and coord.persisted == []
