@@ -157,6 +157,22 @@ async def test_a_single_endpoint_over_the_cap_is_unknown(tmp_path):
     assert (await w.observe()).eth_disposition is DispositionKind.UNKNOWN
 
 
+@pytest.mark.parametrize("kind", ["odd_claimed", "foreign"])
+async def test_logs_that_nominate_nothing_do_not_count_toward_the_cap(tmp_path, kind):
+    """The cap counts what ``_nominates`` would verify, nothing else: a sole endpoint serving more than the
+    cap of ``Claimed`` logs whose data does not open H, or of logs from another contract, still answers,
+    so its F_EXPIRED stands (counting every log would drop it and read UNKNOWN)."""
+    w = _EthTower(tmp_path, endpoints=1)
+    ghosts = _ghosts(MAX_NOMINATIONS_PER_ENDPOINT + 1, kind="claimed", preimage=b"\x5b" * 32)
+    if kind == "foreign":
+        ghosts = tuple(
+            {**g, "address": "0x" + "77" * 20}
+            for g in _ghosts(MAX_NOMINATIONS_PER_ENDPOINT + 1, kind="refunded", preimage=b"")
+        )
+    w.endpoints[0].extra_logs = ghosts
+    assert (await w.observe()).eth_disposition is DispositionKind.F_EXPIRED
+
+
 # --------------------------------------------------------------------------- N-C: at the cap (honest twin)
 
 
@@ -192,6 +208,9 @@ _MALFORMED = [
     {"status": {"nested": 1}},
     {"logs": ["not a log"]},
     {"logs": [{"address": CONTRACT, "topics": 7, "data": "0x"}]},
+    {"status": float("inf")},
+    {"blockNumber": float("inf")},
+    {"blockHash": "zz"},
 ]
 
 

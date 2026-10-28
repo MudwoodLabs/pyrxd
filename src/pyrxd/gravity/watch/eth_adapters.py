@@ -261,7 +261,7 @@ class RpcEthChainSource:
         try:
             status = int(receipt.get("status", 0))
             tx_block = int(receipt["blockNumber"]) if status == 1 else 0
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
             # A malformed receipt (one endpoint's, with a single --eth-rpc-url) is a typed read
             # failure, never an untyped error out of observe() (sandbox review N-D).
             raise NetworkError(f"receipt({claim_tx_hash}) is malformed ({type(exc).__name__})") from exc
@@ -273,8 +273,12 @@ class RpcEthChainSource:
         receipt_hash = receipt.get("blockHash")
         if receipt_hash is None:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+        try:
+            receipt_hash_bytes = bytes(receipt_hash)
+        except (TypeError, ValueError) as exc:
+            raise NetworkError(f"receipt({claim_tx_hash}) has a malformed blockHash ({type(exc).__name__})") from exc
         canonical = await self._rpc.canonical_block_hash(tx_block)
-        if not canonical or bytes(receipt_hash) != canonical:
+        if not canonical or receipt_hash_bytes != canonical:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
         finalized = await self._rpc.finalized_block_number()  # rejects finalized > head (fail-closed)
         if tx_block <= finalized:

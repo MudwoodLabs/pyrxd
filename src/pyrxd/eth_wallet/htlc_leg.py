@@ -155,7 +155,7 @@ def _int_or_none(v: Any) -> int | None:
         if isinstance(v, str):
             return int(v, 16) if v.startswith("0x") else int(v)
         return int(v)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise NetworkError(f"RPC returned a non-integer field: {str(v)[:34]!r}") from exc
 
 
