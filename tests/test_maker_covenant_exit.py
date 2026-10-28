@@ -530,3 +530,34 @@ async def test_an_unspent_answer_needs_the_outpoint_in_the_sources_utxo_set():
         await _one(swap, _NoUtxos(swap.chain, "https://a.example-a.org"))
     honest = await _one(swap, FakeRadiantSource(swap.chain, "https://b.example-b.org"))
     assert honest.spender_txid is None and honest.unread is None
+
+
+class _CountingSource(FakeRadiantSource):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.fetched: list[str] = []
+
+    async def get_transaction(self, txid):
+        self.fetched.append(txid)
+        return await super().get_transaction(txid)
+
+
+async def test_past_the_cap_only_the_records_own_refund_is_fetched():
+    """Re-review L3: the shortcut is a fetch bound, not only an answer."""
+    swap = _Swap()
+    refund = swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 3)
+    _spam(swap)
+    src = _CountingSource(swap.chain, "https://a.example-a.org")
+    answer = await RadiantChainIO._spender_from_one("s", src, swap.cov.funded_spk, swap.outpoint, refund)
+    assert answer.spender_txid == refund and src.fetched == [refund]
+
+
+async def test_a_recorded_txid_that_does_not_spend_the_covenant_reads_unread_past_the_cap():
+    """Re-review L1: a recorded txid (from the primary's broadcast reply) that is only a payment to the
+    script must leave the source unread, not failed, so it still counts against a decision."""
+    swap = _Swap()
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 3)
+    spam = _spam(swap)
+    src = FakeRadiantSource(swap.chain, "https://a.example-a.org")
+    answer = await RadiantChainIO._spender_from_one("s", src, swap.cov.funded_spk, swap.outpoint, spam[0])
+    assert answer.unread is not None and answer.spender_txid is None

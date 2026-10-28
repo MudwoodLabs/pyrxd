@@ -785,19 +785,17 @@ class RadiantChainIO:
         if funding_txid not in history:
             raise NetworkError("the covenant's funding transaction is not in this source's history of its script")
         candidates = [t for t in dict.fromkeys(history) if t != funding_txid]
+        unread: str | None = None
         if len(candidates) > MAX_COVENANT_HISTORY:
             # Anyone can pay a covenant's public script; past this many the read does not fetch them.
             # It checks the record's own refund if the source lists it, and otherwise answers unread.
+            unread = (
+                f"its history of the covenant script holds {len(candidates)} other transactions, more than the "
+                f"{MAX_COVENANT_HISTORY} read"
+            )
             known = known_spender.lower() if known_spender else None
             if known is None or known not in candidates:
-                return CovenantSpendAnswer(
-                    source=label,
-                    spender_txid=None,
-                    raw_tx=None,
-                    depth=0,
-                    unread=f"its history of the covenant script holds {len(candidates)} other transactions, "
-                    f"more than the {MAX_COVENANT_HISTORY} read",
-                )
+                return CovenantSpendAnswer(source=label, spender_txid=None, raw_tx=None, depth=0, unread=unread)
             candidates = [known]
         spenders: list[tuple[str, bytes]] = []
         for txid in candidates:
@@ -811,6 +809,9 @@ class RadiantChainIO:
                 spenders.append((txid, raw))
         if len(spenders) > 1:
             raise NetworkError(f"two transactions in this source's history spend {outpoint}")
+        if not spenders and unread is not None:
+            # The record's refund does not spend the outpoint here, and the rest was not read.
+            return CovenantSpendAnswer(source=label, spender_txid=None, raw_tx=None, depth=0, unread=unread)
         if not spenders:
             utxos = await src.get_utxos(script_hash)
             if any(f"{str(u.tx_hash).lower()}:{u.tx_pos}" == f"{funding_txid}:{vout}" for u in utxos):
