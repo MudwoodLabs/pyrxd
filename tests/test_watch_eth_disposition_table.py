@@ -710,6 +710,22 @@ async def test_an_ack_of_an_unassessable_claim_race_does_not_silence_its_squeeze
     assert len(ch.sent) == 2, "the ACK of the un-assessable page silenced the winner-take-all page"
 
 
+@pytest.mark.parametrize(
+    ("finality", "intent"),
+    [(CounterClaimState.FINAL, Intent.PAGE_CLAIM), (CounterClaimState.NOT_YET_FINAL_LIVE, Intent.WATCH)],
+)
+def test_a_scan_hit_the_endpoints_agree_is_our_claim_stays_the_claim_race_beside_a_broken_read(finality, intent):
+    """N-A's twin: beside an UNKNOWN read, a scan hit whose receipt every endpoint agrees is our claim
+    (so its finality was read) is the claim race, not "investigate"."""
+    d = _d(
+        _record(SwapState.BTC_LOCKED),
+        _obs(eth_claim_detected=True, eth_claim_finality=finality, eth_disposition=DispositionKind.UNKNOWN),
+    )
+    assert d.intent is intent
+    if intent is Intent.PAGE_CLAIM:
+        assert d.situation == decide_mod.SITUATION_CLAIM_RACE
+
+
 async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):
     """One endpoint that fails drops out of the scan; the primary failing still raises (the reconciler
     pages a decision-required), as before the union."""
