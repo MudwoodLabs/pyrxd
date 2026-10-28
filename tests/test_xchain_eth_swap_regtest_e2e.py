@@ -863,7 +863,17 @@ class TestEthRxdSwap:
         assert rec.state is SwapState.BOTH_LOCKED and rec.counter_refund_tx_hash is not None, rec.state.value
         _anvil_mine(url, 3)  # --slots-in-an-epoch 1: finalized = latest - 2
         rec = await coord.mutual_refund()
-        assert rec.state is SwapState.MUTUAL_REFUND
+        # DIAGNOSTIC (temporary): what the reader saw.
+        _d = await coord._read_counter_disposition()
+        _fin = _anvil_rpc(url, "eth_getBlockByNumber", ["finalized", False])["result"]
+        _lat = _anvil_rpc(url, "eth_getBlockByNumber", ["latest", False])["result"]
+        _rcpt = _anvil_rpc(url, "eth_getTransactionReceipt", [rec.counter_refund_tx_hash])["result"]
+        assert rec.state is SwapState.MUTUAL_REFUND, (
+            f"DIAG kind={_d.kind} why={_d.reason!r} d={_d!r} fin={int(_fin['number'], 16)} "
+            f"lat={int(_lat['number'], 16)} fin_ts={int(_fin['timestamp'], 16)} timeout={terms.eth_timeout_unix_s} "
+            f"rcpt_block={_rcpt and int(_rcpt['blockNumber'], 16)} rcpt_status={_rcpt and _rcpt['status']} "
+            f"rcpt_logs={_rcpt and len(_rcpt['logs'])} rec={rec!r}"
+        )
         _outpoint_txid, _, _outpoint_vout = coord.record.radiant_covenant_outpoint.partition(":")
         rxd_spent = node.rxd("gettxout", _outpoint_txid, _outpoint_vout or "0")
         assert rxd_spent in (None, ""), "RXD covenant should be refunded (spent) on mutual refund"
