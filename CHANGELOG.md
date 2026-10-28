@@ -756,7 +756,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scan at the deploy transaction's block, so on every taker or single-operator ETH record that
   reached BOTH_LOCKED it answered `UNKNOWN`, and `mutual_refund` sent our refund but never moved the
   record to MUTUAL_REFUND (nor sent a single operator's covenant refund). The nightly ETH e2e had
-  failed on this since #850 PR 6. Records already written at BOTH_LOCKED still carry the
+  failed on this since #850 PR 6. The watchtower's ETH claim scan reads the same field; on such a
+  record it failed closed (an "investigate" page each tick) rather than scanning. Only a taker's
+  or single operator's own deploy is kept; a maker's record still carries the placeholder, since a
+  deploy hash there is the taker's word. Records already written at BOTH_LOCKED still carry the
   placeholder.
 
 - **The watchtower no longer lets one BTC source, or an unreadable covenant, lower a page.**
