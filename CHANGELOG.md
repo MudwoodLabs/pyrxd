@@ -750,6 +750,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **One RXD source pushing the covenant's lock height below 0 no longer quiets the near-`t_rxd` page
+  (Mythos B-1).** The tower derives the lock height as `tip - depth + 1` from the lowest tip and the
+  deepest covenant depth its RXD sources report, and dropped a height below 0 as unread. One source
+  got there by over-reporting the depth or under-reporting its tip, and at `BOTH_LOCKED` the unread
+  branch watches on the counter-leg clock, so where honest sources paged `both_locked_refund_due` the
+  tower stayed silent until the BTC refund matured or the ETH timeout passed. Such a height now reads
+  as locked at height 0, with the tip shifted up so the `depth` blocks between them stand: the same
+  reading an in-range depth that deep already gave.
+
 - **One ETH endpoint can no longer multiply the counter-leg reader's reads, or turn a malformed
   receipt into a generic reconcile error.**
   - `read_counter_disposition` verified every transaction any endpoint's log scan nominated, each by

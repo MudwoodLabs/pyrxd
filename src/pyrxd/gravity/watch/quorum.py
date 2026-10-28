@@ -267,8 +267,7 @@ class ChainObserver(Observer):
     async def observe(self, swap_id: str, record: SwapRecord) -> Observations:
         tip = await self._rxd.tip_height()
         # Asset-lock height from the covenant's confirmation depth: tip - confs + 1. Shared by both
-        # directions. Out-of-range (bogus/lying source) → None so the gate sees "un-assessable" and
-        # decide() fails closed, rather than feeding a nonsensical height to the gate.
+        # directions. A depth past the tip is shifted, never dropped (below).
         # THE depth->height conversion, and the only one on this path. It is written out rather
         # than implied because the reverse mistake (storing the depth) is the defect this whole
         # unit-tagging exists for: `Confirmations` in, `ChainHeight` out, with the arithmetic
@@ -281,9 +280,16 @@ class ChainObserver(Observer):
         if record.radiant_covenant_outpoint is not None and record.state is not SwapState.NEGOTIATED:
             cov_confs = await self._rxd.covenant_confirmations(record.radiant_covenant_outpoint)
             if cov_confs is not None and cov_confs >= 1:
-                candidate = ChainHeight(int(tip) - int(cov_confs) + 1)
-                if 0 <= candidate <= tip:
-                    asset_locked = candidate
+                candidate = int(tip) - int(cov_confs) + 1
+                if candidate < 0:
+                    # The depth (MAX across sources) is past the tip (MIN across sources): one source
+                    # over-reported its depth or under-reported its tip. Dropping the height read as
+                    # unread and watched on the counter-leg clock, which quieted the near-t_rxd page
+                    # (Mythos B-1). decide() reads only the gap between the two heights, so shift both
+                    # up to keep it at ``cov_confs - 1``, the gap an in-range depth gives.
+                    tip = ChainHeight(int(cov_confs) - 1)
+                    candidate = 0
+                asset_locked = ChainHeight(candidate)
         low_corr = not self._rxd_corroborated
 
         if record.terms.counter_chain == "eth":
