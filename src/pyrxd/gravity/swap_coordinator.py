@@ -3738,11 +3738,15 @@ class SwapCoordinator:
         try:
             reverified = await verify(locator.contract_address, self.record.terms, block_identifier=block_id)
             # The re-verified locator is rebuilt from config and the terms, so it names no deploy
-            # transaction. Keep the one on record: the counter-leg disposition reader starts its log
-            # scan at that transaction's block, and without it every later read is UNKNOWN, so
-            # mutual_refund and reconcile_counter_leg could never see our refund land.
+            # transaction. Keep the one on record when we deployed it ourselves (a taker's or single
+            # operator's fund): the counter-leg disposition reader and the watchtower's claim scan
+            # start at that transaction's block, and without it every later read is UNKNOWN, so
+            # mutual_refund and reconcile_counter_leg could never see our refund land. A maker's
+            # record keeps the placeholder: a deploy hash there is the taker's word, and a later
+            # transaction named as the deploy could start a scan past a real claim.
             if (
-                str(reverified.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH
+                self.config.role is not SwapRole.MAKER
+                and str(reverified.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH
                 and str(locator.deploy_tx_hash).lower() != UNKNOWN_DEPLOY_TX_HASH
                 and str(reverified.contract_address).lower() == str(locator.contract_address).lower()
             ):

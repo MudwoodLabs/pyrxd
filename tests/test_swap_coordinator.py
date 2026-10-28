@@ -2812,6 +2812,23 @@ async def test_eth_revalidate_without_a_recorded_deploy_tx_stays_unknown():
     assert rec.counterchain_locator.deploy_tx_hash == "0x" + "00" * 32
 
 
+async def test_eth_revalidate_on_a_maker_record_never_keeps_a_deploy_tx():
+    # A deploy hash on a maker's record is the taker's word (scripts/eth_swap_two_host.py,
+    # _maker_view): a later transaction named as the deploy could start the claim scan past a real
+    # claim. The re-verify must not carry it forward.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd, role=SwapRole.MAKER)
+    coord.record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(_eth_locator(h))
+    coord.record = coord.record.with_state(SwapState.BTC_LOCKED)
+    assert coord.record.counterchain_locator.deploy_tx_hash == "0x" + "cd" * 32
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED and "verify_counterparty" in leg.calls
+    assert rec.counterchain_locator.deploy_tx_hash == "0x" + "00" * 32
+
+
 async def test_eth_fund_rejects_wrong_wei_amount():
     # The funded-amount bind runs in the ETH wei unit (mirrors the BTC sats bind).
     secret, h = generate_secret()
