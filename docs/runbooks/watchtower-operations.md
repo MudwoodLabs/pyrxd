@@ -63,7 +63,8 @@ into the same app or receiver changes nothing.
   chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes
   from its own vetted registry for the given chain id (768 s Ethereum/Sepolia, 900 s Base/Optimism,
   1200 s Arbitrum, 6000 s Linea). On a chain id the registry does not know, it logs an `ERROR` and
-  leaves the gate un-assessable, which pages `SQUEEZED` "verify finality manually" *every tick* —
+  leaves the gate un-assessable, which pages `SQUEEZED` "verify finality manually" *every tick*
+  (situation `claim_race_unassessable`, so an ACK of it does not silence the winner-take-all page) —
   pass `--eth-finalization-window-s` with a sourced figure for that chain. Do not shrink it to
   quieten a page: the reserve is compared against the room left before the maker's refund opens, so
   a smaller window makes the gate say WAIT with less margin than the chain actually needs.
@@ -131,8 +132,9 @@ into the same app or receiver changes nothing.
   maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`
   (a maker's record: `reconcile_counter_leg` alone, which only records the claim, so the record stays
   at BTC_LOCKED and the page repeats until ACKed). The claim scan
-  asks every endpoint; a log it counts as a claim that the reader does not count as one (and that no
-  claim on record explains) pages CRITICAL "investigate" (a maker's record is told to refund its
+  asks every endpoint; a log it counts as a claim that the reader does not count as one, or that no
+  endpoint agrees is our claim when the reader cannot read the contract (and that no claim on record
+  explains), pages CRITICAL "investigate" (a maker's record is told to refund its
   covenant if no log opens H). Once ACKed, that page stays quiet while the log is served, so watch
   the counter leg's timeout yourself. A claim kept on the record (`counter_claim_tx`) that no read
   shows this turn pages the covenant claim, on every turn until your refund is final; its text also
