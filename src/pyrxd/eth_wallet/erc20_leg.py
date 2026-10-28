@@ -175,6 +175,23 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             values["deployer"] = _addr_word(deployer)
         return values
 
+    def _has_artifact_shape(self, code: bytes) -> bool:
+        """Whether ``code`` equals this artifact's runtime everywhere outside the immutable slots.
+
+        A shape check for diagnosis, never a pass: it ignores the slots, so it can only say a contract
+        is certainly not ours. Whether the slots hold the negotiated values is the exact compare's job.
+        """
+        expected = self.expected_runtime_code
+        if len(code) != len(expected):
+            return False
+        masked_code, masked_expected = bytearray(code), bytearray(expected)
+        for offsets in (self._artifact.get("immutableReferences") or {}).values():
+            for ref in offsets:
+                start, length = int(ref["start"]), int(ref["length"])
+                masked_code[start : start + length] = bytes(length)
+                masked_expected[start : start + length] = bytes(length)
+        return masked_code == masked_expected
+
     async def derive_deployer(self, contract_address: str, *, block_identifier: Any = None) -> str:
         """The account that created the contract at ``contract_address``, from the chain, checked by CREATE.
 
@@ -189,7 +206,9 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         ``block_identifier``), after the contract's code is read at the same block: no code there is
         the deploy not yet buried at that block, said as such, and a contract with no working
         ``deployer()`` is refused as not an Erc20Htlc of this build, rather than surfacing a raw
-        decoding error.
+        decoding error. Code that differs from the artifact outside the immutable slots is refused
+        the same way before the getter is read, since a fleet whose every endpoint fails the getter
+        would otherwise report an outage.
 
         Each endpoint's transaction count for the candidate opens its own window, the
         :data:`DEPLOYER_NONCE_SEARCH` nonces below that count, and a hit in ANY window is accepted:
@@ -211,11 +230,20 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         from eth_utils import keccak, to_checksum_address
 
         _bid = "latest" if block_identifier is None else block_identifier
-        if not await self._rpc.get_code(contract_address, block_identifier):
+        code = await self._rpc.get_code(contract_address, block_identifier)
+        if not code:
             raise ValidationError(
                 f"no contract code at {contract_address} as of block_identifier={block_identifier!r}, so its "
                 "deployer cannot be read. If that is 'finalized', the deploy is most likely simply NOT YET "
                 "FINALIZED: retry once it buries. Empty code at a checkpoint is not evidence of a wrong contract."
+            )
+        if not self._has_artifact_shape(bytes(code)):
+            # Diagnosis only, and only ever a refusal: the exact compare in `verify_funded` still gates.
+            # Without it a contract with no `deployer()` failed the getter on every endpoint, which a
+            # fleet reports as a retryable outage rather than a wrong contract (re-review MED-1).
+            raise ValidationError(
+                f"the code at {contract_address} is not this build's Erc20Htlc: it differs from the artifact "
+                "outside the immutable slots, so no value of any immutable could make it match. Refusing."
             )
 
         def _call(r):
@@ -243,8 +271,11 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         answers = await asyncio.gather(
             *(r.get_transaction_count(candidate, "latest") for r in endpoints), return_exceptions=True
         )
-        counts = sorted({int(a) for a in answers if not isinstance(a, BaseException) and int(a) >= 0})
-        silent = len(answers) - sum(1 for a in answers if not isinstance(a, BaseException))
+        # A count outside [0, 2**64) is no answer: EIP-2681 caps an account's nonce below 2**64, and a
+        # larger one would not RLP-encode as a nonce (re-review LOW-2).
+        valid = [int(a) for a in answers if not isinstance(a, BaseException) and 0 <= int(a) < 2**64]
+        counts = sorted(set(valid))
+        silent = len(answers) - len(valid)
         target = bytes.fromhex(contract_address[2:].lower())
         searched: set[int] = set()
         for count in counts:

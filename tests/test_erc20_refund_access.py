@@ -43,6 +43,8 @@ _TOKEN = Erc20Token("TKN", "0x" + "70" * 20, 6, 31337, has_blacklist=False)
 _TIMEOUT = 2_000_000_000
 _CLAIMANT = "0x" + "44" * 20
 _REFUNDEE = "0x" + "55" * 20
+# The artifact's runtime with its immutable slots as built (zero): the shape a deployed one has.
+_RUNTIME = bytes.fromhex(_ARTIFACT["runtime_bytecode"][2:])
 
 
 def _key() -> PrivateKeyMaterial:
@@ -161,10 +163,10 @@ def test_a_locator_with_no_deployer_fails_closed_rather_than_masking_the_slot() 
 class _Endpoint:
     """One endpoint: the contract's ``deployer()`` answer and the candidate's transaction count."""
 
-    def __init__(self, candidate, count, *, code: bytes = b"\x60\x80") -> None:
+    def __init__(self, candidate, count, *, code: bytes | None = None) -> None:
         self.candidate = candidate
         self.count = count
-        self.code = code
+        self.code = _RUNTIME if code is None else code
         self.getter_blocks: list[object] = []
         self.code_blocks: list[object] = []
         endpoint = self
@@ -310,6 +312,93 @@ def test_a_contract_without_a_working_getter_is_a_typed_refusal() -> None:
     who = derive_address(_key())
     with pytest.raises(ValidationError, match="no working deployer"):
         _derive(_Endpoint(RuntimeError("could not decode output"), 9), _create_address(who, 5))
+
+
+def _getter_failing_fleet(code: bytes) -> _Fleet:
+    """Every endpoint's getter fails, and the quorum says so the way the real fleet does: as an outage."""
+
+    class _OutageFleet(_Fleet):
+        async def eth_call_quorum(self, make_call, *, label, combine=None):
+            try:
+                return await super().eth_call_quorum(make_call, label=label, combine=combine)
+            except Exception as exc:
+                raise NetworkError(f"{label}: only 0 of {len(self.sources)} endpoints answered") from exc
+
+    return _OutageFleet([_Endpoint(RuntimeError("could not decode output"), 9, code=code) for _ in range(2)])
+
+
+def test_a_fleet_refuses_code_that_is_not_this_build_rather_than_reporting_an_outage() -> None:
+    """Re-review MED-1. Every endpoint failed the getter on another contract (the native EthHtlc
+    here), which the real fleet reports as a retryable NetworkError. The shape check refuses it as a
+    wrong contract first, and no getter is read."""
+    native = json.loads((Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
+    fleet = _getter_failing_fleet(bytes.fromhex(native["runtime_bytecode"][2:]))
+    with pytest.raises(ValidationError, match="not this build's Erc20Htlc"):
+        _derive(fleet, "0x" + "c0" * 20)
+    assert all(e.getter_blocks == [] for e in fleet.sources)
+
+
+def test_one_byte_outside_the_slots_is_not_this_build_but_any_slot_contents_are() -> None:
+    """The honest side of the shape check: it ignores every immutable slot (a real deploy fills them),
+    and nothing else. A changed logic byte is refused; a changed slot byte reaches the getter."""
+    refs = _ARTIFACT["immutableReferences"]
+    slot_bytes = {r["start"] + i for offs in refs.values() for r in offs for i in range(r["length"])}
+    logic = next(i for i in range(len(_RUNTIME)) if i not in slot_bytes)
+    forged = bytearray(_RUNTIME)
+    forged[logic] ^= 0xFF
+    with pytest.raises(ValidationError, match="not this build's Erc20Htlc"):
+        _derive(_getter_failing_fleet(bytes(forged)), "0x" + "c0" * 20)
+    filled = bytearray(_RUNTIME)
+    for i in slot_bytes:
+        filled[i] = 0xAB
+    with pytest.raises(NetworkError, match="only 0 of 2"):
+        _derive(_getter_failing_fleet(bytes(filled)), "0x" + "c0" * 20)
+
+
+@pytest.mark.parametrize("absurd", [2**64, 2**400, -1])
+def test_a_count_no_nonce_can_have_is_no_answer(absurd) -> None:
+    """Re-review LOW-2. A count of 2**400 made the RLP encoder raise a raw ValueError on a miss. A
+    count outside [0, 2**64) now counts as no answer: a miss is the typed retryable NetworkError,
+    and an honest endpoint beside the liar still derives the creator."""
+    who, creator = derive_address(_key()), derive_address(_key())
+    with pytest.raises(NetworkError, match="1 of 2 endpoints did not report"):
+        _derive(_Fleet([_Endpoint(who, absurd), _Endpoint(who, 9)]), _create_address(creator, 5))
+    assert _derive(_Fleet([_Endpoint(who, absurd), _Endpoint(who, 9)]), _create_address(who, 5)).lower() == who.lower()
+
+
+def test_a_resume_whose_derivation_fails_is_still_gated_by_verify_funded(monkeypatch) -> None:
+    """Re-review LOW-3. The resume's deployer check is diagnosis only: when derivation fails it must
+    not refuse, and it must not skip the gate either. ``verify_funded`` runs and its refusal stands."""
+    from pyrxd.eth_wallet.locator import PendingDeploy
+
+    leg = _leg(_Rpc())
+    seen = []
+
+    async def _derive_deployer(contract, *, block_identifier=None):
+        raise NetworkError("every endpoint down")
+
+    async def _verify(locator, **k):
+        seen.append(locator.deployer)
+        raise ValidationError("runtime does not match the expected bytecode")
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr(leg, "derive_deployer", _derive_deployer)
+    monkeypatch.setattr(leg, "verify_funded", _verify)
+    monkeypatch.setattr(erc20_leg_mod, "assert_token_matches_chain", _ok)
+    with pytest.raises(ValidationError, match="runtime does not match"):
+        asyncio.run(
+            leg.fund(
+                hashlock=b"\x22" * 32,
+                claimant=_CLAIMANT,
+                refundee=_REFUNDEE,
+                timeout=_TIMEOUT,
+                amount_wei=1,
+                resume_from=PendingDeploy(address="0x" + "c0" * 20, deploy_tx_hash="0x" + "11" * 32),
+            )
+        )
+    assert seen == [leg._account_address().lower()]
 
 
 def test_resume_of_a_contract_another_key_deployed_says_so_and_sends_nothing(monkeypatch) -> None:
