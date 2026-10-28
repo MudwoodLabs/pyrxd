@@ -1606,8 +1606,14 @@ def _decide_eth(
         return dataclasses.replace(
             base,
             reason=base.reason
-            + "; the detection scan also names a log on the ETH contract that the reader does not count as a "
-            "claim that opens H (read the contract's logs on another endpoint)",
+            + (
+                "; the reader could not read the ETH contract and the detection scan names a log on it that no "
+                "endpoint agrees is a claim: p may be public, so read the contract's logs on another endpoint "
+                "before relying on this refund"
+                if obs.eth_disposition is DispositionKind.UNKNOWN
+                else "; the detection scan also names a log on the ETH contract that the reader does not count as "
+                "a claim that opens H (read the contract's logs on another endpoint)"
+            ),
         )
 
     # A claim after a params mismatch (#850 PR 10, design §3.2): there is deliberately no way into the

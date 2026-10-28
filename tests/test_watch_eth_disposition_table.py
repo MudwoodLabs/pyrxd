@@ -726,6 +726,21 @@ def test_a_scan_hit_the_endpoints_agree_is_our_claim_stays_the_claim_race_beside
         assert d.situation == decide_mod.SITUATION_CLAIM_RACE
 
 
+async def test_a_hidden_claim_after_a_params_mismatch_beside_a_broken_read_says_p_may_be_public(tmp_path):
+    """Re-review C1: the maker's claim is final, and one endpoint forks a read, withholds the claim's
+    receipt and serves a decoy, so the reader is UNKNOWN and finality un-assessable. The refund page
+    must not say the reader found no claim: it did not read the logs, and p may be public."""
+    w = _EthTower(tmp_path, state=SwapState.PARAMS_MISMATCH, endpoint_kw=[{"fork": "x"}, {}, {}])
+    claim = w.chain.claim(CLAIM_BLOCK)
+    w.endpoints[0].extra_logs = (_fake_claim_log(w.chain.preimage),)
+    w.endpoints[0].hide_receipts = (claim,)
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_finality is None
+    d = await w.decide()
+    assert "p may be public" in d.reason
+    assert "does not count as a claim" not in d.reason
+
+
 async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):
     """One endpoint that fails drops out of the scan; the primary failing still raises (the reconciler
     pages a decision-required), as before the union."""

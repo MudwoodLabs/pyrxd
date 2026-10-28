@@ -145,7 +145,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     or beside an `UNKNOWN` read where no candidate is a claim the endpoints agree on, pages
     `PAGE_SQUEEZED` "investigate" at `BTC_LOCKED` or `BOTH_LOCKED` (on a taker's or no-role record
     that holds a claim, the D14 page), not a claim race whose steps the coordinator refuses on an
-    `UNKNOWN` read (Mythos pass 2, N-A). An un-assessable claim race (BTC or ETH) now carries its
+    `UNKNOWN` read (Mythos pass 2, N-A); at `PARAMS_MISMATCH` the same hit gives the refund page,
+    whose text says p may be public when the read failed. An un-assessable claim race (BTC or ETH) now carries its
     own `situation`, `claim_race_unassessable`, so its ACK no longer silences the winner-take-all
     page the race later squeezes into (N-B; an existing ACK of the shared key pages once more).
   - `--eth-rpc-url` on `pyrxd-watchtower` may be repeated: two or more endpoints (distinct operators)
