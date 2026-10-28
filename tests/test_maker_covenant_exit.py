@@ -728,3 +728,19 @@ async def test_HONEST_a_one_block_lag_is_pending_not_a_dispute():
     coord = swap.coordinator(pin=True, leg=swap.leg(sources=[swap.sources[0], lagging]))
     rec = await coord.reconcile_covenant()
     assert rec.state is SwapState.NEGOTIATED and coord.persisted == []
+
+
+async def test_with_fewer_than_two_operators_the_least_depth_of_every_source_counts():
+    """Re-review L1: below two identified operators the depth is the least ANY source reports,
+    unidentified ones included, so an unidentified source at 0 holds a buried refund (pending)."""
+    swap = _Swap(sources=1)
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 9)  # 10 deep at the identified source
+    unlabelled = FakeRadiantSource(swap.chain, "https://u.example-u.org", depth_bonus=-1000)
+    unlabelled.source_key = "unlabelled"
+    coord = swap.coordinator(pin=True, leg=swap.leg(sources=[*swap.sources, unlabelled], min_confirmations=3))
+    with pytest.raises(NetworkError, match="not at the depth a quorum vouches for"):
+        await coord.reconcile_covenant()
+    assert coord.record.state is SwapState.NEGOTIATED and coord.persisted == []
+    # The honest pair: the same identified source alone ends the record.
+    alone = swap.coordinator(pin=True, leg=swap.leg(min_confirmations=3))
+    assert (await alone.reconcile_covenant()).state is SwapState.ABORTED

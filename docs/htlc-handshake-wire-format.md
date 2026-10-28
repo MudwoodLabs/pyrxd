@@ -465,10 +465,10 @@ one-sided taker loss because the claim leaf does not cap value.
 
 All three additionally pin `OP_TXOUTPUTCOUNT OP_1` (exactly one output) and the destination hash.
 The leg re-reads the on-chain value rather than trusting a self-report, filtering the covenant UTXO
-set on the expected value and failing closed when nothing matches (`radiant_leg.py:389-392`). When
+set on the expected value and failing closed when nothing matches (`radiant_leg.py:390-393`). When
 **several** outputs match it does **not** refuse: it selects the earliest-confirmed one (unconfirmed
 sorts last; ties break on txid, then index), and once the funded outpoint is recorded, the claim
-pins to it instead of scanning again (`radiant_leg.py:393-438`). Refusing was the weakness this
+pins to it instead of scanning again (`radiant_leg.py:394-439`). Refusing was the weakness this
 replaced. The covenant SPK is a pure function of public terms, so a second payment to it can come
 from anyone who can build one, and a refusal would let that payment block the taker's claim until
 the maker's CSV refund opens. That is a one-sided taker loss. Selecting is safe because every
