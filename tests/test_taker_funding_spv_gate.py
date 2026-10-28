@@ -1939,6 +1939,25 @@ async def test_a_definitively_refused_token_resume_whose_push_may_have_been_sent
     assert "the token push may have been sent" in str(exc) and "fund" not in eth.calls
 
 
+@pytest.mark.parametrize("created", [True, False], ids=["this-key-created-it", "not-shown"])
+async def test_a_tracked_token_resume_records_the_deployer_only_when_the_chain_shows_this_key(created):
+    """#850 PR C, review LOW-1. The token locator's ``deployer`` (who may refund) is this leg's key
+    when ``created_by_this_key`` confirms the CREATE; otherwise none is recorded, and the refund then
+    skips its caller pre-check while the contract still enforces the rule."""
+    leg = FakeEthLeg(preimage=os.urandom(32), verdict=_final())
+    leg.created_by_key = created
+    coord, _eth, _exc, _ = await _resume(covenant_funded=True, now=_LATE, token="0x" + "77" * 20, push_nonce=7, leg=leg)
+    loc = coord.record.counterchain_locator
+    assert coord.record.state is SwapState.BTC_LOCKED and "deploy-proof" in leg.calls
+    assert loc.deployer == (leg.signer if created else None)
+
+
+async def test_a_tracked_NATIVE_resume_never_asks_who_deployed_it():
+    """A native contract has no deployer immutable; nothing is read or recorded for one."""
+    coord, eth, _exc, _ = await _resume(covenant_funded=True, now=_LATE)
+    assert not hasattr(coord.record.counterchain_locator, "deployer") and "deploy-proof" not in eth.calls
+
+
 async def test_a_leg_that_cannot_rebuild_the_locator_keeps_the_handle_and_says_so():
     class _NoExpected(FakeEthLeg):
         expected_locator = None

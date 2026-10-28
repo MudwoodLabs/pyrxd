@@ -298,10 +298,12 @@ class EthLeg:
         # taken from the taker. It decides only who may call refund(), which always pays the refundee,
         # so it is not what protects the maker; it is bound so the runtime compare leaves no slot
         # unverified. Read at the same pinned block as every other check.
-        deployer = None
+        # The asset checks first: they need no chain read, so a terms/leg mismatch is refused as such
+        # rather than after a read of a contract that may not even be the right kind (review MED-3).
+        expected = self.expected_locator(terms, contract_address=contract_address)
         if getattr(self._leg, "token", None) is not None:
             deployer = await self._leg.derive_deployer(contract_address, block_identifier=block_identifier)
-        expected = self.expected_locator(terms, contract_address=contract_address, deployer=deployer)
+            expected = self.expected_locator(terms, contract_address=contract_address, deployer=deployer)
         await self._leg.verify_funded(
             expected, expected_amount_wei=int(terms.value_amount), block_identifier=block_identifier
         )

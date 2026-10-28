@@ -169,7 +169,7 @@ Role comes from `CoordinatorConfig.role`, which is not persisted. Still open, an
 | BTC F-A (taker `mutual_refund` still pushes the covenant refund) | PR 1c (runner pre-check, interim); PR 9a (coordinator fix) |
 | Runners that set no role (`eth_swap_run.py`, `eth_swap_grief_run.py`, `dust_swap_run.py`, `dust_swap_resume.py`) | PR R (explicit role), D11 |
 | Runner pre-check "counter leg settled or claimed → refuse `--phase refund`" (Mythos M1) | ETH: PR 1's failure-time read covers the coordinator, and PR R adds the pre-check. BTC: PR 1c |
-| PR 1's claim/settled reads are single-endpoint: `_explain_failed_taker_eth_refund` (#851 `swap_coordinator.py:4247`), called only from `mutual_refund` (#851 `:4384`), and `EthLeg.observed_claim_tx` / `is_settled` (#851 `eth_leg.py:338`, `:338`) | replaced by the shared reader (PR 4) in **PR 6**, which reworks `mutual_refund`; the runner's `--phase claim` discovery (#851 `scripts/eth_swap_two_host.py:684`) is switched to the union read in the same PR. Until then they are used only for refusals and pages (PR R pre-check) |
+| PR 1's claim/settled reads are single-endpoint: `_explain_failed_taker_eth_refund` (#851 `swap_coordinator.py:4248`), called only from `mutual_refund` (#851 `:4384`), and `EthLeg.observed_claim_tx` / `is_settled` (#851 `eth_leg.py:340`, `:338`) | replaced by the shared reader (PR 4) in **PR 6**, which reworks `mutual_refund`; the runner's `--phase claim` discovery (#851 `scripts/eth_swap_two_host.py:684`) is switched to the union read in the same PR. Until then they are used only for refusals and pages (PR R pre-check) |
 
 ## 2. The model
 
@@ -642,7 +642,7 @@ Mechanism (PR 9b for BTC, PR 10 for ETH; both touch `src/pyrxd/gravity/watch/ada
 ## 6. BTC leg
 
 The weakness is the same as on ETH, and worse:
-- `taker_refund_btc` advances on broadcast (`swap_coordinator.py:4239-4245`);
+- `taker_refund_btc` advances on broadcast (`swap_coordinator.py:4240-4246`);
 - the store drops terminal records (§1);
 - the refund signals BIP125 and has a fixed fee (§1);
 - a dropped refund needs no race.

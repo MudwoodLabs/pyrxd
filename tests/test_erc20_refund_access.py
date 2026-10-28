@@ -161,15 +161,19 @@ def test_a_locator_with_no_deployer_fails_closed_rather_than_masking_the_slot() 
 class _Endpoint:
     """One endpoint: the contract's ``deployer()`` answer and the candidate's transaction count."""
 
-    def __init__(self, candidate: str, count) -> None:
+    def __init__(self, candidate, count, *, code: bytes = b"\x60\x80") -> None:
         self.candidate = candidate
         self.count = count
+        self.code = code
         self.getter_blocks: list[object] = []
+        self.code_blocks: list[object] = []
         endpoint = self
 
         class _Call:
             async def call(self, block_identifier=None):
                 endpoint.getter_blocks.append(block_identifier)
+                if isinstance(endpoint.candidate, Exception):
+                    raise endpoint.candidate
                 return endpoint.candidate
 
         class _Fns:
@@ -181,6 +185,10 @@ class _Endpoint:
                 return type("C", (), {"functions": _Fns()})()
 
         self.w3 = type("W3", (), {"eth": _Eth()})()
+
+    async def get_code(self, address, block_identifier=None):
+        self.code_blocks.append(block_identifier)
+        return self.code
 
     async def get_transaction_count(self, who, block):
         assert who == self.candidate and block == "latest"
@@ -194,6 +202,9 @@ class _Fleet:
 
     def __init__(self, endpoints) -> None:
         self.sources = endpoints
+
+    async def get_code(self, address, block_identifier=None):
+        return await self.sources[0].get_code(address, block_identifier)
 
     async def eth_call_quorum(self, make_call, *, label, combine=None):
         answers = [await make_call(e) for e in self.sources]
@@ -231,18 +242,39 @@ def test_a_getter_naming_an_account_that_did_not_create_the_address_is_refused()
 
 
 def test_a_lagging_endpoint_cannot_hide_the_nonce() -> None:
-    """The count is the MAX over every endpoint: one reporting a count below the deploy's nonce
-    does not make the honest contract unverifiable."""
+    """Each endpoint opens its own window: one reporting a count below the deploy's nonce does not
+    make the honest contract unverifiable."""
     who = derive_address(_key())
     fleet = _Fleet([_Endpoint(who, 3), _Endpoint(who, 9), _Endpoint(who, 9)])
     assert _derive(fleet, _create_address(who, 5)).lower() == who.lower()
 
 
-def test_an_endpoint_that_does_not_answer_leaves_the_deployer_unknown() -> None:
+@pytest.mark.parametrize("liar_index", [0, 2], ids=["primary", "later"])
+def test_an_OVER_reporting_endpoint_cannot_move_the_window_off_the_nonce(liar_index) -> None:
+    """Review MED-1. With a MAX over the counts, one endpoint reporting 10**9 moved the only window
+    past the deploy's nonce and an honest contract was refused, blaming the taker. Each count now
+    opens its own window and a hit in any is accepted. The primary is tested as the liar too."""
     who = derive_address(_key())
+    eps = [_Endpoint(who, 9), _Endpoint(who, 9), _Endpoint(who, 9)]
+    eps[liar_index].count = 10**9
+    assert _derive(_Fleet(eps), _create_address(who, 5)).lower() == who.lower()
+
+
+def test_a_silent_endpoint_does_not_stop_a_hit_in_another_window() -> None:
+    """Review MED-2: an endpoint that does not answer contributes no window; it does not stall a
+    derivation another endpoint's window settles."""
+    who = derive_address(_key())
+    fleet = _Fleet([_Endpoint(who, NetworkError("429")), _Endpoint(who, 9)])
+    assert _derive(fleet, _create_address(who, 5)).lower() == who.lower()
+
+
+def test_no_hit_with_a_silent_endpoint_is_unknown_not_a_refusal() -> None:
+    """The silent endpoint may hold the window that matches, so no hit is retryable, never a verdict."""
+    who, creator = derive_address(_key()), derive_address(_key())
     fleet = _Fleet([_Endpoint(who, 9), _Endpoint(who, NetworkError("down"))])
-    with pytest.raises(NetworkError, match="did not answer"):
-        _derive(fleet, _create_address(who, 5))
+    with pytest.raises(NetworkError, match="did not report") as e:
+        _derive(fleet, _create_address(creator, 5))
+    assert not isinstance(e.value, ValidationError)
 
 
 def test_endpoints_disagreeing_on_the_candidate_is_not_resolved_by_one_of_them() -> None:
@@ -252,14 +284,67 @@ def test_endpoints_disagreeing_on_the_candidate_is_not_resolved_by_one_of_them()
         _derive(fleet, _create_address(who, 5))
 
 
-def test_the_search_is_bounded_to_the_latest_nonces(monkeypatch) -> None:
+def test_the_search_is_bounded_below_each_count(monkeypatch) -> None:
     monkeypatch.setattr(erc20_leg_mod, "DEPLOYER_NONCE_SEARCH", 10)
     who = derive_address(_key())
     # Inside the window (nonces 90..99 of a count of 100): found.
     assert _derive(_Endpoint(who, 100), _create_address(who, 90)).lower() == who.lower()
-    # One below it: refused, and the message says the search was partial.
-    with pytest.raises(ValidationError, match="its latest 10 nonces"):
+    # One below it: refused, and the message names the window searched.
+    with pytest.raises(ValidationError, match=r"\[90, 100\)"):
         _derive(_Endpoint(who, 100), _create_address(who, 89))
+
+
+def test_no_code_at_the_block_says_not_yet_finalized_and_reads_no_getter() -> None:
+    """Review MED-3: at 'finalized' before the deploy buries there is no code. That is said as such
+    (a ValidationError the coordinator handles), and the getter is never called."""
+    who = derive_address(_key())
+    ep = _Endpoint(who, 9, code=b"")
+    with pytest.raises(ValidationError, match="NOT YET FINALIZED"):
+        _derive(ep, _create_address(who, 5), block_identifier="finalized")
+    assert ep.code_blocks == ["finalized"] and ep.getter_blocks == []
+
+
+def test_a_contract_without_a_working_getter_is_a_typed_refusal() -> None:
+    """A contract with no ``deployer()`` (an old artifact, or another contract) makes web3 raise a
+    decoding error; it is refused as a ValidationError, not let out as a raw exception."""
+    who = derive_address(_key())
+    with pytest.raises(ValidationError, match="no working deployer"):
+        _derive(_Endpoint(RuntimeError("could not decode output"), 9), _create_address(who, 5))
+
+
+def test_resume_of_a_contract_another_key_deployed_says_so_and_sends_nothing(monkeypatch) -> None:
+    """Review LOW-4: the resume names the real deployer instead of letting the runtime compare call
+    the operator's own contract a wrong one."""
+    from pyrxd.eth_wallet.locator import PendingDeploy
+
+    other = derive_address(_key())
+    leg = _leg(_Rpc())
+    sent = []
+
+    async def _derive_deployer(contract, *, block_identifier=None):
+        return other
+
+    async def _verify(*a, **k):
+        sent.append("verify")
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr(leg, "derive_deployer", _derive_deployer)
+    monkeypatch.setattr(leg, "verify_funded", _verify)
+    monkeypatch.setattr(erc20_leg_mod, "assert_token_matches_chain", _ok)
+    with pytest.raises(ValidationError, match="Resume with the key that deployed it"):
+        asyncio.run(
+            leg.fund(
+                hashlock=b"\x22" * 32,
+                claimant=_CLAIMANT,
+                refundee=_REFUNDEE,
+                timeout=_TIMEOUT,
+                amount_wei=1,
+                resume_from=PendingDeploy(address="0x" + "c0" * 20, deploy_tx_hash="0x" + "11" * 32),
+            )
+        )
+    assert sent == []
 
 
 # ── the maker's verify uses the derived deployer ────────────────────────────────────────────────

@@ -147,8 +147,9 @@ into the same app or receiver changes nothing.
   for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
   contract's `Claimed` event that opens H.
   Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
-  ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the
-  timeout; it pays the refundee) and is read again every turn; a claim, or one on record, pages the
+  ones: an unsettled contract pages "call `refund()` on the contract" (after the timeout anyone may
+  call it on a native ETH contract, and only the refundee or the deploying key on an ERC-20 one; it
+  pays the refundee) and is read again every turn; a claim, or one on record, pages the
   covenant claim; a refund, or an empty contract no signed push can still fill, agrees and is marked.
   An empty contract a push may still fill is read again every turn.
 - **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,

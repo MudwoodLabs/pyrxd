@@ -555,7 +555,7 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
             f"({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(int(terms.eth_timeout_unix_s)))}); from then "
             + (
                 # A token contract's refund() is callable by its refundee or deployer only (#850 PR C).
-                "on its refundee (your refund address) or the key that deployed it (this runner's ETH key) can "
+                "on its refundee (your refund address) or the key that sent its deploy (this runner's ETH key, if unchanged since) can "
                 "call its refund(), which pays the contract's whole balance to the refundee, from a wallet "
                 "holding either key or, for example:\n"
                 if terms.token_address

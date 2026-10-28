@@ -2016,6 +2016,37 @@ class TestARerunFundNeverOverwritesTheRecord:
         assert _record_path(args).read_bytes() == before
         assert built == {}, "a leg was built before the refusal"
 
+    async def test_a_TOKEN_interrupted_deploy_names_who_may_refund_it(self, eth_mod, tmp_path, monkeypatch):
+        """#850 PR C: an Erc20Htlc's refund() is callable by its refundee or deployer only, so the
+        refusal must not tell the operator that any account can call it (review LOW-2)."""
+        import dataclasses
+
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=False)
+        terms = dataclasses.replace(terms, token_address="0x" + "70" * 20)
+        env = json.loads((io_dir / "envelope.json").read_text())
+        env["terms"] = terms.to_dict()
+        (io_dir / "envelope.json").write_text(json.dumps(env))
+        await _seed(
+            args,
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=terms,
+                pending_counter_contract="0x" + "98" * 20,
+                pending_counter_deploy_tx="0x" + "97" * 32,
+                pending_push_nonce=3,
+            ),
+        )
+        built = _wire_eth(eth_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="interrupted fund") as raised:
+            await eth_mod.taker_phase_fund(_with_fee(args))
+        msg = str(raised.value.code)
+        assert "ANY account" not in msg
+        assert "its refundee (your refund address) or the key that sent its deploy" in msg
+        assert ("cast send 0x" + "98" * 20 + " 'refund()'") in msg
+        assert built == {}
+
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     async def test_a_completed_fund_is_not_funded_again(self, name, tmp_path, monkeypatch):
         mod = _load(name)

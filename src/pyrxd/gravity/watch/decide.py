@@ -2294,7 +2294,7 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
       p is public beside it. Conclusive once the page is delivered after t_rxd has matured.
     * a log the detection scan counts as a claim and the reader does not → PAGE_SQUEEZED "investigate".
     * unsettled (OPEN, TIP_EXPIRED, F_EXPIRED) → PAGE_REFUND: the recorded refund never landed, and
-      ``refund()`` on the contract (anyone may call it after the timeout; it pays the refundee) is
+      ``refund()`` on the contract (after the timeout anyone may call it on EthHtlc, only the refundee or the deployer on Erc20Htlc; it pays the refundee) is
       still due. Never conclusive, like an unspent BTC HTLC. Not urgent: before the timeout a refund
       cannot be sent yet, and from the timeout on the contract refuses a claim, so nothing races it.
     * REFUNDED, or EXPIRED_EMPTY_CLOSED, on a read of more than one endpoint → agrees; conclusive. One

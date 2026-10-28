@@ -3999,8 +3999,9 @@ class SwapCoordinator:
             # skips its caller pre-check and the contract still enforces the rule.
             deployer = None
             created = getattr(self.counter_leg, "created_by_this_key", None)
-            if terms.token_address and callable(created) and await created(address, deploy_tx):
-                deployer = self.counter_leg.signer_address()
+            signer = getattr(self.counter_leg, "signer_address", None)
+            if terms.token_address and callable(created) and callable(signer) and await created(address, deploy_tx):
+                deployer = signer()
             locator = (
                 build(terms, contract_address=address, deploy_tx_hash=deploy_tx, deployer=deployer)
                 if deployer is not None
