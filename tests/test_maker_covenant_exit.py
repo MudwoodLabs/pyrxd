@@ -25,7 +25,7 @@ from pyrxd.btc_wallet import taproot as t
 from pyrxd.gravity import swap_coordinator as sc
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
-from pyrxd.gravity.radiant_leg import CovenantSpendKind, RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.radiant_leg import MAX_COVENANT_HISTORY, CovenantSpendKind, RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import (
     AbortReason,
@@ -421,3 +421,112 @@ def test_each_steps_spelled_out_guard_matches_its_module_set():
     guards = _state_guards()
     assert guards["maker_refund_covenant"] == sc._MAKER_COVENANT_SEND_STATES
     assert guards["reconcile_covenant"] == sc._MAKER_COVENANT_READ_STATES
+
+
+# --------------------------------------------------------------------------- review round 1 (M1, M2, L2)
+
+
+def _spam(swap: _Swap, n: int = MAX_COVENANT_HISTORY + 1) -> list[str]:
+    """*n* payments to the covenant's public script, mined: anyone can make them."""
+    return [swap.chain.add(payment(swap.cov.funded_spk, 600), height=swap.chain.tip - 1) for _ in range(n)]
+
+
+async def test_a_source_that_trims_a_spammed_history_cannot_decide_alone():
+    """Review M1. The covenant script is spammed past the read cap, so the honest sources cannot read
+    it; a liar that trims its history and serves a decoy refund must not then decide on its own.
+    Each honest source answers 'unread', which blocks a decision: the record stays, nothing persisted."""
+    swap = _Swap()
+    spam = _spam(swap)
+    liar = FakeRadiantSource(swap.chain, "https://liar.example-x.org", hide=set(spam), extra=[swap.refund_tx()])
+    coord = swap.coordinator(state=SwapState.BTC_LOCKED, pin=True, leg=swap.leg(sources=[*swap.sources, liar]))
+    with pytest.raises(NetworkError, match="cannot be read from every answering source"):
+        await coord.reconcile_covenant()
+    assert coord.record.state is SwapState.BTC_LOCKED and coord.persisted == []
+
+
+async def test_a_spammed_history_still_ends_the_record_on_its_own_recorded_refund():
+    """The honest pair to the above: the record's own refund (``asset_refund_txid``, a txid no source
+    nominated) is checked at each source despite the spam, so the record still ends once it is buried."""
+    swap = _Swap()
+    coord = swap.coordinator()
+    await coord.maker_refund_covenant()
+    _spam(swap)
+    swap.chain.mine(1)
+    rec = await coord.maker_refund_covenant()
+    assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.COVENANT_REFUNDED
+    assert _broadcasts(swap) == 1
+
+
+async def test_a_spammed_history_without_a_recorded_refund_says_why_it_cannot_decide():
+    swap = _Swap()
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip - 3)  # made elsewhere, so not on the record
+    _spam(swap)
+    coord = swap.coordinator(state=SwapState.BTC_LOCKED, pin=True)
+    with pytest.raises(NetworkError, match=f"more than the {MAX_COVENANT_HISTORY} read"):
+        await coord.reconcile_covenant()
+    assert coord.record.state is SwapState.BTC_LOCKED
+
+
+async def test_a_params_mismatch_record_with_the_unverifiable_placeholder_is_repinned_and_refunded():
+    """Review M2. post_asset_lock_revalidate pins a placeholder when it cannot recompute the covenant.
+    The maker's exit re-pins the covenant the terms build, then refunds it."""
+    swap = _Swap()
+    rec = SwapRecord(state=SwapState.PARAMS_MISMATCH, terms=swap.terms).with_radiant_lock(
+        sc._UNVERIFIABLE_COVENANT_PIN, "00"
+    )
+    coord = swap.coordinator(record=rec)
+    rec = await coord.maker_refund_covenant()
+    assert rec.radiant_covenant_outpoint == swap.outpoint and _broadcasts(swap) == 1
+    swap.chain.mine(1)
+    assert (await coord.maker_refund_covenant()).state is SwapState.ABORTED
+
+
+async def test_reconcile_treats_the_placeholder_as_no_pin():
+    swap = _Swap()
+    rec = SwapRecord(state=SwapState.PARAMS_MISMATCH, terms=swap.terms).with_radiant_lock(
+        sc._UNVERIFIABLE_COVENANT_PIN, "00"
+    )
+    with pytest.raises(ValidationError, match="needs the covenant outpoint pinned"):
+        await swap.coordinator(record=rec).reconcile_covenant()
+
+
+class _NoFundingInHistory(FakeRadiantSource):
+    async def get_history(self, script_hash):
+        return [h for h in await super().get_history(script_hash) if h["tx_hash"] != self.funding_txid]
+
+
+class _NoUtxos(FakeRadiantSource):
+    async def get_utxos(self, script_hash):
+        return []
+
+
+async def _one(swap: _Swap, src: FakeRadiantSource):
+    return await RadiantChainIO._spender_from_one("s", src, swap.cov.funded_spk, swap.outpoint)
+
+
+async def test_a_source_whose_history_lacks_the_funding_gives_no_answer():
+    """Review L2: each of the per-source guards, removed, lets a source answer it should not."""
+    swap = _Swap()
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip)
+    src = _NoFundingInHistory(swap.chain, "https://a.example-a.org")
+    src.funding_txid = swap.funding_txid
+    with pytest.raises(NetworkError, match="funding transaction is not in"):
+        await _one(swap, src)
+    honest = await _one(swap, FakeRadiantSource(swap.chain, "https://b.example-b.org"))
+    assert honest.spender_txid is not None
+
+
+async def test_a_source_naming_two_spenders_gives_no_answer():
+    swap = _Swap()
+    swap.chain.add(swap.refund_tx(), height=swap.chain.tip)
+    src = FakeRadiantSource(swap.chain, "https://a.example-a.org", extra=[swap.refund_tx()])
+    with pytest.raises(NetworkError, match="two transactions"):
+        await _one(swap, src)
+
+
+async def test_an_unspent_answer_needs_the_outpoint_in_the_sources_utxo_set():
+    swap = _Swap()
+    with pytest.raises(NetworkError, match="not in this source's UTXO set"):
+        await _one(swap, _NoUtxos(swap.chain, "https://a.example-a.org"))
+    honest = await _one(swap, FakeRadiantSource(swap.chain, "https://b.example-b.org"))
+    assert honest.spender_txid is None and honest.unread is None

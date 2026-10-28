@@ -1689,6 +1689,9 @@ def _serialized_step(method):
     return _wrapper
 
 
+#: What :meth:`SwapCoordinator.post_asset_lock_revalidate` pins when it cannot recompute the covenant.
+_UNVERIFIABLE_COVENANT_PIN = "<unverifiable>"
+
 #: Where a MAKER's covenant refund may be SENT from (#850 PR 11): the states in which the maker has not
 #: revealed ``p`` and has not reached BOTH_LOCKED, whose maker refund is
 #: ``maybe_refund_asset_on_maker_stall``.
@@ -3518,7 +3521,7 @@ class SwapCoordinator:
         except Exception as exc:
             # Cannot recompute the expected SPK => treat as mismatch (fail-closed):
             # the taker has BTC locked and must be able to recover.
-            self.record = self.record.with_radiant_lock("<unverifiable>", observed.hex())
+            self.record = self.record.with_radiant_lock(_UNVERIFIABLE_COVENANT_PIN, observed.hex())
             self._advance(SwapEvent.MAKER_LOCKS_WRONG_PARAMS)
             await self._persist_record(self.record, shield=True)
             raise ValidationError(f"could not recompute expected covenant SPK; PARAMS_MISMATCH ({exc})") from exc
@@ -4502,6 +4505,12 @@ class SwapCoordinator:
             return str(cd.tx_hash)
         return None
 
+    def _covenant_pinned(self) -> bool:
+        """Whether the record pins a covenant outpoint the spend read can use. The placeholder
+        :meth:`post_asset_lock_revalidate` writes when it cannot recompute the covenant
+        (PARAMS_MISMATCH) pins nothing."""
+        return self.record.radiant_covenant_outpoint not in (None, _UNVERIFIABLE_COVENANT_PIN)
+
     async def _pin_maker_covenant(self) -> None:
         """Pin the covenant outpoint before the maker's refund is sent, so the read that ends the record
         finds the same output the refund spends. Persisted first. A covenant no longer in the UTXO set
@@ -4590,7 +4599,7 @@ class SwapCoordinator:
         state = self.record.state
         if state not in (SwapState.NEGOTIATED, SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED):
             raise self._maker_covenant_state_error("reconcile_covenant", _MAKER_COVENANT_READ_STATES)
-        if self.record.radiant_covenant_outpoint is None:
+        if not self._covenant_pinned():
             raise ValidationError(
                 "reconcile_covenant needs the covenant outpoint pinned on the record; maker_refund_covenant pins "
                 "it before it sends"
@@ -4638,7 +4647,7 @@ class SwapCoordinator:
                 f"this record holds a counter-leg claim ({claim}), so p is public and the counter leg was paid to "
                 "the maker: refunding the covenant as well would take both legs. Nothing was sent."
             )
-        if self.record.radiant_covenant_outpoint is None:
+        if not self._covenant_pinned():
             await self._pin_maker_covenant()
         spend = await self._read_covenant_spend()
         outcome = await self._apply_covenant_spend(spend)

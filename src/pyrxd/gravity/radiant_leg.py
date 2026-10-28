@@ -711,7 +711,7 @@ class RadiantChainIO:
         return bool(await fn(txid, vout))
 
     async def covenant_spend_answers(
-        self, spk: bytes, outpoint: str
+        self, spk: bytes, outpoint: str, *, known_spender: str | None = None
     ) -> tuple[tuple[CovenantSpendAnswer, ...], tuple[str, ...]]:
         """What each configured source says spent the covenant ``outpoint`` (#850 PR 11), and the
         sources that could not say.
@@ -724,7 +724,14 @@ class RadiantChainIO:
         finds no spender must also hold ``outpoint`` in its UTXO set, or it has answered nothing.
         Returns ``(answers, failed)``: ``failed`` names each source that errored, timed out or could
         not account for the outpoint. Nothing here is judged; see
-        :meth:`RadiantCovenantLeg.covenant_spend`."""
+        :meth:`RadiantCovenantLeg.covenant_spend`.
+
+        Anyone can pay the covenant's public script, so a history longer than
+        :data:`MAX_COVENANT_HISTORY` is not fetched. A source in that case still answers, as
+        ``unread`` (dissent, not absence: a source that trims its history must not decide alone
+        while the honest ones fall silent), unless *known_spender* (the record's own refund, a txid
+        no source nominated) is in its history: then only that transaction is checked, and if it
+        spends the outpoint no other transaction can."""
         asked: list[tuple[int, Any]] = []
         made: list[Any] = []
         for index, src in enumerate(self._distinct_sources()):
@@ -741,7 +748,8 @@ class RadiantChainIO:
             label = self._operator_label(index, src)
             try:
                 return await asyncio.wait_for(
-                    self._spender_from_one(label, src, bytes(spk), outpoint), self._depth_timeout_s
+                    self._spender_from_one(label, src, bytes(spk), outpoint, known_spender),
+                    self._depth_timeout_s,
                 )
             except Exception as exc:  # a timeout, an error or an answer that does not add up
                 logger.debug("covenant spend source %s gave no answer: %s", label, exc)
@@ -758,7 +766,9 @@ class RadiantChainIO:
         return answers, failed
 
     @staticmethod
-    async def _spender_from_one(label: str, src: Any, spk: bytes, outpoint: str) -> CovenantSpendAnswer:
+    async def _spender_from_one(
+        label: str, src: Any, spk: bytes, outpoint: str, known_spender: str | None = None
+    ) -> CovenantSpendAnswer:
         """One source's answer for :meth:`covenant_spend_answers`, or an exception."""
         import hashlib
 
@@ -776,9 +786,19 @@ class RadiantChainIO:
             raise NetworkError("the covenant's funding transaction is not in this source's history of its script")
         candidates = [t for t in dict.fromkeys(history) if t != funding_txid]
         if len(candidates) > MAX_COVENANT_HISTORY:
-            # Anyone can pay a covenant's public script; past this many the read gives up rather than
-            # fetch without bound. The refund itself does not need this read (see maker_refund_covenant).
-            raise NetworkError(f"the covenant script has {len(candidates)} other transactions; not read")
+            # Anyone can pay a covenant's public script; past this many the read does not fetch them.
+            # It checks the record's own refund if the source lists it, and otherwise answers unread.
+            known = known_spender.lower() if known_spender else None
+            if known is None or known not in candidates:
+                return CovenantSpendAnswer(
+                    source=label,
+                    spender_txid=None,
+                    raw_tx=None,
+                    depth=0,
+                    unread=f"its history of the covenant script holds {len(candidates)} other transactions, "
+                    f"more than the {MAX_COVENANT_HISTORY} read",
+                )
+            candidates = [known]
         spenders: list[tuple[str, bytes]] = []
         for txid in candidates:
             raw = bytes(await src.get_transaction(txid))
@@ -817,12 +837,15 @@ class CovenantSpendAnswer:
     """One source's answer about a covenant outpoint (:meth:`RadiantChainIO.covenant_spend_answers`):
     the transaction that spends it and that transaction's verified bytes, or ``None`` with the
     outpoint still in the source's UTXO set. ``depth`` is the confirmations the source reports for the
-    spender (0 in its mempool)."""
+    spender (0 in its mempool). ``unread`` says why a source could not read its history."""
 
     source: str
     spender_txid: str | None
     raw_tx: bytes | None
     depth: int
+    #: Why this source's history was not read (too long to fetch); such an answer decides nothing
+    #: and blocks every other answer from deciding.
+    unread: str | None = None
 
 
 class CovenantSpendKind(Enum):
@@ -1517,7 +1540,10 @@ class RadiantCovenantLeg:
         ``OP_1`` alone and its single output pays the maker's holder script; the claim leaf's opens
         ``H`` and pays the taker's. Consensus binds each leaf to its output, so a spend that matches
         neither is ``UNKNOWN``. ``buried`` is the least reported depth at or above *burial_blocks*.
-        Never raises for a chain that cannot be read: that is ``UNKNOWN`` with the reason."""
+        A source whose history of the covenant script is too long to read
+        (:data:`MAX_COVENANT_HISTORY`) makes the answer ``UNKNOWN`` too; the record's own refund
+        (``asset_refund_txid``) is still checked at such a source. Never raises for a chain that
+        cannot be read: that is ``UNKNOWN`` with the reason."""
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
         if not isinstance(burial_blocks, int) or isinstance(burial_blocks, bool) or burial_blocks < 1:
@@ -1527,7 +1553,9 @@ class RadiantCovenantLeg:
             return CovenantSpend(CovenantSpendKind.UNKNOWN, "the record pins no covenant outpoint")
         cov = self._build_covenant(record.terms)
         try:
-            answers, failed = await self.chain_io.covenant_spend_answers(cov.funded_spk, outpoint)
+            answers, failed = await self.chain_io.covenant_spend_answers(
+                cov.funded_spk, outpoint, known_spender=record.asset_refund_txid
+            )
         except Exception as exc:
             return CovenantSpend(CovenantSpendKind.UNKNOWN, f"the covenant could not be read: {exc}")
         if not answers:
@@ -1535,6 +1563,17 @@ class RadiantCovenantLeg:
             return CovenantSpend(CovenantSpendKind.UNKNOWN, f"no source answered{why}", failed=failed)
         sources = tuple(a.source for a in answers)
         operators = len(counted_operators(sources))
+        unread = [a for a in answers if a.unread is not None]
+        if unread:
+            said = "; ".join(f"{a.source}: {a.unread}" for a in unread)
+            return CovenantSpend(
+                CovenantSpendKind.UNKNOWN,
+                f"what spent {outpoint} cannot be read from every answering source ({said}); anyone can pay the "
+                "covenant's script, so such a source counts against a decision, not as absent",
+                sources=sources,
+                operators=operators,
+                failed=failed,
+            )
         named = {a.spender_txid for a in answers}
         if len(named) > 1:
             said = "; ".join(f"{a.source}: {a.spender_txid or 'unspent'}" for a in answers)

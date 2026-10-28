@@ -146,19 +146,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     from its own history, by bytes that hash to the txid, or holds the outpoint in its UTXO set. They
     must all agree, or the answer is `UNKNOWN`. The spender is classified by the leaf it took, from
     its bytes. Its depth is the least any answering source reports. On a Radiant network that carries
-    value, fewer than two identified operators change nothing. A covenant script with more than 64
-    other transactions in its history is not read (`UNKNOWN`); the refund is still sent.
+    value, fewer than two identified operators change nothing. Anyone can pay the covenant's script:
+    a source whose history of it holds more than 64 other transactions does not fetch them and
+    answers "unread", which makes the read `UNKNOWN` rather than leaving the other sources to decide;
+    the record's own refund (`asset_refund_txid`) is still checked at such a source, so it can still
+    end the record. The refund is sent either way.
   - An `UNKNOWN` read does not stop the refund: the leg's own checks (the outpoint live at the
     primary source, the CSV mature) decide, and a refund of a spent covenant fails at the node.
   - The two-host runners' maker `--phase abort` now drives `maker_refund_covenant`: run it again once
     the refund is buried to close the record. It also accepts a `PARAMS_MISMATCH` record, which holds
-    the taker's locator. Records written by an earlier `--phase abort` pinned no covenant outpoint,
-    so a covenant they refunded cannot be read from the record.
+    the taker's locator, including one whose revalidation could not recompute the covenant (its
+    `<unverifiable>` placeholder is re-pinned to the covenant the terms build). Records written by an
+    earlier `--phase abort` pinned no covenant outpoint, so a covenant they refunded cannot be read
+    from the record.
   - `SWAP_RECORD_SCHEMA_VERSION` is 11. A pyrxd from before this change refuses a record with
     `abort_reason` `covenant_refunded`.
   - Not in this change: a single operator's `MUTUAL_REFUND` still follows the covenant refund's
     broadcast, not its burial, and a maker's record after the reveal (`SECRET_REVEALED`) has no exit
-    yet.
+    yet. `reconcile_covenant` reads the counter leg's claim from the record only, so a maker whose
+    claim of the counter leg was sent but never recorded can see `MUTUAL_REFUND` on a record that
+    holds both legs (a label; nothing is sent).
 
 - **The watchtower reads an ETH counter leg's disposition with the coordinator's reader, pages the
   rest of the design §5.1 table, and checks legacy ETH records once (#850 PR 10) [Changed (breaking)].**
