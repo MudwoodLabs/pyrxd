@@ -145,7 +145,12 @@ into the same app or receiver changes nothing.
   the lowest any endpoint reports, so an endpoint that lags its head and finalized block together
   holds a final claim at "not yet final" until the claim race squeezes. A claim's finality counts only
   for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
-  contract's `Claimed` event that opens H.
+  contract's `Claimed` event that opens H. An endpoint whose log scan names more than eight
+  transactions (an honest contract emits one `Claimed` or `Refunded` log at most) is read as a
+  failed scan and none of its logs are checked, so it cannot multiply the tower's reads; the other
+  endpoints' logs are all checked, and with none left the answer is unknown. An endpoint that
+  returns a malformed receipt for a claim fails that read, so the claim race pages fail-closed
+  rather than a reconcile error.
   Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
   ones: an unsettled contract pages "call `refund()` on the contract" (anyone may call it after the
   timeout; it pays the refundee) and is read again every turn; a claim, or one on record, pages the
