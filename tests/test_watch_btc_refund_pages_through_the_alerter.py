@@ -914,8 +914,10 @@ def test_every_refund_page_names_a_definite_situation():
 
 @pytest.mark.parametrize("acked", [True, False], ids=["acked", "unacked"])
 async def test_one_quiet_tick_from_a_failed_read_neither_ends_an_ack_nor_zeroes_escalation(tmp_path, acked):
-    """Finding 2: at BOTH_LOCKED a failed covenant-depth read decides WATCH (residual R1). One such
-    tick ended the ACK of the CRITICAL page, and read 0 on an un-ACKed one, resetting escalation."""
+    """Finding 2: at BOTH_LOCKED a failed covenant-depth read decided WATCH (residual R1). One such
+    tick ended the ACK of the CRITICAL page, and read 0 on an un-ACKed one, resetting escalation.
+    Since register R1 with R8 was fixed, that tick pages its own CRITICAL situation (the BTC funding
+    depth shows the refund leaf matured); the first page's ACK and count still hold across it."""
     w = _Tower(tmp_path, state=SwapState.BOTH_LOCKED)
     _near(w, past=3)  # t_rxd matured: mutual_refund page, CRITICAL
     alerter, ch = _alerter()
@@ -926,11 +928,12 @@ async def test_one_quiet_tick_from_a_failed_read_neither_ends_an_ack_nor_zeroes_
         assert alerter.ack(SWAP) is True
     w.rxd.cov_confs = None
     (blind,) = await rec.tick()
-    assert blind.decision.intent is Intent.WATCH, blind.decision.reason
-    assert alerter.unacked_critical_count() == (0 if acked else 1), "one failed read moved the escalation count"
+    assert blind.decision.intent is Intent.PAGE_REFUND and blind.decision.urgent, blind.decision.reason
+    assert blind.decision.situation != first.decision.situation
+    assert alerter.unacked_critical_count() == 1, "one failed read moved the escalation count"
     _near(w, past=4)
     await rec.tick()
-    assert len(ch.sent) == (1 if acked else 2), "the ACK ended at one failed read"
+    assert len(ch.sent) == (2 if acked else 3), "the ACK ended at one failed read"
 
 
 class _DownChannel(_Channel):

@@ -37,6 +37,7 @@ from ..security.errors import FeeRejected, InsufficientConfirmationsError, Netwo
 from ..security.secrets import SecretBytes
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
 from ._guards import finite_int, merkle_branch, nonneg_int, require_bool
+from .quorum_depth import depth_vouched_by_quorum
 from .source_identity import SameSourceFailover, SourceKey, group_by_source, require_distinct_sources, source_key
 
 logger = logging.getLogger(__name__)
@@ -1750,8 +1751,10 @@ class MultiSourceBtcFundingReader:
       * ``dust_cap_sats`` = 10_000: at/below the cap a single successful read is
         accepted (the documented dust posture); ABOVE it the quorum is REQUIRED
         (fail-closed).
-      * :meth:`confirmations` returns the MINIMUM depth across responding sources — a
-        tx is only as buried as the most-pessimistic source, defeating an over-reporter.
+      * :meth:`confirmations` returns the depth a quorum of responding sources vouches for
+        (:func:`~pyrxd.network.quorum_depth.depth_vouched_by_quorum`): one over-reporter cannot
+        raise it, and one under-reporter cannot hold it down while a quorum of others answers.
+        With exactly ``quorum`` answers it is their minimum.
       * :meth:`read_output_amount_sats` requires >= ``quorum`` sources to agree on the
         EXACT amount (a deterministic value; disagreement fails closed).
 
@@ -1864,7 +1867,8 @@ class MultiSourceBtcFundingReader:
         return [x for x in results if not isinstance(x, Exception)]
 
     async def confirmations(self, txid: str, *, value_sats: int | None = None) -> int:
-        """Quorum'd confirmation depth, returning the conservative MINIMUM.
+        """Quorum'd confirmation depth: the deepest that at least ``quorum`` sources report
+        (:func:`~pyrxd.network.quorum_depth.depth_vouched_by_quorum`; the minimum when fewer answer).
 
         ``value_sats`` selects the dust gate: ``None`` (the default, used by the
         reorg gate) or any value above ``dust_cap_sats`` REQUIRES the quorum and
@@ -1879,7 +1883,7 @@ class MultiSourceBtcFundingReader:
             )
         if not oks:
             return 0  # below-dust, no source responded -> 0 (the gate's >= N check fails closed)
-        return min(oks)  # a tx is only as buried as the most-pessimistic source
+        return depth_vouched_by_quorum(oks, self._quorum)
 
     async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
         """Quorum'd output-amount read-back. Above the dust cap the exact amount must

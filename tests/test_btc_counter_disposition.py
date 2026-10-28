@@ -173,12 +173,27 @@ async def test_depth_is_the_quorum_minimum_so_one_over_reporting_source_cannot_b
     assert (await _read(chain, _panel(chain))).kind is K.REFUNDED
 
 
-async def test_a_lagging_source_holds_the_depth_down():
+async def test_a_lagging_source_holds_the_depth_down_only_when_it_is_needed_for_the_quorum():
+    """Register R13: the depth is the one a quorum vouches for, not the minimum. A lagging source
+    beside a quorum of others that answer does not hold a buried refund back; with only a quorum
+    answering, it is one of the quorum and does."""
     chain = FakeBtcChain()
     chain.submit(chain.refund_tx())
     chain.mine(BURIAL)
     d = await _read(chain, [FakeBtcSource(chain, lag=3), *_panel(chain, 2)])
+    assert d.kind is K.REFUNDED and d.refunds_seen[0].confirmations == BURIAL
+    d = await _read(chain, [FakeBtcSource(chain, lag=3), *_panel(chain, 1)])
     assert d.kind is K.REFUND_PENDING and d.refunds_seen[0].confirmations == BURIAL - 3
+
+
+async def test_one_source_over_reporting_depth_cannot_bury_a_shallow_refund():
+    """The other direction (F-17): one source that reports the refund deep beside honest sources
+    that see it shallow does not make it buried."""
+    chain = FakeBtcChain()
+    chain.submit(chain.refund_tx())
+    chain.mine(1)
+    d = await _read(chain, [FakeBtcSource(chain, lie_depth=BURIAL + 50), *_panel(chain, 2)])
+    assert d.kind is K.REFUND_PENDING and d.refunds_seen[0].confirmations == 1
 
 
 @pytest.mark.parametrize("value", [2**63, 2**64 - 1])
@@ -559,10 +574,14 @@ async def test_the_leg_reads_each_source_of_a_quorum_reader_at_its_quorum():
     chain.submit(chain.refund_tx())
     chain.mine(BURIAL)
     sources = [FakeBtcSource(chain), FakeBtcSource(chain), FakeBtcSource(chain, lag=4)]
+    leg = _leg(chain, MultiSourceBtcFundingReader(sources, quorum=3))
+    d = await leg.counter_disposition(chain.locator, hashlock=chain.hashlock, burial_blocks=BURIAL)
+    assert d.kind is K.REFUND_PENDING and not d.single_source  # at 3 of 3 the lagging source holds it down
+    assert d.sources == tuple(str(s.source_key) for s in sources) and d.quorum == 3
+    # At 2 of 3 two sources vouch for the burial, and the lagging one is outvoted (register R13).
     leg = _leg(chain, MultiSourceBtcFundingReader(sources, quorum=2))
     d = await leg.counter_disposition(chain.locator, hashlock=chain.hashlock, burial_blocks=BURIAL)
-    assert d.kind is K.REFUND_PENDING and not d.single_source  # the lagging source holds it down
-    assert d.sources == tuple(str(s.source_key) for s in sources)
+    assert d.kind is K.REFUNDED and d.quorum == 2
 
 
 async def test_the_leg_on_one_reader_is_single_source():

@@ -19,23 +19,15 @@ The invariants are the alert-path contract, checked after every tick:
   for a page that never went out does not stop that page going out once the channel is back.
 * **The escalation signal follows.** ``unacked_critical_count`` is 1 exactly when an open CRITICAL
   situation, delivered or not, is un-ACKed.
-* **One source cannot lower a page, but for two known ways.** With at most one faulty source, the
-  decision is at least as severe as the one the same tower takes over three honest sources of the
-  same chain. The two exceptions this machine found, both left as they are pending a decision:
-
-  - a source that alone holds a refund of ours (``pyrxd.btc_wallet.disposition``, "unspent_by")
-    turns the refund page into a WATCH on that pending refund, until t_rxd comes near;
-  - a source that under-reports a spender's depth holds it below burial (the reader takes the
-    minimum depth), so a buried refund stays a WATCH and a buried maker claim stays a WATCH
-    ("awaiting reorg-safe burial") instead of a CRITICAL claim page, until the t_rxd window closes
-    and it pages as a squeeze.
-
-  Neither exception may lower a squeeze: a decision the honest tower takes as PAGE_SQUEEZED is
-  CRITICAL here too.
+* **One source cannot lower a page.** With at most one faulty source, the decision is at least as
+  severe as the one the same tower takes over three honest sources of the same chain. (This machine
+  found two exceptions, register R12 and R13: a source that alone holds a refund of ours, and one
+  that under-reports a spender's depth. Both are fixed: ``BtcCounterDisposition.refund_outvoted``
+  and ``pyrxd.network.quorum_depth.depth_vouched_by_quorum``.)
 * **Autonomy needs a quorum of "unspent".** The pre-signed refund is armed only when at least a
-  quorum of sources answer that the outpoint is unspent and none names a spender (the reader's rule,
-  ``pyrxd.btc_wallet.disposition``). A source that is down or fails its read is never a vote for
-  "unspent".
+  quorum of sources answer that the outpoint is unspent, none names a claim, and fewer than a
+  quorum name a refund of ours (``BtcCounterDisposition.refund_outvoted``: sending our own refund
+  again costs nothing). A source that is down or fails its read is never a vote for "unspent".
 * **An unburied refund of ours near t_rxd is CRITICAL.** With every source honest, our refund on the
   chain short of burial while the taker's refund window is open (``taker_refund_window_open``, the
   coordinator's own predicate) pages CRITICAL: the maker can then refund the covenant and still claim
@@ -354,30 +346,29 @@ class AlertPathMachine(RuleBasedStateMachine):
             record = self.w.record()
             obs = self._loop.run_until_complete(self.honest.observe(SWAP, record))
             reference = decide(record=record, observations=obs, policy=_policy(), safety_window_blocks=SAFETY)
-            if _RANK[_severity(decision)] < _RANK[_severity(reference)]:
-                lowered = f"faults {self.faults} lowered {_key(reference)} ({reference.reason}) to {decision.intent.value} ({decision.reason})"
-                assert reference.intent is not Intent.PAGE_SQUEEZED, lowered
-                assert decision.intent is Intent.WATCH, lowered
-                if "forge_refund" in self.faults:
-                    assert _severity(reference) is not Severity.CRITICAL, lowered
-                    assert "refunds the outpoint and is not yet buried" in decision.reason, lowered
-                else:
-                    assert "lie_depth" in self.faults, lowered
-                    assert "awaiting reorg-safe burial" in decision.reason or "is not yet buried" in decision.reason, (
-                        lowered
-                    )
+            assert _RANK[_severity(decision)] >= _RANK[_severity(reference)], (
+                f"faults {self.faults} lowered {_key(reference)} ({reference.reason}) to {decision.intent.value} "
+                f"({decision.reason})"
+            )
         if decision.autonomous_btc_refund:
             # What each source answers to "who spends the outpoint": an honest or depth-lying source the
             # chain's spender, a hiding one "unspent", a forging one its forgery; a source that is down or
             # fails the read answers nothing. Two hiding sources outvote one honest one at quorum 2 of 3,
-            # and the machine allows that: it is the quorum's stated limit.
+            # and the machine allows that: it is the quorum's stated limit. A refund of ours named by
+            # fewer than a quorum is outvoted (register R12); a claim named by any source never is.
             says_unspent = sum(
                 f == "hide_spender" or (f in ("ok", "lie_depth") and spender is None) for f in self.faults
             )
-            names_one = sum(
-                f.startswith("forge_") or (f in ("ok", "lie_depth") and spender is not None) for f in self.faults
+            on_chain = spender is not None
+            names_claim = sum(
+                f == "forge_claim" or (f in ("ok", "lie_depth") and on_chain and spender in self.claims)
+                for f in self.faults
             )
-            assert says_unspent >= QUORUM and names_one == 0, (
+            names_refund = sum(
+                f == "forge_refund" or (f in ("ok", "lie_depth") and on_chain and spender not in self.claims)
+                for f in self.faults
+            )
+            assert says_unspent >= QUORUM and names_claim == 0 and names_refund < QUORUM, (
                 f"refund armed on faults {self.faults} with spender {spender}: {decision.reason}"
             )
         refund_unburied = (
