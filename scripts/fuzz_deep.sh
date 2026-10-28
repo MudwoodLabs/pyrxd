@@ -68,6 +68,7 @@ PYTHONUNBUFFERED=1 \
     tests/test_preimage_differential.py \
     tests/test_glyph_cbor_roundtrip.py \
     tests/test_dmint_vector_derivations.py \
+    tests/test_watch_alert_path_state_machine.py \
     --no-cov \
     -p no:cacheprovider \
     -v \
