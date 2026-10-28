@@ -37,6 +37,7 @@ from pyrxd.gravity.swap_state import (
     SwapState,
 )
 from pyrxd.gravity.watch.adapters import JsonDirRecordStore, is_legacy_candidate
+from pyrxd.gravity.watch.alerts import DedupAlerter
 from pyrxd.gravity.watch.decide import Intent, Observations, decide
 from pyrxd.gravity.watch.eth_adapters import RpcEthChainSource
 from pyrxd.gravity.watch.quorum import ChainObserver
@@ -269,10 +270,12 @@ async def test_a_lying_primary_that_also_forks_cannot_hide_a_final_claim(tmp_pat
     assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
     assert obs.eth_claim_detected is True
     # The forked primary disagrees on the claim's block, so the verdict read fails: finality is
-    # un-assessable and the claim race pages fail-closed, not a reconcile error that names no claim.
+    # un-assessable. With the read UNKNOWN and no claim it collected, the page is "investigate", which
+    # names the covenant claim if a log opens H (Mythos pass 2, N-A), not a reconcile the coordinator
+    # refuses on an UNKNOWN read.
     assert obs.eth_claim_finality is None
     d = await w.decide()
-    assert d.situation == decide_mod.SITUATION_CLAIM_RACE, d
+    assert d.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES, d
     assert d.intent is Intent.PAGE_SQUEEZED
     assert "taker_refund_btc" not in (d.recommended_action or "")
     del claim
@@ -377,7 +380,7 @@ async def test_a_lying_primarys_fake_claim_cannot_hold_a_final_claim_in_watch(tm
     assert obs.eth_claim_detected is True
     d = await w.decide()
     assert d.intent is not Intent.WATCH, d
-    assert d.situation == decide_mod.SITUATION_CLAIM_RACE, d
+    assert d.situation == decide_mod.SITUATION_CLAIM_RACE_UNASSESSABLE, d
     assert "taker_refund_btc" not in (d.recommended_action or "")
     # Through the production reconciler and alerter, the first tick pages.
     await w.reconciler().tick()
@@ -399,7 +402,7 @@ async def test_a_pending_claim_waits_and_a_decoy_beside_it_pages(tmp_path):
     w.endpoints[0].extra_logs = (_fake_claim_log(w.chain.preimage),)
     assert (await w.observe()).eth_claim_finality is None
     d = await w.decide()
-    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE
+    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE_UNASSESSABLE
     # Once the real claim is final, the decoy beside it does not hold it back.
     w.chain.finalized = CLAIM_BLOCK
     assert (await w.observe()).eth_claim_finality is CounterClaimState.FINAL
@@ -421,7 +424,7 @@ async def test_many_fake_claims_from_one_endpoint_cannot_crowd_out_the_real_one(
     assert len(fakes) > quorum_mod._MAX_ETH_VERDICT_READS
     assert obs.eth_claim_detected is True and obs.eth_claim_finality is None
     d = await w.decide()
-    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE
+    assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE_UNASSESSABLE
 
 
 @pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED])
@@ -617,7 +620,7 @@ async def test_a_lying_primary_that_breaks_the_read_and_serves_a_decoy_cannot_ho
     assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
     d = await w.decide()
     assert d.intent is not Intent.WATCH, d
-    assert d.situation == decide_mod.SITUATION_CLAIM_RACE
+    assert d.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
 
 
 @pytest.mark.parametrize("liar", [0, 1, 2])
@@ -636,6 +639,75 @@ async def test_a_decoy_on_a_real_final_transaction_does_not_make_an_unfinal_clai
     obs = await w.observe()
     assert obs.eth_claim_finality is not CounterClaimState.FINAL
     assert (await w.decide()).intent is not Intent.PAGE_CLAIM
+
+
+class _Sent:
+    """The alerter's delivery channel: keeps every page it actually sends."""
+
+    def __init__(self) -> None:
+        self.sent: list = []
+
+    async def send(self, page) -> None:
+        self.sent.append(page)
+
+
+@pytest.mark.parametrize("liar", [0, 1, 2])
+@pytest.mark.parametrize("role", [RecordRole.TAKER, None])
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH])
+async def test_an_odd_log_beside_a_broken_read_still_names_the_due_refund(tmp_path, state, role, liar):
+    """Mythos pass 2, N-A: the contract is unsettled and past its timeout. One endpoint serves an odd
+    Claimed log AND forks, so the reader stops at UNKNOWN before it collects a claim, and the only
+    candidate is a transaction no endpoint holds. The page named reconcile_counter_leg (or the gated
+    abandon), which the coordinator refuses on an UNKNOWN read, and never the refund that is due."""
+    kw: list[dict] = [{}, {}, {}]
+    kw[liar] = {"extra_logs": (_odd_claimed_log(),), "fork": "x"}
+    w = _EthTower(tmp_path, state=state, role=role, endpoint_kw=kw)
+    obs = await w.observe()
+    assert obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_seen is False
+    assert obs.eth_claim_detected is True and obs.eth_claim_finality is None
+    d = await w.decide()
+    assert "reconcile_counter_leg" not in (d.recommended_action or "")
+    assert "abandon_counter_leg" not in (d.recommended_action or "")
+    if state is SwapState.PARAMS_MISMATCH:
+        assert d.intent is Intent.PAGE_REFUND and d.recommended_action == "taker_refund_btc"
+    else:
+        assert d.situation == decide_mod.SITUATION_ETH_DISCOVERY_DISAGREES
+        assert "refund is due" in d.recommended_action
+
+
+@pytest.mark.parametrize("state", [SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH])
+async def test_a_broken_read_without_an_odd_log_pages_the_refund(tmp_path, state):
+    """N-A's honest-path twin: the same fork with no odd log pages the refund, as before."""
+    w = _EthTower(tmp_path, state=state, endpoint_kw=[{"fork": "x"}, {}, {}])
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND
+
+
+async def test_an_ack_of_an_unassessable_claim_race_does_not_silence_its_squeeze(tmp_path):
+    """Mythos pass 2, N-B: a decoy and a withheld receipt make the claim race un-assessable, and the
+    operator ACKs that page. The liar then lets the claim read "not yet final" until the window
+    squeezes. The winner-take-all page shared the un-assessable page's ACK key and was never sent."""
+    w = _EthTower(tmp_path, endpoint_kw=[{"hide_claimed": True}, {}, {}])
+    claim = w.chain.claim(CLAIM_BLOCK)
+    w.endpoints[0].extra_logs = (_fake_claim_log(w.chain.preimage),)
+    w.endpoints[0].hide_receipts = (claim,)
+    ch = _Sent()
+    alerter = DedupAlerter(channel=ch, situation_hold_ticks=1)
+    rec = w.reconciler(alerter=alerter)
+    (first,) = await rec.tick()
+    assert first.decision.situation == decide_mod.SITUATION_CLAIM_RACE_UNASSESSABLE
+    assert len(ch.sent) == 1 and alerter.ack(SWAP) is True
+    # The liar stops withholding; every endpoint now reads the claim not yet final (P1), and the
+    # RXD window closes.
+    w.endpoints[0].extra_logs = ()
+    w.endpoints[0].hide_receipts = ()
+    w.chain.finalized = CLAIM_BLOCK - 1
+    w.rxd.tip, w.rxd.cov_confs = TIP + 38, 39
+    (squeezed,) = await rec.tick()
+    assert squeezed.decision.intent is Intent.PAGE_SQUEEZED, squeezed.decision
+    assert squeezed.decision.situation == decide_mod.SITUATION_CLAIM_RACE
+    assert "winner-take-all" in squeezed.decision.recommended_action
+    assert len(ch.sent) == 2, "the ACK of the un-assessable page silenced the winner-take-all page"
 
 
 async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):

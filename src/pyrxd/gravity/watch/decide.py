@@ -681,6 +681,10 @@ SITUATION_BTC_DISCOVERY_DISAGREES = "btc_discovery_disagrees"
 #: one, so no two dangers share an ACK. ``tests/test_watch_btc_refund_pages_through_the_alerter.py``
 #: derives the construction sites from the source and fails on one without a tag.
 SITUATION_CLAIM_RACE = "claim_race"
+#: A claim race whose finality the tower cannot assess (fail-closed). Its own situation, so an ACK of it
+#: does not silence the winner-take-all page the same race squeezes into (Mythos pass 2 on #850 PR 10,
+#: N-B: one endpoint could hold a race un-assessable, have it ACKed, then let the window squeeze).
+SITUATION_CLAIM_RACE_UNASSESSABLE = "claim_race_unassessable"
 SITUATION_CLAIM_SEEN_P_PUBLIC = "claim_seen_p_public"
 SITUATION_ASSET_VULNERABLE = "asset_vulnerable"
 SITUATION_UNEXPECTED_STATE = "unexpected_state"
@@ -950,7 +954,7 @@ def decide(
                 reason="maker claim observed but finality un-assessable (missing claim depth or asset-lock height) — fail-closed",
                 recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 low_corroboration=corr,
-                situation=SITUATION_CLAIM_RACE,
+                situation=SITUATION_CLAIM_RACE_UNASSESSABLE,
             )
         verdict = CounterClaimFinality.from_btc_depth(obs.btc_claim_confirmations, _required_btc_depth_blocks(policy))
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
@@ -971,7 +975,7 @@ def decide(
                 recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
-                situation=SITUATION_CLAIM_RACE,
+                situation=SITUATION_CLAIM_RACE_UNASSESSABLE,
             )
         if finality is ClaimFinality.SAFE:
             return Decision(
@@ -1319,6 +1323,19 @@ def _eth_corroboration(obs: Observations) -> bool:
     return obs.low_corroboration or obs.eth_single_source
 
 
+def _eth_scan_hit_unbacked(obs: Observations) -> bool:
+    """A claim only the detection scan names, with nothing behind it: the reader collected no claim
+    that opens H, and its answer is clean (no claim found), or UNKNOWN with no candidate claim the
+    endpoints agree on (finality un-assessable). One endpoint can produce this with an odd log and,
+    for UNKNOWN, one broken read (Mythos pass 2 on #850 PR 10, N-A), so it pages "investigate", or the
+    refund at PARAMS_MISMATCH, and never steps that need a claim the coordinator can read."""
+    if not obs.eth_claim_detected or obs.eth_claim_seen:
+        return False
+    if obs.eth_disposition in _ETH_CLEAN_UNCLAIMED:
+        return True
+    return obs.eth_disposition is DispositionKind.UNKNOWN and obs.eth_claim_finality is None
+
+
 def _eth_refund_final(obs: Observations) -> bool:
     """A refund of the contract verified at the finalized block, on a read of more than one endpoint.
     One endpoint's REFUNDED decides nothing here (design §5.1: "a single endpoint's Refunded() never
@@ -1578,12 +1595,7 @@ def _decide_eth(
     # opens H, on a record at PARAMS_MISMATCH: one endpoint's odd log must not replace the refund page
     # with the gated exit below, whose abandon the coordinator refuses unless the reader says CLAIMED
     # (Mythos F2, PR 10). Decide without it, and say what was set aside.
-    if (
-        state is SwapState.PARAMS_MISMATCH
-        and obs.eth_claim_detected
-        and not obs.eth_claim_seen
-        and obs.eth_disposition in _ETH_CLEAN_UNCLAIMED
-    ):
+    if state is SwapState.PARAMS_MISMATCH and _eth_scan_hit_unbacked(obs):
         # A claim on record still reaches the gated exit below, in the call without the scan's hit.
         base = _decide_eth(
             record=record,
@@ -1632,22 +1644,20 @@ def _decide_eth(
     # log. It pages "investigate" rather than a claim race whose WAIT on a transaction that never mines
     # would hold back the refund page (re-review of the fix round, F-B). A record that holds a claim gets
     # the D14 page, which names it; a maker's record is told to check, then refund its covenant.
-    if (
-        obs.eth_claim_detected
-        and not obs.eth_claim_seen
-        and not refund_final
-        and obs.eth_disposition in _ETH_CLEAN_UNCLAIMED
-        and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED)
-    ):
+    if _eth_scan_hit_unbacked(obs) and not refund_final and state in (SwapState.BTC_LOCKED, SwapState.BOTH_LOCKED):
         maker = record.role is RecordRole.MAKER
         if claim_on_record and not maker:
             return _eth_claim_on_record_page(record, obs, policy)
         return Decision(
             Intent.PAGE_SQUEEZED,
             reason=(
-                f"the detection scan names a log on the ETH counter-leg contract that the reader, over the endpoints "
-                f"whose logs it read, does not count as a claim that opens H; it reads the contract "
-                f"{obs.eth_disposition.value}"
+                "the detection scan names a log on the ETH counter-leg contract that "
+                + (
+                    "no endpoint holds as a claim the others agree on, and the reader could not read the contract"
+                    if obs.eth_disposition is DispositionKind.UNKNOWN
+                    else "the reader, over the endpoints whose logs it read, does not count as a claim that opens H; "
+                    f"it reads the contract {obs.eth_disposition.value}"
+                )
                 + (f" ({obs.eth_disposition_reason})" if obs.eth_disposition_reason else "")
             ),
             recommended_action=(
@@ -1679,7 +1689,7 @@ def _decide_eth(
                 reason="maker ETH claim observed but finality un-assessable (missing finalized verdict or asset-lock height) — fail-closed",
                 recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 low_corroboration=corr,
-                situation=SITUATION_CLAIM_RACE,
+                situation=SITUATION_CLAIM_RACE_UNASSESSABLE,
             )
         # Depth-less verdict (ETH finalized checkpoint): assess_claim_finality takes the no-depth path.
         verdict = CounterClaimFinality(state=obs.eth_claim_finality)
@@ -1701,7 +1711,7 @@ def _decide_eth(
                 recommended_action=_claim_action(state, role=record.role, note="verify finality manually"),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
-                situation=SITUATION_CLAIM_RACE,
+                situation=SITUATION_CLAIM_RACE_UNASSESSABLE,
             )
         if finality is ClaimFinality.SAFE:
             return Decision(
