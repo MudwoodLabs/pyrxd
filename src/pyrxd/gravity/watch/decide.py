@@ -951,6 +951,58 @@ def _both_locked_lock_height_unread(record: SwapRecord, obs: Observations, corr:
     )
 
 
+def _eth_both_locked_lock_height_unread(record: SwapRecord, obs: Observations, corr: bool) -> Decision:
+    """BOTH_LOCKED on an ETH counter leg, with no covenant lock height this tick (the ETH side of
+    register R1 with R8).
+
+    As on BTC, a WATCH here held for as long as the RXD sources could not read the covenant, past
+    t_rxd too. The ETH contract's absolute deadline (``eth_timeout_unix_s``) is the clock instead, as
+    at BTC_LOCKED: the swap was gated on the covenant refund opening no earlier than that deadline plus
+    a margin, so before it t_rxd should not be near. That rests on the gate's nominal margin, as the
+    BTC side's funding depth does. Once the deadline has passed, or the clock cannot be read, this
+    pages. Not urgent: past the deadline the contract refuses a claim, so the taker's ETH is not open
+    to the maker, and the refund that is due is the taker's own (mutual_refund sends it from
+    BOTH_LOCKED). A record with no covenant pinned keeps the WATCH (nothing says a covenant exists)."""
+    deadline_s = record.terms.eth_timeout_unix_s
+    if not _covenant_known(record, obs):
+        return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
+    if obs.now_unix_s is not None and deadline_s is not None and obs.now_unix_s < deadline_s:
+        return Decision(
+            Intent.WATCH,
+            reason=(
+                "both legs locked; the covenant's lock height could not be read this tick, but the ETH HTLC "
+                f"deadline ({deadline_s}) has not passed (now {obs.now_unix_s}), and the swap was gated so the "
+                "covenant refund opens after it: t_rxd should not be near yet"
+            ),
+            low_corroboration=corr,
+        )
+    why = (
+        "the ETH clock could not be read this tick"
+        if obs.now_unix_s is None or deadline_s is None
+        else f"the ETH HTLC deadline {deadline_s} has passed (now {obs.now_unix_s})"
+    )
+    if record.role is RecordRole.MAKER:
+        return _maker_covenant_refund(
+            f"the covenant's lock height could not be read this tick and {why}, so t_rxd may be near or past; "
+            "the taker refunds its ETH",
+            deadline=None,
+            corr=corr,
+            situation=SITUATION_MAKER_REFUND_LOCK_HEIGHT_UNREAD,
+        )
+    return Decision(
+        Intent.PAGE_REFUND,
+        reason=(
+            "both legs locked and the maker has not claimed, but the covenant pinned on the record could not be "
+            f"read on the RXD sources this tick, so this tower cannot tell where t_rxd is; {why}. Failing toward "
+            "this page: run mutual_refund, which reads the ETH HTLC from the chain and sends or follows your ETH "
+            "refund (run it again until it ends). Read the covenant on another RXD source."
+        ),
+        recommended_action="mutual_refund",
+        low_corroboration=corr,
+        situation=SITUATION_BOTH_LOCKED_LOCK_HEIGHT_UNREAD,
+    )
+
+
 def _btc_spend_permits_autonomy(obs: Observations) -> bool:
     """Whether the spender read lets an autonomous refund go out: a classified read must hold the
     outpoint UNSPENT at its quorum (a read below quorum, or one that names a spender, never arms).
@@ -1916,7 +1968,7 @@ def _decide_eth(
         )
     if state is SwapState.BOTH_LOCKED:
         if obs.asset_locked_at_height is None:
-            return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
+            return _eth_both_locked_lock_height_unread(record, obs, corr)
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
         try:
             refund_due = taker_refund_window_open(
