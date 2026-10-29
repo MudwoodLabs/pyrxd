@@ -824,8 +824,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`legacy_unresolved`) on every read until it resolves. The default is 6 hours, or twice the
   policy's longest honest wait (ETH finality, or BTC reorg depth times block interval) when that is
   longer; a bound at or below that wait is refused. Every failed read counts. Retries the tower's
-  configuration explains (one endpoint, whose word it already takes alone, or a source that cannot
-  read the leg) and an empty token contract (every endpoint must read it empty at its tip, so no
+  configuration explains (every read rests on one source: one endpoint, or a BTC quorum of one; or a
+  source that cannot read the leg) and an empty token contract (every endpoint must read it empty at its tip, so no
   endpoint can hold it while value is at stake) are marked `LegacyCheck.quiet_by_design` and never
   page. A record marked checked after
   its page has that page ACKed by the tower, so it leaves the escalation count. The clock is in

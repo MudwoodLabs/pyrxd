@@ -2146,8 +2146,8 @@ class LegacyCheck:
     delivered. Neither: write nothing, and the record is read again on a later tick.
 
     ``quiet_by_design``: a retried WATCH that does not page. Either this tower's configuration
-    explains it (it cannot read this counter leg, or it has one endpoint, whose word it already takes
-    alone), or no endpoint can hold it while value is at stake (``EXPIRED_EMPTY_OPEN``: every
+    explains it (it cannot read this counter leg, or every read rests on one source: one endpoint, or a
+    BTC quorum of one), or no endpoint can hold it while value is at stake (``EXPIRED_EMPTY_OPEN``: every
     endpoint reads the contract empty at its tip, and a push that lands leaves that answer). Every
     other retried WATCH is *unresolved*, and the reconciler pages "investigate"
     once a record has stayed unresolved too long (#921): one endpoint can hold the read there (a stale

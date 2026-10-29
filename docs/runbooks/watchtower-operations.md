@@ -128,8 +128,8 @@ into the same app or receiver changes nothing.
   measured), or twice the policy's longest honest wait (ETH finality, or the BTC reorg depth times
   the block interval) when that is longer; a value at or below that wait is refused at start. Every
   failed read counts, including on a tower with no ETH source for an ETH record. Three retries do
-  not count. Two follow from the tower's configuration: one endpoint configured (the tower already
-  takes that endpoint's word alone), and a source that cannot classify the leg. The third is an
+  not count. Two follow from the tower's configuration: every read resting on one source (one endpoint,
+  or a BTC `--quorum` of 1), and a source that cannot classify the leg. The third is an
   empty token contract a push may still reach, which no endpoint can hold while value is at stake
   (every endpoint must read it empty at its tip). When the record is later marked checked, the tower ACKs
   its own `legacy_unresolved` page, so it leaves the escalation count. The clock is kept in memory,
