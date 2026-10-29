@@ -18,7 +18,7 @@ from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.gravity.swap_coordinator import SwapCoordinator
 from pyrxd.gravity.swap_state import AbortReason, RecordRole, SwapRecord, SwapRole, SwapState
 from pyrxd.security.errors import NetworkError, ValidationError
-from tests._fake_evm_chain import FakeEvmChain, FakeEvmEndpoint
+from tests._fake_evm_chain import CONTRACT, FakeEvmChain, FakeEvmEndpoint
 from tests._fake_evm_chain import _tx_hash as _fake_tx_hash
 from tests.test_swap_coordinator import (
     CoordinatorConfig,
@@ -252,7 +252,7 @@ async def test_both_locked_refunded_is_a_takers_mutual_refund_only(role, lands_i
 
 def _with_a_dropped_claim(chain):
     dropped = {
-        "address": "0x" + "c0" * 20,
+        "address": CONTRACT,
         "topics": [CLAIMED_TOPIC0],
         "data": "0x" + chain.preimage.hex(),
         "transactionHash": "0x" + "dd" * 32,
