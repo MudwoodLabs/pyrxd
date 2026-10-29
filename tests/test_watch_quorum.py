@@ -149,11 +149,12 @@ async def test_no_locator_skips_btc_query():
     assert btc.claim_status_calls == []  # no funding outpoint to watch yet
 
 
-async def test_bogus_covenant_confs_guarded_to_none():
-    # cov_confs > tip + 1 (impossible on an honest chain) ⇒ candidate < 0 ⇒ None, not negative.
+async def test_a_depth_past_the_tip_keeps_its_blocks():
+    # cov_confs > tip + 1 (impossible on an honest chain): never a negative height, and never "unread"
+    # either (Mythos B-1). Both heights shift up so the 500 blocks between them stand.
     btc = FakeBtc(BtcClaimStatus(claimed=False))
     obs = await ChainObserver(btc=btc, rxd=FakeRxd(tip=200, cov_confs=500)).observe("s", _record())
-    assert obs.asset_locked_at_height is None
+    assert (obs.asset_locked_at_height, obs.now_rxd_height) == (0, 499)
 
 
 async def test_corroboration_flag_requires_structural_quorum():
