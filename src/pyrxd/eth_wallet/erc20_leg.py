@@ -210,14 +210,16 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         the same way before the getter is read, since a fleet whose every endpoint fails the getter
         would otherwise report an outage.
 
-        Each endpoint's transaction count for the candidate opens its own window, the
-        :data:`DEPLOYER_NONCE_SEARCH` nonces below that count, and a hit in ANY window is accepted:
+        Each endpoint's transaction count for the candidate, read at ``block_identifier`` like the code,
+        opens its own window, the :data:`DEPLOYER_NONCE_SEARCH` nonces below that count, and a hit in
+        ANY window is accepted:
         the CREATE equation proves itself, so no endpoint's count needs to be believed. One endpoint
         reporting a count far too high (or too low) moves only its own window; an endpoint that does
         not answer contributes none. The refusal is a :class:`ValidationError` only when every
         endpoint answered and no window holds the nonce; with any endpoint silent it is a retryable
         :class:`NetworkError`, because the silent one may hold the window that would have matched
-        (review MED-1, MED-2).
+        (review MED-1, MED-2). A refusal names the search bound when a window stops short of nonce 0:
+        a key busier than the bound is refused without blaming the taker.
 
         Divergence from the design text (D1 condition 2), deliberate: it named the sender recovered
         from the deploy transaction's signature, with the transaction's hash taken from the locator.
@@ -269,7 +271,12 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         sources = getattr(self._rpc, "sources", None)
         endpoints = list(sources) if sources else [self._rpc]
         answers = await asyncio.gather(
-            *(r.get_transaction_count(candidate, "latest") for r in endpoints), return_exceptions=True
+            # At the block the code and the getter were read at, not at `latest`: the deploy is mined by
+            # then, so an endpoint that can answer for that block counts past the deploy's nonce. A
+            # `latest` count served by a lagging node behind a load balancer could sit below it and
+            # turn an honest contract into a permanent refusal (Mythos 20261028T100731, LOW-2).
+            *(r.get_transaction_count(candidate, _bid) for r in endpoints),
+            return_exceptions=True,
         )
         # A count outside [0, 2**64) is no answer: EIP-2681 caps an account's nonce below 2**64, and a
         # larger one would not RLP-encode as a nonce (re-review LOW-2).
@@ -294,11 +301,24 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 f"{len(answers)} endpoints did not report a usable transaction count for it. The window that "
                 "would match may be theirs, so the deployer is unknown. Nothing was concluded; retry."
             )
+        if all(c <= DEPLOYER_NONCE_SEARCH for c in counts):
+            # Every window holds every nonce the account had used by that block: a proven negative.
+            raise ValidationError(
+                f"the contract at {contract_address} names {candidate} as its deployer, but no nonce that "
+                f"account had used by block_identifier={block_identifier!r} (windows {windows}) creates this "
+                "address. Refusing: the deployer is derived from the chain, and this contract was not created "
+                "the way an Erc20Htlc deploy creates one."
+            )
+        # Some window stops short of nonce 0, so the deploy may simply lie further back: a key that sent
+        # more than DEPLOYER_NONCE_SEARCH transactions since it deployed. Not evidence against the taker,
+        # and retrying will not find it either (Mythos 20261028T100731, LOW-1).
         raise ValidationError(
-            f"the contract at {contract_address} names {candidate} as its deployer, but no nonce of that "
-            f"account in the windows every endpoint opened ({windows}; at most {DEPLOYER_NONCE_SEARCH} below "
-            "each reported transaction count) creates this address. Refusing: the deployer is derived from "
-            "the chain, and this contract was not created the way an Erc20Htlc deploy creates one."
+            f"the contract at {contract_address} names {candidate} as its deployer, and no nonce in the "
+            f"windows searched ({windows}) creates this address. The search covers the newest "
+            f"{DEPLOYER_NONCE_SEARCH} nonces below each reported count, so either this contract was not "
+            f"created by {candidate}, or that account has sent more than {DEPLOYER_NONCE_SEARCH} transactions "
+            "since it deployed it. The deployer cannot be derived; refusing. A taker deploying from a busy "
+            "shared key should deploy from a dedicated key."
         )
 
     async def fund(

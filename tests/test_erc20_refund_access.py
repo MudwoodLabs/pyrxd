@@ -169,6 +169,7 @@ class _Endpoint:
         self.code = _RUNTIME if code is None else code
         self.getter_blocks: list[object] = []
         self.code_blocks: list[object] = []
+        self.count_blocks: list[object] = []
         endpoint = self
 
         class _Call:
@@ -193,7 +194,10 @@ class _Endpoint:
         return self.code
 
     async def get_transaction_count(self, who, block):
-        assert who == self.candidate and block == "latest"
+        assert who == self.candidate
+        self.count_blocks.append(block)
+        if callable(self.count):
+            return self.count(block)
         if isinstance(self.count, Exception):
             raise self.count
         return self.count
@@ -226,6 +230,7 @@ def test_the_creator_is_derived_and_the_getter_read_is_pinned_to_the_block() -> 
     derived = _derive(ep, contract, block_identifier="finalized")
     assert derived.lower() == who.lower() and derived != contract
     assert ep.getter_blocks == ["finalized"]
+    assert ep.count_blocks == ["finalized"]
 
 
 @pytest.mark.parametrize("nonce", [0, 1, 0x7F, 0x80, 0xFFFF, 0x10000])
@@ -239,7 +244,7 @@ def test_a_getter_naming_an_account_that_did_not_create_the_address_is_refused()
     """A contract whose creation code was not ours can name anyone in ``deployer()``. The name is a
     candidate: no nonce of it creates this address, so it is refused."""
     who, creator = derive_address(_key()), derive_address(_key())
-    with pytest.raises(ValidationError, match="no nonce of that account"):
+    with pytest.raises(ValidationError, match="not created the way an Erc20Htlc deploy creates one"):
         _derive(_Endpoint(who, 50), _create_address(creator, 5))
 
 
@@ -277,6 +282,31 @@ def test_no_hit_with_a_silent_endpoint_is_unknown_not_a_refusal() -> None:
     with pytest.raises(NetworkError, match="did not report") as e:
         _derive(fleet, _create_address(creator, 5))
     assert not isinstance(e.value, ValidationError)
+
+
+def test_the_count_is_read_at_the_block_the_code_was_read_at() -> None:
+    """Mythos 20261028T100731 LOW-2. The count was read at ``latest`` while the code was read at the
+    pinned block, so one endpoint whose ``latest`` view lagged (a node behind a load balancer) put the
+    window below the deploy's nonce and refused an honest contract for good. At the pinned block the
+    deploy is mined, so the count there is past its nonce."""
+    who = derive_address(_key())
+    ep = _Endpoint(who, lambda block: 5 if block == "latest" else 9)
+    assert _derive(ep, _create_address(who, 5), block_identifier="finalized").lower() == who.lower()
+    assert ep.count_blocks == ["finalized"]
+
+
+def test_a_key_busier_than_the_search_is_refused_without_blaming_the_taker(monkeypatch) -> None:
+    """Mythos 20261028T100731 LOW-1. When a window stops short of nonce 0 the deploy may lie further
+    back, so the refusal names the bound and does not call the contract a wrong one. When every window
+    reaches nonce 0 the miss is proven, and the refusal says so."""
+    monkeypatch.setattr(erc20_leg_mod, "DEPLOYER_NONCE_SEARCH", 10)
+    who = derive_address(_key())
+    with pytest.raises(ValidationError, match="more than 10 transactions since it deployed it") as busy:
+        _derive(_Endpoint(who, 100), _create_address(who, 5))
+    assert "not created the way" not in str(busy.value)
+    with pytest.raises(ValidationError, match="not created the way an Erc20Htlc deploy creates one") as proven:
+        _derive(_Endpoint(who, 10), _create_address(derive_address(_key()), 5))
+    assert "more than 10" not in str(proven.value)
 
 
 def test_endpoints_disagreeing_on_the_candidate_is_not_resolved_by_one_of_them() -> None:

@@ -550,7 +550,7 @@ async def test_a_real_Erc20Htlc_deploy_verifies_and_every_forged_copy_is_refused
         assert "deployer" in forged_names
         # A copy of the honest runtime placed where nothing created it names the taker as its
         # deployer, and no nonce of the taker creates that address: refused.
-        with pytest.raises(ValidationError, match="no nonce of that account"):
+        with pytest.raises(ValidationError, match="not created the way an Erc20Htlc deploy creates one"):
             await maker.derive_deployer(to_checksum_address("0x" + "cc" * 18 + "0001"))
     finally:
         await rpc.close()
