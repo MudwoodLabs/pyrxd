@@ -189,6 +189,15 @@ class _Endpoint:
 
         self.w3 = type("W3", (), {"eth": _Eth()})()
 
+    head = 120
+    finalized = 100
+
+    async def block_number(self):
+        return self.head
+
+    async def finalized_block_number(self):
+        return self.finalized
+
     async def get_code(self, address, block_identifier=None):
         self.code_blocks.append(block_identifier)
         return self.code
@@ -208,6 +217,12 @@ class _Fleet:
 
     def __init__(self, endpoints) -> None:
         self.sources = endpoints
+
+    async def block_number(self):
+        return min(e.head for e in self.sources)
+
+    async def finalized_block_number(self):
+        return min(e.finalized for e in self.sources)
 
     async def get_code(self, address, block_identifier=None):
         return await self.sources[0].get_code(address, block_identifier)
@@ -229,8 +244,8 @@ def test_the_creator_is_derived_and_the_getter_read_is_pinned_to_the_block() -> 
     ep = _Endpoint(who, 9)
     derived = _derive(ep, contract, block_identifier="finalized")
     assert derived.lower() == who.lower() and derived != contract
-    assert ep.getter_blocks == ["finalized"]
-    assert ep.count_blocks == ["finalized"]
+    # The tag is resolved once, to the finalized block number, and every read is pinned to it.
+    assert ep.getter_blocks == ep.count_blocks == ep.code_blocks == [ep.finalized]
 
 
 @pytest.mark.parametrize("nonce", [0, 1, 0x7F, 0x80, 0xFFFF, 0x10000])
@@ -285,14 +300,17 @@ def test_no_hit_with_a_silent_endpoint_is_unknown_not_a_refusal() -> None:
 
 
 def test_the_count_is_read_at_the_block_the_code_was_read_at() -> None:
-    """Mythos 20261028T100731 LOW-2. The count was read at ``latest`` while the code was read at the
-    pinned block, so one endpoint whose ``latest`` view lagged (a node behind a load balancer) put the
-    window below the deploy's nonce and refused an honest contract for good. At the pinned block the
-    deploy is mined, so the count there is past its nonce."""
+    """Mythos 20261028T100731 LOW-2, and its re-review F1. The count was read at ``latest`` while the
+    code was read at the pinned block; then at the same TAG, which a load balancer resolves again per
+    request. Either way a lagging backend's count sat below the deploy's nonce and refused an honest
+    contract for good. The tag is now resolved to one block number, where the deploy is mined. Here
+    any tag reaches the lagging backend (count 5); only the number reaches the current one."""
     who = derive_address(_key())
-    ep = _Endpoint(who, lambda block: 5 if block == "latest" else 9)
-    assert _derive(ep, _create_address(who, 5), block_identifier="finalized").lower() == who.lower()
-    assert ep.count_blocks == ["finalized"]
+    ep = _Endpoint(who, lambda block: 9 if isinstance(block, int) else 5)
+    for tag in ("finalized", "latest", None):
+        ep.count_blocks.clear()
+        assert _derive(ep, _create_address(who, 5), block_identifier=tag).lower() == who.lower()
+        assert ep.count_blocks and all(isinstance(b, int) for b in ep.count_blocks)
 
 
 def test_a_key_busier_than_the_search_is_refused_without_blaming_the_taker(monkeypatch) -> None:
@@ -333,7 +351,7 @@ def test_no_code_at_the_block_says_not_yet_finalized_and_reads_no_getter() -> No
     ep = _Endpoint(who, 9, code=b"")
     with pytest.raises(ValidationError, match="NOT YET FINALIZED"):
         _derive(ep, _create_address(who, 5), block_identifier="finalized")
-    assert ep.code_blocks == ["finalized"] and ep.getter_blocks == []
+    assert ep.code_blocks == [ep.finalized] and ep.getter_blocks == []
 
 
 def test_a_contract_without_a_working_getter_is_a_typed_refusal() -> None:

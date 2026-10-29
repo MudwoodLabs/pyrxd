@@ -210,10 +210,10 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         the same way before the getter is read, since a fleet whose every endpoint fails the getter
         would otherwise report an outage.
 
-        Each endpoint's transaction count for the candidate, read at ``block_identifier`` like the code,
-        opens its own window, the :data:`DEPLOYER_NONCE_SEARCH` nonces below that count, and a hit in
-        ANY window is accepted:
-        the CREATE equation proves itself, so no endpoint's count needs to be believed. One endpoint
+        ``block_identifier`` is resolved to one block number first, and the code, the getter and every
+        count are read at that number. Each endpoint's transaction count for the candidate opens its
+        own window, the :data:`DEPLOYER_NONCE_SEARCH` nonces below that count, and a hit in ANY window
+        is accepted: the CREATE equation proves itself, so no endpoint's count needs to be believed. One endpoint
         reporting a count far too high (or too low) moves only its own window; an endpoint that does
         not answer contributes none. The refusal is a :class:`ValidationError` only when every
         endpoint answered and no window holds the nonce; with any endpoint silent it is a retryable
@@ -231,11 +231,20 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
 
         from eth_utils import keccak, to_checksum_address
 
-        _bid = "latest" if block_identifier is None else block_identifier
-        code = await self._rpc.get_code(contract_address, block_identifier)
+        # One concrete block for every read below. A tag ("finalized", "latest") is resolved again by
+        # each request, so behind a load balancer the code and the count could come from nodes at
+        # different blocks; a node asked for a number it has not reached errors instead, and an error
+        # is a silent endpoint, never a refusal (Mythos 20261028T100731 LOW-2, re-review F1).
+        if block_identifier is None or block_identifier == "latest":
+            _bid = int(await self._rpc.block_number())
+        elif block_identifier == "finalized":
+            _bid = int(await self._rpc.finalized_block_number())
+        else:
+            _bid = block_identifier
+        code = await self._rpc.get_code(contract_address, _bid)
         if not code:
             raise ValidationError(
-                f"no contract code at {contract_address} as of block_identifier={block_identifier!r}, so its "
+                f"no contract code at {contract_address} as of block {_bid} (block_identifier={block_identifier!r}), so its "
                 "deployer cannot be read. If that is 'finalized', the deploy is most likely simply NOT YET "
                 "FINALIZED: retry once it buries. Empty code at a checkpoint is not evidence of a wrong contract."
             )
@@ -271,10 +280,8 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         sources = getattr(self._rpc, "sources", None)
         endpoints = list(sources) if sources else [self._rpc]
         answers = await asyncio.gather(
-            # At the block the code and the getter were read at, not at `latest`: the deploy is mined by
-            # then, so an endpoint that can answer for that block counts past the deploy's nonce. A
-            # `latest` count served by a lagging node behind a load balancer could sit below it and
-            # turn an honest contract into a permanent refusal (Mythos 20261028T100731, LOW-2).
+            # At the block the code and the getter were read at: the deploy is mined by then, so a node
+            # that answers for that block number counts past the deploy's nonce.
             *(r.get_transaction_count(candidate, _bid) for r in endpoints),
             return_exceptions=True,
         )
@@ -305,7 +312,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             # Every window holds every nonce the account had used by that block: a proven negative.
             raise ValidationError(
                 f"the contract at {contract_address} names {candidate} as its deployer, but no nonce that "
-                f"account had used by block_identifier={block_identifier!r} (windows {windows}) creates this "
+                f"account had used by block {_bid} (windows {windows}) creates this "
                 "address. Refusing: the deployer is derived from the chain, and this contract was not created "
                 "the way an Erc20Htlc deploy creates one."
             )
