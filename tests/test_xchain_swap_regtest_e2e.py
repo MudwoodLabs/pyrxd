@@ -74,9 +74,10 @@ from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.devnet import RegtestNode
 from pyrxd.gravity.finality import CounterClaimFinality
+from pyrxd.gravity.funding_spv import radiant_chain_for_leg
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput
-from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.radiant_leg import CovenantSpendKind, RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.swap_coordinator import (
     ClaimFinality,
     CoordinatorConfig,
@@ -85,7 +86,7 @@ from pyrxd.gravity.swap_coordinator import (
     assert_timelock_margin,
     assess_claim_finality,
 )
-from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, SwapState
+from pyrxd.gravity.swap_state import AbortReason, NegotiatedTerms, SwapRecord, SwapRole, SwapState
 from pyrxd.gravity.watch.alerts import DedupAlerter, Page, Severity
 from pyrxd.gravity.watch.decide import Intent
 from pyrxd.gravity.watch.quorum import BtcClaimStatus, ChainObserver
@@ -313,12 +314,58 @@ class _RadiantCliClient(NodeSpvReads):
     def __init__(self, nodes: _Nodes) -> None:
         self._n = nodes
         self._spk_by_hash: dict[bytes, bytes] = {}
+        # The history index (`get_history`) starts at the tip this client is made at: every
+        # covenant in this suite is funded after its swap's client exists, so no block before it
+        # can touch one. Walking the module's whole shared chain per swap would cost a docker exec
+        # per block for nothing.
+        self._indexed = int(nodes.rxd("getblockcount"))
+        self._history: dict[bytes, dict[str, int]] = {}
+        self._owner: dict[tuple[str, int], bytes] = {}
 
     def rpc(self, method: str, *args):
         return self._n.rxd(method, *args)
 
     def register_spk(self, spk: bytes) -> None:
         self._spk_by_hash[hashlib.sha256(bytes(spk)).digest()[::-1]] = bytes(spk)
+
+    # ElectrumX's per-script history, rebuilt from the node's own blocks (the pattern of
+    # `tests/test_fresh_wallet_spends_regtest_e2e.py`'s `_ChainIndex`). The maker's covenant
+    # read (`RadiantChainIO.covenant_spend_answers`) asks it, then fetches each listed tx's bytes
+    # and finds the spender itself. Every output is indexed by `sha256(scriptPubKey)` reversed and
+    # every input is attributed to the script of the output it spends. It decides nothing: it lists
+    # what the chain and the mempool hold, as an ElectrumX server would.
+
+    def _index_tx(self, tx: dict, height: int, into: dict[bytes, dict[str, int]]) -> None:
+        txid = str(tx["txid"])
+        for vin in tx["vin"]:
+            owner = self._owner.get((vin.get("txid"), vin.get("vout")))
+            if owner is not None:
+                into.setdefault(owner, {})[txid] = height
+        for out in tx["vout"]:
+            sh = hashlib.sha256(bytes.fromhex(out["scriptPubKey"]["hex"])).digest()[::-1]
+            into.setdefault(sh, {})[txid] = height
+            if height > 0:
+                self._owner[(txid, int(out["n"]))] = sh
+
+    def sync(self) -> None:
+        """Index every block up to the tip. ``get_history`` calls it; a test calls it too after
+        mining many blocks, so the read under the leg's per-source timeout walks few."""
+        tip = int(self._n.rxd("getblockcount"))
+        for height in range(self._indexed + 1, tip + 1):
+            block = self._n.rxd("getblock", str(self._n.rxd("getblockhash", str(height))), "2")
+            for tx in block["tx"]:
+                self._index_tx(tx, height, self._history)
+        self._indexed = max(self._indexed, tip)
+
+    async def get_history(self, script_hash) -> list[dict]:
+        self.sync()
+        view = {sh: dict(txs) for sh, txs in self._history.items()}
+        # The mempool too, at height 0, as ElectrumX lists it: a refund sent and not yet mined is in
+        # the covenant's history, so the next read sees it pending rather than the covenant unspent.
+        for txid in self._n.rxd("getrawmempool"):
+            self._index_tx(self._n.rxd("getrawtransaction", str(txid), "true"), 0, view)
+        sh = bytes(script_hash)
+        return [{"tx_hash": txid, "height": h} for txid, h in sorted(view.get(sh, {}).items())]
 
     async def broadcast(self, raw_tx: bytes) -> str:
         return self._n.rxd("sendrawtransaction", bytes(raw_tx).hex())
@@ -623,10 +670,16 @@ def _rxd_confs(nodes: _Nodes, txid: str) -> int:
 
 
 class _LockedSwap:
-    """A swap driven to BOTH_LOCKED on both real chains, ready for any terminal path."""
+    """A swap set up on both real chains: driven to BOTH_LOCKED, ready for any terminal path
+    (:func:`_setup_locked_swap`), or with only the maker's covenant funded (:func:`_setup_funded_covenant`)."""
 
-    def __init__(self, *, coord, cov, p_secret, broadcaster, t_btc, t_rxd, rxd_locked_at, rxd_amount):
+    def __init__(
+        self, *, coord, cov, p_secret, broadcaster, t_btc, t_rxd, rxd_locked_at, rxd_amount, rxd_client, cov_outpoint
+    ):
         self.coord = coord
+        self.rxd_client = rxd_client
+        #: ``txid:vout`` of the maker's covenant funding, as the node accepted it (``_rxd_pay`` pays vout 0).
+        self.cov_outpoint = cov_outpoint
         self.cov = cov
         self.p_secret = p_secret
         self.broadcaster = broadcaster
@@ -644,6 +697,35 @@ async def _setup_locked_swap(nodes: _Nodes, *, role=None) -> _LockedSwap:
     mines towards it from here rather than negotiating a smaller ``t_rxd``: a window short enough
     to be closing at the reveal cannot also carry the margin, and the gate refuses it before any
     lock.
+    """
+    s = await _setup_funded_covenant(nodes, role=role)
+    coord, terms = s.coord, s.coord.record.terms
+
+    # 2. Taker funds the BTC HTLC — this now runs the HZ-1 gate against a genuinely funded,
+    #    mined covenant (twice: once in pre_btc_lock_check, once re-run inside taker_funds_btc
+    #    immediately before the broadcast, which is what closes the verify->lock TOCTOU).
+    rec = await coord.taker_funds_btc(terms)
+    assert rec.state is SwapState.BTC_LOCKED
+    assert rec.btc_locator.amount_sats == terms.btc_sats
+
+    # 3. Taker re-validates the on-chain covenant SPK and advances to BOTH_LOCKED.
+    rec = await coord.post_asset_lock_revalidate(s.cov.funded_spk)
+    assert rec.state is SwapState.BOTH_LOCKED
+
+    # Not a fiction: BOTH_LOCKED is where the maker may reveal p, and under the #482 ordering the
+    # counter leg is the SHORT one. A fixture whose BTC refund were already spendable here would have
+    # every scenario below reveal p into an open refund race without saying so.
+    assert _btc_confs(nodes, rec.btc_locator.funding_outpoint.txid) < s.t_btc.value, (
+        "fixture: the taker's BTC refund must still be closed when the swap reaches BOTH_LOCKED"
+    )
+    return s
+
+
+async def _setup_funded_covenant(nodes: _Nodes, *, role=None) -> _LockedSwap:
+    """Negotiate a swap and fund the maker's RXD covenant (mined); the record stays NEGOTIATED.
+
+    Step 1 of :func:`_setup_locked_swap`, and on its own the state a maker is left in when the taker
+    never funds its counter leg (the maker's covenant exit, #850 PR 11).
     """
     p_secret = SecretBytes(os.urandom(32))
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
@@ -736,25 +818,8 @@ async def _setup_locked_swap(nodes: _Nodes, *, role=None) -> _LockedSwap:
     #    scripts/btc_swap_two_host.py; the FSM still records the taker's lock as the first
     #    TRANSITION, because the requirement is a precondition on that transition, not an edge.
     rxd_locked_at = int(nodes.rxd("getblockcount"))
-    _rxd_pay(nodes, cov.funded_spk, rxd_photons)
-
-    # 2. Taker funds the BTC HTLC — this now runs the HZ-1 gate against a genuinely funded,
-    #    mined covenant (twice: once in pre_btc_lock_check, once re-run inside taker_funds_btc
-    #    immediately before the broadcast, which is what closes the verify->lock TOCTOU).
-    rec = await coord.taker_funds_btc(terms)
-    assert rec.state is SwapState.BTC_LOCKED
-    assert rec.btc_locator.amount_sats == btc_sats
-
-    # 3. Taker re-validates the on-chain covenant SPK and advances to BOTH_LOCKED.
-    rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
-    assert rec.state is SwapState.BOTH_LOCKED
-
-    # Not a fiction: BOTH_LOCKED is where the maker may reveal p, and under the #482 ordering the
-    # counter leg is the SHORT one. A fixture whose BTC refund were already spendable here would have
-    # every scenario below reveal p into an open refund race without saying so.
-    assert _btc_confs(nodes, rec.btc_locator.funding_outpoint.txid) < t_btc.value, (
-        "fixture: the taker's BTC refund must still be closed when the swap reaches BOTH_LOCKED"
-    )
+    cov_funding_txid = _rxd_pay(nodes, cov.funded_spk, rxd_photons)
+    assert coord.record.state is SwapState.NEGOTIATED
 
     return _LockedSwap(
         coord=coord,
@@ -765,6 +830,8 @@ async def _setup_locked_swap(nodes: _Nodes, *, role=None) -> _LockedSwap:
         t_rxd=t_rxd,
         rxd_locked_at=rxd_locked_at,
         rxd_amount=rxd_photons,
+        rxd_client=rxd_client,
+        cov_outpoint=f"{cov_funding_txid}:0",
     )
 
 
@@ -974,6 +1041,174 @@ class TestCovenantRefundCsvMaturity:
         assert len(txid) == 64
         nodes.rxd_mine(1)
         assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), "the mature CSV refund spent the covenant"
+
+
+def _maker_coordinator(s: _LockedSwap, record: SwapRecord) -> SwapCoordinator:
+    """A MAKER-role coordinator over *record*, on *s*'s two legs: the maker's own process, which
+    holds its record apart from the taker's (``scripts/btc_swap_two_host.py``, ``--phase abort``)."""
+    c = s.coord
+    return SwapCoordinator(
+        record=record,
+        btc_leg=c.counter_leg,
+        radiant_leg=c.radiant_leg,
+        indexer=None,
+        seen_store=_Seen(),
+        config=CoordinatorConfig(margin_policy=c.config.margin_policy, role=SwapRole.MAKER),
+    )
+
+
+def _covenant_refund_burial(coord: SwapCoordinator) -> int:
+    """The depth at which the maker's covenant read calls a refund buried: the burial its funding
+    needed, as ``SwapCoordinator._read_covenant_spend`` asks it of the leg."""
+    chain = radiant_chain_for_leg(coord.radiant_leg, counter_leg=coord.counter_leg)
+    burial = coord._funding_burial_blocks(chain, coord._funding_value_at_stake_photons(coord.record.terms))
+    return max(1, int(burial))
+
+
+def _covenant_spenders(nodes: _Nodes, outpoint: str) -> list[str]:
+    """Every mempool transaction that spends *outpoint*, read from the node."""
+    txid, vout = outpoint.split(":")
+    out = []
+    for t in nodes.rxd("getrawmempool"):
+        vin = nodes.rxd("getrawtransaction", str(t), "true")["vin"]
+        if any(i.get("txid") == txid and i.get("vout") == int(vout) for i in vin):
+            out.append(str(t))
+    return out
+
+
+async def _drive_maker_covenant_exit(nodes: _Nodes, s: _LockedSwap, maker: SwapCoordinator) -> None:
+    """Drive *maker* (a MAKER record that never revealed ``p``) out through its covenant's CSV refund
+    and check each step against the node: refused before maturity, sent once at maturity, held while
+    the refund is shallower than the burial, and ABORTED (``covenant_refunded``) once it is buried.
+    The record's own read of what spent the covenant decides each step (#850 PR 11); a second
+    coordinator over the same record, through ``reconcile_covenant``, must reach the same end."""
+    start = maker.record.state
+    terms = maker.record.terms
+    burial = _covenant_refund_burial(maker)
+
+    async def read():
+        # The leg's own read, asked directly as well: a read that cannot decide (UNKNOWN) would
+        # still let maker_refund_covenant send, so its steps alone cannot show the read works.
+        return await maker.radiant_leg.covenant_spend(maker.record, burial_blocks=burial)
+
+    # 1. Before t_rxd: the leg's maturity check refuses, and nothing is sent. The covenant is pinned
+    #    first (and the pin is the outpoint the node holds), so the read that ends the record later
+    #    finds the output the refund spends.
+    with pytest.raises(NetworkError, match="not yet mature"):
+        await maker.maker_refund_covenant()
+    assert maker.record.state is start
+    assert maker.record.radiant_covenant_outpoint == s.cov_outpoint
+    assert maker.record.asset_refund_txid is None
+    assert isinstance(nodes.rxd("gettxout", s.cov_outpoint.split(":")[0], "0"), dict), "nothing was sent"
+    spend = await read()
+    assert spend.kind is CovenantSpendKind.UNSPENT, spend.reason
+    # reconcile_covenant reads the same chain: unspent, so nothing changes.
+    rec = await maker.reconcile_covenant()
+    assert rec.state is start and rec.asset_refund_txid is None
+
+    # 2. At t_rxd confirmations the covenant's CSV refund is final: it is sent, and recorded. The
+    #    record stays where it is until a later read finds the refund buried.
+    nodes.rxd_mine(terms.t_rxd.value - _rxd_confs(nodes, s.cov_outpoint.split(":")[0]))
+    s.rxd_client.sync()
+    rec = await maker.maker_refund_covenant()
+    refund_txid = rec.asset_refund_txid
+    assert rec.state is start
+    assert refund_txid is not None
+    assert _covenant_spenders(nodes, s.cov_outpoint) == [refund_txid], "the node holds the refund, and only it"
+    # Paid to the maker's holder script, read from the node's own decoding, not from the leg.
+    refund = nodes.rxd("getrawtransaction", refund_txid, "true")
+    assert refund["vout"][0]["scriptPubKey"]["hex"] == s.cov.maker_holder_script.hex()
+    spend = await read()
+    assert spend.kind is CovenantSpendKind.REFUNDED, spend.reason
+    assert spend.txid == refund_txid and spend.depth == 0 and not spend.buried
+
+    # 3. Called again while the refund sits in the mempool: the read finds it pending, sends nothing
+    #    (this suite's fee source mines a block per fee input, so a second send would have mined the
+    #    first), and leaves the record as it was.
+    rec = await maker.maker_refund_covenant()
+    assert rec.state is start and rec.asset_refund_txid == refund_txid
+    assert _rxd_confs(nodes, refund_txid) == 0
+    assert _covenant_spenders(nodes, s.cov_outpoint) == [refund_txid]
+
+    # 4. Mined but shallower than the burial: still pending, still nothing sent.
+    if burial > 1:
+        nodes.rxd_mine(burial - 1)
+        s.rxd_client.sync()
+        assert _rxd_confs(nodes, refund_txid) == burial - 1
+        spend = await read()
+        assert spend.kind is CovenantSpendKind.REFUNDED and spend.depth == burial - 1 and not spend.buried
+        rec = await maker.maker_refund_covenant()
+        assert rec.state is start and rec.asset_refund_txid == refund_txid
+        rec = await maker.reconcile_covenant()
+        assert rec.state is start
+
+    # 5. Buried: the read finds the refund leaf, paying the maker, at the burial depth, and the record
+    #    ends. Once through a second coordinator's reconcile_covenant (no broadcast at all), once
+    #    through the maker's own maker_refund_covenant.
+    pending = maker.record
+    nodes.rxd_mine(burial - _rxd_confs(nodes, refund_txid))
+    s.rxd_client.sync()
+    assert _rxd_confs(nodes, refund_txid) == burial
+    spend = await read()
+    assert spend.kind is CovenantSpendKind.REFUNDED and spend.buried, spend.reason
+    for rec in (await _maker_coordinator(s, pending).reconcile_covenant(), await maker.maker_refund_covenant()):
+        assert rec.state is SwapState.ABORTED
+        assert rec.abort_reason is AbortReason.COVENANT_REFUNDED
+        assert rec.asset_refund_txid == refund_txid
+    assert nodes.rxd("gettxout", s.cov_outpoint.split(":")[0], "0") in (None, ""), "the covenant is spent"
+    assert _covenant_spenders(nodes, s.cov_outpoint) == [], "nothing else was sent"
+
+
+class TestMakerCovenantExit:
+    """The MAKER's exit from a swap in which it never revealed ``p`` (#850 PR 11,
+    ``SwapCoordinator.maker_refund_covenant`` / ``reconcile_covenant``), on real consensus.
+
+    Its read of what spent the covenant goes through the production ``RadiantChainIO`` against the
+    node: each transaction in the covenant script's history (``_RadiantCliClient.get_history``, the
+    node's blocks and mempool) is fetched as bytes and classified by the leaf it spends. The CSV
+    refund itself is the node's to accept. The two states it is run from are the two
+    ``scripts/btc_swap_two_host.py --phase abort`` drives: NEGOTIATED (the taker never funded) and
+    PARAMS_MISMATCH (the maker's own revalidation failed)."""
+
+    async def test_taker_never_funds_maker_refunds_covenant_and_record_aborts(self, nodes):
+        s = await _setup_funded_covenant(nodes, role=SwapRole.MAKER)
+        assert s.coord.record.state is SwapState.NEGOTIATED
+        assert s.coord.record.radiant_covenant_outpoint is None, "nothing pins the covenant before the exit"
+        await _drive_maker_covenant_exit(nodes, s, s.coord)
+
+    async def test_params_mismatch_maker_refunds_covenant_and_record_aborts(self, nodes):
+        # The taker funds its BTC HTLC (against the maker's funded covenant, through its own gate).
+        s = await _setup_funded_covenant(nodes)
+        terms = s.coord.record.terms
+        taker = await s.coord.taker_funds_btc(terms)
+        assert taker.state is SwapState.BTC_LOCKED
+        loc = taker.btc_locator
+
+        # The maker's own record, at BTC_LOCKED as the two-host maker builds it, revalidates against
+        # an SPK that is not the one the terms build (here: the same covenant with a CSV one block
+        # longer). The covenant the terms build is the one on chain, and the record pins it.
+        maker = _maker_coordinator(
+            s,
+            SwapRecord(state=SwapState.NEGOTIATED, terms=terms).with_counter_lock(loc).with_state(SwapState.BTC_LOCKED),
+        )
+        wrong = build_htlc_covenant_rxd(
+            amount=terms.radiant_amount,
+            taker_pkh=s.coord.radiant_leg.taker_pkh,
+            maker_pkh=s.coord.radiant_leg.maker_pkh,
+            hashlock=terms.hashlock,
+            refund_csv=terms.t_rxd.value + 1,
+        )
+        assert wrong.funded_spk != s.cov.funded_spk
+        rec = await maker.post_asset_lock_revalidate(wrong.funded_spk)
+        assert rec.state is SwapState.PARAMS_MISMATCH
+        assert rec.radiant_covenant_outpoint == s.cov_outpoint
+
+        await _drive_maker_covenant_exit(nodes, s, maker)
+
+        # The maker's exit took its covenant only: the taker's BTC HTLC is still unspent, its own to refund.
+        assert isinstance(nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout)), dict), (
+            "the taker's BTC HTLC is untouched"
+        )
 
 
 class TestBtcActiveAdversary:
