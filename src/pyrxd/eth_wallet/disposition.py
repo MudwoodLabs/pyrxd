@@ -57,7 +57,7 @@ import asyncio
 import dataclasses
 import hashlib
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -935,14 +935,22 @@ async def _deploy_block(source: Any, deploy_tx_hash: str, contract_address: str)
 def created_contract(tx: Any, contract_address: str) -> bool:
     """Whether the transaction *tx* (as ``eth_getTransactionByHash`` returns it) is the CREATE that
     made *contract_address*: it calls nothing, and ``keccak(rlp([from, nonce]))[12:]`` is that
-    address. A field that is missing or malformed answers ``False``."""
-    try:
-        sender, nonce = tx.get("from"), _int_or_none(tx.get("nonce"))
-        if tx.get("to") or not isinstance(sender, str) or nonce is None or nonce < 0:
-            return False
-        return _addr(create_address(sender, nonce)) == _addr(contract_address)
-    except (NetworkError, ValidationError, ValueError, AttributeError):
+    address.
+
+    Raises :class:`NetworkError` when *tx* carries no usable sender or nonce: that is an endpoint's
+    malformed answer, which drops the endpoint, not a vote that the transaction created nothing."""
+    if not isinstance(tx, Mapping):
+        raise NetworkError(f"eth_getTransactionByHash answered {type(tx).__name__}, not a transaction")
+    sender, nonce = tx.get("from"), _int_or_none(tx.get("nonce"))
+    if not isinstance(sender, str) or nonce is None or nonce < 0:
+        raise NetworkError("eth_getTransactionByHash answered a transaction with no usable sender or nonce")
+    if tx.get("to"):
         return False
+    try:
+        derived = create_address(sender, nonce)
+    except (ValidationError, ValueError) as exc:
+        raise NetworkError(f"eth_getTransactionByHash answered a malformed sender: {exc}") from exc
+    return _addr(derived) == _addr(contract_address)
 
 
 # --------------------------------------------------------------------------- an unfunded token contract

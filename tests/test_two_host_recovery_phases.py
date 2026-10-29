@@ -2048,6 +2048,11 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
         await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
         loc = _read_back(args).counterchain_locator
         assert loc.deploy_tx_hash != lie
+        # A maker's record keeps the placeholder: the refusal below must come from that, not from the
+        # deploy check refusing whatever hash the record holds.
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
+
+        assert loc.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
 
         from pyrxd.eth_wallet.htlc_leg import create_address
 

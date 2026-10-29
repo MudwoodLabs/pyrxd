@@ -486,9 +486,7 @@ class _DeployIs(_FakeEthRpc):
         {"blockNumber": 500, "from": _DEPLOYER, "nonce": 1, "to": _CONTRACT},  # a later call to the contract
         {"blockNumber": 10, "from": _DEPLOYER, "nonce": 1, "to": None},  # a creation of another address
         {"blockNumber": 10, "from": "0x" + "ee" * 20, "nonce": 0, "to": None},  # another sender's creation
-        {"blockNumber": 10, "to": None},  # no sender or nonce to derive from
         {"blockNumber": 10, "from": _DEPLOYER, "nonce": 0, "to": _CONTRACT},  # a call, whatever it derives
-        {"blockNumber": 10, "from": "0x12", "nonce": 0, "to": None},  # a malformed sender
     ],
 )
 async def test_claim_status_refuses_a_deploy_that_did_not_create_the_contract(tx):
@@ -499,6 +497,26 @@ async def test_claim_status_refuses_a_deploy_that_did_not_create_the_contract(tx
     fake = _DeployIs(tx, logs=[claimed])
     with pytest.raises(NetworkError, match="did not create"):
         await RpcEthChainSource(fake).claim_status(_CONTRACT, "0x" + "cd" * 32)
+    assert fake.get_logs_calls == []
+
+
+@pytest.mark.parametrize(
+    "tx",
+    [
+        {"blockNumber": 10, "to": None},  # no sender or nonce to derive from
+        {"blockNumber": 10, "from": "0x12", "nonce": 0, "to": None},  # a malformed sender
+        {"blockNumber": 10, "from": _DEPLOYER, "nonce": "zz", "to": None},  # a malformed nonce
+    ],
+)
+async def test_claim_status_treats_a_malformed_deploy_answer_as_the_endpoints_failure(tx):
+    """An answer with no usable sender or nonce is the endpoint failing, not a vote that the
+    transaction created nothing: it raises a plain NetworkError, so a secondary's is dropped."""
+    from pyrxd.gravity.watch.eth_adapters import DeployNotCreationError
+
+    fake = _DeployIs(tx, logs=[])
+    with pytest.raises(NetworkError) as raised:
+        await RpcEthChainSource(fake).claim_status(_CONTRACT, "0x" + "cd" * 32)
+    assert not isinstance(raised.value, DeployNotCreationError)
     assert fake.get_logs_calls == []
 
 

@@ -87,6 +87,12 @@ def _topic0(log: dict[str, Any]) -> str | None:
     return _to_0x_hash(topics[0]).lower()
 
 
+class DeployNotCreationError(NetworkError):
+    """An endpoint says the record's deploy transaction did not create the HTLC contract. Unlike an
+    endpoint's ordinary failure, this is raised whichever endpoint says it: the scan's start is then
+    in doubt, and a lying primary must not be able to pass the check while it drops the others."""
+
+
 async def _scan_for_claim(rpc: EthRpc, contract_address: str, deploy_tx_hash: str) -> tuple[EthClaimStatus, bool]:
     """One endpoint's selector-agnostic scan: ``(status, canonical)``, ``canonical`` True when the claim
     is a ``Claimed(bytes32)`` log rather than an unrecognised one."""
@@ -98,7 +104,7 @@ async def _scan_for_claim(rpc: EthRpc, contract_address: str, deploy_tx_hash: st
     # start it past a claim. It must be the one that created the contract, derived from its sender
     # and nonce, never read from a receipt's contractAddress.
     if not created_contract(deploy, contract_address):
-        raise NetworkError(
+        raise DeployNotCreationError(
             "the recorded deploy transaction did not create the HTLC contract; cannot bound the claim scan"
         )
     deploy_block = deploy.get("blockNumber")
@@ -172,12 +178,18 @@ class RpcEthChainSource:
         would hide it from the tower however many endpoints were configured. Each endpoint is scanned
         on its own instead, and a claim any one of them serves is the answer: a ``Claimed`` log first,
         else an unrecognised log (fail toward paging). The primary's failure still raises, as before;
-        another endpoint's failure only drops that endpoint from the union."""
+        another endpoint's failure only drops that endpoint from the union, except
+        :class:`DeployNotCreationError`, which raises when no endpoint served a claim."""
         endpoints = self._rpc.sources if isinstance(self._rpc, MultiSourceEthRpc) else [self._rpc]
         results: list[tuple[EthClaimStatus, bool]] = []
+        not_creation: DeployNotCreationError | None = None
         for index, endpoint in enumerate(endpoints):
             try:
                 results.append(await _scan_for_claim(endpoint, contract_address, deploy_tx_hash))
+            except DeployNotCreationError as exc:
+                if index == 0:
+                    raise
+                not_creation = exc  # any endpoint's: kept, never dropped like a failure
             except Exception:
                 if index == 0:
                     raise  # the primary was required before the union and still is
@@ -188,6 +200,8 @@ class RpcEthChainSource:
             for status, canonical in results:
                 if status.claimed and canonical is wanted_canonical:
                     return status
+        if not_creation is not None:
+            raise not_creation
         return EthClaimStatus(claimed=False)
 
     async def claim_receipt_opens_h(self, locator: EthHtlcLocator, claim_tx_hash: str) -> bool | None:

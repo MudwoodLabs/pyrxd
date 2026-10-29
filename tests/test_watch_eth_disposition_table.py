@@ -39,7 +39,7 @@ from pyrxd.gravity.swap_state import (
 from pyrxd.gravity.watch.adapters import JsonDirRecordStore, is_legacy_candidate
 from pyrxd.gravity.watch.alerts import DedupAlerter
 from pyrxd.gravity.watch.decide import Intent, Observations, decide
-from pyrxd.gravity.watch.eth_adapters import RpcEthChainSource
+from pyrxd.gravity.watch.eth_adapters import DeployNotCreationError, RpcEthChainSource
 from pyrxd.gravity.watch.quorum import ChainObserver
 from pyrxd.gravity.watch.reconciler import Reconciler
 from pyrxd.security.errors import NetworkError, ValidationError
@@ -1401,3 +1401,68 @@ async def test_a_repeated_eth_rpc_url_builds_a_multi_source_reader(monkeypatch):
     async with contextlib.AsyncExitStack() as stack:
         assert isinstance((await run._build_eth_source(one, stack))._rpc, _FakeEthRpc)
     assert await run._build_eth_source(argparse.Namespace(eth_rpc_url=None, eth_chain_id=None), stack) is None
+
+
+# --------------------------------------------------------------------- the claim scan's start, on every endpoint
+
+
+class _AnswersTx(_Endpoint):
+    """Honest, except that it answers ``eth_getTransactionByHash`` for one hash as told."""
+
+    def __init__(self, chain, *, tx_hash: str, tx: dict) -> None:
+        super().__init__(chain)
+        self._lie_hash, self._lie_tx = tx_hash, tx
+
+    async def get_transaction(self, tx_hash: str) -> dict:
+        if tx_hash == self._lie_hash:
+            return dict(self._lie_tx)
+        return await super().get_transaction(tx_hash)
+
+
+def _claimed_chain_with_a_later_call():
+    chain = FakeEvmChain(preimage=os.urandom(32), timeout=0)
+    chain.timeout = chain.ts(TIMEOUT_BLOCK)
+    chain.claim(20)
+    late = chain.force_receipt(60, topic0=REFUNDED_TOPIC0, address="0x" + "0d" * 20, label="later-call")
+    return chain, late
+
+
+async def test_a_lying_primary_cannot_pass_the_deploy_check_the_honest_endpoints_refuse():
+    """The record names a later transaction as the deploy. A primary that answers it with the real
+    deploy's (public) sender and nonce passes its own check and scans from the late block, past the
+    claim. The honest endpoints say the transaction created nothing; their refusal is not dropped
+    like an endpoint's failure, so the scan raises (a page) instead of reading the claimed contract
+    unclaimed."""
+    chain, late = _claimed_chain_with_a_later_call()
+    liar = _AnswersTx(
+        chain, tx_hash=late, tx={"from": chain.deploy_from, "nonce": chain.deploy_nonce, "to": None, "blockNumber": 60}
+    )
+    rpc = MultiSourceEthRpc([liar, _Endpoint(chain), _Endpoint(chain)])
+    with pytest.raises(DeployNotCreationError):
+        await RpcEthChainSource(rpc).claim_status(CONTRACT, late)
+    # The primary alone is fooled, which is why the others' refusal must count.
+    assert not (await RpcEthChainSource(liar).claim_status(CONTRACT, late)).claimed
+
+
+async def test_HONEST_every_endpoint_scans_the_real_deploy_and_reads_the_claim():
+    chain, _late = _claimed_chain_with_a_later_call()
+    rpc = MultiSourceEthRpc([_Endpoint(chain), _Endpoint(chain), _Endpoint(chain)])
+    assert (await RpcEthChainSource(rpc).claim_status(CONTRACT, chain.deploy_tx)).claimed
+
+
+async def test_a_secondary_that_refuses_the_real_deploy_never_hides_a_claim_the_others_read():
+    """A lying secondary's refusal can force a page on an unclaimed contract (fail toward paging),
+    but never outranks a claim another endpoint serves."""
+    chain, _late = _claimed_chain_with_a_later_call()
+    call = {"from": chain.deploy_from, "nonce": 1, "to": CONTRACT, "blockNumber": chain.deploy_block}
+    rpc = MultiSourceEthRpc([_Endpoint(chain), _AnswersTx(chain, tx_hash=chain.deploy_tx, tx=call), _Endpoint(chain)])
+    assert (await RpcEthChainSource(rpc).claim_status(CONTRACT, chain.deploy_tx)).claimed
+
+    open_chain = FakeEvmChain(preimage=os.urandom(32), timeout=0)
+    open_chain.timeout = open_chain.ts(TIMEOUT_BLOCK)
+    call = {**call, "from": open_chain.deploy_from}
+    rpc = MultiSourceEthRpc(
+        [_Endpoint(open_chain), _AnswersTx(open_chain, tx_hash=open_chain.deploy_tx, tx=call), _Endpoint(open_chain)]
+    )
+    with pytest.raises(DeployNotCreationError):
+        await RpcEthChainSource(rpc).claim_status(CONTRACT, open_chain.deploy_tx)
