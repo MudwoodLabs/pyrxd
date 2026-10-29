@@ -91,7 +91,9 @@ from _dust_swap_shared import (
     atomic_write_mode_600,
     confirm,
     derive_counter_timelock,
+    drive_maker_abort,
     elapsed_reserve_blocks,
+    maker_abort_rebuild_state,
     merge_with_persisted_record,
     prior_fund_record,
     refuse_by_persisted_state,
@@ -1609,28 +1611,31 @@ async def maker_phase_refund(args: argparse.Namespace) -> None:
 
 
 async def maker_phase_abort(args: argparse.Namespace) -> None:
-    """MAKER recovery — the taker never funded, so unlock the asset and walk (``--phase abort``).
+    """MAKER recovery — unlock the asset and walk, when the maker never revealed p (``--phase abort``).
 
-    Drives ``RadiantCovenantLeg.refund_asset()`` DIRECTLY, and that is the honest wiring rather than
-    a shortcut: the maker funds the covenant right after publishing the envelope, so a taker that
-    never funds leaves the maker at NEGOTIATED with a locked asset — and BOTH coordinator asset
-    refunds (``mutual_refund``, ``maybe_refund_asset_on_maker_stall``) require BOTH_LOCKED. The FSM's
-    NEGOTIATED --TAKER_NEVER_FUNDS--> ABORTED edge has no maker driver (the taker's is
-    ``abandon_unfunded``; the maker's is #850 PR 11). Rather than
-    fabricate a BOTH_LOCKED record for a counter leg that was never funded, this calls the same leg
-    primitive both coordinator refunds call and does not advance the FSM at all.
+    Drives ``SwapCoordinator.maker_refund_covenant()`` (#850 PR 11): it pins the covenant, sends its CSV
+    refund and records the txid; once that refund reads buried, a later run ends the record at ABORTED
+    (``covenant_refunded``). Two cases reach it. The taker never funded (NEGOTIATED): the maker funds
+    the covenant right after publishing the envelope, so a taker that never funds leaves the maker
+    with a locked asset. Or the maker's own revalidation failed (PARAMS_MISMATCH): it never reached
+    BOTH_LOCKED, never revealed p, and ``--phase refund`` (BOTH_LOCKED only) cannot end that record.
 
-    Refuses once the taker HAS published a funded counter leg: that is the mutual unwind, and it
-    belongs in ``--phase refund`` where the coordinator's trigger and role guard apply. Refuses as
-    well when this host's record holds a counter-leg locator (the taker did fund, whatever the
-    exchange directory holds now) or says this maker claimed the counter leg.
+    Otherwise it refuses once the taker HAS published a funded counter leg: that is the mutual unwind,
+    and it belongs in ``--phase refund`` where the coordinator's trigger and role guard apply. It
+    refuses as well when this host's record holds a counter-leg locator (the taker did fund, whatever
+    the exchange directory holds now) or says this maker claimed the counter leg.
     """
     io_dir = _io_dir(args)
     local = _load_local_secret(args)
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
     _refuse_by_persisted_state(args, terms, phase="abort")  # before any chain read
-    if (io_dir / "taker_funding.json").exists():
+    state = maker_abort_rebuild_state(_record_sink(args.local_out).load_record())
+    if state is None:
+        return
+    record = _merged_record(args, SwapRecord(state=state, terms=terms), keys_out=args.local_out, phase="abort")
+    mismatch = record.state is SwapState.PARAMS_MISMATCH
+    if (io_dir / "taker_funding.json").exists() and not mismatch:
         raise SystemExit(
             "taker_funding.json is present: the taker DID fund a counter leg, so this is the mutual "
             "unwind, not an abort. Use --phase refund — it drives the coordinator's own maker-side "
@@ -1646,23 +1651,24 @@ async def maker_phase_abort(args: argparse.Namespace) -> None:
         )
     fee_source = _require_fee_source(args, what="the maker's asset abort (--phase abort)")
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
-
-    # No coordinator here, but the leg reads the record: a covenant outpoint this host persisted
-    # earlier pins which UTXO the refund spends.
-    record = _merged_record(
-        args, SwapRecord(state=SwapState.NEGOTIATED, terms=terms), keys_out=args.local_out, phase="abort"
-    )
     refuse_maker_abort_with_a_counter_leg(record, path=_record_sink(args.local_out).path)
-    confirm(MAKER_ABORT_CONFIRM, auto_yes=args.yes)
-    # The leg's own P3 maturity self-check refuses before t_rxd with an exact "needs N, has M" a
-    # block-based poller retries on, so there is nothing to pre-check here: this is the only
-    # broadcast on this path, and a premature call cannot half-unwind anything.
-    txid = await rxd_leg.refund_asset(record)
-    print(f"  -> covenant CSV refund broadcast: {txid}")
-    print(
-        "  The FSM is NOT advanced: no coordinator method drives an asset refund from NEGOTIATED, and "
-        "inventing a state here would put a fiction in the durable record."
+    # The coordinator needs a counter leg; nothing here calls it.
+    rpc, eth_leg = _eth_leg(
+        args,
+        claim_to=local["eth_maker_claim_addr"],
+        refund_to=local["eth_taker_refund_addr"],
+        eth_timeout=int(terms.eth_timeout_unix_s),
     )
+    try:
+        coord = _coordinator(
+            args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record, phase="abort"
+        )
+        confirm(MAKER_ABORT_CONFIRM, auto_yes=args.yes)
+        # The leg's own P3 maturity self-check refuses before t_rxd with an exact "needs N, has M" a
+        # block-based poller retries on, so there is nothing to pre-check here.
+        await drive_maker_abort(coord)
+    finally:
+        await rpc.close()
 
 
 # ---------------------------------------------------------------------------

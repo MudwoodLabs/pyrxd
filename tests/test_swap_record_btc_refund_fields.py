@@ -47,7 +47,7 @@ def test_a_recorded_refund_round_trips_and_writes_the_current_schema():
     record = dataclasses.replace(_btc(chain), counter_refund_raw=raw.hex().upper())
     assert record.counter_refund_raw == raw.hex(), "not normalised to lower-case"
     d = record.to_dict()
-    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 10
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 11
     assert SwapRecord.from_dict(json.loads(json.dumps(d))) == record
     # ...and a BTC record without any new field keeps the v1 form.
     assert "schema_version" not in _btc(chain).to_dict()
