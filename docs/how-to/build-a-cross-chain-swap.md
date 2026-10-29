@@ -166,7 +166,10 @@ the two parties. A stablecoin leg removes that — the amount agreed is the amou
 The protocol is unchanged. `Erc20Htlc.sol` was deliberately given the same `claim(bytes32)` /
 `refund()` signatures and the same **un-indexed** `Claimed(bytes32)` event as the native contract,
 so `Erc20HtlcLeg` subclasses `EthHtlcContractLeg` and inherits secret recovery, finality and the
-refund path unchanged. Wiring it is one substitution:
+refund path unchanged. One difference: `Erc20Htlc.refund()` is callable only by the refundee or the
+account that deployed the contract (a third party could otherwise refund a contract holding the first
+part of a push and strand the rest), while `EthHtlc.refund()` is callable by anyone. Both pay the
+refundee. Wiring it is one substitution:
 
 ```python
 from pyrxd import EthLeg, KNOWN_EVM_CHAINS
