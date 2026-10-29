@@ -1427,7 +1427,8 @@ def _claimed_chain_with_a_later_call():
     return chain, late
 
 
-async def test_a_lying_primary_cannot_pass_the_deploy_check_the_honest_endpoints_refuse():
+@pytest.mark.parametrize("liar_at", [0, 1, 2])
+async def test_a_lying_endpoint_cannot_pass_the_deploy_check_the_honest_endpoints_refuse(liar_at):
     """The record names a later transaction as the deploy. A primary that answers it with the real
     deploy's (public) sender and nonce passes its own check and scans from the late block, past the
     claim. The honest endpoints say the transaction created nothing; their refusal is not dropped
@@ -1437,9 +1438,10 @@ async def test_a_lying_primary_cannot_pass_the_deploy_check_the_honest_endpoints
     liar = _AnswersTx(
         chain, tx_hash=late, tx={"from": chain.deploy_from, "nonce": chain.deploy_nonce, "to": None, "blockNumber": 60}
     )
-    rpc = MultiSourceEthRpc([liar, _Endpoint(chain), _Endpoint(chain)])
+    endpoints: list[_Endpoint] = [_Endpoint(chain), _Endpoint(chain)]
+    endpoints.insert(liar_at, liar)
     with pytest.raises(DeployNotCreationError):
-        await RpcEthChainSource(rpc).claim_status(CONTRACT, late)
+        await RpcEthChainSource(MultiSourceEthRpc(endpoints)).claim_status(CONTRACT, late)
     # The primary alone is fooled, which is why the others' refusal must count.
     assert not (await RpcEthChainSource(liar).claim_status(CONTRACT, late)).claimed
 
@@ -1466,3 +1468,5 @@ async def test_a_secondary_that_refuses_the_real_deploy_never_hides_a_claim_the_
     )
     with pytest.raises(DeployNotCreationError):
         await RpcEthChainSource(rpc).claim_status(CONTRACT, open_chain.deploy_tx)
+    honest = MultiSourceEthRpc([_Endpoint(open_chain), _Endpoint(open_chain), _Endpoint(open_chain)])
+    assert not (await RpcEthChainSource(honest).claim_status(CONTRACT, open_chain.deploy_tx)).claimed

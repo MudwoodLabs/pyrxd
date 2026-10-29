@@ -188,7 +188,7 @@ class RpcEthChainSource:
                 results.append(await _scan_for_claim(endpoint, contract_address, deploy_tx_hash))
             except DeployNotCreationError as exc:
                 if index == 0:
-                    raise
+                    raise  # as any primary failure: the secondaries are not scanned for a claim
                 not_creation = exc  # any endpoint's: kept, never dropped like a failure
             except Exception:
                 if index == 0:

@@ -820,8 +820,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a claimed contract as unclaimed. Each now derives the CREATE address from that transaction's sender
   and nonce (`keccak(rlp([from, nonce]))`, not the receipt's `contractAddress`) and refuses a
   transaction that is not this contract's creation: `read_counter_disposition` answers `UNKNOWN`,
-  and `claim_status` raises, which pages. Since #917 the hash kept on a record is our own deploy, so
-  this guards a record written another way.
+  and `claim_status` raises `DeployNotCreationError`, which pages. The tower counts that refusal from
+  any endpoint, not only the primary, unless some endpoint serves a claim; so one lying endpoint can
+  turn the swap's own page into an "investigate" page, never into silence. Since #917 the hash kept
+  on a record is our own deploy, so this guards a record written another way.
 
 - **An ETH counter-leg record keeps its deploy transaction through `post_asset_lock_revalidate`.**
   The lock-time re-verify replaced the record's locator with one rebuilt from config, whose
