@@ -2145,10 +2145,12 @@ class LegacyCheck:
     ``conclusive``: write the marker now. ``conclusive_once_delivered``: write it once this page is
     delivered. Neither: write nothing, and the record is read again on a later tick.
 
-    ``quiet_by_design``: a WATCH this tower's configuration explains (it cannot read this counter
-    leg, or it has one endpoint), not one an endpoint's answer chose. Every other retried WATCH is
-    *unresolved*, and the reconciler pages "investigate" once a record has stayed unresolved too long
-    (#921): one endpoint can hold the read there (a stale finalized block, a disagreeing receipt)."""
+    ``quiet_by_design``: a retried WATCH no endpoint can hold while value is at stake: this tower's
+    configuration explains it (it cannot read this counter leg, or it has one endpoint), or every
+    endpoint reads the contract empty at its tip (``EXPIRED_EMPTY_OPEN``: a push that lands leaves
+    that answer). Every other retried WATCH is *unresolved*, and the reconciler pages "investigate"
+    once a record has stayed unresolved too long (#921): one endpoint can hold the read there (a stale
+    finalized block, a disagreeing receipt)."""
 
     decision: Decision
     verdict: str
@@ -2485,7 +2487,9 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
         # Empty now, but a token push signed for the contract may still land (the funding key's nonce at
         # the finalized block has not passed it). A marker would stop every later read, and a push that
         # lands would leave value in the contract with no one told; read again, so a landed push reads
-        # F_EXPIRED and pages the refund (review F2).
+        # F_EXPIRED and pages the refund (review F2). Quiet by design (#921): the answer needs every
+        # endpoint to read 0 at its tip, so one endpoint cannot hide tokens behind it, and a tower
+        # without the push key's nonce (a record before 0.27) never reads it closed.
         return LegacyCheck(
             Decision(
                 Intent.WATCH,
@@ -2496,6 +2500,7 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
                 low_corroboration=corr,
             ),
             kind.value,
+            quiet_by_design=True,
         )
     agreeing = (DispositionKind.REFUNDED, DispositionKind.EXPIRED_EMPTY_CLOSED)
     if kind in agreeing and obs.eth_single_source:

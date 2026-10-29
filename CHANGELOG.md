@@ -817,12 +817,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Watchtower: a legacy record's D9 check that one endpoint holds without a verdict now pages
   (#921).** Before, a failed or retried read of a pre-0.27 terminal record was silent on every tick.
   One endpoint could keep it there for good: an old finalized block (the reader takes the lowest)
-  holds a final ETH refund at `settled_unfinal`, and a deploy receipt the other endpoints disagree
-  with holds it at `UNKNOWN`. A record unresolved for longer than the new
-  `--legacy-unresolved-page-after-s` (`Reconciler(legacy_unresolved_page_after_s=...)`, default 6
-  hours) pages CRITICAL "investigate" (`legacy_unresolved`) on every read until it resolves. Retries
-  the tower's configuration explains (one endpoint, a source that cannot read the leg) are marked
-  `LegacyCheck.quiet_by_design` and never page. The clock is in memory, so a restart starts it over.
+  holds a final ETH refund at `settled_unfinal`, a deploy receipt the other endpoints disagree with
+  holds it at `UNKNOWN`, and one BTC source naming another block holds a buried refund at
+  `refund_pending`. A record unresolved for longer than the new `--legacy-unresolved-page-after-s`
+  (`Reconciler(legacy_unresolved_page_after_s=...)`) pages CRITICAL "investigate"
+  (`legacy_unresolved`) on every read until it resolves. The default is 6 hours, or twice the
+  policy's longest honest wait (ETH finality, or BTC reorg depth times block interval) when that is
+  longer; a bound at or below that wait is refused. Every failed read counts. Retries no endpoint can
+  hold while value is at stake (one endpoint, a source that cannot read the leg, an empty token
+  contract) are marked `LegacyCheck.quiet_by_design` and never page. A record marked checked after
+  its page has that page ACKed by the tower, so it leaves the escalation count. The clock is in
+  memory, so a restart starts it over.
 - **The ETH counter-leg reader and the watchtower's claim scan check that the recorded deploy
   transaction created the contract.** Both start their log scan at the deploy transaction's block,
   so a later transaction named as the deploy would start it past a claim; the tower's scan then read

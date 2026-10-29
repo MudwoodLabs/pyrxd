@@ -107,7 +107,7 @@ def build_reconciler(
     alert_channel: AlertChannel,
     eth_source: EthChainSource | None = None,
     executor: Executor | None = None,
-    legacy_unresolved_page_after_s: float = DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S,
+    legacy_unresolved_page_after_s: float | None = None,
 ) -> Reconciler:
     """Compose the real ports into a Reconciler (pure wiring — no network at call time).
 
@@ -810,9 +810,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--legacy-unresolved-page-after-s",
         type=float,
-        default=DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S,
+        default=None,
         help="page 'investigate' once a legacy (pre-0.27) record's check has stayed unresolved this long "
-        "(a failed read, or a retry its configuration does not explain); one endpoint can hold it there",
+        "(a failed read, or a retry that one endpoint can hold). Default: "
+        f"{DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S:g} s, or twice the policy's longest honest wait (ETH "
+        "finality, BTC reorg depth x block interval) when that is longer; a value at or below that wait "
+        "is refused",
     )
     p.add_argument("--quorum", type=int, default=2, help="BTC funding-reader quorum (of 3 Esplora sources)")
     p.add_argument("--block-interval-s", type=float, default=600.0)

@@ -37,6 +37,7 @@ from pyrxd.gravity.watch.decide import (
     Intent,
     LegacyCheck,
     Observations,
+    _required_btc_depth_blocks,
     decide,
     decide_legacy,
 )
@@ -113,12 +114,25 @@ SITUATION_RECONCILE_ERROR = "reconcile_error"
 #: A legacy record whose D9 read has stayed unresolved for longer than the bound (#921).
 SITUATION_LEGACY_UNRESOLVED = "legacy_unresolved"
 
-#: How long a legacy record's D9 read may stay unresolved (a failed read, or a retried WATCH its
-#: configuration does not explain) before it pages "investigate" (#921). Chosen, not measured: it
-#: must outlast the honest waits behind a retried WATCH, which are ETH finality (minutes) and our BTC
-#: refund's burial at the policy's reorg depth (about an hour at 6 blocks of 600 s), and stay well
-#: inside the time a refund that never landed can wait for an operator.
+#: How long a legacy record's D9 read may stay unresolved (a failed read, or a retried WATCH that is
+#: not quiet by design) before it pages "investigate" (#921), unless the policy's honest waits need
+#: longer (:func:`legacy_unresolved_bound_s`). Chosen, not measured: it must outlast the honest waits
+#: behind a retried WATCH, and stay well inside the time a refund that never landed can wait for an
+#: operator.
 DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S = 6 * 3600.0
+
+
+def legacy_honest_wait_s(policy: MarginPolicy) -> float:
+    """The longest honest wait behind a retried legacy WATCH under ``policy``: ETH finality, or our
+    BTC refund's burial at the policy's reorg depth (the depth the tower's observer is given)."""
+    btc = float(int(_required_btc_depth_blocks(policy))) * float(policy.block_interval_s)
+    return max(btc, float(policy.eth_finalization_window_s or 0))
+
+
+def legacy_unresolved_bound_s(policy: MarginPolicy) -> float:
+    """The default bound: :data:`DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S`, or twice the policy's honest
+    wait when that is longer."""
+    return max(DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S, 2 * legacy_honest_wait_s(policy))
 
 
 def _legacy_evidence(record: SwapRecord, obs: Observations) -> dict[str, Any]:
@@ -164,7 +178,7 @@ class Reconciler:
         policy: MarginPolicy,
         safety_window_blocks: int,
         executor: Executor | None = None,
-        legacy_unresolved_page_after_s: float = DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S,
+        legacy_unresolved_page_after_s: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(policy, MarginPolicy):
@@ -183,6 +197,8 @@ class Reconciler:
         self._policy = policy
         self._safety = safety_window_blocks
         self._inflight: set[str] = set()
+        if legacy_unresolved_page_after_s is None:
+            legacy_unresolved_page_after_s = legacy_unresolved_bound_s(policy)
         if (
             not isinstance(legacy_unresolved_page_after_s, (int, float))
             or isinstance(legacy_unresolved_page_after_s, bool)
@@ -190,10 +206,20 @@ class Reconciler:
             or legacy_unresolved_page_after_s <= 0
         ):
             raise ValidationError("Reconciler requires a positive, finite legacy_unresolved_page_after_s")
+        honest = legacy_honest_wait_s(policy)
+        if legacy_unresolved_page_after_s <= honest:
+            raise ValidationError(
+                f"legacy_unresolved_page_after_s ({legacy_unresolved_page_after_s:g} s) must exceed the policy's "
+                f"longest honest wait ({honest:g} s: ETH finality, or the BTC reorg depth times the block "
+                "interval); raise --legacy-unresolved-page-after-s"
+            )
         self._legacy_page_after_s = float(legacy_unresolved_page_after_s)
         self._clock = clock
         # swap_id -> clock reading when its legacy read became unresolved (#921).
         self._legacy_unresolved_since: dict[str, float] = {}
+        # Legacy records this reconciler sent (or tried to send) the unresolved page for: a record
+        # marked checked is never read again, so that page is ACKed here when it is (review MED-1).
+        self._legacy_paged: set[str] = set()
 
     @property
     def alerter(self) -> Alerter:
@@ -244,8 +270,9 @@ class Reconciler:
         pure :func:`decide_legacy`, a page when it names one, and the marker only on a conclusive
         verdict. Never the executor: nothing here is autonomous.
 
-        A read that fails, or a retried WATCH its configuration does not explain (``UNKNOWN``,
-        ``settled_unfinal``, a refund not yet buried, ...), writes nothing and is read again on a later
+        A read that fails (including on a tower with no source for the leg), or a retried WATCH that is
+        not quiet by design (``UNKNOWN``, ``settled_unfinal``, a refund not yet buried, ...), writes
+        nothing and is read again on a later
         tick. One endpoint can hold the read there for good (a stale finalized block, a receipt the
         others disagree with), so once a record has been unresolved for longer than
         ``legacy_unresolved_page_after_s`` it pages "investigate" on every read until it resolves
@@ -285,7 +312,26 @@ class Reconciler:
                     )
                 except Exception:
                     logger.exception("could not write the legacy-checked marker for %s; read again later", swap_id)
+                else:
+                    self._close_legacy_unresolved_page(swap_id, check.verdict)
         return ReconcileResult(swap_id, decision, alert_delivered=delivered, legacy=True)
+
+    def _close_legacy_unresolved_page(self, swap_id: str, verdict: str) -> None:
+        """The record is marked checked and is never read again, so nothing would close its open
+        "investigate" page: it would count toward escalation for good. ACK that one situation, and
+        log why (review MED-1). Any other page on the swap is left as it is."""
+        if swap_id not in self._legacy_paged:
+            return
+        self._legacy_paged.discard(swap_id)
+        ack = getattr(self._alerter, "ack", None)
+        if not callable(ack):
+            return
+        try:
+            ack(swap_id, f"{Intent.PAGE_SQUEEZED.value}:{SITUATION_LEGACY_UNRESOLVED}")
+        except Exception:
+            logger.exception("could not close the legacy_unresolved page of %s", swap_id)
+            return
+        logger.info("legacy swap %s resolved (%s): its legacy_unresolved page is closed", swap_id, verdict)
 
     async def _legacy_unresolved(
         self, swap_id: str, quiet: Decision, last: str, *, error: str | None = None
@@ -311,6 +357,7 @@ class Reconciler:
             ),
             situation=SITUATION_LEGACY_UNRESOLVED,
         )
+        self._legacy_paged.add(swap_id)
         delivered = await self._safe_handle(swap_id, decision)
         return ReconcileResult(swap_id, decision, error=error, alert_delivered=delivered, legacy=True)
 
