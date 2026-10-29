@@ -382,6 +382,9 @@ def _real_verify_leg(
     """A leg whose `verify_funded` is the PRODUCTION one, backed by a node fake serving the
     contract's immutables. `on_chain` overrides let a test deploy a contract that is NOT this
     swap's and watch the real check refuse it."""
+    from pyrxd.eth_wallet.keys import derive_address
+
+    key = PrivateKeyMaterial(os.urandom(32))
     imm = {
         "hashlock": b"\x33" * 32,
         "claimant": _CLAIMANT,
@@ -389,6 +392,8 @@ def _real_verify_leg(
         "timeout": _TIMEOUT,
         "amount": _AMOUNT,
         "token": _USDC.address,
+        # This leg's own key created it (#850 PR C): the deploy a resume completes.
+        "deployer": derive_address(key),
         **on_chain,
     }
     state = {"held": int(held)}
@@ -502,9 +507,7 @@ def _real_verify_leg(
             state["held"] += state.pop("pending", 0)
             return {"status": 1, "logs": []}
 
-    leg = Erc20HtlcLeg(
-        token=_USDC, rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART
-    )
+    leg = Erc20HtlcLeg(token=_USDC, rpc=_Rpc(), signing_key=key, chain_id=1, artifact=_ART)
 
     async def _sign_and_send(*a, **k):
         order.append("tokens-pushed")
@@ -535,6 +538,7 @@ class TestTheRealVerifyFundedRunsOnResume:
             ("a different refundee", {"refundee": "0x" + "99" * 20}),
             ("a different timeout", {"timeout": _TIMEOUT + 1}),
             ("a different amount", {"amount": _AMOUNT + 1}),
+            ("another deployer", {"deployer": "0x" + "99" * 20}),
         ],
     )
     def test_a_resume_REFUSES_a_contract_whose_immutables_differ(self, label: str, override: dict) -> None:

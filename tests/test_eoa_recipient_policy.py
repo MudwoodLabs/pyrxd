@@ -39,6 +39,7 @@ _TOKEN_ART = json.loads((_FIX / "Erc20Htlc.json").read_text())
 _HTLC = "0x" + "11" * 20
 _CLAIMANT = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 _REFUNDEE = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+_DEPLOYER = _REFUNDEE  # Erc20Htlc's creator (#850 PR C): the taker deploys and is refunded
 _HASHLOCK = "0x" + "33" * 32
 _TIMEOUT = 1_800_000_000
 _AMOUNT = 12_345_678
@@ -66,6 +67,7 @@ def _spliced_runtime(artifact: dict) -> bytes:
         "timeout": int(_TIMEOUT).to_bytes(32, "big"),
         "token": _addr_word(token_for("USDC", 1).address),
         "amount": int(_AMOUNT).to_bytes(32, "big"),
+        "deployer": _addr_word(_DEPLOYER),
     }
     for ref_id, offsets in artifact.get("immutableReferences", {}).items():
         name = artifact["immutable_names"][str(ref_id)]
@@ -185,6 +187,7 @@ def _token_locator() -> Erc20HtlcLocator:
         timeout=_TIMEOUT,
         amount_wei=_AMOUNT,
         token_address=token_for("USDC", 1).address,
+        deployer=_DEPLOYER,
     )
 
 

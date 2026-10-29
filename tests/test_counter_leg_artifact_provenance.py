@@ -24,18 +24,19 @@ and these pins cannot drift apart unnoticed.
   cited a ``docs/plans/`` path that exists only in that repo), then hardened before the external
   audit: the constructor refuses a zero claimant or refundee (``ZeroAddress``), and ``claim()``
   checks ``Expired`` before ``BadPreimage``.
-* ``contracts/Erc20Htlc.sol`` is git blob ``c1451092``: blob ``a0c9010f`` from
+* ``contracts/Erc20Htlc.sol`` is git blob ``0650f140``: blob ``a0c9010f`` from
   ``MudwoodLabs/pyrxd-eth-htlc@7b7d005e9148:contracts/src/Erc20Htlc.sol``, hardened at the same
   time: ``refund()`` reverts ``NothingToRefund`` without settling when the balance is zero, and the
-  pragma is pinned to ``0.8.24``.
+  pragma is pinned to ``0.8.24``. Then (#850 PR C) a ``deployer`` immutable, and ``refund()``
+  reverts ``NotRefunder`` unless called by the refundee or the deployer.
 
 Before this, both artifacts were built in that (private) repo: EthHtlc with the optimizer OFF
 (2087 runtime bytes) and Erc20Htlc with it on, each with an IPFS metadata hash. #845 reproduced
 both byte for byte; the build script's standard-JSON path, run with those old settings, reproduces
 them byte for byte too. #846 then made the optimized build with no metadata hash canonical, and
 the hardening above changed the logic of both contracts, so neither artifact matches an earlier
-one: EthHtlc is 1215 runtime / 1548 creation bytes, Erc20Htlc 1856 / 2298. A contract deployed
-from a previous artifact is not one these runners accept.
+one: EthHtlc is 1215 runtime / 1548 creation bytes, Erc20Htlc 2034 / 2506 (1856 / 2298 before
+#850 PR C). A contract deployed from a previous artifact is not one these runners accept.
 
 Adopting a different build is a deliberate act: change the source or the settings, run the script,
 and update the constants below and ``scripts/swap_run_verify.py``'s creation pin TOGETHER, in one
@@ -87,16 +88,17 @@ _PINS: dict[str, _Pin] = {
     ),
     "Erc20Htlc.json": _Pin(
         source=(
-            "contracts/Erc20Htlc.sol (git blob c14510925b1ec5df61ac9ab29bde8ea72c73a670), modified since it was "
+            "contracts/Erc20Htlc.sol (git blob 0650f1400ce654a22c929cf81675002427323533), modified since it was "
             "copied from MudwoodLabs/pyrxd-eth-htlc@7b7d005e9148a8ffd88b1a2e36b0e36450e0e40a:contracts/src/Erc20Htlc.sol "
             "(git blob a0c9010f0125e5ba9baba4970108a6b20b8405e9); changed: refund() reverts NothingToRefund, without "
             "settling, when the balance is zero; pragma pinned to 0.8.24 (was ^0.8.20); comments on the "
-            "claim-error order and the sweep guard"
+            "claim-error order and the sweep guard; a deployer immutable (msg.sender of the constructor), and "
+            "refund() reverts NotRefunder unless called by the refundee or the deployer"
         ),
-        runtime_sha256="38e445bf4c4ef93cc2aa820b022d5a3c39e7deb0ae2e97b89699333b577e4fb8",
-        creation_sha256="2902ba9f380bec3548362999939342e3299280dc25db6e113b4c2416d2e0797d",
-        abi_sha256="a7a0bc6de7b222dc125bb463f338593b830f12141dc7c6f91dee4c6ba7a35730",
-        layout_sha256="c417e8b57d53f20e9bc8ceaa95a4f509e2c8cc960d88b4b55241985f5e0e898e",
+        runtime_sha256="b71a06d68659ee3ebd18cbc7be4a8b86a15b09f82700f466e087945f26e0c9a8",
+        creation_sha256="64c6639ef1c801962ba744d3644e5e4dc10117ef9c00b76509fdf5e7c38afe04",
+        abi_sha256="ecac011c0ca0a4326de58cd15bad636f07eed28bd4e0d346afa105bb7212ac6b",
+        layout_sha256="d38df61f099e4e1dfd12d1f10a5db5974832a9de5e63069de4299f2b6292f883",
     ),
 }
 

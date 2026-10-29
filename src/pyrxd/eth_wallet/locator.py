@@ -248,11 +248,21 @@ class Erc20HtlcLocator(EthHtlcLocator):
     ``amount_wei`` is inherited and carries the amount in the token's **BASE UNITS** — the field
     name is the parent's, the unit is the token's. Prefer :attr:`amount_base_units` when reading;
     the unit is unambiguous from the TYPE, which is the discriminator that matters.
+
+    ``deployer`` is the account that created the contract: ``Erc20Htlc.refund`` is callable by the
+    refundee or the deployer only (#850 PR C, design D1(c)), and the runtime compare needs the
+    ``deployer`` immutable's value like any other. It is DERIVED, never taken from a counterparty: the
+    taker's leg writes its own key (the key that sent the deploy), and the maker's
+    :meth:`~pyrxd.gravity.eth_leg.EthLeg.verify_counterparty_funded` derives it from the chain
+    (:meth:`~pyrxd.eth_wallet.erc20_leg.Erc20HtlcLeg.derive_deployer`). ``None`` is a record written
+    before the field existed, for a contract built without it; verifying against ``None`` fails
+    closed (no value for the immutable). An older binary reading a record that has it ignores it.
     """
 
     CHAIN_TAG: ClassVar[str] = "eth-erc20"
 
     token_address: str = ""
+    deployer: str | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -263,6 +273,9 @@ class Erc20HtlcLocator(EthHtlcLocator):
             )
         _check_hex_addr("token_address", self.token_address)
         object.__setattr__(self, "token_address", self.token_address.lower())
+        if self.deployer is not None:
+            _check_hex_addr("deployer", self.deployer)
+            object.__setattr__(self, "deployer", self.deployer.lower())
 
     @property
     def amount_base_units(self) -> int:
@@ -272,6 +285,8 @@ class Erc20HtlcLocator(EthHtlcLocator):
     def to_dict(self) -> dict:
         d = super().to_dict()
         d["token_address"] = self.token_address
+        if self.deployer is not None:
+            d["deployer"] = self.deployer
         return d
 
     @classmethod
@@ -287,6 +302,8 @@ class Erc20HtlcLocator(EthHtlcLocator):
                 timeout=d["timeout"],
                 amount_wei=d["amount_wei"],
                 token_address=d["token_address"],
+                # Absent in a record written before #850 PR C (a contract built without it).
+                deployer=d.get("deployer"),
             )
         except KeyError as exc:
             raise ValidationError(f"Erc20HtlcLocator.from_dict missing field: {exc}") from exc

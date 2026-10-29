@@ -100,8 +100,12 @@ def _verify(monkeypatch, *, frozen: tuple[str, ...] = (), native: bool = False) 
     async def _noop_verify(locator, **k):
         return None
 
+    async def _deployer(contract_address, **k):
+        return _REFUNDEE
+
     monkeypatch.setattr(inner, "verify_funded", _noop_verify)
-    monkeypatch.setattr(leg, "expected_locator", lambda terms, *, contract_address: _locator())
+    monkeypatch.setattr(inner, "derive_deployer", _deployer)
+    monkeypatch.setattr(leg, "expected_locator", lambda terms, *, contract_address, deployer=None: _locator())
 
     asyncio.run(leg.verify_counterparty_funded(_CONTRACT, _Terms()))
     return reads

@@ -2091,14 +2091,14 @@ class FakeEthLeg:
             raise ValidationError("verify_funded failed AFTER deploy (contract is live on-chain)")
         return loc
 
-    def expected_locator(self, terms, *, contract_address, deploy_tx_hash=None) -> EthHtlcLocator:
+    def expected_locator(self, terms, *, contract_address, deploy_tx_hash=None, deployer=None) -> EthHtlcLocator:
         """The locator ``fund`` would return for *contract_address*, built from the terms (as the real
         ``EthLeg.expected_locator`` builds it from its own config) — no chain read. A token locator for
-        token terms, as the real one."""
+        token terms, as the real one, carrying ``deployer`` when given (#850 PR C)."""
         from pyrxd.eth_wallet.locator import Erc20HtlcLocator
 
         cls = Erc20HtlcLocator if getattr(terms, "token_address", "") else EthHtlcLocator
-        extra = {"token_address": terms.token_address} if cls is Erc20HtlcLocator else {}
+        extra = {"token_address": terms.token_address, "deployer": deployer} if cls is Erc20HtlcLocator else {}
         return cls(
             **extra,
             chain_id=11155111,
@@ -2139,11 +2139,20 @@ class FakeEthLeg:
         self.calls.append("verdict")
         return self._verdict
 
+    #: Whether :meth:`created_by_this_key` answers that this key created the contract. This fake
+    #: deployed every contract its tests resume unless a test says otherwise.
+    created_by_key = True
+    #: The address :meth:`signer_address` reports (lower-case, as the real one).
+    signer = "0x" + "5a" * 20
+
     async def created_by_this_key(self, contract_address, deploy_tx_hash) -> bool:
         # A resume of a push pinned before the record named its key needs this key's deploy (#850
-        # PR 7a). This fake deployed every contract its tests resume.
+        # PR 7a).
         self.calls.append("deploy-proof")
-        return True
+        return self.created_by_key
+
+    def signer_address(self) -> str:
+        return self.signer
 
     async def verify_counterparty_funded(self, contract_address, terms, *, block_identifier=None):
         """MAKER-side gate stand-in: records the call, raises if configured hostile, else returns a
