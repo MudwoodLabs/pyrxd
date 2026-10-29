@@ -814,6 +814,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The ETH counter-leg reader and the watchtower's claim scan check that the recorded deploy
+  transaction created the contract.** Both start their log scan at the deploy transaction's block,
+  so a later transaction named as the deploy would start it past a claim; the tower's scan then read
+  a claimed contract as unclaimed. Each now derives the CREATE address from that transaction's sender
+  and nonce (`keccak(rlp([from, nonce]))`, not the receipt's `contractAddress`) and refuses a
+  transaction that is not this contract's creation: `read_counter_disposition` answers `UNKNOWN`,
+  and `claim_status` raises, which pages. Since #917 the hash kept on a record is our own deploy, so
+  this guards a record written another way.
+
 - **One RXD source pushing the covenant's lock height below 0 no longer quiets the near-`t_rxd` page
   (Mythos B-1).** The tower derives the lock height as `tip - depth + 1` from the lowest tip and the
   deepest covenant depth its RXD sources report, and dropped a height below 0 as unread. One source

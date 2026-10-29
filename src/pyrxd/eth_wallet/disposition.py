@@ -65,7 +65,7 @@ from typing import Any
 from ..network.source_identity import require_distinct_sources
 from ..security.errors import NetworkError, ValidationError
 from .events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
-from .htlc_leg import SETTLED_SLOT, _addr, _b, _int_or_none, _receipt_facts
+from .htlc_leg import SETTLED_SLOT, _addr, _b, _int_or_none, _receipt_facts, create_address
 from .locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator
 
 __all__ = [
@@ -77,6 +77,7 @@ __all__ = [
     "DispositionKind",
     "LogUnion",
     "UnfundedTokenBalance",
+    "created_contract",
     "read_counter_disposition",
     "read_unfunded_token_balance",
     "union_logs",
@@ -582,9 +583,16 @@ async def read_counter_disposition(
         if from_block is None:
             if str(locator.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH:
                 return unknown("no deploy transaction is known, so the log scan has no start; pass from_block")
-            deploy = await _identity(panel, lambda s: _deploy_block(s, locator.deploy_tx_hash), "deploy receipt")
+            deploy = await _identity(
+                panel, lambda s: _deploy_block(s, locator.deploy_tx_hash, locator.contract_address), "deploy receipt"
+            )
             if deploy is None:
                 return unknown("the deploy transaction's receipt is not available", finalized)
+            if deploy == _NOT_THE_DEPLOY:
+                return unknown(
+                    "the recorded deploy transaction did not create this contract, so the log scan has no safe start",
+                    finalized,
+                )
             from_block = deploy
     except _BelowQuorum as exc:
         return unknown(f"a required read failed: {exc}")
@@ -905,11 +913,36 @@ def _is_hex(text: str) -> bool:
     return re.fullmatch(r"[0-9a-fA-F]+", text) is not None
 
 
-async def _deploy_block(source: Any, deploy_tx_hash: str) -> int | None:
+#: What :func:`_deploy_block` answers for a transaction that did not create the contract.
+_NOT_THE_DEPLOY = "not-the-deploy"
+
+
+async def _deploy_block(source: Any, deploy_tx_hash: str, contract_address: str) -> int | str | None:
+    """The block of *deploy_tx_hash*, ``None`` when it has no receipt, or :data:`_NOT_THE_DEPLOY` when
+    it did not create *contract_address*.
+
+    The log scan starts at this block, so a later transaction named as the deploy would start it
+    past a claim. Whether the transaction created the contract is derived from its sender and nonce
+    (``keccak(rlp([from, nonce]))``), never read from the receipt's ``contractAddress``."""
     receipt = await source.get_transaction_receipt(deploy_tx_hash)
     if receipt is None:
         return None
+    if not created_contract(await source.get_transaction(deploy_tx_hash), contract_address):
+        return _NOT_THE_DEPLOY
     return _int_or_none(receipt.get("blockNumber"))
+
+
+def created_contract(tx: Any, contract_address: str) -> bool:
+    """Whether the transaction *tx* (as ``eth_getTransactionByHash`` returns it) is the CREATE that
+    made *contract_address*: it calls nothing, and ``keccak(rlp([from, nonce]))[12:]`` is that
+    address. A field that is missing or malformed answers ``False``."""
+    try:
+        sender, nonce = tx.get("from"), _int_or_none(tx.get("nonce"))
+        if tx.get("to") or not isinstance(sender, str) or nonce is None or nonce < 0:
+            return False
+        return _addr(create_address(sender, nonce)) == _addr(contract_address)
+    except (NetworkError, ValidationError, ValueError, AttributeError):
+        return False
 
 
 # --------------------------------------------------------------------------- an unfunded token contract

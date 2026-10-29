@@ -14,6 +14,7 @@ import os
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.eth_wallet.htlc_leg import create_address
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.swap_coordinator import MarginPolicy
@@ -215,10 +216,15 @@ def _eth_terms() -> NegotiatedTerms:
     )
 
 
+#: The key that deployed ``ETH_CONTRACT`` at nonce 0, so a claim scan's derivation check passes.
+ETH_DEPLOYER = "0x" + "de" * 20
+ETH_CONTRACT = create_address(ETH_DEPLOYER, 0).lower()
+
+
 def _eth_locator() -> EthHtlcLocator:
     return EthHtlcLocator(
         chain_id=11155111,
-        contract_address="0x" + "ab" * 20,
+        contract_address=ETH_CONTRACT,
         deploy_tx_hash="0x" + "cd" * 32,
         hashlock="0x" + "ef" * 32,
         claimant="0x" + "11" * 20,
@@ -274,7 +280,7 @@ async def test_eth_maker_not_claimed():
     assert obs.now_rxd_height == 200
     assert obs.asset_locked_at_height == 100  # shared RXD derivation: 200 - 101 + 1
     assert obs.low_corroboration is True
-    assert eth.claim_status_calls == [("0x" + "ab" * 20, "0x" + "cd" * 32)]
+    assert eth.claim_status_calls == [(ETH_CONTRACT, "0x" + "cd" * 32)]
     assert eth.verdict_calls == []  # not claimed → no finality read
 
 

@@ -46,7 +46,7 @@ import hashlib
 import logging
 from typing import Any
 
-from pyrxd.eth_wallet.disposition import CounterDisposition, read_counter_disposition
+from pyrxd.eth_wallet.disposition import CounterDisposition, created_contract, read_counter_disposition
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
@@ -94,6 +94,13 @@ async def _scan_for_claim(rpc: EthRpc, contract_address: str, deploy_tx_hash: st
     # means the HTLC contract is not on-chain yet, so nothing can have claimed it → unclaimed.
     # On the WRONG chain the deploy tx is not found → get_transaction raises → fail-closed page.
     deploy = await rpc.get_transaction(deploy_tx_hash)
+    # The scan starts at this transaction's block, so a later transaction named as the deploy would
+    # start it past a claim. It must be the one that created the contract, derived from its sender
+    # and nonce, never read from a receipt's contractAddress.
+    if not created_contract(deploy, contract_address):
+        raise NetworkError(
+            "the recorded deploy transaction did not create the HTLC contract; cannot bound the claim scan"
+        )
     deploy_block = deploy.get("blockNumber")
     if deploy_block is None:
         return EthClaimStatus(claimed=False), False

@@ -31,9 +31,9 @@ from pyrxd.gravity.watch import ChainObserver, EthChainSource, Intent, RpcEthCha
 from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, REFUNDED_TOPIC0, _to_0x_hash
 from pyrxd.security.errors import NetworkError
 from pyrxd.security.secrets import PrivateKeyMaterial
-from tests.test_watch_quorum import FakeRxd, _eth_policy, _eth_record
+from tests.test_watch_quorum import ETH_CONTRACT, ETH_DEPLOYER, FakeRxd, _eth_policy, _eth_record
 
-_CONTRACT = "0x" + "ab" * 20
+_DEPLOYER, _CONTRACT = ETH_DEPLOYER, ETH_CONTRACT
 _DEPLOY = "0x" + "cd" * 32
 _CLAIM_HASH = "0x" + "12" * 32
 _OTHER_HASH = "0x" + "99" * 32
@@ -83,7 +83,7 @@ class _FakeEthRpc:
         self.get_logs_calls: list[dict] = []
 
     async def get_transaction(self, tx_hash):
-        return {"blockNumber": self._deploy_block}
+        return {"blockNumber": self._deploy_block, "from": _DEPLOYER, "nonce": 0, "to": None}
 
     async def get_logs(self, *, address, topics=None, from_block="earliest", to_block="latest"):
         self.get_logs_calls.append(
@@ -466,3 +466,44 @@ async def test_real_adapter_sustained_stall_upgrades_to_not_finalizing_across_ti
     assert obs.eth_claim_finality is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING
     d = decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6)
     assert d.intent is Intent.PAGE_SQUEEZED
+
+
+# ─────────────────────────────── the claim scan's start is the contract's own creation ──
+
+
+class _DeployIs(_FakeEthRpc):
+    def __init__(self, tx: dict, **kw) -> None:
+        super().__init__(deploy_block=10, **kw)
+        self._tx = tx
+
+    async def get_transaction(self, tx_hash):
+        return dict(self._tx)
+
+
+@pytest.mark.parametrize(
+    "tx",
+    [
+        {"blockNumber": 500, "from": _DEPLOYER, "nonce": 1, "to": _CONTRACT},  # a later call to the contract
+        {"blockNumber": 10, "from": _DEPLOYER, "nonce": 1, "to": None},  # a creation of another address
+        {"blockNumber": 10, "from": "0x" + "ee" * 20, "nonce": 0, "to": None},  # another sender's creation
+        {"blockNumber": 10, "to": None},  # no sender or nonce to derive from
+        {"blockNumber": 10, "from": _DEPLOYER, "nonce": 0, "to": _CONTRACT},  # a call, whatever it derives
+        {"blockNumber": 10, "from": "0x12", "nonce": 0, "to": None},  # a malformed sender
+    ],
+)
+async def test_claim_status_refuses_a_deploy_that_did_not_create_the_contract(tx):
+    """A later transaction named as the deploy started the scan past a real claim, and the claimed
+    contract read unclaimed. The scan now derives the CREATE address from the named transaction's
+    sender and nonce and refuses (a page, never silence) when it is not this contract."""
+    claimed = {"address": _CONTRACT, "topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32}
+    fake = _DeployIs(tx, logs=[claimed])
+    with pytest.raises(NetworkError, match="did not create"):
+        await RpcEthChainSource(fake).claim_status(_CONTRACT, "0x" + "cd" * 32)
+    assert fake.get_logs_calls == []
+
+
+async def test_claim_status_honest_deploy_still_scans_from_its_block():
+    claimed = {"address": _CONTRACT, "topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32}
+    fake = _DeployIs({"blockNumber": 10, "from": _DEPLOYER, "nonce": 0, "to": None}, logs=[claimed])
+    status = await RpcEthChainSource(fake).claim_status(_CONTRACT, "0x" + "cd" * 32)
+    assert status.claimed and fake.get_logs_calls[0]["from_block"] == 10

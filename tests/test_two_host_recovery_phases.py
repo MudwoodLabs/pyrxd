@@ -2049,21 +2049,31 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
         loc = _read_back(args).counterchain_locator
         assert loc.deploy_tx_hash != lie
 
-        class _Chain:  # deploy at block 10, a real claim at 100, the lying tx at 500
+        from pyrxd.eth_wallet.htlc_leg import create_address
+
+        deployer = "0x" + "de" * 20
+        contract = create_address(deployer, 0)
+
+        class _Chain:  # deploy at block 10, a real claim at 100, the lying tx (a call) at 500
             blocks = {real_deploy: 10, lie: 500}
 
             async def get_transaction(self, tx_hash):
                 if tx_hash not in self.blocks:
                     raise NetworkError(f"eth_getTransactionByHash failed: {tx_hash} not found")
-                return {"blockNumber": self.blocks[tx_hash]}
+                if tx_hash == real_deploy:
+                    return {"blockNumber": 10, "from": deployer, "nonce": 0, "to": None}
+                return {"blockNumber": self.blocks[tx_hash], "from": deployer, "nonce": 1, "to": contract}
 
             async def get_logs(self, *, address, topics=None, from_block="earliest", to_block="latest"):
                 claim = {"topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32, "blockNumber": 100}
                 return [claim] if int(from_block) <= 100 else []
 
         source = RpcEthChainSource(_Chain())
-        assert (await source.claim_status(loc.contract_address, real_deploy)).claimed  # control
-        assert not (await source.claim_status(loc.contract_address, lie)).claimed  # what the lie did
+        assert (await source.claim_status(contract, real_deploy)).claimed  # control
+        # What the lie did before the scan checked its start: it read the claimed contract unclaimed.
+        # A transaction that did not create the contract now refuses the scan.
+        with pytest.raises(NetworkError, match="did not create"):
+            await source.claim_status(contract, lie)
         with pytest.raises(NetworkError):
             await source.claim_status(loc.contract_address, loc.deploy_tx_hash)
 

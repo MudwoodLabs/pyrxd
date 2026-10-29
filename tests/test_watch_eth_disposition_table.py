@@ -78,7 +78,8 @@ class _Endpoint(FakeEvmEndpoint):
         r = self.chain.receipts.get(tx_hash)
         if r is None:
             raise NetworkError(f"transaction {tx_hash} not found")
-        return {"blockNumber": r["blockNumber"], "nonce": 0}
+        tx = await super().get_transaction(tx_hash)
+        return {**tx, "blockNumber": r["blockNumber"]}  # mined, whatever this endpoint's head
 
 
 class _Rxd:
@@ -817,7 +818,7 @@ async def test_the_verdict_is_read_for_the_verified_claim_not_the_scans_odd_log(
     the answer is UNKNOWN, not CLAIMED: the finality verdict must be read for the claim the reader
     verified, not for the odd log's transaction."""
     odd = {
-        "address": "0x" + "c0" * 20,
+        "address": CONTRACT,
         "topics": ["0x" + "ee" * 32],
         "data": "0x",
         "transactionHash": "0x" + "e1" * 32,

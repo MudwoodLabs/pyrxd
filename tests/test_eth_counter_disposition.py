@@ -292,7 +292,7 @@ async def test_rule_4_a_verified_refund_beside_an_unverified_claim_seen_is_refun
     chain = _chain(finalized=90)
     refund_tx = chain.refund(85)
     dropped = {
-        "address": "0x" + "c0" * 20,
+        "address": CONTRACT,
         "topics": [CLAIMED_TOPIC0],
         "data": "0x" + chain.preimage.hex(),
         "transactionHash": "0x" + "dd" * 32,
@@ -466,6 +466,28 @@ async def test_an_unknown_deploy_hash_without_from_block_is_unknown():
     assert d.kind is DispositionKind.REFUNDED
 
 
+async def test_a_later_transaction_named_as_the_deploy_is_unknown():
+    """The scan starts at the deploy transaction's block, so a later transaction named as the deploy
+    would start it past a claim. The reader derives the CREATE address from the named transaction's
+    sender and nonce, never from a receipt, and a transaction that created nothing is refused."""
+    chain = _chain(finalized=90)
+    chain.claim(20)
+    later = chain.force_receipt(60, topic0=REFUNDED_TOPIC0, address=OTHER_CONTRACT, label="later-call")
+    d = await read_counter_disposition(_quorum(chain), chain.locator(deploy_tx_hash=later))
+    assert d.kind is DispositionKind.UNKNOWN and "did not create this contract" in d.reason
+    d = await _read(_quorum(chain), chain)  # the honest pair: the real deploy reads the claim
+    assert d.kind is DispositionKind.CLAIMED
+
+
+async def test_a_creation_of_another_contract_named_as_the_deploy_is_unknown():
+    """A contract creation is not enough: it must be the creation of THIS contract."""
+    chain = _chain(finalized=90)
+    chain.claim(20)
+    chain.deploy_nonce = 1  # the named deploy now creates another address
+    d = await _read(_quorum(chain), chain)
+    assert d.kind is DispositionKind.UNKNOWN and "did not create this contract" in d.reason
+
+
 @pytest.mark.parametrize(
     "kw",
     [
@@ -536,7 +558,7 @@ async def test_rule_4_with_a_liar_that_also_forges_the_claim_receipt_is_unknown(
         chain,
         extra_logs=(
             {
-                "address": "0x" + "c0" * 20,
+                "address": CONTRACT,
                 "topics": [CLAIMED_TOPIC0],
                 "data": "0x" + chain.preimage.hex(),
                 "transactionHash": claim_tx,
