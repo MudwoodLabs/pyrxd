@@ -313,6 +313,26 @@ def test_the_count_is_read_at_the_block_the_code_was_read_at() -> None:
         assert ep.count_blocks and all(isinstance(b, int) for b in ep.count_blocks)
 
 
+def test_latest_is_the_highest_head_so_a_lagging_endpoint_cannot_hide_a_fresh_deploy() -> None:
+    """Re-review 2 of the Mythos fixes: resolving ``latest`` to the fleet's LOWEST head read a deploy
+    mined in the newest block as empty code at every endpoint, a permanent refusal. It is the highest
+    head; an endpoint that cannot say its head is left out, and none at all is unknown."""
+    who = derive_address(_key())
+    eps = [_Endpoint(who, 9), _Endpoint(who, 9), _Endpoint(who, 9)]
+    eps[0].head, eps[1].head = 119, 121
+
+    async def _down():
+        raise NetworkError("down")
+
+    eps[2].block_number = _down
+    assert _derive(_Fleet(eps), _create_address(who, 5)).lower() == who.lower()
+    assert eps[0].code_blocks == [121] and eps[0].count_blocks == [121]
+    for e in eps:
+        e.block_number = _down
+    with pytest.raises(NetworkError, match="no endpoint reported its head block"):
+        _derive(_Fleet(eps), _create_address(who, 5))
+
+
 def test_a_key_busier_than_the_search_is_refused_without_blaming_the_taker(monkeypatch) -> None:
     """Mythos 20261028T100731 LOW-1. When a window stops short of nonce 0 the deploy may lie further
     back, so the refusal names the bound and does not call the contract a wrong one. When every window

@@ -202,8 +202,9 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         below the candidate's transaction count. That equation is checked here, locally, and no
         endpoint can make it true for an account that did not create the address.
 
-        The candidate is read through :func:`read_contract` (an identity read at
-        ``block_identifier``), after the contract's code is read at the same block: no code there is
+        The candidate is read through :func:`read_contract` (an identity read at the block
+        ``block_identifier`` resolves to; for ``latest``, the highest head any endpoint reports), after
+        the contract's code is read at the same block: no code there is
         the deploy not yet buried at that block, said as such, and a contract with no working
         ``deployer()`` is refused as not an Erc20Htlc of this build, rather than surfacing a raw
         decoding error. Code that differs from the artifact outside the immutable slots is refused
@@ -233,10 +234,21 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
 
         # One concrete block for every read below. A tag ("finalized", "latest") is resolved again by
         # each request, so behind a load balancer the code and the count could come from nodes at
-        # different blocks; a node asked for a number it has not reached errors instead, and an error
+        # different blocks; a node asked for a number it has not reached is expected to error (geth:
+        # "header not found"), and an error
         # is a silent endpoint, never a refusal (Mythos 20261028T100731 LOW-2, re-review F1).
         if block_identifier is None or block_identifier == "latest":
-            _bid = int(await self._rpc.block_number())
+            # The HIGHEST head any endpoint reports, not the fleet's lowest: at the lowest, one lagging
+            # endpoint made a just-mined deploy read as empty code everywhere, a permanent refusal. At
+            # the highest, an endpoint that has not reached it errors, which only delays (re-review 2).
+            heads = await asyncio.gather(
+                *(r.block_number() for r in (getattr(self._rpc, "sources", None) or [self._rpc])),
+                return_exceptions=True,
+            )
+            known = [int(h) for h in heads if not isinstance(h, BaseException)]
+            if not known:
+                raise NetworkError(f"no endpoint reported its head block, so {contract_address} was not read")
+            _bid = max(known)
         elif block_identifier == "finalized":
             _bid = int(await self._rpc.finalized_block_number())
         else:
