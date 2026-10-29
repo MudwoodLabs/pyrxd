@@ -179,12 +179,13 @@ def test_a_bad_record_field_is_refused(base, fields):
             "counter_disposition": CounterDispositionRecord(**{**_GOOD, "kind": "unknown", "tx_hash": None}),
         },
         {"abort_reason": AbortReason.TAKER_NEVER_FUNDS, "state": SwapState.ABORTED},
+        {"abort_reason": AbortReason.COVENANT_REFUNDED, "state": SwapState.ABORTED, "asset_refund_txid": "ab" * 32},
     ],
 )
 def test_each_new_field_alone_writes_the_current_schema_version(fields):
     record = dataclasses.replace(_eth_base(), **fields)
     d = record.to_dict()
-    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 10
+    assert d["schema_version"] == SWAP_RECORD_SCHEMA_VERSION == 11
     assert SwapRecord.from_dict(d) == record
 
 

@@ -110,6 +110,10 @@ _RATE_LIMIT = re.compile(r"\b429\b|too many requests|rate[ -]?limit")
 #: An endpoint over it is recorded as a failed scan and NONE of its nominations are used: verifying
 #: "the first" few would let that endpoint choose which are verified (its ghost hashes are its own to
 #: pick). Its silence is then unknown, never "no logs", exactly as for any other failed scan.
+#: For a future autonomous consumer (ETH-leg autonomy, #519): a dropped endpoint narrows who actually
+#: answered, while ``single_source`` reports the CONFIGURED panel. An executor that broadcasts on this
+#: answer must count the endpoints that answered, not the ones configured. No autonomous executor
+#: reads this answer today; the tower's pages and the operator-run coordinator do.
 MAX_NOMINATIONS_PER_ENDPOINT = 8
 
 
