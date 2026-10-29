@@ -191,6 +191,7 @@ class _Endpoint:
 
     head = 120
     finalized = 100
+    deployed_at = 0  # the block the deploy is mined in: before it, every honest endpoint has no code
 
     async def block_number(self):
         return self.head
@@ -200,6 +201,8 @@ class _Endpoint:
 
     async def get_code(self, address, block_identifier=None):
         self.code_blocks.append(block_identifier)
+        if isinstance(block_identifier, int) and block_identifier < self.deployed_at:
+            return b""
         return self.code
 
     async def get_transaction_count(self, who, block):
@@ -215,6 +218,8 @@ class _Endpoint:
 class _Fleet:
     """Several endpoints as the leg sees them: ``sources``, and an identity quorum for contract reads."""
 
+    _min = 2  # `min_agreeing`, which `quorum_combiner` reads
+
     def __init__(self, endpoints) -> None:
         self.sources = endpoints
 
@@ -229,6 +234,8 @@ class _Fleet:
 
     async def eth_call_quorum(self, make_call, *, label, combine=None):
         answers = [await make_call(e) for e in self.sources]
+        if combine is not None:
+            return combine(answers)
         if len(set(answers)) != 1:
             raise NetworkError(f"{label}: endpoints disagree")
         return answers[0]
@@ -350,6 +357,28 @@ def test_empty_code_at_a_resolved_latest_is_retryable_never_a_refusal() -> None:
     assert not isinstance(e.value, ValidationError)
     with pytest.raises(ValidationError, match="NOT YET FINALIZED"):
         _derive(_Fleet(eps), _create_address(who, 5), block_identifier="finalized")
+
+
+def test_one_low_finalized_report_does_not_pick_the_block() -> None:
+    """Re-review 4. With the fleet's MIN, one endpoint reporting finalized 0 chose a block before the
+    deploy; the honest nodes then agreed the code was empty there, and an honest finalized contract was
+    refused as "not yet finalized". The block is the height a quorum vouches for, so one low (or one
+    high) report moves nothing."""
+    who = derive_address(_key())
+    contract = _create_address(who, 5)
+    for liar_finalized in (0, 10**9):
+        eps = [_Endpoint(who, 9), _Endpoint(who, 9), _Endpoint(who, 9)]
+        for e in eps:
+            e.deployed_at = 90
+        eps[0].finalized = liar_finalized
+        assert _derive(_Fleet(eps), contract, block_identifier="finalized").lower() == who.lower()
+        assert eps[0].code_blocks == [100]  # the fleet fake reads code through its first endpoint
+    # Honest path: a deploy no quorum has finalized yet is still the typed "not yet finalized" refusal.
+    eps = [_Endpoint(who, 9), _Endpoint(who, 9), _Endpoint(who, 9)]
+    for e in eps:
+        e.deployed_at = 110
+    with pytest.raises(ValidationError, match="NOT YET FINALIZED"):
+        _derive(_Fleet(eps), contract, block_identifier="finalized")
 
 
 def test_a_key_busier_than_the_search_is_refused_without_blaming_the_taker(monkeypatch) -> None:

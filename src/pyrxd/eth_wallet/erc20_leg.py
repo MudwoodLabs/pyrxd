@@ -252,7 +252,21 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 raise NetworkError(f"no endpoint reported its head block, so {contract_address} was not read")
             _bid = max(known)
         elif block_identifier == "finalized":
-            _bid = int(await self._rpc.finalized_block_number())
+            # The height a quorum of endpoints vouch is finalized, not the fleet's lowest: with MIN one
+            # endpoint reporting finalized 0 chose a block before the deploy, the honest nodes agreed its
+            # code was empty there, and an honest finalized contract was refused as "not yet finalized"
+            # for as long as that endpoint kept it up (re-review 4). A liar can no more pull the block
+            # up than down: the quorum-th value needs `min_agreeing` endpoints at or above it.
+            from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+            _bid = int(
+                await read_contract(
+                    self._rpc,
+                    lambda s: s.finalized_block_number(),
+                    label="finalized_block_number",
+                    combine=quorum_combiner(self._rpc),
+                )
+            )
         else:
             _bid = block_identifier
         code = await self._rpc.get_code(contract_address, _bid)
