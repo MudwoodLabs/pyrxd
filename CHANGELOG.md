@@ -823,6 +823,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `claim_status` raises, which pages. Since #917 the hash kept on a record is our own deploy, so
   this guards a record written another way.
 
+- **An ETH counter-leg record keeps its deploy transaction through `post_asset_lock_revalidate`.**
+  The lock-time re-verify replaced the record's locator with one rebuilt from config, whose
+  `deploy_tx_hash` is the all-zero placeholder. The counter-leg disposition reader starts its log
+  scan at the deploy transaction's block, so on every taker or single-operator ETH record that
+  reached BOTH_LOCKED it answered `UNKNOWN`, and `mutual_refund` sent our refund but never moved the
+  record to MUTUAL_REFUND (nor sent a single operator's covenant refund). The nightly ETH e2e had
+  failed on this since #850 PR 6. The watchtower's ETH claim scan reads the same field; on such a
+  record it failed closed (an "investigate" page each tick) rather than scanning. Only a taker's
+  or single operator's own deploy is kept; a maker's record still carries the placeholder, since a
+  deploy hash there is the taker's word. Records already written at BOTH_LOCKED still carry the
+  placeholder.
+
 - **One RXD source pushing the covenant's lock height below 0 no longer quiets the near-`t_rxd` page
   (Mythos B-1).** The tower derives the lock height as `tip - depth + 1` from the lowest tip and the
   deepest covenant depth its RXD sources report, and dropped a height below 0 as unread. One source

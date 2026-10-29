@@ -15,8 +15,8 @@ branch from the same BOTH_LOCKED state (``_setup_locked_swap``):
 * HAPPY PATH: maker_claims_btc -> SECRET_REVEALED (reveals p); then
   taker_scrape_and_claim_asset -> COMPLETED (scrapes p, claims the RXD covenant).
 * MUTUAL REFUND (maker never claims): the taker's BTC refund opens FIRST (``t_btc``), the
-  maker's Radiant refund LAST (``t_rxd``); once both have matured, mutual_refund refunds
-  BOTH legs -> MUTUAL_REFUND. No one-sided loss.
+  maker's Radiant refund LAST (``t_rxd``); once both have matured, mutual_refund sends the BTC
+  refund, and once that is buried, the covenant refund -> MUTUAL_REFUND. No one-sided loss.
 * MAKER STALL (mechanics): ``maybe_refund_asset_on_maker_stall`` fires near ``t_rxd`` and
   CSV-refunds the covenant -> ASSET_REFUNDED_TAKER_ACTS. That refund pays the MAKER, so it is a
   maker-side primitive, not a taker recovery (see TestMakerStallAssetOnlyRefundIsTakerLoss).
@@ -385,6 +385,39 @@ class _BtcFundingReader:
         # Node-authoritative txid (never a local segwit parse).
         decoded = self._n.btc("decoderawtransaction", bytes(raw_tx).hex())
         return str(decoded["txid"])
+
+    # The BTC disposition reader's two reads (#850 PR 9a, `read_btc_counter_disposition`), done
+    # with the RPCs `BitcoinCoreRpcSource.get_outpoint_spender` and `BitcoinCoreFundingReader.tx_block`
+    # use. Without them the leg's `counter_disposition` reads UNKNOWN for ever, and a refund the
+    # coordinator sent can never be seen buried.
+
+    async def outpoint_spender(self, txid, vout) -> bytes | None:
+        # gettxout with the mempool: a dict means unspent; the CLI prints nothing for null.
+        if isinstance(self._n.btc("gettxout", str(txid), str(int(vout)), "true"), dict):
+            return None
+        try:
+            entries = self._n.btc("gettxspendingprevout", json.dumps([{"txid": str(txid), "vout": int(vout)}]))
+        except RuntimeError:
+            entries = []  # a node without the RPC (Core < 24, Litecoin): the block scan below
+        for entry in entries if isinstance(entries, list) else []:
+            spender = entry.get("spendingtxid") if isinstance(entry, dict) else None
+            if isinstance(spender, str):
+                return bytes.fromhex(self._n.btc("getrawtransaction", spender, "true")["hex"])
+        located = await self.tx_block(txid)
+        if located is None:
+            raise NetworkError(f"{txid}:{vout} is not unspent and its funding tx is in no block; fail-closed")
+        for height in range(located[0], int(self._n.btc("getblockcount")) + 1):
+            block = self._n.btc("getblock", self._n.btc("getblockhash", str(height)), "2")
+            for tx in block["tx"]:
+                if any(i.get("txid") == str(txid) and i.get("vout") == int(vout) for i in tx["vin"]):
+                    return bytes.fromhex(tx["hex"])
+        raise NetworkError(f"{txid}:{vout} is not unspent and no spender was found; fail-closed")
+
+    async def tx_block(self, txid) -> tuple[int, str] | None:
+        block_hash = self._n.btc("getrawtransaction", str(txid), "true").get("blockhash")
+        if block_hash is None:
+            return None
+        return int(self._n.btc("getblockheader", block_hash)["height"]), str(block_hash).lower()
 
 
 # --------------------------------------------------------------------------- RXD tx helpers
@@ -810,9 +843,11 @@ class TestCrossChainSwap:
         at the same wall clock. Only once ``t_rxd`` has also matured does ``mutual_refund`` run, and it
         refunds both legs -> MUTUAL_REFUND. Neither party suffers a one-sided loss.
 
-        ``mutual_refund`` is called once, after BOTH have matured. Called between the two maturities
-        it refunds the counter leg, fails on the covenant and leaves the record at BOTH_LOCKED, which
-        is why the two-host runner's refund phase checks both timeouts before broadcasting anything.
+        Since #850 PR 9a this record (no role: one operator holds both legs) unwinds in two calls.
+        The first reads the BTC HTLC unspent, records the taker's refund, sends it and nothing else:
+        the record stays BOTH_LOCKED and the covenant is untouched. Once that refund is buried, the
+        next call reads it REFUNDED, sends the covenant's CSV refund and moves the record to
+        MUTUAL_REFUND.
         """
         s = await _setup_locked_swap(nodes)
         coord = s.coord
@@ -833,10 +868,27 @@ class TestCrossChainSwap:
             await coord.radiant_leg.refund_asset(coord.record)
         assert isinstance(nodes.rxd("gettxout", cov_txid, "0"), dict), "the covenant is still unspent"
 
-        # 2. The maker's Radiant refund matures last; now mutual_refund unwinds BOTH legs.
+        # 2. The maker's Radiant refund matures last; now mutual_refund unwinds BOTH legs. It reads
+        #    the BTC HTLC first: unspent, so it records our refund, sends it, and stops there. (This
+        #    suite's broadcaster mines a block after each send.)
         nodes.rxd_mine(s.t_rxd.value - _rxd_confs(nodes, cov_txid))
         rec = await coord.mutual_refund()
+        assert rec.state is SwapState.BOTH_LOCKED
+        assert rec.counter_refund_raw is not None, "the BTC refund is recorded before its broadcast"
+        refund_txid = bt.btc_txid_from_raw(bytes.fromhex(rec.counter_refund_raw))
+        assert _btc_confs(nodes, refund_txid) >= 1, "the BTC refund was sent"
+        assert isinstance(nodes.rxd("gettxout", cov_txid, "0"), dict), "the covenant waits for a buried BTC refund"
+
+        # 3. Buried at the depth the coordinator requires, the refund reads REFUNDED: the next call
+        #    sends the covenant refund and the record reaches MUTUAL_REFUND.
+        burial = coord._btc_burial_blocks()
+        assert burial >= 1
+        nodes.btc_mine(max(0, burial - _btc_confs(nodes, refund_txid)))
+        rec = await coord.mutual_refund()
         assert rec.state is SwapState.MUTUAL_REFUND
+        assert rec.counter_disposition is not None and rec.counter_disposition.kind == "refunded"
+        assert rec.counter_disposition.tx_hash == refund_txid
+        assert rec.asset_refund_txid is not None
 
         # Both locked UTXOs are now spent (refunded) on their chains.
         btc_spent = nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout))

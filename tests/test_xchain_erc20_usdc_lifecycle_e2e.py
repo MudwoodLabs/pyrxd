@@ -946,31 +946,38 @@ async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
 
     coord2, _c2, _p2, _l2, _r2, _t2, _m2 = _build(node, url, workdir, token, seen=seen, reuse=reuse)
     sink = JsonFileRecordSink(str(workdir / "swap") + ".swaprec.json")
+    pinned_hash = on_disk.get("pending_push_tx_hash")
+    assert pinned_hash is not None, "no durable push hash: the resume cannot price a replacement"
+    assert pinned_hash.lower() in [str(h).lower() for h in pending], "the recorded push is not the pending one"
 
-    # WHILE THE PUSH IS PENDING the resume REFUSES, and does not reach the pinned re-send at all.
-    # This is the behaviour that actually holds, not the replacement the pin's comment describes:
-    # the in-flight check (erc20_leg.py) fires first and cannot tell our own pending push from an
-    # unrelated transaction. Fail-closed and correct — a resume that guessed here could double-fund
-    # — but it means the pin's "replaces rather than adds" property is NOT what protects this case.
-    with pytest.raises(NetworkError, match="still in flight"):
-        await coord2.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
+    # WHILE THE PUSH IS PENDING the resume REPLACES it (#850 PR 3): one transaction in flight, at the
+    # pinned nonce, under the recorded hash, is provably our own push, so the resume re-sends at that
+    # nonce, priced past the pending one. Only one transaction per nonce can mine. The replacement is
+    # sent while mining is still off, so it displaces the push in the pool; mining resumes after it.
+    # (Turning automine on first mines the pending push, and the replacement then fails "nonce too low".)
+    leg2 = coord2._token_leg
+    real_send2 = leg2._sign_and_send
+    resent: list[tuple[int, str]] = []
 
-    # Let the pending push mine, as the refusal instructs ("Wait for them to mine").
-    _rpc(url, "evm_setAutomine", [True])
-    _rpc(url, "evm_mine", [])
+    async def _send_and_mine(tx, **kw):
+        sent = await real_send2(tx, **kw)
+        resent.append((int(tx["nonce"]), str(sent).lower()))
+        _rpc(url, "evm_setAutomine", [True])
+        _rpc(url, "evm_mine", [])
+        return sent
 
-    # Now the resume completes — and finds nothing left to do, because the push it was going to
-    # retry is the one that just landed. THE property, end to end: crash mid-broadcast, resume,
-    # and the value is delivered EXACTLY once.
-    rec = await coord3_resume(node, url, workdir, token, seen, reuse, terms, sink)
+    leg2._sign_and_send = _send_and_mine
+    rec = await coord2.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
+    assert [n for n, _h in resent] == [int(pinned)], f"the resume did not re-send once at the pinned nonce: {resent}"
+    assert resent[0][1] != pinned_hash.lower(), "the re-send was not a new (bumped) transaction"
+    mined = _rpc(url, "eth_getTransactionReceipt", [resent[0][1]])["result"]
+    assert mined is not None and int(mined["status"], 16) == 1, "the replacement did not mine"
+    assert _rpc(url, "eth_getTransactionReceipt", [pinned_hash])["result"] is None, "the replaced push mined too"
+
+    # THE property, end to end: crash mid-broadcast, resume, and the value is delivered EXACTLY once.
+    assert rec.state is SwapState.BTC_LOCKED, f"the resumed fund did not complete: {rec.state}"
     htlc = on_disk["pending_counter_contract"]
     assert rec.counterchain_locator.contract_address.lower() == htlc.lower()
     assert _usdc_balance(url, htlc, token) == _AMOUNT, f"HTLC holds {_usdc_balance(url, htlc, token)}, not {_AMOUNT}"
     spent = taker_before - _usdc_balance(url, _ADDR_TAKER, token)
     assert spent == _AMOUNT, f"the taker paid {spent}, not {_AMOUNT}: the crashed push and the resume BOTH delivered"
-
-
-async def coord3_resume(node, url, workdir, token, seen, reuse, terms, sink):
-    """A third process, resuming after the pending push settled."""
-    coord3, _c, _p, _l, _r, _t, _m = _build(node, url, workdir, token, seen=seen, reuse=reuse)
-    return await coord3.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
