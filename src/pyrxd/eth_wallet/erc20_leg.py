@@ -204,7 +204,8 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
 
         The candidate is read through :func:`read_contract` (an identity read at the block
         ``block_identifier`` resolves to; for ``latest``, the highest head an answering endpoint
-        reports, where empty code is a retryable :class:`NetworkError`), after
+        reports; for ``finalized``, the height a quorum of endpoints vouch for. On a fleet, empty code
+        at either is a retryable :class:`NetworkError`, since one endpoint can still move the block), after
         the contract's code is read at the same block: no code there is
         the deploy not yet buried at that block, said as such, and a contract with no working
         ``deployer()`` is refused as not an Erc20Htlc of this build, rather than surfacing a raw
@@ -255,8 +256,10 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             # The height a quorum of endpoints vouch is finalized, not the fleet's lowest: with MIN one
             # endpoint reporting finalized 0 chose a block before the deploy, the honest nodes agreed its
             # code was empty there, and an honest finalized contract was refused as "not yet finalized"
-            # for as long as that endpoint kept it up (re-review 4). A liar can no more pull the block
-            # up than down: the quorum-th value needs `min_agreeing` endpoints at or above it.
+            # for as long as that endpoint kept it up (re-review 4). The quorum-th value needs
+            # `min_agreeing` endpoints at or above it, so a minority cannot pull the block up. It can
+            # still pull it down when no honest majority outvotes it (two sources, or one of three
+            # down), so empty code at this height is retryable below, never a refusal (re-review 5).
             from pyrxd.eth_wallet.multi_rpc import quorum_combiner
 
             _bid = int(
@@ -275,6 +278,12 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 f"no contract code at {contract_address} as of block {_bid}, the newest head an endpoint "
                 "reported. The deploy may simply not be visible there yet (a lagging endpoint); nothing was "
                 "concluded, retry. A contract that never appears is not verified, so nothing is locked."
+            )
+        if not code and block_identifier == "finalized" and getattr(self._rpc, "sources", None):
+            raise NetworkError(
+                f"no contract code at {contract_address} as of block {_bid}, the finalized height a quorum "
+                "of endpoints reported. The deploy is most likely simply NOT YET FINALIZED, or one endpoint "
+                "reported a low finalized height; nothing was concluded, retry once it buries."
             )
         if not code:
             raise ValidationError(

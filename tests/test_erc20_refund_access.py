@@ -343,7 +343,8 @@ def test_latest_is_the_highest_head_so_a_lagging_endpoint_cannot_hide_a_fresh_de
 def test_empty_code_at_a_resolved_latest_is_retryable_never_a_refusal() -> None:
     """Re-review 3: the head can still lag when only a lagging endpoint answers its head read, and the
     honest nodes then agree the deploy's code is empty at that block. At ``latest`` that is retryable.
-    At ``finalized`` empty code stays the typed "NOT YET FINALIZED" refusal the coordinator handles."""
+    At ``finalized`` on a fleet it is retryable too (re-review 5); a single endpoint, the caller's
+    whole trust root, keeps the typed "NOT YET FINALIZED" refusal."""
     who = derive_address(_key())
 
     async def _down():
@@ -355,8 +356,9 @@ def test_empty_code_at_a_resolved_latest_is_retryable_never_a_refusal() -> None:
     with pytest.raises(NetworkError, match="may simply not be visible there yet") as e:
         _derive(_Fleet(eps), _create_address(who, 5))
     assert not isinstance(e.value, ValidationError)
-    with pytest.raises(ValidationError, match="NOT YET FINALIZED"):
+    with pytest.raises(NetworkError, match="NOT YET FINALIZED") as e:
         _derive(_Fleet(eps), _create_address(who, 5), block_identifier="finalized")
+    assert not isinstance(e.value, ValidationError)
 
 
 def test_one_low_finalized_report_does_not_pick_the_block() -> None:
@@ -373,12 +375,42 @@ def test_one_low_finalized_report_does_not_pick_the_block() -> None:
         eps[0].finalized = liar_finalized
         assert _derive(_Fleet(eps), contract, block_identifier="finalized").lower() == who.lower()
         assert eps[0].code_blocks == [100]  # the fleet fake reads code through its first endpoint
-    # Honest path: a deploy no quorum has finalized yet is still the typed "not yet finalized" refusal.
+    # A deploy no quorum has finalized yet is said as such, and retryable: on a fleet the empty code
+    # may equally come from a low report no honest majority outvoted (re-review 5, below).
     eps = [_Endpoint(who, 9), _Endpoint(who, 9), _Endpoint(who, 9)]
     for e in eps:
         e.deployed_at = 110
-    with pytest.raises(ValidationError, match="NOT YET FINALIZED"):
+    with pytest.raises(NetworkError, match="NOT YET FINALIZED") as e:
         _derive(_Fleet(eps), contract, block_identifier="finalized")
+    assert not isinstance(e.value, ValidationError)
+
+
+@pytest.mark.parametrize("finalized", [[0, 100], [0, 100, None]])
+def test_a_low_finalized_report_no_majority_outvotes_is_retryable(finalized) -> None:
+    """Re-review 5, through the real ``MultiSourceEthRpc`` quorum. With two sources, or three with one
+    down, the quorum-th finalized height is the liar's 0. The honest node then has no code there, and
+    that must be a retry, never the typed refusal."""
+    from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
+
+    who = derive_address(_key())
+    eps = []
+    for i, f in enumerate(finalized):
+        ep = _Endpoint(who, 9)
+        ep.deployed_at, ep.source_key = 90, f"operator-{i}"
+        if f is None:
+
+            async def _down():
+                raise NetworkError("429")
+
+            ep.finalized_block_number = _down
+        else:
+            ep.finalized = f
+        eps.append(ep)
+    fleet = MultiSourceEthRpc.__new__(MultiSourceEthRpc)
+    fleet._sources, fleet._min = eps, 2
+    with pytest.raises(NetworkError, match="NOT YET FINALIZED") as e:
+        _derive(fleet, _create_address(who, 5), block_identifier="finalized")
+    assert not isinstance(e.value, ValidationError)
 
 
 def test_a_key_busier_than_the_search_is_refused_without_blaming_the_taker(monkeypatch) -> None:
