@@ -4692,7 +4692,7 @@ class SwapCoordinator:
         outcome = await self._apply_covenant_spend(spend)
         if outcome == "refunded":
             return self.record
-        if outcome == "pending" and False:  # PLANTED DEFECT: a pending refund is re-sent
+        if outcome == "pending":
             logger.info("the covenant refund %s is not yet buried (%s); nothing sent", spend.txid, spend.reason)
             return self.record
         if outcome == "disputed":
