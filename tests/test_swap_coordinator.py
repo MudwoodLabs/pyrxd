@@ -2797,6 +2797,42 @@ async def test_eth_revalidate_keeps_the_recorded_deploy_tx():
     assert coord.persisted[-1].counterchain_locator.deploy_tx_hash == funded
 
 
+async def test_eth_revalidate_keeps_the_recorded_deploy_tx_on_a_taker_record():
+    # The two-party case the fix is for: a TAKER funded the contract, so the deploy tx is its own.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd, role=SwapRole.TAKER)
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    funded = rec.counterchain_locator.deploy_tx_hash
+    assert funded == "0x" + "cd" * 32
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED and "verify_counterparty" in leg.calls
+    assert rec.counterchain_locator.deploy_tx_hash == funded
+
+
+async def test_eth_revalidate_never_overwrites_a_deploy_tx_the_verifier_names():
+    # Only the placeholder is filled in. A re-verify that names a deploy tx of its own is the chain's
+    # answer, and the record's must not replace it.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    real_verify = leg.verify_counterparty_funded
+
+    async def _verify_naming_a_deploy(contract_address, terms, *, block_identifier=None):
+        loc = await real_verify(contract_address, terms, block_identifier=block_identifier)
+        return dataclasses.replace(loc, deploy_tx_hash="0x" + "ab" * 32)
+
+    leg.verify_counterparty_funded = _verify_naming_a_deploy
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED
+    assert rec.counterchain_locator.deploy_tx_hash == "0x" + "ab" * 32
+
+
 async def test_eth_revalidate_without_a_recorded_deploy_tx_stays_unknown():
     # The honest path for a record that never knew the deploy tx (a maker's): nothing is invented.
     secret, h = generate_secret()
