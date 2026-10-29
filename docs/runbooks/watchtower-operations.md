@@ -120,6 +120,14 @@ into the same app or receiver changes nothing.
   On a conclusive verdict (refunded, or a claim page delivered after t_rxd) the tower writes
   `<swap_id>.legacy-checked.json` beside the record (mode 600, atomic). It never writes a record.
   Delete the marker to have the record read again.
+  A legacy record (BTC or ETH) whose read fails or retries without a verdict (`UNKNOWN`, a
+  refund not yet buried or not yet final, an empty token contract a push may still reach) for longer
+  than `--legacy-unresolved-page-after-s` (default 6 hours, chosen, not measured) pages CRITICAL
+  "investigate" (`legacy_unresolved`) on every read until it resolves (#921). One endpoint can hold
+  such a read for good, for example by reporting an old finalized block. Compare the endpoints'
+  answers and check the counter leg by hand. A read that retries only because of the tower's own
+  configuration (one endpoint, or a source that cannot read the leg) does not count. The clock is kept
+  in memory, so restarting the tower starts it over.
 - **ETH counter legs (#850 PR 10).** On a read of more than one endpoint: your refund verified at
   the finalized block sends an INFO `RECONCILE` page naming `reconcile_counter_leg` (`mutual_refund`
   from BOTH_LOCKED); a `Claimed` log that opens H beside it, or a claim on record, pages the covenant

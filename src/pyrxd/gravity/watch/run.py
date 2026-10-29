@@ -83,6 +83,7 @@ from pyrxd.gravity.watch import (
 from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
 from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
 from pyrxd.gravity.watch.preflight import preflight_timing
+from pyrxd.gravity.watch.reconciler import DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.network.redaction import redacted_url
@@ -106,6 +107,7 @@ def build_reconciler(
     alert_channel: AlertChannel,
     eth_source: EthChainSource | None = None,
     executor: Executor | None = None,
+    legacy_unresolved_page_after_s: float = DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S,
 ) -> Reconciler:
     """Compose the real ports into a Reconciler (pure wiring — no network at call time).
 
@@ -148,6 +150,7 @@ def build_reconciler(
         policy=policy,
         safety_window_blocks=safety_window_blocks,
         executor=executor,
+        legacy_unresolved_page_after_s=legacy_unresolved_page_after_s,
     )
 
 
@@ -804,6 +807,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "boot-time timing cross-check (the watchdog is a separate process). Set to match it.",
     )
     p.add_argument("--safety-window-blocks", type=int, default=6)
+    p.add_argument(
+        "--legacy-unresolved-page-after-s",
+        type=float,
+        default=DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S,
+        help="page 'investigate' once a legacy (pre-0.27) record's check has stayed unresolved this long "
+        "(a failed read, or a retry its configuration does not explain); one endpoint can hold it there",
+    )
     p.add_argument("--quorum", type=int, default=2, help="BTC funding-reader quorum (of 3 Esplora sources)")
     p.add_argument("--block-interval-s", type=float, default=600.0)
     p.add_argument("--rxd-block-interval-s", type=float, default=300.0)
@@ -1151,6 +1161,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
             alert_channel=_build_alert_channel(args, http_session),
             eth_source=eth_source,
             executor=executor,
+            legacy_unresolved_page_after_s=args.legacy_unresolved_page_after_s,
         )
         # Wire the un-ACK'd CRITICAL count into the heartbeat. Without this the emitted beat
         # carries no `unacked_critical` key at all, so an external escalation monitor has

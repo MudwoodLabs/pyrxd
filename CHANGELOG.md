@@ -814,6 +814,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Watchtower: a legacy record's D9 check that one endpoint holds without a verdict now pages
+  (#921).** Before, a failed or retried read of a pre-0.27 terminal record was silent on every tick.
+  One endpoint could keep it there for good: an old finalized block (the reader takes the lowest)
+  holds a final ETH refund at `settled_unfinal`, and a deploy receipt the other endpoints disagree
+  with holds it at `UNKNOWN`. A record unresolved for longer than the new
+  `--legacy-unresolved-page-after-s` (`Reconciler(legacy_unresolved_page_after_s=...)`, default 6
+  hours) pages CRITICAL "investigate" (`legacy_unresolved`) on every read until it resolves. Retries
+  the tower's configuration explains (one endpoint, a source that cannot read the leg) are marked
+  `LegacyCheck.quiet_by_design` and never page. The clock is in memory, so a restart starts it over.
 - **The ETH counter-leg reader and the watchtower's claim scan check that the recorded deploy
   transaction created the contract.** Both start their log scan at the deploy transaction's block,
   so a later transaction named as the deploy would start it past a claim; the tower's scan then read

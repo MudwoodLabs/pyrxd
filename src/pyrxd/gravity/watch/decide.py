@@ -2143,12 +2143,18 @@ class LegacyCheck:
 
     ``decision`` is what to page (``WATCH``: nothing). ``verdict`` is the word the marker records.
     ``conclusive``: write the marker now. ``conclusive_once_delivered``: write it once this page is
-    delivered. Neither: write nothing, and the record is read again on a later tick."""
+    delivered. Neither: write nothing, and the record is read again on a later tick.
+
+    ``quiet_by_design``: a WATCH this tower's configuration explains (it cannot read this counter
+    leg, or it has one endpoint), not one an endpoint's answer chose. Every other retried WATCH is
+    *unresolved*, and the reconciler pages "investigate" once a record has stayed unresolved too long
+    (#921): one endpoint can hold the read there (a stale finalized block, a disagreeing receipt)."""
 
     decision: Decision
     verdict: str
     conclusive: bool = False
     conclusive_once_delivered: bool = False
+    quiet_by_design: bool = False
 
 
 def decide_legacy(
@@ -2179,7 +2185,9 @@ def decide_legacy(
         return _decide_legacy_eth(record=record, observations=obs, policy=policy)
     if record.terms.counter_chain != "btc":
         return LegacyCheck(
-            Decision(Intent.WATCH, reason="legacy net: only a BTC or ETH counter leg is read here"), "skipped"
+            Decision(Intent.WATCH, reason="legacy net: only a BTC or ETH counter leg is read here"),
+            "skipped",
+            quiet_by_design=True,
         )
     if not obs.btc_spend_classified:
         return LegacyCheck(
@@ -2187,6 +2195,7 @@ def decide_legacy(
                 Intent.WATCH, reason="legacy net: this tower does not classify BTC spenders", low_corroboration=corr
             ),
             "unclassified",
+            quiet_by_design=True,
         )
     deadline = (
         None
@@ -2311,6 +2320,7 @@ def decide_legacy(
                 low_corroboration=corr,
             ),
             "refunded_single_source",
+            quiet_by_design=True,
         )
     if kind is BtcDispositionKind.REFUNDED:
         return LegacyCheck(
@@ -2369,6 +2379,7 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
                 low_corroboration=corr,
             ),
             "unclassified",
+            quiet_by_design=True,
         )
     locator = record.counterchain_locator
     contract = getattr(locator, "contract_address", "(no locator)")
@@ -2495,6 +2506,7 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
                 low_corroboration=corr,
             ),
             f"{kind.value}_single_source",
+            quiet_by_design=True,
         )
     if kind in agreeing:
         return LegacyCheck(

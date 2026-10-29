@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -107,6 +110,15 @@ class ReconcileResult:
 SITUATION_STORE_UNREADABLE = "store_unreadable"
 SITUATION_RECORD_UNREADABLE = "record_unreadable"
 SITUATION_RECONCILE_ERROR = "reconcile_error"
+#: A legacy record whose D9 read has stayed unresolved for longer than the bound (#921).
+SITUATION_LEGACY_UNRESOLVED = "legacy_unresolved"
+
+#: How long a legacy record's D9 read may stay unresolved (a failed read, or a retried WATCH its
+#: configuration does not explain) before it pages "investigate" (#921). Chosen, not measured: it
+#: must outlast the honest waits behind a retried WATCH, which are ETH finality (minutes) and our BTC
+#: refund's burial at the policy's reorg depth (about an hour at 6 blocks of 600 s), and stay well
+#: inside the time a refund that never landed can wait for an operator.
+DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S = 6 * 3600.0
 
 
 def _legacy_evidence(record: SwapRecord, obs: Observations) -> dict[str, Any]:
@@ -140,7 +152,8 @@ def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
 
 
 class Reconciler:
-    """Stateless-across-ticks reconciler. Inject the store/observer/alerter ports."""
+    """Reconciler. Inject the store/observer/alerter ports. Its only state across ticks is when each
+    legacy record's D9 read became unresolved (#921), kept in memory: a restart starts the bound over."""
 
     def __init__(
         self,
@@ -151,6 +164,8 @@ class Reconciler:
         policy: MarginPolicy,
         safety_window_blocks: int,
         executor: Executor | None = None,
+        legacy_unresolved_page_after_s: float = DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(policy, MarginPolicy):
             raise ValidationError("Reconciler requires a MarginPolicy")
@@ -168,6 +183,17 @@ class Reconciler:
         self._policy = policy
         self._safety = safety_window_blocks
         self._inflight: set[str] = set()
+        if (
+            not isinstance(legacy_unresolved_page_after_s, (int, float))
+            or isinstance(legacy_unresolved_page_after_s, bool)
+            or not math.isfinite(legacy_unresolved_page_after_s)
+            or legacy_unresolved_page_after_s <= 0
+        ):
+            raise ValidationError("Reconciler requires a positive, finite legacy_unresolved_page_after_s")
+        self._legacy_page_after_s = float(legacy_unresolved_page_after_s)
+        self._clock = clock
+        # swap_id -> clock reading when its legacy read became unresolved (#921).
+        self._legacy_unresolved_since: dict[str, float] = {}
 
     @property
     def alerter(self) -> Alerter:
@@ -216,8 +242,15 @@ class Reconciler:
     async def _check_legacy(self, swap_id: str, record: SwapRecord) -> ReconcileResult:
         """The D9 net for one legacy terminal record (#850 PR 9b, design §5.2). One observation, the
         pure :func:`decide_legacy`, a page when it names one, and the marker only on a conclusive
-        verdict. Never the executor: nothing here is autonomous. A read that fails writes nothing
-        and pages nothing: the record is read again on a later tick (``UNKNOWN`` writes nothing)."""
+        verdict. Never the executor: nothing here is autonomous.
+
+        A read that fails, or a retried WATCH its configuration does not explain (``UNKNOWN``,
+        ``settled_unfinal``, a refund not yet buried, ...), writes nothing and is read again on a later
+        tick. One endpoint can hold the read there for good (a stale finalized block, a receipt the
+        others disagree with), so once a record has been unresolved for longer than
+        ``legacy_unresolved_page_after_s`` it pages "investigate" on every read until it resolves
+        (#921). Any page or conclusive verdict ends the unresolved run; a quiet-by-design WATCH leaves
+        it as it is, so a liar that alternates with one cannot restart the bound."""
         try:
             obs = await self._observer.observe(swap_id, record)
             check: LegacyCheck = decide_legacy(
@@ -226,10 +259,15 @@ class Reconciler:
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             logger.warning("legacy check of swap %s failed; read again later: %s", swap_id, err)
-            return ReconcileResult(
-                swap_id, Decision(Intent.WATCH, reason=f"legacy check failed: {err}"), error=err, legacy=True
-            )
+            decision = Decision(Intent.WATCH, reason=f"legacy check failed: {err}")
+            return await self._legacy_unresolved(swap_id, decision, f"the read failed: {err}", error=err)
         decision = check.decision
+        if decision.intent not in _ROUTED_INTENTS and not check.conclusive:
+            if not check.quiet_by_design:
+                return await self._legacy_unresolved(swap_id, decision, decision.reason)
+            self._safe_resolve(swap_id)
+            return ReconcileResult(swap_id, decision, legacy=True)
+        self._legacy_unresolved_since.pop(swap_id, None)
         delivered: bool | None = None
         if decision.intent in _ROUTED_INTENTS:
             delivered = await self._safe_handle(swap_id, decision)
@@ -248,6 +286,33 @@ class Reconciler:
                 except Exception:
                     logger.exception("could not write the legacy-checked marker for %s; read again later", swap_id)
         return ReconcileResult(swap_id, decision, alert_delivered=delivered, legacy=True)
+
+    async def _legacy_unresolved(
+        self, swap_id: str, quiet: Decision, last: str, *, error: str | None = None
+    ) -> ReconcileResult:
+        """One unresolved legacy read (#921): quiet until the record has been unresolved for longer
+        than the bound, then the "investigate" page, on every such read, so the alerter keeps it open
+        (and its ACK, if any) while the read stays unresolved."""
+        now = self._clock()
+        since = self._legacy_unresolved_since.setdefault(swap_id, now)
+        if now - since < self._legacy_page_after_s:
+            self._safe_resolve(swap_id)
+            return ReconcileResult(swap_id, quiet, error=error, legacy=True)
+        decision = Decision(
+            Intent.PAGE_SQUEEZED,
+            reason=(
+                f"legacy swap {swap_id}: the D9 check has not reached a verdict for {int(now - since)} s; it may "
+                f"be that one endpoint holds it there. Last read: {last}"
+            ),
+            recommended_action=(
+                "investigate — compare the endpoints' answers for this counter leg (finalized block, deploy "
+                "receipt, spender, depth) and check by hand whether the recorded refund landed; if it did not, "
+                "refund it, and if a claim opened H, p is public: claim the covenant before t_rxd"
+            ),
+            situation=SITUATION_LEGACY_UNRESOLVED,
+        )
+        delivered = await self._safe_handle(swap_id, decision)
+        return ReconcileResult(swap_id, decision, error=error, alert_delivered=delivered, legacy=True)
 
     async def _reconcile_one(self, swap_id: str, record: SwapRecord) -> ReconcileResult:
         if swap_id in self._inflight:
