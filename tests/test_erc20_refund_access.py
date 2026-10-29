@@ -333,6 +333,25 @@ def test_latest_is_the_highest_head_so_a_lagging_endpoint_cannot_hide_a_fresh_de
         _derive(_Fleet(eps), _create_address(who, 5))
 
 
+def test_empty_code_at_a_resolved_latest_is_retryable_never_a_refusal() -> None:
+    """Re-review 3: the head can still lag when only a lagging endpoint answers its head read, and the
+    honest nodes then agree the deploy's code is empty at that block. At ``latest`` that is retryable.
+    At ``finalized`` empty code stays the typed "NOT YET FINALIZED" refusal the coordinator handles."""
+    who = derive_address(_key())
+
+    async def _down():
+        raise NetworkError("429")
+
+    eps = [_Endpoint(who, 9, code=b""), _Endpoint(who, 9, code=b""), _Endpoint(who, 9, code=b"")]
+    eps[0].head = 115
+    eps[1].block_number = eps[2].block_number = _down
+    with pytest.raises(NetworkError, match="may simply not be visible there yet") as e:
+        _derive(_Fleet(eps), _create_address(who, 5))
+    assert not isinstance(e.value, ValidationError)
+    with pytest.raises(ValidationError, match="NOT YET FINALIZED"):
+        _derive(_Fleet(eps), _create_address(who, 5), block_identifier="finalized")
+
+
 def test_a_key_busier_than_the_search_is_refused_without_blaming_the_taker(monkeypatch) -> None:
     """Mythos 20261028T100731 LOW-1. When a window stops short of nonce 0 the deploy may lie further
     back, so the refusal names the bound and does not call the contract a wrong one. When every window

@@ -203,7 +203,8 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         endpoint can make it true for an account that did not create the address.
 
         The candidate is read through :func:`read_contract` (an identity read at the block
-        ``block_identifier`` resolves to; for ``latest``, the highest head any endpoint reports), after
+        ``block_identifier`` resolves to; for ``latest``, the highest head an answering endpoint
+        reports, where empty code is a retryable :class:`NetworkError`), after
         the contract's code is read at the same block: no code there is
         the deploy not yet buried at that block, said as such, and a contract with no working
         ``deployer()`` is refused as not an Erc20Htlc of this build, rather than surfacing a raw
@@ -235,12 +236,13 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # One concrete block for every read below. A tag ("finalized", "latest") is resolved again by
         # each request, so behind a load balancer the code and the count could come from nodes at
         # different blocks; a node asked for a number it has not reached is expected to error (geth:
-        # "header not found"), and an error
-        # is a silent endpoint, never a refusal (Mythos 20261028T100731 LOW-2, re-review F1).
-        if block_identifier is None or block_identifier == "latest":
-            # The HIGHEST head any endpoint reports, not the fleet's lowest: at the lowest, one lagging
-            # endpoint made a just-mined deploy read as empty code everywhere, a permanent refusal. At
-            # the highest, an endpoint that has not reached it errors, which only delays (re-review 2).
+        # "header not found"), and an error is a silent endpoint, never a refusal (Mythos
+        # 20261028T100731 LOW-2, re-review F1).
+        latest = block_identifier is None or block_identifier == "latest"
+        if latest:
+            # The HIGHEST head an answering endpoint reports, not the fleet's lowest, so a deploy mined in
+            # the newest block is inside the read. A head can still lag (only a lagging endpoint
+            # answered), so empty code at a resolved `latest` is retryable below, never a refusal.
             heads = await asyncio.gather(
                 *(r.block_number() for r in (getattr(self._rpc, "sources", None) or [self._rpc])),
                 return_exceptions=True,
@@ -254,6 +256,12 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         else:
             _bid = block_identifier
         code = await self._rpc.get_code(contract_address, _bid)
+        if not code and latest:
+            raise NetworkError(
+                f"no contract code at {contract_address} as of block {_bid}, the newest head an endpoint "
+                "reported. The deploy may simply not be visible there yet (a lagging endpoint); nothing was "
+                "concluded, retry. A contract that never appears is not verified, so nothing is locked."
+            )
         if not code:
             raise ValidationError(
                 f"no contract code at {contract_address} as of block {_bid} (block_identifier={block_identifier!r}), so its "
