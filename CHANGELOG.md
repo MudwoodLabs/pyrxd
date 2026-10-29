@@ -126,6 +126,52 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A maker's swap record ends on its own covenant refund (#850 PR 11) [Changed (breaking)].** New
+  `SwapCoordinator.maker_refund_covenant()` is the `MAKER`'s exit from `NEGOTIATED` (the taker never
+  funded), `BTC_LOCKED` and `PARAMS_MISMATCH` (the maker's own revalidation failed; until now that
+  record's only exits were the taker's). It reads what spent the covenant first: a refund buried at
+  the burial the maker's funding needed takes the record to `ABORTED` on the new event
+  `MAKER_COVENANT_REFUND_OBSERVED`, with the new `abort_reason` `covenant_refunded` and the refund in
+  `asset_refund_txid`, and sends nothing. Otherwise it pins the covenant outpoint (persisted first)
+  and sends the covenant's CSV refund, recording its txid; the record stays where it is until a later
+  call reads the refund buried. A covenant claimed by the taker raises and changes nothing; a record
+  that holds a counter-leg claim is refused, since the refund would then take both legs. New
+  `reconcile_covenant()` only reads, and also ends a maker's `BOTH_LOCKED` record at `MUTUAL_REFUND`
+  on a refund made elsewhere (refused while the record holds a counter-leg claim). Both steps refuse a
+  `TAKER` or single-operator coordinator.
+  - The read is new `RadiantCovenantLeg.covenant_spend(record, *, burial_blocks)` over new
+    `RadiantChainIO.covenant_spend_answers`. Every configured source with `get_history`,
+    `get_transaction`, `get_transaction_verbose` and `get_utxos` (`client`, `proof_client`,
+    `depth_sources`, a multi-operator client once per operator) names the spender of the pinned outpoint
+    from its own history, by bytes that hash to the txid, or holds the outpoint in its UTXO set. They
+    must all agree, or the answer is `UNKNOWN`. The spender is classified by the leaf it took, from
+    its bytes. Its depth is the one two identified operators vouch for (one depth per operator, the
+    least it reports; the least any source reports when fewer than two operators answer), so one
+    operator, through however many hosts, cannot bury it, and among three operators one cannot hold
+    it down. A refund some source reports buried, with the reports differing by more than the burial,
+    raises, naming each source's depth. On a Radiant
+    network that carries value, fewer than two identified operators change nothing. Anyone can pay
+    the covenant's script, so each source reads the record's own refund (`asset_refund_txid`) first
+    and stops there when it spends the covenant; otherwise it fetches the other transactions in its
+    history at once. A source whose history holds more than 64 other transactions does not fetch
+    them and answers "unread", which makes the read `UNKNOWN` rather than leaving the other sources
+    to decide. The refund is sent either way.
+  - An `UNKNOWN` read does not stop the refund: the leg's own checks (the outpoint live at the
+    primary source, the CSV mature) decide, and a refund of a spent covenant fails at the node.
+  - The two-host runners' maker `--phase abort` now drives `maker_refund_covenant`: run it again once
+    the refund is buried to close the record. It also accepts a `PARAMS_MISMATCH` record, which holds
+    the taker's locator, including one whose revalidation could not recompute the covenant (its
+    `<unverifiable>` placeholder is re-pinned to the covenant the terms build). Records written by an
+    earlier `--phase abort` pinned no covenant outpoint, so a covenant they refunded cannot be read
+    from the record.
+  - `SWAP_RECORD_SCHEMA_VERSION` is 11. A pyrxd from before this change refuses a record with
+    `abort_reason` `covenant_refunded`.
+  - Not in this change: a single operator's `MUTUAL_REFUND` still follows the covenant refund's
+    broadcast, not its burial, and a maker's record after the reveal (`SECRET_REVEALED`) has no exit
+    yet. `reconcile_covenant` reads the counter leg's claim from the record only, so a maker whose
+    claim of the counter leg was sent but never recorded can see `MUTUAL_REFUND` on a record that
+    holds both legs (a label; nothing is sent).
+
 - **The watchtower reads an ETH counter leg's disposition with the coordinator's reader, pages the
   rest of the design §5.1 table, and checks legacy ETH records once (#850 PR 10) [Changed (breaking)].**
   - `RpcEthChainSource.counter_disposition` runs `read_counter_disposition` over the source's RPC,
@@ -426,7 +472,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   uses, which now also compares the push nonce and hash). It holds `CoordinatorConfig.fund_lock`,
   when one is set, from that read to its write; only the ETH fund takes that lock, so it does not
   exclude a BTC fund running at the same time in another process. A `MAKER`-role coordinator is
-  refused: the maker's `NEGOTIATED` exit is #850 PR 11. A BTC record that may have been written by
+  refused: the maker's `NEGOTIATED` exit is `maker_refund_covenant` (#850 PR 11). A BTC record that may have been written by
   0.26.x or earlier is refused unless the caller passes `confirm_btc_htlc_empty=True` after checking
   the HTLC address: one that was read without a `role`, one whose record on disk names no `role` or
   was once read without one, or any BTC record when there is no persist hook that reads the record
