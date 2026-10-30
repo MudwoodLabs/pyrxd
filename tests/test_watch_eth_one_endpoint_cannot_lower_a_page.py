@@ -197,6 +197,18 @@ async def test_an_acked_reconcile_error_does_not_outlive_its_bound_or_its_class(
     assert again.decision.situation.endswith(":ValueError:0"), again.decision.situation
 
 
+def test_the_reconcile_error_window_uses_the_fast_block_interval():
+    """Review of the F-1 fix: the window is counted in the fast block interval when the policy has
+    one, so blocks arriving fast cannot pass the safety window before the ACK lapses."""
+    import dataclasses
+
+    nominal = _policy()
+    assert reconcile_error_repage_s(nominal, 6) == 6 * nominal.rxd_block_interval_s
+    assert reconcile_error_repage_s(nominal, 0) == nominal.rxd_block_interval_s
+    fast = dataclasses.replace(nominal, rxd_block_interval_fast_s=nominal.rxd_block_interval_s / 4)
+    assert reconcile_error_repage_s(fast, 6) == 6 * nominal.rxd_block_interval_s / 4
+
+
 async def test_HONEST_a_failing_secondary_with_no_claim_is_no_claim(tmp_path):
     w = _EthTower(tmp_path)
     _fail(w.endpoints[2], "get_logs")

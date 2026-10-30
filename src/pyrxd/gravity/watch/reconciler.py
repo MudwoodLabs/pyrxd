@@ -137,10 +137,14 @@ def legacy_unresolved_bound_s(policy: MarginPolicy) -> float:
 
 def reconcile_error_repage_s(policy: MarginPolicy, safety_window_blocks: int) -> float:
     """How long an ACK of one reconcile error holds before the same fault pages again: the safety
-    window in seconds (at least one Radiant block). While observe/decide fails, every other page for
+    window in seconds (at least one Radiant block), at the policy's fast block interval when it has
+    one, so blocks arriving fast do not outrun it. While observe/decide fails, every other page for
     the swap is pre-empted, so a blind tower must not stay quiet for longer than the margin it keeps
     before a deadline (re-review of the 0.27 fixes, F-1 and its review)."""
-    return float(max(1, safety_window_blocks)) * float(policy.rxd_block_interval_s)
+    interval = float(policy.rxd_block_interval_s)
+    if policy.rxd_block_interval_fast_s is not None:
+        interval = min(interval, float(policy.rxd_block_interval_fast_s))
+    return float(max(1, safety_window_blocks)) * interval
 
 
 def _legacy_evidence(record: SwapRecord, obs: Observations) -> dict[str, Any]:
