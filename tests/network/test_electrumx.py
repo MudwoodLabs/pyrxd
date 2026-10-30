@@ -1397,6 +1397,19 @@ async def test_policy_rejection_surfaces_through_a_broadcast() -> None:
     assert ei.value.code == 1
 
 
+async def test_a_code_1_answer_to_a_broadcast_arrives_as_a_verdict_by_code_alone() -> None:
+    """The reader must tell _rpc_error which method the reply answers: with no reason marker in the
+    message, only the method makes a code-1 broadcast rejection a verdict."""
+    ws = _make_ws_mock({"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "rejected"}})
+
+    with _patch_connect(ws):
+        async with ElectrumXClient(["wss://example.com"]) as client:
+            with pytest.raises(PolicyRejection) as ei:
+                await client.broadcast(_VALID_RAW_TX)
+
+    assert ei.value.code == 1
+
+
 async def test_a_code_1_answer_to_a_header_read_arrives_as_a_fault() -> None:
     """End-to-end through the reader loop: the same code on a read must NOT arrive as a verdict.
 
