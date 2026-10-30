@@ -42,7 +42,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
@@ -4788,15 +4788,35 @@ class SwapCoordinator:
         Not :meth:`_covenant_elapsed_blocks`: that one finds the covenant as an UNSPENT output and
         raises once it is spent, so a hold that read it could never lift after the maker's CSV
         refund, the very moment it should (review of #850 PR 5a). The funding transaction's depth
-        stays readable after the covenant is spent. One Radiant server's reported depth, like every
-        other depth on this path. Falls back to the unspent read without a pin or a chain reader."""
+        stays readable after the covenant is spent. Falls back to the unspent read without a pin or a
+        chain reader.
+
+        The LOWEST depth any configured operator reports, the primary's included: this age lifts the D14
+        hold, so one over-reporting server must not end a record while p is public and the covenant is
+        still claimable (0.27 release review, B-1). A source that does not answer is left out, so with
+        only the primary answering this is its depth, as before; an operator that under-reports only
+        keeps the hold, the fail-safe direction."""
         outpoint = self.record.radiant_covenant_outpoint
         chain_io = getattr(self.radiant_leg, "chain_io", None)
         if outpoint is None or chain_io is None:
             return await self._covenant_elapsed_blocks()
-        confs = await chain_io.confirmations(outpoint.split(":")[0])
+        txid = outpoint.split(":")[0]
+        confs = await chain_io.confirmations(txid)
         if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
             raise ValidationError(f"the covenant funding depth {confs!r} is not a non-negative int; fail-closed")
+        others = getattr(chain_io, "funding_tx_depths", None)
+        if callable(others):
+            primary = confs
+            for operator, depth in await others(txid):
+                if depth < confs:
+                    confs, low = depth, operator  # the lowest age keeps the D14 hold: fail-safe
+            if confs < primary:
+                logger.warning(
+                    "covenant funding depth: %s reports %d, below the primary's %d; the D14 hold uses the lowest",
+                    low,
+                    confs,
+                    primary,
+                )
         return int(confs)
 
     async def _claim_seen_holds_the_terminal(self) -> bool:
@@ -4842,7 +4862,7 @@ class SwapCoordinator:
 
         changed = False
         if self.record.counter_claim_tx is None and disposition.claims_seen:
-            claim = disposition.claims_seen[0]
+            claim = _claim_to_record(disposition.claims_seen)
             self.record = dataclasses.replace(self.record, counter_claim_tx=claim.tx_hash)
             changed = True
             logger.warning(
@@ -5043,7 +5063,7 @@ class SwapCoordinator:
         changed = False
         claims = disposition.claims_seen
         if self.record.counter_claim_tx is None and claims:
-            claim = claims[0]
+            claim = _claim_to_record(claims)
             self.record = dataclasses.replace(self.record, counter_claim_tx=claim.txid)
             changed = True
             logger.warning(
@@ -5751,8 +5771,8 @@ class SwapCoordinator:
         before = self.record
         # A Claimed log the read saw goes on the record as well as into the note, so whatever reads the
         # record later still sees that p may be public (Mythos review of #850 PR 7b, F3).
-        claims = sorted(disposition.claims_seen, key=lambda c: not c.verified)  # a verified claim first
-        claim_tx = self.record.counter_claim_tx or next((c.tx_hash for c in claims), None)
+        claims = disposition.claims_seen
+        claim_tx = self.record.counter_claim_tx or (_claim_to_record(claims).tx_hash if claims else None)
         self.record = dataclasses.replace(
             self.record,
             state=advance(state, SwapEvent.OPERATOR_ABANDONED),
@@ -6410,3 +6430,19 @@ class SwapCoordinator:
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+
+def _claim_to_record(claims_seen: Sequence[Any]) -> Any:
+    """The claim the record keeps as ``counter_claim_tx``, from a non-empty ``claims_seen`` (an ETH
+    ``ClaimSeen`` or a BTC ``BtcSpender``): a verified claim first, then the one the most sources
+    nominated, then by hash.
+
+    The readers list claims by hash, and the first used to be recorded. Once p is public, one source
+    can serve a claim on a transaction no other holds (an ETH ``Claimed(p)`` log, a BTC claim-leaf
+    spend whose signature does not verify); when its hash sorted first, the record kept it beside the
+    real claim, every later read nominated it back, and the pages and ``--phase claim`` named a
+    transaction nobody can fetch (0.27 release review, B-2)."""
+    return min(
+        claims_seen,
+        key=lambda c: (not c.verified, -len(set(c.nominated_by)), getattr(c, "tx_hash", None) or c.txid),
+    )
