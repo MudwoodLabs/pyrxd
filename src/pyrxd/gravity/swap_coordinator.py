@@ -1713,22 +1713,6 @@ def _leg_is_value_bearing(leg: object) -> bool:
     return isinstance(net, str) and bool(net) and net not in AUDIT_CLEARED_NETWORKS
 
 
-def _claim_to_record(claims_seen: Sequence[Any]) -> Any:
-    """The claim the record keeps as ``counter_claim_tx``, from a non-empty ``claims_seen`` (an ETH
-    ``ClaimSeen`` or a BTC ``BtcSpender``): a verified claim first, then the one the most sources
-    nominated, then by hash.
-
-    The readers list claims by hash, and the first used to be recorded. Once p is public, one source
-    can serve a claim on a transaction no other holds (an ETH ``Claimed(p)`` log, a BTC claim-leaf
-    spend whose signature does not verify); when its hash sorted first, the record kept it beside the
-    real claim, every later read nominated it back, and the pages and ``--phase claim`` named a
-    transaction nobody can fetch (0.27 release review, B-2)."""
-    return min(
-        claims_seen,
-        key=lambda c: (not c.verified, -len(set(c.nominated_by)), getattr(c, "tx_hash", None) or c.txid),
-    )
-
-
 class SwapCoordinator:
     """Drive the swap FSM for one live participant against injected chain legs.
 
@@ -6446,3 +6430,19 @@ class SwapCoordinator:
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+
+def _claim_to_record(claims_seen: Sequence[Any]) -> Any:
+    """The claim the record keeps as ``counter_claim_tx``, from a non-empty ``claims_seen`` (an ETH
+    ``ClaimSeen`` or a BTC ``BtcSpender``): a verified claim first, then the one the most sources
+    nominated, then by hash.
+
+    The readers list claims by hash, and the first used to be recorded. Once p is public, one source
+    can serve a claim on a transaction no other holds (an ETH ``Claimed(p)`` log, a BTC claim-leaf
+    spend whose signature does not verify); when its hash sorted first, the record kept it beside the
+    real claim, every later read nominated it back, and the pages and ``--phase claim`` named a
+    transaction nobody can fetch (0.27 release review, B-2)."""
+    return min(
+        claims_seen,
+        key=lambda c: (not c.verified, -len(set(c.nominated_by)), getattr(c, "tx_hash", None) or c.txid),
+    )
