@@ -106,7 +106,7 @@ async def test_an_acked_reconcile_error_does_not_swallow_a_later_claim(tmp_path,
     rec = w.reconciler(alerter=alerter)
 
     (first,) = await rec.tick()
-    assert first.decision.situation == SITUATION_RECONCILE_ERROR
+    assert first.decision.situation .startswith(SITUATION_RECONCILE_ERROR)
     assert channel.sent and channel.sent[-1].severity is Severity.CRITICAL
     swap, key = _ack_line(channel.sent[-1])
     assert swap == ack_id(SWAP) and alerter.ack(SWAP, key) is True
@@ -131,8 +131,54 @@ async def test_HONEST_a_failing_primary_with_no_claim_anywhere_still_raises(tmp_
         await w.observer._eth.claim_status(w.chain.locator().contract_address, w.chain.deploy_tx)
     channel = _Channel()
     (res,) = await w.reconciler(alerter=DedupAlerter(channel=channel)).tick()
-    assert res.decision.situation == SITUATION_RECONCILE_ERROR
+    assert res.decision.situation .startswith(SITUATION_RECONCILE_ERROR)
     assert channel.sent[-1].severity is Severity.CRITICAL
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_an_acked_reconcile_error_does_not_outlive_its_bound_or_its_class(tmp_path):
+    """Re-review of the 0.27 fixes, F-1: with no claim served, a failing primary still pre-empts every
+    page for the swap, so an ACK of the reconcile error used to silence it for as long as the fault
+    lasted (a refund that became due or runnable meanwhile paged nothing). The ACK now holds for one
+    error class and at most one bound; each further bound, and a new class, pages CRITICAL again."""
+    w = _EthTower(tmp_path)
+    _fail(w.endpoints[0], "get_logs")
+    channel, clock = _Channel(), _Clock()
+    alerter = DedupAlerter(channel=channel)
+    rec = w.reconciler(alerter=alerter, legacy_unresolved_page_after_s=21_600.0, clock=clock)
+
+    (first,) = await rec.tick()
+    assert first.decision.situation.startswith(SITUATION_RECONCILE_ERROR)
+    swap, key = _ack_line(channel.sent[-1])
+    assert alerter.ack(SWAP, key) is True and alerter.unacked_critical_count() == 0
+    before = len(channel.sent)
+
+    clock.now += 21_599.0  # inside the bound, same class: the ACK holds (honest twin)
+    await rec.tick()
+    assert len(channel.sent) == before and alerter.unacked_critical_count() == 0
+
+    clock.now += 2.0  # past the bound: the same fault pages again
+    (later,) = await rec.tick()
+    assert later.decision.situation != first.decision.situation
+    assert len(channel.sent) == before + 1 and channel.sent[-1].severity is Severity.CRITICAL
+    assert alerter.unacked_critical_count() == 1
+    _swap, key = _ack_line(channel.sent[-1])
+    assert alerter.ack(SWAP, key) is True
+    before = len(channel.sent)
+
+    def _other(*_a, **_k):
+        raise ValueError("a different fault")
+
+    w.endpoints[0].get_logs = _other  # a new error class is a new situation
+    await rec.tick()
+    assert len(channel.sent) == before + 1 and channel.sent[-1].severity is Severity.CRITICAL
 
 
 async def test_HONEST_a_failing_secondary_with_no_claim_is_no_claim(tmp_path):
