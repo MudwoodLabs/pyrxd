@@ -184,6 +184,8 @@ def test_the_btc_claim_on_record_is_chosen_the_same_way():
     real, ghost = "ab" * 32, "00" * 32
     assert _claim_to_record([spender(ghost, ("a",), False), spender(real, ("a", "b", "c"), True)]).txid == real
     assert _claim_to_record([spender(ghost, ("a",), False), spender(real, ("b", "c"), False)]).txid == real
+    # A verified claim outranks any number of nominations of one that does not verify.
+    assert _claim_to_record([spender(ghost, ("a", "b", "c"), False), spender(real, ("a",), True)]).txid == real
     # Honest twin: a lone claim is recorded whatever its hash.
     assert _claim_to_record([spender(ghost, ("a",), False)]).txid == ghost
 
