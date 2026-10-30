@@ -147,9 +147,27 @@ def test_funding_tx_depths_reports_each_operator_and_leaves_out_the_rest():
     )
     io = RadiantChainIO(primary, depth_sources=(other, wrong, down, unmined))
     got = asyncio.run(io.funding_tx_depths("ab" * 32))
-    assert sorted(d for _op, d in got) == [3, 40]
-    assert len({op for op, _d in got}) == 2
+    # A 0 that names the transaction is an answer (the deepest under-report an honest operator gives,
+    # re-review F-4); a failure and a reply about another transaction are not.
+    assert sorted(d for _op, d in got) == [0, 3, 40]
+    assert len({op for op, _d in got}) == 3
     assert all(s.tip_reads == 0 for s in (primary, other, wrong, down, unmined))  # no tip or header reads
+
+
+async def test_an_operator_reporting_the_funding_unconfirmed_keeps_the_d14_hold():
+    """Re-review of the B-1 fix, F-4: the primary over-reports the covenant funding's depth past t_rxd
+    and the one other operator, honest, reports it unconfirmed (0). Through the real reader that 0 is an
+    answer, so the lowest depth keeps the hold."""
+    coord, t_rxd = _held_setup(0, ())
+    coord.radiant_leg.chain_io = RadiantChainIO(_Server(t_rxd + 1000), depth_sources=(_Server(0),))
+    rec = await coord.reconcile_counter_leg()
+    assert rec.state is SwapState.BTC_LOCKED and rec.counter_claim_tx is not None
+
+
+async def test_HONEST_through_the_real_reader_every_operator_past_t_rxd_lifts_the_hold():
+    coord, t_rxd = _held_setup(0, ())
+    coord.radiant_leg.chain_io = RadiantChainIO(_Server(t_rxd + 5), depth_sources=(_Server(t_rxd + 1),))
+    assert (await coord.reconcile_counter_leg()).state is SwapState.ABORTED
 
 
 async def test_a_variant_of_the_real_claims_log_does_not_cut_its_nominations():

@@ -615,9 +615,9 @@ class RadiantChainIO:
         """``((operator, confirmations), ...)``: the verbose ``confirmations`` each configured source
         (``client``, ``proof_client`` and every ``depth_sources`` reader, a client over several
         operators' URLs once per operator) reports for *txid*, as :attr:`DepthReports.funding_tx` does,
-        without the tip and header reads. A source that fails, times out, reports no positive count or
-        names another transaction is left out. Nothing here is proved; callers take the lowest where
-        one over-reporting source must not move a decision (0.27 release review, B-1)."""
+        without the tip and header reads, a 0 kept. A source that fails, times out or names another
+        transaction is left out. Nothing is proved; callers take the lowest where one over-reporting
+        source must not move a decision (0.27 release review, B-1; a 0 counts, F-4 of its re-review)."""
         asked: list[tuple[int, Any]] = []
         made: list[Any] = []
         for index, src in enumerate(self._distinct_sources()):
@@ -631,7 +631,7 @@ class RadiantChainIO:
         async def one(index: int, src: Any) -> tuple[str, int] | None:
             try:
                 confs, _tip = await asyncio.wait_for(
-                    self._ask_one(index, src, txid, 0, with_tip=False), self._depth_timeout_s
+                    self._ask_one(index, src, txid, 0, with_tip=False, zero_counts=True), self._depth_timeout_s
                 )
             except asyncio.TimeoutError:
                 logger.debug("depth source %d did not answer within %.1f s", index, self._depth_timeout_s)
@@ -692,10 +692,10 @@ class RadiantChainIO:
 
     @staticmethod
     async def _ask_one(
-        index: int, src: Any, txid: str, height: int, *, with_tip: bool = True
+        index: int, src: Any, txid: str, height: int, *, with_tip: bool = True, zero_counts: bool = False
     ) -> tuple[int | None, int | None]:
         """``(confirmations, tip)`` one source reports: its verbose ``confirmations`` for *txid*
-        (``None`` unless it answered that read with a positive count) and its tip height (``None``
+        (``None`` unless it answered a positive count, or 0 with ``zero_counts``) and its tip (``None``
         unless it answered one at or above *height*, and never read without ``with_tip``); a read that
         fails is ``None``.
 
@@ -715,7 +715,7 @@ class RadiantChainIO:
                 if not isinstance(info, dict) or not _names_txid(info.get("txid"), txid):
                     return None
                 confs = finite_int(info.get("confirmations", 0) or 0)
-                return confs if confs > 0 else None
+                return confs if confs > 0 or (zero_counts and confs == 0) else None
             except Exception:
                 logger.debug("depth source %d gave no confirmations", index, exc_info=True)
                 return None
