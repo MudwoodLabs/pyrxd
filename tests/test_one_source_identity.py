@@ -368,6 +368,10 @@ _NOT_SOURCE_IDENTITY: dict[tuple[str, str], str] = {
         "a DISPLAY form (scheme://host:port) for naming an endpoint in a message without its "
         "credentials; nothing is counted, and it must keep the port the operator typed"
     ),
+    ("scripts/record_endpoint_replies.py", "check_publishable_url"): (
+        "decides whether a URL may be written into a published fixture (no credentials, query or "
+        "key-like path) and names its host in the refusal; nothing is counted as a source"
+    ),
 }
 
 #: Inside a counting site, any of these is the site building its own identity: case-folding text,

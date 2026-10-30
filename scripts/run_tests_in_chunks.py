@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Run the default test suite as a series of fresh pytest processes, one chunk of files each.
 
-WHY THIS EXISTS: the review sandbox guest has 8 GB of RAM and no swap, and the full suite in one
-process does not finish there (it ended in INTERNALERROR/MemoryError on every run; see the
-mythos-run skill). A reviewer that cannot run the whole suite picks a few test files instead, and a
-"no test catches this" claim made from a few files is wrong when the catching test lives in a file
-it left out (the 0.27 release pass reported exactly that, and it was false). Memory a pytest
-process grows is only returned when the process exits, so running the same files in several
-processes caps the peak at the largest chunk instead of the whole suite.
+WHY THIS EXISTS: the full suite in one process does not finish in the review sandbox guest (8 GB of
+RAM; it ended in INTERNALERROR/MemoryError on every run, see the mythos-run skill). A reviewer that
+cannot run the whole suite picks a few test files instead, and a "no test catches this" claim made
+from a few files is wrong when the catching test lives in a file it left out (the 0.27 release
+pass reported exactly that, and it was false).
+
+The guest crash's cause is NOT known. One process over the whole default suite peaked at 2,093 MiB
+resident on a 16 GB Linux sandbox (Python 3.13, 2026-10-30), so it is not simple growth past 8 GB;
+what differs in the guest (Python 3.12, the command it ran, where /tmp lives) was not measured.
+Chunking is still the safer shape there: each chunk is a fresh process, so memory a chunk holds is
+returned when it exits, one chunk that dies loses only its own results, and the per-chunk peak
+printed below shows where the memory goes.
 
 WHAT IT RUNS: every ``test_*.py`` under ``tests/``, sorted and cut into ``--chunks`` contiguous
 groups, each run as ``pytest --no-cov -p no:cacheprovider <files>``. The repository's ``addopts``
