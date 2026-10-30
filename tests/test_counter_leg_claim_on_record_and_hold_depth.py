@@ -186,3 +186,35 @@ def test_the_btc_claim_on_record_is_chosen_the_same_way():
     assert _claim_to_record([spender(ghost, ("a",), False), spender(real, ("b", "c"), False)]).txid == real
     # Honest twin: a lone claim is recorded whatever its hash.
     assert _claim_to_record([spender(ghost, ("a",), False)]).txid == ghost
+
+
+async def test_a_btc_claim_one_source_forges_is_not_the_claim_on_record(tmp_path):
+    """The BTC twin through the coordinator: the maker's real claim is in the mempool and every source
+    serves it, except one, which serves a claim-leaf spend carrying p whose signature does not verify
+    (signed by a key that is not the maker's), with a lower txid. The record names the real claim."""
+    from pyrxd.btc_wallet import taproot as t
+    from pyrxd.btc_wallet.keys import generate_keypair
+    from tests._fake_btc_chain import CLAIM_SPK
+    from tests.test_btc_counter_refund_coordinator import _Swap
+
+    s = _Swap(tmp_path)
+    real = s.chain.claim_tx(fee_sats=2_000)
+    real_txid = t.btc_txid_from_raw(real)
+    stranger = generate_keypair("bcrt")
+    for fee in range(600, 900):
+        forged = t.build_claim_tx(
+            locator=s.chain.locator,
+            preimage=s.chain.preimage,
+            claim_privkey=stranger._privkey.unsafe_raw_bytes(),
+            to_scriptpubkey=CLAIM_SPK,
+            fee_sats=fee,
+            aux_rand=t.fresh_aux_rand(),
+        )
+        if t.btc_txid_from_raw(forged) < real_txid:
+            break
+    else:
+        pytest.fail("no forged claim with a lower txid in 300 tries")
+    s.chain.submit(real)
+    s.sources[0].forge_spender = forged
+    rec = await s.coord().taker_refund_btc()
+    assert rec.counter_claim_tx == real_txid, rec.counter_claim_tx
