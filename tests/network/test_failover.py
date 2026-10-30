@@ -200,6 +200,17 @@ async def test_policy_rejection_on_a_read_is_not_retried_either() -> None:
     assert fakes[B].calls == []
 
 
+async def test_a_code_1_out_of_range_read_is_asked_of_the_next_endpoint() -> None:
+    """ElectrumX code 1 on a read is a bad request, not a verdict (recorded 2026-10-30 from the
+    shipped servers: "height N out of range" from one that had not reached N). The next endpoint
+    must still be asked; classified as a verdict, one lagging server ended the read."""
+    client, fakes = build([A, B])
+    fakes[A].tip_error = _rpc_error(1, "height 577,275 out of range")
+
+    await client.get_tip_height()
+    assert fakes[B].calls
+
+
 async def test_call_extension_is_not_retried_by_default() -> None:
     """`call_extension` reaches arbitrary indexer RPCs; the failover layer cannot
     know whether replaying one is safe, so it does not."""

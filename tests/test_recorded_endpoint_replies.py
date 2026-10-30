@@ -221,12 +221,8 @@ def _drpc_like(limit: int, refusal: dict[str, Any], tip: int) -> Any:
     return answer
 
 
-@pytest.mark.parametrize(
-    ("host", "limit"),
-    [("eth.drpc.org", disposition.LOG_CHUNK_BLOCKS), ("eth-mainnet.public.blastapi.io", 11)],
-)
-def test_a_range_limited_endpoint_still_completes_the_scan(host: str, limit: int) -> None:
-    """Liveness under the recorded refusals: the scan halves until the endpoint accepts, and ends."""
+def _scan_against(host: str, limit: int) -> tuple[BaseException | list[Any], list[int]]:
+    """Run one endpoint's log scan against the recorded refusal; the outcome and the spans asked."""
     refusal = _GETLOGS_RECORDS[(host, "get_logs_chunk_quiet")]
     tip = 2 * disposition.LOG_CHUNK_BLOCKS
     server = _Replay(_drpc_like(limit, refusal, tip))
@@ -240,7 +236,10 @@ def test_a_range_limited_endpoint_still_completes_the_scan(host: str, limit: int
             await rpc.close()
 
     try:
-        assert asyncio.run(go()) == []
+        try:
+            outcome: BaseException | list[Any] = asyncio.run(go())
+        except NetworkError as exc:
+            outcome = exc
         spans = [
             int(r["params"][0]["toBlock"], 16) - int(r["params"][0]["fromBlock"], 16) + 1
             for r in server.requests
@@ -248,8 +247,26 @@ def test_a_range_limited_endpoint_still_completes_the_scan(host: str, limit: int
         ]
     finally:
         server.close()
+    return outcome, spans
+
+
+def test_a_range_limited_endpoint_still_completes_the_scan() -> None:
+    """Liveness under drpc's recorded refusal: the scan halves until the endpoint accepts, and ends."""
+    limit = disposition.LOG_CHUNK_BLOCKS
+    outcome, spans = _scan_against("eth.drpc.org", limit)
+    assert outcome == []
     assert spans[0] == disposition.LOG_CHUNK_BLOCKS  # it asked for the full chunk first
-    assert sum(s for s in spans if s < limit) == tip  # covering every block exactly once
+    assert sum(s for s in spans if s < limit) == 2 * disposition.LOG_CHUNK_BLOCKS  # every block once
+
+
+def test_an_endpoint_capped_below_the_floor_fails_promptly() -> None:
+    """Blast's recorded reply states a 10-block limit, below ``LOG_MIN_CHUNK_BLOCKS``: the scan halves
+    to the floor and fails that endpoint, rather than asking for 20,000 blocks ten at a time."""
+    outcome, spans = _scan_against("eth-mainnet.public.blastapi.io", 11)
+    assert isinstance(outcome, NetworkError) and disposition._is_range_limit(outcome)
+    assert spans[0] == disposition.LOG_CHUNK_BLOCKS
+    assert min(spans) >= disposition.LOG_MIN_CHUNK_BLOCKS
+    assert len(spans) <= (disposition.LOG_CHUNK_BLOCKS // disposition.LOG_MIN_CHUNK_BLOCKS).bit_length()
 
 
 # --------------------------------------------------------------------------- ElectrumX: JSON-RPC errors
@@ -308,6 +325,6 @@ def _classify(exc: NetworkError) -> str:
 def test_a_recorded_electrumx_error_is_classified_as_intended(
     host: str, probe: str, method: str, error: dict[str, Any]
 ) -> None:
-    exc = _rpc_error(error.get("code", "unknown"), error.get("message"), method)
+    exc = _rpc_error(error.get("code", "unknown"), error.get("message"))
     assert isinstance(exc, NetworkError)
     assert _classify(exc) == _ELECTRUMX_EXPECTED[probe], (error.get("code"), str(error.get("message"))[:200])
