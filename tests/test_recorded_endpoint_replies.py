@@ -296,34 +296,28 @@ _ELECTRUMX_EXPECTED: dict[str, str] = {
     "unknown_method": "method_not_found",  # code -32601
 }
 
-#: The recording shows ElectrumX answers a malformed or out-of-range READ with code 1 (its
-#: BAD_REQUEST), and ``_POLICY_ERROR_CODES`` treats every code-1 error as a transaction verdict. The
-#: failover layer never retries a ``PolicyRejection``, so a server that has not reached a height
-#: answers a header read with "node rejected the transaction" and no other server is asked. Strict:
-#: the fix flips these to passing and must delete this set.
-_KNOWN_MISCLASSIFIED = {"tx_get_malformed", "merkle_unknown_tx", "header_beyond_tip"}
 
-
-def _electrumx_errors() -> list[tuple[str, str, dict[str, Any]]]:
+def _electrumx_errors() -> list[tuple[str, str, str, dict[str, Any]]]:
+    """``(host, probe, method asked, error object)`` for every recorded ElectrumX error."""
     out = []
     for r in _FIXTURE["electrumx"]:
         if "reply" not in r:
             continue
         msg = json.loads(r["reply"])
         if "error" in msg:
-            out.append((_host(r["endpoint"]), r["probe"], msg["error"]))
+            out.append((_host(r["endpoint"]), r["probe"], r["request"]["method"], msg["error"]))
     return out
 
 
 def test_every_recorded_electrumx_error_has_an_expectation() -> None:
-    probes = {probe for _, probe, _ in _electrumx_errors()}
+    probes = {probe for _, probe, _, _ in _electrumx_errors()}
     assert probes
     assert probes == set(_ELECTRUMX_EXPECTED)
 
 
 def test_the_recorded_daemon_error_code_is_2_not_1() -> None:
-    """``_POLICY_ERROR_CODES`` documents code 1 as ElectrumX's DAEMON_ERROR; the servers say 2."""
-    daemon = [err for _, probe, err in _electrumx_errors() if probe == "tx_get_unknown"]
+    """ElectrumX's DAEMON_ERROR is code 2 (code 1 is its BAD_REQUEST; see ``_POLICY_ERROR_CODES``)."""
+    daemon = [err for _, probe, _, err in _electrumx_errors() if probe == "tx_get_unknown"]
     assert daemon
     assert all(err["code"] == 2 and str(err["message"]).startswith("daemon error") for err in daemon)
 
@@ -337,21 +331,12 @@ def _classify(exc: NetworkError) -> str:
 
 
 @pytest.mark.parametrize(
-    ("host", "probe", "error"),
-    [
-        pytest.param(
-            h,
-            p,
-            e,
-            id=f"{h}-{p}",
-            marks=pytest.mark.xfail(
-                p in _KNOWN_MISCLASSIFIED, strict=True, reason="ElectrumX code 1 on a read is not a tx verdict"
-            ),
-        )
-        for h, p, e in _electrumx_errors()
-    ],
+    ("host", "probe", "method", "error"),
+    [pytest.param(h, p, m, e, id=f"{h}-{p}") for h, p, m, e in _electrumx_errors()],
 )
-def test_a_recorded_electrumx_error_is_classified_as_intended(host: str, probe: str, error: dict[str, Any]) -> None:
-    exc = _rpc_error(error.get("code", "unknown"), error.get("message"))
+def test_a_recorded_electrumx_error_is_classified_as_intended(
+    host: str, probe: str, method: str, error: dict[str, Any]
+) -> None:
+    exc = _rpc_error(error.get("code", "unknown"), error.get("message"), method)
     assert isinstance(exc, NetworkError)
     assert _classify(exc) == _ELECTRUMX_EXPECTED[probe], (error.get("code"), str(error.get("message"))[:200])

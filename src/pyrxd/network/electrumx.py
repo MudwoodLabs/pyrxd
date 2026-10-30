@@ -132,11 +132,20 @@ _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 # now raises the typed ``PolicyRejection``; genuine transport faults stay ``NetworkError``.
 
 # Codes that mean "the node evaluated your transaction and said no".
-#   1   ElectrumX's DAEMON_ERROR — how it forwards a bitcoind sendrawtransaction failure
+#   1   ElectrumX's BAD_REQUEST — how `blockchain.transaction.broadcast` wraps a failed
+#       sendrawtransaction ("the transaction was rejected by network rules"). ONLY on a broadcast:
+#       on every other method code 1 means the request itself was bad or out of range. Recorded
+#       2026-10-30 from all three shipped servers (tests/fixtures/recorded_endpoint_replies.json):
+#       "zz should be a transaction hash", "tx ... not in block at height 1", "height N out of
+#       range", each with code 1. Read as a verdict, those became a PolicyRejection, which the
+#       failover layer never retries, so a lagging primary's "out of range" ended a header read.
+#       (ElectrumX's DAEMON_ERROR is code 2: a missing transaction arrived as code 2 "daemon error".)
 #  -25  RPC_TRANSACTION_ERROR
 #  -26  RPC_TRANSACTION_REJECTED
 #  -27  RPC_TRANSACTION_ALREADY_IN_CHAIN
 _POLICY_ERROR_CODES: frozenset[int] = frozenset({1, -25, -26, -27})
+_BAD_REQUEST_CODE: int = 1
+_BROADCAST_METHOD: str = "blockchain.transaction.broadcast"
 
 # JSON-RPC 2.0 "Method not found". It is how a server without the RXinDexer extension answers
 # `wave.*` / `glyph.*` / `swap.*` calls. Measured 2026-09-24 against the first shipped mainnet
@@ -239,12 +248,13 @@ def _sanitize_server_message(message: Any) -> str:
     return out
 
 
-def _rpc_error(code: Any, message: Any) -> NetworkError:
-    """Build the exception for a JSON-RPC error object.
+def _rpc_error(code: Any, message: Any, method: str | None = None) -> NetworkError:
+    """Build the exception for a JSON-RPC error object answering *method*.
 
     Returns :class:`~pyrxd.security.errors.PolicyRejection` (itself a
     ``NetworkError``, so existing ``except NetworkError`` handlers keep working) when
-    the code or the sanitized reason says the node rejected a transaction;
+    the code or the sanitized reason says the node rejected a transaction (code 1 counts only
+    when *method* is ``blockchain.transaction.broadcast``, see ``_POLICY_ERROR_CODES``);
     :class:`~pyrxd.security.errors.RpcMethodNotFound` (also a ``NetworkError``) for code
     ``-32601``, so the failover layer can tell "this server does not implement that method"
     from a transport fault; a plain ``NetworkError`` otherwise.
@@ -256,7 +266,8 @@ def _rpc_error(code: Any, message: Any) -> NetworkError:
     """
     reason = _sanitize_server_message(message)
     lowered = reason.lower()
-    is_policy = code in _POLICY_ERROR_CODES or any(marker in lowered for marker in _POLICY_MESSAGE_MARKERS)
+    by_code = code in _POLICY_ERROR_CODES and (code != _BAD_REQUEST_CODE or method == _BROADCAST_METHOD)
+    is_policy = by_code or any(marker in lowered for marker in _POLICY_MESSAGE_MARKERS)
     if not is_policy:
         if code == _METHOD_NOT_FOUND_CODE:
             return RpcMethodNotFound(f"ElectrumX RPC error (code {code})")
@@ -470,6 +481,7 @@ class ElectrumXClient:
         # B's result, because recv() returns whatever message arrives next
         # rather than the one matching A's request id.
         self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._pending_methods: dict[int, str] = {}  # what each pending id asked, for _rpc_error
         self._reader_task: asyncio.Task[None] | None = None
 
         # Validate all URLs at construction time (fast-fail).
@@ -1060,6 +1072,7 @@ class ElectrumXClient:
             if not fut.done():
                 fut.set_exception(exc)
         self._pending.clear()
+        self._pending_methods.clear()
 
     async def _reader_loop(self) -> None:
         """Read messages from the socket and dispatch by JSON-RPC id.
@@ -1120,6 +1133,7 @@ class ElectrumXClient:
                     continue
 
                 fut = self._pending.pop(req_id, None)
+                method = self._pending_methods.pop(req_id, None)
                 if fut is None or fut.done():
                     logger.debug("ElectrumX reader dropped orphan response id=%d", req_id)
                     continue
@@ -1127,7 +1141,7 @@ class ElectrumXClient:
                 if "error" in data and data["error"] is not None:
                     err = data["error"]
                     if isinstance(err, dict):
-                        fut.set_exception(_rpc_error(err.get("code", "unknown"), err.get("message")))
+                        fut.set_exception(_rpc_error(err.get("code", "unknown"), err.get("message"), method))
                     else:
                         fut.set_exception(NetworkError("ElectrumX RPC error"))
                 elif "result" in data:
@@ -1179,6 +1193,7 @@ class ElectrumXClient:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
         self._pending[req_id] = fut
+        self._pending_methods[req_id] = method
 
         try:
             try:
@@ -1199,3 +1214,4 @@ class ElectrumXClient:
             # Drop the pending entry whether we got a response, errored, or
             # timed out. If the reader has already popped it, this is a no-op.
             self._pending.pop(req_id, None)
+            self._pending_methods.pop(req_id, None)
