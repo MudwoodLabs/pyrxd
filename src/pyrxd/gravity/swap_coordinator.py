@@ -6441,8 +6441,24 @@ def _claim_to_record(claims_seen: Sequence[Any]) -> Any:
     can serve a claim on a transaction no other holds (an ETH ``Claimed(p)`` log, a BTC claim-leaf
     spend whose signature does not verify); when its hash sorted first, the record kept it beside the
     real claim, every later read nominated it back, and the pages and ``--phase claim`` named a
-    transaction nobody can fetch (0.27 release review, B-2)."""
-    return min(
-        claims_seen,
-        key=lambda c: (not c.verified, -len(set(c.nominated_by)), getattr(c, "tx_hash", None) or c.txid),
-    )
+    transaction nobody can fetch (0.27 release review, B-2).
+
+    This holds from three sources up. With two, one source that withholds the real claim's log and
+    receipt and serves another ties it one nomination to one, and neither verifies; no rule can tell
+    them apart, so the tie falls to the hash and is logged (re-review of the B-2 fix, F-3). The record
+    is replaced only when a read is CLAIMED with its transaction, which that liar can prevent."""
+
+    def rank(c: Any) -> tuple[bool, int]:
+        return (not c.verified, -len(set(c.nominated_by)))
+
+    chosen = min(claims_seen, key=lambda c: (*rank(c), getattr(c, "tx_hash", None) or c.txid))
+    tied = [c for c in claims_seen if rank(c) == rank(chosen)]
+    if len(tied) > 1 and chosen.verified is False:
+        logger.warning(
+            "%d claims seen with equal evidence (none verified, %d nominator(s) each): recording %s by hash "
+            "order; one source may be serving a claim no other holds, so compare the sources' answers",
+            len(tied),
+            len(set(chosen.nominated_by)),
+            getattr(chosen, "tx_hash", None) or chosen.txid,
+        )
+    return chosen

@@ -134,10 +134,10 @@ v1 §1 stands. Corrections and additions:
   the two-host refund phases fabricate it with `with_radiant_lock`
   (`scripts/eth_swap_two_host.py:1094`, `scripts/btc_swap_two_host.py:1108`) (Mythos I1).
 - **The taker discards the covenant outpoint it verified.** `taker_funds_btc` binds
-  `_rerun_outpoint` and drops it (`swap_coordinator.py:2871`). A taker record at `BTC_LOCKED`
+  `_rerun_outpoint` and drops it (now `swap_coordinator.py:3022`). A taker record at `BTC_LOCKED`
   therefore has no outpoint, and re-discovery by scan can be steered by anyone paying the
-  covenant SPK (`radiant_leg.py:1124-1131`) (Opus B7, Mythos L2).
-- **The covenant-refund comment is false under F-A.** `radiant_leg.py:1331-1335` says "the
+  covenant SPK (`find_covenant_utxo`, now `radiant_leg.py:356-359`) (Opus B7, Mythos L2).
+- **The covenant-refund comment is false under F-A.** The comment (now `radiant_leg.py:1587-1591`, corrected by PR 6) said "the
   competing claim branch needs p, which on this path the counterparty has not revealed" (Opus A8).
 - **Measurements, 2026-10-09** (REVIEW-INPUTS §D, by the reviewers, not re-run here):
   - **Finalized lag:** Ethereum 780–1008 s (65–84 blocks). Base 886–1208 s (443–604 blocks).
@@ -806,7 +806,7 @@ Review key: **O** = Opus hostile review; **O+M** = Opus plus a Mythos sandbox pa
 | 4a | Leg refund plumbing: `refund(on_signed=…)`; gas 150k; estimate check; `gas` kept in the preflight; out-of-gas classification from the receipt. **The hook has no caller until PR 5b**; the gas and preflight changes take effect at once | `htlc_leg.py` (refund), `erc20_leg.py` (refund), `eth_leg.py` (refund), `rpc.py` (preflight), fork gas tests | low-medium | O |
 | 5a | **Observe-only.** `reconcile_counter_leg`; `taker_refund_btc` reads the disposition first (`CLAIMED` → SECRET_REVEALED, new edge; third-party/earlier `REFUNDED` → ABORTED, held under the D14 gate for TAKER and none (N1); `UNKNOWN`/`CLAIM_SEEN` branches). **Sending is unchanged** (still advances on our broadcast) | `swap_coordinator.py`, `swap_state.py`, wire doc | high | O+M |
 | 5b | **Pending/re-send/replace:** refund recorded pending; re-send rules §3.4; expiry anchor; `PAYOUT_REVERTS`; ETH runner abort polls to terminal | `swap_coordinator.py`, `swap_state.py`, `scripts/eth_swap_two_host.py` | high | O+M |
-| 6 | `mutual_refund` (ETH) on the disposition; role-aware terminals, with the D14 gate on MUTUAL_REFUND for TAKER and none (N1); role None covenant ordering; the empty-counter-contract branch pointing at the abandon (N2); `asset_refund_txid`; **replaces #851's single-endpoint `_explain_failed_taker_eth_refund` and the runner's `observed_claim_tx` discovery with the shared reader**; fix the `radiant_leg.py:1331-1335` comment | `swap_coordinator.py`, `swap_state.py`, `radiant_leg.py` (comment), runners | high | O+M |
+| 6 | `mutual_refund` (ETH) on the disposition; role-aware terminals, with the D14 gate on MUTUAL_REFUND for TAKER and none (N1); role None covenant ordering; the empty-counter-contract branch pointing at the abandon (N2); `asset_refund_txid`; **replaces #851's single-endpoint `_explain_failed_taker_eth_refund` and the runner's `observed_claim_tx` discovery with the shared reader**; fix the covenant-refund comment (now `radiant_leg.py:1587-1591`) | `swap_coordinator.py`, `swap_state.py`, `radiant_leg.py` (comment), runners | high | O+M |
 | 7a | Empty/expired ERC-20 with a nonce: closed-at-`F`, `close_push_nonce`, `COUNTER_LEG_EXPIRED_EMPTY` held under the D14 gate for TAKER and none (N1) | `swap_coordinator.py`, `erc20_leg.py`, `swap_state.py` | high | O+M |
 | 7b | #849: nonce-less → page; `abandon_counter_leg` (three states, new BOTH_LOCKED edge, including BOTH_LOCKED on `EXPIRED_EMPTY_*` after `F_EXPIRED`, N2); `--phase abandon`; `abort_note` | `swap_coordinator.py`, `swap_state.py`, `scripts/eth_swap_two_host.py`, `security/errors.py` | high (ends records without a refund) | O+M |
 | 8 | Taker `abandon_unfunded` | `swap_coordinator.py` | medium | O |
