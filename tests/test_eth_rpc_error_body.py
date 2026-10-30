@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -29,18 +30,33 @@ _KEY = "SECRETKEY0123456789abcdefXYZ"
 _RANGE = "ranges over 10000 blocks are not supported on free plan"  # drpc's recorded wording
 
 
-def _serve(status: int, body: Any) -> tuple[HTTPServer, str]:
-    """Answer every POST with ``status`` and ``body`` (a callable of the request id, or bytes)."""
+def _serve(status: int, body: Any, split_at: int | None = None) -> tuple[HTTPServer, str]:
+    """Answer every POST with ``status`` and ``body`` (a callable of the request id, or bytes).
+
+    With ``split_at``, the body goes out chunked in two pieces with a pause between them, so the
+    client's first read sees only the first piece."""
 
     class _H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def do_POST(self) -> None:
             req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             data = body(req.get("id")) if callable(body) else body
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            if split_at is None:
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            self.wfile.write(data)
+            for piece in (data[:split_at], data[split_at:]):
+                self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.2)
+            self.wfile.write(b"0\r\n\r\n")
 
         def log_message(self, *_a: Any) -> None:
             pass
@@ -54,8 +70,8 @@ def _error(message: str, code: int = 35) -> Any:
     return lambda rid: json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}).encode()
 
 
-def _get_logs(status: int, body: Any) -> BaseException:
-    srv, url = _serve(status, body)
+def _get_logs(status: int, body: Any, split_at: int | None = None) -> BaseException:
+    srv, url = _serve(status, body, split_at)
 
     async def go() -> None:
         rpc = EthRpc(url, expected_chain_id=1)
@@ -93,8 +109,34 @@ def test_a_400_without_a_jsonrpc_error_body_still_fails_on_its_status() -> None:
 
 
 def test_a_400_body_with_a_result_is_not_read_as_an_answer() -> None:
-    exc = _get_logs(400, lambda rid: json.dumps({"jsonrpc": "2.0", "id": rid, "result": []}).encode())
+    """An error body that also carries a ``result`` is refused, so a 400 can never deliver data."""
+    exc = _get_logs(
+        400,
+        lambda rid: json.dumps(
+            {"jsonrpc": "2.0", "id": rid, "result": [], "error": {"code": 35, "message": _RANGE}}
+        ).encode(),
+    )
     assert "400" in str(exc)
+    assert _RANGE not in str(exc)
+
+
+def test_a_400_error_body_sent_in_two_chunks_is_read_whole() -> None:
+    exc = _get_logs(400, _error(_RANGE), split_at=20)
+    assert _RANGE in str(exc)
+    assert _is_range_limit(exc)
+
+
+def test_an_over_cap_body_is_refused_even_when_its_first_chunk_is_a_whole_error() -> None:
+    """The first chunk alone parses; the padding after it puts the body over the cap."""
+
+    def body(rid: Any) -> bytes:
+        doc = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": 35, "message": _RANGE}}).encode()
+        return doc + b" " * (rpc_module._MAX_ERROR_BODY_BYTES + 1 - len(doc))
+
+    probe = json.dumps({"jsonrpc": "2.0", "id": 0, "error": {"code": 35, "message": _RANGE}}).encode()
+    exc = _get_logs(400, body, split_at=len(probe) + 4)  # past the doc whatever the id's width
+    assert "400" in str(exc)
+    assert _RANGE not in str(exc)
 
 
 def test_a_429_with_a_jsonrpc_error_body_stays_an_http_error() -> None:

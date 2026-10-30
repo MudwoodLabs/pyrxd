@@ -286,7 +286,16 @@ def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
                 kwargs["raise_for_status"] = False
                 response = await self.async_get_response_from_post_request(endpoint_uri, data=data, **kwargs)
                 if response.status in _ERROR_BODY_STATUSES:
-                    raw = await response.content.read(_MAX_ERROR_BODY_BYTES + 1)
+                    # ``read(n)`` returns what is buffered, not the whole body: read to the end or to
+                    # one byte past the cap, so a chunked body is seen whole and an over-cap one is
+                    # refused even when its first chunk parses. Reading to the end releases the
+                    # connection; ``raise_for_status`` releases it otherwise.
+                    raw = b""
+                    while len(raw) <= _MAX_ERROR_BODY_BYTES:
+                        chunk = await response.content.read(_MAX_ERROR_BODY_BYTES + 1 - len(raw))
+                        if not chunk:
+                            break
+                        raw += chunk
                     if len(raw) <= _MAX_ERROR_BODY_BYTES and _is_jsonrpc_error_body(raw):
                         return bytes(raw)
                 response.raise_for_status()

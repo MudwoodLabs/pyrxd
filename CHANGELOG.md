@@ -819,16 +819,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the block) with code 1, its BAD_REQUEST; recorded from all three shipped servers. `_rpc_error`
   treated every code 1 as `PolicyRejection`, which `FailoverElectrumXClient` never retries, so a
   server that had not reached a height ended the read instead of the next server being asked, and
-  the message said "node rejected the transaction". Code 1 is now a verdict only on
-  `blockchain.transaction.broadcast`; on any other method it raises a plain `NetworkError`.
-  Reason-marker matching is unchanged.
+  the message said "node rejected the transaction". Code 1 is now a verdict only when it answers
+  `ElectrumXClient.broadcast`; on any other method it raises a `NetworkError` that is not a
+  `PolicyRejection`. Reason-marker matching is unchanged.
 - **ETH: a JSON-RPC error sent with HTTP 400 keeps its reason.** drpc and Blast refuse a wide
   `eth_getLogs` with HTTP 400 and the reason in the body (recorded 2026-10-30). web3 raised on the
   status before reading the body, so the log scan's range-limit rule never saw the reason, never
   halved its window, and those endpoints failed every scan (safe, since a failed scan is never "no
   logs", but they never answered). `EthRpc` now reads a 400 body of at most 64 KiB and, when it is
   one well-formed JSON-RPC error, raises it with the server's reason, scrubbed of URL secrets like
-  any response. Every other status, 429 included, fails on its status as before.
+  any response. Every other status, 429 included, fails on its status as before. The range-limit
+  halving now stops at 1,000 blocks (`LOG_MIN_CHUNK_BLOCKS`, chosen): an endpoint that refuses even
+  that fails its scan, rather than being asked for the range a few blocks at a time. Blast's
+  recorded 10-block limit is below the floor, so Blast endpoints still fail log scans; drpc
+  (10,000-block limit) now answers.
 
 - **Watchtower (ETH): one endpoint can no longer lower or silence a page by failing, lagging or
   forking.** Found by the 0.27 release review and reproduced on the fake chains with the fault at

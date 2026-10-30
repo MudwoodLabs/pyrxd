@@ -423,6 +423,20 @@ async def test_a_range_capped_endpoint_halves_until_it_answers():
     assert (0, 9_999) in capped.log_requests and (0, 2_499) in capped.log_requests
 
 
+async def test_an_endpoint_capped_below_the_floor_fails_after_a_bounded_number_of_requests():
+    """Pair of the test above. A 10-block cap (both Blast endpoints, recorded 2026-10-30) halves to
+    the floor and then fails that endpoint, instead of scanning 25,000 blocks ten at a time."""
+    from pyrxd.eth_wallet.disposition import LOG_CHUNK_BLOCKS, LOG_MIN_CHUNK_BLOCKS
+
+    chain = _chain(head=25_000, finalized=24_000)
+    capped = FakeEvmEndpoint(chain, range_cap=10)
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=25_000)
+    assert str(capped.source_key) in u.failed
+    halvings = (LOG_CHUNK_BLOCKS // LOG_MIN_CHUNK_BLOCKS).bit_length()  # 10,000 -> ... -> 1,250
+    assert 1 <= len(capped.log_requests) <= halvings
+    assert min(hi - lo + 1 for lo, hi in capped.log_requests) >= LOG_MIN_CHUNK_BLOCKS
+
+
 async def test_logs_newer_than_the_agreed_head_are_still_nominated():
     """The agreed head is the quorum-th highest (here 2 of 3, both 2 blocks behind); a log in a
     block only the freshest endpoint has reached is still nominated, by its scan past the agreed
