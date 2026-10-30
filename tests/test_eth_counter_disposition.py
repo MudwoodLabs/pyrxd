@@ -430,6 +430,17 @@ async def test_an_endpoint_capped_below_the_floor_fails_after_a_bounded_number_o
 
     chain = _chain(head=25_000, finalized=24_000)
     capped = FakeEvmEndpoint(chain, range_cap=10)
+    # Bounded: a halving that resends a refused span at the floor never ends, and this suite has no
+    # per-test timeout, so it would hang CI rather than fail. The fake never yields, so a wait_for
+    # cannot stop it; the 50th request raises instead, so a looping scan ends and the asserts below fail.
+    real_get_logs = capped.get_logs
+
+    async def bounded_get_logs(**kwargs):
+        if len(capped.log_requests) >= 50:
+            raise RuntimeError("request bound reached")
+        return await real_get_logs(**kwargs)
+
+    capped.get_logs = bounded_get_logs
     u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=25_000)
     assert str(capped.source_key) in u.failed
     spans = [hi - lo + 1 for lo, hi in capped.log_requests]

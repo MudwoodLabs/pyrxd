@@ -232,6 +232,37 @@ async def test_a_code_1_read_refused_everywhere_still_fails() -> None:
     assert not isinstance(caught.value, (PolicyRejection, RpcMethodNotFound))
 
 
+async def test_a_code_1_answer_to_a_non_idempotent_call_is_not_sent_again() -> None:
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _rpc_error(1, "bad params")
+
+    with pytest.raises(NetworkError):
+        await client.call_extension("some.mutating.method")
+    assert not any(name == "call_extension" for name, _ in fakes[B].calls)
+
+
+async def test_a_code_1_from_the_chain_check_is_still_a_fault() -> None:
+    """The chain check runs before the op; an endpoint that cannot answer it is not verified, so it
+    is discarded and the winner promoted, as for any fault."""
+    client, fakes = build([A, B], genesis=_GENESIS, verify_chain=True)
+    fakes[A].chain_error = _rpc_error(1, "height 0 out of range")
+    await client.get_tip_height()
+
+    assert fakes[A].closed == 1
+    assert client.active_url == B
+
+
+async def test_lacking_the_method_on_one_endpoint_and_refusing_on_another_is_not_method_not_found() -> None:
+    """B implements the method (it answered code 1), so "no endpoint implements it" would be false."""
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _method_not_found("wave.resolve")
+    fakes[B].extension_error = _rpc_error(1, "bad params")
+
+    with pytest.raises(NetworkError) as caught:
+        await client.call_extension("wave.resolve", ["alice"], idempotent=True)
+    assert not isinstance(caught.value, RpcMethodNotFound)
+
+
 async def test_a_custom_client_raising_code_1_from_broadcast_is_a_verdict() -> None:
     """A client_factory client that does not convert code 1 itself: the failover layer converts it,
     so a refused transaction is not sent on to the next endpoint."""
