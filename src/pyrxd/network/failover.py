@@ -94,18 +94,6 @@ _ALREADY_HAVE_MARKERS: tuple[str, ...] = (
 _ALREADY_HAVE_CODE: int = -27
 
 
-async def _broadcast_on(client: ElectrumXClient, payload: bytes) -> Txid:
-    """``client.broadcast(payload)``, with ElectrumX code 1 read as the node's verdict.
-
-    ``ElectrumXClient.broadcast`` already converts it; a client from a custom ``client_factory``
-    may not, and an unconverted ``_BadRequest`` is a ``NetworkError``, which would send the
-    transaction on to the next endpoint after a node refused it."""
-    try:
-        return await client.broadcast(payload)
-    except _BadRequest as exc:
-        raise _policy_rejection(exc.code, exc.reason) from None
-
-
 def _is_already_have(exc: PolicyRejection) -> bool:
     """True when a rejection means the node already holds this exact transaction."""
     if exc.code == _ALREADY_HAVE_CODE:
@@ -365,7 +353,13 @@ class FailoverElectrumXClient:
         for endpoint in self._candidates():
             try:
                 client = await self._client_for(endpoint)
-                result = await _broadcast_on(client, payload)
+                try:
+                    result = await client.broadcast(payload)
+                except _BadRequest as exc:
+                    # ElectrumXClient.broadcast already converts code 1; a client from a custom
+                    # client_factory may not, and an unconverted _BadRequest is a NetworkError, which
+                    # would send a refused transaction on to the next endpoint.
+                    raise _policy_rejection(exc.code, exc.reason) from None
             except PolicyRejection as exc:
                 if attempted > 0 and _is_already_have(exc):
                     # "I already have this" is a CLAIM, not evidence (audit B6). Corroborate it
