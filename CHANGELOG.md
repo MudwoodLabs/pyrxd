@@ -822,11 +822,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `reconcile_error`; once that page was ACKed, a final claim the other endpoints served paged
     nothing. With no claim served, the primary's failure, or any endpoint's
     `DeployNotCreationError`, still raises and pages.
-  - The tower judges a claim's finality, and feeds its stall tracker, with the `finalized` block a
-    quorum of endpoints stand at or above, not the lowest any endpoint reports. One endpoint whose
-    `finalized` lagged (even with an honest head) held a final claim at "not yet final" until the
-    claim race squeezed, and reset the stall tracker whenever its own value moved. The
-    coordinator's reader and gate still read the lowest.
+  - The tower judges a claim's finality, and feeds its stall tracker, with the `finalized` block
+    (and, for the tracker, the head) a quorum of endpoints stand at or above, not the lowest any
+    endpoint reports. One endpoint whose `finalized` lagged (even with an honest head) held a final
+    claim at "not yet final" until the claim race squeezed, and reset the stall tracker whenever its
+    own value moved; one endpoint answering a frozen head kept the tracker from declaring a stall.
+    This holds with more endpoints than the quorum (three at the default 2-of-3); with two, the
+    quorum is both and nothing changes. The coordinator's reader and gate still read the lowest.
   - At `PARAMS_MISMATCH`, a refund page set aside for a scan hit the reader could not read (one
     forked endpoint) is CRITICAL (`urgent`), as the honest tower's "claimed after a params mismatch"
     page is, for taker and maker records. Before, it was one WARN. A clean read beside one
@@ -835,6 +837,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     has passed (`both_locked_refund_runnable`, not urgent), and a legacy record past its timeout
     (the new `legacy_eth_refund_runnable`). Before, the page sent while the timeout was ahead was
     the only one.
+- **Swap coordinator: one source can no longer pick the claim on record or lift the D14 hold.**
+  Found by the 0.27 release review.
+  - The claim kept as `counter_claim_tx` (ETH and BTC) is a verified claim first, then the one the
+    most sources nominated, then by hash. Before, the first by hash was kept, so once p was public
+    one source's claim on a transaction no other holds could be the claim on record, nominated back
+    on every later read. The ETH reader now counts every endpoint that served any variant of a
+    transaction's log among its nominations.
+  - The covenant age that lifts the D14 hold (a refunded counter leg held open while a claim on
+    record makes p public) is the lowest depth any configured Radiant operator reports for the
+    covenant's funding transaction (`RadiantChainIO.funding_tx_depths`), the primary's included.
+    Before, one over-reporting server could end the record while the covenant was still claimable.
+    A source that does not answer is left out; one that under-reports keeps the hold, and the
+    coordinator logs which.
 - **Watchtower: a legacy record's D9 check that one endpoint holds without a verdict now pages
   (#921).** Before, a failed or retried read of a pre-0.27 terminal record was silent on every tick.
   One endpoint could keep it there for good: an old finalized block (the reader takes the lowest)

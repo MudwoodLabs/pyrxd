@@ -1713,15 +1713,20 @@ def _leg_is_value_bearing(leg: object) -> bool:
     return isinstance(net, str) and bool(net) and net not in AUDIT_CLEARED_NETWORKS
 
 
-def _eth_claim_to_record(claims_seen: Sequence[Any]) -> Any:
-    """The ``Claimed(p)`` the record keeps as ``counter_claim_tx``, from a non-empty ``claims_seen``: a
-    verified claim first, then the one the most endpoints nominated, then by hash.
+def _claim_to_record(claims_seen: Sequence[Any]) -> Any:
+    """The claim the record keeps as ``counter_claim_tx``, from a non-empty ``claims_seen`` (an ETH
+    ``ClaimSeen`` or a BTC ``BtcSpender``): a verified claim first, then the one the most sources
+    nominated, then by hash.
 
-    The reader lists claims by hash, and the first used to be recorded. Once p is public, one endpoint
-    can serve a ``Claimed(p)`` log on a transaction no endpoint holds; when its hash sorted first, the
-    record kept that ghost beside the real claim, every later read nominated it back, and the pages
-    and ``--phase claim`` named a transaction nobody can fetch (0.27 release review, B-2)."""
-    return min(claims_seen, key=lambda c: (not c.verified, -len(c.nominated_by), c.tx_hash))
+    The readers list claims by hash, and the first used to be recorded. Once p is public, one source
+    can serve a claim on a transaction no other holds (an ETH ``Claimed(p)`` log, a BTC claim-leaf
+    spend whose signature does not verify); when its hash sorted first, the record kept it beside the
+    real claim, every later read nominated it back, and the pages and ``--phase claim`` named a
+    transaction nobody can fetch (0.27 release review, B-2)."""
+    return min(
+        claims_seen,
+        key=lambda c: (not c.verified, -len(set(c.nominated_by)), getattr(c, "tx_hash", None) or c.txid),
+    )
 
 
 class SwapCoordinator:
@@ -4817,8 +4822,17 @@ class SwapCoordinator:
             raise ValidationError(f"the covenant funding depth {confs!r} is not a non-negative int; fail-closed")
         others = getattr(chain_io, "funding_tx_depths", None)
         if callable(others):
-            for _operator, depth in await others(txid):
-                confs = min(confs, depth)  # the lowest age keeps the D14 hold: fail-safe
+            primary = confs
+            for operator, depth in await others(txid):
+                if depth < confs:
+                    confs, low = depth, operator  # the lowest age keeps the D14 hold: fail-safe
+            if confs < primary:
+                logger.warning(
+                    "covenant funding depth: %s reports %d, below the primary's %d; the D14 hold uses the lowest",
+                    low,
+                    confs,
+                    primary,
+                )
         return int(confs)
 
     async def _claim_seen_holds_the_terminal(self) -> bool:
@@ -4864,7 +4878,7 @@ class SwapCoordinator:
 
         changed = False
         if self.record.counter_claim_tx is None and disposition.claims_seen:
-            claim = _eth_claim_to_record(disposition.claims_seen)
+            claim = _claim_to_record(disposition.claims_seen)
             self.record = dataclasses.replace(self.record, counter_claim_tx=claim.tx_hash)
             changed = True
             logger.warning(
@@ -5065,7 +5079,7 @@ class SwapCoordinator:
         changed = False
         claims = disposition.claims_seen
         if self.record.counter_claim_tx is None and claims:
-            claim = claims[0]
+            claim = _claim_to_record(claims)
             self.record = dataclasses.replace(self.record, counter_claim_tx=claim.txid)
             changed = True
             logger.warning(
@@ -5774,7 +5788,7 @@ class SwapCoordinator:
         # A Claimed log the read saw goes on the record as well as into the note, so whatever reads the
         # record later still sees that p may be public (Mythos review of #850 PR 7b, F3).
         claims = disposition.claims_seen
-        claim_tx = self.record.counter_claim_tx or (_eth_claim_to_record(claims).tx_hash if claims else None)
+        claim_tx = self.record.counter_claim_tx or (_claim_to_record(claims).tx_hash if claims else None)
         self.record = dataclasses.replace(
             self.record,
             state=advance(state, SwapEvent.OPERATOR_ABANDONED),

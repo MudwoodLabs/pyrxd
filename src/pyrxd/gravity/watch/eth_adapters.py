@@ -140,16 +140,19 @@ async def _tower_finalized_block(rpc: EthRpc | MultiSourceEthRpc) -> int:
     gate use (erring low there only delays a value-moving step). For an alert-only tower the MIN let one
     lagging endpoint, at any index, hold a final claim at "not yet final", so the tower WATCHed where it
     should page the claim race, and reset the stall tracker whenever its own value moved (0.27 release
-    review, A-2; the BTC twin was register R13, fixed with the quorum-vouched depth). One endpoint can
-    no longer move this value either way; a quorum that lags still holds it, as before. A single
+    review, A-2; the BTC twin was register R13, fixed with the quorum-vouched depth). With more
+    endpoints than the quorum (three at the default 2-of-3), one endpoint can no longer move this value
+    either way. When the quorum is every endpoint (two endpoints at the default), the quorum-th value
+    is the MIN and one lagging endpoint still holds it, as before; so does a quorum that lags. A single
     endpoint is read as it is."""
+    return await _tower_quorum_block(rpc, "finalized_block_number")
+
+
+async def _tower_quorum_block(rpc: EthRpc | MultiSourceEthRpc, method: str) -> int:
+    """``finalized_block_number`` or ``block_number`` as a quorum of endpoints stand at or above it."""
     if not isinstance(rpc, MultiSourceEthRpc):
-        return await rpc.finalized_block_number()
-    return int(
-        await rpc.eth_call_quorum(
-            lambda s: s.finalized_block_number(), label="finalized_block_number", combine=quorum_combiner(rpc)
-        )
-    )
+        return int(await getattr(rpc, method)())
+    return int(await rpc.eth_call_quorum(lambda s: getattr(s, method)(), label=method, combine=quorum_combiner(rpc)))
 
 
 class RpcEthChainSource:
@@ -295,11 +298,14 @@ class RpcEthChainSource:
         OPTIONAL capability (duck-typed; the observer probes for it) so a minimal source without it
         keeps the point-in-time fast path unchanged — a missing checkpoint never INVENTS a stall.
 
-        The ``finalized`` read is :func:`_tower_finalized_block`, the quorum-th value, so one endpoint
-        cannot reset the tracker by moving its own. Each endpoint's ``finalized_block_number`` rejects
+        The ``finalized`` and head reads are quorum-th values (:func:`_tower_finalized_block`), so with
+        more endpoints than the quorum one endpoint can neither reset the tracker by moving its
+        ``finalized`` nor hold it off with a frozen head. Each endpoint's ``finalized_block_number`` rejects
         an incoherent ``finalized > head`` over-report (fail-closed); the head is clamped below."""
         finalized = await _tower_finalized_block(self._rpc)  # each endpoint rejects finalized > head
-        head = await self._rpc.block_number()
+        # The head by quorum too: with the MIN, one endpoint answering a frozen head kept the head's
+        # progress at 0, so the tracker never declared a stall (re-review of the A-2 fix).
+        head = await _tower_quorum_block(self._rpc, "block_number")
         # Defend the tracker's finalized <= head precondition against a head that regressed between the
         # two reads (a reorg/lagging-replica race): clamp head up to finalized rather than feed an
         # incoherent pair. A frozen finalized with head==finalized is simply "no stall" (gap 0).

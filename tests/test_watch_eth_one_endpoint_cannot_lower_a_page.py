@@ -287,3 +287,32 @@ async def test_a_legacy_eth_refund_pages_again_once_it_can_run(tmp_path):
         assert "refund it" in res.decision.reason
     assert len(channel.sent) == 2
     assert w.marker() is None
+
+
+@pytest.mark.parametrize("frozen_at", [None, *INDICES])
+async def test_one_endpoint_with_a_frozen_head_does_not_hold_off_the_stall(tmp_path, frozen_at):
+    """Re-review of the A-2 fix: the tracker's head was the MIN, so one endpoint answering a frozen head
+    kept the head's progress at 0 and no stall was ever declared. ``finalized`` is frozen below the
+    claim while the head climbs; the stall is declared whichever endpoint freezes its head."""
+    w = _EthTower(tmp_path)
+    w.chain.claim(CLAIM_BLOCK)
+    w.chain.finalized, w.chain.head = 30, 100
+    if frozen_at is not None:
+
+        async def frozen():
+            return 100
+
+        w.endpoints[frozen_at].block_number = frozen
+    states = []
+    for _ in range(8):
+        states.append((await w.observe()).eth_claim_finality)
+        w.chain.head += 60
+    assert CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING in states, states
+
+
+async def test_HONEST_two_endpoints_one_lagging_finalized_still_holds_the_claim(tmp_path):
+    """The limit the docstring states: with two endpoints the default quorum is both, the quorum-th
+    value is the MIN, and one lagging endpoint still reads the claim not final."""
+    w = _EthTower(tmp_path, endpoint_kw=[{}, {"finalized_lag": 30}])
+    w.chain.claim(CLAIM_BLOCK)
+    assert (await w.observe()).eth_claim_finality is not CounterClaimState.FINAL

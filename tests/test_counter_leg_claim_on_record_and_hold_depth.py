@@ -150,3 +150,39 @@ def test_funding_tx_depths_reports_each_operator_and_leaves_out_the_rest():
     assert sorted(d for _op, d in got) == [3, 40]
     assert len({op for op, _d in got}) == 2
     assert all(s.tip_reads == 0 for s in (primary, other, wrong, down, unmined))  # no tip or header reads
+
+
+async def test_a_variant_of_the_real_claims_log_does_not_cut_its_nominations():
+    """Re-review of the B-2 fix: one endpoint serves the ghost and the real claim's log at another block
+    number. The reader counts every endpoint that served any variant of a transaction's log, so the
+    real claim keeps its three nominations and is still the claim on record."""
+    made: list[FakeEvmEndpoint] = []
+
+    def endpoints(chain):
+        made.extend(FakeEvmEndpoint(chain) for _ in range(3))
+        return made
+
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, endpoints=endpoints, chain_kw={"finalized": 60})
+    tx = chain.claim(70)
+    variant = {**_ghost_log(chain), "transactionHash": tx, "blockNumber": 69}
+    made[0].extra_logs = (_ghost_log(chain), variant)
+    await coord.reconcile_counter_leg()
+    assert coord.record.counter_claim_tx == tx, coord.record.counter_claim_tx
+
+
+def test_the_btc_claim_on_record_is_chosen_the_same_way():
+    """The BTC twin of B-2: a claim-leaf spend one source serves whose signature does not verify, with a
+    low txid, beside the real claim the others serve."""
+    from pyrxd.btc_wallet.disposition import BtcSpender, SpendPath
+    from pyrxd.gravity.swap_coordinator import _claim_to_record
+
+    def spender(txid, by, verified):
+        return BtcSpender(
+            txid=txid, path=SpendPath.CLAIM, raw=b"", nominated_by=by, confirmations=None, block=None, verified=verified
+        )
+
+    real, ghost = "ab" * 32, "00" * 32
+    assert _claim_to_record([spender(ghost, ("a",), False), spender(real, ("a", "b", "c"), True)]).txid == real
+    assert _claim_to_record([spender(ghost, ("a",), False), spender(real, ("b", "c"), False)]).txid == real
+    # Honest twin: a lone claim is recorded whatever its hash.
+    assert _claim_to_record([spender(ghost, ("a",), False)]).txid == ghost
