@@ -829,10 +829,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   logs", but they never answered). `EthRpc` now reads a 400 body of at most 64 KiB and, when it is
   one well-formed JSON-RPC error, raises it with the server's reason, scrubbed of URL secrets like
   any response. Every other status, 429 included, fails on its status as before. The range-limit
-  halving now stops at 1,000 blocks (`LOG_MIN_CHUNK_BLOCKS`, chosen): an endpoint that refuses even
-  that fails its scan, rather than being asked for the range a few blocks at a time. Blast's
-  recorded 10-block limit is below the floor, so Blast endpoints still fail log scans; drpc
-  (10,000-block limit) now answers.
+  halving in the counter-leg log read (`union_logs`) now halves the refused span, down to 1,000
+  blocks (`LOG_MIN_CHUNK_BLOCKS`, chosen); an endpoint that refuses a span of 1,000 or fewer fails
+  its scan at once, rather than being asked for the range a few blocks at a time. Blast's recorded
+  10-block limit is below the floor, so Blast endpoints still fail that read; drpc (10,000-block
+  limit) now answers it. The watchtower's claim scan asks for its whole range in one request and is
+  unchanged.
+- **ElectrumX failover: a code-1 read moves on without dropping the server.** Like a -32601 answer,
+  it asks the next endpoint without closing the refusing one (which failed its other in-flight
+  calls) and without promoting past it. A code 1 raised from a custom client's broadcast is now read
+  as the node's verdict, so the transaction is not sent on to the next endpoint.
 
 - **Watchtower (ETH): one endpoint can no longer lower or silence a page by failing, lagging or
   forking.** Found by the 0.27 release review and reproduced on the fake chains with the fault at

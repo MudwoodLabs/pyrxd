@@ -170,3 +170,29 @@ def test_a_400_body_that_quotes_the_key_is_scrubbed() -> None:
     exc = _get_logs(400, _error(f"{_RANGE} for /v3/{_KEY}"))
     assert _RANGE in str(exc)
     assert _KEY not in "".join(traceback.format_exception(exc))
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"jsonrpc": "2.0", "error": {"code": "35", "message": _RANGE}},  # code not an int
+        {"jsonrpc": "2.0", "error": {"code": True, "message": _RANGE}},  # bool is not an int code
+        {"jsonrpc": "2.0", "error": {"code": 35, "message": 35}},  # message not a string
+        {"jsonrpc": "1.0", "error": {"code": 35, "message": _RANGE}},
+        {"jsonrpc": "2.0", "error": [35, _RANGE]},  # error not an object
+    ],
+    ids=["str-code", "bool-code", "int-message", "jsonrpc-1.0", "error-list"],
+)
+def test_a_malformed_400_error_body_still_fails_on_its_status(doc: dict[str, Any]) -> None:
+    """Only one well-formed JSON-RPC error is read; any other 400 body fails as an HTTP 400."""
+    exc = _get_logs(400, lambda rid: json.dumps({**doc, "id": rid}).encode())
+    assert "400" in str(exc)
+    assert not _is_range_limit(exc)
+
+
+@pytest.mark.parametrize("bad_id", ["abc", True, None, 1.5], ids=["non-digit", "bool", "null", "float"])
+def test_a_400_error_body_with_an_id_web3_never_sent_fails_on_its_status(bad_id: Any) -> None:
+    body = json.dumps({"jsonrpc": "2.0", "id": bad_id, "error": {"code": 35, "message": _RANGE}}).encode()
+    exc = _get_logs(400, body)
+    assert "400" in str(exc)
+    assert not _is_range_limit(exc)

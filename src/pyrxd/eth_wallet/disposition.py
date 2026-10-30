@@ -87,7 +87,8 @@ __all__ = [
 #: cap: a range-limit refusal halves the chunk for that endpoint, down to :data:`LOG_MIN_CHUNK_BLOCKS`.
 LOG_CHUNK_BLOCKS = 10_000
 
-#: The smallest chunk a range-limit refusal halves to; one more refusal there fails the endpoint.
+#: The smallest chunk a range-limit refusal halves to; a refusal of a span this size or smaller fails
+#: the endpoint.
 #: CHOSEN, not measured. Without a floor, an endpoint capped at 10 blocks (recorded 2026-10-30 for
 #: both Blast endpoints, ``tests/fixtures/recorded_endpoint_replies.json``) turns a scan into
 #: thousands of sequential requests, and ``_ask_all`` waits for the slowest source; an endpoint
@@ -330,8 +331,11 @@ async def _logs_from_one(
         try:
             raw.extend(await source.get_logs(address=address, topics=topics, from_block=start, to_block=end))
         except Exception as exc:
-            if _is_range_limit(exc) and chunk // 2 >= LOG_MIN_CHUNK_BLOCKS:
-                chunk //= 2  # floor-is-deliberate: a smaller chunk is only ever more requests
+            span = end - start + 1
+            if _is_range_limit(exc) and span > LOG_MIN_CHUNK_BLOCKS:
+                # Halve the span that was refused, not the chunk: near the end of the range the span
+                # is shorter than the chunk, and halving the chunk alone would resend the same request.
+                chunk = max(LOG_MIN_CHUNK_BLOCKS, span // 2)  # floor-is-deliberate: smaller is only more requests
                 continue
             raise
         start = end + 1

@@ -264,9 +264,7 @@ def test_an_endpoint_capped_below_the_floor_fails_promptly() -> None:
     to the floor and fails that endpoint, rather than asking for 20,000 blocks ten at a time."""
     outcome, spans = _scan_against("eth-mainnet.public.blastapi.io", 11)
     assert isinstance(outcome, NetworkError) and disposition._is_range_limit(outcome)
-    assert spans[0] == disposition.LOG_CHUNK_BLOCKS
-    assert min(spans) >= disposition.LOG_MIN_CHUNK_BLOCKS
-    assert len(spans) <= (disposition.LOG_CHUNK_BLOCKS // disposition.LOG_MIN_CHUNK_BLOCKS).bit_length()
+    assert spans == [disposition.LOG_CHUNK_BLOCKS, 5_000, 2_500, 1_250, disposition.LOG_MIN_CHUNK_BLOCKS]
 
 
 # --------------------------------------------------------------------------- ElectrumX: JSON-RPC errors

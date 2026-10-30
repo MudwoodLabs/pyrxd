@@ -432,9 +432,49 @@ async def test_an_endpoint_capped_below_the_floor_fails_after_a_bounded_number_o
     capped = FakeEvmEndpoint(chain, range_cap=10)
     u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=25_000)
     assert str(capped.source_key) in u.failed
-    halvings = (LOG_CHUNK_BLOCKS // LOG_MIN_CHUNK_BLOCKS).bit_length()  # 10,000 -> ... -> 1,250
-    assert 1 <= len(capped.log_requests) <= halvings
-    assert min(hi - lo + 1 for lo, hi in capped.log_requests) >= LOG_MIN_CHUNK_BLOCKS
+    spans = [hi - lo + 1 for lo, hi in capped.log_requests]
+    assert spans == [LOG_CHUNK_BLOCKS, 5_000, 2_500, 1_250, LOG_MIN_CHUNK_BLOCKS]
+
+
+def test_the_scan_limits_are_the_documented_numbers():
+    """The CHANGELOG and docstrings name these values; a test that imports the constant would pass
+    whatever it were set to."""
+    from pyrxd.eth_wallet import disposition, rpc
+
+    assert disposition.LOG_CHUNK_BLOCKS == 10_000
+    assert disposition.LOG_MIN_CHUNK_BLOCKS == 1_000
+    assert rpc._MAX_ERROR_BODY_BYTES == 64 * 1024
+
+
+async def test_an_endpoint_capped_at_exactly_the_floor_answers():
+    """Honest twin of the test above: the halving reaches the floor itself, not the first halving
+    under it (10,000 -> 5,000 -> 2,500 -> 1,250 -> 1,000)."""
+    from pyrxd.eth_wallet.disposition import LOG_MIN_CHUNK_BLOCKS
+
+    chain = _chain(head=25_000, finalized=24_000)
+    chain.timeout = chain.ts(20_000)
+    tx = chain.refund(23_000)
+    capped = FakeEvmEndpoint(chain, range_cap=LOG_MIN_CHUNK_BLOCKS)
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=25_000)
+    assert u.failed == {} and [log["transactionHash"] for log in u.logs] == [tx]
+
+
+async def test_a_refused_span_shorter_than_the_chunk_is_halved_not_resent():
+    """Near the end of the range the request is shorter than the chunk. Halving only the chunk
+    resent the identical request until the chunk fell below it."""
+    chain = _chain(head=3_000, finalized=2_000)
+    capped = FakeEvmEndpoint(chain, range_cap=1_500)
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=3_000)
+    assert u.failed == {}
+    assert len(capped.log_requests) == len(set(capped.log_requests))  # no request asked twice
+
+
+async def test_a_refused_span_already_at_or_under_the_floor_fails_at_once():
+    chain = _chain(head=500, finalized=400)
+    capped = FakeEvmEndpoint(chain, range_cap=400)
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=500)
+    assert str(capped.source_key) in u.failed
+    assert capped.log_requests == [(0, 500)]
 
 
 async def test_logs_newer_than_the_agreed_head_are_still_nominated():
