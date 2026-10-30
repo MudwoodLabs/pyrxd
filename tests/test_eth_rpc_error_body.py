@@ -111,6 +111,19 @@ def test_an_oversized_400_body_is_not_read() -> None:
     assert _RANGE not in str(exc)
 
 
+def test_a_400_body_one_byte_over_the_cap_is_not_read_even_when_it_parses() -> None:
+    """The read stops at cap + 1 bytes, so only the length check refuses a body that is valid JSON
+    up to there (here: a small error padded with trailing whitespace to exactly cap + 1)."""
+
+    def body(rid: Any) -> bytes:
+        doc = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": 35, "message": _RANGE}}).encode()
+        return doc + b" " * (rpc_module._MAX_ERROR_BODY_BYTES + 1 - len(doc))
+
+    exc = _get_logs(400, body)
+    assert "400" in str(exc)
+    assert _RANGE not in str(exc)
+
+
 def test_a_400_body_that_quotes_the_key_is_scrubbed() -> None:
     exc = _get_logs(400, _error(f"{_RANGE} for /v3/{_KEY}"))
     assert _RANGE in str(exc)
