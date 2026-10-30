@@ -159,11 +159,17 @@ into the same app or receiver changes nothing.
   at the default 2-of-3) it cannot delay a claim page by lagging: the tower reads the finalized block
   a quorum of endpoints stand at or above, so only a quorum that lags holds a final claim at "not yet
   final" (until the claim race squeezes), and its stall check reads the head the same way. With two endpoints the quorum is both, so one
-  lagging endpoint still delays it. The coordinator's own gate still reads the lowest finalized
+  lagging endpoint still delays it. The pages that rest on the reader alone (a taker's final-refund
+  INFO, a maker's WARN after the taker's refund, a legacy record's marking) still read the lowest
+  finalized block, so one lagging endpoint can still delay those; none of them carries value at
+  stake. The coordinator's own gate still reads the lowest finalized
   block, so after a claim page it can refuse the claim step until the lagging endpoint catches up;
   run the step again then, and check that endpoint if it does not catch up before t_rxd. A primary endpoint that
   fails every scan pages a reconcile error, but a claim another endpoint serves still pages the claim
-  race, even after that reconcile error was ACKed. A claim's finality counts only
+  race, even after that reconcile error was ACKed. With no claim served, the reconcile error stands
+  in for every other page for the swap, so an ACK of it holds for one error class and at most one
+  `--legacy-unresolved-page-after-s` bound; then it pages CRITICAL again. Fix or replace the endpoint
+  rather than re-ACKing it. A claim's finality counts only
   for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
   contract's `Claimed` event that opens H. An endpoint whose log scan names more than eight
   transactions (an honest contract emits one `Claimed` or `Refunded` log at most) is read as a

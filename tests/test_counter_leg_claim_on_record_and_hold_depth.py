@@ -208,6 +208,29 @@ def test_the_btc_claim_on_record_is_chosen_the_same_way():
     assert _claim_to_record([spender(ghost, ("a",), False)]).txid == ghost
 
 
+def test_two_sources_tied_on_unverified_claims_are_logged(caplog):
+    """Re-review of the B-2 fix, F-3: with two sources, a real claim and a ghost each nominated once and
+    neither verified cannot be told apart; the record takes the hash order and says so in the log."""
+    from pyrxd.btc_wallet.disposition import BtcSpender, SpendPath
+    from pyrxd.gravity.swap_coordinator import _claim_to_record
+
+    def spender(txid, by, verified):
+        return BtcSpender(
+            txid=txid, path=SpendPath.CLAIM, raw=b"", nominated_by=by, confirmations=None, block=None, verified=verified
+        )
+
+    real, ghost = "ab" * 32, "00" * 32
+    with caplog.at_level("WARNING", logger="pyrxd.gravity.swap_coordinator"):
+        assert _claim_to_record([spender(ghost, ("a",), False), spender(real, ("b",), False)]).txid == ghost
+    assert any("equal evidence" in r.getMessage() and ghost in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    # Honest twins: a nomination lead, or a verified claim, is no tie and logs nothing.
+    with caplog.at_level("WARNING", logger="pyrxd.gravity.swap_coordinator"):
+        assert _claim_to_record([spender(ghost, ("a",), False), spender(real, ("b", "c"), False)]).txid == real
+        assert _claim_to_record([spender(ghost, ("a",), True), spender(real, ("b",), True)]).txid == ghost
+    assert not any("equal evidence" in r.getMessage() for r in caplog.records)
+
+
 async def test_a_btc_claim_one_source_forges_is_not_the_claim_on_record(tmp_path):
     """The BTC twin through the coordinator: the maker's real claim is in the mempool and every source
     serves it, except one, which serves a claim-leaf spend carrying p whose signature does not verify
