@@ -213,9 +213,12 @@ class FakeEvmEndpoint:
         lie_nonce: int | None = None,
         pending_extra: int = 0,
         hide_receipts: tuple[str, ...] = (),
+        finalized_lag: int = 0,
     ) -> None:
         self.chain = chain
         self.lag = lag
+        #: Blocks this endpoint's ``finalized`` trails the chain's by, with an honest head.
+        self.finalized_lag = finalized_lag
         self.fork = fork
         self.forge_refunded_tx = forge_refunded_tx
         self.forge_receipt = forge_receipt
@@ -250,7 +253,7 @@ class FakeEvmEndpoint:
         return _block_hash(number, self.fork if number > self.chain.deploy_block else "")
 
     async def finalized_block_number(self) -> int:
-        return min(self.chain.finalized, self.head)
+        return min(max(self.chain.finalized - self.finalized_lag, 0), self.head)
 
     async def block_number(self) -> int:
         return self.head

@@ -49,7 +49,7 @@ from typing import Any
 from pyrxd.eth_wallet.disposition import CounterDisposition, created_contract, read_counter_disposition
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
-from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
+from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc, quorum_combiner
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.watch.quorum import EthClaimStatus
@@ -131,6 +131,30 @@ async def _scan_for_claim(rpc: EthRpc, contract_address: str, deploy_tx_hash: st
     return EthClaimStatus(claimed=True, claim_tx_hash=_to_0x_hash(tx_hash)), bool(claimed_logs)
 
 
+async def _tower_finalized_block(rpc: EthRpc | MultiSourceEthRpc) -> int:
+    """The ``finalized`` block the tower judges a claim's finality and a stall by: the value a quorum of
+    endpoints stand at or above (:func:`~pyrxd.eth_wallet.multi_rpc.quorum_combiner`), each endpoint's
+    own answer already bounded by its head.
+
+    Deliberately not ``MultiSourceEthRpc.finalized_block_number``, the MIN the coordinator's reader and
+    gate use (erring low there only delays a value-moving step). For an alert-only tower the MIN let one
+    lagging endpoint, at any index, hold a final claim at "not yet final", so the tower WATCHed where it
+    should page the claim race, and reset the stall tracker whenever its own value moved (0.27 release
+    review, A-2; the BTC twin was register R13, fixed with the quorum-vouched depth). With more
+    endpoints than the quorum (three at the default 2-of-3), one endpoint can no longer move this value
+    either way. When the quorum is every endpoint (two endpoints at the default), the quorum-th value
+    is the MIN and one lagging endpoint still holds it, as before; so does a quorum that lags. A single
+    endpoint is read as it is."""
+    return await _tower_quorum_block(rpc, "finalized_block_number")
+
+
+async def _tower_quorum_block(rpc: EthRpc | MultiSourceEthRpc, method: str) -> int:
+    """``finalized_block_number`` or ``block_number`` as a quorum of endpoints stand at or above it."""
+    if not isinstance(rpc, MultiSourceEthRpc):
+        return int(await getattr(rpc, method)())
+    return int(await rpc.eth_call_quorum(lambda s: getattr(s, method)(), label=method, combine=quorum_combiner(rpc)))
+
+
 class RpcEthChainSource:
     """``EthChainSource`` over a keyless :class:`EthRpc`, or a :class:`MultiSourceEthRpc` of several
     (read-only, no key, never touches ``p``)."""
@@ -177,31 +201,44 @@ class RpcEthChainSource:
         ``MultiSourceEthRpc.get_logs`` reads the primary alone, so a primary that hides the claim's log
         would hide it from the tower however many endpoints were configured. Each endpoint is scanned
         on its own instead, and a claim any one of them serves is the answer: a ``Claimed`` log first,
-        else an unrecognised log (fail toward paging). The primary's failure still raises, as before;
-        another endpoint's failure only drops that endpoint from the union, except
-        :class:`DeployNotCreationError`, which raises when no endpoint served a claim."""
+        else an unrecognised log (fail toward paging).
+
+        A claim another endpoint serves wins over every endpoint's failure, the primary's included. The
+        primary's failure used to raise before the others were scanned, so a primary that failed every
+        tick (one rate-limited public RPC) turned the swap's every page into one ``reconcile_error``,
+        and once the operator ACKed it a final claim the others served paged nothing (0.27 release
+        review, A-1; the primary's :class:`DeployNotCreationError` was register R17's case of it). With
+        no claim served, the primary's failure still raises, and so does any endpoint's
+        :class:`DeployNotCreationError`; another endpoint's ordinary failure only drops it."""
         endpoints = self._rpc.sources if isinstance(self._rpc, MultiSourceEthRpc) else [self._rpc]
         results: list[tuple[EthClaimStatus, bool]] = []
         not_creation: DeployNotCreationError | None = None
+        primary_failure: Exception | None = None
         for index, endpoint in enumerate(endpoints):
             try:
                 results.append(await _scan_for_claim(endpoint, contract_address, deploy_tx_hash))
             except DeployNotCreationError as exc:
+                not_creation = not_creation or exc  # any endpoint's: kept, never dropped like a failure
+            except Exception as exc:
                 if index == 0:
-                    raise  # as any primary failure: the secondaries are not scanned for a claim
-                not_creation = exc  # any endpoint's: kept, never dropped like a failure
-            except Exception:
-                if index == 0:
-                    raise  # the primary was required before the union and still is
+                    primary_failure = exc  # the primary was required before the union, and still is
+                    continue  # unless another endpoint serves a claim
                 logger.warning(
                     "ETH claim scan: endpoint %d of %d failed; scanned without it", index + 1, len(endpoints)
                 )
         for wanted_canonical in (True, False):
             for status, canonical in results:
                 if status.claimed and canonical is wanted_canonical:
+                    if primary_failure is not None or not_creation is not None:
+                        logger.warning(
+                            "ETH claim scan: a claim served beside a failed or refused read (%s); paging the claim",
+                            type(not_creation or primary_failure).__name__,
+                        )
                     return status
         if not_creation is not None:
             raise not_creation
+        if primary_failure is not None:
+            raise primary_failure
         return EthClaimStatus(claimed=False)
 
     async def claim_receipt_opens_h(self, locator: EthHtlcLocator, claim_tx_hash: str) -> bool | None:
@@ -261,11 +298,14 @@ class RpcEthChainSource:
         OPTIONAL capability (duck-typed; the observer probes for it) so a minimal source without it
         keeps the point-in-time fast path unchanged — a missing checkpoint never INVENTS a stall.
 
-        ``finalized_block_number`` already rejects an incoherent ``finalized > head`` over-report
-        (fail-closed) and returns the same head it bounded against, so ``finalized <= head`` holds for
-        the tracker by construction."""
-        finalized = await self._rpc.finalized_block_number()  # rejects finalized > head (fail-closed)
-        head = await self._rpc.block_number()
+        The ``finalized`` and head reads are quorum-th values (:func:`_tower_finalized_block`), so with
+        more endpoints than the quorum one endpoint can neither reset the tracker by moving its
+        ``finalized`` nor hold it off with a frozen head. Each endpoint's ``finalized_block_number`` rejects
+        an incoherent ``finalized > head`` over-report (fail-closed); the head is clamped below."""
+        finalized = await _tower_finalized_block(self._rpc)  # each endpoint rejects finalized > head
+        # The head by quorum too: with the MIN, one endpoint answering a frozen head kept the head's
+        # progress at 0, so the tracker never declared a stall (re-review of the A-2 fix).
+        head = await _tower_quorum_block(self._rpc, "block_number")
         # Defend the tracker's finalized <= head precondition against a head that regressed between the
         # two reads (a reorg/lagging-replica race): clamp head up to finalized rather than feed an
         # incoherent pair. A frozen finalized with head==finalized is simply "no stall" (gap 0).
@@ -302,7 +342,7 @@ class RpcEthChainSource:
         canonical = await self._rpc.canonical_block_hash(tx_block)
         if not canonical or receipt_hash_bytes != canonical:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
-        finalized = await self._rpc.finalized_block_number()  # rejects finalized > head (fail-closed)
+        finalized = await _tower_finalized_block(self._rpc)  # each endpoint rejects finalized > head
         if tx_block <= finalized:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)

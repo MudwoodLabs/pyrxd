@@ -155,9 +155,15 @@ into the same app or receiver changes nothing.
   says to refund the ETH leg once its timeout passes, but once ACKed the refund coming due does not
   page again, so watch that timeout yourself. One endpoint can add a page (an "investigate" page, or a
   fail-closed claim race when it withholds a claim's receipt or serves a log on a transaction no
-  endpoint holds), and it cannot mark a legacy record. It can delay one page: the finalized block is
-  the lowest any endpoint reports, so an endpoint that lags its head and finalized block together
-  holds a final claim at "not yet final" until the claim race squeezes. A claim's finality counts only
+  endpoint holds), and it cannot mark a legacy record. With more endpoints than the quorum (three
+  at the default 2-of-3) it cannot delay a claim page by lagging: the tower reads the finalized block
+  a quorum of endpoints stand at or above, so only a quorum that lags holds a final claim at "not yet
+  final" (until the claim race squeezes), and its stall check reads the head the same way. With two endpoints the quorum is both, so one
+  lagging endpoint still delays it. The coordinator's own gate still reads the lowest finalized
+  block, so after a claim page it can refuse the claim step until the lagging endpoint catches up;
+  run the step again then, and check that endpoint if it does not catch up before t_rxd. A primary endpoint that
+  fails every scan pages a reconcile error, but a claim another endpoint serves still pages the claim
+  race, even after that reconcile error was ACKed. A claim's finality counts only
   for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
   contract's `Claimed` event that opens H. An endpoint whose log scan names more than eight
   transactions (an honest contract emits one `Claimed` or `Refunded` log at most) is read as a

@@ -632,7 +632,15 @@ async def read_counter_disposition(
         if log["topics"][0] == refunded_topic:
             refunds.add(log["transactionHash"])
         else:
-            claims.setdefault(log["transactionHash"], log)
+            # One transaction's log can come in several variants (block number or hash per endpoint);
+            # its nominations are every endpoint that served any of them, so one endpoint serving a
+            # variant cannot cut a real claim's count to its own (0.27 release review of B-2).
+            prior = claims.get(log["transactionHash"])
+            if prior is None:
+                claims[log["transactionHash"]] = log
+            else:
+                by = tuple(dict.fromkeys((*prior["nominated_by"], *log["nominated_by"])))
+                claims[log["transactionHash"]] = {**prior, "nominated_by": by}
     for h in recorded_claim_hashes:
         # A claim the record kept, nominated by the record itself: verified by its receipt like any other
         # nomination, so a pruned log cannot hide it (Mythos review of #850 PR 7b, F1).

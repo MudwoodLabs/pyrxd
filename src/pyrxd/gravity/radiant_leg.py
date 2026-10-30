@@ -611,6 +611,41 @@ class RadiantChainIO:
                 tip_headers.append((label, served[0], served[1], tip))
         return DepthReports(reported=tuple(reported), funding_tx=tuple(funding_tx), tip_headers=tuple(tip_headers))
 
+    async def funding_tx_depths(self, txid: str) -> tuple[tuple[str, int], ...]:
+        """``((operator, confirmations), ...)``: the verbose ``confirmations`` each configured source
+        (``client``, ``proof_client`` and every ``depth_sources`` reader, a client over several
+        operators' URLs once per operator) reports for *txid*, as :attr:`DepthReports.funding_tx` does,
+        without the tip and header reads. A source that fails, times out, reports no positive count or
+        names another transaction is left out. Nothing here is proved; callers take the lowest where
+        one over-reporting source must not move a decision (0.27 release review, B-1)."""
+        asked: list[tuple[int, Any]] = []
+        made: list[Any] = []
+        for index, src in enumerate(self._distinct_sources()):
+            if self._splits(src):
+                parts = tuple(src.per_source_clients())
+                made.extend(parts)
+                asked.extend((index, part) for part in parts)
+            else:
+                asked.append((index, src))
+
+        async def one(index: int, src: Any) -> tuple[str, int] | None:
+            try:
+                confs, _tip = await asyncio.wait_for(
+                    self._ask_one(index, src, txid, 0, with_tip=False), self._depth_timeout_s
+                )
+            except asyncio.TimeoutError:
+                logger.debug("depth source %d did not answer within %.1f s", index, self._depth_timeout_s)
+                return None
+            return None if confs is None else (self._operator_label(index, src), confs)
+
+        try:
+            answers = await asyncio.gather(*(one(index, src) for index, src in asked))
+        finally:
+            for part in made:
+                with contextlib.suppress(Exception):
+                    await part.close()
+        return tuple(a for a in answers if a is not None)
+
     async def _ask_depths(
         self, asked: list[tuple[int, Any]], txid: str, height: int
     ) -> tuple[tuple[str, int | None, int | None, tuple[int, tuple[bytes, ...]] | None], ...]:
@@ -656,10 +691,13 @@ class RadiantChainIO:
         return (start, got) if got else None
 
     @staticmethod
-    async def _ask_one(index: int, src: Any, txid: str, height: int) -> tuple[int | None, int | None]:
+    async def _ask_one(
+        index: int, src: Any, txid: str, height: int, *, with_tip: bool = True
+    ) -> tuple[int | None, int | None]:
         """``(confirmations, tip)`` one source reports: its verbose ``confirmations`` for *txid*
         (``None`` unless it answered that read with a positive count) and its tip height (``None``
-        unless it answered one at or above *height*); a read that fails is ``None``.
+        unless it answered one at or above *height*, and never read without ``with_tip``); a read that
+        fails is ``None``.
 
         The two reads are asked ONE AFTER THE OTHER. Only different sources run concurrently: two
         concurrent first calls on one fresh ``ElectrumXClient`` would each open a connection, and
@@ -693,7 +731,7 @@ class RadiantChainIO:
                 logger.debug("depth source %d gave no tip height", index, exc_info=True)
                 return None
 
-        return await confirmations(), await from_tip()
+        return await confirmations(), (await from_tip() if with_tip else None)
 
     async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
         """Mempool-AWARE liveness of a covenant outpoint — the complement to

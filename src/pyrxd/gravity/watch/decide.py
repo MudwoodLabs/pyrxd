@@ -739,6 +739,7 @@ SITUATION_ETH_EXPIRED_EMPTY_BOTH_LOCKED = "eth_expired_empty_both_locked"
 SITUATION_ETH_EXPIRED_EMPTY_OPEN = "eth_expired_empty_open"
 SITUATION_ETH_EXPIRED_EMPTY_CLOSED = "eth_expired_empty_closed"
 SITUATION_LEGACY_ETH_UNSETTLED = "legacy_eth_unsettled"
+SITUATION_LEGACY_ETH_REFUND_RUNNABLE = "legacy_eth_refund_runnable"
 SITUATION_LEGACY_UNCLASSIFIED_CLAIM = "legacy_unclassified_claim"
 
 
@@ -1767,8 +1768,14 @@ def _decide_eth(
             policy=policy,
             safety_window_blocks=safety_window_blocks,
         )
+        # On an UNKNOWN read the claim may be real: one forked endpoint makes the reader UNKNOWN and the
+        # claim's finality un-assessable while the others serve a final claim. The honest tower pages
+        # that CRITICAL, re-paged until ACKed, so the refund page set aside for it is CRITICAL too, not
+        # one WARN (0.27 release review, A-3, taker and maker alike). A clean read keeps the WARN.
+        urgent = obs.eth_disposition is DispositionKind.UNKNOWN and base.intent is Intent.PAGE_REFUND
         return dataclasses.replace(
             base,
+            urgent=base.urgent or urgent,
             reason=base.reason
             + (
                 "; the reader could not read the ETH contract and the detection scan names a log on it that no "
@@ -2009,13 +2016,21 @@ def _decide_eth(
                 situation=SITUATION_MAKER_REFUND_T_RXD_NEAR,
             )
         if refund_due:
+            # The step runs once the ETH timeout has passed. That moment pages under its own situation:
+            # the page sent while the timeout was ahead is one WARN, and the same situation stayed live
+            # across the transition, so mutual_refund becoming runnable never paged (0.27 release review,
+            # A-5; the BTC twin is the runnable split above). Not urgent: past its timeout the contract
+            # refuses a claim, so nothing races the refund.
+            deadline_s = terms.eth_timeout_unix_s
+            runnable = obs.now_unix_s is not None and deadline_s is not None and obs.now_unix_s >= deadline_s
             return Decision(
                 Intent.PAGE_REFUND,
-                reason=_BOTH_LOCKED_REFUND_REASON_ETH,
+                reason=_BOTH_LOCKED_REFUND_REASON_ETH
+                + (f" The ETH timeout {deadline_s} has passed: mutual_refund can run now." if runnable else ""),
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
-                situation=SITUATION_BOTH_LOCKED_REFUND_DUE,
+                situation=SITUATION_BOTH_LOCKED_REFUND_RUNNABLE if runnable else SITUATION_BOTH_LOCKED_REFUND_DUE,
             )
         return Decision(
             Intent.WATCH,
@@ -2480,7 +2495,13 @@ def _decide_legacy_eth(*, record: SwapRecord, observations: Observations, policy
                 ),
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
-                situation=SITUATION_LEGACY_ETH_UNSETTLED,
+                # Past the timeout the refund can run: its own situation, so the page sent while the
+                # contract was OPEN is not the only one this record gets (0.27 release review, A-5).
+                situation=(
+                    SITUATION_LEGACY_ETH_UNSETTLED
+                    if kind is DispositionKind.OPEN
+                    else SITUATION_LEGACY_ETH_REFUND_RUNNABLE
+                ),
             ),
             kind.value,
         )
