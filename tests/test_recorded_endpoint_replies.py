@@ -122,25 +122,12 @@ _GETLOGS_RECORDS = {
 }
 
 
-#: The recording shows drpc and Blast refuse a wide range with HTTP 400 and the reason in the body.
-#: web3's HTTP provider raises on the 400 status before the body is read, so the text that reaches
-#: ``disposition._is_range_limit`` is "400, message='Bad Request'" and the reason is lost: the
-#: chunk is never halved, and against drpc (which refuses the 10,000-block chunk the code asks
-#: for) or Blast (10 blocks) every log scan fails. That fails safe (a failed scan is never "no
-#: logs") but those endpoints never answer. Derived from the recording, not typed: every
-#: "range_limit" reply that came back with HTTP 400. Strict: the fix flips these and deletes this.
-_KNOWN_LOST_IN_HTTP_400 = {
-    key
-    for key, expected in _GETLOGS_EXPECTED.items()
-    if expected == "range_limit" and _GETLOGS_RECORDS[key]["status"] == 400
-}
-_LOST_REASON = "the provider's reason is in a 400 body that web3 never reads"
-
-
 def test_every_recorded_getlogs_reply_has_an_expectation() -> None:
     assert _GETLOGS_RECORDS
     assert set(_GETLOGS_RECORDS) == set(_GETLOGS_EXPECTED)
-    assert _KNOWN_LOST_IN_HTTP_400  # the derivation found the replies it describes
+    # drpc and Blast send their range-limit reason with HTTP 400; it must still reach the halving
+    # rule (``eth_wallet/rpc.py``, ``_ERROR_BODY_STATUSES``). Derived, so the cases it names exist.
+    assert any(_GETLOGS_EXPECTED[k] == "range_limit" and r["status"] == 400 for k, r in _GETLOGS_RECORDS.items())
 
 
 class _Replay:
@@ -194,17 +181,7 @@ async def _get_logs_through_ethrpc(url: str) -> Any:
         await rpc.close()
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        pytest.param(
-            k,
-            id=f"{k[0]}-{k[1]}",
-            marks=pytest.mark.xfail(k in _KNOWN_LOST_IN_HTTP_400, strict=True, reason=_LOST_REASON),
-        )
-        for k in sorted(_GETLOGS_EXPECTED)
-    ],
-)
+@pytest.mark.parametrize("key", sorted(_GETLOGS_EXPECTED), ids=lambda k: f"{k[0]}-{k[1]}")
 def test_a_recorded_getlogs_reply_is_classified_as_intended(key: tuple[str, str]) -> None:
     record = _GETLOGS_RECORDS[key]
     server = _Replay(lambda req: (record["status"], record.get("content_type", ""), _with_id(record["body"], req)))
@@ -246,13 +223,7 @@ def _drpc_like(limit: int, refusal: dict[str, Any], tip: int) -> Any:
 
 @pytest.mark.parametrize(
     ("host", "limit"),
-    [
-        pytest.param(
-            host, limit, marks=pytest.mark.xfail(key in _KNOWN_LOST_IN_HTTP_400, strict=True, reason=_LOST_REASON)
-        )
-        for host, limit in [("eth.drpc.org", disposition.LOG_CHUNK_BLOCKS), ("eth-mainnet.public.blastapi.io", 11)]
-        for key in [(host, "get_logs_chunk_quiet")]
-    ],
+    [("eth.drpc.org", disposition.LOG_CHUNK_BLOCKS), ("eth-mainnet.public.blastapi.io", 11)],
 )
 def test_a_range_limited_endpoint_still_completes_the_scan(host: str, limit: int) -> None:
     """Liveness under the recorded refusals: the scan halves until the endpoint accepts, and ends."""
