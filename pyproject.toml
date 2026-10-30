@@ -393,6 +393,10 @@ check-coverage-omissions = "python3 scripts/check_coverage_omissions.py"
 # tests/vendor/radiant_core/README.md. The scheduled owner is the `vendor-freshness` job
 # in .github/workflows/integration.yml; this task is the same check by hand.
 check-vendor = "python3 scripts/refresh_radiant_core_vendor.py --check"
+# `task test-chunked` runs what `task test` runs (minus xdist and coverage) as several fresh
+# pytest processes, so it fits a memory-limited machine such as the review sandbox guest. Not
+# a CI gate: CI runs `task test`. See the script's docstring.
+test-chunked = "python scripts/run_tests_in_chunks.py"
 # `task test-regtest` runs the node-backed suites the per-push integration lane runs
 # (.github/workflows/integration.yml, job `regtest-core`). Needs docker and the
 # radiant-core regtest image — build it once with `pyrxd regtest setup`. Each module
