@@ -153,13 +153,14 @@ class _EthTower:
     async def decide(self):
         return decide(record=self.record(), observations=await self.observe(), policy=_policy(), safety_window_blocks=6)
 
-    def reconciler(self, alerter=None) -> Reconciler:
+    def reconciler(self, alerter=None, **kw) -> Reconciler:
         return Reconciler(
             store=self.store,
             observer=self.observer,
             alerter=self.pages if alerter is None else alerter,
             policy=_policy(),
             safety_window_blocks=SAFETY,
+            **kw,
         )
 
     def marker(self) -> dict | None:

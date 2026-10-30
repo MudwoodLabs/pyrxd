@@ -135,6 +135,18 @@ def legacy_unresolved_bound_s(policy: MarginPolicy) -> float:
     return max(DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S, 2 * legacy_honest_wait_s(policy))
 
 
+def reconcile_error_repage_s(policy: MarginPolicy, safety_window_blocks: int) -> float:
+    """How long an ACK of one reconcile error holds before the same fault pages again: the safety
+    window in seconds (at least one Radiant block), at the policy's fast block interval when it has
+    one, so blocks arriving fast do not outrun it. While observe/decide fails, every other page for
+    the swap is pre-empted, so a blind tower must not stay quiet for longer than the margin it keeps
+    before a deadline (re-review of the 0.27 fixes, F-1 and its review)."""
+    interval = float(policy.rxd_block_interval_s)
+    if policy.rxd_block_interval_fast_s is not None:
+        interval = min(interval, float(policy.rxd_block_interval_fast_s))
+    return float(max(1, safety_window_blocks)) * interval
+
+
 def _legacy_evidence(record: SwapRecord, obs: Observations) -> dict[str, Any]:
     """What a D9 marker records its verdict rests on: the counter leg's disposition read (#850 PR 9b
     for BTC, PR 10 for ETH)."""
@@ -167,7 +179,8 @@ def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
 
 class Reconciler:
     """Reconciler. Inject the store/observer/alerter ports. Its only state across ticks is when each
-    legacy record's D9 read became unresolved (#921), kept in memory: a restart starts the bound over."""
+    legacy record's D9 read became unresolved (#921) and when each swap's observe/decide began failing
+    (F-1), kept in memory: a restart starts both over."""
 
     def __init__(
         self,
@@ -220,6 +233,9 @@ class Reconciler:
         # Legacy records this reconciler sent (or tried to send) the unresolved page for: a record
         # marked checked is never read again, so that page is ACKed here when it is (review MED-1).
         self._legacy_paged: set[str] = set()
+        # swap_id -> clock reading when its observe/decide began failing (re-review of the 0.27 fixes, F-1).
+        self._error_since: dict[str, float] = {}
+        self._error_repage_s = reconcile_error_repage_s(policy, safety_window_blocks)
 
     @property
     def alerter(self) -> Alerter:
@@ -361,6 +377,19 @@ class Reconciler:
         delivered = await self._safe_handle(swap_id, decision)
         return ReconcileResult(swap_id, decision, error=error, alert_delivered=delivered, legacy=True)
 
+    def _error_situation(self, swap_id: str, exc: Exception) -> str:
+        """The situation of a reconcile-error page: the error's class and how many bounds it has lasted.
+
+        While observe/decide fails, every other page for the swap is pre-empted, so an ACK of the error
+        page used to silence the swap for as long as the fault lasted: a refund that became due or
+        runnable meanwhile paged nothing (re-review of the 0.27 fixes, F-1). A new error class, or each
+        further :func:`reconcile_error_repage_s` of the same fault, is a new situation, so an ACK holds
+        for one class and at most one safety window."""
+        now = self._clock()
+        since = self._error_since.setdefault(swap_id, now)
+        period = int((now - since) // self._error_repage_s)
+        return f"{SITUATION_RECONCILE_ERROR}:{type(exc).__name__}:{period}"
+
     async def _reconcile_one(self, swap_id: str, record: SwapRecord) -> ReconcileResult:
         if swap_id in self._inflight:
             # Another (overlapping) tick is already on this swap — skip, don't double-act.
@@ -377,6 +406,7 @@ class Reconciler:
                     policy=self._policy,
                     safety_window_blocks=self._safety,
                 )
+                self._error_since.pop(swap_id, None)
             except Exception as exc:  # observe/decide failure must not crash the loop
                 err = f"{type(exc).__name__}: {exc}"
                 logger.exception("reconcile failed for swap %s", swap_id)
@@ -384,7 +414,7 @@ class Reconciler:
                     Intent.PAGE_SQUEEZED,
                     reason=f"reconcile error, fail-closed (investigate manually): {err}",
                     recommended_action="investigate",
-                    situation=SITUATION_RECONCILE_ERROR,
+                    situation=self._error_situation(swap_id, exc),
                 )
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, error=err, alert_delivered=delivered)

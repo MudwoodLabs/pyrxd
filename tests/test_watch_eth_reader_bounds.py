@@ -243,7 +243,7 @@ async def test_one_endpoints_malformed_receipt_pages_the_claim_race_not_a_reconc
     assert d.intent is Intent.PAGE_SQUEEZED and d.situation == decide_mod.SITUATION_CLAIM_RACE_UNASSESSABLE
     await w.reconciler().tick()
     assert [(s, p.situation) for s, p in w.pages.got] == [("e1", decide_mod.SITUATION_CLAIM_RACE_UNASSESSABLE)]
-    assert all(p.situation != SITUATION_RECONCILE_ERROR for _s, p in w.pages.got)
+    assert not any(p.situation.startswith(SITUATION_RECONCILE_ERROR) for _s, p in w.pages.got)
 
 
 @pytest.mark.parametrize("change", _MALFORMED)
