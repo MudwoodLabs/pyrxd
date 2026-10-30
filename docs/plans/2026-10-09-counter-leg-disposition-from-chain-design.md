@@ -134,7 +134,7 @@ v1 §1 stands. Corrections and additions:
   the two-host refund phases fabricate it with `with_radiant_lock`
   (`scripts/eth_swap_two_host.py:1094`, `scripts/btc_swap_two_host.py:1108`) (Mythos I1).
 - **The taker discards the covenant outpoint it verified.** `taker_funds_btc` binds
-  `_rerun_outpoint` and drops it (`swap_coordinator.py:2871`). A taker record at `BTC_LOCKED`
+  `_rerun_outpoint` and drops it (now `swap_coordinator.py:3022`). A taker record at `BTC_LOCKED`
   therefore has no outpoint, and re-discovery by scan can be steered by anyone paying the
   covenant SPK (`find_covenant_utxo`, now `radiant_leg.py:356-359`) (Opus B7, Mythos L2).
 - **The covenant-refund comment is false under F-A.** The comment (now `radiant_leg.py:1587-1591`, corrected by PR 6) said "the

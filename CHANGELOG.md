@@ -822,9 +822,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `reconcile_error`; once that page was ACKed, a final claim the other endpoints served paged
     nothing. With no claim served, the primary's failure, or any endpoint's
     `DeployNotCreationError`, still raises and pages. That reconcile error still pre-empts every
-    other page for the swap, so its situation now carries the error's class and how many
-    `legacy_unresolved_page_after_s` bounds the fault has lasted: an ACK holds for one class and at
-    most one bound, then the page is CRITICAL again. Before, an ACKed reconcile error kept a refund
+    other page for the swap, so its situation now carries the error's class and how many safety
+    windows (`--safety-window-blocks` times the Radiant block interval) the fault has lasted: an ACK
+    holds for one class and at most one window, then the page is CRITICAL again. Before, an ACKed reconcile error kept a refund
     that came due or runnable meanwhile quiet for as long as the fault lasted (re-review, F-1).
   - The tower judges a claim's finality, and feeds its stall tracker, with the `finalized` block
     (and, for the tracker, the head) a quorum of endpoints stand at or above, not the lowest any
@@ -849,16 +849,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     on every later read. The ETH reader now counts every endpoint that served any variant of a
     transaction's log among its nominations. This holds from three sources up: with two, one source
     that withholds the real claim's log and receipt and serves another ties it, neither verifies, and
-    the tie falls to the hash. The coordinator logs that tie; a claim that later verifies replaces it
-    (re-review, F-3).
+    the tie falls to the hash, and the coordinator logs that tie (re-review, F-3). The recorded claim
+    is replaced only when the read becomes `CLAIMED` with its transaction, which that liar prevents by
+    withholding the receipt. With one of three sources down the claims can tie the same way.
   - The covenant age that lifts the D14 hold (a refunded counter leg held open while a claim on
     record makes p public) is the lowest depth any configured Radiant operator reports for the
     covenant's funding transaction (`RadiantChainIO.funding_tx_depths`), the primary's included.
     Before, one over-reporting server could end the record while the covenant was still claimable.
     A source that does not answer is left out; one that under-reports keeps the hold, and the
     coordinator logs which. A source that reports the funding transaction unconfirmed (0) is an
-    answer, not a silence, so it keeps the hold too (re-review, F-4). The shipped runners configure
-    one Radiant client, so this takes effect when `depth_sources` or a multi-operator client is set.
+    answer, not a silence, so it keeps the hold too (re-review, F-4). The operators asked are the
+    client, the proof client and any `depth_sources`, a multi-operator client once per operator. The
+    mainnet runners that pass `mainnet_proof_client()` (pyrxd's default endpoints) ask more than one.
 - **Watchtower: a legacy record's D9 check that one endpoint holds without a verdict now pages
   (#921).** Before, a failed or retried read of a pre-0.27 terminal record was silent on every tick.
   One endpoint could keep it there for good: an old finalized block (the reader takes the lowest)

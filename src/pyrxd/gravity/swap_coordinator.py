@@ -6445,8 +6445,8 @@ def _claim_to_record(claims_seen: Sequence[Any]) -> Any:
 
     This holds from three sources up. With two, one source that withholds the real claim's log and
     receipt and serves another ties it one nomination to one, and neither verifies; no rule can tell
-    them apart, so the tie falls to the hash and is logged (re-review of the B-2 fix, F-3). A claim that
-    later verifies replaces it on the CLAIMED path."""
+    them apart, so the tie falls to the hash and is logged (re-review of the B-2 fix, F-3). The record
+    is replaced only when a read is CLAIMED with its transaction, which that liar can prevent."""
 
     def rank(c: Any) -> tuple[bool, int]:
         return (not c.verified, -len(set(c.nominated_by)))

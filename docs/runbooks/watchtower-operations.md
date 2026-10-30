@@ -168,7 +168,7 @@ into the same app or receiver changes nothing.
   fails every scan pages a reconcile error, but a claim another endpoint serves still pages the claim
   race, even after that reconcile error was ACKed. With no claim served, the reconcile error stands
   in for every other page for the swap, so an ACK of it holds for one error class and at most one
-  `--legacy-unresolved-page-after-s` bound; then it pages CRITICAL again. Fix or replace the endpoint
+  safety window (`--safety-window-blocks` times `--rxd-block-interval-s`); then it pages CRITICAL again. Fix or replace the endpoint
   rather than re-ACKing it. A claim's finality counts only
   for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
   contract's `Claimed` event that opens H. An endpoint whose log scan names more than eight
