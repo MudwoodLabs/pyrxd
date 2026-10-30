@@ -742,9 +742,11 @@ async def test_a_hidden_claim_after_a_params_mismatch_beside_a_broken_read_says_
     assert "does not count as a claim" not in d.reason
 
 
-async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp_path):
-    """One endpoint that fails drops out of the scan; the primary failing still raises (the reconciler
-    pages a decision-required), as before the union."""
+async def test_the_scan_survives_a_failed_secondary_and_a_failed_primary(tmp_path):
+    """One endpoint that fails drops out of the scan, and a claim another serves wins even when the
+    primary fails too (0.27 release review, A-1). With every endpoint failing, it raises (the reconciler
+    pages a decision-required); a failed primary beside no claim is
+    ``test_HONEST_a_failing_primary_with_no_claim_anywhere_still_raises``."""
     w = _EthTower(tmp_path)
     claim = w.chain.claim(CLAIM_BLOCK)
     addr, deploy = w.chain.locator().contract_address, w.chain.deploy_tx
@@ -756,6 +758,9 @@ async def test_the_scan_survives_a_failed_secondary_and_not_a_failed_primary(tmp
     status = await w.observer._eth.claim_status(addr, deploy)
     assert status.claimed is True and status.claim_tx_hash == claim
     w.endpoints[0].get_logs = _boom
+    status = await w.observer._eth.claim_status(addr, deploy)
+    assert status.claimed is True and status.claim_tx_hash == claim
+    w.endpoints[2].get_logs = _boom
     with pytest.raises(NetworkError):
         await w.observer._eth.claim_status(addr, deploy)
 
@@ -1267,7 +1272,8 @@ async def test_a_legacy_refund_that_never_landed_pages_and_is_never_marked(tmp_p
         [res] = await w.reconciler().tick()
         assert res.legacy is True
         assert res.decision.intent is Intent.PAGE_REFUND
-        assert res.decision.situation == decide_mod.SITUATION_LEGACY_ETH_UNSETTLED
+        # The fake chain is past the contract's timeout, so the refund can run (0.27 release review, A-5).
+        assert res.decision.situation == decide_mod.SITUATION_LEGACY_ETH_REFUND_RUNNABLE
         assert "refund()" in res.decision.recommended_action
     assert w.marker() is None
 
