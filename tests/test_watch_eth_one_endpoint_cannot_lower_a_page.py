@@ -29,14 +29,16 @@ from pyrxd.gravity.swap_state import RecordRole, SwapState
 from pyrxd.gravity.watch.alerts import DedupAlerter, Severity, ack_id
 from pyrxd.gravity.watch.decide import Intent
 from pyrxd.gravity.watch.eth_adapters import RpcEthChainSource
-from pyrxd.gravity.watch.reconciler import SITUATION_RECONCILE_ERROR
+from pyrxd.gravity.watch.reconciler import SITUATION_RECONCILE_ERROR, reconcile_error_repage_s
 from pyrxd.security.errors import NetworkError
 from tests.test_watch_eth_disposition_table import (
     CLAIM_BLOCK,
+    SAFETY,
     SWAP,
     TIMEOUT_BLOCK,
     _Endpoint,
     _EthTower,
+    _policy,
     decide_mod,
 )
 
@@ -106,7 +108,7 @@ async def test_an_acked_reconcile_error_does_not_swallow_a_later_claim(tmp_path,
     rec = w.reconciler(alerter=alerter)
 
     (first,) = await rec.tick()
-    assert first.decision.situation .startswith(SITUATION_RECONCILE_ERROR)
+    assert first.decision.situation.startswith(SITUATION_RECONCILE_ERROR)
     assert channel.sent and channel.sent[-1].severity is Severity.CRITICAL
     swap, key = _ack_line(channel.sent[-1])
     assert swap == ack_id(SWAP) and alerter.ack(SWAP, key) is True
@@ -131,7 +133,7 @@ async def test_HONEST_a_failing_primary_with_no_claim_anywhere_still_raises(tmp_
         await w.observer._eth.claim_status(w.chain.locator().contract_address, w.chain.deploy_tx)
     channel = _Channel()
     (res,) = await w.reconciler(alerter=DedupAlerter(channel=channel)).tick()
-    assert res.decision.situation .startswith(SITUATION_RECONCILE_ERROR)
+    assert res.decision.situation.startswith(SITUATION_RECONCILE_ERROR)
     assert channel.sent[-1].severity is Severity.CRITICAL
 
 
@@ -152,15 +154,18 @@ async def test_an_acked_reconcile_error_does_not_outlive_its_bound_or_its_class(
     _fail(w.endpoints[0], "get_logs")
     channel, clock = _Channel(), _Clock()
     alerter = DedupAlerter(channel=channel)
-    rec = w.reconciler(alerter=alerter, legacy_unresolved_page_after_s=21_600.0, clock=clock)
+    rec = w.reconciler(alerter=alerter, clock=clock)
+    bound = reconcile_error_repage_s(_policy(), SAFETY)
+    assert 0 < bound < 21_600.0  # one safety window, not the legacy bound
 
     (first,) = await rec.tick()
     assert first.decision.situation.startswith(SITUATION_RECONCILE_ERROR)
     swap, key = _ack_line(channel.sent[-1])
+    assert swap == ack_id(SWAP)
     assert alerter.ack(SWAP, key) is True and alerter.unacked_critical_count() == 0
     before = len(channel.sent)
 
-    clock.now += 21_599.0  # inside the bound, same class: the ACK holds (honest twin)
+    clock.now += bound - 1.0  # inside the bound, same class: the ACK holds (honest twin)
     await rec.tick()
     assert len(channel.sent) == before and alerter.unacked_critical_count() == 0
 
@@ -179,6 +184,17 @@ async def test_an_acked_reconcile_error_does_not_outlive_its_bound_or_its_class(
     w.endpoints[0].get_logs = _other  # a new error class is a new situation
     await rec.tick()
     assert len(channel.sent) == before + 1 and channel.sent[-1].severity is Severity.CRITICAL
+    _swap, key = _ack_line(channel.sent[-1])
+    assert alerter.ack(SWAP, key) is True
+    before = len(channel.sent)
+
+    # A tick that succeeds ends the fault: a later fault starts its bound over, at period 0.
+    w.endpoints[0].get_logs = w.endpoints[1].get_logs
+    await rec.tick()
+    w.endpoints[0].get_logs = _other
+    clock.now += bound + 1.0
+    (again,) = await rec.tick()
+    assert again.decision.situation.endswith(":ValueError:0"), again.decision.situation
 
 
 async def test_HONEST_a_failing_secondary_with_no_claim_is_no_claim(tmp_path):
