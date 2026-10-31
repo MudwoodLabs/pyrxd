@@ -1163,6 +1163,23 @@ class TestPolicyRejectionClassification:
         assert not isinstance(err, (PolicyRejection, RpcMethodNotFound)), method
         assert str(err) == "ElectrumX RPC error (code 1)"  # no server text in a fault's message
 
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            # Radiant-Core's own wording (src/node/transaction.cpp, read 2026-10-31). None of these
+            # reasons carries a marker, so the code alone must make them verdicts.
+            (-25, "Missing inputs"),
+            (-26, "some-rule-this-client-does-not-know (code 16)"),
+            (-27, "transaction already in block chain"),
+        ],
+    )
+    def test_each_verdict_code_alone_makes_a_broadcast_answer_a_verdict(self, code, message) -> None:
+        assert not any(marker in message.lower() for marker in electrumx._POLICY_MESSAGE_MARKERS)
+        err = _broadcast_error(code, message)
+        assert isinstance(err, PolicyRejection)
+        assert err.code == code
+        assert err.reason == message
+
     def test_code_1_on_a_broadcast_with_no_reason_is_still_a_verdict(self) -> None:
         # Honest pair of the read case: a broadcast rejection is classified by code alone.
         err = _broadcast_error(1, "")
@@ -1199,6 +1216,14 @@ class TestPolicyRejectionClassification:
         assert isinstance(err, NetworkError)
         assert not isinstance(err, (PolicyRejection, RpcMethodNotFound))
         assert str(err) == f"ElectrumX RPC error (code {code})"  # no server text in a fault's message
+
+    def test_a_read_refusal_carries_only_sanitized_server_text(self) -> None:
+        """It leaves the module as a NetworkError (see _VerdictShaped): its message stays static and
+        its ``reason`` is the sanitizer's output, never the raw server text."""
+        raw_hex = "cd" * 300
+        err = _rpc_error(-26, f"dust \x1b[31mred {raw_hex}\nsecond line")
+        assert str(err) == "ElectrumX RPC error (code -26)"
+        assert err.reason == "dust [31mred <redacted>"
 
     @pytest.mark.parametrize(
         ("code", "message"),
@@ -1270,6 +1295,41 @@ class TestServerMessageSanitization:
         err = _broadcast_error(1, "dust\nsecond line with detail\nthird line")
         assert "second line" not in str(err)
         assert "third line" not in str(err)
+
+    # ElectrumX's own wording of a failed broadcast (Radiant-Core/ElectrumX and
+    # Radiant-Core/RXinDexer, electrumx/server/session.py, read 2026-10-31): the node's reason is
+    # on the third line and the raw transaction on the fourth.
+    _WRAPPER = "the transaction was rejected by network rules.\n\n{}\n[{}]"
+
+    def test_electrumx_wrapper_keeps_the_node_reason_line(self) -> None:
+        raw_hex = "02000000" + "ab" * 200
+        err = _broadcast_error(1, self._WRAPPER.format("txn-mempool-conflict (code 18)", raw_hex))
+        assert err.reason == "the transaction was rejected by network rules. txn-mempool-conflict (code 18)"
+        assert raw_hex[:20] not in str(err)
+
+    def test_electrumx_wrapper_with_an_empty_reason_does_not_keep_the_raw_tx(self) -> None:
+        raw_hex = "02000000" + "ab" * 200
+        err = _broadcast_error(1, self._WRAPPER.format("", raw_hex))
+        assert err.reason == "the transaction was rejected by network rules."
+
+    def test_electrumx_wrapper_keeps_one_line_only(self) -> None:
+        err = _broadcast_error(1, "the transaction was rejected by network rules.\n\nMissing inputs\nthird\nfourth")
+        assert err.reason == "the transaction was rejected by network rules. Missing inputs"
+
+    def test_electrumx_wrapper_reason_line_is_sanitized(self) -> None:
+        err = _broadcast_error(1, self._WRAPPER.format("dust \x1b[31mred " + "cd" * 300, "00"))
+        assert "\x1b" not in str(err)
+        assert "cd" * 20 not in str(err)
+        assert "<redacted>" in str(err)
+
+    def test_a_short_fragment_at_the_clip_inside_the_wrapper_reason_is_not_leaked(self) -> None:
+        # The clip can land inside the reason line now that it is kept: the same short-fragment
+        # rule must apply to it as to a first line.
+        secret = "c0ffee" * 2_000_000
+        padded = "the transaction was rejected by network rules.\n\ndust " + "x" * electrumx._MAX_SCANNED_CHARS
+        out = _sanitize_server_message(padded[: electrumx._MAX_SCANNED_CHARS - 4] + " " + secret)
+        assert out.endswith("dust <redacted>"), out  # the 3-char fragment "c0f" is dropped
+        assert "c0f" not in out
 
     def test_control_characters_are_stripped(self) -> None:
         err = _broadcast_error(1, "dust \x1b[31mred\x00nul\ttab")

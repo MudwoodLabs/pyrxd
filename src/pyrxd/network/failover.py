@@ -49,7 +49,8 @@ What is retried, and what is not
   shopping for a node that likes a rejected transaction is the opposite of what a
   failover layer should do. Only a broadcast gets one: the same reject code or reason
   on a read asks a node to judge nothing, so it moves on to the next endpoint like a
-  ``-32601`` does, without dropping the server.
+  ``-32601`` does, without dropping the server. A call that may not be resent (a
+  non-idempotent ``call_extension``) raises it instead, also without dropping the server.
 """
 
 from __future__ import annotations
@@ -601,6 +602,8 @@ class FailoverElectrumXClient:
                 "(JSON-RPC -32601)"
             ) from last_exc
         detail = f"; {unsupported} of them do not implement the method" if unsupported else ""
+        if refused:
+            detail += f"; {refused} of them refused the request"
         raise NetworkError(
             f"{description} failed on all {len(self._order)} ElectrumX endpoint(s){detail}"
         ) from last_exc

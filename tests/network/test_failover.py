@@ -221,6 +221,7 @@ async def test_a_reject_code_or_reason_on_a_read_is_asked_of_the_next_endpoint(c
     await client.get_tip_height()
     assert fakes[B].calls
     assert fakes[A].closed == 0
+    assert client.active_url == A, "a refusal does not demote the server"
 
 
 async def test_a_reject_reason_answering_a_custom_clients_broadcast_is_still_a_verdict() -> None:
@@ -252,6 +253,19 @@ async def test_a_code_1_read_refused_everywhere_still_fails() -> None:
     with pytest.raises(NetworkError, match="all 2 ElectrumX endpoint") as caught:
         await client.get_tip_height()
     assert not isinstance(caught.value, (PolicyRejection, RpcMethodNotFound))
+    # Every server answered, so the message must not read as "all down" (the shape at line ~409).
+    assert str(caught.value) == "get_tip_height failed on all 2 ElectrumX endpoint(s); 2 of them refused the request"
+    assert "out of range" not in str(caught.value), "no server text in the message"
+
+
+async def test_one_refusal_and_one_fault_both_show_in_the_message() -> None:
+    client, fakes = build([A, B])
+    fakes[A].tip_error = _rpc_error(-26, "rejected")
+    fakes[B].tip_error = NetworkError("down")
+
+    with pytest.raises(NetworkError) as caught:
+        await client.get_tip_height()
+    assert str(caught.value) == "get_tip_height failed on all 2 ElectrumX endpoint(s); 1 of them refused the request"
 
 
 async def test_a_code_1_answer_to_a_non_idempotent_call_is_not_sent_again() -> None:
@@ -275,11 +289,12 @@ async def test_a_reject_answer_to_a_non_idempotent_call_keeps_the_server() -> No
     assert not any(name == "call_extension" for name, _ in fakes[B].calls)
 
 
-async def test_a_code_1_from_the_chain_check_is_still_a_fault() -> None:
+@pytest.mark.parametrize(("code", "message"), [(1, "height 0 out of range"), (-26, "rejected"), (-99, "dust")])
+async def test_a_reject_answer_from_the_chain_check_is_still_a_fault(code, message) -> None:
     """The chain check runs before the op; an endpoint that cannot answer it is not verified, so it
     is discarded and the winner promoted, as for any fault."""
     client, fakes = build([A, B], genesis=_GENESIS, verify_chain=True)
-    fakes[A].chain_error = _rpc_error(1, "height 0 out of range")
+    fakes[A].chain_error = _rpc_error(code, message)
     await client.get_tip_height()
 
     assert fakes[A].closed == 1
@@ -297,16 +312,28 @@ async def test_lacking_the_method_on_one_endpoint_and_refusing_on_another_is_not
     assert not isinstance(caught.value, RpcMethodNotFound)
 
 
-async def test_a_custom_client_raising_code_1_from_broadcast_is_a_verdict() -> None:
-    """A client_factory client that does not convert code 1 itself: the failover layer converts it,
-    so a refused transaction is not sent on to the next endpoint."""
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (1, ""),
+        # Radiant-Core's own wording (src/node/transaction.cpp, read 2026-10-31): no marker in any
+        # of these, so the code alone must keep the transaction from going on to the next server.
+        (-25, "Missing inputs"),
+        (-26, "some-rule-this-client-does-not-know (code 16)"),
+        (-27, "transaction already in block chain"),
+    ],
+)
+async def test_a_custom_client_raising_a_verdict_code_from_broadcast_is_a_verdict(code, message) -> None:
+    """A client_factory client that does not convert the code itself: the failover layer converts
+    it, so a refused transaction is not sent on to the next endpoint, and the server is kept."""
     client, fakes = build([A, B])
-    fakes[A].broadcast_error = _rpc_error(1, "")
+    fakes[A].broadcast_error = _rpc_error(code, message)
 
     with pytest.raises(PolicyRejection) as caught:
         await client.broadcast(_RAW_TX)
-    assert caught.value.code == 1
+    assert caught.value.code == code
     assert fakes[B].calls == []
+    assert fakes[A].closed == 0
 
 
 async def test_call_extension_is_not_retried_by_default() -> None:
