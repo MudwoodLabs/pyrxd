@@ -388,7 +388,7 @@ async def test_a_consensus_rejection_pages_and_never_disarms_the_claim(tick, cod
         (-26, "txn-mempool-conflict (code 18)"),
         (1, "Missing inputs"),
         (-25, "Missing inputs"),
-        # A transient state wins over a permanent-looking prefix on the same reason.
+        # A transient state wins over a consensus-looking prefix on the same reason.
         (-26, "bad-txns-inputs-missingorspent"),
         (-26, "bad-txns-nonfinal"),
         (-26, "non-final (code 64)"),

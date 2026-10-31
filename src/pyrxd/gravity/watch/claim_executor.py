@@ -575,8 +575,9 @@ class ClaimExecutor:
             if not _is_consensus_rejection(exc):
                 # A conflict, a missing input, a fee, policy or unrecognised answer: a plain retry.
                 return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
-            # A consensus verdict: still retried, but paged as one, with the node's reason, every
-            # tick, so the operator sees that the claim itself may be unusable before the deadline.
+            # A consensus verdict: still retried. DECLINED and an ERROR log with the node's reason, every
+            # tick, so the operator can see the claim itself may be unusable before the deadline. The
+            # claim page (PAGE_CLAIM) fires either way; it does not carry this outcome or reason.
             logger.error(
                 "autonomous claim swap %s: node rejected the covenant claim on a consensus rule (%s) — "
                 "retrying with a new fee input; operator must check the claim before the deadline",

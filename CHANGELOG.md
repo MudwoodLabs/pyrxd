@@ -855,8 +855,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still the idempotent success). The executor never marks the claim seen on a rejection, because
   nothing clears that mark and any reason can come from one endpoint, one node's policy or this
   tick's fee input. A consensus rejection (`mandatory-script-verify-flag-failed`, `bad-txns-`) is
-  paged as one, with the node's reason, and retried on a new fee input, bounded by the capped,
-  dispense-once fee pool. Every other answer (a mempool conflict, missing inputs, non-final, an
+  returned as DECLINED and logged at ERROR with the node's reason, and retried on a new fee input,
+  bounded by the capped, dispense-once fee pool. The claim page fires as before and does not yet
+  carry the executor's outcome or the node's reason. Every other answer (a mempool conflict, missing inputs, non-final, an
   over-long chain, a fee or policy answer, or an unrecognised reason) is a plain retry. The
   executor's old permanent-rejection arm, which marked the claim seen, was never reachable through
   `RadiantChainIO` and is gone.
