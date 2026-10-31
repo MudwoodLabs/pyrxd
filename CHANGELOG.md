@@ -144,6 +144,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   minimum, as before. The same rule now decides when the coordinator bumps a pending BTC refund (it
   bumps once fewer than a quorum of sources hold it mined), and when a refund or claim is buried.
 
+- **ElectrumX: a reject code or reason on a read no longer ends failover.** A reason containing a
+  reject marker ("dust", "non-final", "bad-txns-" and the rest) or a code -25/-26/-27 made any RPC
+  error a `PolicyRejection`, including one answering a header or balance read, so one hostile
+  primary could end every read. These are now verdicts only when they answer a broadcast
+  (`ElectrumXClient.broadcast` or `FailoverElectrumXClient.broadcast`); on a read they are a
+  `NetworkError`, and the failover layer asks the next endpoint without dropping the server (a
+  non-idempotent `call_extension` raises it instead, also keeping the server).
+  What to catch now: on a read (`get_balance`, a header or merkle request, any method but a
+  broadcast) catch `NetworkError`, which is never a `PolicyRejection` there; `PolicyRejection`
+  comes only from `ElectrumXClient.broadcast` and `FailoverElectrumXClient.broadcast`. Code that
+  caught `PolicyRejection` around a read no longer sees it. The code-1 change under Fixed works
+  the same way.
+
 ### Changed
 
 - **The newest Radiant checkpoint is now block 475,776 (0.26.1 shipped 469,728) (#896, #908).**
@@ -836,13 +849,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the message said "node rejected the transaction". Code 1 is now a verdict only when it answers
   `ElectrumXClient.broadcast`; on any other method it raises a `NetworkError` that is not a
   `PolicyRejection`.
-- **ElectrumX: a reject code or reason on a read no longer ends failover.** A reason containing a
-  reject marker ("dust", "non-final", "bad-txns-" and the rest) or a code -25/-26/-27 made any RPC
-  error a `PolicyRejection`, including one answering a header or balance read, so one hostile
-  primary could end every read. These are now verdicts only when they answer a broadcast
-  (`ElectrumXClient.broadcast` or `FailoverElectrumXClient.broadcast`); on a read they are a
-  `NetworkError`, and the failover layer asks the next endpoint without dropping the server (a
-  non-idempotent `call_extension` raises it instead, also keeping the server).
 - **ETH: a JSON-RPC error sent with HTTP 400 keeps its reason.** drpc and Blast refuse a wide
   `eth_getLogs` with HTTP 400 and the reason in the body (recorded 2026-10-30). web3 raised on the
   status before reading the body, so the log scan's range-limit rule never saw the reason, never

@@ -9,6 +9,7 @@ pip install --upgrade pyrxd          # or 'pyrxd[eth]' for the ETH/ERC-20 legs
 - **Swap records:** `SWAP_RECORD_SCHEMA_VERSION` is now 11 (0.26.1 wrote 2). This release reads records written by 0.26.1. A pyrxd before 0.27 refuses a record this release writes. Do not drive one swap with mixed pyrxd versions.
 - **ETH counter-leg contracts:** the contracts are now built in this repo, optimized, and were revised before the external audit. Contracts deployed from the 0.26.1 artifacts are refused by this repo's swap runners and tests, which check a deployed contract byte for byte. The wheel ships no ETH artifact, so an application that injects its own is unaffected.
 - **`Erc20Htlc.refund()`** can now be called only by the refundee or the deployer. Before, anyone could refund a matured contract, so a third party could refund one holding the first part of a token push and leave the rest of the push, arriving later, movable by nobody. `EthHtlc` is unchanged. **A contract already deployed from the 0.26.1 or earlier artifacts keeps the old rule, and upgrading does not change it:** push the full token amount before the contract matures, and do not push into a matured contract.
+- **ElectrumX reads raise `NetworkError`, not `PolicyRejection`:** a reject code or reason answering a read is now a `NetworkError`, and failover asks the next server. `PolicyRejection` comes only from `broadcast`, so catch `NetworkError` around reads.
 
 ## Swaps follow the chain (#850)
 
