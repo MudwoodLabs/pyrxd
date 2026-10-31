@@ -565,26 +565,26 @@ class ClaimExecutor:
             )
             return ExecOutcome.DECLINED, f"fee input below the deadline-aware relay requirement: {exc}"
         except PolicyRejection as exc:
-            # PERMANENT: the node rejected the tx on a consensus/policy rule (bad script, dust,
-            # min-relay-fee). Retrying cannot help, and this path RE-CARVES a real-value fee input
-            # on every attempt — so a FAILED here would burn fees every tick, forever.
-            #
-            # PolicyRejection subclasses NetworkError so existing broadcast handlers keep catching
-            # node rejections; that makes THIS clause order load-bearing — it must precede the
-            # NetworkError clause below or a permanent rejection reads as transient.
-            #
-            # Mark seen for the same reason a success does: stop the fire-once loop. The operator is
-            # still paged (DECLINED pages), and the reason names the rejection so it is actionable
-            # rather than an endless "claim broadcast failed".
-            if self._seen is not None:
-                await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
+            # PolicyRejection subclasses NetworkError, so this clause must precede the NetworkError
+            # one below. Never marked seen, whatever the reason: a node's verdict can come from one
+            # endpoint (failover never asks a second after a rejection), from one node's policy,
+            # or from this tick's fee input (an immature coinbase, an operator-typed value the
+            # signature commits to), and nothing clears a seen mark (Mythos pass on #934 and its
+            # re-review). The next tick rebuilds with a new fee input, bounded by the capped,
+            # dispense-once pool, the same trade the InsufficientFundsError arm makes.
+            if not _is_consensus_rejection(exc):
+                # A conflict, a missing input, a fee, policy or unrecognised answer: a plain retry.
+                return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
+            # A consensus verdict: still retried. DECLINED and an ERROR log with the node's reason, every
+            # tick, so the operator can see the claim itself may be unusable before the deadline. The
+            # claim page (PAGE_CLAIM) fires either way; it does not carry this outcome or reason.
             logger.error(
-                "autonomous claim swap %s: node PERMANENTLY rejected the covenant claim (%s) — "
-                "not retrying; operator must act before the deadline",
+                "autonomous claim swap %s: node rejected the covenant claim on a consensus rule (%s) — "
+                "retrying with a new fee input; operator must check the claim before the deadline",
                 swap_id,
                 exc,
             )
-            return ExecOutcome.DECLINED, f"node rejected the claim on a policy/consensus rule (permanent): {exc}"
+            return ExecOutcome.DECLINED, f"node rejected the claim on a consensus rule (retrying): {exc}"
         except NetworkError as exc:
             if _is_missing_utxo(exc):  # raced to spent between the check and the build → benign
                 return ExecOutcome.DECLINED, "covenant spent during claim (raced) — idempotent no-op"
@@ -676,6 +676,56 @@ async def _maybe_await(fn, *args):
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+#: Reject reasons that describe the mempool or the UTXO set at this moment, not the claim. A
+#: conflicting spend can be evicted (a rebuilt claim conflicts with our own relayed one, see
+#: tests/test_claim_executor_echo_mismatch_rebuilds.py), a missing input can arrive, a non-final tx
+#: becomes final, and an over-long chain shortens as its ancestors confirm. A covenant that is really
+#: spent is caught by the next tick's spentness check. Radiant-Core's sendrawtransaction answers -26
+#: "txn-mempool-conflict" and -25 "Missing inputs" (src/node/transaction.cpp, src/validation.cpp,
+#: read 2026-10-31); the other spellings are other nodes' names for the same states.
+_TRANSIENT_REJECTION_MARKERS: tuple[str, ...] = (
+    "txn-mempool-conflict",
+    "missing inputs",
+    "missing-inputs",
+    "inputs-missingorspent",
+    "non-final",
+    "nonfinal",
+    "non-bip68-final",
+    "too-long-mempool-chain",
+)
+
+#: Policy reasons: one node's local rules, not consensus. Another node, or the same one after a
+#: policy change or an upgrade, may relay the claim (Mythos pass on #934, P1-F1). "non-mandatory-script-verify-flag" is listed
+#: because it contains the consensus marker below; "nonstandard" covers
+#: "bad-txns-nonstandard-inputs", which carries the consensus prefix.
+_POLICY_REJECTION_MARKERS: tuple[str, ...] = (
+    "non-mandatory-script-verify-flag",
+    "nonstandard",
+    "scriptsig-",
+    "scriptpubkey",
+    "dust",
+)
+
+#: Reject reasons that name a CONSENSUS rule, paged as a possibly unusable claim. Policy reasons
+#: (above) and fee answers are absent: the claim has no change, so its whole fee input is the fee
+#: (htlc_spend.py, build_htlc_claim_tx), and the next tick's input gives a different fee rate.
+_CONSENSUS_REJECTION_MARKERS: tuple[str, ...] = (
+    "mandatory-script-verify-flag",
+    "bad-txns-",
+)
+
+
+def _is_consensus_rejection(exc: PolicyRejection) -> bool:
+    """True only if a node rejection names a consensus rule and no passing state or policy word.
+
+    It decides only how the rejection is paged; every rejection is retried (see the executor).
+    """
+    text = f"{exc.reason or ''} {exc}".lower()
+    if any(marker in text for marker in (*_TRANSIENT_REJECTION_MARKERS, *_POLICY_REJECTION_MARKERS)):
+        return False
+    return any(marker in text for marker in _CONSENSUS_REJECTION_MARKERS)
 
 
 def _is_missing_utxo(exc: Exception) -> bool:

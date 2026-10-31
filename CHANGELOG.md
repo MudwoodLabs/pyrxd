@@ -839,7 +839,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   error a `PolicyRejection`, including one answering a header or balance read, so one hostile
   primary could end every read. These are now verdicts only when they answer a broadcast
   (`ElectrumXClient.broadcast` or `FailoverElectrumXClient.broadcast`); on a read they are a
-  `NetworkError`, and the failover layer asks the next endpoint without dropping the server.
+  `NetworkError`, and the failover layer asks the next endpoint without dropping the server (a
+  non-idempotent `call_extension` raises it instead, also keeping the server).
 - **ETH: a JSON-RPC error sent with HTTP 400 keeps its reason.** drpc and Blast refuse a wide
   `eth_getLogs` with HTTP 400 and the reason in the body (recorded 2026-10-30). web3 raised on the
   status before reading the body, so the log scan's range-limit rule never saw the reason, never
@@ -856,7 +857,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **ElectrumX failover: a code-1 read moves on without dropping the server.** Like a -32601 answer,
   it asks the next endpoint without closing the refusing one (which failed its other in-flight
   calls) and without promoting past it. A code 1 raised from a custom client's broadcast is now read
-  as the node's verdict, so the transaction is not sent on to the next endpoint.
+  as the node's verdict, so the transaction is not sent on to the next endpoint. When every
+  endpoint fails a read, the message now says how many of them refused it, so an all-refused read
+  no longer reads like all servers down.
+- **Autonomous claim: a node rejection reaches the claim executor, and no rejection disarms the
+  claim.** `RadiantChainIO.broadcast` wrapped every client error, `PolicyRejection` included, in a
+  plain `NetworkError`, so `ClaimExecutor` never saw the node's verdict and paged every refusal as
+  "claim broadcast failed". It now raises `PolicyRejection` as itself (an "already known" answer is
+  still the idempotent success). The executor never marks the claim seen on a rejection, because
+  nothing clears that mark and any reason can come from one endpoint, one node's policy or this
+  tick's fee input. A consensus rejection (`mandatory-script-verify-flag-failed`, `bad-txns-`) is
+  returned as DECLINED and logged at ERROR with the node's reason, and retried on a new fee input,
+  bounded by the capped, dispense-once fee pool. The claim page fires as before and does not yet
+  carry the executor's outcome or the node's reason. Every other answer (a mempool conflict, missing inputs, non-final, an
+  over-long chain, a fee or policy answer, or an unrecognised reason) is a plain retry. The
+  executor's old permanent-rejection arm, which marked the claim seen, was never reachable through
+  `RadiantChainIO` and is gone.
+- **ElectrumX: a broadcast rejection keeps the node's reason.** ElectrumX answers a failed broadcast
+  with code 1 and "the transaction was rejected by network rules.", with the node's reason on a
+  later line and the raw transaction after it (Radiant-Core's ElectrumX and RXinDexer). The
+  server-message sanitizer kept the first line only, so every rejection through ElectrumX read the
+  same and `PolicyRejection.reason` never named the rule. After that first line it now also keeps
+  the next non-empty line, unless it is the bracketed raw transaction, under the same character,
+  redaction and length rules.
 
 - **Watchtower (ETH): one endpoint can no longer lower or silence a page by failing, lagging or
   forking.** Found by the 0.27 release review and reproduced on the fake chains with the fault at

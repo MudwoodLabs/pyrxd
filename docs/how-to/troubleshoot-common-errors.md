@@ -377,15 +377,15 @@ means.
 Three real strings from `ElectrumXClient`:
 
 - `"Failed to connect to any ElectrumX server"` —
-  [`src/pyrxd/network/electrumx.py:1098`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`src/pyrxd/network/electrumx.py:1120`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   every server in your URL list failed to connect. Check the URL(s), your
   network, and that the server is up.
 - `"ElectrumX connection lost"` —
-  [`:1186`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`:1208`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   the WebSocket dropped mid-session; all pending requests fail with this.
   Reconnect (a fresh `ElectrumXClient` / `async with` block).
 - `"ElectrumX request timed out"` (or `"... (send)"`) —
-  [`:1235, :1240`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
+  [`:1257, :1262`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/network/electrumx.py):
   a single RPC call exceeded its timeout. Retry, or pass a longer timeout if
   the server is just slow.
 
