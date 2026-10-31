@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-10-31
+
 ### Added
 
 - **`pyrxd.btc_wallet.disposition.read_btc_counter_disposition`: what the chain says about a BTC
