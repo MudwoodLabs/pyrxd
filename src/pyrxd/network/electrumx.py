@@ -134,9 +134,7 @@ _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 # Codes that mean "the node evaluated your transaction and said no".
 #   1   ElectrumX's BAD_REQUEST — how the broadcast RPC wraps a failed sendrawtransaction ("the
 #       transaction was rejected by network rules"). ONLY on a broadcast: on every other method
-#       code 1 means the request itself was bad or out of range. ``_rpc_error`` therefore returns
-#       the private ``_BadRequest`` for a code 1 with no reject marker, and only
-#       ``ElectrumXClient.broadcast`` turns that into a ``PolicyRejection``. Recorded
+#       code 1 means the request itself was bad or out of range. Recorded
 #       2026-10-30 from all three shipped servers (tests/fixtures/recorded_endpoint_replies.json):
 #       "zz should be a transaction hash", "tx ... not in block at height 1", "height N out of
 #       range", each with code 1. Read as a verdict, those became a PolicyRejection, which the
@@ -145,22 +143,30 @@ _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 #  -25  RPC_TRANSACTION_ERROR
 #  -26  RPC_TRANSACTION_REJECTED
 #  -27  RPC_TRANSACTION_ALREADY_IN_CHAIN
+#
+# A code or reason marker is a verdict only when it answers a broadcast: no other RPC asks a node
+# to judge a transaction. ``_rpc_error`` sees no method, so it returns the private
+# ``_VerdictShaped`` for any error that WOULD be a verdict, and only the two broadcast paths
+# (``ElectrumXClient.broadcast`` and ``FailoverElectrumXClient.broadcast``) turn it into a
+# ``PolicyRejection``. On a read it stays a ``NetworkError`` that the failover layer passes over:
+# before, a server answering a header read with code -26 or a reason containing "dust" raised a
+# verdict there, which failover never retries, so one hostile primary could end any read.
 _POLICY_ERROR_CODES: frozenset[int] = frozenset({1, -25, -26, -27})
-_BAD_REQUEST_CODE: int = 1
 
 
-class _BadRequest(NetworkError):
-    """ElectrumX code 1 (BAD_REQUEST) with no reject marker in its reason.
+class _VerdictShaped(NetworkError):
+    """An RPC error whose code or reason would be the node's verdict on a transaction.
 
-    On a read it is a fault (bad or out-of-range request) and stays a ``NetworkError``, so the
-    failover layer retries it on another server. ``ElectrumXClient.broadcast`` is the one caller
-    that reads it as the node's verdict on a transaction. The message keeps the static form every
-    other RPC error has; the sanitized reason travels in ``reason`` for that conversion only.
+    It is one only when it answers a broadcast; both broadcast paths convert it with
+    :func:`_policy_rejection`. On any other method it is an answer from a server that refused the
+    request (code 1 "out of range" from one that has not reached a height, recorded 2026-10-30),
+    and the failover layer asks the next server. The message keeps the static form every other RPC
+    error has; the sanitized reason travels in ``reason`` for the broadcast conversion only.
     """
 
-    def __init__(self, reason: str) -> None:
-        super().__init__(f"ElectrumX RPC error (code {_BAD_REQUEST_CODE})")
-        self.code = _BAD_REQUEST_CODE
+    def __init__(self, code: Any, reason: str) -> None:
+        super().__init__(f"ElectrumX RPC error (code {code})")
+        self.code = code
         self.reason = reason
 
 
@@ -273,28 +279,22 @@ def _sanitize_server_message(message: Any) -> str:
 def _rpc_error(code: Any, message: Any) -> NetworkError:
     """Build the exception for a JSON-RPC error object.
 
-    Returns :class:`~pyrxd.security.errors.PolicyRejection` (itself a
-    ``NetworkError``, so existing ``except NetworkError`` handlers keep working) when
-    the code or the sanitized reason says the node rejected a transaction; the private
-    ``_BadRequest`` for code 1 with no reject marker, which only a broadcast reads as a
-    rejection (see ``_POLICY_ERROR_CODES``);
+    Returns the private :class:`_VerdictShaped` (a ``NetworkError``) when the code or the
+    sanitized reason would say the node rejected a transaction; only a broadcast turns it into a
+    :class:`~pyrxd.security.errors.PolicyRejection` (see ``_POLICY_ERROR_CODES``);
     :class:`~pyrxd.security.errors.RpcMethodNotFound` (also a ``NetworkError``) for code
     ``-32601``, so the failover layer can tell "this server does not implement that method"
     from a transport fault; a plain ``NetworkError`` otherwise.
 
-    The sanitized reason is attached **only** to a policy rejection — that is the one
+    The sanitized reason is carried **only** for a policy rejection — that is the one
     place where discarding it caused real harm. Every other RPC error keeps the
     original static description, so the module's "no server text in the message"
     invariant still holds everywhere it mattered before.
     """
     reason = _sanitize_server_message(message)
     lowered = reason.lower()
-    if (code in _POLICY_ERROR_CODES and code != _BAD_REQUEST_CODE) or any(
-        marker in lowered for marker in _POLICY_MESSAGE_MARKERS
-    ):
-        return _policy_rejection(code, reason)
-    if code == _BAD_REQUEST_CODE:
-        return _BadRequest(reason)
+    if code in _POLICY_ERROR_CODES or any(marker in lowered for marker in _POLICY_MESSAGE_MARKERS):
+        return _VerdictShaped(code, reason)
     if code == _METHOD_NOT_FOUND_CODE:
         return RpcMethodNotFound(f"ElectrumX RPC error (code {code})")
     return NetworkError(f"ElectrumX RPC error (code {code})")
@@ -727,20 +727,21 @@ class ElectrumXClient:
             broadcast may or may not have relayed; the exception carries ``local_txid``.
         PolicyRejection
             The node refused the transaction (a reject code, a reject reason, or ElectrumX's
-            code 1, which on a broadcast wraps a failed ``sendrawtransaction``).
+            code 1, which on a broadcast wraps a failed ``sendrawtransaction``). This is the only
+            client method that raises it: on a read the same error is a ``NetworkError``.
         NetworkError
             Transport failure, or a reply that is not a txid at all.
         """
         validated = RawTx(raw_tx)
-        bad_request: _BadRequest | None = None
+        verdict: _VerdictShaped | None = None
         try:
             result = await self._call("blockchain.transaction.broadcast", [validated.hex()])
-        except _BadRequest as exc:
-            bad_request = exc
-        if bad_request is not None:
-            # Code 1 answering a broadcast is the node's verdict on the transaction. Raised outside
-            # the except block so nothing is chained onto the rejection.
-            raise _policy_rejection(bad_request.code, bad_request.reason)
+        except _VerdictShaped as exc:
+            verdict = exc
+        if verdict is not None:
+            # Answering a broadcast, a reject code or reason is the node's verdict on the
+            # transaction. Raised outside the except block so nothing is chained onto it.
+            raise _policy_rejection(verdict.code, verdict.reason)
         if not isinstance(result, str):
             raise NetworkError("Unexpected response type for broadcast result")
         try:

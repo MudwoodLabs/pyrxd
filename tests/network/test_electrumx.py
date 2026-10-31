@@ -1185,8 +1185,20 @@ class TestPolicyRejectionClassification:
         ],
     )
     def test_policy_shaped_reasons_map_to_policy_rejection_under_any_code(self, message) -> None:
-        # Deliberately an unremarkable code: the reason alone must be enough.
-        assert isinstance(_rpc_error(-99, message), PolicyRejection)
+        # Deliberately an unremarkable code: on a broadcast the reason alone must be enough.
+        assert isinstance(_broadcast_error(-99, message), PolicyRejection)
+
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [(-99, "dust"), (-99, "non-final"), (2, "height 9 out of range, dust"), (-26, "rejected"), (-27, "")],
+    )
+    def test_a_reject_code_or_reason_on_a_read_is_not_a_verdict(self, code, message) -> None:
+        """Only a broadcast asks a node to judge a transaction. A verdict is never retried on
+        another server, so a liar answering a read with "dust" or -26 ended the read for all."""
+        err = _rpc_error(code, message)
+        assert isinstance(err, NetworkError)
+        assert not isinstance(err, (PolicyRejection, RpcMethodNotFound))
+        assert str(err) == f"ElectrumX RPC error (code {code})"  # no server text in a fault's message
 
     @pytest.mark.parametrize(
         ("code", "message"),
@@ -1421,6 +1433,18 @@ async def test_a_code_1_answer_to_a_broadcast_arrives_as_a_verdict_by_code_alone
                 await client.broadcast(_VALID_RAW_TX)
 
     assert ei.value.code == 1
+
+
+async def test_a_reject_reason_answering_a_header_read_arrives_as_a_fault() -> None:
+    """End to end: a liar's "dust" on a read must not arrive as a verdict."""
+    ws = _make_ws_mock({"jsonrpc": "2.0", "id": 1, "error": {"code": -99, "message": "dust"}})
+
+    with _patch_connect(ws):
+        async with ElectrumXClient(["wss://example.com"]) as client:
+            with pytest.raises(NetworkError) as ei:
+                await client.get_block_header(577_275)
+
+    assert not isinstance(ei.value, (PolicyRejection, RpcMethodNotFound))
 
 
 async def test_a_code_1_answer_to_a_header_read_arrives_as_a_fault() -> None:
