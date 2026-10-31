@@ -49,7 +49,8 @@ What is retried, and what is not
   shopping for a node that likes a rejected transaction is the opposite of what a
   failover layer should do. Only a broadcast gets one: the same reject code or reason
   on a read asks a node to judge nothing, so it moves on to the next endpoint like a
-  ``-32601`` does, without dropping the server.
+  ``-32601`` does, without dropping the server. A call that may not be resent (a
+  non-idempotent ``call_extension``) raises it instead, also without dropping the server.
 """
 
 from __future__ import annotations

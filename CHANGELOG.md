@@ -827,7 +827,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   error a `PolicyRejection`, including one answering a header or balance read, so one hostile
   primary could end every read. These are now verdicts only when they answer a broadcast
   (`ElectrumXClient.broadcast` or `FailoverElectrumXClient.broadcast`); on a read they are a
-  `NetworkError`, and the failover layer asks the next endpoint without dropping the server.
+  `NetworkError`, and the failover layer asks the next endpoint without dropping the server (a
+  non-idempotent `call_extension` raises it instead, also keeping the server).
 - **ETH: a JSON-RPC error sent with HTTP 400 keeps its reason.** drpc and Blast refuse a wide
   `eth_getLogs` with HTTP 400 and the reason in the body (recorded 2026-10-30). web3 raised on the
   status before reading the body, so the log scan's range-limit rule never saw the reason, never
