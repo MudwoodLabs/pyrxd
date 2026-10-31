@@ -44,10 +44,12 @@ What is retried, and what is not
   first (measured 2026-09-24). On a core read, a non-idempotent extension call, or the chain
   check, a ``-32601`` is a fault like any other.
 * **Node verdicts** (:class:`~pyrxd.security.errors.PolicyRejection`) — never
-  retried, on any method. "Your transaction is invalid / underpriced / already
-  known" is an answer, not a failure; re-asking a different node mostly produces
-  the same answer, and shopping for a node that likes a rejected transaction is
-  the opposite of what a failover layer should do.
+  retried. "Your transaction is invalid / underpriced / already known" is an answer,
+  not a failure; re-asking a different node mostly produces the same answer, and
+  shopping for a node that likes a rejected transaction is the opposite of what a
+  failover layer should do. Only a broadcast gets one: the same reject code or reason
+  on a read asks a node to judge nothing, so it moves on to the next endpoint like a
+  ``-32601`` does, without dropping the server.
 """
 
 from __future__ import annotations
@@ -68,7 +70,7 @@ from ..security.errors import (
 )
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..spv.radiant import TxMerkleBranch
-from .electrumx import ElectrumXClient, UtxoRecord, _BadRequest, _policy_rejection, verified_broadcast_txid
+from .electrumx import ElectrumXClient, UtxoRecord, _policy_rejection, _VerdictShaped, verified_broadcast_txid
 from .redaction import redacted_url
 from .registry import Endpoint, NetworkProfile
 
@@ -355,10 +357,10 @@ class FailoverElectrumXClient:
                 client = await self._client_for(endpoint)
                 try:
                     result = await client.broadcast(payload)
-                except _BadRequest as exc:
-                    # ElectrumXClient.broadcast already converts code 1; a client from a custom
-                    # client_factory may not, and an unconverted _BadRequest is a NetworkError, which
-                    # would send a refused transaction on to the next endpoint.
+                except _VerdictShaped as exc:
+                    # ElectrumXClient.broadcast already converts a reject code or reason; a client
+                    # from a custom client_factory may not, and an unconverted _VerdictShaped is a
+                    # NetworkError, which would send a refused transaction on to the next endpoint.
                     raise _policy_rejection(exc.code, exc.reason) from None
             except PolicyRejection as exc:
                 if attempted > 0 and _is_already_have(exc):
@@ -553,7 +555,7 @@ class FailoverElectrumXClient:
         last_exc: Exception | None = None
         faulted = False  # some endpoint failed during this call (discarded)
         unsupported = 0  # endpoints whose answer to THIS extension method was "not found"
-        refused = 0  # endpoints that answered this read with ElectrumX code 1 (bad or out-of-range request)
+        refused = 0  # endpoints that answered this read with a reject code or reason (see _VerdictShaped)
         for endpoint in self._candidates():
             reached_op = False  # False while the failure can only have come from _client_for
             try:
@@ -573,14 +575,14 @@ class FailoverElectrumXClient:
                     unsupported += 1
                     logger.info("%s is not implemented by %s; next endpoint", description, redacted_url(endpoint.url))
                     continue
-                if retryable and reached_op and isinstance(exc, _BadRequest):
-                    # An answer, not a fault: "out of range" from a server that has not reached a
-                    # height. Ask the next one, but keep this one (no discard, which would abort
-                    # its other in-flight calls) and do not promote past it, as for -32601 above.
+                if retryable and reached_op and isinstance(exc, _VerdictShaped):
+                    # An answer, not a fault: a reject code or reason on a read ("out of range"
+                    # from a server that has not reached a height, or a liar's "dust"). It is never
+                    # a verdict here, so ask the next one, but keep this one (no discard, which
+                    # would abort its other in-flight calls) and do not promote past it, as for
+                    # -32601 above.
                     refused += 1
-                    logger.info(
-                        "%s was refused as a bad request by %s; next endpoint", description, redacted_url(endpoint.url)
-                    )
+                    logger.info("%s was refused by %s; next endpoint", description, redacted_url(endpoint.url))
                     continue
                 faulted = True
                 logger.warning("%s failed on %s (%s)", description, redacted_url(endpoint.url), type(exc).__name__)
