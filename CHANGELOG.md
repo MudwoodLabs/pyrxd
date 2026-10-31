@@ -744,7 +744,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `pyrxd verify`'s human report wraps a VERIFIED claim to at most 20 lines (was 14), never breaking
   inside "proof-of-work", so the longer claim from a cached anchor is printed whole.
 - **The ETH counter-leg contracts are now built in this repo, and the canonical build is
-  optimized.** The Solidity source of `EthHtlc` and `Erc20Htlc` moved into `contracts/` from the
+  optimized [Changed (breaking)].** The Solidity source of `EthHtlc` and `Erc20Htlc` moved into `contracts/` from the
   private repo where it was written, unchanged except one comment in `EthHtlc.sol` that cited a
   file only that repo has. `scripts/build_counter_leg_artifacts.py`
   builds `tests/fixtures/EthHtlc.json` and `tests/fixtures/Erc20Htlc.json` from it with solc
@@ -761,7 +761,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   these artifacts. The wheel ships no ETH artifact, so an application that injects its own is
   unaffected.
 - **The ETH counter-leg contracts were revised before the external audit, so the audited bytecode
-  is final.** Both artifacts change again (EthHtlc 1,215 runtime / 1,548 creation bytes; Erc20Htlc
+  is final [Changed (breaking)].** Both artifacts change again (EthHtlc 1,215 runtime / 1,548 creation bytes; Erc20Htlc
   1,856 / 2,298), and contracts deployed from the earlier artifacts are refused by this repo's swap
   runners and tests, as above. The behaviour changes:
   - **A refund of an `Erc20Htlc` that holds no tokens now reverts `NothingToRefund`, and leaves the
