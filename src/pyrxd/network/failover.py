@@ -575,12 +575,14 @@ class FailoverElectrumXClient:
                     unsupported += 1
                     logger.info("%s is not implemented by %s; next endpoint", description, redacted_url(endpoint.url))
                     continue
-                if retryable and reached_op and isinstance(exc, _VerdictShaped):
+                if reached_op and isinstance(exc, _VerdictShaped):
                     # An answer, not a fault: a reject code or reason on a read ("out of range"
                     # from a server that has not reached a height, or a liar's "dust"). It is never
-                    # a verdict here, so ask the next one, but keep this one (no discard, which
-                    # would abort its other in-flight calls) and do not promote past it, as for
-                    # -32601 above.
+                    # a verdict here, so keep this server (no discard, which would abort its other
+                    # in-flight calls) and do not promote past it, as for -32601 above. A call that
+                    # may not be resent surfaces the answer instead of asking the next server.
+                    if not retryable:
+                        raise
                     refused += 1
                     logger.info("%s was refused by %s; next endpoint", description, redacted_url(endpoint.url))
                     continue

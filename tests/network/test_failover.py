@@ -263,6 +263,18 @@ async def test_a_code_1_answer_to_a_non_idempotent_call_is_not_sent_again() -> N
     assert not any(name == "call_extension" for name, _ in fakes[B].calls)
 
 
+async def test_a_reject_answer_to_a_non_idempotent_call_keeps_the_server() -> None:
+    """Not resent, and not a fault either: closing the client would fail its other calls."""
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _rpc_error(-26, "dust")
+
+    with pytest.raises(NetworkError) as caught:
+        await client.call_extension("some.mutating.method")
+    assert not isinstance(caught.value, PolicyRejection)
+    assert fakes[A].closed == 0
+    assert not any(name == "call_extension" for name, _ in fakes[B].calls)
+
+
 async def test_a_code_1_from_the_chain_check_is_still_a_fault() -> None:
     """The chain check runs before the op; an endpoint that cannot answer it is not verified, so it
     is discarded and the winner promoted, as for any fault."""
