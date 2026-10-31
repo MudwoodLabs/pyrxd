@@ -84,8 +84,17 @@ __all__ = [
 ]
 
 #: Blocks per ``eth_getLogs`` request before halving. CHOSEN, not measured against any provider's
-#: cap: a range-limit refusal halves the chunk for that endpoint, down to one block.
+#: cap: a range-limit refusal halves the chunk for that endpoint, down to :data:`LOG_MIN_CHUNK_BLOCKS`.
 LOG_CHUNK_BLOCKS = 10_000
+
+#: The smallest chunk a range-limit refusal halves to; a refusal of a span this size or smaller fails
+#: the endpoint.
+#: CHOSEN, not measured. Without a floor, an endpoint capped at 10 blocks (recorded 2026-10-30 for
+#: both Blast endpoints, ``tests/fixtures/recorded_endpoint_replies.json``) turns a scan into
+#: thousands of sequential requests, and ``_ask_all`` waits for the slowest source; an endpoint
+#: that answers every request with range-limit text could force a chunk of one block. drpc's
+#: recorded limit (ranges over 10,000 blocks refused) is reached at 5,000, above the floor.
+LOG_MIN_CHUNK_BLOCKS = 1_000
 
 #: How far past the agreed head one endpoint's log scan follows its OWN head. CHOSEN, not measured.
 #: Bounded so an endpoint reporting an absurd head cannot make its own scan endless; a log beyond it
@@ -307,7 +316,8 @@ async def _logs_from_one(
 
     Every request names integer blocks the endpoint has reached. Asking past its head is refused
     by real nodes (anvil: ``BlockOutOfRangeError``), and an open ``"latest"`` tail would dodge the
-    chunking. A range-limit refusal halves the chunk. Any other failure (a 429, a timeout, a pruned
+    chunking. A range-limit refusal halves the chunk, down to :data:`LOG_MIN_CHUNK_BLOCKS`; a refusal
+    at the floor fails this endpoint. Any other failure (a 429, a timeout, a pruned
     range, a malformed field) raises: it is never "no logs". Returned normalised, so a malformed
     answer fails THIS endpoint rather than the whole read."""
     own_head = int(await source.block_number())
@@ -321,8 +331,11 @@ async def _logs_from_one(
         try:
             raw.extend(await source.get_logs(address=address, topics=topics, from_block=start, to_block=end))
         except Exception as exc:
-            if _is_range_limit(exc) and chunk > 1:
-                chunk = max(1, chunk // 2)
+            span = end - start + 1
+            if _is_range_limit(exc) and span > LOG_MIN_CHUNK_BLOCKS:
+                # Halve the span that was refused, not the chunk: near the end of the range the span
+                # is shorter than the chunk, and halving the chunk alone would resend the same request.
+                chunk = max(LOG_MIN_CHUNK_BLOCKS, span // 2)  # floor-is-deliberate: smaller is only more requests
                 continue
             raise
         start = end + 1

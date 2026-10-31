@@ -68,7 +68,7 @@ from ..security.errors import (
 )
 from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ..spv.radiant import TxMerkleBranch
-from .electrumx import ElectrumXClient, UtxoRecord, verified_broadcast_txid
+from .electrumx import ElectrumXClient, UtxoRecord, _BadRequest, _policy_rejection, verified_broadcast_txid
 from .redaction import redacted_url
 from .registry import Endpoint, NetworkProfile
 
@@ -353,7 +353,13 @@ class FailoverElectrumXClient:
         for endpoint in self._candidates():
             try:
                 client = await self._client_for(endpoint)
-                result = await client.broadcast(payload)
+                try:
+                    result = await client.broadcast(payload)
+                except _BadRequest as exc:
+                    # ElectrumXClient.broadcast already converts code 1; a client from a custom
+                    # client_factory may not, and an unconverted _BadRequest is a NetworkError, which
+                    # would send a refused transaction on to the next endpoint.
+                    raise _policy_rejection(exc.code, exc.reason) from None
             except PolicyRejection as exc:
                 if attempted > 0 and _is_already_have(exc):
                     # "I already have this" is a CLAIM, not evidence (audit B6). Corroborate it
@@ -547,6 +553,7 @@ class FailoverElectrumXClient:
         last_exc: Exception | None = None
         faulted = False  # some endpoint failed during this call (discarded)
         unsupported = 0  # endpoints whose answer to THIS extension method was "not found"
+        refused = 0  # endpoints that answered this read with ElectrumX code 1 (bad or out-of-range request)
         for endpoint in self._candidates():
             reached_op = False  # False while the failure can only have come from _client_for
             try:
@@ -566,16 +573,25 @@ class FailoverElectrumXClient:
                     unsupported += 1
                     logger.info("%s is not implemented by %s; next endpoint", description, redacted_url(endpoint.url))
                     continue
+                if retryable and reached_op and isinstance(exc, _BadRequest):
+                    # An answer, not a fault: "out of range" from a server that has not reached a
+                    # height. Ask the next one, but keep this one (no discard, which would abort
+                    # its other in-flight calls) and do not promote past it, as for -32601 above.
+                    refused += 1
+                    logger.info(
+                        "%s was refused as a bad request by %s; next endpoint", description, redacted_url(endpoint.url)
+                    )
+                    continue
                 faulted = True
                 logger.warning("%s failed on %s (%s)", description, redacted_url(endpoint.url), type(exc).__name__)
                 await self._discard(endpoint)
                 if not retryable:
                     raise
                 continue
-            if faulted or not unsupported:
+            if faulted or not (unsupported or refused):
                 self._promote(endpoint)
             return result
-        if unsupported and not faulted:
+        if unsupported and not faulted and not refused:
             raise RpcMethodNotFound(
                 f"{description}: none of the {unsupported} ElectrumX endpoint(s) tried implements this method "
                 "(JSON-RPC -32601)"

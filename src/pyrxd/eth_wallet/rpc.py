@@ -12,6 +12,7 @@ This is the I/O layer; the security-critical preimage parsing is the pure
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -219,6 +220,38 @@ def _kept_as_sent(member: Any, value: Any) -> bool:
     return False
 
 
+#: HTTP statuses whose body may carry the JSON-RPC error that explains them. Recorded 2026-10-30
+#: (``tests/fixtures/recorded_endpoint_replies.json``): drpc and Blast refuse a wide ``eth_getLogs``
+#: with HTTP 400 and put the reason, a range limit, in a JSON-RPC error body. web3 raises on the
+#: status before reading the body, so the reason never reached ``disposition._is_range_limit``, the
+#: log scan never halved its window, and those endpoints failed every scan. Only 400: a 429 or a 5xx
+#: stays the HTTP error it is (and keeps web3's retry), because what it means is the status itself.
+_ERROR_BODY_STATUSES = frozenset({400})
+#: An error body larger than this is not read as one; the request fails on its status as before.
+_MAX_ERROR_BODY_BYTES = 64 * 1024
+
+
+def _is_jsonrpc_error_body(raw: bytes) -> bool:
+    """Whether *raw* is one well-formed JSON-RPC error response (and nothing else).
+
+    The same shape rules as :func:`_scrub_response`'s well-formed case, plus an ``error`` carrying an
+    honest int ``code`` and a string ``message``. Anything else is left to fail on its HTTP status."""
+    try:
+        doc = json.loads(raw)
+    except ValueError:  # includes UnicodeDecodeError
+        return False
+    if not isinstance(doc, dict) or "result" in doc:
+        return False
+    error = doc.get("error")
+    return (
+        isinstance(error, dict)
+        and _honest_code(error.get("code"))
+        and isinstance(error.get("message"), str)
+        and _honest_jsonrpc(doc.get("jsonrpc"))
+        and _honest_id(doc.get("id"))
+    )
+
+
 _PROVIDER_CLASS: Any = None
 
 
@@ -240,11 +273,39 @@ def _redacting_http_provider(web3: Any, rpc_url: str) -> Any:
     """
     global _PROVIDER_CLASS
     if _PROVIDER_CLASS is None:
+        from web3._utils.http_session_manager import HTTPSessionManager
+
+        class _ErrorBodySessionManager(HTTPSessionManager):  # type: ignore[misc]
+            """Returns a JSON-RPC error that arrived with HTTP 400 as a response (see
+            :data:`_ERROR_BODY_STATUSES`), so web3 raises it with the server's reason; it then crosses
+            :func:`_scrub_response` like any other response. Every other non-2xx raises as before."""
+
+            async def async_make_post_request(self, endpoint_uri: Any, data: Any, **kwargs: Any) -> bytes:
+                # web3's session raises on any non-2xx inside ``post`` itself, before a body can be
+                # read; this request opts out, and every status but 400 is raised just below.
+                kwargs["raise_for_status"] = False
+                response = await self.async_get_response_from_post_request(endpoint_uri, data=data, **kwargs)
+                if response.status in _ERROR_BODY_STATUSES:
+                    # ``read(n)`` returns what is buffered, not the whole body: read to the end or to
+                    # one byte past the cap, so a chunked body is seen whole and an over-cap one is
+                    # refused even when its first chunk parses. Reading to the end releases the
+                    # connection; ``raise_for_status`` releases it otherwise.
+                    raw = b""
+                    while len(raw) <= _MAX_ERROR_BODY_BYTES:
+                        chunk = await response.content.read(_MAX_ERROR_BODY_BYTES + 1 - len(raw))
+                        if not chunk:
+                            break
+                        raw += chunk
+                    if len(raw) <= _MAX_ERROR_BODY_BYTES and _is_jsonrpc_error_body(raw):
+                        return bytes(raw)
+                response.raise_for_status()
+                return bytes(await response.read())
 
         class _RedactingAsyncHTTPProvider(web3.AsyncWeb3.AsyncHTTPProvider):  # type: ignore[misc,name-defined]
             def __init__(self, endpoint_uri: str) -> None:
                 super().__init__(endpoint_uri)
                 self.logger = _RedactingLogger(type(self).logger, str(endpoint_uri))
+                self._request_session_manager = _ErrorBodySessionManager()
 
             async def make_request(self, method: Any, params: Any) -> Any:
                 try:

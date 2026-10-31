@@ -122,25 +122,12 @@ _GETLOGS_RECORDS = {
 }
 
 
-#: The recording shows drpc and Blast refuse a wide range with HTTP 400 and the reason in the body.
-#: web3's HTTP provider raises on the 400 status before the body is read, so the text that reaches
-#: ``disposition._is_range_limit`` is "400, message='Bad Request'" and the reason is lost: the
-#: chunk is never halved, and against drpc (which refuses the 10,000-block chunk the code asks
-#: for) or Blast (10 blocks) every log scan fails. That fails safe (a failed scan is never "no
-#: logs") but those endpoints never answer. Derived from the recording, not typed: every
-#: "range_limit" reply that came back with HTTP 400. Strict: the fix flips these and deletes this.
-_KNOWN_LOST_IN_HTTP_400 = {
-    key
-    for key, expected in _GETLOGS_EXPECTED.items()
-    if expected == "range_limit" and _GETLOGS_RECORDS[key]["status"] == 400
-}
-_LOST_REASON = "the provider's reason is in a 400 body that web3 never reads"
-
-
 def test_every_recorded_getlogs_reply_has_an_expectation() -> None:
     assert _GETLOGS_RECORDS
     assert set(_GETLOGS_RECORDS) == set(_GETLOGS_EXPECTED)
-    assert _KNOWN_LOST_IN_HTTP_400  # the derivation found the replies it describes
+    # drpc and Blast send their range-limit reason with HTTP 400; it must still reach the halving
+    # rule (``eth_wallet/rpc.py``, ``_ERROR_BODY_STATUSES``). Derived, so the cases it names exist.
+    assert any(_GETLOGS_EXPECTED[k] == "range_limit" and r["status"] == 400 for k, r in _GETLOGS_RECORDS.items())
 
 
 class _Replay:
@@ -194,17 +181,7 @@ async def _get_logs_through_ethrpc(url: str) -> Any:
         await rpc.close()
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        pytest.param(
-            k,
-            id=f"{k[0]}-{k[1]}",
-            marks=pytest.mark.xfail(k in _KNOWN_LOST_IN_HTTP_400, strict=True, reason=_LOST_REASON),
-        )
-        for k in sorted(_GETLOGS_EXPECTED)
-    ],
-)
+@pytest.mark.parametrize("key", sorted(_GETLOGS_EXPECTED), ids=lambda k: f"{k[0]}-{k[1]}")
 def test_a_recorded_getlogs_reply_is_classified_as_intended(key: tuple[str, str]) -> None:
     record = _GETLOGS_RECORDS[key]
     server = _Replay(lambda req: (record["status"], record.get("content_type", ""), _with_id(record["body"], req)))
@@ -244,18 +221,8 @@ def _drpc_like(limit: int, refusal: dict[str, Any], tip: int) -> Any:
     return answer
 
 
-@pytest.mark.parametrize(
-    ("host", "limit"),
-    [
-        pytest.param(
-            host, limit, marks=pytest.mark.xfail(key in _KNOWN_LOST_IN_HTTP_400, strict=True, reason=_LOST_REASON)
-        )
-        for host, limit in [("eth.drpc.org", disposition.LOG_CHUNK_BLOCKS), ("eth-mainnet.public.blastapi.io", 11)]
-        for key in [(host, "get_logs_chunk_quiet")]
-    ],
-)
-def test_a_range_limited_endpoint_still_completes_the_scan(host: str, limit: int) -> None:
-    """Liveness under the recorded refusals: the scan halves until the endpoint accepts, and ends."""
+def _scan_against(host: str, limit: int) -> tuple[BaseException | list[Any], list[int]]:
+    """Run one endpoint's log scan against the recorded refusal; the outcome and the spans asked."""
     refusal = _GETLOGS_RECORDS[(host, "get_logs_chunk_quiet")]
     tip = 2 * disposition.LOG_CHUNK_BLOCKS
     server = _Replay(_drpc_like(limit, refusal, tip))
@@ -269,7 +236,10 @@ def test_a_range_limited_endpoint_still_completes_the_scan(host: str, limit: int
             await rpc.close()
 
     try:
-        assert asyncio.run(go()) == []
+        try:
+            outcome: BaseException | list[Any] = asyncio.run(go())
+        except NetworkError as exc:
+            outcome = exc
         spans = [
             int(r["params"][0]["toBlock"], 16) - int(r["params"][0]["fromBlock"], 16) + 1
             for r in server.requests
@@ -277,8 +247,24 @@ def test_a_range_limited_endpoint_still_completes_the_scan(host: str, limit: int
         ]
     finally:
         server.close()
+    return outcome, spans
+
+
+def test_a_range_limited_endpoint_still_completes_the_scan() -> None:
+    """Liveness under drpc's recorded refusal: the scan halves until the endpoint accepts, and ends."""
+    limit = disposition.LOG_CHUNK_BLOCKS
+    outcome, spans = _scan_against("eth.drpc.org", limit)
+    assert outcome == []
     assert spans[0] == disposition.LOG_CHUNK_BLOCKS  # it asked for the full chunk first
-    assert sum(s for s in spans if s < limit) == tip  # covering every block exactly once
+    assert sum(s for s in spans if s < limit) == 2 * disposition.LOG_CHUNK_BLOCKS  # every block once
+
+
+def test_an_endpoint_capped_below_the_floor_fails_promptly() -> None:
+    """Blast's recorded reply states a 10-block limit, below ``LOG_MIN_CHUNK_BLOCKS``: the scan halves
+    to the floor and fails that endpoint, rather than asking for 20,000 blocks ten at a time."""
+    outcome, spans = _scan_against("eth-mainnet.public.blastapi.io", 11)
+    assert isinstance(outcome, NetworkError) and disposition._is_range_limit(outcome)
+    assert spans == [disposition.LOG_CHUNK_BLOCKS, 5_000, 2_500, 1_250, disposition.LOG_MIN_CHUNK_BLOCKS]
 
 
 # --------------------------------------------------------------------------- ElectrumX: JSON-RPC errors
@@ -296,34 +282,28 @@ _ELECTRUMX_EXPECTED: dict[str, str] = {
     "unknown_method": "method_not_found",  # code -32601
 }
 
-#: The recording shows ElectrumX answers a malformed or out-of-range READ with code 1 (its
-#: BAD_REQUEST), and ``_POLICY_ERROR_CODES`` treats every code-1 error as a transaction verdict. The
-#: failover layer never retries a ``PolicyRejection``, so a server that has not reached a height
-#: answers a header read with "node rejected the transaction" and no other server is asked. Strict:
-#: the fix flips these to passing and must delete this set.
-_KNOWN_MISCLASSIFIED = {"tx_get_malformed", "merkle_unknown_tx", "header_beyond_tip"}
 
-
-def _electrumx_errors() -> list[tuple[str, str, dict[str, Any]]]:
+def _electrumx_errors() -> list[tuple[str, str, str, dict[str, Any]]]:
+    """``(host, probe, method asked, error object)`` for every recorded ElectrumX error."""
     out = []
     for r in _FIXTURE["electrumx"]:
         if "reply" not in r:
             continue
         msg = json.loads(r["reply"])
         if "error" in msg:
-            out.append((_host(r["endpoint"]), r["probe"], msg["error"]))
+            out.append((_host(r["endpoint"]), r["probe"], r["request"]["method"], msg["error"]))
     return out
 
 
 def test_every_recorded_electrumx_error_has_an_expectation() -> None:
-    probes = {probe for _, probe, _ in _electrumx_errors()}
+    probes = {probe for _, probe, _, _ in _electrumx_errors()}
     assert probes
     assert probes == set(_ELECTRUMX_EXPECTED)
 
 
 def test_the_recorded_daemon_error_code_is_2_not_1() -> None:
-    """``_POLICY_ERROR_CODES`` documents code 1 as ElectrumX's DAEMON_ERROR; the servers say 2."""
-    daemon = [err for _, probe, err in _electrumx_errors() if probe == "tx_get_unknown"]
+    """ElectrumX's DAEMON_ERROR is code 2 (code 1 is its BAD_REQUEST; see ``_POLICY_ERROR_CODES``)."""
+    daemon = [err for _, probe, _, err in _electrumx_errors() if probe == "tx_get_unknown"]
     assert daemon
     assert all(err["code"] == 2 and str(err["message"]).startswith("daemon error") for err in daemon)
 
@@ -337,21 +317,12 @@ def _classify(exc: NetworkError) -> str:
 
 
 @pytest.mark.parametrize(
-    ("host", "probe", "error"),
-    [
-        pytest.param(
-            h,
-            p,
-            e,
-            id=f"{h}-{p}",
-            marks=pytest.mark.xfail(
-                p in _KNOWN_MISCLASSIFIED, strict=True, reason="ElectrumX code 1 on a read is not a tx verdict"
-            ),
-        )
-        for h, p, e in _electrumx_errors()
-    ],
+    ("host", "probe", "method", "error"),
+    [pytest.param(h, p, m, e, id=f"{h}-{p}") for h, p, m, e in _electrumx_errors()],
 )
-def test_a_recorded_electrumx_error_is_classified_as_intended(host: str, probe: str, error: dict[str, Any]) -> None:
+def test_a_recorded_electrumx_error_is_classified_as_intended(
+    host: str, probe: str, method: str, error: dict[str, Any]
+) -> None:
     exc = _rpc_error(error.get("code", "unknown"), error.get("message"))
     assert isinstance(exc, NetworkError)
     assert _classify(exc) == _ELECTRUMX_EXPECTED[probe], (error.get("code"), str(error.get("message"))[:200])
