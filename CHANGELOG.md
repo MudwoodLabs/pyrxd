@@ -848,19 +848,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as the node's verdict, so the transaction is not sent on to the next endpoint. When every
   endpoint fails a read, the message now says how many of them refused it, so an all-refused read
   no longer reads like all servers down.
-- **Autonomous claim: a node rejection reaches the claim executor, and only a verdict on the claim
-  stops it.** `RadiantChainIO.broadcast` wrapped every client error, `PolicyRejection` included, in
-  a plain `NetworkError`, so `ClaimExecutor`'s permanent-rejection arm never ran and a claim the
-  node refused on its script was rebuilt every tick, drawing a new fee input from the capped pool
-  each time. It now raises `PolicyRejection` as itself (an "already known" answer is still the
-  idempotent success). The executor marks the claim seen and pages only when the reason names a
-  consensus rule the claim breaks (`mandatory-script-verify-flag-failed`, `bad-txns-`). A mempool
-  conflict, missing inputs, a non-final transaction, an over-long chain, a fee answer (the claim's
-  whole fee input is its fee, so the next tick's input gives a different rate), a policy answer
-  (dust, `scriptsig-`, `scriptpubkey`, a non-mandatory script flag, non-standard inputs: one node's
-  local rules, which another node may not apply), or a reason it does not recognise is retried as
-  before: marking one of those seen would disarm a claim that could still land, and the
-  maker's refund would then take the asset.
+- **Autonomous claim: a node rejection reaches the claim executor, and no rejection disarms the
+  claim.** `RadiantChainIO.broadcast` wrapped every client error, `PolicyRejection` included, in a
+  plain `NetworkError`, so `ClaimExecutor` never saw the node's verdict and paged every refusal as
+  "claim broadcast failed". It now raises `PolicyRejection` as itself (an "already known" answer is
+  still the idempotent success). The executor never marks the claim seen on a rejection, because
+  nothing clears that mark and any reason can come from one endpoint, one node's policy or this
+  tick's fee input. A consensus rejection (`mandatory-script-verify-flag-failed`, `bad-txns-`) is
+  paged as one, with the node's reason, and retried on a new fee input, bounded by the capped,
+  dispense-once fee pool. Every other answer (a mempool conflict, missing inputs, non-final, an
+  over-long chain, a fee or policy answer, or an unrecognised reason) is a plain retry. The
+  executor's old permanent-rejection arm, which marked the claim seen, was never reachable through
+  `RadiantChainIO` and is gone.
 - **ElectrumX: a broadcast rejection keeps the node's reason.** ElectrumX answers a failed broadcast
   with code 1 and "the transaction was rejected by network rules.", with the node's reason on a
   later line and the raw transaction after it (Radiant-Core's ElectrumX and RXinDexer). The

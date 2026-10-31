@@ -10,7 +10,7 @@ other txid. ``RadiantChainIO.broadcast`` wraps every client exception except a n
   most one claim confirms and the asset moves once;
 * a rebuilt claim's fee input is committed only if THAT claim confirms. A claim that conflicts with
   one already in the mempool is refused, and its fee input stays unspent. That refusal is a node
-  rejection (``PolicyRejection``), and the executor must read it as transient, not as a permanent
+  rejection (``PolicyRejection``), and the executor must retry it, not read it as a permanent
   verdict that marks the claim seen: the relayed claim it conflicts with may still be evicted.
 
 Everything here is production code except the SERVER: the executor drives a real
@@ -316,10 +316,10 @@ async def test_an_honest_broadcast_is_unchanged(tick) -> None:
 
 # --------------------------------------------------------------------------- node rejections
 #
-# A node rejection reaches ClaimExecutor as PolicyRejection through the real RadiantChainIO. A
-# permanent one (a script or policy verdict on the claim) is marked seen so the executor stops
-# re-carving fee inputs for a claim the node will never take; a passing one (a conflict, a missing
-# input) is retried like any failure, because marking it seen would disarm the claim for good.
+# A node rejection reaches ClaimExecutor as PolicyRejection through the real RadiantChainIO. No
+# rejection marks the claim seen, since nothing clears that mark: one endpoint, one node's policy or
+# one bad fee input can produce any of them. A consensus one is paged (DECLINED) and retried on a
+# new fee input; every other one is a plain FAILED retry.
 
 #: How Radiant-Core words a claim whose script fails (src/node/transaction.cpp: -26 with the state).
 _SCRIPT_FAILED = "mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation) (code 16)"
@@ -356,22 +356,29 @@ async def test_already_known_is_still_the_idempotent_sentinel(tick) -> None:
     ],
     ids=["script-electrumx", "script-bare", "bad-txns"],
 )
-async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, code, node_reason) -> None:
+async def test_a_consensus_rejection_pages_and_never_disarms_the_claim(tick, code, node_reason) -> None:
+    """The case a disarm would lose: the rejection came from this tick's fee input (or one node), and
+    the next tick, on a new fee input, lands the claim."""
     from pyrxd.gravity.radiant_leg import SeenStore
 
+    seen = SeenStore()
     node = _Node()
-    ex, rec, fees = await _armed(node, SeenStore())
+    ex, rec, fees = await _armed(node, seen)
     node.reject = (code, node_reason)
 
     outcome, reason = await tick(ex, rec)
     assert outcome is ExecOutcome.DECLINED, reason
-    assert "PERMANENTLY rejected" in reason and node_reason.split(" ")[0] in reason
-    assert len(node.broadcasts) == 1 and len(fees.outpoints) == 1
+    assert "consensus rule (retrying)" in reason and node_reason.split(" ")[0] in reason
 
     outcome, reason = await tick(ex, rec)
     assert outcome is ExecOutcome.DECLINED, reason
-    assert "already broadcast" in reason
-    assert len(node.broadcasts) == 1 and len(fees.outpoints) == 1, "no second fee input is carved"
+    assert len(node.broadcasts) == 2 and len(fees.outpoints) == 2, "rebuilt on a new fee input"
+
+    node.reject = None
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, reason
+    node.mine()
+    assert _assert_paid_once(node, fees) == _txid(node.broadcasts[2])
 
 
 @pytest.mark.parametrize(
@@ -433,7 +440,7 @@ async def test_a_passing_or_unknown_rejection_is_retried_and_the_claim_stays_arm
 
     outcome, reason = await tick(ex, rec)
     assert outcome is ExecOutcome.FAILED, reason
-    assert "claim broadcast failed" in reason and "PERMANENTLY" not in reason
+    assert "claim broadcast failed" in reason and "consensus" not in reason
 
     # The state passes; the claim is still armed, so the next tick sends it.
     node.reject = None
@@ -494,12 +501,12 @@ def test_every_retry_marker_has_a_case() -> None:
 @pytest.mark.parametrize("marker", sorted(_RETRY_BESIDE_A_CONSENSUS_WORD))
 def test_a_retry_marker_wins_over_a_consensus_word(marker) -> None:
     """Every transient or policy marker is load-bearing: with it gone, the consensus word beside it
-    would disarm the claim."""
-    from pyrxd.gravity.watch.claim_executor import _is_permanent_rejection
+    would page a passing or policy answer as a consensus verdict on the claim."""
+    from pyrxd.gravity.watch.claim_executor import _is_consensus_rejection
     from pyrxd.network.electrumx import _policy_rejection
 
     reason = _RETRY_BESIDE_A_CONSENSUS_WORD[marker]
     assert marker in reason.lower()
-    assert not _is_permanent_rejection(_policy_rejection(-26, f"bad-txns-vout-negative {reason}"))
-    # Honest pair: the consensus word alone is permanent.
-    assert _is_permanent_rejection(_policy_rejection(-26, "bad-txns-vout-negative"))
+    assert not _is_consensus_rejection(_policy_rejection(-26, f"bad-txns-vout-negative {reason}"))
+    # Honest pair: the consensus word alone is a consensus rejection.
+    assert _is_consensus_rejection(_policy_rejection(-26, "bad-txns-vout-negative"))
