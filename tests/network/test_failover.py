@@ -211,6 +211,28 @@ async def test_a_code_1_out_of_range_read_is_asked_of_the_next_endpoint() -> Non
     assert fakes[B].calls
 
 
+@pytest.mark.parametrize(("code", "message"), [(-26, "rejected"), (-99, "dust"), (2, "non-final")])
+async def test_a_reject_code_or_reason_on_a_read_is_asked_of_the_next_endpoint(code, message) -> None:
+    """A liar answering every read with a verdict-shaped error must not end the read: only a
+    broadcast's answer is a verdict, and only a verdict is never retried."""
+    client, fakes = build([A, B])
+    fakes[A].tip_error = _rpc_error(code, message)
+
+    await client.get_tip_height()
+    assert fakes[B].calls
+    assert fakes[A].closed == 0
+
+
+async def test_a_reject_reason_answering_a_custom_clients_broadcast_is_still_a_verdict() -> None:
+    client, fakes = build([A, B])
+    fakes[A].broadcast_error = _rpc_error(-99, "dust")
+
+    with pytest.raises(PolicyRejection) as caught:
+        await client.broadcast(_RAW_TX)
+    assert "dust" in caught.value.reason
+    assert fakes[B].calls == []
+
+
 async def test_a_code_1_read_costs_the_endpoint_nothing() -> None:
     """Like -32601: the refusing endpoint is not closed (which would fail its other in-flight
     calls) and is not demoted, so the next read still goes to it first."""
@@ -238,6 +260,18 @@ async def test_a_code_1_answer_to_a_non_idempotent_call_is_not_sent_again() -> N
 
     with pytest.raises(NetworkError):
         await client.call_extension("some.mutating.method")
+    assert not any(name == "call_extension" for name, _ in fakes[B].calls)
+
+
+async def test_a_reject_answer_to_a_non_idempotent_call_keeps_the_server() -> None:
+    """Not resent, and not a fault either: closing the client would fail its other calls."""
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _rpc_error(-26, "dust")
+
+    with pytest.raises(NetworkError) as caught:
+        await client.call_extension("some.mutating.method")
+    assert not isinstance(caught.value, PolicyRejection)
+    assert fakes[A].closed == 0
     assert not any(name == "call_extension" for name, _ in fakes[B].calls)
 
 
