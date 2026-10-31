@@ -17,6 +17,7 @@
     "electrumx/server/glyph_api.py": "27f8816e43c40d2f50e2daafce423dfd62d2bda269af871254097350e4dff061",
     "electrumx/server/glyph_index.py": "8fdbf57ebd23a6ba58f95430bd582f7375d5903a839c07a032e7946ddea03fe2",
     "electrumx/server/rest_api.py": "91fb253c2b4c325c56cdc5b957f63d3273dd3a6f6f43bcaa7e8a716fc995158a",
+    "electrumx/server/session.py": "87ee603db0f625b3fca17713cc25ed62066933c48cb64492732c227ac599c78a",
     "electrumx/server/swap_index.py": "683c98f512a1fae1e8c32ccd7519ea9f764be87aa7be0d4a18a2d96b3db7b627",
     "electrumx/server/wave_index.py": "2724f291a55e83751fdf553e52dd68413e66cde0a7e879ec91391241c99afe53"
   }

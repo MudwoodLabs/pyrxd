@@ -347,17 +347,28 @@ async def test_already_known_is_still_the_idempotent_sentinel(tick) -> None:
     assert _txid(node.broadcasts[0]) in reason
 
 
-@pytest.mark.parametrize("code", [1, -26], ids=["through-electrumx", "bare"])
-async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, code) -> None:
+@pytest.mark.parametrize(
+    ("code", "node_reason"),
+    [
+        (1, _SCRIPT_FAILED),
+        (-26, _SCRIPT_FAILED),
+        (-26, "non-mandatory-script-verify-flag (Non-canonical signature) (code 64)"),
+        (-26, "scriptsig-not-pushonly (code 16)"),
+        (-26, "bad-txns-vout-negative (code 16)"),
+        (-26, "dust (code 64)"),
+    ],
+    ids=["script-electrumx", "script-bare", "non-mandatory", "scriptsig", "bad-txns", "dust"],
+)
+async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, code, node_reason) -> None:
     from pyrxd.gravity.radiant_leg import SeenStore
 
     node = _Node()
     ex, rec, fees = await _armed(node, SeenStore())
-    node.reject = (code, _SCRIPT_FAILED)
+    node.reject = (code, node_reason)
 
     outcome, reason = await tick(ex, rec)
     assert outcome is ExecOutcome.DECLINED, reason
-    assert "PERMANENTLY rejected" in reason and "mandatory-script-verify-flag-failed" in reason
+    assert "PERMANENTLY rejected" in reason and node_reason.split(" ")[0] in reason
     assert len(node.broadcasts) == 1 and len(fees.outpoints) == 1
 
     outcome, reason = await tick(ex, rec)
@@ -373,8 +384,16 @@ async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, cod
         (-26, "txn-mempool-conflict (code 18)"),
         (1, "Missing inputs"),
         (-25, "Missing inputs"),
+        # A transient state wins over a permanent-looking prefix on the same reason.
         (-26, "bad-txns-inputs-missingorspent"),
+        (-26, "bad-txns-nonfinal"),
         (-26, "non-final (code 64)"),
+        (-26, "non-BIP68-final (code 64)"),
+        # Fee answers retry: the next tick's fee input, and so the fee rate, differs.
+        (1, "66: min relay fee not met"),
+        (-26, "insufficient priority (code 66)"),
+        (-26, "insufficient fee"),
+        (-26, "absurdly-high-fee"),
         (1, "too-long-mempool-chain"),
         (1, ""),
         (-26, "some-rule-this-client-does-not-know"),
@@ -385,7 +404,13 @@ async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, cod
         "missing-inputs-electrumx",
         "missing-inputs-bare",
         "missingorspent",
+        "bad-txns-nonfinal",
         "non-final",
+        "non-bip68-final",
+        "min-relay-fee",
+        "insufficient-priority",
+        "insufficient-fee",
+        "absurdly-high-fee",
         "long-chain",
         "no-reason",
         "unknown-reason",

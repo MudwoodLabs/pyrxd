@@ -234,7 +234,8 @@ _MAX_SCANNED_CHARS: int = 8192
 
 # ElectrumX answers a failed broadcast with code 1 and
 #   "the transaction was rejected by network rules.\n\n{daemon message}\n[{raw tx}]"
-# (Radiant-Core/ElectrumX and Radiant-Core/RXinDexer, electrumx/server/session.py, read 2026-10-31).
+# (Radiant-Core/ElectrumX, and Radiant-Core/RXinDexer at the pinned ca8a6a4,
+# electrumx/server/session.py, read 2026-10-31).
 # The node's reason ("txn-mempool-conflict", "Missing inputs", a script failure) is on a later line,
 # so for this first line the sanitizer also keeps the next non-empty line unless it is the "[...]"
 # raw transaction. Without it every rejection through ElectrumX read the same.

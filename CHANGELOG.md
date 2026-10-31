@@ -854,8 +854,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   node refused on its script was rebuilt every tick, drawing a new fee input from the capped pool
   each time. It now raises `PolicyRejection` as itself (an "already known" answer is still the
   idempotent success). The executor marks the claim seen and pages only when the reason names a
-  rule about the claim itself (a script failure, dust, a fee rate, `bad-txns-`). A mempool conflict,
-  missing inputs, a non-final transaction, an over-long chain, or a reason it does not recognise is
+  rule about the claim itself (a script failure, `bad-txns-`, dust). A mempool conflict, missing
+  inputs, a non-final transaction, an over-long chain, a fee answer (the claim's whole fee input is
+  its fee, so the next tick's input gives a different rate), or a reason it does not recognise is
   retried as before: marking one of those seen would disarm a claim that could still land, and the
   maker's refund would then take the asset.
 - **ElectrumX: a broadcast rejection keeps the node's reason.** ElectrumX answers a failed broadcast

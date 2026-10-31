@@ -569,8 +569,8 @@ class ClaimExecutor:
                 # Not a verdict on the claim itself (a conflict, a missing input, or a reason we do
                 # not recognise): retry as before. Marking it seen would disarm the claim for good.
                 return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
-            # PERMANENT: the node rejected the tx on a consensus/policy rule (bad script, dust,
-            # min-relay-fee). Retrying cannot help, and this path RE-CARVES a real-value fee input
+            # PERMANENT: the node rejected the tx on a consensus/policy rule about the claim itself
+            # (bad script, dust; see _PERMANENT_REJECTION_MARKERS). Retrying cannot help, and this path RE-CARVES a real-value fee input
             # on every attempt — so a FAILED here would burn fees every tick, forever.
             #
             # PolicyRejection subclasses NetworkError so existing broadcast handlers keep catching
@@ -696,21 +696,22 @@ _TRANSIENT_REJECTION_MARKERS: tuple[str, ...] = (
     "inputs-missingorspent",
     "non-final",
     "nonfinal",
+    "non-bip68-final",
     "too-long-mempool-chain",
 )
 
 #: Reject reasons that are a verdict on the claim transaction itself, which a retry rebuilds the
-#: same way: its script, its outputs, its fee rate.
+#: same way: its script and its one output. Fee answers ("min relay fee not met", "insufficient
+#: fee", "insufficient priority", "absurdly-high-fee") are deliberately absent: the claim has no
+#: change, so its whole fee input is the fee (htlc_spend.py, build_htlc_claim_tx), and the next tick
+#: dispenses a different input from the dispense-once pool, at a different fee rate. That is the
+#: InsufficientFundsError arm's reasoning, and those answers retry like it.
 _PERMANENT_REJECTION_MARKERS: tuple[str, ...] = (
     "mandatory-script-verify-flag",
     "scriptsig-",
     "scriptpubkey",
     "bad-txns-",
     "dust",
-    "min relay fee not met",
-    "insufficient fee",
-    "insufficient priority",
-    "absurdly-high-fee",
 )
 
 
