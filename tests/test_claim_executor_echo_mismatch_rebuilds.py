@@ -2,14 +2,16 @@
 cannot pay twice (#780, #786).
 
 ``ElectrumXClient.broadcast`` raises ``BroadcastEchoMismatch`` when the server's reply names some
-other txid. ``RadiantChainIO.broadcast`` wraps every client exception as ``NetworkError``, so
-``ClaimExecutor`` reads the mismatch as a transient FAILED and, on a later tick, calls
+other txid. ``RadiantChainIO.broadcast`` wraps every client exception except a node rejection as
+``NetworkError``, so ``ClaimExecutor`` reads the mismatch as a transient FAILED and, on a later tick, calls
 ``claim_asset`` again: a NEW claim with a freshly dispensed fee input. That is safe because:
 
 * the covenant output is spendable once, and every claim pays the same fixed destination, so at
   most one claim confirms and the asset moves once;
 * a rebuilt claim's fee input is committed only if THAT claim confirms. A claim that conflicts with
-  one already in the mempool is refused, and its fee input stays unspent.
+  one already in the mempool is refused, and its fee input stays unspent. That refusal is a node
+  rejection (``PolicyRejection``), and the executor must read it as transient, not as a permanent
+  verdict that marks the claim seen: the relayed claim it conflicts with may still be evicted.
 
 Everything here is production code except the SERVER: the executor drives a real
 ``RadiantCovenantLeg`` over a real ``RadiantChainIO`` over a real ``ElectrumXClient`` whose ``_call``
@@ -40,8 +42,8 @@ from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import ClaimExecutor, ExecOutcome
 from pyrxd.hash import hash256
 from pyrxd.keys import PrivateKey
-from pyrxd.network.electrumx import ElectrumXClient
-from pyrxd.security.errors import BroadcastEchoMismatch, NetworkError
+from pyrxd.network.electrumx import ElectrumXClient, _rpc_error
+from pyrxd.security.errors import BroadcastEchoMismatch, NetworkError, PolicyRejection
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 
@@ -74,6 +76,12 @@ def _spends(raw: bytes) -> set[str]:
     return {f"{i.source_txid}:{i.source_output_index}" for i in tx.inputs}
 
 
+def _wrapped(node_reason: str, raw_hex: str) -> str:
+    """How ElectrumX words a failed broadcast (code 1): Radiant-Core/ElectrumX and
+    Radiant-Core/RXinDexer, electrumx/server/session.py, read 2026-10-31."""
+    return f"the transaction was rejected by network rules.\n\n{node_reason}\n[{raw_hex}]"
+
+
 class _Node(ElectrumXClient):
     """A real ``ElectrumXClient``; only ``_call`` (the wire) and ``_ensure_connected`` are faked.
 
@@ -86,6 +94,9 @@ class _Node(ElectrumXClient):
     def __init__(self) -> None:
         super().__init__(["wss://fake.invalid/"])
         self.relay, self.lie = True, False
+        #: ``(code, node reason)`` to refuse every broadcast with, when set. Code 1 is ElectrumX's
+        #: wrapper around the node's reason (:func:`_wrapped`); any other code carries it bare.
+        self.reject: tuple[int, str] | None = None
         self.mempool: dict[str, bytes] = {}
         self.confirmed: dict[str, bytes] = {}
         self.broadcasts: list[bytes] = []
@@ -113,8 +124,12 @@ class _Node(ElectrumXClient):
         if method == "blockchain.transaction.broadcast":
             raw = bytes.fromhex(params[0])
             self.broadcasts.append(raw)
+            # Errors go through the client's own JSON-RPC error mapping, as a real reply would.
+            if self.reject is not None:
+                code, reason = self.reject
+                raise _rpc_error(code, _wrapped(reason, params[0]) if code == 1 else reason)
             if _spends(raw) & self._spent():
-                raise NetworkError("the transaction was rejected by network rules. txn-mempool-conflict")
+                raise _rpc_error(1, _wrapped("txn-mempool-conflict (code 18)", params[0]))
             if self.relay:
                 self.mempool[_txid(raw)] = raw
             return _LIE if self.lie else _txid(raw)
@@ -141,7 +156,7 @@ class _CountingFeeSource:
         )
 
 
-async def _armed(node: _Node):
+async def _armed(node: _Node, seen_store: Any = None):
     """A ClaimExecutor wired to a real leg over *node*, plus the record and fee source."""
     taker_kp, maker_kp = generate_keypair("bcrt"), generate_keypair("bcrt")
     taker_pkh, maker_pkh = os.urandom(20), os.urandom(20)
@@ -190,6 +205,7 @@ async def _armed(node: _Node):
         claim_bytes_source=_FakeBytesSource({claim_txid: raw_claim}),
         policy=MarginPolicy.estimated(),
         network="bcrt",
+        seen_store=seen_store,
     )
     rec = SwapRecord(
         state=SwapState.SECRET_REVEALED,
@@ -296,3 +312,120 @@ async def test_an_honest_broadcast_is_unchanged(tick) -> None:
     assert len(fees.outpoints) == 1 and len(node.broadcasts) == 1
     node.mine()
     assert _assert_paid_once(node, fees) == _txid(node.broadcasts[0])
+
+
+# --------------------------------------------------------------------------- node rejections
+#
+# A node rejection reaches ClaimExecutor as PolicyRejection through the real RadiantChainIO. A
+# permanent one (a script or policy verdict on the claim) is marked seen so the executor stops
+# re-carving fee inputs for a claim the node will never take; a passing one (a conflict, a missing
+# input) is retried like any failure, because marking it seen would disarm the claim for good.
+
+#: How Radiant-Core words a claim whose script fails (src/node/transaction.cpp: -26 with the state).
+_SCRIPT_FAILED = "mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation) (code 16)"
+
+
+@pytest.mark.parametrize("code", [1, -26], ids=["through-electrumx", "bare"])
+async def test_a_node_rejection_reaches_the_executor_as_itself(code) -> None:
+    node = _Node()
+    node.reject = (code, _SCRIPT_FAILED)
+    raw = os.urandom(80)
+    with pytest.raises(PolicyRejection) as info:
+        await RadiantChainIO(node).broadcast(raw)
+    assert type(info.value) is PolicyRejection and info.value.code == code
+    assert "mandatory-script-verify-flag-failed" in (info.value.reason or ""), "the node's reason survives"
+    assert raw.hex()[:20] not in str(info.value) and "[" not in str(info.value), "ElectrumX's raw-tx line is dropped"
+
+
+async def test_already_known_is_still_the_idempotent_sentinel(tick) -> None:
+    """A rejection that says the node already has this tx stays a success with the local txid."""
+    node = _Node()
+    ex, rec, _fees = await _armed(node)
+    node.reject = (1, "txn-already-known")
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, reason
+    assert _txid(node.broadcasts[0]) in reason
+
+
+@pytest.mark.parametrize("code", [1, -26], ids=["through-electrumx", "bare"])
+async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, code) -> None:
+    from pyrxd.gravity.radiant_leg import SeenStore
+
+    node = _Node()
+    ex, rec, fees = await _armed(node, SeenStore())
+    node.reject = (code, _SCRIPT_FAILED)
+
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED, reason
+    assert "PERMANENTLY rejected" in reason and "mandatory-script-verify-flag-failed" in reason
+    assert len(node.broadcasts) == 1 and len(fees.outpoints) == 1
+
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED, reason
+    assert "already broadcast" in reason
+    assert len(node.broadcasts) == 1 and len(fees.outpoints) == 1, "no second fee input is carved"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        (1, "txn-mempool-conflict (code 18)"),
+        (-26, "txn-mempool-conflict (code 18)"),
+        (1, "Missing inputs"),
+        (-25, "Missing inputs"),
+        (-26, "bad-txns-inputs-missingorspent"),
+        (-26, "non-final (code 64)"),
+        (1, "too-long-mempool-chain"),
+        (1, ""),
+        (-26, "some-rule-this-client-does-not-know"),
+    ],
+    ids=[
+        "conflict-electrumx",
+        "conflict-bare",
+        "missing-inputs-electrumx",
+        "missing-inputs-bare",
+        "missingorspent",
+        "non-final",
+        "long-chain",
+        "no-reason",
+        "unknown-reason",
+    ],
+)
+async def test_a_passing_or_unknown_rejection_is_retried_and_the_claim_stays_armed(tick, reply) -> None:
+    from pyrxd.gravity.radiant_leg import SeenStore
+
+    node = _Node()
+    ex, rec, _fees = await _armed(node, SeenStore())
+    node.reject = reply
+
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED, reason
+    assert "claim broadcast failed" in reason and "PERMANENTLY" not in reason
+
+    # The state passes; the claim is still armed, so the next tick sends it.
+    node.reject = None
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, reason
+    assert len(node.broadcasts) == 2
+
+
+async def test_a_conflict_with_an_evicted_claim_still_claims(tick) -> None:
+    """The case marking a conflict seen would lose: our relayed claim is evicted after the conflict."""
+    from pyrxd.gravity.radiant_leg import SeenStore
+
+    node = _Node()
+    ex, rec, fees = await _armed(node, SeenStore())
+    node.lie = True  # relays the first claim, then lies about it
+
+    outcome, _ = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED
+    node.lie = False
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED, reason
+    assert "txn-mempool-conflict" in reason
+
+    node.mempool.clear()  # the first claim is evicted
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, reason
+    node.mine()
+    assert _assert_paid_once(node, fees) == _txid(node.broadcasts[2])

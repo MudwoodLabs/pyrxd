@@ -602,6 +602,8 @@ class FailoverElectrumXClient:
                 "(JSON-RPC -32601)"
             ) from last_exc
         detail = f"; {unsupported} of them do not implement the method" if unsupported else ""
+        if refused:
+            detail += f"; {refused} of them refused the request"
         raise NetworkError(
             f"{description} failed on all {len(self._order)} ElectrumX endpoint(s){detail}"
         ) from last_exc

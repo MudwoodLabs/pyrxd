@@ -162,6 +162,12 @@ class _VerdictShaped(NetworkError):
     request (code 1 "out of range" from one that has not reached a height, recorded 2026-10-30),
     and the failover layer asks the next server. The message keeps the static form every other RPC
     error has; the sanitized reason travels in ``reason`` for the broadcast conversion only.
+
+    It does leave this module: every read method raises it as the ``NetworkError`` it is (the
+    failover layer must see it to pass over the server), a non-idempotent failover call re-raises
+    it, and an all-endpoints failure chains it as ``__cause__``. Callers match ``NetworkError``,
+    never this private name, and ``reason`` holds only :func:`_sanitize_server_message` output,
+    the same text a ``PolicyRejection.reason`` carries.
     """
 
     def __init__(self, code: Any, reason: str) -> None:
@@ -226,6 +232,14 @@ _MAX_TOKEN_CHARS: int = 64
 # such token collapses to ``<redacted>`` or a 64-char clip anyway.
 _MAX_SCANNED_CHARS: int = 8192
 
+# ElectrumX answers a failed broadcast with code 1 and
+#   "the transaction was rejected by network rules.\n\n{daemon message}\n[{raw tx}]"
+# (Radiant-Core/ElectrumX and Radiant-Core/RXinDexer, electrumx/server/session.py, read 2026-10-31).
+# The node's reason ("txn-mempool-conflict", "Missing inputs", a script failure) is on a later line,
+# so for this first line the sanitizer also keeps the next non-empty line unless it is the "[...]"
+# raw transaction. Without it every rejection through ElectrumX read the same.
+_ELECTRUMX_BROADCAST_WRAPPER: str = "the transaction was rejected by network rules"
+
 
 def _sanitize_server_message(message: Any) -> str:
     """Render an untrusted node message safe to embed in an exception.
@@ -233,8 +247,9 @@ def _sanitize_server_message(message: Any) -> str:
     Applies, in order: non-``str`` → empty; **clip to** :data:`_MAX_SCANNED_CHARS` (see
     there — this bounds every step below, which would otherwise stall the receive loop
     on a 10 MB frame); first line only (kills multi-line reject dumps and log-injection
-    via embedded newlines); non-printable characters → spaces (ANSI escapes, NULs, bidi
-    controls); :func:`~pyrxd.security.errors.redact` per long whitespace token (an
+    via embedded newlines), except that ElectrumX's broadcast wrapper keeps its node-reason
+    line (see :data:`_ELECTRUMX_BROADCAST_WRAPPER`), joined with a space; non-printable
+    characters → spaces (ANSI escapes, NULs, bidi controls); :func:`~pyrxd.security.errors.redact` per long whitespace token (an
     ElectrumX broadcast error historically appended the **entire raw transaction hex**
     to the reason — that token is pure hex and collapses to ``<redacted>``); per-token
     clipping; whole-message clipping.
@@ -247,13 +262,19 @@ def _sanitize_server_message(message: Any) -> str:
     head = message[:_MAX_SCANNED_CHARS]
     lines = head.splitlines()
     first_line = lines[0] if lines else ""
+    last_used = 0
+    if first_line.strip().lower().startswith(_ELECTRUMX_BROADCAST_WRAPPER):
+        detail = next((i for i in range(1, len(lines)) if lines[i].strip()), None)
+        if detail is not None and not lines[detail].lstrip().startswith("["):
+            first_line = f"{first_line} {lines[detail]}"
+            last_used = detail
     # Did the clip land inside the first line (rather than the line ending first)? If so
     # its final token is a FRAGMENT of a longer one. A fragment at or above
     # _REDACT_TOKEN_MIN_CHARS is fine — it is still redacted/clipped like any long token,
     # and a prefix of hex/base58 is still hex/base58, so a payload that would have
     # collapsed to "<redacted>" still does. A SHORT fragment is the one hazard: it would
     # slip past a redaction the whole token would have triggered. Drop only that.
-    clipped_mid_line = len(message) > _MAX_SCANNED_CHARS and len(lines) <= 1
+    clipped_mid_line = len(message) > _MAX_SCANNED_CHARS and last_used >= len(lines) - 1
     cleaned = "".join(ch if ch.isprintable() else " " for ch in first_line)
     raw_tokens = cleaned.split()
     if (

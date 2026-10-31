@@ -85,7 +85,7 @@ from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
 from pyrxd.network._guards import finite_int
 from pyrxd.network.quorum_depth import depth_vouched_by_quorum
 from pyrxd.network.source_identity import SourceKey, source_key_of
-from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.security.units import ChainHeight, Confirmations, PhotonValue
 
@@ -313,6 +313,10 @@ class RadiantChainIO:
                 # Idempotent: the node already has it. Re-derive nothing; the caller
                 # tracks the txid from the builder. Surface a sentinel for the leg.
                 raise _AlreadyKnown() from exc
+            if isinstance(exc, PolicyRejection):
+                # The node's verdict, raised as itself: ClaimExecutor tells a permanent rejection
+                # from a transient one only by this type and its reason.
+                raise
             raise NetworkError(f"radiant broadcast failed: {exc}") from exc
 
     async def confirmations(self, txid: str) -> Confirmations:

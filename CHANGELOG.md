@@ -845,7 +845,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **ElectrumX failover: a code-1 read moves on without dropping the server.** Like a -32601 answer,
   it asks the next endpoint without closing the refusing one (which failed its other in-flight
   calls) and without promoting past it. A code 1 raised from a custom client's broadcast is now read
-  as the node's verdict, so the transaction is not sent on to the next endpoint.
+  as the node's verdict, so the transaction is not sent on to the next endpoint. When every
+  endpoint fails a read, the message now says how many of them refused it, so an all-refused read
+  no longer reads like all servers down.
+- **Autonomous claim: a node rejection reaches the claim executor, and only a verdict on the claim
+  stops it.** `RadiantChainIO.broadcast` wrapped every client error, `PolicyRejection` included, in
+  a plain `NetworkError`, so `ClaimExecutor`'s permanent-rejection arm never ran and a claim the
+  node refused on its script was rebuilt every tick, drawing a new fee input from the capped pool
+  each time. It now raises `PolicyRejection` as itself (an "already known" answer is still the
+  idempotent success). The executor marks the claim seen and pages only when the reason names a
+  rule about the claim itself (a script failure, dust, a fee rate, `bad-txns-`). A mempool conflict,
+  missing inputs, a non-final transaction, an over-long chain, or a reason it does not recognise is
+  retried as before: marking one of those seen would disarm a claim that could still land, and the
+  maker's refund would then take the asset.
+- **ElectrumX: a broadcast rejection keeps the node's reason.** ElectrumX answers a failed broadcast
+  with code 1 and "the transaction was rejected by network rules.", with the node's reason on a
+  later line and the raw transaction after it (Radiant-Core's ElectrumX and RXinDexer). The
+  server-message sanitizer kept the first line only, so every rejection through ElectrumX read the
+  same and `PolicyRejection.reason` never named the rule. After that first line it now also keeps
+  the next non-empty line, unless it is the bracketed raw transaction, under the same character,
+  redaction and length rules.
 
 - **Watchtower (ETH): one endpoint can no longer lower or silence a page by failing, lagging or
   forking.** Found by the 0.27 release review and reproduced on the fake chains with the fault at

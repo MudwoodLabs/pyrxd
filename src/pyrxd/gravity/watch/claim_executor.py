@@ -565,6 +565,10 @@ class ClaimExecutor:
             )
             return ExecOutcome.DECLINED, f"fee input below the deadline-aware relay requirement: {exc}"
         except PolicyRejection as exc:
+            if not _is_permanent_rejection(exc):
+                # Not a verdict on the claim itself (a conflict, a missing input, or a reason we do
+                # not recognise): retry as before. Marking it seen would disarm the claim for good.
+                return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
             # PERMANENT: the node rejected the tx on a consensus/policy rule (bad script, dust,
             # min-relay-fee). Retrying cannot help, and this path RE-CARVES a real-value fee input
             # on every attempt — so a FAILED here would burn fees every tick, forever.
@@ -676,6 +680,52 @@ async def _maybe_await(fn, *args):
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+#: Reject reasons that describe the mempool or the UTXO set at this moment, not the claim. A
+#: conflicting spend can be evicted (a rebuilt claim conflicts with our own relayed one, see
+#: tests/test_claim_executor_echo_mismatch_rebuilds.py), a missing input can arrive, a non-final tx
+#: becomes final, and an over-long chain shortens as its ancestors confirm. A covenant that is really
+#: spent is caught by the next tick's spentness check. Radiant-Core's sendrawtransaction answers -26
+#: "txn-mempool-conflict" and -25 "Missing inputs" (src/node/transaction.cpp, src/validation.cpp,
+#: read 2026-10-31); the other spellings are other nodes' names for the same states.
+_TRANSIENT_REJECTION_MARKERS: tuple[str, ...] = (
+    "txn-mempool-conflict",
+    "missing inputs",
+    "missing-inputs",
+    "inputs-missingorspent",
+    "non-final",
+    "nonfinal",
+    "too-long-mempool-chain",
+)
+
+#: Reject reasons that are a verdict on the claim transaction itself, which a retry rebuilds the
+#: same way: its script, its outputs, its fee rate.
+_PERMANENT_REJECTION_MARKERS: tuple[str, ...] = (
+    "mandatory-script-verify-flag",
+    "scriptsig-",
+    "scriptpubkey",
+    "bad-txns-",
+    "dust",
+    "min relay fee not met",
+    "insufficient fee",
+    "insufficient priority",
+    "absurdly-high-fee",
+)
+
+
+def _is_permanent_rejection(exc: PolicyRejection) -> bool:
+    """True only if a node rejection names a rule about the claim itself and no passing state.
+
+    The default is False, a retry: marking a claim seen disarms it, and the maker's refund then
+    takes the asset, while a needless retry costs one dispense from a capped, dispense-once fee
+    pool (the same trade the InsufficientFundsError arm makes). An unrecognised or empty reason
+    therefore retries, as every rejection did before RadiantChainIO let PolicyRejection through.
+    """
+    text = f"{exc.reason or ''} {exc}".lower()
+    if any(marker in text for marker in _TRANSIENT_REJECTION_MARKERS):
+        return False
+    return any(marker in text for marker in _PERMANENT_REJECTION_MARKERS)
 
 
 def _is_missing_utxo(exc: Exception) -> bool:
