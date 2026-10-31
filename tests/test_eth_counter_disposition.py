@@ -292,7 +292,7 @@ async def test_rule_4_a_verified_refund_beside_an_unverified_claim_seen_is_refun
     chain = _chain(finalized=90)
     refund_tx = chain.refund(85)
     dropped = {
-        "address": "0x" + "c0" * 20,
+        "address": CONTRACT,
         "topics": [CLAIMED_TOPIC0],
         "data": "0x" + chain.preimage.hex(),
         "transactionHash": "0x" + "dd" * 32,
@@ -423,6 +423,71 @@ async def test_a_range_capped_endpoint_halves_until_it_answers():
     assert (0, 9_999) in capped.log_requests and (0, 2_499) in capped.log_requests
 
 
+async def test_an_endpoint_capped_below_the_floor_fails_after_a_bounded_number_of_requests():
+    """Pair of the test above. A 10-block cap (both Blast endpoints, recorded 2026-10-30) halves to
+    the floor and then fails that endpoint, instead of scanning 25,000 blocks ten at a time."""
+    from pyrxd.eth_wallet.disposition import LOG_CHUNK_BLOCKS, LOG_MIN_CHUNK_BLOCKS
+
+    chain = _chain(head=25_000, finalized=24_000)
+    capped = FakeEvmEndpoint(chain, range_cap=10)
+    # Bounded: a halving that resends a refused span at the floor never ends, and this suite has no
+    # per-test timeout, so it would hang CI rather than fail. The fake never yields, so a wait_for
+    # cannot stop it; the 50th request raises instead, so a looping scan ends and the asserts below fail.
+    real_get_logs = capped.get_logs
+
+    async def bounded_get_logs(**kwargs):
+        if len(capped.log_requests) >= 50:
+            raise RuntimeError("request bound reached")
+        return await real_get_logs(**kwargs)
+
+    capped.get_logs = bounded_get_logs
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=25_000)
+    assert str(capped.source_key) in u.failed
+    spans = [hi - lo + 1 for lo, hi in capped.log_requests]
+    assert spans == [LOG_CHUNK_BLOCKS, 5_000, 2_500, 1_250, LOG_MIN_CHUNK_BLOCKS]
+
+
+def test_the_scan_limits_are_the_documented_numbers():
+    """The CHANGELOG and docstrings name these values; a test that imports the constant would pass
+    whatever it were set to."""
+    from pyrxd.eth_wallet import disposition, rpc
+
+    assert disposition.LOG_CHUNK_BLOCKS == 10_000
+    assert disposition.LOG_MIN_CHUNK_BLOCKS == 1_000
+    assert rpc._MAX_ERROR_BODY_BYTES == 64 * 1024
+
+
+async def test_an_endpoint_capped_at_exactly_the_floor_answers():
+    """Honest twin of the test above: the halving reaches the floor itself, not the first halving
+    under it (10,000 -> 5,000 -> 2,500 -> 1,250 -> 1,000)."""
+    from pyrxd.eth_wallet.disposition import LOG_MIN_CHUNK_BLOCKS
+
+    chain = _chain(head=25_000, finalized=24_000)
+    chain.timeout = chain.ts(20_000)
+    tx = chain.refund(23_000)
+    capped = FakeEvmEndpoint(chain, range_cap=LOG_MIN_CHUNK_BLOCKS)
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=25_000)
+    assert u.failed == {} and [log["transactionHash"] for log in u.logs] == [tx]
+
+
+async def test_a_refused_span_shorter_than_the_chunk_is_halved_not_resent():
+    """Near the end of the range the request is shorter than the chunk. Halving only the chunk
+    resent the identical request until the chunk fell below it."""
+    chain = _chain(head=3_000, finalized=2_000)
+    capped = FakeEvmEndpoint(chain, range_cap=1_500)
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=3_000)
+    assert u.failed == {}
+    assert len(capped.log_requests) == len(set(capped.log_requests))  # no request asked twice
+
+
+async def test_a_refused_span_already_at_or_under_the_floor_fails_at_once():
+    chain = _chain(head=500, finalized=400)
+    capped = FakeEvmEndpoint(chain, range_cap=400)
+    u = await union_logs(capped, address=chain.locator().contract_address, topics=[], from_block=0, to_block=500)
+    assert str(capped.source_key) in u.failed
+    assert capped.log_requests == [(0, 500)]
+
+
 async def test_logs_newer_than_the_agreed_head_are_still_nominated():
     """The agreed head is the quorum-th highest (here 2 of 3, both 2 blocks behind); a log in a
     block only the freshest endpoint has reached is still nominated, by its scan past the agreed
@@ -464,6 +529,28 @@ async def test_an_unknown_deploy_hash_without_from_block_is_unknown():
     assert d.kind is DispositionKind.UNKNOWN
     d = await read_counter_disposition(FakeEvmEndpoint(chain), loc, from_block=0)
     assert d.kind is DispositionKind.REFUNDED
+
+
+async def test_a_later_transaction_named_as_the_deploy_is_unknown():
+    """The scan starts at the deploy transaction's block, so a later transaction named as the deploy
+    would start it past a claim. The reader derives the CREATE address from the named transaction's
+    sender and nonce, never from a receipt, and a transaction that created nothing is refused."""
+    chain = _chain(finalized=90)
+    chain.claim(20)
+    later = chain.force_receipt(60, topic0=REFUNDED_TOPIC0, address=OTHER_CONTRACT, label="later-call")
+    d = await read_counter_disposition(_quorum(chain), chain.locator(deploy_tx_hash=later))
+    assert d.kind is DispositionKind.UNKNOWN and "did not create this contract" in d.reason
+    d = await _read(_quorum(chain), chain)  # the honest pair: the real deploy reads the claim
+    assert d.kind is DispositionKind.CLAIMED
+
+
+async def test_a_creation_of_another_contract_named_as_the_deploy_is_unknown():
+    """A contract creation is not enough: it must be the creation of THIS contract."""
+    chain = _chain(finalized=90)
+    chain.claim(20)
+    chain.deploy_nonce = 1  # the named deploy now creates another address
+    d = await _read(_quorum(chain), chain)
+    assert d.kind is DispositionKind.UNKNOWN and "did not create this contract" in d.reason
 
 
 @pytest.mark.parametrize(
@@ -536,7 +623,7 @@ async def test_rule_4_with_a_liar_that_also_forges_the_claim_receipt_is_unknown(
         chain,
         extra_logs=(
             {
-                "address": "0x" + "c0" * 20,
+                "address": CONTRACT,
                 "topics": [CLAIMED_TOPIC0],
                 "data": "0x" + chain.preimage.hex(),
                 "transactionHash": claim_tx,

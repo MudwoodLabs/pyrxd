@@ -64,6 +64,7 @@ This repo is public and published to PyPI. Each rule below exists because the op
 - A relative timelock is enforced by the spending transaction's BIP68 fields (`nVersion >= 2`, `nSequence`), not by the covenant opcode alone.
 - HTLC: the secret-holder's locked leg has the longest timelock, and the leg they claim the shortest.
 - A value that decides where funds go must not come from one endpoint without derivation. Count sources by operator, not by host (`src/pyrxd/network/source_identity.py`).
+- One endpoint must not choose what the others verify. A candidate one source nominates (a log, a tx hash, the first match, a tie-break) is a claim, not the subject of the check. Test a lying primary that both adds a decoy and withholds the real item; a liar at a later index does not exercise the primary's privileges. A wait that rests on one source's nomination pages, it never stays silent.
 - WAVE label rules live in `src/pyrxd/glyph/wave_rules.py`.
 
 ## Upstream parity, specs and published artifacts
@@ -84,6 +85,7 @@ This repo is public and published to PyPI. Each rule below exists because the op
 
 ## Security review
 
+- `.claude/defensive-profile.md` names the Tier 2 paths, the harness commands and the invariants. Read it before choosing a review tier.
 - `.claude/skills/security-panel/SKILL.md` is the panel procedure. Its reviewer agents come from a plugin a fresh clone may not have; say so rather than skipping lanes silently.
 - Run reviewers on `opus` by default; it keeps token use down. Use `fable` only to vary the model across a panel (the skill's two `fable` lanes), not as the default for every lane.
 - A defensive Mythos review in the maintainer's contained sandbox VM is also available, and only the maintainer can start it. When you finish or scope a review, say whether one is worth running: recommend it for changes to keys, signing, covenants, money paths, wire formats, trust boundaries or a release range, and say it is not needed for docs, tests or small refactors. It runs alongside the other reviewers, never instead of them.

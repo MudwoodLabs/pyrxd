@@ -18,6 +18,9 @@ The tower is ALERT-ONLY: these reads hold no key, sign nothing, and never read t
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+
 import pytest
 
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
@@ -28,12 +31,15 @@ from pyrxd.gravity.watch import ChainObserver, EthChainSource, Intent, RpcEthCha
 from pyrxd.gravity.watch.eth_adapters import CLAIMED_TOPIC0, REFUNDED_TOPIC0, _to_0x_hash
 from pyrxd.security.errors import NetworkError
 from pyrxd.security.secrets import PrivateKeyMaterial
-from tests.test_watch_quorum import FakeRxd, _eth_policy, _eth_record
+from tests.test_watch_quorum import ETH_CONTRACT, ETH_DEPLOYER, FakeRxd, _eth_policy, _eth_record
 
-_CONTRACT = "0x" + "ab" * 20
+_DEPLOYER, _CONTRACT = ETH_DEPLOYER, ETH_CONTRACT
 _DEPLOY = "0x" + "cd" * 32
 _CLAIM_HASH = "0x" + "12" * 32
 _OTHER_HASH = "0x" + "99" * 32
+#: The preimage the fake claim reveals; :func:`_claim_record` locks the contract to its hash, so the fake
+#: receipt is a claim of this contract that opens H (the observer checks that before a verdict counts).
+_P = b"\x5a" * 32
 
 
 # ─────────────────────────────────────────────────────────── fakes ──
@@ -77,7 +83,7 @@ class _FakeEthRpc:
         self.get_logs_calls: list[dict] = []
 
     async def get_transaction(self, tx_hash):
-        return {"blockNumber": self._deploy_block}
+        return {"blockNumber": self._deploy_block, "from": _DEPLOYER, "nonce": 0, "to": None}
 
     async def get_logs(self, *, address, topics=None, from_block="earliest", to_block="latest"):
         self.get_logs_calls.append(
@@ -86,7 +92,8 @@ class _FakeEthRpc:
         return list(self._logs)
 
     def _receipt(self) -> dict:
-        r: dict = {"status": self._status, "blockNumber": self._block}
+        claimed = {"address": _CONTRACT, "topics": [CLAIMED_TOPIC0], "data": "0x" + _P.hex()}
+        r: dict = {"status": self._status, "blockNumber": self._block, "logs": [claimed]}
         if self._bh is not None:
             r["blockHash"] = self._bh
         return r
@@ -177,6 +184,13 @@ def _log(topic0: str | None, tx_hash: object = _CLAIM_HASH) -> dict:
     if topic0 is not None:
         log["topics"] = [topic0]
     return log
+
+
+def _claim_record(state: SwapState):
+    """``_eth_record`` with its contract locked to ``sha256(_P)``, so the fake receipt's claim opens H."""
+    rec = _eth_record(state=state)
+    locator = dataclasses.replace(rec.counterchain_locator, hashlock="0x" + hashlib.sha256(_P).hexdigest())
+    return dataclasses.replace(rec, counterchain_locator=locator)
 
 
 # ───────────────────────────────────────────────────── pinned selectors ──
@@ -389,7 +403,7 @@ async def test_real_adapter_through_chain_observer_final_pages_claim():
     # FINAL ETH counter-leg, observed at a safe RXD window, must PAGE_CLAIM (mirrors the FakeEth
     # routing test, but through the production adapter wiring).
     fake = _FakeEthRpc(deploy_block=10, logs=[_log(CLAIMED_TOPIC0, _CLAIM_HASH)], block=100, finalized=120)
-    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    rec = _claim_record(SwapState.SECRET_REVEALED)
     obs = await ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=150, cov_confs=51)).observe("s", rec)
     assert obs.eth_claim_detected is True
     assert obs.eth_claim_finality is CounterClaimState.FINAL
@@ -401,7 +415,7 @@ async def test_real_adapter_through_chain_observer_final_pages_claim():
 
 async def test_real_adapter_through_chain_observer_not_final_waits():
     fake = _FakeEthRpc(deploy_block=10, logs=[_log(CLAIMED_TOPIC0, _CLAIM_HASH)], block=100, finalized=0)
-    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    rec = _claim_record(SwapState.SECRET_REVEALED)
     obs = await ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=150, cov_confs=51)).observe("s", rec)
     assert obs.eth_claim_detected is True
     assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
@@ -443,7 +457,7 @@ async def test_real_adapter_sustained_stall_upgrades_to_not_finalizing_across_ti
     # NOT_YET_FINAL_LIVE every tick and only the across-time stall can upgrade it.
     fake = _FakeEthRpc(deploy_block=10, logs=[_log(CLAIMED_TOPIC0, _CLAIM_HASH)], block=100, finalized=50, head=60)
     observer = ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=150, cov_confs=51))
-    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    rec = _claim_record(SwapState.SECRET_REVEALED)
 
     obs = await observer.observe("s", rec)  # establish the frozen-finalized run (gap 10, head 60)
     assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
@@ -452,3 +466,62 @@ async def test_real_adapter_sustained_stall_upgrades_to_not_finalizing_across_ti
     assert obs.eth_claim_finality is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING
     d = decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6)
     assert d.intent is Intent.PAGE_SQUEEZED
+
+
+# ─────────────────────────────── the claim scan's start is the contract's own creation ──
+
+
+class _DeployIs(_FakeEthRpc):
+    def __init__(self, tx: dict, **kw) -> None:
+        super().__init__(deploy_block=10, **kw)
+        self._tx = tx
+
+    async def get_transaction(self, tx_hash):
+        return dict(self._tx)
+
+
+@pytest.mark.parametrize(
+    "tx",
+    [
+        {"blockNumber": 500, "from": _DEPLOYER, "nonce": 1, "to": _CONTRACT},  # a later call to the contract
+        {"blockNumber": 10, "from": _DEPLOYER, "nonce": 1, "to": None},  # a creation of another address
+        {"blockNumber": 10, "from": "0x" + "ee" * 20, "nonce": 0, "to": None},  # another sender's creation
+        {"blockNumber": 10, "from": _DEPLOYER, "nonce": 0, "to": _CONTRACT},  # a call, whatever it derives
+    ],
+)
+async def test_claim_status_refuses_a_deploy_that_did_not_create_the_contract(tx):
+    """A later transaction named as the deploy started the scan past a real claim, and the claimed
+    contract read unclaimed. The scan now derives the CREATE address from the named transaction's
+    sender and nonce and refuses (a page, never silence) when it is not this contract."""
+    claimed = {"address": _CONTRACT, "topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32}
+    fake = _DeployIs(tx, logs=[claimed])
+    with pytest.raises(NetworkError, match="did not create"):
+        await RpcEthChainSource(fake).claim_status(_CONTRACT, "0x" + "cd" * 32)
+    assert fake.get_logs_calls == []
+
+
+@pytest.mark.parametrize(
+    "tx",
+    [
+        {"blockNumber": 10, "to": None},  # no sender or nonce to derive from
+        {"blockNumber": 10, "from": "0x12", "nonce": 0, "to": None},  # a malformed sender
+        {"blockNumber": 10, "from": _DEPLOYER, "nonce": "zz", "to": None},  # a malformed nonce
+    ],
+)
+async def test_claim_status_treats_a_malformed_deploy_answer_as_the_endpoints_failure(tx):
+    """An answer with no usable sender or nonce is the endpoint failing, not a vote that the
+    transaction created nothing: it raises a plain NetworkError, so a secondary's is dropped."""
+    from pyrxd.gravity.watch.eth_adapters import DeployNotCreationError
+
+    fake = _DeployIs(tx, logs=[])
+    with pytest.raises(NetworkError) as raised:
+        await RpcEthChainSource(fake).claim_status(_CONTRACT, "0x" + "cd" * 32)
+    assert not isinstance(raised.value, DeployNotCreationError)
+    assert fake.get_logs_calls == []
+
+
+async def test_claim_status_honest_deploy_still_scans_from_its_block():
+    claimed = {"address": _CONTRACT, "topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32}
+    fake = _DeployIs({"blockNumber": 10, "from": _DEPLOYER, "nonce": 0, "to": None}, logs=[claimed])
+    status = await RpcEthChainSource(fake).claim_status(_CONTRACT, "0x" + "cd" * 32)
+    assert status.claimed and fake.get_logs_calls[0]["from_block"] == 10

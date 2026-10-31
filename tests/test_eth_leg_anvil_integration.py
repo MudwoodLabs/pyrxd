@@ -521,9 +521,13 @@ async def test_a_real_Erc20Htlc_deploy_verifies_and_every_forged_copy_is_refused
         await maker.verify_funded(loc, expected_amount_wei=_ERC20_AMOUNT)
         honest = bytes(await rpc.get_code(loc.contract_address))
         assert honest == maker._expected_runtime(loc)
+        # The maker derives the deployer from the chain (#850 PR C), and it is the taker's key.
+        assert (await maker.derive_deployer(loc.contract_address)).lower() == _ADDR_TAKER.lower() == loc.deployer
 
         forged_count = 0
-        for slots in _ERC20_ARTIFACT["immutableReferences"].values():
+        forged_names = set()
+        for ref_id, slots in _ERC20_ARTIFACT["immutableReferences"].items():
+            forged_names.add(_ERC20_ARTIFACT["immutable_names"][ref_id])
             for slot in slots:
                 forged = bytearray(honest)
                 forged[slot["start"] + 31] ^= 0x01
@@ -541,8 +545,13 @@ async def test_a_real_Erc20Htlc_deploy_verifies_and_every_forged_copy_is_refused
                 first = int(re.search(r"first difference at byte (\d+)", str(e.value)).group(1))
                 assert first == slot["start"] + 31, (slot, first)
                 forged_count += 1
-        # Non-vacuity: every slot of every immutable was forged and refused.
+        # Non-vacuity: every slot of every immutable was forged and refused, the deployer's included.
         assert forged_count == sum(len(s) for s in _ERC20_ARTIFACT["immutableReferences"].values()) >= 12
+        assert "deployer" in forged_names
+        # A copy of the honest runtime placed where nothing created it names the taker as its
+        # deployer, and no nonce of the taker creates that address: refused.
+        with pytest.raises(ValidationError, match="not created the way an Erc20Htlc deploy creates one"):
+            await maker.derive_deployer(to_checksum_address("0x" + "cc" * 18 + "0001"))
     finally:
         await rpc.close()
 
@@ -951,12 +960,15 @@ def _erc20_leg(rpc, token, key: str):
     )
 
 
-async def _deploy_unfunded_erc20_htlc(rpc, token, *, hashlock: bytes, timeout: int, amount: int):
-    """Deploy an Erc20Htlc and push NOTHING into it: the state a failed or unsent push leaves."""
+async def _deploy_unfunded_erc20_htlc(
+    rpc, token, *, hashlock: bytes, timeout: int, amount: int, refundee: str = _ADDR_TAKER
+):
+    """Deploy an Erc20Htlc from the taker's account and push NOTHING into it: the state a failed or
+    unsent push leaves. The deployer is the taker's account; the refundee defaults to it too."""
     from pyrxd.eth_wallet.locator import Erc20HtlcLocator
 
     c = rpc.w3.eth.contract(abi=_ERC20_ARTIFACT["abi"], bytecode=_ERC20_ARTIFACT["bytecode"])
-    h = await c.constructor(hashlock, _ADDR_MAKER, _ADDR_TAKER, timeout, _checksum(token.address), amount).transact(
+    h = await c.constructor(hashlock, _ADDR_MAKER, refundee, timeout, _checksum(token.address), amount).transact(
         {"from": _ADDR_TAKER}
     )
     receipt = await rpc.w3.eth.wait_for_transaction_receipt(h)
@@ -967,10 +979,11 @@ async def _deploy_unfunded_erc20_htlc(rpc, token, *, hashlock: bytes, timeout: i
         deploy_tx_hash="0x" + bytes(h).hex().removeprefix("0x"),
         hashlock="0x" + hashlock.hex(),
         claimant=_ADDR_MAKER,
-        refundee=_ADDR_TAKER,
+        refundee=refundee,
         timeout=timeout,
         amount_wei=amount,
         token_address=token.address,
+        deployer=_ADDR_TAKER,
     )
 
 
@@ -1068,6 +1081,68 @@ async def test_HONEST_Erc20Htlc_claim_and_refund_through_the_leg_with_a_token_th
         await _advance_time(rpc, 200)
         assert int((await rpc.wait_receipt(await taker.refund(refund_loc)))["status"]) == 1
         assert await _token_balance(rpc, token, _ADDR_TAKER) == before + _ERC20_AMOUNT
+    finally:
+        await rpc.close()
+
+
+_ADDR_THIRD = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"  # anvil acct 2: neither refundee nor deployer
+_ADDR_REFUNDEE = "0x90F79bf6EB2c4f870365E785982E1f101E93b906"  # anvil acct 3: a refundee that did not deploy
+
+
+async def test_Erc20Htlc_refund_is_callable_by_the_refundee_or_the_deployer_only(anvil_url):
+    """#850 PR C (design D1(c)). The stranding Mythos executed: a third party refunds a matured
+    contract holding a first small part of the push, ``settled`` is set, and the rest of the push,
+    arriving later, can be moved by nobody. Now:
+
+    * a third party's refund (and the claimant's) reverts ``NotRefunder``, mined or not, and leaves
+      the contract open; the leg refuses it before signing and spends no nonce;
+    * HONEST PATH, the deployer: the rest of the push lands and the deployer's refund sweeps it all
+      to the refundee, who is not the deployer;
+    * HONEST PATH, the refundee: on a second contract the refundee's own refund succeeds."""
+    rpc = EthRpc(anvil_url, expected_chain_id=_CHAIN_ID)
+    try:
+        token = await _moving_token(rpc, mint_to=_ADDR_TAKER, amount=10 * _ERC20_AMOUNT)
+        _p, h = _secret()
+        loc = await _deploy_unfunded_erc20_htlc(
+            rpc, token, hashlock=h, timeout=await _now_plus(rpc, 100), amount=_ERC20_AMOUNT, refundee=_ADDR_REFUNDEE
+        )
+        await _token_transfer(rpc, token, sender=_ADDR_TAKER, to=loc.contract_address, amount=1)
+        await _advance_time(rpc, 200)
+
+        for caller in (_ADDR_THIRD, _ADDR_MAKER):
+            call = {"from": caller, "to": loc.contract_address, "data": _sel("refund()")}
+            assert await _revert_selector(rpc, call) == _sel("NotRefunder()"), caller
+        mined = await rpc.w3.eth.wait_for_transaction_receipt(
+            await rpc.w3.eth.send_transaction(
+                {"from": _ADDR_THIRD, "to": loc.contract_address, "data": _sel("refund()"), "gas": 200_000}
+            )
+        )
+        assert mined["status"] == 0 and await _settled(rpc, loc.contract_address) is False
+
+        third_leg = _erc20_leg(rpc, token, _KEY_MAKER)  # the claimant's key: not allowed to refund
+        nonce_before = await rpc.w3.eth.get_transaction_count(_ADDR_MAKER)
+        with pytest.raises(ValidationError, match="NotRefunder"):
+            await third_leg.refund(loc)
+        assert await rpc.w3.eth.get_transaction_count(_ADDR_MAKER) == nonce_before, "nothing may be sent"
+
+        # The rest of the push, then the deployer's refund: everything goes to the refundee.
+        await _token_transfer(rpc, token, sender=_ADDR_TAKER, to=loc.contract_address, amount=_ERC20_AMOUNT - 1)
+        deployer_leg = _erc20_leg(rpc, token, _KEY_TAKER)
+        assert int((await rpc.wait_receipt(await deployer_leg.refund(loc)))["status"]) == 1
+        assert await _token_balance(rpc, token, _ADDR_REFUNDEE) == _ERC20_AMOUNT
+        assert await _token_balance(rpc, token, loc.contract_address) == 0
+
+        _p2, h2 = _secret()
+        loc2 = await _deploy_unfunded_erc20_htlc(
+            rpc, token, hashlock=h2, timeout=await _now_plus(rpc, 100), amount=_ERC20_AMOUNT, refundee=_ADDR_REFUNDEE
+        )
+        await _token_transfer(rpc, token, sender=_ADDR_TAKER, to=loc2.contract_address, amount=_ERC20_AMOUNT)
+        await _advance_time(rpc, 200)
+        h_ref = await rpc.w3.eth.send_transaction(
+            {"from": _ADDR_REFUNDEE, "to": loc2.contract_address, "data": _sel("refund()"), "gas": 200_000}
+        )
+        assert (await rpc.w3.eth.wait_for_transaction_receipt(h_ref))["status"] == 1
+        assert await _token_balance(rpc, token, _ADDR_REFUNDEE) == 2 * _ERC20_AMOUNT
     finally:
         await rpc.close()
 

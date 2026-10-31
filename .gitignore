@@ -213,6 +213,7 @@ HANDOFF-*.md
 #                 .claude/skills/, which is shared tooling and travels with the
 #                 repo: /security-panel is how a pre-release audit is run here, and
 #                 a skill only one machine has is a process nobody else can follow.
+#                 .claude/defensive-profile.md travels too: the review skills read it.
 #                 Written as `.claude/*` + a negation because git cannot re-include
 #                 a path whose parent directory is excluded.
 # .worktrees/   — git worktree checkouts (local-only by definition)
@@ -220,6 +221,7 @@ HANDOFF-*.md
 # poetry.lock   — library project; deps resolve from pyproject.toml
 .claude/*
 !.claude/skills/
+!.claude/defensive-profile.md
 .worktrees/
 logs/
 poetry.lock

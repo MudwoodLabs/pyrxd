@@ -11,10 +11,11 @@ Backends:
 * RXD       — an ElectrumX URL (``--rxd-electrumx-url``). For an ssh-tr radiant-cli
               backend, pass any client exposing ``get_tip_height()`` +
               ``get_transaction_verbose(txid)`` via :func:`build_reconciler`.
-* BTC depth — ``MultiSourceBtcFundingReader`` (2-of-3 Esplora, conservative min depth).
+* BTC depth — ``MultiSourceBtcFundingReader`` (2-of-3 Esplora, the depth a quorum vouches for).
 * BTC claim — mempool.space ``/outspend`` (detect the maker's claim of the HTLC outpoint).
-* ETH       — optional ``--eth-rpc-url`` (+ ``--eth-chain-id``): a keyless, read-only RPC to watch
-              RXD<->ETH swaps (detect the maker's ``Claimed`` event, finalized-checkpoint verdict).
+* ETH       — optional ``--eth-rpc-url`` (+ ``--eth-chain-id``), repeatable: keyless, read-only RPCs to
+              watch RXD<->ETH swaps (detect the maker's ``Claimed`` event, finalized-checkpoint verdict,
+              and the contract's disposition from the coordinator's shared reader, #850 PR 10).
 
 Example (console script, installed with the package):
     pyrxd-watchtower \
@@ -80,7 +81,9 @@ from pyrxd.gravity.watch import (
     run_loop,
 )
 from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
+from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
 from pyrxd.gravity.watch.preflight import preflight_timing
+from pyrxd.gravity.watch.reconciler import DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.network.redaction import redacted_url
@@ -104,6 +107,7 @@ def build_reconciler(
     alert_channel: AlertChannel,
     eth_source: EthChainSource | None = None,
     executor: Executor | None = None,
+    legacy_unresolved_page_after_s: float | None = None,
 ) -> Reconciler:
     """Compose the real ports into a Reconciler (pure wiring — no network at call time).
 
@@ -127,8 +131,17 @@ def build_reconciler(
     outspend_fns = [_make_outspend(u) for u in mempool_base_urls]
     btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
     # RXD corroboration is ``rxd_corroborated`` (True only behind a real >= quorum MultiSourceRxdChainSource).
-    # The single ETH RPC, if any, is still single-source → its pages stay low-corroboration.
-    observer = ChainObserver(btc=btc_source, eth=eth_source, rxd=rxd_source, rxd_corroborated=rxd_corroborated)
+    # A single ETH RPC, if any, is single-source → its pages stay low-corroboration (#850 PR 10: the
+    # disposition read marks them, and a repeated --eth-rpc-url builds a MultiSourceEthRpc).
+    observer = ChainObserver(
+        btc=btc_source,
+        eth=eth_source,
+        rxd=rxd_source,
+        rxd_corroborated=rxd_corroborated,
+        # The depth our refund must be buried before it counts (#850 PR 9b): the policy's BTC reorg
+        # depth, the same number the claim gate requires of the maker's claim.
+        btc_burial_blocks=int(_required_btc_depth_blocks(policy)),
+    )
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
         store=store,
@@ -137,6 +150,7 @@ def build_reconciler(
         policy=policy,
         safety_window_blocks=safety_window_blocks,
         executor=executor,
+        legacy_unresolved_page_after_s=legacy_unresolved_page_after_s,
     )
 
 
@@ -354,24 +368,43 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
 
 async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> RpcEthChainSource | None:
     """Optional ETH counter-leg source (alert-only v3): a keyless, read-only ``RpcEthChainSource``
-    over ``EthRpc``. Returns ``None`` when ``--eth-rpc-url`` is unset (a BTC-only tower). Fails closed
-    on a wrong network (``assert_chain``) so the tower never watches the wrong chain, and registers
-    the RPC's ``close()`` on the exit stack. No key, no broadcast — read-only observation only."""
-    if not args.eth_rpc_url:
+    over ``EthRpc``, or over a ``MultiSourceEthRpc`` when ``--eth-rpc-url`` is given more than once
+    (distinct operators, refused otherwise; #850 PR 10). Returns ``None`` when ``--eth-rpc-url`` is
+    unset (a BTC-only tower). Fails closed on a wrong network (``assert_chain``) so the tower never
+    watches the wrong chain, and registers the RPC's ``close()`` on the exit stack. No key, no
+    broadcast — read-only observation only.
+
+    With one endpoint every disposition read is single-source: it can page, but it never stops a
+    page, never marks a legacy record checked, and every ETH page is low-corroboration."""
+    urls = _eth_rpc_urls(args)
+    if not urls:
         return None
     if not args.eth_chain_id:
         raise ValidationError("--eth-chain-id is required with --eth-rpc-url")
+    from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
     from pyrxd.eth_wallet.rpc import EthRpc
 
-    rpc = EthRpc(args.eth_rpc_url, expected_chain_id=args.eth_chain_id)
-    stack.push_async_callback(rpc.close)
-    await rpc.assert_chain()  # fail closed if the endpoint is not the negotiated chain
+    endpoints = [EthRpc(url, expected_chain_id=args.eth_chain_id) for url in urls]
+    for endpoint in endpoints:
+        stack.push_async_callback(endpoint.close)
+    rpc: EthRpc | MultiSourceEthRpc = endpoints[0] if len(endpoints) == 1 else MultiSourceEthRpc(endpoints)
+    await rpc.assert_chain()  # fail closed if an endpoint is not the negotiated chain
     logger.info(
-        "ETH counter-leg watch ENABLED: rpc=%s chain_id=%d (read-only, no key, single-source → low-corroboration)",
-        redacted_url(args.eth_rpc_url),
+        "ETH counter-leg watch ENABLED: rpc=%s chain_id=%d (read-only, no key, %s)",
+        ", ".join(redacted_url(u) for u in urls),
         args.eth_chain_id,
+        "single-source → low-corroboration" if len(endpoints) == 1 else f"{len(endpoints)} endpoints",
     )
     return RpcEthChainSource(rpc)
+
+
+def _eth_rpc_urls(args: argparse.Namespace) -> list[str]:
+    """The ``--eth-rpc-url`` values, in order, blanks dropped (the flag repeats)."""
+    raw = args.eth_rpc_url
+    if raw is None:
+        return []
+    values = [raw] if isinstance(raw, str) else list(raw)
+    return [u for u in values if u]
 
 
 def _reorg_cost_from_args(args: argparse.Namespace) -> ReorgCostMeasurement | None:
@@ -490,7 +523,7 @@ def _eth_finalization_window_s_from_args(args: argparse.Namespace) -> int | None
     """
     if args.eth_finalization_window_s is not None:
         return int(args.eth_finalization_window_s)
-    if not args.eth_rpc_url or args.eth_chain_id is None:
+    if not _eth_rpc_urls(args) or args.eth_chain_id is None:
         # No ETH leg, or no chain id yet — `_build_eth_source` is the one that refuses the
         # second case, with the message that names --eth-chain-id.
         return None
@@ -774,6 +807,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "boot-time timing cross-check (the watchdog is a separate process). Set to match it.",
     )
     p.add_argument("--safety-window-blocks", type=int, default=6)
+    p.add_argument(
+        "--legacy-unresolved-page-after-s",
+        type=float,
+        default=None,
+        help="page 'investigate' once a legacy (pre-0.27) record's check has stayed unresolved this long "
+        "(a failed read, or a retry that one endpoint can hold). Default: "
+        f"{DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S:g} s, or twice the policy's longest honest wait (ETH "
+        "finality, BTC reorg depth x block interval) when that is longer; a value at or below that wait "
+        "is refused",
+    )
     p.add_argument("--quorum", type=int, default=2, help="BTC funding-reader quorum (of 3 Esplora sources)")
     p.add_argument("--block-interval-s", type=float, default=600.0)
     p.add_argument("--rxd-block-interval-s", type=float, default=300.0)
@@ -883,8 +926,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # would latch on forever. See FileAckInbox in gravity/watch/alerts.py.
     p.add_argument(
         "--ack-inbox",
-        help="operator ACK inbox: append a swap_id per line (e.g. `echo <swap_id> >> FILE`) to "
-        "acknowledge its CRITICAL page. Drained once per tick; suppresses re-paging for that "
+        help="operator ACK inbox: append the CRITICAL page's ack: line, the swap_id and its situation "
+        "key (e.g. `echo '<swap_id> <key>' >> FILE`); a bare swap_id works only when that swap has "
+        "one open, un-ACKed CRITICAL situation. Drained once per tick; suppresses re-paging for that "
         "exact situation and drops it from the heartbeat's unacked_critical count. MUST be a "
         "0600 regular file you own (create it with `install -m 600 /dev/null FILE`) — anyone "
         "who can write it can silence a claim-race page.",
@@ -892,8 +936,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # ETH counter-leg (alert-only v3): watch RXD↔ETH swaps too. Read-only, no key, never touches p.
     p.add_argument(
         "--eth-rpc-url",
+        action="append",
         help="Ethereum RPC URL to watch RXD<->ETH swaps (read-only; enables the ETH counter-leg source). "
-        "Single-source in v1 → ETH pages are low-corroboration. Requires --eth-chain-id.",
+        "Repeat it for endpoints of distinct operators: the counter-leg disposition is then read from all of "
+        "them, and only an answer they agree on stops a page or marks a legacy record checked. With one, ETH "
+        "pages are low-corroboration. Requires --eth-chain-id.",
     )
     p.add_argument(
         "--eth-chain-id",
@@ -959,8 +1006,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--auto-refund-on-single-source",
         action="store_true",
         help="permit the autonomous refund (--refund-spk) to broadcast on a single-source (low-corroboration) "
-        "RXD read. Off by default: a single source's 'not locked' then pages instead of broadcasting. "
-        "Separate from --accept-single-source, which only lets the tower start",
+        "RXD read, or a single-source BTC spender read (--quorum 1, or one Esplora). Off by default: a single "
+        "source's 'not locked' or 'unspent' then pages instead of broadcasting. Separate from "
+        "--accept-single-source, which only lets the tower start",
     )
     return p
 
@@ -977,6 +1025,23 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = _build_parser().parse_args(argv)
     setattr(args, _SUPPLIED_ATTR, _supplied_policy_flags(argv))
     return args
+
+
+def apply_acks(alerter: AckingAlerter, lines: list[str]) -> None:
+    """Apply drained ACK-inbox lines, ``<swap_id>`` or ``<swap_id> <situation key>`` (third Mythos
+    pass, F2)."""
+    for line in lines:
+        swap_id, _, key = line.partition(" ")
+        if not alerter.ack(swap_id, key or None):
+            # ACKs are inert for an unknown/uncritical swap, and a bare id is refused when the swap
+            # has more than one open, un-ACKed CRITICAL situation (DedupAlerter.ack records nothing), but say
+            # so: it is an operator typo, an ambiguous ACK on a time-critical page, or someone probing
+            # the inbox to silence one.
+            logger.warning(
+                "ACK %r ignored — no CRITICAL situation it names unambiguously; "
+                "write the page's ack: line (swap id and situation key)",
+                line,
+            )
 
 
 def _require_acking_alerter(alerter: object, ack_inbox: str) -> AckingAlerter:
@@ -1099,6 +1164,7 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
             alert_channel=_build_alert_channel(args, http_session),
             eth_source=eth_source,
             executor=executor,
+            legacy_unresolved_page_after_s=args.legacy_unresolved_page_after_s,
         )
         # Wire the un-ACK'd CRITICAL count into the heartbeat. Without this the emitted beat
         # carries no `unacked_critical` key at all, so an external escalation monitor has
@@ -1114,19 +1180,15 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
         if args.heartbeat_file:
             heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file, unacked_critical=unacked))
         # Drain the operator ACK inbox once per tick, before the reconciler decides. An ACK is
-        # never lost or double-consumed (FileAckInbox.drain renames the inbox aside atomically).
+        # never double-consumed (FileAckInbox.drain renames the inbox aside atomically); one written
+        # in the instant around the rename can be dropped, and its page keeps firing (see drain).
         on_tick_start: Callable[[], None] | None = None
         if args.ack_inbox:
             acking_alerter = _require_acking_alerter(alerter, args.ack_inbox)
             ack_inbox = FileAckInbox(args.ack_inbox)
 
             def _drain_acks() -> None:
-                for swap_id in ack_inbox.drain():
-                    if not acking_alerter.ack(swap_id):
-                        # ACKs are inert for an unknown/uncritical swap (DedupAlerter.ack records
-                        # nothing), but say so: it is either an operator typo on a time-critical
-                        # page, or someone probing the inbox to silence one.
-                        logger.warning("ACK for %r ignored — no live CRITICAL situation with that swap id", swap_id)
+                apply_acks(acking_alerter, ack_inbox.drain())
 
             on_tick_start = _drain_acks
 

@@ -115,10 +115,10 @@ v1 §1 stands. Corrections and additions:
   timelock (`:334-356`). The refund fee is fixed (`btc_wallet/htlc_leg.py:750-757`). A *dropped*
   refund needs no race at all (A7, Mythos M1).
 - **The runners rebuild the record on every recovery phase.**
-  - Each phase builds a fresh record: `scripts/eth_swap_two_host.py:997`, `:1083-1089`,
+  - Each phase builds a fresh record: `scripts/eth_swap_two_host.py:1004`, `:1083-1089`,
     `:1155`; `scripts/btc_swap_two_host.py:1020`, `:1104-1109`, `:1187`.
   - `_coordinator` then persists it to `<keys_out>.swaprec.json`
-    (`scripts/eth_swap_two_host.py:1245-1262`), overwriting what an earlier phase saved.
+    (`scripts/eth_swap_two_host.py:1252-1269`), overwriting what an earlier phase saved.
   - Some paths do load the record: the BTC fund resume (`scripts/btc_swap_two_host.py:640-646`),
     `scripts/eth_swap_run.py:1576-1582` under `--resume`, and
     `scripts/dust_swap_resume.py:79`. The recovery phases do not.
@@ -132,12 +132,12 @@ v1 §1 stands. Corrections and additions:
   thing keeping it disarmed while the maker can still claim (Mythos H3).
 - **Runners set `radiant_covenant_outpoint` too.** It is not only `post_asset_lock_revalidate`:
   the two-host refund phases fabricate it with `with_radiant_lock`
-  (`scripts/eth_swap_two_host.py:1087`, `scripts/btc_swap_two_host.py:1108`) (Mythos I1).
+  (`scripts/eth_swap_two_host.py:1094`, `scripts/btc_swap_two_host.py:1108`) (Mythos I1).
 - **The taker discards the covenant outpoint it verified.** `taker_funds_btc` binds
-  `_rerun_outpoint` and drops it (`swap_coordinator.py:2871`). A taker record at `BTC_LOCKED`
+  `_rerun_outpoint` and drops it (now `swap_coordinator.py:3022`). A taker record at `BTC_LOCKED`
   therefore has no outpoint, and re-discovery by scan can be steered by anyone paying the
-  covenant SPK (`radiant_leg.py:1086-1093`) (Opus B7, Mythos L2).
-- **The covenant-refund comment is false under F-A.** `radiant_leg.py:1293-1297` says "the
+  covenant SPK (`find_covenant_utxo`, now `radiant_leg.py:356-359`) (Opus B7, Mythos L2).
+- **The covenant-refund comment is false under F-A.** The comment (now `radiant_leg.py:1587-1591`, corrected by PR 6) said "the
   competing claim branch needs p, which on this path the counterparty has not revealed" (Opus A8).
 - **Measurements, 2026-10-09** (REVIEW-INPUTS §D, by the reviewers, not re-run here):
   - **Finalized lag:** Ethereum 780–1008 s (65–84 blocks). Base 886–1208 s (443–604 blocks).
@@ -169,7 +169,7 @@ Role comes from `CoordinatorConfig.role`, which is not persisted. Still open, an
 | BTC F-A (taker `mutual_refund` still pushes the covenant refund) | PR 1c (runner pre-check, interim); PR 9a (coordinator fix) |
 | Runners that set no role (`eth_swap_run.py`, `eth_swap_grief_run.py`, `dust_swap_run.py`, `dust_swap_resume.py`) | PR R (explicit role), D11 |
 | Runner pre-check "counter leg settled or claimed → refuse `--phase refund`" (Mythos M1) | ETH: PR 1's failure-time read covers the coordinator, and PR R adds the pre-check. BTC: PR 1c |
-| PR 1's claim/settled reads are single-endpoint: `_explain_failed_taker_eth_refund` (#851 `swap_coordinator.py:4236`), called only from `mutual_refund` (#851 `:4384`), and `EthLeg.observed_claim_tx` / `is_settled` (#851 `eth_leg.py:323`, `:338`) | replaced by the shared reader (PR 4) in **PR 6**, which reworks `mutual_refund`; the runner's `--phase claim` discovery (#851 `scripts/eth_swap_two_host.py:677`) is switched to the union read in the same PR. Until then they are used only for refusals and pages (PR R pre-check) |
+| PR 1's claim/settled reads are single-endpoint: `_explain_failed_taker_eth_refund` (#851 `swap_coordinator.py:4248`), called only from `mutual_refund` (#851 `:4384`), and `EthLeg.observed_claim_tx` / `is_settled` (#851 `eth_leg.py:340`, `:338`) | replaced by the shared reader (PR 4) in **PR 6**, which reworks `mutual_refund`; the runner's `--phase claim` discovery (#851 `scripts/eth_swap_two_host.py:684`) is switched to the union read in the same PR. Until then they are used only for refusals and pages (PR R pre-check) |
 
 ## 2. The model
 
@@ -198,7 +198,7 @@ Settlement happens once, so a proven refund excludes a claim, and absence is nev
   `NotYetExpired` with no state change. This keeps today's timing.
 - **`F`** decides every state change.
 - One lagging endpoint delays tip decisions (MIN), which is the safe direction (Mythos L3). The
-  tower's deadline page uses the wall clock (`quorum.py:250`). That is fine for a page and is not
+  tower's deadline page uses the wall clock (`quorum.py:261`). That is fine for a page and is not
   an input to any terminal decision.
 
 ### 2.3 Dispositions (ETH counter leg)
@@ -552,7 +552,7 @@ Validators follow the push-field pattern (`swap_state.py:667-679`):
   (M5).
 - **Runner state checks change.** The checks that `SystemExit` on anything but ABORTED or
   MUTUAL_REFUND must poll to terminal:
-  - `scripts/eth_swap_two_host.py:1018-1020` changes in PR 5b;
+  - `scripts/eth_swap_two_host.py:1025-1027` changes in PR 5b;
   - `scripts/btc_swap_two_host.py:1041-1043` and `:1118` change in PR 9a.
 - **Between PR 5b and PR 9a, the two legs behave differently, and that is intended:** ETH refunds
   are pending/no-advance, BTC still advances on broadcast. The BTC runner checks stay valid in
@@ -633,13 +633,16 @@ Mechanism (PR 9b for BTC, PR 10 for ETH; both touch `src/pyrxd/gravity/watch/ada
    so only on a conclusive verdict: agrees, or the swap's last deadline has passed and the page
    has been delivered. `UNKNOWN` writes nothing, so the record is retried.
    - The tower becomes a writer of sidecars (D13). It never writes records.
+   - As built in PR 9b (BTC): "the last deadline" is t_rxd, and only the claim page uses it. An
+     UNSPENT HTLC is never conclusive: the maker can claim it at any time, and past t_rxd can also
+     refund the covenant, so the refund-by-address page is repeated until the refund is buried.
 5. **The marker carries the verdict and the block**, so a restart does not re-read conclusively
    checked records.
 
 ## 6. BTC leg
 
 The weakness is the same as on ETH, and worse:
-- `taker_refund_btc` advances on broadcast (`swap_coordinator.py:4228-4234`);
+- `taker_refund_btc` advances on broadcast (`swap_coordinator.py:4240-4246`);
 - the store drops terminal records (§1);
 - the refund signals BIP125 and has a fixed fee (§1);
 - a dropped refund needs no race.
@@ -803,7 +806,7 @@ Review key: **O** = Opus hostile review; **O+M** = Opus plus a Mythos sandbox pa
 | 4a | Leg refund plumbing: `refund(on_signed=…)`; gas 150k; estimate check; `gas` kept in the preflight; out-of-gas classification from the receipt. **The hook has no caller until PR 5b**; the gas and preflight changes take effect at once | `htlc_leg.py` (refund), `erc20_leg.py` (refund), `eth_leg.py` (refund), `rpc.py` (preflight), fork gas tests | low-medium | O |
 | 5a | **Observe-only.** `reconcile_counter_leg`; `taker_refund_btc` reads the disposition first (`CLAIMED` → SECRET_REVEALED, new edge; third-party/earlier `REFUNDED` → ABORTED, held under the D14 gate for TAKER and none (N1); `UNKNOWN`/`CLAIM_SEEN` branches). **Sending is unchanged** (still advances on our broadcast) | `swap_coordinator.py`, `swap_state.py`, wire doc | high | O+M |
 | 5b | **Pending/re-send/replace:** refund recorded pending; re-send rules §3.4; expiry anchor; `PAYOUT_REVERTS`; ETH runner abort polls to terminal | `swap_coordinator.py`, `swap_state.py`, `scripts/eth_swap_two_host.py` | high | O+M |
-| 6 | `mutual_refund` (ETH) on the disposition; role-aware terminals, with the D14 gate on MUTUAL_REFUND for TAKER and none (N1); role None covenant ordering; the empty-counter-contract branch pointing at the abandon (N2); `asset_refund_txid`; **replaces #851's single-endpoint `_explain_failed_taker_eth_refund` and the runner's `observed_claim_tx` discovery with the shared reader**; fix the `radiant_leg.py:1293-1297` comment | `swap_coordinator.py`, `swap_state.py`, `radiant_leg.py` (comment), runners | high | O+M |
+| 6 | `mutual_refund` (ETH) on the disposition; role-aware terminals, with the D14 gate on MUTUAL_REFUND for TAKER and none (N1); role None covenant ordering; the empty-counter-contract branch pointing at the abandon (N2); `asset_refund_txid`; **replaces #851's single-endpoint `_explain_failed_taker_eth_refund` and the runner's `observed_claim_tx` discovery with the shared reader**; fix the covenant-refund comment (now `radiant_leg.py:1587-1591`) | `swap_coordinator.py`, `swap_state.py`, `radiant_leg.py` (comment), runners | high | O+M |
 | 7a | Empty/expired ERC-20 with a nonce: closed-at-`F`, `close_push_nonce`, `COUNTER_LEG_EXPIRED_EMPTY` held under the D14 gate for TAKER and none (N1) | `swap_coordinator.py`, `erc20_leg.py`, `swap_state.py` | high | O+M |
 | 7b | #849: nonce-less → page; `abandon_counter_leg` (three states, new BOTH_LOCKED edge, including BOTH_LOCKED on `EXPIRED_EMPTY_*` after `F_EXPIRED`, N2); `--phase abandon`; `abort_note` | `swap_coordinator.py`, `swap_state.py`, `scripts/eth_swap_two_host.py`, `security/errors.py` | high (ends records without a refund) | O+M |
 | 8 | Taker `abandon_unfunded` | `swap_coordinator.py` | medium | O |
@@ -862,6 +865,12 @@ Conditions (L1, B10):
 2. `deployer` is derived, not taker-supplied: the sender recovered from the deploy tx's signature
    (its hash is in the locator), cross-checked locally against `CREATE(sender, nonce) == address`
    (`create_address`, `htlc_leg.py:107-132`).
+   *As built (#850 PR C), deliberately different:* the maker's locator has no deploy hash (the
+   taker's word for it is not used), so there is no signature to recover. The contract's
+   `deployer()` getter, read as an identity read across the quorum, is only a candidate. It is
+   accepted when `CREATE(candidate, n) == address` for a nonce `n` in a window below some
+   endpoint's transaction count for the candidate. The CREATE equation alone binds the candidate
+   to the address (`Erc20HtlcLeg.derive_deployer`, `src/pyrxd/eth_wallet/erc20_leg.py`).
 3. Both artifacts are regenerated by `scripts/build_counter_leg_artifacts.py` (the
    `immutable_names` ids shift), and the #821 forged-copy test gains a `deployer` forgery.
 

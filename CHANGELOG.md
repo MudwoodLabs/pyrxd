@@ -110,7 +110,217 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spender, a longer span, a spender not found) raises `NetworkError`; it never answers "unspent"
   by default.
 
+### Changed (breaking)
+
+- **`Erc20Htlc.refund()` is callable by the refundee or the deployer only (#850 PR C).** The
+  contract gains a `deployer` immutable (`msg.sender` of the constructor) and a `NotRefunder` error;
+  `refund()` checks, in order, `AlreadySettled`, `NotYetExpired`, `NotRefunder`, `NothingToRefund`.
+  It still pays the refundee. Before, anyone could refund a matured contract: a third party could
+  refund one holding a first small part of the push, setting `settled`, and the rest of the push,
+  arriving later, could then be moved by nobody. `tests/fixtures/Erc20Htlc.json` is rebuilt, so a
+  contract deployed from an earlier artifact is not one these runners accept, and an older pyrxd
+  verifying a new contract fails closed. `EthHtlc` is unchanged, and so refundable by anyone.
+  - `Erc20HtlcLocator` gains `deployer` (wire key `deployer`, omitted when absent). The taker's leg
+    writes its own key. The maker derives it from the chain
+    (`Erc20HtlcLeg.derive_deployer`): the contract's `deployer()` is accepted only when CREATE from
+    that account at one of its nonces is the contract's address. A locator without it (a record
+    written before this change) fails the runtime compare closed.
+  - `Erc20HtlcLeg.refund` refuses, before signing, a key that is neither the refundee nor the
+    locator's deployer. `refund_revert_reason` names `NotRefunder`.
+  - Refunding an ERC-20 contract by address now needs the refundee's key or the deploying key; the
+    watchtower's legacy page and the two-host runner's interrupted-fund message say so.
+
+- **A multi-source BTC depth is now the depth a quorum of sources vouches for, not the minimum.**
+  `MultiSourceBtcFundingReader.confirmations` and the counter-leg disposition reader
+  (`read_btc_counter_disposition`) take the deepest depth that at least `quorum` of the answering
+  sources report (`pyrxd.network.quorum_depth.depth_vouched_by_quorum`). Under the minimum, one
+  source that under-reported held every depth down: a buried maker claim read as shallow, so the
+  claim gate (the coordinator's and the watchtower's) waited until the `t_rxd` window closed and then
+  named the winner-take-all path. One source that over-reports still cannot raise the depth when the
+  quorum is 2 or more: another answering source must report that depth too. With exactly `quorum`
+  answers, a quorum of 1, or fewer answers than the quorum (a below-dust read), the result is the
+  minimum, as before. The same rule now decides when the coordinator bumps a pending BTC refund (it
+  bumps once fewer than a quorum of sources hold it mined), and when a refund or claim is buried.
+
 ### Changed
+
+- **A maker's swap record ends on its own covenant refund (#850 PR 11) [Changed (breaking)].** New
+  `SwapCoordinator.maker_refund_covenant()` is the `MAKER`'s exit from `NEGOTIATED` (the taker never
+  funded), `BTC_LOCKED` and `PARAMS_MISMATCH` (the maker's own revalidation failed; until now that
+  record's only exits were the taker's). It reads what spent the covenant first: a refund buried at
+  the burial the maker's funding needed takes the record to `ABORTED` on the new event
+  `MAKER_COVENANT_REFUND_OBSERVED`, with the new `abort_reason` `covenant_refunded` and the refund in
+  `asset_refund_txid`, and sends nothing. Otherwise it pins the covenant outpoint (persisted first)
+  and sends the covenant's CSV refund, recording its txid; the record stays where it is until a later
+  call reads the refund buried. A covenant claimed by the taker raises and changes nothing; a record
+  that holds a counter-leg claim is refused, since the refund would then take both legs. New
+  `reconcile_covenant()` only reads, and also ends a maker's `BOTH_LOCKED` record at `MUTUAL_REFUND`
+  on a refund made elsewhere (refused while the record holds a counter-leg claim). Both steps refuse a
+  `TAKER` or single-operator coordinator.
+  - The read is new `RadiantCovenantLeg.covenant_spend(record, *, burial_blocks)` over new
+    `RadiantChainIO.covenant_spend_answers`. Every configured source with `get_history`,
+    `get_transaction`, `get_transaction_verbose` and `get_utxos` (`client`, `proof_client`,
+    `depth_sources`, a multi-operator client once per operator) names the spender of the pinned outpoint
+    from its own history, by bytes that hash to the txid, or holds the outpoint in its UTXO set. They
+    must all agree, or the answer is `UNKNOWN`. The spender is classified by the leaf it took, from
+    its bytes. Its depth is the one two identified operators vouch for (one depth per operator, the
+    least it reports; the least any source reports when fewer than two operators answer), so one
+    operator, through however many hosts, cannot bury it, and among three operators one cannot hold
+    it down. A refund some source reports buried, with the reports differing by more than the burial,
+    raises, naming each source's depth. On a Radiant
+    network that carries value, fewer than two identified operators change nothing. Anyone can pay
+    the covenant's script, so each source reads the record's own refund (`asset_refund_txid`) first
+    and stops there when it spends the covenant; otherwise it fetches the other transactions in its
+    history at once. A source whose history holds more than 64 other transactions does not fetch
+    them and answers "unread", which makes the read `UNKNOWN` rather than leaving the other sources
+    to decide. The refund is sent either way.
+  - An `UNKNOWN` read does not stop the refund: the leg's own checks (the outpoint live at the
+    primary source, the CSV mature) decide, and a refund of a spent covenant fails at the node.
+  - The two-host runners' maker `--phase abort` now drives `maker_refund_covenant`: run it again once
+    the refund is buried to close the record. It also accepts a `PARAMS_MISMATCH` record, which holds
+    the taker's locator, including one whose revalidation could not recompute the covenant (its
+    `<unverifiable>` placeholder is re-pinned to the covenant the terms build). Records written by an
+    earlier `--phase abort` pinned no covenant outpoint, so a covenant they refunded cannot be read
+    from the record.
+  - `SWAP_RECORD_SCHEMA_VERSION` is 11. A pyrxd from before this change refuses a record with
+    `abort_reason` `covenant_refunded`.
+  - Not in this change: a single operator's `MUTUAL_REFUND` still follows the covenant refund's
+    broadcast, not its burial, and a maker's record after the reveal (`SECRET_REVEALED`) has no exit
+    yet. `reconcile_covenant` reads the counter leg's claim from the record only, so a maker whose
+    claim of the counter leg was sent but never recorded can see `MUTUAL_REFUND` on a record that
+    holds both legs (a label; nothing is sent).
+
+- **The watchtower reads an ETH counter leg's disposition with the coordinator's reader, pages the
+  rest of the design §5.1 table, and checks legacy ETH records once (#850 PR 10) [Changed (breaking)].**
+  - `RpcEthChainSource.counter_disposition` runs `read_counter_disposition` over the source's RPC,
+    with the arguments the coordinator builds for the same record (new
+    `pyrxd.gravity.eth_counter_disposition.eth_counter_disposition_kwargs`, now also used by
+    `SwapCoordinator`). The source holds no key, so a token record that does not name its push key
+    can read `EXPIRED_EMPTY_OPEN` but not `EXPIRED_EMPTY_CLOSED`. `ChainObserver` reads it for every
+    funded ETH swap when the source has it. `Observations` gains `eth_disposition`,
+    `eth_disposition_reason`, `eth_disposition_tx`, `eth_claim_seen`, `eth_single_source`,
+    `eth_settled_at_finalized` and `eth_nonce_at_finalized`.
+  - `RpcEthChainSource.claim_status`, the detection scan, now scans every endpoint of a
+    `MultiSourceEthRpc` (before, the primary alone, through `get_logs`), and a claim any endpoint
+    serves is the answer; another endpoint's failure drops it from the scan (the primary's, since
+    the 0.27 release review, only when another endpoint serves a claim). The scan stays the claim trigger, and the read only adds to it: a `Claimed` log that opens
+    H the read collected, or a `CLAIMED` answer, is a claim even when the scan missed it. On a taker's or
+    no-role record at `BTC_LOCKED` or `BOTH_LOCKED`, a claim the record kept (`counter_claim_tx`) that
+    this tick's reads do not show pages the covenant claim, its text also naming the refund (D14, as
+    on the BTC branch), even when one endpoint makes the read return `UNKNOWN` before it looks at any claim. A `CLAIMED` answer from more than one endpoint is
+    taken as `FINAL`. With no claim verified, every claim an endpoint served (the most-nominated
+    first, at most 8) and the scan's are checked, not the first log the scan met: a candidate counts
+    only when every endpoint returns the same receipt, logs included, carrying this contract's
+    `Claimed` event that opens H; then `FINAL` if any reads final. A log on a transaction no endpoint
+    holds, or a failed read, makes finality un-assessable (a fail-closed page). Before, a primary
+    serving a fake `Claimed` log held a final claim at "not yet final" and the tower watched until
+    the window squeezed (Mythos F1; on `main` the scan read the primary alone). A claim race whose gate waits,
+    beside a contract the reader finds settled at the finalized block, pages the reader's
+    contradiction instead of watching (on a taker's or no-role record; a maker's still watches). A claim whose finality read fails because the endpoints
+    disagree is paged as a claim race with finality un-assessable, where it raised a reconcile error
+    before. A log the scan
+    counts as a claim beside a reader answer that found no claim opening H (`OPEN`, `TIP_EXPIRED`, `F_EXPIRED`, `EXPIRED_EMPTY_*`),
+    or beside an `UNKNOWN` read where no candidate is a claim the endpoints agree on, pages
+    `PAGE_SQUEEZED` "investigate" at `BTC_LOCKED` or `BOTH_LOCKED` (on a taker's or no-role record
+    that holds a claim, the D14 page), not a claim race whose steps the coordinator refuses on an
+    `UNKNOWN` read (Mythos pass 2, N-A); at `PARAMS_MISMATCH` the same hit gives the refund page,
+    whose text says p may be public when the read failed. An un-assessable claim race (BTC or ETH) now carries its
+    own `situation`, `claim_race_unassessable`, so its ACK no longer silences the winner-take-all
+    page the race later squeezes into (N-B; an existing ACK of the shared key pages once more).
+  - `--eth-rpc-url` on `pyrxd-watchtower` may be repeated: two or more endpoints (distinct operators)
+    build a `MultiSourceEthRpc`. With one endpoint every read is single-source: it may page, never
+    stops a page, never marks a legacy record, and every ETH page is now marked `low_corroboration`
+    (before, only a single-source RXD read set it, although the flag's help said ETH pages were).
+  - New ETH pages, each with its own `situation`: our refund verified at the finalized block →
+    `Intent.RECONCILE` naming `reconcile_counter_leg` (`mutual_refund` from `BOTH_LOCKED`); beside it,
+    a claim that opens H or one on record → the covenant claim (D14), a log the scan counts as a claim
+    and the reader does not → `PAGE_SQUEEZED` "investigate", a maker's record → refund its covenant.
+    Settled at the finalized block with nothing that explains it → `PAGE_SQUEEZED` "investigate". An
+    empty token contract → `close_push_nonce` (`EXPIRED_EMPTY_OPEN`) or `taker_refund_btc`
+    (`EXPIRED_EMPTY_CLOSED`) from `BTC_LOCKED`, the gated abandon from `BOTH_LOCKED`, and the covenant
+    refund then the gated abandon from `PARAMS_MISMATCH`, only on a read of more than one endpoint. A
+    claim after a params mismatch → `PAGE_SQUEEZED` naming the covenant refund and
+    `abandon_counter_leg` (design §3.2), where it named "investigate" before; a log only the scan
+    counts, beside a clean reader answer, is named on the refund page instead (Mythos F2: the abandon
+    needs a `CLAIMED` answer, so one endpoint's odd log replaced the due refund with a step the
+    coordinator refuses). `SETTLED_UNFINAL` and an
+    `UNKNOWN` from a failed read change no page.
+  - `_CLAIM_PATH[BTC_LOCKED]`: a claim race on a record still at `BTC_LOCKED` (BTC or ETH) names
+    `reconcile_counter_leg, then taker_scrape_and_claim_asset` instead of "investigate". On a maker's
+    record it names `reconcile_counter_leg` alone, which only records the claim there.
+  - The D9 net for ETH (design §5.2 item 3): `is_legacy_candidate` also lists a terminal ETH record
+    with an ETH locator and no `counter_disposition`, and no longer lists a record ended by
+    `abandon_unfunded`. An unsettled contract pages "call `refund()` on the contract" and is never
+    marked; a claim, or a claim on record, pages the covenant claim (marked once delivered after
+    t_rxd); a refund, or an empty contract no signed push can still fill (`EXPIRED_EMPTY_CLOSED`), on
+    a read of more than one endpoint agrees and is marked. An empty contract a push may still fill
+    (`EXPIRED_EMPTY_OPEN`) is read again, so a push that lands pages the refund.
+  - Not built from the §5.1 table: the page for a pending refund older than a threshold (the record
+    keeps no send time) and `PAYOUT_REVERTS` (the coordinator's reading of its own refund, not of the
+    contract).
+
+- **The watchtower tells a taker's BTC refund from the maker's claim, re-arms the pre-signed refund
+  on that read, and checks legacy BTC records once (#850 PR 9b) [Changed (breaking)].**
+  - `OutspendBtcClaimSource.spend_disposition` runs the shared BTC disposition reader (PR 9a) over
+    the funding reader's sources and quorum, and `ChainObserver` reads it for every funded BTC swap
+    (new `btc_burial_blocks`, required with a classifying source; the shipped tower passes the
+    policy's `btc_claim_reorg_depth` in blocks). A spend leaves the claim trigger only when that read
+    classifies its txid as a refund-leaf spend whose signature verifies, so the operator's refund
+    and the tower's pre-signed one both read as ours. Any claim the read sees is the trigger even
+    when the outspend discovery missed it, and a spend the read cannot account for stays a claim.
+    A claim source without `spend_disposition` keeps the earlier rule. `Observations` gains
+    `btc_spend_classified`, `btc_disposition`, `btc_refund_txid`, `btc_disposition_reason` and
+    `btc_spenders_named`.
+  - The pre-signed refund is autonomous again while the maker's covenant is observed (PR 1b turned
+    it off), on a classified read that holds the outpoint unspent at its quorum, for a taker's or
+    single operator's record. A read below quorum, or one that names a spender, arms nothing, also
+    at `PARAMS_MISMATCH` and for a never-locked covenant when the source classifies. The page says
+    the blob's fee is fixed and names `taker_refund_btc` for a bump.
+  - Our refund unburied: `WATCH` (the reason names the txid), and `PAGE_SQUEEZED` naming
+    `taker_refund_btc` (`mutual_refund` from `BOTH_LOCKED`) once t_rxd is within the safety window:
+    past t_rxd the maker can refund the covenant and still claim the BTC by replacing an
+    unconfirmed refund. Buried at the burial depth: new `Intent.RECONCILE` (INFO, routed) naming
+    `reconcile_counter_leg`, or `mutual_refund` from `BOTH_LOCKED`. A claim that opens H on record
+    (`counter_claim_tx`), or a claim witness served beside our buried refund, is a covenant-claim
+    page whatever the outpoint shows now, and arms nothing (D14). A maker's record is paged to
+    refund its covenant. Sources that contradict each other on the spender page `PAGE_SQUEEZED`
+    "investigate". Before, the tower paged our own refund as the maker's claim.
+  - The D9 net for BTC (design §5.2): `JsonDirRecordStore.legacy` lists at most
+    `LEGACY_CHECKS_PER_TICK` (5, chosen, not measured) terminal records per tick, in turn, that are
+    ABORTED or MUTUAL_REFUND, BTC, funded, without `counter_disposition`, not a maker's and not an
+    operator's abandon, and that have no `<swap_id>.legacy-checked.json` marker. The reconciler reads
+    each once through `decide_legacy` (never an executor): a claim pages the covenant claim (`pyrxd
+    swap build-claim`), an unspent HTLC pages a refund by address (`pyrxd swap build-refund`), a
+    buried refund agrees. The tower writes the marker (mode 600, atomic, carrying the verdict and the
+    RXD height) on agreement, or once the claim page is delivered after t_rxd. An unspent HTLC is
+    never marked, which departs from design §5.2 item 4 on purpose (noted there). The store never
+    writes a record.
+  - Fixes from the Mythos review of the PR (F1 to F6). `Decision` gains `situation` and `urgent`.
+    `DedupAlerter` dedups and ACKs by intent and situation, so an ACK of the pending-refund page, the
+    contradicting-sources page or the discovery-disagreement page no longer silences the claim race
+    (all are `PAGE_SQUEEZED`). After two more Mythos passes and an Opus re-review, every
+    `PAGE_SQUEEZED`, `PAGE_CLAIM` and `PAGE_REFUND` page carries a situation (claim race, reconcile
+    error, unreadable record, each refund page and the others). In `DedupAlerter` a situation stays
+    open until it has been absent for `situation_hold_ticks` ticks in a row (new; default
+    `DEFAULT_SITUATION_HOLD_TICKS` = 10, chosen, not measured), counting quiet ticks the reconciler
+    reports through `DedupAlerter.resolve`. While open, a WARN or INFO pages once, a CRITICAL counts
+    toward escalation until ACKed, and an ACK holds, so a one-tick read failure neither ends it nor
+    resets escalation; once closed, the ACK ends and a late ACK records nothing. A page records
+    nothing until it is sent. Each CRITICAL page prints an `ack:` line; the ACK inbox takes
+    `<swap_id> <situation key>` (`run.apply_acks`), and a bare swap id ACKs only when the swap has
+    one open, un-ACKed CRITICAL page and no ACK yet. A CRITICAL page that failed to send counts
+    toward escalation until it goes out. The store-unreadable page closes once the store reads again.
+    A situation keeps the highest severity it paged at: one
+    `urgent` tick keeps it CRITICAL, re-paged, until it is ACKed. The
+    armed refund page no longer says the tower broadcasts: the reconciler appends what this tick's
+    executor did. A refund page for an unspent HTLC near or past t_rxd is `urgent` (CRITICAL,
+    re-paged) at `BTC_LOCKED`, `PARAMS_MISMATCH` and `BOTH_LOCKED`, and on a legacy record also when
+    it pins no covenant; `decide_legacy` takes `safety_window_blocks`. A spender only discovery names,
+    beside our buried refund, pages "investigate" rather than a served claim witness, and a legacy
+    record with one is never marked (`Observations.btc_claim_witness_seen`). The page names the
+    buried refund, not the smallest txid seen. A single-source BTC read (`btc_single_source`, quorum
+    1, or one Esplora) marks the decision low-corroboration, and its "buried" decides nothing: it is
+    read as still pending, sets no claim aside as lost, ends no maker's or legacy record.
 
 - **On a BTC swap, `taker_refund_btc`, `mutual_refund` and `reconcile_counter_leg` follow the chain,
   not our own refund's broadcast (#850 PR 9a, part 2) [Changed (breaking)].** With a
@@ -160,9 +370,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the PR 1c pre-check. A claim seen ends the phase naming `--phase claim` with the claim's bytes.
     `--phase refund` no longer sends the covenant refund, needs no `--fee-*`, and no longer waits
     for the covenant's `t_rxd`.
-  - Known interim until #850 PR 9b: the watchtower still reads any spend of the BTC HTLC as a
-    claim, so a taker's own refund on a `BOTH_LOCKED` record is paged as one (a page, never an
-    autonomous broadcast).
+  - Interim until #850 PR 9b (above, which fixes it): the watchtower read any spend of the BTC HTLC
+    as a claim, so a taker's own refund on a `BOTH_LOCKED` record was paged as one.
   - Do not drive one record from mixed versions: an older `taker_refund_btc` on a record with a
     pending v10 refund sends another and advances on its broadcast.
 
@@ -281,7 +490,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   uses, which now also compares the push nonce and hash). It holds `CoordinatorConfig.fund_lock`,
   when one is set, from that read to its write; only the ETH fund takes that lock, so it does not
   exclude a BTC fund running at the same time in another process. A `MAKER`-role coordinator is
-  refused: the maker's `NEGOTIATED` exit is #850 PR 11. A BTC record that may have been written by
+  refused: the maker's `NEGOTIATED` exit is `maker_refund_covenant` (#850 PR 11). A BTC record that may have been written by
   0.26.x or earlier is refused unless the caller passes `confirm_btc_htlc_empty=True` after checking
   the HTLC address: one that was read without a `role`, one whose record on disk names no `role` or
   was once read without one, or any BTC record when there is no persist hook that reads the record
@@ -605,6 +814,194 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **ElectrumX: a code-1 error on a read is a fault, not a transaction rejection.** ElectrumX answers
+  a malformed or out-of-range read (a header past its tip, a merkle request for a transaction not in
+  the block) with code 1, its BAD_REQUEST; recorded from all three shipped servers. `_rpc_error`
+  treated every code 1 as `PolicyRejection`, which `FailoverElectrumXClient` never retries, so a
+  server that had not reached a height ended the read instead of the next server being asked, and
+  the message said "node rejected the transaction". Code 1 is now a verdict only when it answers
+  `ElectrumXClient.broadcast`; on any other method it raises a `NetworkError` that is not a
+  `PolicyRejection`. Reason-marker matching is unchanged.
+- **ETH: a JSON-RPC error sent with HTTP 400 keeps its reason.** drpc and Blast refuse a wide
+  `eth_getLogs` with HTTP 400 and the reason in the body (recorded 2026-10-30). web3 raised on the
+  status before reading the body, so the log scan's range-limit rule never saw the reason, never
+  halved its window, and those endpoints failed every scan (safe, since a failed scan is never "no
+  logs", but they never answered). `EthRpc` now reads a 400 body of at most 64 KiB and, when it is
+  one well-formed JSON-RPC error, raises it with the server's reason, scrubbed of URL secrets like
+  any response. Every other status, 429 included, fails on its status as before. The range-limit
+  halving in the counter-leg log read (`union_logs`) now halves the refused span, down to 1,000
+  blocks (`LOG_MIN_CHUNK_BLOCKS`, chosen); an endpoint that refuses a span of 1,000 or fewer fails
+  its scan at once, rather than being asked for the range a few blocks at a time. Blast's recorded
+  10-block limit is below the floor, so Blast endpoints still fail that read; drpc (10,000-block
+  limit) now answers it. The watchtower's claim scan asks for its whole range in one request and is
+  unchanged.
+- **ElectrumX failover: a code-1 read moves on without dropping the server.** Like a -32601 answer,
+  it asks the next endpoint without closing the refusing one (which failed its other in-flight
+  calls) and without promoting past it. A code 1 raised from a custom client's broadcast is now read
+  as the node's verdict, so the transaction is not sent on to the next endpoint.
+
+- **Watchtower (ETH): one endpoint can no longer lower or silence a page by failing, lagging or
+  forking.** Found by the 0.27 release review and reproduced on the fake chains with the fault at
+  each endpoint index.
+  - A claim any endpoint's scan serves now wins over the primary's failure. Before, a primary that
+    failed every scan (one rate-limited public RPC) made every page for the swap one
+    `reconcile_error`; once that page was ACKed, a final claim the other endpoints served paged
+    nothing. With no claim served, the primary's failure, or any endpoint's
+    `DeployNotCreationError`, still raises and pages. That reconcile error still pre-empts every
+    other page for the swap, so its situation now carries the error's class and how many safety
+    windows (`--safety-window-blocks` times the Radiant block interval) the fault has lasted: an ACK
+    holds for one class and at most one window, then the page is CRITICAL again. Before, an ACKed reconcile error kept a refund
+    that came due or runnable meanwhile quiet for as long as the fault lasted (re-review, F-1).
+  - The tower judges a claim's finality, and feeds its stall tracker, with the `finalized` block
+    (and, for the tracker, the head) a quorum of endpoints stand at or above, not the lowest any
+    endpoint reports. One endpoint whose `finalized` lagged (even with an honest head) held a final
+    claim at "not yet final" until the claim race squeezed, and reset the stall tracker whenever its
+    own value moved; one endpoint answering a frozen head kept the tracker from declaring a stall.
+    This holds with more endpoints than the quorum (three at the default 2-of-3); with two, the
+    quorum is both and nothing changes. The coordinator's reader and gate still read the lowest.
+  - At `PARAMS_MISMATCH`, a refund page set aside for a scan hit the reader could not read (one
+    forked endpoint) is CRITICAL (`urgent`), as the honest tower's "claimed after a params mismatch"
+    page is, for taker and maker records. Before, it was one WARN. A clean read beside one
+    endpoint's odd log keeps the WARN.
+  - An ETH HTLC's refund pages again when it becomes runnable: `BOTH_LOCKED` once the ETH timeout
+    has passed (`both_locked_refund_runnable`, not urgent), and a legacy record past its timeout
+    (the new `legacy_eth_refund_runnable`). Before, the page sent while the timeout was ahead was
+    the only one.
+- **Swap coordinator: one source can no longer pick the claim on record or lift the D14 hold.**
+  Found by the 0.27 release review.
+  - The claim kept as `counter_claim_tx` (ETH and BTC) is a verified claim first, then the one the
+    most sources nominated, then by hash. Before, the first by hash was kept, so once p was public
+    one source's claim on a transaction no other holds could be the claim on record, nominated back
+    on every later read. The ETH reader now counts every endpoint that served any variant of a
+    transaction's log among its nominations. This holds from three sources up: with two, one source
+    that withholds the real claim's log and receipt and serves another ties it, neither verifies, and
+    the tie falls to the hash, and the coordinator logs that tie (re-review, F-3). The recorded claim
+    is replaced only when the read becomes `CLAIMED` with its transaction, which that liar prevents by
+    withholding the receipt. With one of three sources down the claims can tie the same way.
+  - The covenant age that lifts the D14 hold (a refunded counter leg held open while a claim on
+    record makes p public) is the lowest depth any configured Radiant operator reports for the
+    covenant's funding transaction (`RadiantChainIO.funding_tx_depths`), the primary's included.
+    Before, one over-reporting server could end the record while the covenant was still claimable.
+    A source that does not answer is left out; one that under-reports keeps the hold, and the
+    coordinator logs which. A source that reports the funding transaction unconfirmed (0) is an
+    answer, not a silence, so it keeps the hold too (re-review, F-4). The operators asked are the
+    client, the proof client and any `depth_sources`, a multi-operator client once per operator. The
+    mainnet runners that pass `mainnet_proof_client()` (pyrxd's default endpoints) ask more than one.
+- **Watchtower: a legacy record's D9 check that one endpoint holds without a verdict now pages
+  (#921).** Before, a failed or retried read of a pre-0.27 terminal record was silent on every tick.
+  One endpoint could keep it there for good: an old finalized block (the reader takes the lowest)
+  holds a final ETH refund at `settled_unfinal`, a deploy receipt the other endpoints disagree with
+  holds it at `UNKNOWN`, and one BTC source naming another block holds a buried refund at
+  `refund_pending`. A record unresolved for longer than the new `--legacy-unresolved-page-after-s`
+  (`Reconciler(legacy_unresolved_page_after_s=...)`) pages CRITICAL "investigate"
+  (`legacy_unresolved`) on every read until it resolves. The default is 6 hours, or twice the
+  policy's longest honest wait (ETH finality, or BTC reorg depth times block interval) when that is
+  longer; a bound at or below that wait is refused. Every failed read counts. Retries the tower's
+  configuration explains (every read rests on one source: one endpoint, or a BTC quorum of one; or a
+  source that cannot read the leg) and an empty token contract (every endpoint must read it empty at its tip, so no
+  endpoint can hold it while value is at stake) are marked `LegacyCheck.quiet_by_design` and never
+  page. A record marked checked after
+  its page has that page ACKed by the tower, so it leaves the escalation count. The clock is in
+  memory, so a restart starts it over.
+- **The ETH counter-leg reader and the watchtower's claim scan check that the recorded deploy
+  transaction created the contract.** Both start their log scan at the deploy transaction's block,
+  so a later transaction named as the deploy would start it past a claim; the tower's scan then read
+  a claimed contract as unclaimed. Each now derives the CREATE address from that transaction's sender
+  and nonce (`keccak(rlp([from, nonce]))`, not the receipt's `contractAddress`) and refuses a
+  transaction that is not this contract's creation: `read_counter_disposition` answers `UNKNOWN`,
+  and `claim_status` raises `DeployNotCreationError`, which pages. The tower counts that refusal from
+  any endpoint, not only the primary, unless some endpoint serves a claim; so one lying endpoint can
+  turn the swap's own page into an "investigate" page, never into silence. Since #917 the hash kept
+  on a record is our own deploy, so this guards a record written another way.
+
+- **An ETH counter-leg record keeps its deploy transaction through `post_asset_lock_revalidate`.**
+  The lock-time re-verify replaced the record's locator with one rebuilt from config, whose
+  `deploy_tx_hash` is the all-zero placeholder. The counter-leg disposition reader starts its log
+  scan at the deploy transaction's block, so on every taker or single-operator ETH record that
+  reached BOTH_LOCKED it answered `UNKNOWN`, and `mutual_refund` sent our refund but never moved the
+  record to MUTUAL_REFUND (nor sent a single operator's covenant refund). The nightly ETH e2e had
+  failed on this since #850 PR 6. The watchtower's ETH claim scan reads the same field; on such a
+  record it failed closed (an "investigate" page each tick) rather than scanning. Only a taker's
+  or single operator's own deploy is kept; a maker's record still carries the placeholder, since a
+  deploy hash there is the taker's word. Records already written at BOTH_LOCKED still carry the
+  placeholder.
+
+- **One RXD source pushing the covenant's lock height below 0 no longer quiets the near-`t_rxd` page
+  (Mythos B-1).** The tower derives the lock height as `tip - depth + 1` from the lowest tip and the
+  deepest covenant depth its RXD sources report, and dropped a height below 0 as unread. One source
+  got there by over-reporting the depth or under-reporting its tip, and at `BOTH_LOCKED` the unread
+  branch watches on the counter-leg clock, so where honest sources paged `both_locked_refund_due` the
+  tower stayed silent until the BTC refund matured or the ETH timeout passed. Such a height now reads
+  as locked at height 0, with the tip shifted up so the `depth` blocks between them stand: the same
+  reading an in-range depth that deep already gave.
+
+- **One ETH endpoint can no longer multiply the counter-leg reader's reads, or turn a malformed
+  receipt into a generic reconcile error.**
+  - `read_counter_disposition` verified every transaction any endpoint's log scan nominated, each by
+    a receipt and a canonical-hash read on every endpoint, with no cap. One endpoint serving N ghost
+    `Refunded` logs (no preimage needed) cost about 3N reads per endpoint, per swap, per tick, in
+    the watchtower and the coordinator alike. An endpoint that nominates more than
+    `MAX_NOMINATIONS_PER_ENDPOINT` (8) distinct transactions is now a failed scan (`logs_failed`)
+    and none of its nominations are used. Every other endpoint's are verified, so it can neither
+    hide a real claim or refund nor choose what is read; with no endpoint left the answer is
+    `UNKNOWN`, never "no logs". An honest `EthHtlc` or `Erc20Htlc` emits at most one `Claimed` or
+    `Refunded` log.
+  - `RpcEthChainSource.claim_receipt_opens_h` let one endpoint's malformed receipt field escape as an
+    untyped `ValueError`, so the watchtower's observe raised and paged a reconcile error instead of
+    the claim race. That endpoint's answer is now a `NetworkError`, and the claim race pages
+    fail-closed. `_int_or_none` and `_receipt_facts` (`pyrxd.eth_wallet.htlc_leg`) raise
+    `NetworkError` on a malformed field, as `_b` already did, and `claim_finality_verdict` does the
+    same for a malformed receipt from a sole endpoint.
+- **The watchtower no longer lets one BTC source, or an unreadable covenant, lower a page.**
+  - One source still serving a refund of ours that a quorum of sources reads as unspent (a refund
+    that was dropped, replaced, or never relayed) made the read `REFUND_PENDING`. The tower then
+    watched that refund, armed no pre-signed refund, and paged only near `t_rxd`, naming a refund
+    that was on no chain. The read now reports `refund_outvoted`, and the tower (the legacy net
+    too) treats it as unspent: it pages the refund and may arm the pre-signed one. Re-sending our
+    own refund costs nothing. At `BOTH_LOCKED` with `t_rxd` known to be near, where nothing
+    arms, the CRITICAL pending-refund page stays.
+  - A `BOTH_LOCKED` BTC swap whose covenant lock height the RXD sources could not read got `WATCH`
+    on every tick, past `t_rxd` too. The tower now reads the BTC funding depth there and uses it
+    as the clock, as it does at `BTC_LOCKED`: it watches while the BTC refund leaf has not matured
+    (the swap's timelock gate opens the BTC refund first, by a nominal wall-clock margin), and otherwise pages (urgent for the taker, `both_locked_lock_height_unread`; the
+    maker gets its covenant-refund page). A record with no covenant pinned still watches.
+  - The same held on an ETH counter leg. A `BOTH_LOCKED` ETH swap whose covenant lock height could
+    not be read now uses the ETH HTLC's absolute deadline (`eth_timeout_unix_s`) as the clock, as
+    at `BTC_LOCKED`: it watches before the deadline (the swap's timelock gate opens the covenant
+    refund after it, plus a margin) and pages `mutual_refund` from it, or when the clock cannot be
+    read (`both_locked_lock_height_unread`, not urgent: past the deadline the contract refuses a
+    claim). The maker gets its covenant-refund page; a record with no covenant pinned still watches.
+  - The claim page no longer waits on one source under-reporting a claim's depth (see "Changed
+    (breaking)").
+
+- **An ACK written as the watchtower runbook said was dropped (whole-component Mythos pass of the
+  watchtower, F1).** `FileAckInbox.drain` renames the inbox away to read it, so the operator's next
+  `echo ... >> $ACKS` created the file under their umask (0644 or 0664 by default) and the owner-only
+  gate refused it: the page kept firing and escalation followed. The drain now puts an empty 0600
+  inbox back at once (never through a link), and creates a missing one. An append in the instant
+  between the rename and the re-create still lands under the writer's umask and is refused, so the
+  runbook's ACK command is now `(umask 077; echo ... >> $ACKS)`. The gate itself is unchanged.
+- **`DedupAlerter`: an ACK of a page that did not go out (F2, F6).** An ACK written while the page
+  channel was down never took the swap off `unacked_critical_count`, so the second channel fired on
+  an acknowledged page; and a CRITICAL whose first send failed counted toward escalation but could
+  not be ACKed by either form. An undelivered CRITICAL is now an open situation: its own key ACKs
+  it (the tower logs the line to append when the send fails; a bare swap id does not, so one re-run
+  from shell history cannot switch off escalation for a page nobody saw), and an ACKed one does not
+  count. The escalation page now says how to ACK.
+- **`EscalationMonitor`: one blind heartbeat used up the episode's escalation (F3).** A `-1` or
+  missing count escalated at once and set the same edge real escalations use, so with the default
+  `re_escalate_every_s=0` an un-ACKed CRITICAL after it never escalated. The blind page now has its
+  own persisted edge (`blind_fired`, read as false from an older state file); blindness still starts
+  the escalation clock. A state file an earlier version wrote during a blind episode still holds
+  `fired`, so that episode does not escalate again until the count returns to 0.
+- **A page for a record whose file name the ACK inbox cannot carry could never be ACKed (F5).** The
+  records store names a swap by its file stem and accepts any name; a stem with a space, `+`,
+  non-ASCII or more than 128 characters was printed on the `ack:` line and the inbox dropped the line
+  as malformed. Such a page now prints `ack: id-<hash> <key>` (`alerts.ack_id`), which
+  `DedupAlerter.ack` resolves to the swap.
+- **`scripts/watchtower_dust_run.py plan` printed a command the tower refused (F4).** It now adds
+  `--accept-flat-burial` (a dust run) and a placeholder for the measured fast-tail RXD block
+  interval, which a `--measured` tower requires.
 - **`BitcoinCoreRpcSource.get_tx_block_height` failed for every mined transaction on a real
   Bitcoin Core node.** It read a `blockheight` key that Core's `getrawtransaction` does not send,
   so it raised "unconfirmed" whenever the transaction was mined. It now reads the transaction's

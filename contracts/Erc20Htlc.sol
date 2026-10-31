@@ -42,6 +42,10 @@ contract Erc20Htlc {
     address public immutable token;
     /// @notice Amount in the token's own BASE UNITS (USDC has 6 decimals, not 18).
     uint256 public immutable amount;
+    /// @notice The account that created this contract (`msg.sender` of the constructor). With the
+    ///         refundee, the only account allowed to call `refund`. Not a constructor argument, so
+    ///         no deployer can name someone else here.
+    address public immutable deployer;
 
     bool public settled;
 
@@ -56,6 +60,7 @@ contract Erc20Htlc {
     error NotYetExpired();
     error Underfunded();
     error NothingToRefund();
+    error NotRefunder();
     error TransferFailed();
     error ZeroValue();
     error ZeroAddress();
@@ -78,6 +83,7 @@ contract Erc20Htlc {
         timeout = _timeout;
         token = _token;
         amount = _amount;
+        deployer = msg.sender;
     }
 
     /// @notice Reveal the preimage and sweep the balance to the claimant.
@@ -105,8 +111,19 @@ contract Erc20Htlc {
         _sweep(claimant, balance);
     }
 
-    /// @notice After the timeout, return everything to the refundee.
-    /// @dev No `Underfunded` check here — refunding a partial balance is strictly better than
+    /// @notice After the timeout, return everything to the refundee. Callable by the refundee or
+    ///         the deployer only.
+    /// @dev Why the caller is restricted, although the payout always goes to `refundee`: funding is
+    ///      a push that follows the deploy, and may arrive in parts. If anyone could refund, a third
+    ///      party could refund a contract holding a first small part (even 1 base unit, sent by
+    ///      anyone), setting `settled`; the rest of the push, arriving later, could then be moved by
+    ///      neither `claim` nor `refund` and would be stranded for good. The refundee and the
+    ///      deployer, the funder's own keys, choose when a refund is final.
+    ///
+    ///      Error order: AlreadySettled, then NotYetExpired, then NotRefunder, then NothingToRefund.
+    ///      The state and the clock come before the caller, as in `claim`.
+    ///
+    ///      No `Underfunded` check here — refunding a partial balance is strictly better than
     ///      stranding it, and no secret is revealed by refunding.
     ///
     ///      But an EMPTY balance is refused, and refused WITHOUT settling. Funding is a push that
@@ -117,6 +134,7 @@ contract Erc20Htlc {
     function refund() external {
         if (settled) revert AlreadySettled();
         if (block.timestamp < timeout) revert NotYetExpired();
+        if (msg.sender != refundee && msg.sender != deployer) revert NotRefunder();
         uint256 balance = _balance();
         if (balance == 0) revert NothingToRefund();
 

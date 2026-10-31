@@ -212,7 +212,9 @@ class EthLeg:
         await self._leg.verify_funded(locator, expected_amount_wei=int(terms.value_amount))
         return locator
 
-    def expected_locator(self, terms, *, contract_address: str, deploy_tx_hash: str | None = None) -> EthHtlcLocator:
+    def expected_locator(
+        self, terms, *, contract_address: str, deploy_tx_hash: str | None = None, deployer: str | None = None
+    ) -> EthHtlcLocator:
         """The locator the MAKER expects for a correctly-funded counter HTLC at ``contract_address``.
 
         Built entirely from the maker's OWN payout config (``claim_to``/``refund_to``/
@@ -222,7 +224,11 @@ class EthLeg:
         binds the taker-deployed contract to 'pays the maker on claim, refunds the taker, on the
         agreed H/amount/deadline'. ``deploy_tx_hash`` is informational (not bound on-chain); without
         one the locator carries ``UNKNOWN_DEPLOY_TX_HASH``. The runners' record merge does not
-        compare the field, and a log scan from it fails closed (no such transaction)."""
+        compare the field, and a log scan from it fails closed (no such transaction).
+
+        ``deployer`` (token leg only, #850 PR C) is the contract's creator as
+        :meth:`Erc20HtlcLeg.derive_deployer` derived it from the chain; without one a token locator's
+        ``deployer`` immutable has no value and verifying it fails closed. A native leg refuses one."""
         common = {
             "chain_id": self._leg.chain_id,
             "contract_address": contract_address,
@@ -250,6 +256,8 @@ class EthLeg:
                     f"terms name token {terms_token} but this leg is a native-ETH leg; "
                     "refusing to build a locator that would misdescribe the asset"
                 )
+            if deployer is not None:
+                raise ValidationError("a native-ETH leg's contract has no deployer immutable; refusing one")
             return EthHtlcLocator(**common)
         # Both directions, and BEFORE anything is built. An empty terms_token against a token leg
         # used to fall through silently and produce a token locator, leaving the disagreement to be
@@ -263,7 +271,7 @@ class EthLeg:
             )
         if terms_token != token.address:
             raise ValidationError(f"terms name token {terms_token} but the leg is pinned to {token.address}")
-        return Erc20HtlcLocator(**common, token_address=token.address)
+        return Erc20HtlcLocator(**common, token_address=token.address, deployer=deployer)
 
     async def verify_counterparty_funded(
         self, contract_address: str, terms, *, block_identifier: str | int | None = None
@@ -286,7 +294,16 @@ class EthLeg:
         ``block_identifier`` (red-team HIGH TOCTOU): the coordinator re-runs this at RXD-lock time
         pinned to ``'finalized'`` so a reorg cannot replace the taker's deploy after the maker
         verified it; see :meth:`SwapCoordinator.post_asset_lock_revalidate`."""
+        # The token contract's `deployer` immutable (#850 PR C) is derived from the chain, never
+        # taken from the taker. It decides only who may call refund(), which always pays the refundee,
+        # so it is not what protects the maker; it is bound so the runtime compare leaves no slot
+        # unverified. Read at the same pinned block as every other check.
+        # The asset checks first: they need no chain read, so a terms/leg mismatch is refused as such
+        # rather than after a read of a contract that may not even be the right kind (review MED-3).
         expected = self.expected_locator(terms, contract_address=contract_address)
+        if getattr(self._leg, "token", None) is not None:
+            deployer = await self._leg.derive_deployer(contract_address, block_identifier=block_identifier)
+            expected = self.expected_locator(terms, contract_address=contract_address, deployer=deployer)
         await self._leg.verify_funded(
             expected, expected_amount_wei=int(terms.value_amount), block_identifier=block_identifier
         )

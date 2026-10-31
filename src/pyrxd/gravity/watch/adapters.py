@@ -7,13 +7,15 @@ operational entrypoint (arg parsing, real-client construction, the poll loop) st
 
 * :class:`JsonDirRecordStore` — discovers the operator's in-flight swaps from a
   directory of ``SwapRecord`` JSON files (the same JSON the coordinator persists),
-  skipping terminal swaps and unreadable files.
+  skipping terminal swaps and unreadable files, and lists a bounded number of legacy
+  terminal BTC and ETH records for the D9 net (#850 PR 9b, PR 10).
 * :class:`ElectrumRxdChainSource` — ``RxdChainSource`` over any client exposing
   ``get_tip_height()`` + ``get_transaction_verbose(txid)`` (ElectrumXClient, or a thin
   ssh-tr shim). RXD is single-source in v1 (the ``ChainObserver`` flags it).
 * :class:`OutspendBtcClaimSource` — ``BtcClaimSource`` from an injected ``outspend``
-  callable (claim detection) + a ``BtcFundingReader`` for the quorum-agreed depth
-  (wire ``MultiSourceBtcFundingReader`` here). :func:`mempool_space_outspend` is the
+  callable (spend detection) + a ``BtcFundingReader`` for the quorum-agreed depth
+  (wire ``MultiSourceBtcFundingReader`` here), and the spender classification over that
+  reader's sources (``spend_disposition``, #850 PR 9b). :func:`mempool_space_outspend` is the
   default outspend backend.
 * :class:`LoggingAlertChannel` / :class:`CallbackAlertChannel` — the page sinks; the
   callback channel is where the shell plugs an authenticated webhook / push.
@@ -28,9 +30,15 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
-from pyrxd.gravity.swap_state import RecordFromNewerPyrxd, SwapRecord, is_terminal
+from pyrxd.btc_wallet.disposition import BtcCounterDisposition, read_btc_counter_disposition
+from pyrxd.btc_wallet.taproot import BtcHtlcLocator
+from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.gravity.record_sink import JsonFileRecordSink
+from pyrxd.gravity.swap_state import AbortReason, RecordFromNewerPyrxd, RecordRole, SwapRecord, is_terminal
 from pyrxd.gravity.watch.alerts import Page, Severity
+from pyrxd.gravity.watch.decide import LEGACY_TERMINAL_STATES
 from pyrxd.gravity.watch.quorum import BtcClaimStatus
 from pyrxd.network.source_identity import SourceKey, require_distinct_sources
 from pyrxd.security.errors import NetworkError, ValidationError
@@ -39,6 +47,8 @@ from pyrxd.security.units import ChainHeight, Confirmations
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "LEGACY_CHECKS_PER_TICK",
+    "LEGACY_MARKER_SUFFIX",
     "CallbackAlertChannel",
     "CompositeAlertChannel",
     "ElectrumRxdChainSource",
@@ -68,6 +78,35 @@ def page_to_dict(page: Page) -> dict:
     }
 
 
+#: At most this many legacy terminal records are read per tick (design §5.2 item 2), so the chain reads
+#: the D9 net adds are bounded however many old records a directory holds. CHOSEN, not measured.
+LEGACY_CHECKS_PER_TICK = 5
+#: The tower's marker beside a legacy record it has checked conclusively (D13): ``<swap_id>`` + this.
+LEGACY_MARKER_SUFFIX = ".legacy-checked.json"
+
+
+def is_legacy_candidate(record: SwapRecord) -> bool:
+    """A terminal record that an old pyrxd ended on its counter-leg refund's broadcast (D9, design
+    §5.2): BTC since PR 9b, ETH since PR 10.
+
+    ABORTED or MUTUAL_REFUND, a counter leg that was funded (a BTC or ETH locator for its chain), no
+    ``counter_disposition`` (a 0.27 coordinator records the chain read that ends a record), not a
+    maker's record (the counter leg is the taker's), and not ended by an explicit 0.27 step that
+    reads no refund: the operator's abandon, or the taker's ``abandon_unfunded``. Whether the marker
+    exists is the store's question."""
+    locator = record.counterchain_locator
+    funded = (record.terms.counter_chain == "btc" and isinstance(locator, BtcHtlcLocator)) or (
+        record.terms.counter_chain == "eth" and isinstance(locator, EthHtlcLocator)
+    )
+    return (
+        record.state in LEGACY_TERMINAL_STATES
+        and funded
+        and record.counter_disposition is None
+        and record.role is not RecordRole.MAKER
+        and record.abort_reason not in (AbortReason.OPERATOR_ABANDONED, AbortReason.TAKER_NEVER_FUNDS)
+    )
+
+
 class JsonDirRecordStore:
     """``RecordStore`` over a directory of ``SwapRecord`` JSON files (``<swap_id>.json``).
 
@@ -76,7 +115,10 @@ class JsonDirRecordStore:
     raise into a PAGE, so "watching nothing" can never masquerade as a healthy swaps=0 tick):
       * the records dir does not exist (typo / unmounted / wrong path);
       * files are present but EVERY one is unreadable (we can read none of them).
-    A genuinely empty existing dir returns ``[]`` (0 swaps, healthy). Read-only: v1 never writes.
+    A genuinely empty existing dir returns ``[]`` (0 swaps, healthy).
+
+    It never writes a record. Its one write is the D9 marker (:meth:`mark_legacy_checked`), a sidecar
+    beside a legacy terminal record (D13).
     """
 
     def __init__(self, records_dir: str | Path) -> None:
@@ -85,6 +127,32 @@ class JsonDirRecordStore:
         #: reconciler pages each one by name (#850 PR 3): a skipped record is a swap the tower is not
         #: watching, and a log line alone left that silent unless EVERY record failed.
         self.unreadable: list[tuple[str, str]] = []
+        #: Legacy terminal records to read this tick (D9): at most :data:`LEGACY_CHECKS_PER_TICK`,
+        #: in turn, so a record whose read never concludes cannot hold the others out.
+        self.legacy: list[tuple[str, SwapRecord]] = []
+        self._legacy_after: str | None = None
+
+    def legacy_marker_path(self, swap_id: str) -> Path:
+        return self._dir / f"{swap_id}{LEGACY_MARKER_SUFFIX}"
+
+    def mark_legacy_checked(self, swap_id: str, verdict: str, *, rxd_height: int, evidence: dict[str, Any]) -> Path:
+        """Write the D9 marker for *swap_id*: atomically, mode 600, by the same temp-file, fsync and
+        rename as :class:`~pyrxd.gravity.record_sink.JsonFileRecordSink`. It carries the verdict and
+        what it rests on (the RXD height, and the spender read), so a restart does not read the
+        record again. Raises :class:`NetworkError` when it cannot be written; the record is then
+        read again on a later tick."""
+        payload = {
+            "version": 1,
+            "swap_id": swap_id,
+            "verdict": verdict,
+            "rxd_height": int(rxd_height),
+            "evidence": evidence,
+        }
+        path = self.legacy_marker_path(swap_id)
+        JsonFileRecordSink._atomic_replace(
+            path, json.dumps(payload, sort_keys=True).encode(), what="the legacy-checked marker"
+        )
+        return path
 
     async def list_active(self) -> list[tuple[str, SwapRecord]]:
         if not self._dir.is_dir():
@@ -98,11 +166,13 @@ class JsonDirRecordStore:
         # (``<swap_id>.claim.json``). Counting them here would spam per-tick "unreadable record" warnings
         # and could trip the all-unreadable "watching nothing" page (and their file stem isn't the swap_id
         # either). They are loaded separately, keyed by swap_id, in the executor.
-        _SIDECARS = (".refund.json", ".claim.json")
+        # The D9 marker (``<swap_id>.legacy-checked.json``) is the tower's own sidecar, excluded alike.
+        _SIDECARS = (".refund.json", ".claim.json", LEGACY_MARKER_SUFFIX)
         paths = [p for p in sorted(self._dir.glob("*.json")) if not p.name.endswith(_SIDECARS)]
         failed = 0
         unreadable: list[tuple[str, str]] = []
         self.unreadable = unreadable
+        legacy: list[tuple[str, SwapRecord]] = []
         for path in paths:
             try:
                 rec = SwapRecord.from_dict(json.loads(path.read_text()))
@@ -119,12 +189,26 @@ class JsonDirRecordStore:
                 unreadable.append((path.stem, f"unreadable ({type(exc).__name__}: {str(exc)[:160]})"))
                 continue
             if is_terminal(rec.state):
+                if is_legacy_candidate(rec) and not self.legacy_marker_path(path.stem).exists():
+                    legacy.append((path.stem, rec))
                 continue
             out.append((path.stem, rec))
+        self.legacy = self._next_legacy(legacy)
         if failed and failed == len(paths):
             # Every record present failed to parse → we are BLIND, not "0 active". Page.
             raise NetworkError(f"all {failed} record(s) in {self._dir} are unreadable — the tower is watching nothing")
         return out
+
+    def _next_legacy(self, candidates: list[tuple[str, SwapRecord]]) -> list[tuple[str, SwapRecord]]:
+        """The next :data:`LEGACY_CHECKS_PER_TICK` candidates after the last one taken, wrapping."""
+        if not candidates:
+            return []
+        after = self._legacy_after
+        start = next((i for i, (sid, _r) in enumerate(candidates) if after is None or sid > after), 0)
+        n = min(LEGACY_CHECKS_PER_TICK, len(candidates))
+        chosen = [candidates[(start + i) % len(candidates)] for i in range(n)]
+        self._legacy_after = chosen[-1][0]
+        return chosen
 
 
 class ElectrumRxdChainSource:
@@ -289,8 +373,14 @@ def _is_hex64(value: str) -> bool:
 
 
 class OutspendBtcClaimSource:
-    """``BtcClaimSource`` = injected outspend backend(s) (claim DETECTION) + a ``BtcFundingReader``
-    for the quorum-agreed depth (wire ``MultiSourceBtcFundingReader``).
+    """``BtcClaimSource`` = injected outspend backend(s) (spend DETECTION) + a ``BtcFundingReader``
+    for the quorum-agreed depth (wire ``MultiSourceBtcFundingReader``), and the spender
+    CLASSIFICATION over that reader's sources (:meth:`spend_disposition`, #850 PR 9b).
+
+    :meth:`claim_status` reports ANY spend of the outpoint (with a txid) as claimed: it cannot tell
+    our refund from the maker's claim (``watch/adapters.py`` before 9b; design §6). The
+    :class:`~pyrxd.gravity.watch.quorum.ChainObserver` therefore also reads :meth:`spend_disposition`
+    and takes a spender out of the claim trigger only when that read proves it spends the refund leaf.
 
     Multi-source detection (red-team MEDIUM): the maker-claim DETECTION boolean is the trigger that
     arms the whole claim-race assessment, so a SINGLE lagging/lying/MITM'd ``/outspend`` source that
@@ -298,7 +388,7 @@ class OutspendBtcClaimSource:
     Pass several outspend backends of distinct operators (the same Esplora set used for depth): detection then
     fails TOWARD paging — if ANY source sees the outpoint spent (with a txid) we treat it as claimed
     (a missed claim is the real harm; a false page is cheap — the operator just verifies, and the
-    DEPTH read below is still the conservative quorum-min, so a single lying "spent" cannot fake
+    DEPTH read below is still the depth a quorum vouches for, so a single lying "spent" cannot fake
     reorg-safety into a SAFE auto-claim). If EVERY detection source errors we fail closed (raise →
     the reconciler pages a decision-required), never a silent "unspent". One source still works
     (degrades to v1 behaviour)."""
@@ -329,8 +419,21 @@ class OutspendBtcClaimSource:
     async def confirmations(self, claim_txid: str) -> Confirmations:
         return Confirmations(int(await self._reader.confirmations(claim_txid)))
 
+    async def spend_disposition(
+        self, locator: BtcHtlcLocator, *, hashlock: bytes, burial_blocks: int
+    ) -> BtcCounterDisposition:
+        """What spends *locator*'s funding outpoint, classified by the leaf it spends: the shared
+        reader the coordinator uses (:func:`pyrxd.btc_wallet.disposition.read_btc_counter_disposition`,
+        #850 PR 9a), over the funding reader's own sources and quorum (``panel()``), or that reader
+        alone. Never raises for an unreadable chain: that answer is ``UNKNOWN``."""
+        panel = getattr(self._reader, "panel", None)
+        readers, quorum = panel() if callable(panel) else ((self._reader,), 1)
+        return await read_btc_counter_disposition(
+            readers, locator, hashlock=hashlock, burial_blocks=burial_blocks, quorum=quorum
+        )
+
     async def funding_confirmations(self, funding_txid: str) -> Confirmations | None:
-        """Funding-tx depth via the SAME quorum reader (conservative min). Returns ``None`` if the read
+        """Funding-tx depth via the SAME quorum reader (the depth a quorum vouches for). Returns ``None`` if the read
         fails (down/unknown) so decide() fails closed (no autonomous refund) instead of guessing — a
         genuine 0 (unconfirmed) is returned as 0 and the maturity gate keeps watching."""
         try:

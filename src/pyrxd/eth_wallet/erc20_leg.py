@@ -64,6 +64,25 @@ _TRANSFER_ABI = [
 ]
 
 
+#: How many of a candidate deployer's nonces :meth:`Erc20HtlcLeg.derive_deployer` searches, newest
+#: first. A bound on local work (one keccak per nonce), not a measurement; a deployer key with more
+#: transactions than this is refused rather than searched.
+DEPLOYER_NONCE_SEARCH = 100_000
+
+
+def _create_rlp(addr: bytes, nonce: int) -> bytes:
+    """``rlp([addr, nonce])`` for a 20-byte ``addr``: the preimage of a CREATE address."""
+    if nonce == 0:
+        n = b"\x80"
+    elif nonce < 0x80:
+        n = bytes([nonce])
+    else:
+        b = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
+        n = bytes([0x80 + len(b)]) + b
+    payload = b"\x94" + addr + n
+    return bytes([0xC0 + len(payload)]) + payload
+
+
 def _create_address(sender: str, nonce: int) -> str:
     """The CREATE address for ``sender`` at ``nonce`` — keccak(rlp([sender, nonce]))[12:].
 
@@ -77,15 +96,7 @@ def _create_address(sender: str, nonce: int) -> str:
     addr = bytes.fromhex(sender[2:] if sender.startswith("0x") else sender)
     if len(addr) != 20:
         raise ValidationError(f"sender must be a 20-byte address, got {len(addr)}")
-    if nonce == 0:
-        n = b"\x80"
-    elif nonce < 0x80:
-        n = bytes([nonce])
-    else:
-        b = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
-        n = bytes([0x80 + len(b)]) + b
-    payload = b"\x94" + addr + n
-    return to_checksum_address(keccak(bytes([0xC0 + len(payload)]) + payload)[12:])
+    return to_checksum_address(keccak(_create_rlp(addr, nonce))[12:])
 
 
 def _fee_fields_of(tx: dict) -> dict[str, int]:
@@ -156,7 +167,209 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         values = super()._immutable_values(locator)
         values["token"] = _addr_word(self._token.address)
         values["amount"] = int(locator.amount_wei).to_bytes(32, "big")
+        # The `deployer` immutable (#850 PR C): `refund` is callable by the refundee or the deployer.
+        # No value without a derived deployer on the locator, so `_expected_runtime` fails closed on a
+        # record written before the field existed rather than masking the slot.
+        deployer = getattr(locator, "deployer", None)
+        if deployer is not None:
+            values["deployer"] = _addr_word(deployer)
         return values
+
+    def _has_artifact_shape(self, code: bytes) -> bool:
+        """Whether ``code`` equals this artifact's runtime everywhere outside the immutable slots.
+
+        A shape check for diagnosis, never a pass: it ignores the slots, so it can only say a contract
+        is certainly not ours. Whether the slots hold the negotiated values is the exact compare's job.
+        """
+        expected = self.expected_runtime_code
+        if len(code) != len(expected):
+            return False
+        masked_code, masked_expected = bytearray(code), bytearray(expected)
+        for offsets in (self._artifact.get("immutableReferences") or {}).values():
+            for ref in offsets:
+                start, length = int(ref["start"]), int(ref["length"])
+                masked_code[start : start + length] = bytes(length)
+                masked_expected[start : start + length] = bytes(length)
+        return masked_code == masked_expected
+
+    async def derive_deployer(self, contract_address: str, *, block_identifier: Any = None) -> str:
+        """The account that created the contract at ``contract_address``, from the chain, checked by CREATE.
+
+        The ``deployer`` immutable is set to ``msg.sender`` by the constructor, so the contract names
+        its creator — but a contract whose creation code was not ours could name anyone, so the value
+        read is a candidate, not the answer. It is accepted only when a nonce of the candidate
+        produces this address: ``keccak(rlp([candidate, n]))[12:] == contract_address`` for some ``n``
+        below the candidate's transaction count. That equation is checked here, locally, and no
+        endpoint can make it true for an account that did not create the address.
+
+        The candidate is read through :func:`read_contract` (an identity read at the block
+        ``block_identifier`` resolves to; for ``latest``, the highest head an answering endpoint
+        reports; for ``finalized``, the height a quorum of endpoints vouch for. On a fleet, empty code
+        at either is a retryable :class:`NetworkError`, since one endpoint can still move the block), after
+        the contract's code is read at the same block: no code there is
+        the deploy not yet buried at that block, said as such, and a contract with no working
+        ``deployer()`` is refused as not an Erc20Htlc of this build, rather than surfacing a raw
+        decoding error. Code that differs from the artifact outside the immutable slots is refused
+        the same way before the getter is read, since a fleet whose every endpoint fails the getter
+        would otherwise report an outage.
+
+        ``block_identifier`` is resolved to one block number first, and the code, the getter and every
+        count are read at that number. Each endpoint's transaction count for the candidate opens its
+        own window, the :data:`DEPLOYER_NONCE_SEARCH` nonces below that count, and a hit in ANY window
+        is accepted: the CREATE equation proves itself, so no endpoint's count needs to be believed. One endpoint
+        reporting a count far too high (or too low) moves only its own window; an endpoint that does
+        not answer contributes none. The refusal is a :class:`ValidationError` only when every
+        endpoint answered and no window holds the nonce; with any endpoint silent it is a retryable
+        :class:`NetworkError`, because the silent one may hold the window that would have matched
+        (review MED-1, MED-2). A refusal names the search bound when a window stops short of nonce 0:
+        a key busier than the bound is refused without blaming the taker.
+
+        Divergence from the design text (D1 condition 2), deliberate: it named the sender recovered
+        from the deploy transaction's signature, with the transaction's hash taken from the locator.
+        The maker's locator carries no deploy hash (``UNKNOWN_DEPLOY_TX_HASH``; the taker's word for
+        it is not used), and recovering a signature adds nothing the CREATE equation does not already
+        bind: the equation alone ties the candidate to the address.
+        """
+        import asyncio
+
+        from eth_utils import keccak, to_checksum_address
+
+        # One concrete block for every read below. A tag ("finalized", "latest") is resolved again by
+        # each request, so behind a load balancer the code and the count could come from nodes at
+        # different blocks; a node asked for a number it has not reached is expected to error (geth:
+        # "header not found"), and an error is a silent endpoint, never a refusal (Mythos
+        # 20261028T100731 LOW-2, re-review F1).
+        latest = block_identifier is None or block_identifier == "latest"
+        if latest:
+            # The HIGHEST head an answering endpoint reports, not the fleet's lowest, so a deploy mined in
+            # the newest block is inside the read. A head can still lag (only a lagging endpoint
+            # answered), so empty code at a resolved `latest` is retryable below, never a refusal.
+            heads = await asyncio.gather(
+                *(r.block_number() for r in (getattr(self._rpc, "sources", None) or [self._rpc])),
+                return_exceptions=True,
+            )
+            known = [int(h) for h in heads if not isinstance(h, BaseException)]
+            if not known:
+                raise NetworkError(f"no endpoint reported its head block, so {contract_address} was not read")
+            _bid = max(known)
+        elif block_identifier == "finalized":
+            # The height a quorum of endpoints vouch is finalized, not the fleet's lowest: with MIN one
+            # endpoint reporting finalized 0 chose a block before the deploy, the honest nodes agreed its
+            # code was empty there, and an honest finalized contract was refused as "not yet finalized"
+            # for as long as that endpoint kept it up (re-review 4). The quorum-th value needs
+            # `min_agreeing` endpoints at or above it, so a minority cannot pull the block up. It can
+            # still pull it down when no honest majority outvotes it (two sources, or one of three
+            # down), so empty code at this height is retryable below, never a refusal (re-review 5).
+            from pyrxd.eth_wallet.multi_rpc import quorum_combiner
+
+            _bid = int(
+                await read_contract(
+                    self._rpc,
+                    lambda s: s.finalized_block_number(),
+                    label="finalized_block_number",
+                    combine=quorum_combiner(self._rpc),
+                )
+            )
+        else:
+            _bid = block_identifier
+        code = await self._rpc.get_code(contract_address, _bid)
+        if not code and latest:
+            raise NetworkError(
+                f"no contract code at {contract_address} as of block {_bid}, the newest head an endpoint "
+                "reported. The deploy may simply not be visible there yet (a lagging endpoint); nothing was "
+                "concluded, retry. A contract that never appears is not verified, so nothing is locked."
+            )
+        if not code and block_identifier == "finalized" and getattr(self._rpc, "sources", None):
+            raise NetworkError(
+                f"no contract code at {contract_address} as of block {_bid}, the finalized height a quorum "
+                "of endpoints reported. The deploy is most likely simply NOT YET FINALIZED, or one endpoint "
+                "reported a low finalized height; nothing was concluded, retry once it buries."
+            )
+        if not code:
+            raise ValidationError(
+                f"no contract code at {contract_address} as of block {_bid} (block_identifier={block_identifier!r}), so its "
+                "deployer cannot be read. If that is 'finalized', the deploy is most likely simply NOT YET "
+                "FINALIZED: retry once it buries. Empty code at a checkpoint is not evidence of a wrong contract."
+            )
+        if not self._has_artifact_shape(bytes(code)):
+            # Diagnosis only, and only ever a refusal: the exact compare in `verify_funded` still gates.
+            # Without it a contract with no `deployer()` failed the getter on every endpoint, which a
+            # fleet reports as a retryable outage rather than a wrong contract (re-review MED-1).
+            raise ValidationError(
+                f"the code at {contract_address} is not this build's Erc20Htlc: it differs from the artifact "
+                "outside the immutable slots, so no value of any immutable could make it match. Refusing."
+            )
+
+        def _call(r):
+            c = r.w3.eth.contract(address=contract_address, abi=self._artifact["abi"])
+            return c.functions.deployer().call(block_identifier=_bid)
+
+        try:
+            candidate = str(await read_contract(self._rpc, _call, label=f"{contract_address}.deployer()"))
+        except (NetworkError, ValidationError):
+            raise
+        except Exception as exc:  # a contract without the getter: web3 cannot decode its answer
+            raise ValidationError(
+                f"the contract at {contract_address} has no working deployer() getter ({type(exc).__name__}), "
+                "so it is not an Erc20Htlc of this build"
+            ) from exc
+        try:
+            sender = bytes.fromhex(candidate[2:]) if candidate.startswith("0x") else b""
+        except ValueError:
+            sender = b""
+        if len(sender) != 20:
+            raise ValidationError(f"{contract_address}.deployer() is not a 20-byte address: {candidate[:60]!r}")
+
+        sources = getattr(self._rpc, "sources", None)
+        endpoints = list(sources) if sources else [self._rpc]
+        answers = await asyncio.gather(
+            # At the block the code and the getter were read at: the deploy is mined by then, so a node
+            # that answers for that block number counts past the deploy's nonce.
+            *(r.get_transaction_count(candidate, _bid) for r in endpoints),
+            return_exceptions=True,
+        )
+        # A count outside [0, 2**64) is no answer: EIP-2681 caps an account's nonce below 2**64, and a
+        # larger one would not RLP-encode as a nonce (re-review LOW-2).
+        valid = [int(a) for a in answers if not isinstance(a, BaseException) and 0 <= int(a) < 2**64]
+        counts = sorted(set(valid))
+        silent = len(answers) - len(valid)
+        target = bytes.fromhex(contract_address[2:].lower())
+        searched: set[int] = set()
+        for count in counts:
+            # Newest first: a swap's deploy is usually among the deployer's latest transactions.
+            for nonce in range(count - 1, max(count - DEPLOYER_NONCE_SEARCH, 0) - 1, -1):
+                if nonce in searched:
+                    continue
+                searched.add(nonce)
+                if keccak(_create_rlp(sender, nonce))[12:] == target:
+                    return to_checksum_address(sender)
+        windows = ", ".join(f"[{max(c - DEPLOYER_NONCE_SEARCH, 0)}, {c})" for c in counts) or "none"
+        if silent:
+            raise NetworkError(
+                f"the contract at {contract_address} names {candidate} as its deployer, and no nonce in the "
+                f"windows the answering endpoints opened ({windows}) creates this address, but {silent} of "
+                f"{len(answers)} endpoints did not report a usable transaction count for it. The window that "
+                "would match may be theirs, so the deployer is unknown. Nothing was concluded; retry."
+            )
+        if all(c <= DEPLOYER_NONCE_SEARCH for c in counts):
+            # Every window holds every nonce the account had used by that block: a proven negative.
+            raise ValidationError(
+                f"the contract at {contract_address} names {candidate} as its deployer, but no nonce that "
+                f"account had used by block {_bid} (windows {windows}) creates this "
+                "address. Refusing: the deployer is derived from the chain, and this contract was not created "
+                "the way an Erc20Htlc deploy creates one."
+            )
+        # Some window stops short of nonce 0, so the deploy may simply lie further back: a key that sent
+        # more than DEPLOYER_NONCE_SEARCH transactions since it deployed. Not evidence against the taker,
+        # and retrying will not find it either (Mythos 20261028T100731, LOW-1).
+        raise ValidationError(
+            f"the contract at {contract_address} names {candidate} as its deployer, and no nonce in the "
+            f"windows searched ({windows}) creates this address. The search covers the newest "
+            f"{DEPLOYER_NONCE_SEARCH} nonces below each reported count, so either this contract was not "
+            f"created by {candidate}, or that account has sent more than {DEPLOYER_NONCE_SEARCH} transactions "
+            "since it deployed it. The deployer cannot be derived; refusing. A taker deploying from a busy "
+            "shared key should deploy from a dedicated key."
+        )
 
     async def fund(
         self,
@@ -221,6 +434,19 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         if resume_from is not None:
             address = checksum(resume_from.address)
             deploy_hash = resume_from.deploy_tx_hash
+            # This leg's key must be the contract's deployer, which the locator below names (#850 PR
+            # C). Say so plainly when another key created it, rather than leaving the exact runtime
+            # compare to call the operator's own contract a wrong one. A derivation that cannot
+            # answer leaves the diagnosis to `verify_funded`, which refuses anything not exact.
+            try:
+                creator = await self.derive_deployer(address)
+            except Exception:  # diagnosis only: any failure leaves the gate to `verify_funded`
+                creator = None
+            if creator is not None and creator.lower() != self._account_address().lower():
+                raise ValidationError(
+                    f"the contract {address} this fund would resume was deployed by {creator}, not by this "
+                    f"leg's key {self._account_address()}. Nothing was sent. Resume with the key that deployed it."
+                )
             # PROVE it is ours before sending anything to it. `verify_funded` runs the full
             # immutable binding (hashlock, claimant, refundee, timeout, token, AMOUNT) plus the
             # runtime-code and recipient checks; `require_balance=False` waives the balance floor
@@ -587,6 +813,9 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             timeout=int(timeout),
             amount_wei=int(amount_wei),
             token_address=self._token.address,
+            # This leg's own key: it sent the deploy (fresh), or the contract is refused by the exact
+            # runtime compare (a resume of a contract another key created).
+            deployer=self._account_address(),
         )
 
     async def refund(
@@ -610,6 +839,9 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         * settled: no early answer here; the parent's preflight reports the revert as before (a
           retry after a refund that already succeeded lands there, not in "nothing to refund").
         * not yet mature: the parent's transient :class:`NetworkError`, unchanged.
+        * matured, unsettled, and this key is neither the refundee nor the locator's deployer:
+          :class:`ValidationError`, before anything is signed (the contract would revert
+          ``NotRefunder``, #850 PR C).
         * matured, unsettled, zero balance: :class:`NothingToRefund`, before anything is signed.
 
         The balance is read from EVERY configured endpoint and the MAX is taken. "Empty" needs every
@@ -621,6 +853,19 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         await self._rpc.assert_chain()
         now_ts = await self._rpc.latest_block_timestamp_min()
         if now_ts >= int(locator.timeout) and not any(await self._settled_word(locator, None)):
+            # The caller check comes next in the contract's order (#850 PR C): only the refundee or
+            # the deployer may refund. From the record's derived deployer; a record without one is
+            # for a contract built before the rule, which any account may refund.
+            deployer = getattr(locator, "deployer", None)
+            if deployer is not None:
+                me = self._account_address().lower()
+                if me not in (locator.refundee.lower(), deployer.lower()):
+                    raise ValidationError(
+                        f"this key ({me}) cannot refund the HTLC at {locator.contract_address}: refund() "
+                        f"is callable by its refundee ({locator.refundee}) or its deployer ({deployer}) "
+                        "only, and reverts NotRefunder for any other account. Nothing was sent. Refund "
+                        "with one of those keys."
+                    )
             answers = await self._read_every_endpoint(
                 lambda r: balance_of(r, self._token, locator.contract_address),
                 label=f"{self._token.symbol}.balanceOf({locator.contract_address})",

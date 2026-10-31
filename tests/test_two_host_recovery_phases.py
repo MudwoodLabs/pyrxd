@@ -91,6 +91,35 @@ class _FakeRadiantLeg:
         self._funded = funded
         self.refund_calls: list[object] = []
 
+    async def covenant_outpoint(self, terms):
+        if not self._funded:
+            raise NetworkError("no UTXO found for the covenant scriptPubKey (not yet funded / wrong SPK)")
+        return "cc" * 32 + ":0"
+
+    async def expected_covenant_scriptpubkey(self, terms):
+        return b"\x51"
+
+    async def covenant_spend(self, record, *, burial_blocks):
+        """The covenant read (#850 PR 11): unspent until this fake has refunded it, then the refund,
+        buried as deep as ``confs``."""
+        from pyrxd.gravity.radiant_leg import CovenantSpend, CovenantSpendKind
+
+        if not (self.refund_calls or self.already_refunded):
+            return CovenantSpend(CovenantSpendKind.UNSPENT, "scripted: unspent", sources=("a",), operators=1)
+        return CovenantSpend(
+            CovenantSpendKind.REFUNDED,
+            "scripted: refunded",
+            txid=self.REFUND_TXID,
+            depth=self._confs,
+            buried=self._confs >= burial_blocks,
+            sources=("a",),
+            operators=1,
+        )
+
+    REFUND_TXID = "ad" * 32
+    #: A covenant refunded by an EARLIER run (each phase builds a fresh leg).
+    already_refunded = False
+
     async def find_covenant_utxo(self, spk, *, expected_value=None, pin_outpoint=None):
         if not self._funded:
             raise NetworkError("no UTXO found for the covenant scriptPubKey (not yet funded / wrong SPK)")
@@ -111,7 +140,7 @@ class _FakeRadiantLeg:
                 f"confirmations, has {self._confs}"
             )
         self.refund_calls.append(record)
-        return "rxdrefund" + "0" * 55
+        return self.REFUND_TXID
 
 
 class _FakeFundingReader:
@@ -648,13 +677,13 @@ class TestTheHarnessRoleTagMakesTheTrapUnreachableAtRuntime:
 
 
 class TestTheLibraryHasNoAssetRefundOutsideBothLocked:
-    """The maker's ``--phase abort`` calls ``RadiantCovenantLeg.refund_asset`` directly and says in
-    its docstring that no coordinator method drives an asset refund from NEGOTIATED. That is a
-    CLAIM, and a claim inside a comment rots silently — so it is pinned here in both directions:
-    the membership of the coordinator's asset-refunding methods, and their refusal from NEGOTIATED.
-    Grow a third one, or relax either state guard, and this fails."""
+    """Which coordinator methods can send the covenant's CSV refund, and from which states, pinned in
+    both directions: the membership of the asset-refunding methods, and their state guards. Until
+    #850 PR 11 there were two, both BOTH_LOCKED only, and the maker's ``--phase abort`` called the
+    leg directly. PR 11 adds ``maker_refund_covenant``, the maker's step from the states in which it
+    never revealed p. Grow a fourth, or relax a state guard, and this fails."""
 
-    def test_exactly_two_coordinator_methods_refund_the_asset(self):
+    def test_exactly_three_coordinator_methods_refund_the_asset(self):
         # A private helper that calls ``refund_asset`` (``_refund_the_covenant_once``, #850 PR 6) is
         # followed up to the public methods that reach it, so moving the call into a helper cannot
         # hide a new entry point.
@@ -675,9 +704,21 @@ class TestTheLibraryHasNoAssetRefundOutsideBothLocked:
             frontier = {name for name, called in calls.items() if called & frontier} - reached
             reached |= frontier
         public = {name for name in reached if not name.startswith("_")}
-        assert public == {"maybe_refund_asset_on_maker_stall", "mutual_refund"}, (public, reached)
+        assert public == {"maybe_refund_asset_on_maker_stall", "mutual_refund", "maker_refund_covenant"}, (
+            public,
+            reached,
+        )
 
-    async def test_both_of_them_refuse_from_negotiated(self, eth_mod, tmp_path):
+    def test_the_makers_step_sends_only_from_states_before_the_reveal(self):
+        """``maker_refund_covenant`` sends from NEGOTIATED, BTC_LOCKED and PARAMS_MISMATCH: never from
+        BOTH_LOCKED (whose maker refund checks the counter-leg claim) or any state after the reveal."""
+        from pyrxd.gravity.swap_coordinator import _MAKER_COVENANT_SEND_STATES
+        from pyrxd.gravity.swap_state import REVEALED_STATES
+
+        assert {SwapState.NEGOTIATED, SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH} == _MAKER_COVENANT_SEND_STATES
+        assert not _MAKER_COVENANT_SEND_STATES & (REVEALED_STATES | {SwapState.BOTH_LOCKED})
+
+    async def test_the_two_both_locked_ones_refuse_from_negotiated(self, eth_mod, tmp_path):
         args, terms, _io = _eth_scenario(eth_mod, tmp_path, role="maker", with_funding=True)
         rxd_leg = _FakeRadiantLeg(fee_source=_FeeSource())
         coord = eth_mod._coordinator(
@@ -1416,6 +1457,48 @@ class TestMakerAbortUnlocksAnAssetTheTakerNeverMatched:
         assert built["rxd"].refund_calls[0].state is SwapState.NEGOTIATED, "no fabricated BOTH_LOCKED"
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_a_later_run_ends_the_record_once_the_refund_is_buried(self, name, tmp_path, monkeypatch, capsys):
+        """#850 PR 11: the abort goes through the coordinator, so the record no longer stays NEGOTIATED
+        after the covenant is refunded. The first run sends and records the refund; a run after it is
+        buried reads it and ends the record, sending nothing; a third says it is closed."""
+        from pyrxd.gravity.swap_state import AbortReason
+
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, _terms, _io = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=False)
+        built = (_wire_eth if eth else _wire_btc)(mod, monkeypatch)
+        await mod.maker_phase_abort(_with_fee(args))
+        rec = _read_back(args)
+        assert rec.state is SwapState.NEGOTIATED and rec.asset_refund_txid == _FakeRadiantLeg.REFUND_TXID
+        assert rec.radiant_covenant_outpoint is not None, "the covenant is pinned before the refund"
+
+        monkeypatch.setattr(_FakeRadiantLeg, "already_refunded", True)
+        built = (_wire_eth if eth else _wire_btc)(mod, monkeypatch)
+        await mod.maker_phase_abort(_with_fee(args))
+        rec = _read_back(args)
+        assert rec.state is SwapState.ABORTED and rec.abort_reason is AbortReason.COVENANT_REFUNDED
+        assert built["rxd"].refund_calls == []
+
+        await mod.maker_phase_abort(_with_fee(args))
+        assert "already closed" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
+    async def test_a_params_mismatch_record_is_refunded_though_the_taker_funded(self, name, tmp_path, monkeypatch):
+        """The deferred maker params-mismatch exit: the maker's own revalidation failed, so it never
+        revealed p, and --phase refund (BOTH_LOCKED only) cannot end the record."""
+        mod = _load(name)
+        eth = name == "eth_swap_two_host"
+        args, terms, io_dir = (_eth_scenario if eth else _btc_scenario)(mod, tmp_path, role="maker", with_funding=True)
+        await _seed(
+            args, _seeded_record(terms, io_dir, eth=eth, state=SwapState.PARAMS_MISMATCH, pending=False, maker=True)
+        )
+        assert (io_dir / "taker_funding.json").exists()
+        built = (_wire_eth if eth else _wire_btc)(mod, monkeypatch)
+        await mod.maker_phase_abort(_with_fee(args))
+        assert len(built["rxd"].refund_calls) == 1
+        assert _read_back(args).state is SwapState.PARAMS_MISMATCH
+
+    @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     async def test_it_refuses_once_the_taker_HAS_funded_and_points_at_refund(self, name, tmp_path, monkeypatch):
         """A funded counter leg makes this the mutual unwind, which belongs in --phase refund where
         the coordinator's stall trigger, maturity pre-check and P3 role guard all apply."""
@@ -1965,22 +2048,37 @@ class TestAnHonestMakerCanRecoverAfterItsOwnLockClaim:
         await _run_phase(name, args, monkeypatch, role="maker", phase="refund")
         loc = _read_back(args).counterchain_locator
         assert loc.deploy_tx_hash != lie
+        # A maker's record keeps the placeholder: the refusal below must come from that, not from the
+        # deploy check refusing whatever hash the record holds.
+        from pyrxd.eth_wallet.locator import UNKNOWN_DEPLOY_TX_HASH
 
-        class _Chain:  # deploy at block 10, a real claim at 100, the lying tx at 500
+        assert loc.deploy_tx_hash == UNKNOWN_DEPLOY_TX_HASH
+
+        from pyrxd.eth_wallet.htlc_leg import create_address
+
+        deployer = "0x" + "de" * 20
+        contract = create_address(deployer, 0)
+
+        class _Chain:  # deploy at block 10, a real claim at 100, the lying tx (a call) at 500
             blocks = {real_deploy: 10, lie: 500}
 
             async def get_transaction(self, tx_hash):
                 if tx_hash not in self.blocks:
                     raise NetworkError(f"eth_getTransactionByHash failed: {tx_hash} not found")
-                return {"blockNumber": self.blocks[tx_hash]}
+                if tx_hash == real_deploy:
+                    return {"blockNumber": 10, "from": deployer, "nonce": 0, "to": None}
+                return {"blockNumber": self.blocks[tx_hash], "from": deployer, "nonce": 1, "to": contract}
 
             async def get_logs(self, *, address, topics=None, from_block="earliest", to_block="latest"):
                 claim = {"topics": [CLAIMED_TOPIC0], "transactionHash": "0x" + "12" * 32, "blockNumber": 100}
                 return [claim] if int(from_block) <= 100 else []
 
         source = RpcEthChainSource(_Chain())
-        assert (await source.claim_status(loc.contract_address, real_deploy)).claimed  # control
-        assert not (await source.claim_status(loc.contract_address, lie)).claimed  # what the lie did
+        assert (await source.claim_status(contract, real_deploy)).claimed  # control
+        # What the lie did before the scan checked its start: it read the claimed contract unclaimed.
+        # A transaction that did not create the contract now refuses the scan.
+        with pytest.raises(NetworkError, match="did not create"):
+            await source.claim_status(contract, lie)
         with pytest.raises(NetworkError):
             await source.claim_status(loc.contract_address, loc.deploy_tx_hash)
 
@@ -2015,6 +2113,37 @@ class TestARerunFundNeverOverwritesTheRecord:
         assert ("cast send 0x" + "98" * 20 + " 'refund()'") in msg
         assert _record_path(args).read_bytes() == before
         assert built == {}, "a leg was built before the refusal"
+
+    async def test_a_TOKEN_interrupted_deploy_names_who_may_refund_it(self, eth_mod, tmp_path, monkeypatch):
+        """#850 PR C: an Erc20Htlc's refund() is callable by its refundee or deployer only, so the
+        refusal must not tell the operator that any account can call it (review LOW-2)."""
+        import dataclasses
+
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        args, terms, io_dir = _eth_scenario(eth_mod, tmp_path, role="taker", with_funding=False)
+        terms = dataclasses.replace(terms, token_address="0x" + "70" * 20)
+        env = json.loads((io_dir / "envelope.json").read_text())
+        env["terms"] = terms.to_dict()
+        (io_dir / "envelope.json").write_text(json.dumps(env))
+        await _seed(
+            args,
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=terms,
+                pending_counter_contract="0x" + "98" * 20,
+                pending_counter_deploy_tx="0x" + "97" * 32,
+                pending_push_nonce=3,
+            ),
+        )
+        built = _wire_eth(eth_mod, monkeypatch)
+        with pytest.raises(SystemExit, match="interrupted fund") as raised:
+            await eth_mod.taker_phase_fund(_with_fee(args))
+        msg = str(raised.value.code)
+        assert "ANY account" not in msg
+        assert "its refundee (your refund address) or the key that sent its deploy" in msg
+        assert ("cast send 0x" + "98" * 20 + " 'refund()'") in msg
+        assert built == {}
 
     @pytest.mark.parametrize("name", ["eth_swap_two_host", "btc_swap_two_host"])
     async def test_a_completed_fund_is_not_funded_again(self, name, tmp_path, monkeypatch):

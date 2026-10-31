@@ -55,11 +55,16 @@ into the same app or receiver changes nothing.
   Neither lets the autonomous refund broadcast on a single-source read: that takes its own flag,
   `--auto-refund-on-single-source`.
 - BTC depth + claim detection: defaults to mempool.space / Esplora (`--mempool-base-url`, `--quorum`).
-- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). The finality gate also needs the
+- Optional ETH watching: `--eth-rpc-url` (+ `--eth-chain-id`). Give `--eth-rpc-url` more than once,
+  for endpoints of distinct operators, and the tower reads the counter-leg contract's disposition
+  from all of them (the coordinator's reader). With one endpoint every ETH page is marked low
+  corroboration, and that endpoint's word never stops a page or marks a legacy record checked: a
+  refund it alone reads as final leaves the refund page up. The finality gate also needs the
   chain's **finalization window** — how far the `finalized` tag lags the tip — which the tower takes
   from its own vetted registry for the given chain id (768 s Ethereum/Sepolia, 900 s Base/Optimism,
   1200 s Arbitrum, 6000 s Linea). On a chain id the registry does not know, it logs an `ERROR` and
-  leaves the gate un-assessable, which pages `SQUEEZED` "verify finality manually" *every tick* —
+  leaves the gate un-assessable, which pages `SQUEEZED` "verify finality manually" *every tick*
+  (situation `claim_race_unassessable`, so an ACK of it does not silence the winner-take-all page) —
   pass `--eth-finalization-window-s` with a sourced figure for that chain. Do not shrink it to
   quieten a page: the reserve is compared against the room left before the maker's refund opens, so
   a smaller window makes the gate say WAIT with less margin than the chain actually needs.
@@ -67,10 +72,117 @@ into the same app or receiver changes nothing.
   From 0.27 the tower arms an autonomous refund or claim only for a record that names the taker (or
   the single operator) as its writer, `"role": "taker"` or `"none"`. A record written before 0.27
   has no role and is paged but never acted on; it gains one the next time a 0.27 coordinator saves
-  it. The BTC refund is also never autonomous while the maker's covenant is known (observed, or
-  pinned on the record), because the maker can still claim until the refund confirms: the tower
-  pages, and you refund and watch. A taker's coordinator pins the covenant its fund was verified
-  against, including on a resumed fund, so in practice a taker's BTC refund is paged, not sent.
+  it. While the maker's covenant is known (observed, or pinned on the record), the BTC refund is
+  autonomous only when the tower classifies the HTLC's spender and that read holds the funding
+  outpoint unspent at its quorum (#850 PR 9b). The tower reads each spender by the leaf it spends,
+  so its own pre-signed refund (or yours) is read back as a refund, not as the maker's claim, and a
+  claim that replaces it pages the claim race. A read below quorum, or a refund of yours already
+  seen, arms nothing. A read from one source (`--quorum 1`, or a network with one Esplora, as the
+  shipped non-mainnet setup is) marks the page low-corroboration, so the executor sends nothing
+  unless `--auto-refund-on-single-source` is set, and one source's "buried" is read as still
+  pending: such a tower never sends the `RECONCILE` page, and near t_rxd it pages the refund as
+  unburied. A `ClaimExecutor` you wire yourself declines on the same low-corroboration mark, so
+  on such a network it never claims the covenant either. Run the coordinator step yourself once the refund is buried. The page says whether this tick's executor broadcast the refund: an
+  alert-only or dormant tower says it did not, and the refund is then yours to send. A refund page
+  for an unspent HTLC is CRITICAL, re-paged until you ACK it, once t_rxd is within
+  `--safety-window-blocks` or past it (also from PARAMS_MISMATCH; from BOTH_LOCKED only once t_rxd
+  has matured, since `mutual_refund` runs only after both timeouts). So is the page when the
+  funding depth cannot be read (or `t_btc` is not in blocks) with t_rxd that near: the tower cannot
+  tell whether your refund leaf has matured, so read the depth elsewhere. The shipped
+  `pyrxd-watchtower` classifies; a third-party claim source without `spend_disposition` keeps the
+  earlier rule (paged, never sent).
+- **After a refund.** While a refund of ours is unburied the tower watches silently (the maker can
+  still claim; a claim pages) until t_rxd is within `--safety-window-blocks`: from then on it pages
+  CRITICAL, because once t_rxd matures the maker can refund the covenant and still claim the BTC by
+  replacing an unconfirmed refund. The pre-signed blob's fee is fixed. To bump it, run
+  `taker_refund_btc` (`mutual_refund` from BOTH_LOCKED) and keep it running: it reads the tower's
+  refund as its own, but replaces it only once that one process has seen it in the mempool for
+  `REFUND_REPLACE_AFTER_S` (600 s); the two-host runner's `--phase refund` polls for you. An ACK of
+  that page covers only it: a claim that replaces your refund pages again. Once the
+  refund is buried at the policy's BTC reorg depth the tower sends an INFO `RECONCILE` page naming
+  `reconcile_counter_leg` (`mutual_refund` from BOTH_LOCKED). The coordinator buries at its own
+  depth, so if that step still reads the refund as pending, run it again later.
+- **A claim on record.** If the record names a claim that opens H (`counter_claim_tx`), `p` is
+  public: the tower pages the covenant claim whatever the outpoint shows now, and arms nothing.
+- **Legacy records (the D9 net).** pyrxd before 0.27 ended a BTC refund's record on its broadcast.
+  The tower reads up to 5 such terminal records per tick (ABORTED or MUTUAL_REFUND, BTC, funded,
+  no `counter_disposition`, not a maker's), once each:
+  - spent by the maker's claim: a CRITICAL page to claim the covenant before t_rxd (`pyrxd swap
+    recover-preimage`, then `pyrxd swap build-claim`), not a refund;
+  - unspent: a page to refund by address (`pyrxd swap build-refund`), CRITICAL near or past t_rxd
+    or when the record pins no covenant, WARN otherwise. This one is read again every turn until the
+    refund is buried, because an unspent HTLC stays yours to lose;
+  - a spender only a discovery source names, beside your buried refund: a CRITICAL "investigate"
+    page, never marked;
+  - refunded and buried: nothing is paged.
+  A record that pins no covenant (every record written before 0.27) gives the tower no t_rxd, so
+  its claim page repeats until you ACK it, and it is never marked.
+  On a conclusive verdict (refunded, or a claim page delivered after t_rxd) the tower writes
+  `<swap_id>.legacy-checked.json` beside the record (mode 600, atomic). It never writes a record.
+  Delete the marker to have the record read again.
+  A legacy record (BTC or ETH) whose read fails or retries without a verdict (`UNKNOWN`, a
+  refund not yet buried or not yet final) for longer than `--legacy-unresolved-page-after-s` pages
+  CRITICAL "investigate" (`legacy_unresolved`) on every read until it resolves (#921). One endpoint
+  can hold such a read for good, for example by reporting an old finalized block. Compare the
+  endpoints' answers and check the counter leg by hand. The default is 6 hours (chosen, not
+  measured), or twice the policy's longest honest wait (ETH finality, or the BTC reorg depth times
+  the block interval) when that is longer; a value at or below that wait is refused at start. Every
+  failed read counts, including on a tower with no ETH source for an ETH record. Three retries do
+  not count. Two follow from the tower's configuration: every read resting on one source (one endpoint,
+  or a BTC `--quorum` of 1), and a source that cannot classify the leg. The third is an
+  empty token contract a push may still reach, which no endpoint can hold while value is at stake
+  (every endpoint must read it empty at its tip). When the record is later marked checked, the tower ACKs
+  its own `legacy_unresolved` page, so it leaves the escalation count. The clock is kept in memory,
+  so restarting the tower starts it over.
+- **ETH counter legs (#850 PR 10).** On a read of more than one endpoint: your refund verified at
+  the finalized block sends an INFO `RECONCILE` page naming `reconcile_counter_leg` (`mutual_refund`
+  from BOTH_LOCKED); a `Claimed` log that opens H beside it, or a claim on record, pages the covenant
+  claim instead (`p` is public). A contract settled at the finalized block that the reader cannot
+  explain pages CRITICAL "investigate". An empty token contract past its timeout pages
+  `close_push_nonce` (a push may still land) or `taker_refund_btc` (none can), the gated abandon from
+  BOTH_LOCKED, and from PARAMS_MISMATCH the covenant refund then the abandon. A claim after a params
+  mismatch (one the reader saw or answered CLAIMED, or one on record) pages the covenant refund then
+  `abandon_counter_leg`; a log only the scan counts is named on the refund page instead. A record still at BTC_LOCKED when the
+  maker's claim is final is told to run `reconcile_counter_leg`, then `taker_scrape_and_claim_asset`
+  (a maker's record: `reconcile_counter_leg` alone, which only records the claim, so the record stays
+  at BTC_LOCKED and the page repeats until ACKed). The claim scan
+  asks every endpoint; a log it counts as a claim that the reader does not count as one, or that no
+  endpoint agrees is our claim when the reader cannot read the contract (and that no claim on record
+  explains), pages CRITICAL "investigate" (a maker's record is told to refund its
+  covenant if no log opens H). Once ACKed, that page stays quiet while the log is served, so watch
+  the counter leg's timeout yourself. A claim kept on the record (`counter_claim_tx`) that no read
+  shows this turn pages the covenant claim, on every turn until your refund is final; its text also
+  says to refund the ETH leg once its timeout passes, but once ACKed the refund coming due does not
+  page again, so watch that timeout yourself. One endpoint can add a page (an "investigate" page, or a
+  fail-closed claim race when it withholds a claim's receipt or serves a log on a transaction no
+  endpoint holds), and it cannot mark a legacy record. With more endpoints than the quorum (three
+  at the default 2-of-3) it cannot delay a claim page by lagging: the tower reads the finalized block
+  a quorum of endpoints stand at or above, so only a quorum that lags holds a final claim at "not yet
+  final" (until the claim race squeezes), and its stall check reads the head the same way. With two endpoints the quorum is both, so one
+  lagging endpoint still delays it. The pages that rest on the reader alone (a taker's final-refund
+  INFO, a maker's WARN after the taker's refund, a legacy record's marking) still read the lowest
+  finalized block, so one lagging endpoint can still delay those; none of them carries value at
+  stake. The coordinator's own gate still reads the lowest finalized
+  block, so after a claim page it can refuse the claim step until the lagging endpoint catches up;
+  run the step again then, and check that endpoint if it does not catch up before t_rxd. A primary endpoint that
+  fails every scan pages a reconcile error, but a claim another endpoint serves still pages the claim
+  race, even after that reconcile error was ACKed. With no claim served, the reconcile error stands
+  in for every other page for the swap, so an ACK of it holds for one error class and at most one
+  safety window (`--safety-window-blocks` times `--rxd-block-interval-s`); then it pages CRITICAL again. Fix or replace the endpoint
+  rather than re-ACKing it. A claim's finality counts only
+  for a transaction whose receipt, logs included, every endpoint returns alike and which carries this
+  contract's `Claimed` event that opens H. An endpoint whose log scan names more than eight
+  transactions (an honest contract emits one `Claimed` or `Refunded` log at most) is read as a
+  failed scan and none of its logs are checked, so it cannot multiply the tower's reads; the other
+  endpoints' logs are all checked, and with none left the answer is unknown. An endpoint that
+  returns a malformed receipt for a claim fails that read, so the claim race pages fail-closed
+  rather than a reconcile error.
+  Legacy ETH records (terminal, funded, no `counter_disposition`, not a maker's) are read like the BTC
+  ones: an unsettled contract pages "call `refund()` on the contract" (after the timeout anyone may
+  call it on a native ETH contract, and only the refundee or the deploying key on an ERC-20 one; it
+  pays the refundee) and is read again every turn; a claim, or one on record, pages the
+  covenant claim; a refund, or an empty contract no signed push can still fill, agrees and is marked.
+  An empty contract a push may still fill is read again every turn.
 - **Roles change the pages.** A taker's refund is paged once the counter leg's deadline passes,
   whether or not the maker's covenant is on chain. A maker's record is paged to refund its covenant
   at t_rxd, never to run the taker's `taker_refund_btc` or `mutual_refund`.
@@ -104,11 +216,46 @@ pyrxd-watchtower-escalate \
     --webhook-url https://escalation.channel/endpoint
 ```
 
-Acknowledging a CRITICAL page is a one-liner — it is what stops the re-paging *and* the escalation:
+Acknowledging a CRITICAL page is a one-liner — it is what stops the re-paging *and* the escalation.
+An ACK covers the situation it was paged for. Every page that can be CRITICAL is its own situation
+(the claim race, the pending refund, a reconcile error, an unreadable record, each urgent refund page,
+and the others), so an ACK of one never silences another. Each CRITICAL page ends with an `ack:` line
+naming the swap and the situation; append that line to the inbox:
 
 ```bash
-echo <swap_id> >> /run/wt/acks
+(umask 077; echo "<swap_id> <situation key>" >> /run/wt/acks)   # copy it from the page's "ack:" line
 ```
+
+The tower reads the inbox only if it is owner-only (mode 600), and after each read it puts an empty
+mode-600 inbox back, so a plain `echo ... >>` appends to that file. The `umask 077` covers the
+instant between the read and the re-create: an append that lands there creates the file under your
+umask, the tower refuses it and logs an error, and every ACK appended to it before the next read is
+dropped; write them again. A CRITICAL page whose send failed counts toward escalation; the tower's
+log prints the line that ACKs it, and only that keyed line does (a bare swap id never ACKs a page
+that did not reach you).
+
+A bare swap id also works, but only when that swap has exactly one open, un-ACKed CRITICAL page that
+reached you as CRITICAL, and no ACK yet. Otherwise the tower cannot tell which page you meant, so it logs the ACK as ignored and keeps paging.
+
+Prefer the keyed line: a bare id appended after its page closed lands on whatever page is open then.
+
+A swap is named by its record's file name. A name the inbox cannot carry (a space, `+`, non-ASCII,
+more than 128 characters) appears on the `ack:` line as `id-<hash>`; copy the line as printed.
+
+A page stays open until it has been absent for 10 of that swap's ticks in a row
+(`DEFAULT_SITUATION_HOLD_TICKS`, chosen, not measured); it is closed when the next tick starts, so the
+same danger on the 11th tick pages again. Another page or a quiet tick both count as absent. Ticks are counted per swap: an active swap gets one each poll, about 5
+minutes at the default 30 s poll; a legacy record, which the tower does not visit every poll, holds
+its pages longer. A swap the tower stops visiting without retiring it (its record removed, or marked
+legacy) keeps its open pages until you ACK them or restart the tower. A CRITICAL page that failed to
+send counts toward escalation from its first attempt, and goes out as soon as the channel is back. While it is open, a CRITICAL page counts toward escalation until you ACK it, your ACK
+holds (a one- or two-tick read failure in between neither ends it nor resets escalation), and a WARN
+or INFO page is not sent again. Once it closes, its ACK ends and an ACK written after that records
+nothing, so the same danger coming back later pages again. A CRITICAL page that comes back within the
+window after you ACKed it stays quiet: it is treated as the danger you acknowledged. A situation that
+paged CRITICAL stays CRITICAL, re-paged, until you ACK it, even on a tick that reads it less urgent.
+On an armed refund page the situation includes what the executor did, so a re-broadcast that FAILED
+after one that went out pages once more.
 
 ## Timing relationships that must hold
 
@@ -348,7 +495,7 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
 
   | Page | Meaning | What to do |
   |---|---|---|
-  | `CRITICAL … UNACKNOWLEDGED for Ns` | The tower is alive and paging; nobody has ACK'd. | Check the primary channel, act on the swap, `echo <swap_id> >> $ACK_INBOX`. |
+  | `CRITICAL … UNACKNOWLEDGED for Ns` | The tower is alive and paging; nobody has ACK'd. | Check the primary channel, act on the swap, append the page's `ack:` line (`(umask 077; echo "<swap_id> <situation key>" >> $ACK_INBOX)`). |
   | `CRITICAL (blind) …` | The heartbeat carries no usable count (`-1` sentinel, missing key, or an unknown `schema_version`). | Fix the tower's wiring. Until then the escalation path is **not** protecting you — watch in-flight swaps by hand. |
   | `WARN … monitor is BLIND` | The heartbeat is stale/absent/future-dated. Sent **once** per episode. | Nothing new: the dead-man's-switch owns this alarm. The WARN doubles as proof this channel still works. |
   | `INFO escalation cleared` | `unacked_critical` is back to zero. | Nothing. |

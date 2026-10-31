@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pyrxd.eth_wallet.events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
+from pyrxd.eth_wallet.htlc_leg import create_address
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.security.errors import NetworkError
 from tests._source_hosts import distinct_host
@@ -27,7 +28,11 @@ from tests._source_hosts import distinct_host
 GENESIS_TS = 1_800_000_000
 BLOCK_SECONDS = 12
 CHAIN_ID = 11155111
-CONTRACT = "0x" + "c0" * 20
+#: The key that deployed the contract: its CREATE address at nonce 0 is :data:`CONTRACT`, so the
+#: reader's derivation check on the deploy transaction passes on an honest chain.
+DEPLOYER = "0x" + "de" * 20
+DEPLOY_NONCE = 0
+CONTRACT = create_address(DEPLOYER, DEPLOY_NONCE).lower()
 OTHER_CONTRACT = "0x" + "0d" * 20
 TOKEN = "0x" + "70" * 20
 FUNDER = "0x" + "bb" * 20
@@ -64,6 +69,10 @@ class FakeEvmChain:
         self.hashlock = hashlib.sha256(self.preimage).digest()
         self.deploy_tx = _tx_hash("deploy")
         self.receipts[self.deploy_tx] = self._receipt(self.deploy_block, logs=[], status=1)
+        #: The deploy transaction's sender and nonce. A test that names a different transaction as
+        #: the deploy (one that did not create :data:`CONTRACT`) changes these.
+        self.deploy_from = DEPLOYER
+        self.deploy_nonce = DEPLOY_NONCE
 
     # -- shape
 
@@ -203,9 +212,13 @@ class FakeEvmEndpoint:
         nonce_reads_fail: bool = False,
         lie_nonce: int | None = None,
         pending_extra: int = 0,
+        hide_receipts: tuple[str, ...] = (),
+        finalized_lag: int = 0,
     ) -> None:
         self.chain = chain
         self.lag = lag
+        #: Blocks this endpoint's ``finalized`` trails the chain's by, with an honest head.
+        self.finalized_lag = finalized_lag
         self.fork = fork
         self.forge_refunded_tx = forge_refunded_tx
         self.forge_receipt = forge_receipt
@@ -225,6 +238,8 @@ class FakeEvmEndpoint:
         self.lie_nonce = lie_nonce
         #: Transactions of the funding key in THIS endpoint's pool only, on top of the chain's.
         self.pending_extra = pending_extra
+        #: Transactions this endpoint answers "no receipt" for, whatever the chain holds.
+        self.hide_receipts = hide_receipts
         self.source_key = distinct_host()
         self.expected_chain_id = CHAIN_ID
         self.log_requests: list[tuple[int, int | str]] = []
@@ -238,7 +253,7 @@ class FakeEvmEndpoint:
         return _block_hash(number, self.fork if number > self.chain.deploy_block else "")
 
     async def finalized_block_number(self) -> int:
-        return min(self.chain.finalized, self.head)
+        return min(max(self.chain.finalized - self.finalized_lag, 0), self.head)
 
     async def block_number(self) -> int:
         return self.head
@@ -318,9 +333,18 @@ class FakeEvmEndpoint:
                 "logs": [{"address": CONTRACT, "topics": [REFUNDED_TOPIC0], "data": "0x"}],
             }
         r = self.chain.receipts.get(tx_hash)
-        if r is None or r["blockNumber"] > self.head:
+        if r is None or r["blockNumber"] > self.head or tx_hash in self.hide_receipts:
             return None
         return dict(r)
+
+    async def get_transaction(self, tx_hash: str) -> dict[str, Any]:
+        r = self.chain.receipts.get(tx_hash)
+        if r is None or tx_hash in self.hide_receipts:
+            raise NetworkError(f"transaction {tx_hash} not found")
+        mined = r["blockNumber"] if r["blockNumber"] <= self.head else None
+        if tx_hash == self.chain.deploy_tx:
+            return {"from": self.chain.deploy_from, "nonce": self.chain.deploy_nonce, "to": None, "blockNumber": mined}
+        return {"from": FUNDER, "nonce": 1, "to": CONTRACT, "blockNumber": mined}
 
     async def get_logs(
         self, *, address: str, topics: Any = None, from_block: int | str = "earliest", to_block: int | str = "latest"

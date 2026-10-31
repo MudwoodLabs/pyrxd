@@ -200,6 +200,81 @@ async def test_policy_rejection_on_a_read_is_not_retried_either() -> None:
     assert fakes[B].calls == []
 
 
+async def test_a_code_1_out_of_range_read_is_asked_of_the_next_endpoint() -> None:
+    """ElectrumX code 1 on a read is a bad request, not a verdict (recorded 2026-10-30 from the
+    shipped servers: "height N out of range" from one that had not reached N). The next endpoint
+    must still be asked; classified as a verdict, one lagging server ended the read."""
+    client, fakes = build([A, B])
+    fakes[A].tip_error = _rpc_error(1, "height 577,275 out of range")
+
+    await client.get_tip_height()
+    assert fakes[B].calls
+
+
+async def test_a_code_1_read_costs_the_endpoint_nothing() -> None:
+    """Like -32601: the refusing endpoint is not closed (which would fail its other in-flight
+    calls) and is not demoted, so the next read still goes to it first."""
+    client, fakes = build([A, B])
+    fakes[A].tip_error = _rpc_error(1, "height 577,275 out of range")
+    await client.get_tip_height()
+
+    assert fakes[A].closed == 0
+    assert client.active_url == A
+
+
+async def test_a_code_1_read_refused_everywhere_still_fails() -> None:
+    client, fakes = build([A, B])
+    for fake in fakes.values():
+        fake.tip_error = _rpc_error(1, "height 577,275 out of range")
+
+    with pytest.raises(NetworkError, match="all 2 ElectrumX endpoint") as caught:
+        await client.get_tip_height()
+    assert not isinstance(caught.value, (PolicyRejection, RpcMethodNotFound))
+
+
+async def test_a_code_1_answer_to_a_non_idempotent_call_is_not_sent_again() -> None:
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _rpc_error(1, "bad params")
+
+    with pytest.raises(NetworkError):
+        await client.call_extension("some.mutating.method")
+    assert not any(name == "call_extension" for name, _ in fakes[B].calls)
+
+
+async def test_a_code_1_from_the_chain_check_is_still_a_fault() -> None:
+    """The chain check runs before the op; an endpoint that cannot answer it is not verified, so it
+    is discarded and the winner promoted, as for any fault."""
+    client, fakes = build([A, B], genesis=_GENESIS, verify_chain=True)
+    fakes[A].chain_error = _rpc_error(1, "height 0 out of range")
+    await client.get_tip_height()
+
+    assert fakes[A].closed == 1
+    assert client.active_url == B
+
+
+async def test_lacking_the_method_on_one_endpoint_and_refusing_on_another_is_not_method_not_found() -> None:
+    """B implements the method (it answered code 1), so "no endpoint implements it" would be false."""
+    client, fakes = build([A, B])
+    fakes[A].extension_error = _method_not_found("wave.resolve")
+    fakes[B].extension_error = _rpc_error(1, "bad params")
+
+    with pytest.raises(NetworkError) as caught:
+        await client.call_extension("wave.resolve", ["alice"], idempotent=True)
+    assert not isinstance(caught.value, RpcMethodNotFound)
+
+
+async def test_a_custom_client_raising_code_1_from_broadcast_is_a_verdict() -> None:
+    """A client_factory client that does not convert code 1 itself: the failover layer converts it,
+    so a refused transaction is not sent on to the next endpoint."""
+    client, fakes = build([A, B])
+    fakes[A].broadcast_error = _rpc_error(1, "")
+
+    with pytest.raises(PolicyRejection) as caught:
+        await client.broadcast(_RAW_TX)
+    assert caught.value.code == 1
+    assert fakes[B].calls == []
+
+
 async def test_call_extension_is_not_retried_by_default() -> None:
     """`call_extension` reaches arbitrary indexer RPCs; the failover layer cannot
     know whether replaying one is safe, so it does not."""

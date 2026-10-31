@@ -396,7 +396,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
     print(f"      --autonomous-refund-cap-sats {min(int(state['btc_sats']) + 1, 10_000)} \\")
     print("      --accept-single-source --auto-refund-on-single-source \\")
     print("      --rxd-backend ssh-tr --ssh-host <your node host> --ssh-container <your node container> \\")
-    print("      --measured --poll-interval-s 30 --heartbeat-file ~/.pyrxd/watchtower/heartbeat")
+    # A dust run: the value-scaled burial has no reorg-cost figure to scale by, so it says so. A
+    # measured policy also needs the fast-tail RXD block interval, measured for this run.
+    print("      --measured --accept-flat-burial --rxd-block-interval-fast-s <measured p10 RXD interval s> \\")
+    print("      --poll-interval-s 30 --heartbeat-file ~/.pyrxd/watchtower/heartbeat")
+    print()
+    print("  Fill in the RXD block interval's measured p10 in seconds; the tower refuses a measured")
+    print("  policy without it.")
     print()
     print("  The daemon holds NO key; it broadcasts the pre-signed sidecar once the BTC funding buries")
     print(f"  >= t_btc ({state['t_btc_blocks']}) blocks and the RXD asset is observed un-locked.")

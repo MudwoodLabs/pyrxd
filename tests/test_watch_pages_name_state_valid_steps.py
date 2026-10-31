@@ -396,9 +396,7 @@ def test_secret_revealed_safe_page_still_names_the_plain_step():
     assert d.autonomous_asset_claim is True
 
 
-@pytest.mark.parametrize(
-    "state", [SwapState.PARAMS_MISMATCH, SwapState.MAKER_STALLS, SwapState.BTC_LOCKED, SwapState.NEGOTIATED]
-)
+@pytest.mark.parametrize("state", [SwapState.PARAMS_MISMATCH, SwapState.MAKER_STALLS, SwapState.NEGOTIATED])
 def test_no_step_states_page_investigate_and_say_why(state):
     """States with no valid claim step get a REPORT, not a step name and not silence.
 
@@ -418,6 +416,27 @@ def test_no_step_states_page_investigate_and_say_why(state):
         assert step in action, f"the investigate page must say what {step} needs"
 
 
+@pytest.mark.parametrize("eth", [False, True], ids=["btc", "eth"])
+def test_a_btc_locked_record_is_told_to_reconcile_then_claim(eth):
+    """#850 PR 10 (design §5.1, ``_CLAIM_PATH[BTC_LOCKED]``): a record still at BTC_LOCKED when the
+    chain shows the maker's final claim. ``reconcile_counter_leg`` takes it to SECRET_REVEALED on that
+    CLAIMED disposition, so the page names it first instead of "investigate"."""
+    obs = (
+        _eth_claim_shapes()[0][1]
+        if eth
+        else Observations(
+            maker_has_claimed_btc=True, now_rxd_height=150, asset_locked_at_height=LOCK, btc_claim_confirmations=6
+        )
+    )
+    d = _decide(SwapState.BTC_LOCKED, obs, eth=eth)
+    assert d.intent is Intent.PAGE_CLAIM
+    assert d.recommended_action == "reconcile_counter_leg, then taker_scrape_and_claim_asset"
+    guards = _state_guards()
+    assert SwapState.BTC_LOCKED in guards["reconcile_counter_leg"]
+    # The coordinator's edge the page leans on: BTC_LOCKED -> SECRET_REVEALED on an observed claim.
+    assert can_transition(SwapState.BTC_LOCKED, SwapState.SECRET_REVEALED)
+
+
 def test_eth_branch_gets_the_same_treatment():
     """The ETH arm carried a byte-identical copy of the defect; it must carry the fix too."""
     obs = Observations(
@@ -434,3 +453,66 @@ def test_eth_branch_gets_the_same_treatment():
     )
     # ETH SAFE must still NOT arm the BTC-only autonomous claim discriminator.
     assert _decide(SwapState.SECRET_REVEALED, obs, eth=True).autonomous_asset_claim is False
+
+
+# ---------------------------------------------------------------------------
+# #850 PR 9b: the pages a classified spend of OUR refund leaf emits
+# ---------------------------------------------------------------------------
+
+
+def _btc_refund_shapes() -> list[tuple[str, Observations]]:
+    from pyrxd.btc_wallet.disposition import BtcDispositionKind
+
+    base = {
+        "maker_has_claimed_btc": False,
+        "now_rxd_height": 150,
+        "asset_locked_at_height": LOCK,
+        "btc_funding_confirmations": 40,
+        "btc_spend_classified": True,
+        "btc_disposition_reason": "a read",
+    }
+    return [
+        ("refunded", Observations(**base, btc_disposition=BtcDispositionKind.REFUNDED, btc_refund_txid="ab" * 32)),
+        ("unspent", Observations(**base, btc_disposition=BtcDispositionKind.UNSPENT)),
+        (
+            "contradiction",
+            Observations(**base, btc_disposition=BtcDispositionKind.UNKNOWN, btc_spenders_named=True),
+        ),
+        # Pending, early and inside the safety window before t_rxd (LOCK + 72): the latter pages a step.
+        (
+            "pending",
+            Observations(**base, btc_disposition=BtcDispositionKind.REFUND_PENDING, btc_refund_txid="ab" * 32),
+        ),
+        (
+            "pending-near-t_rxd",
+            Observations(
+                **{**base, "now_rxd_height": REFUND_OPENS - 2},
+                btc_disposition=BtcDispositionKind.REFUND_PENDING,
+                btc_refund_txid="ab" * 32,
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize("state", _NON_TERMINAL, ids=lambda s: s.value)
+def test_no_refund_spend_page_names_a_step_the_record_cannot_run(state):
+    """The RECONCILE page names ``reconcile_counter_leg`` or ``mutual_refund``; both are state-gated
+    (read from the coordinator's guards above), so the sweep covers them like the claim steps."""
+    guards = _state_guards()
+    assert guards["reconcile_counter_leg"] == frozenset(
+        {SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH, SwapState.BOTH_LOCKED}
+    )
+    shapes = [(label, obs, None) for label, obs in _btc_refund_shapes()]
+    shapes += [(f"{label}+claim-on-record", obs, "cd" * 32) for label, obs in _btc_refund_shapes()]
+    for label, obs, claim in shapes:
+        d = decide(
+            record=SwapRecord(state=state, terms=_terms(), role=RecordRole.TAKER, counter_claim_tx=claim),
+            observations=obs,
+            policy=_policy(),
+            safety_window_blocks=SAFETY,
+        )
+        steps = _named_steps(d.recommended_action or "", guards)
+        if steps:
+            assert state in guards[steps[0]], f"{state.value}/{label} pages {steps[0]!r}: {d.recommended_action!r}"
+        if d.intent is Intent.RECONCILE:
+            assert steps, f"{state.value}/{label}: a RECONCILE page must name its step"

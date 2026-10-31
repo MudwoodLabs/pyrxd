@@ -14,6 +14,7 @@ import os
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.eth_wallet.htlc_leg import create_address
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.swap_coordinator import MarginPolicy
@@ -89,6 +90,9 @@ class FakeBtc:
     async def confirmations(self, claim_txid):
         return self._confs
 
+    async def funding_confirmations(self, funding_txid):
+        return None  # unread: decide() fails closed on it
+
 
 class FakeRxd:
     def __init__(self, tip: int, cov_confs: int | None = None, *, corroborated: bool = False):
@@ -146,11 +150,12 @@ async def test_no_locator_skips_btc_query():
     assert btc.claim_status_calls == []  # no funding outpoint to watch yet
 
 
-async def test_bogus_covenant_confs_guarded_to_none():
-    # cov_confs > tip + 1 (impossible on an honest chain) ⇒ candidate < 0 ⇒ None, not negative.
+async def test_a_depth_past_the_tip_keeps_its_blocks():
+    # cov_confs > tip + 1 (impossible on an honest chain): never a negative height, and never "unread"
+    # either (Mythos B-1). Both heights shift up so the 500 blocks between them stand.
     btc = FakeBtc(BtcClaimStatus(claimed=False))
     obs = await ChainObserver(btc=btc, rxd=FakeRxd(tip=200, cov_confs=500)).observe("s", _record())
-    assert obs.asset_locked_at_height is None
+    assert (obs.asset_locked_at_height, obs.now_rxd_height) == (0, 499)
 
 
 async def test_corroboration_flag_requires_structural_quorum():
@@ -211,10 +216,15 @@ def _eth_terms() -> NegotiatedTerms:
     )
 
 
+#: The key that deployed ``ETH_CONTRACT`` at nonce 0, so a claim scan's derivation check passes.
+ETH_DEPLOYER = "0x" + "de" * 20
+ETH_CONTRACT = create_address(ETH_DEPLOYER, 0).lower()
+
+
 def _eth_locator() -> EthHtlcLocator:
     return EthHtlcLocator(
         chain_id=11155111,
-        contract_address="0x" + "ab" * 20,
+        contract_address=ETH_CONTRACT,
         deploy_tx_hash="0x" + "cd" * 32,
         hashlock="0x" + "ef" * 32,
         claimant="0x" + "11" * 20,
@@ -270,7 +280,7 @@ async def test_eth_maker_not_claimed():
     assert obs.now_rxd_height == 200
     assert obs.asset_locked_at_height == 100  # shared RXD derivation: 200 - 101 + 1
     assert obs.low_corroboration is True
-    assert eth.claim_status_calls == [("0x" + "ab" * 20, "0x" + "cd" * 32)]
+    assert eth.claim_status_calls == [(ETH_CONTRACT, "0x" + "cd" * 32)]
     assert eth.verdict_calls == []  # not claimed → no finality read
 
 

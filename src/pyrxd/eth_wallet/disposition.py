@@ -57,7 +57,7 @@ import asyncio
 import dataclasses
 import hashlib
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -65,25 +65,36 @@ from typing import Any
 from ..network.source_identity import require_distinct_sources
 from ..security.errors import NetworkError, ValidationError
 from .events import CLAIMED_TOPIC0, REFUNDED_TOPIC0
-from .htlc_leg import SETTLED_SLOT, _addr, _b, _int_or_none, _receipt_facts
+from .htlc_leg import SETTLED_SLOT, _addr, _b, _int_or_none, _receipt_facts, create_address
 from .locator import UNKNOWN_DEPLOY_TX_HASH, EthHtlcLocator
 
 __all__ = [
     "LOG_CHUNK_BLOCKS",
+    "MAX_NOMINATIONS_PER_ENDPOINT",
     "ClaimSeen",
     "CounterDisposition",
     "DispositionEvidence",
     "DispositionKind",
     "LogUnion",
     "UnfundedTokenBalance",
+    "created_contract",
     "read_counter_disposition",
     "read_unfunded_token_balance",
     "union_logs",
 ]
 
 #: Blocks per ``eth_getLogs`` request before halving. CHOSEN, not measured against any provider's
-#: cap: a range-limit refusal halves the chunk for that endpoint, down to one block.
+#: cap: a range-limit refusal halves the chunk for that endpoint, down to :data:`LOG_MIN_CHUNK_BLOCKS`.
 LOG_CHUNK_BLOCKS = 10_000
+
+#: The smallest chunk a range-limit refusal halves to; a refusal of a span this size or smaller fails
+#: the endpoint.
+#: CHOSEN, not measured. Without a floor, an endpoint capped at 10 blocks (recorded 2026-10-30 for
+#: both Blast endpoints, ``tests/fixtures/recorded_endpoint_replies.json``) turns a scan into
+#: thousands of sequential requests, and ``_ask_all`` waits for the slowest source; an endpoint
+#: that answers every request with range-limit text could force a chunk of one block. drpc's
+#: recorded limit (ranges over 10,000 blocks refused) is reached at 5,000, above the floor.
+LOG_MIN_CHUNK_BLOCKS = 1_000
 
 #: How far past the agreed head one endpoint's log scan follows its OWN head. CHOSEN, not measured.
 #: Bounded so an endpoint reporting an absurd head cannot make its own scan endless; a log beyond it
@@ -99,6 +110,21 @@ _RANGE_LIMIT_MARKERS = ("range", "query returned more than", "too large", "too w
 #: sends a rate-limited endpoint a dozen more requests before it is recorded as failed.
 #: A regex, not substrings: a bare "429" matched inside block numbers such as 0x1429ab.
 _RATE_LIMIT = re.compile(r"\b429\b|too many requests|rate[ -]?limit")
+
+#: The most distinct transactions one endpoint's log scan may nominate for verification (sandbox
+#: review N-C). CHOSEN, not measured. An honest ``EthHtlc``/``Erc20Htlc`` emits at most ONE ``Claimed``
+#: or ``Refunded`` log in its life (``claim()`` and ``refund()`` both revert once ``settled`` is set), so
+#: an honest endpoint nominates at most one; the margin is for an endpoint serving a log a reorg has
+#: since replaced. Each nomination costs a receipt read and a canonical-hash read on EVERY endpoint,
+#: so without this one endpoint serving N ghost logs forced about 3N reads per endpoint per tick.
+#: An endpoint over it is recorded as a failed scan and NONE of its nominations are used: verifying
+#: "the first" few would let that endpoint choose which are verified (its ghost hashes are its own to
+#: pick). Its silence is then unknown, never "no logs", exactly as for any other failed scan.
+#: For a future autonomous consumer (ETH-leg autonomy, #519): a dropped endpoint narrows who actually
+#: answered, while ``single_source`` reports the CONFIGURED panel. An executor that broadcasts on this
+#: answer must count the endpoints that answered, not the ones configured. No autonomous executor
+#: reads this answer today; the tower's pages and the operator-run coordinator do.
+MAX_NOMINATIONS_PER_ENDPOINT = 8
 
 
 class DispositionKind(Enum):
@@ -290,7 +316,8 @@ async def _logs_from_one(
 
     Every request names integer blocks the endpoint has reached. Asking past its head is refused
     by real nodes (anvil: ``BlockOutOfRangeError``), and an open ``"latest"`` tail would dodge the
-    chunking. A range-limit refusal halves the chunk. Any other failure (a 429, a timeout, a pruned
+    chunking. A range-limit refusal halves the chunk, down to :data:`LOG_MIN_CHUNK_BLOCKS`; a refusal
+    at the floor fails this endpoint. Any other failure (a 429, a timeout, a pruned
     range, a malformed field) raises: it is never "no logs". Returned normalised, so a malformed
     answer fails THIS endpoint rather than the whole read."""
     own_head = int(await source.block_number())
@@ -304,8 +331,11 @@ async def _logs_from_one(
         try:
             raw.extend(await source.get_logs(address=address, topics=topics, from_block=start, to_block=end))
         except Exception as exc:
-            if _is_range_limit(exc) and chunk > 1:
-                chunk = max(1, chunk // 2)
+            span = end - start + 1
+            if _is_range_limit(exc) and span > LOG_MIN_CHUNK_BLOCKS:
+                # Halve the span that was refused, not the chunk: near the end of the range the span
+                # is shorter than the chunk, and halving the chunk alone would resend the same request.
+                chunk = max(LOG_MIN_CHUNK_BLOCKS, span // 2)  # floor-is-deliberate: smaller is only more requests
                 continue
             raise
         start = end + 1
@@ -356,6 +386,45 @@ async def union_logs(rpc: Any, *, address: str, topics: list[Any], from_block: i
         for k, who in sorted(nominated_by.items(), key=lambda kv: (kv[0][3], kv[0][4] or 0))
     )
     return LogUnion(logs=logs, answered=frozenset(answered), failed=failed, from_block=from_block, to_block=to_block)
+
+
+def _nominates(log: dict[str, Any], contract: str, hashlock: bytes) -> bool:
+    """Whether a union log names a transaction the reader verifies: a ``Refunded`` log from our
+    contract, or a ``Claimed`` log from it whose data opens ``H``. The one predicate behind both the
+    per-endpoint cap and the nominations, so the cap counts exactly what would be verified."""
+    if log["address"] != contract or not log["topics"]:
+        return False
+    if log["topics"][0] == _b(REFUNDED_TOPIC0):
+        return True
+    return bool(log["topics"][0] == _b(CLAIMED_TOPIC0) and _opens(log["data"], hashlock))
+
+
+def _drop_overflowing(union: LogUnion, contract: str, hashlock: bytes) -> LogUnion:
+    """*union* without the endpoints that nominated more than :data:`MAX_NOMINATIONS_PER_ENDPOINT`
+    distinct transactions (sandbox review N-C). Such an endpoint moves from ``answered`` to
+    ``failed`` and is taken off every log's ``nominated_by``; a log no other endpoint served goes.
+    Every endpoint at or under the cap keeps every nomination, so no endpoint chooses which of
+    another's are verified, and the reads one endpoint can cause stay bounded."""
+    per_endpoint: dict[str, set[str]] = {}
+    for log in union.logs:
+        if _nominates(log, contract, hashlock):
+            for who in log["nominated_by"]:
+                per_endpoint.setdefault(who, set()).add(log["transactionHash"])
+    over = {who: len(txs) for who, txs in per_endpoint.items() if len(txs) > MAX_NOMINATIONS_PER_ENDPOINT}
+    if not over:
+        return union
+    logs = []
+    for log in union.logs:
+        kept = tuple(who for who in log["nominated_by"] if who not in over)
+        if kept:
+            logs.append({**log, "nominated_by": kept})
+    failed = dict(union.failed)
+    for who, count in over.items():
+        failed[who] = (
+            f"its log scan nominated {count} transactions, more than {MAX_NOMINATIONS_PER_ENDPOINT}; an honest "
+            "contract emits at most one Claimed or Refunded log, so none of them were used"
+        )
+    return dataclasses.replace(union, logs=tuple(logs), answered=union.answered - set(over), failed=failed)
 
 
 # --------------------------------------------------------------------------- verify
@@ -457,6 +526,12 @@ async def read_counter_disposition(
     transaction-history limit, say) beside one that has not. UNKNOWN pages and moves nothing, so this costs time, never funds; the
     alternative, letting a majority overrule a disagreeing endpoint, is a majority read the design
     forbids for identity facts (§2.2).
+
+    BOUNDED READS. An endpoint whose log scan nominates more than
+    :data:`MAX_NOMINATIONS_PER_ENDPOINT` distinct transactions is recorded in ``logs_failed`` and
+    none of its nominations are verified (sandbox review N-C); the other endpoints' are all verified,
+    so it can neither hide what they serve nor pick what is read. Like any failed scan, its silence
+    clears ``settled_unexplained``, and with no other endpoint answering the result is UNKNOWN.
     """
     if not isinstance(locator, EthHtlcLocator):
         raise ValidationError("read_counter_disposition requires an EthHtlcLocator")
@@ -521,9 +596,16 @@ async def read_counter_disposition(
         if from_block is None:
             if str(locator.deploy_tx_hash).lower() == UNKNOWN_DEPLOY_TX_HASH:
                 return unknown("no deploy transaction is known, so the log scan has no start; pass from_block")
-            deploy = await _identity(panel, lambda s: _deploy_block(s, locator.deploy_tx_hash), "deploy receipt")
+            deploy = await _identity(
+                panel, lambda s: _deploy_block(s, locator.deploy_tx_hash, locator.contract_address), "deploy receipt"
+            )
             if deploy is None:
                 return unknown("the deploy transaction's receipt is not available", finalized)
+            if deploy == _NOT_THE_DEPLOY:
+                return unknown(
+                    "the recorded deploy transaction did not create this contract, so the log scan has no safe start",
+                    finalized,
+                )
             from_block = deploy
     except _BelowQuorum as exc:
         return unknown(f"a required read failed: {exc}")
@@ -538,6 +620,7 @@ async def read_counter_disposition(
         # silence would read as "no claim" (re-review of #850 PR 7b). Such an endpoint fails its scan.
         to_block=max(int(from_block), int(head), int(finalized)),
     )
+    union = _drop_overflowing(union, contract, hashlock)
     common: dict[str, Any] = {
         "logs_answered": union.answered,
         "logs_failed": union.failed,
@@ -557,12 +640,20 @@ async def read_counter_disposition(
     refunds = {h.lower() for h in recorded_refund_hashes}
     claims: dict[str, dict[str, Any]] = {}
     for log in union.logs:
-        if log["address"] != contract or not log["topics"]:
+        if not _nominates(log, contract, hashlock):
             continue
         if log["topics"][0] == refunded_topic:
             refunds.add(log["transactionHash"])
-        elif log["topics"][0] == claimed_topic and _opens(log["data"], hashlock):
-            claims.setdefault(log["transactionHash"], log)
+        else:
+            # One transaction's log can come in several variants (block number or hash per endpoint);
+            # its nominations are every endpoint that served any of them, so one endpoint serving a
+            # variant cannot cut a real claim's count to its own (0.27 release review of B-2).
+            prior = claims.get(log["transactionHash"])
+            if prior is None:
+                claims[log["transactionHash"]] = log
+            else:
+                by = tuple(dict.fromkeys((*prior["nominated_by"], *log["nominated_by"])))
+                claims[log["transactionHash"]] = {**prior, "nominated_by": by}
     for h in recorded_claim_hashes:
         # A claim the record kept, nominated by the record itself: verified by its receipt like any other
         # nomination, so a pruned log cannot hide it (Mythos review of #850 PR 7b, F1).
@@ -843,11 +934,44 @@ def _is_hex(text: str) -> bool:
     return re.fullmatch(r"[0-9a-fA-F]+", text) is not None
 
 
-async def _deploy_block(source: Any, deploy_tx_hash: str) -> int | None:
+#: What :func:`_deploy_block` answers for a transaction that did not create the contract.
+_NOT_THE_DEPLOY = "not-the-deploy"
+
+
+async def _deploy_block(source: Any, deploy_tx_hash: str, contract_address: str) -> int | str | None:
+    """The block of *deploy_tx_hash*, ``None`` when it has no receipt, or :data:`_NOT_THE_DEPLOY` when
+    it did not create *contract_address*.
+
+    The log scan starts at this block, so a later transaction named as the deploy would start it
+    past a claim. Whether the transaction created the contract is derived from its sender and nonce
+    (``keccak(rlp([from, nonce]))``), never read from the receipt's ``contractAddress``."""
     receipt = await source.get_transaction_receipt(deploy_tx_hash)
     if receipt is None:
         return None
+    if not created_contract(await source.get_transaction(deploy_tx_hash), contract_address):
+        return _NOT_THE_DEPLOY
     return _int_or_none(receipt.get("blockNumber"))
+
+
+def created_contract(tx: Any, contract_address: str) -> bool:
+    """Whether the transaction *tx* (as ``eth_getTransactionByHash`` returns it) is the CREATE that
+    made *contract_address*: it calls nothing, and ``keccak(rlp([from, nonce]))[12:]`` is that
+    address.
+
+    Raises :class:`NetworkError` when *tx* carries no usable sender or nonce: that is an endpoint's
+    malformed answer, which drops the endpoint, not a vote that the transaction created nothing."""
+    if not isinstance(tx, Mapping):
+        raise NetworkError(f"eth_getTransactionByHash answered {type(tx).__name__}, not a transaction")
+    sender, nonce = tx.get("from"), _int_or_none(tx.get("nonce"))
+    if not isinstance(sender, str) or nonce is None or nonce < 0:
+        raise NetworkError("eth_getTransactionByHash answered a transaction with no usable sender or nonce")
+    if tx.get("to"):
+        return False
+    try:
+        derived = create_address(sender, nonce)
+    except (ValidationError, ValueError) as exc:
+        raise NetworkError(f"eth_getTransactionByHash answered a malformed sender: {exc}") from exc
+    return _addr(derived) == _addr(contract_address)
 
 
 # --------------------------------------------------------------------------- an unfunded token contract

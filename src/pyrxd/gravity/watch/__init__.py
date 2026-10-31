@@ -60,8 +60,10 @@ from pyrxd.gravity.watch.daemon import combine_heartbeats, default_heartbeat, ru
 from pyrxd.gravity.watch.decide import (
     Decision,
     Intent,
+    LegacyCheck,
     Observations,
     decide,
+    decide_legacy,
 )
 from pyrxd.gravity.watch.escalation import (
     BeatReading,
@@ -137,6 +139,7 @@ __all__ = [
     "FileHeartbeat",
     "Intent",
     "JsonDirRecordStore",
+    "LegacyCheck",
     "LoggingAlertChannel",
     "MempoolClaimBytesSource",
     "MultiSourceRxdChainSource",
@@ -156,6 +159,7 @@ __all__ = [
     "WebhookAlertChannel",
     "combine_heartbeats",
     "decide",
+    "decide_legacy",
     "default_heartbeat",
     "heartbeat_age_s",
     "load_claim_context",

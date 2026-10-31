@@ -25,7 +25,7 @@ from pyrxd.eth_wallet.multi_rpc import MultiSourceEthRpc
 from pyrxd.gravity.swap_coordinator import CounterLegRefundNeedsOperator, SwapCoordinator
 from pyrxd.gravity.swap_state import AbortReason, SwapRecord, SwapRole, SwapState
 from pyrxd.security.errors import CounterLegSingleSourceAnswer, NetworkError, NothingToRefund, ValidationError
-from tests._fake_evm_chain import FUNDER, TOKEN, FakeEvmChain, FakeEvmEndpoint
+from tests._fake_evm_chain import CONTRACT, FUNDER, TOKEN, FakeEvmChain, FakeEvmEndpoint
 from tests._fake_evm_chain import _tx_hash as _fake_tx_hash
 from tests.test_counter_leg_disposition_coordinator import _ChainLeg
 from tests.test_swap_coordinator import (
@@ -286,7 +286,7 @@ async def test_reconcile_takes_the_same_edge():
 def _with_a_dropped_claim(chain):
     """One endpoint returns a Claimed(p) log (a claim that reverted Underfunded carries p, N1)."""
     dropped = {
-        "address": "0x" + "c0" * 20,
+        "address": CONTRACT,
         "topics": [CLAIMED_TOPIC0],
         "data": "0x" + chain.preimage.hex(),
         "transactionHash": "0x" + "dd" * 32,

@@ -120,12 +120,14 @@ CONTRACTS: tuple[Contract, ...] = (
         origin_blob="a0c9010f0125e5ba9baba4970108a6b20b8405e9",
         changes=(
             "refund() reverts NothingToRefund, without settling, when the balance is zero; pragma pinned to "
-            "0.8.24 (was ^0.8.20); comments on the claim-error order and the sweep guard"
+            "0.8.24 (was ^0.8.20); comments on the claim-error order and the sweep guard; a deployer immutable "
+            "(msg.sender of the constructor), and refund() reverts NotRefunder unless called by the refundee "
+            "or the deployer"
         ),
         note=(
             "Per-swap ERC-20 HTLC. Funded by a plain token transfer to the CREATE address (no allowance is "
             "ever created); claim/refund sweep balanceOf. claim() requires balanceOf >= amount before revealing "
-            "the preimage. The Claimed(bytes32) event keeps the preimage NON-INDEXED because pyrxd scrapes the "
+            "the preimage. refund() is callable by the refundee or the deployer only. The Claimed(bytes32) event keeps the preimage NON-INDEXED because pyrxd scrapes the "
             "secret from the log data."
         ),
     ),
