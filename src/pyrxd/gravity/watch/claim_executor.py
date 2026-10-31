@@ -569,9 +569,9 @@ class ClaimExecutor:
                 # Not a verdict on the claim itself (a conflict, a missing input, or a reason we do
                 # not recognise): retry as before. Marking it seen would disarm the claim for good.
                 return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
-            # PERMANENT: the node rejected the tx on a consensus/policy rule about the claim itself
-            # (bad script, dust; see _PERMANENT_REJECTION_MARKERS). Retrying cannot help, and this path RE-CARVES a real-value fee input
-            # on every attempt — so a FAILED here would burn fees every tick, forever.
+            # PERMANENT: the node rejected the tx on a CONSENSUS rule about the claim itself (see
+            # _PERMANENT_REJECTION_MARKERS). Retrying cannot help, and this path RE-CARVES a
+            # real-value fee input on every attempt — so a FAILED here would burn fees every tick.
             #
             # PolicyRejection subclasses NetworkError so existing broadcast handlers keep catching
             # node rejections; that makes THIS clause order load-bearing — it must precede the
@@ -700,23 +700,32 @@ _TRANSIENT_REJECTION_MARKERS: tuple[str, ...] = (
     "too-long-mempool-chain",
 )
 
-#: Reject reasons that are a verdict on the claim transaction itself, which a retry rebuilds the
-#: same way: its script and its one output. Fee answers ("min relay fee not met", "insufficient
-#: fee", "insufficient priority", "absurdly-high-fee") are deliberately absent: the claim has no
-#: change, so its whole fee input is the fee (htlc_spend.py, build_htlc_claim_tx), and the next tick
-#: dispenses a different input from the dispense-once pool, at a different fee rate. That is the
-#: InsufficientFundsError arm's reasoning, and those answers retry like it.
-_PERMANENT_REJECTION_MARKERS: tuple[str, ...] = (
-    "mandatory-script-verify-flag",
+#: Policy reasons: one node's local rules, not consensus. Another node, or the same one after a
+#: policy change or an upgrade, may relay the claim, so one endpoint's policy answer must not
+#: disarm it for good (Mythos pass on #934, P1-F1). "non-mandatory-script-verify-flag" is listed
+#: because it contains the consensus marker below; "nonstandard" covers
+#: "bad-txns-nonstandard-inputs", which carries the consensus prefix.
+_POLICY_REJECTION_MARKERS: tuple[str, ...] = (
+    "non-mandatory-script-verify-flag",
+    "nonstandard",
     "scriptsig-",
     "scriptpubkey",
-    "bad-txns-",
     "dust",
+)
+
+#: Reject reasons that are a CONSENSUS verdict on the claim itself: no node will take it, and a
+#: retry rebuilds its script and its one output the same way. Policy reasons (above) and fee answers
+#: are deliberately absent. The claim has no change, so its whole fee input is the fee
+#: (htlc_spend.py, build_htlc_claim_tx), and the next tick dispenses a different input from the
+#: dispense-once pool, at a different fee rate; that is the InsufficientFundsError arm's reasoning.
+_PERMANENT_REJECTION_MARKERS: tuple[str, ...] = (
+    "mandatory-script-verify-flag",
+    "bad-txns-",
 )
 
 
 def _is_permanent_rejection(exc: PolicyRejection) -> bool:
-    """True only if a node rejection names a rule about the claim itself and no passing state.
+    """True only if a node rejection names a consensus rule about the claim and no passing state.
 
     The default is False, a retry: marking a claim seen disarms it, and the maker's refund then
     takes the asset, while a needless retry costs one dispense from a capped, dispense-once fee
@@ -724,7 +733,7 @@ def _is_permanent_rejection(exc: PolicyRejection) -> bool:
     therefore retries, as every rejection did before RadiantChainIO let PolicyRejection through.
     """
     text = f"{exc.reason or ''} {exc}".lower()
-    if any(marker in text for marker in _TRANSIENT_REJECTION_MARKERS):
+    if any(marker in text for marker in (*_TRANSIENT_REJECTION_MARKERS, *_POLICY_REJECTION_MARKERS)):
         return False
     return any(marker in text for marker in _PERMANENT_REJECTION_MARKERS)
 

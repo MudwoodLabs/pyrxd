@@ -352,12 +352,9 @@ async def test_already_known_is_still_the_idempotent_sentinel(tick) -> None:
     [
         (1, _SCRIPT_FAILED),
         (-26, _SCRIPT_FAILED),
-        (-26, "non-mandatory-script-verify-flag (Non-canonical signature) (code 64)"),
-        (-26, "scriptsig-not-pushonly (code 16)"),
         (-26, "bad-txns-vout-negative (code 16)"),
-        (-26, "dust (code 64)"),
     ],
-    ids=["script-electrumx", "script-bare", "non-mandatory", "scriptsig", "bad-txns", "dust"],
+    ids=["script-electrumx", "script-bare", "bad-txns"],
 )
 async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, code, node_reason) -> None:
     from pyrxd.gravity.radiant_leg import SeenStore
@@ -394,6 +391,12 @@ async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, cod
         (-26, "insufficient priority (code 66)"),
         (-26, "insufficient fee"),
         (-26, "absurdly-high-fee"),
+        # Policy answers retry: one node's local rules, which another node may not apply.
+        (-26, "non-mandatory-script-verify-flag (Non-canonical signature) (code 64)"),
+        (-26, "scriptsig-not-pushonly (code 16)"),
+        (1, "scriptpubkey (code 64)"),
+        (1, "dust (code 64)"),
+        (-26, "bad-txns-nonstandard-inputs (code 64)"),
         (1, "too-long-mempool-chain"),
         (1, ""),
         (-26, "some-rule-this-client-does-not-know"),
@@ -411,6 +414,11 @@ async def test_a_permanent_rejection_declines_once_and_stops_recarving(tick, cod
         "insufficient-priority",
         "insufficient-fee",
         "absurdly-high-fee",
+        "non-mandatory",
+        "scriptsig",
+        "scriptpubkey",
+        "dust",
+        "nonstandard-inputs",
         "long-chain",
         "no-reason",
         "unknown-reason",
@@ -454,3 +462,44 @@ async def test_a_conflict_with_an_evicted_claim_still_claims(tick) -> None:
     assert outcome is ExecOutcome.BROADCAST, reason
     node.mine()
     assert _assert_paid_once(node, fees) == _txid(node.broadcasts[2])
+
+
+#: Each reason that must retry although it sits beside a consensus word, keyed by the marker that
+#: makes it retry. Hand-written, so deleting a marker from the executor fails its case; the test
+#: below keeps this table in step with the executor's tuples.
+_RETRY_BESIDE_A_CONSENSUS_WORD = {
+    "txn-mempool-conflict": "txn-mempool-conflict",
+    "missing inputs": "Missing inputs",
+    "missing-inputs": "missing-inputs",
+    "inputs-missingorspent": "bad-txns-inputs-missingorspent",
+    "non-final": "non-final",
+    "nonfinal": "bad-txns-nonfinal",
+    "non-bip68-final": "non-BIP68-final",
+    "too-long-mempool-chain": "too-long-mempool-chain",
+    "non-mandatory-script-verify-flag": "non-mandatory-script-verify-flag (Non-canonical signature)",
+    "nonstandard": "bad-txns-nonstandard-inputs",
+    "scriptsig-": "scriptsig-not-pushonly",
+    "scriptpubkey": "scriptpubkey",
+    "dust": "dust",
+}
+
+
+def test_every_retry_marker_has_a_case() -> None:
+    from pyrxd.gravity.watch import claim_executor
+
+    markers = {*claim_executor._TRANSIENT_REJECTION_MARKERS, *claim_executor._POLICY_REJECTION_MARKERS}
+    assert markers and set(_RETRY_BESIDE_A_CONSENSUS_WORD) == markers
+
+
+@pytest.mark.parametrize("marker", sorted(_RETRY_BESIDE_A_CONSENSUS_WORD))
+def test_a_retry_marker_wins_over_a_consensus_word(marker) -> None:
+    """Every transient or policy marker is load-bearing: with it gone, the consensus word beside it
+    would disarm the claim."""
+    from pyrxd.gravity.watch.claim_executor import _is_permanent_rejection
+    from pyrxd.network.electrumx import _policy_rejection
+
+    reason = _RETRY_BESIDE_A_CONSENSUS_WORD[marker]
+    assert marker in reason.lower()
+    assert not _is_permanent_rejection(_policy_rejection(-26, f"bad-txns-vout-negative {reason}"))
+    # Honest pair: the consensus word alone is permanent.
+    assert _is_permanent_rejection(_policy_rejection(-26, "bad-txns-vout-negative"))
