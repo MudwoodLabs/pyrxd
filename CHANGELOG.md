@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-11-03
+
+A checkpoint-only release. Upgrade to keep verifying new HashMarks.
+
+### Changed
+
+- **Radiant checkpoints refreshed to block 477,792 (0.27.0 shipped 475,776) (#943).** `pyrxd verify`
+  and the verification pages link at most 4,032 headers past the newest shipped checkpoint, so
+  0.27.0 could prove a mark's block only up to block 479,808. 0.27.1 reaches block 481,824 (for the
+  CLI, the mark's block plus `--min-confirmations` minus 1 must be at most that, unless `pyrxd
+  headers sync` has cached newer headers). The swap taker gate's reach moves from block 495,936 to
+  497,952. All three default ElectrumX servers and the maintainer's Radiant Core node agreed on all
+  238 entries at tip 478,246 on 2026-11-02, and on every header of the last interval (475,776 to
+  477,792).
+
 ## [0.27.0] — 2026-10-31
 
 ### Added
