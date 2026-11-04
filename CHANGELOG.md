@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **Headers above a checkpoint must carry the difficulty Radiant requires.** `pyrxd verify`, the
+  verification pages and `pyrxd headers sync` now check every header above the newest shipped
+  checkpoint (or cached anchor) against Radiant's difficulty rule: its nBits must be exactly the
+  value Radiant Core's ASERT computes from the header below it (new `pyrxd.spv.asert`, a bit-exact
+  port of `src/pow.cpp` at Radiant-Core v3.1.2, now vendored in `tests/vendor/radiant_core`). A
+  header that breaks it is `CONTRADICTED` at any depth, and is never cached; `verify_header_chain`
+  refuses a stored cache holding one. Before, a header only had to meet the target its own nBits
+  stated and the work floor, so a server forging a confirmation on top of a real header could
+  state a target 16 times easier than Radiant's; now that header costs what Radiant charges for
+  the block. Results gain a `difficulty` step, between `linkage` and `proof_of_work`, and
+  work-level claims say the rule held. `verify_mark_block` takes `difficulty_rule=True`; the swap
+  taker gate passes `False` for now, so its behaviour and pricing are unchanged until that money
+  path has its own review. The rule is modelled for mainnet from block 410,000 only (every shipped
+  checkpoint is above it); other networks get no rule. Parity: Radiant Core's constants are read
+  from the vendored sources, the arithmetic matches all 4,000 of Bitcoin Cash Node's aserti3-2d
+  vectors kept in `tests/vendor/bchn_aserti3_2d`, and a replay over mainnet blocks 410,000 to
+  478,483 (2026-11-03, both shipped operators, outside the suite) matched all 68,484. The caps and
+  the floor are unchanged, so this release still needs a newer checkpoint to verify past them.
+
 ## [0.27.1] — 2026-11-03
 
 A checkpoint-only release. Upgrade to keep verifying new HashMarks.

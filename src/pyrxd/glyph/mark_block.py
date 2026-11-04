@@ -39,16 +39,23 @@ fetched or checked.
   No proof-of-work is checked or needed at this level.
 * **work** — ``H`` is above the newest checkpoint ``C``. The headers ``C+1 .. H`` (and above, for
   burial) are linked hash by hash to ``C``'s header, whose hash must equal the shipped one, and
-  EACH must (a) hash at or below the target its own nBits states and (b) state a target whose work
-  is at least :data:`FLOOR_WORK_DIVISOR`-th of ``C``'s.
+  EACH must (a) carry exactly the nBits Radiant's difficulty rule computes from the header below
+  it (:mod:`pyrxd.spv.asert`; mainnet, unless the caller passes ``difficulty_rule=False``), (b)
+  hash at or below the target its own nBits states and (c) state a target whose work is at least
+  :data:`FLOOR_WORK_DIVISOR`-th of ``C``'s.
 
   WHAT THAT COSTS A LIAR — not the work of every header since ``C``. A server placing the
   transaction at a false height ``H`` can serve the REAL headers ``C+1 .. H-1`` unchanged; it has
   to mine only the header at ``H`` (whose merkle root commits to the transaction) and one on top of
-  it for each further confirmation checked: ``min_confirmations`` headers from ``H`` up, each at
-  or above the floor. The cost is set by ``min_confirmations`` and the floor, not by how far ``H``
-  sits above ``C``. (The low-work test in ``tests/test_mark_block_verification.py`` builds exactly
-  this forgery: real headers to 460,580, one mined header on top.)
+  it for each further confirmation checked: ``min_confirmations`` headers from ``H`` up. The header
+  at ``H`` sits on a REAL parent, so the difficulty rule makes it cost what Radiant charges for that
+  block: one honest block's work. Each forged header above it can push its timestamp late to ease
+  the next one's difficulty, by half for every 12 hours, but never below the floor, so the cost is
+  about one honest block plus ``min_confirmations - 1`` headers at or above the floor (ESTIMATED by
+  a model, not measured on a node). It is set by ``min_confirmations``, the rule and the floor, not
+  by how far ``H`` sits above ``C``. Without the rule (``difficulty_rule=False``) every one of those
+  headers may sit at the floor. (The low-work test in ``tests/test_mark_block_verification.py``
+  builds this forgery: real headers to 460,580, one mined header on top.)
 
   FOR A CALLER THAT GATES FUNDS on this: a single forged confirmation costs one floor-level
   header, so the required ``min_confirmations`` MUST scale with the value at risk, and the refusal
@@ -98,10 +105,11 @@ cache on an abandoned branch goes unnoticed (``cache_disagreement`` stays ``None
 height still rests on the shipped checkpoint, and the claim says the depth is counted through the
 cache. With no cache, nothing here changes.
 
-WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; that any header's
-nBits is the value Radiant's difficulty rules require (Radiant retargets EVERY block, its algorithm
-is not vendored here, so only each header's own target and the floor are checked); that the
-block's timestamp is accurate; that the transaction's scripts are valid. And the checkpoint table
+WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; at the checkpoint
+level, or with ``difficulty_rule=False``, that any header's nBits is the value Radiant's difficulty
+rule requires (at the checkpoint level the checkpoint's hash pins every header instead); that the
+block's timestamp is accurate (a forger chooses timestamps, within what the rule lets the next
+header's difficulty follow); that the transaction's scripts are valid. And the checkpoint table
 is only as good as its sources — see its docstring for who vouched for it.
 
 THE CONTRACT: :func:`verify_mark_block` is synchronous (the browser bridge drives it without an
@@ -129,6 +137,7 @@ from typing import Any
 from pyrxd.hash import radiant_block_hash
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.security.types import BlockHeight
+from pyrxd.spv.asert import header_nbits, required_nbits
 from pyrxd.spv.merkle import build_branch, compute_root, extract_merkle_root, verify_tx_in_block
 from pyrxd.spv.radiant import (
     TxMerkleBranch,
@@ -256,7 +265,7 @@ class BlockVerification:
     cache_disagreement: str | None = None
 
 
-_STEPS = ("tree_depth", "merkle", "blockhash", "linkage", "proof_of_work", "floor", "burial")
+_STEPS = ("tree_depth", "merkle", "blockhash", "linkage", "difficulty", "proof_of_work", "floor", "burial")
 
 
 class _Stop(Exception):
@@ -510,6 +519,7 @@ def verify_mark_block(
     pow_limit: int | None = None,
     header_cache: Any = None,
     cached_floor: tuple[int, int] | None = None,
+    difficulty_rule: bool = True,
 ) -> BlockVerification:
     """Verify that *txid* is in the block at *height*, anchored to a shipped checkpoint.
 
@@ -537,6 +547,11 @@ def verify_mark_block(
 
     ``header_cache`` (:class:`~pyrxd.glyph.header_cache.VerifiedHeaders`, or ``None``) lets the walk
     anchor at a cached header instead (module docstring); ``None`` changes nothing.
+    ``difficulty_rule`` (default ``True``) requires each header above the anchor to carry exactly
+    the nBits Radiant's difficulty rule computes from its parent (:mod:`pyrxd.spv.asert`), on the
+    networks that rule covers (mainnet); a header that does not is CONTRADICTED. The swap taker
+    gate passes ``False`` until that money path has had its own review of the change.
+
     ``cached_floor`` (``(height, work)`` of a cached header) keeps the floor at least that header's
     work // :data:`FLOOR_WORK_DIVISOR` on a walk that does NOT anchor at it: the fallback
     :func:`verify_with_fetched` takes when a server disagrees with the cache, so that disagreeing
@@ -549,6 +564,8 @@ def verify_mark_block(
     target = _require_target(target_confirmations)
     cap = _require_cap(max_headers_from_checkpoint)
     cache = _require_cache(header_cache, table)
+    if not isinstance(difficulty_rule, bool):
+        raise ValidationError("difficulty_rule must be a bool")
     if pow_limit is not None and (
         not isinstance(pow_limit, int) or isinstance(pow_limit, bool) or not 0 < pow_limit < (1 << 256)
     ):
@@ -579,6 +596,7 @@ def verify_mark_block(
             pow_limit=pow_limit,
             cache=cache,
             cached_floor=cached_floor,
+            difficulty_network=network if difficulty_rule else None,
         )
     except _Stop as stop:
         reason = stop.reason
@@ -588,6 +606,19 @@ def verify_mark_block(
     except Exception as exc:  # the totality net; the property tests assert it never fires
         return done(NOT_VERIFIED, f"{_INTERNAL}: {type(exc).__name__})")
     return done(VERIFIED, claim=claim)
+
+
+def _rule_tail(steps: Mapping[str, str]) -> str:
+    """How a work-level claim ends: what the difficulty rule did and did not establish."""
+    if steps["difficulty"] == "passed":
+        return (
+            ", and each carries exactly the difficulty Radiant's rule requires on top of the header below it. "
+            "pyrxd does not check that they are Radiant's most-work chain."
+        )
+    return (
+        ". pyrxd does not check that they are Radiant's most-work chain, or that each difficulty is the "
+        "one Radiant's rules require."
+    )
 
 
 def _verify(
@@ -608,6 +639,7 @@ def _verify(
     pow_limit: int | None = None,
     cache: Any = None,
     cached_floor: tuple[int, int] | None = None,
+    difficulty_network: str | None = None,
 ) -> str:
     """Run every check; return the VERIFIED claim, or raise :class:`_Stop` with the outcome."""
     shipped_h, shipped_hash = table[-1] if table else (None, None)
@@ -769,8 +801,10 @@ def _verify(
             # Known before any header is checked, so reported on a failing proof too (as in #804).
             facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
         below = newest_hash
+        below_header = _header(headers, newest_h)
         linked.add(newest_h)
         reached = newest_h
+        ruled = False  # whether any header was held to Radiant's difficulty rule
         # A header that starts a request did not come in the same reply as the one below it.
         request_starts = {start for start, _count in plan.header_ranges}
         for h in range(newest_h + 1, top + 1):
@@ -793,6 +827,19 @@ def _verify(
                     break
                 steps["linkage"] = "failed"
                 raise _Stop(CONTRADICTED, f"the header at {h} does not link to the header served at {h - 1}")
+            # Radiant's difficulty rule: the nBits must be the one consensus computes from the parent.
+            # A header that breaks it is one no Radiant node accepts, at any depth: CONTRADICTED.
+            want = None if difficulty_network is None else required_nbits(difficulty_network, h - 1, below_header)
+            if want is not None:
+                if header_nbits(hdr) != want:
+                    steps["difficulty"] = "failed"
+                    raise _Stop(
+                        CONTRADICTED,
+                        f"the header at {h} states difficulty bits {header_nbits(hdr):#010x}, but Radiant's "
+                        f"difficulty rule requires {want:#010x} on top of the header at {h - 1}",
+                    )
+                ruled = True
+                steps["difficulty"] = "passed"  # so far: every header up to this one
             try:
                 below = verify_radiant_header_pow(hdr, pow_limit=pow_limit)
             except (SpvVerificationError, ValidationError) as exc:
@@ -815,9 +862,12 @@ def _verify(
             steps["proof_of_work"] = "passed"  # so far: every header up to this one
             linked.add(h)
             reached = h
+            below_header = hdr
         if required_above or reached > newest_h:
             facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
             steps["linkage"] = "passed"
+            if ruled:
+                steps["difficulty"] = "passed"
             steps["proof_of_work"] = "passed"
             steps["floor"] = "passed"
             facts["linked_headers"] = len(linked)
@@ -859,9 +909,8 @@ def _verify(
             f"{height - newest_h} header(s), each meeting its own proof-of-work target and carrying at least "
             f"2^{facts['floor_work_log2']} expected hash evaluations. {_cache_sentence(shipped_h)} A server "
             f"lying about this height could reuse the real headers below it; it would have had to mine the "
-            f"{facts['verified_depth']} header(s) from block {height} up, at that work or more. pyrxd does "
-            f"not check that they are Radiant's most-work chain, or that each difficulty is the one "
-            f"Radiant's rules require."
+            f"{facts['verified_depth']} header(s) from block {height} up, at that work or more"
+            f"{_rule_tail(steps)}"
         )
     else:
         claim = (
@@ -870,9 +919,8 @@ def _verify(
             f"through {height - newest_h} header(s), each meeting its own proof-of-work target and carrying "
             f"at least 2^{facts['floor_work_log2']} expected hash evaluations. A server lying about this "
             f"height could reuse the real headers below it; it would have had to mine the "
-            f"{facts['verified_depth']} header(s) from block {height} up, at that work or more. pyrxd does "
-            f"not check that they are Radiant's most-work chain, or that each difficulty is the one "
-            f"Radiant's rules require."
+            f"{facts['verified_depth']} header(s) from block {height} up, at that work or more"
+            f"{_rule_tail(steps)}"
         )
     if steps["blockhash"] == "differs":
         named = facts.get("named_blockhash")

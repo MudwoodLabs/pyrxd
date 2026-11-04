@@ -453,11 +453,15 @@ def test_a_header_failing_its_own_proof_of_work_exits_2(monkeypatch, tmp_path) -
 def test_the_json_reports_the_floor_on_a_proof_that_fails_above_the_checkpoint(monkeypatch, tmp_path) -> None:
     """``floor_work_log2`` is known before any header above the checkpoint is checked, so a proof
     failing among them still carries it in ``--json`` — here the header mined for
-    ``tests/test_mark_block_verification.py`` on top of the real 460,580, below the floor, ten deep."""
+    ``tests/test_mark_block_verification.py`` on top of the real 460,580, below the floor, ten deep.
+    That header also breaks Radiant's difficulty rule, which ``pyrxd verify`` checks first (the next
+    test), so the rule is switched off here to reach the floor, as the swap taker gate runs it."""
+    from pyrxd.glyph import mark_block
     from pyrxd.glyph.mark_block import FLOOR_WORK_DIVISOR
     from pyrxd.spv.radiant import radiant_header_work
     from tests.test_mark_block_verification import _MINED_HEADER
 
+    monkeypatch.setattr(mark_block, "required_nbits", lambda *_a: None)
     _checkpoint(monkeypatch, C, C.start)
     served = {**C.headers, C.tip + 1: _MINED_HEADER}
     over = {**_confs(C, 10), "blockchain.block.headers": lambda p: _headers_reply(served, *p)}
@@ -466,6 +470,22 @@ def test_the_json_reports_the_floor_on_a_proof_that_fails_above_the_checkpoint(m
     assert bv["state"] == "NOT VERIFIED" and dict(bv["steps"])["floor"] == "failed", bv
     floor = radiant_header_work(C.headers[C.start]) // FLOOR_WORK_DIVISOR
     assert bv["floor_work_log2"] == floor.bit_length() - 1 == 52
+
+
+def test_a_header_breaking_the_difficulty_rule_exits_2(monkeypatch, tmp_path) -> None:
+    """The same served chain with the rule on, as ``pyrxd verify`` runs: the header on top of the real
+    460,580 states a far easier difficulty than Radiant requires there — a lie in the server's own
+    proof, so exit 2 with that reason. (Its own proof-of-work holds; only the rule catches it.)"""
+    from tests.test_mark_block_verification import _MINED_HEADER
+
+    _checkpoint(monkeypatch, C, C.start)
+    served = {**C.headers, C.tip + 1: _MINED_HEADER}
+    over = {**_confs(C, 10), "blockchain.block.headers": lambda p: _headers_reply(served, *p)}
+    r, _ = _verify(monkeypatch, tmp_path, C, _server(C, **over), conf=10)
+    assert r.exit_code == 2, r.output
+    text = _flat(r.output)
+    assert f"the header at {C.tip + 1} states difficulty bits 0x1d7fffff" in text
+    assert "contradicts the height reported for the mark" in text
 
 
 # ── a reorganisation between the anchor's reply and the proof's ────────────────────────────
