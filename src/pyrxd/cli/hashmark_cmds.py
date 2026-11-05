@@ -1662,7 +1662,8 @@ def verify_cmd(
     THE BLOCK IS VERIFIED WHERE PYRXD CAN, on by default. VERIFIED means pyrxd itself checked
     that the transaction's merkle branch leads to that block's header, and that the header is
     linked hash by hash to a checkpoint shipped with pyrxd (above the newest checkpoint, through
-    headers that each meet their own proof-of-work target and a work floor). CONFIRMED means that
+    headers that each carry the difficulty Radiant's rule requires, meet their own proof-of-work
+    target and a work floor). CONFIRMED means that
     could not be done — no checkpoints for this network, a block too far past the newest one, a
     server without the merkle method, a fetch that failed — and the height is the endpoint's word;
     the reason is printed. Both hold the verdict. When the server's own proof CONTRADICTS the

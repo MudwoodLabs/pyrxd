@@ -1324,6 +1324,10 @@ def verify_maker_funding(
         checkpoints=table,
         max_headers_from_checkpoint=cap,
         pow_limit=chain.pow_limit,
+        # NOT YET ON for this money path: Radiant's difficulty rule (pyrxd.spv.asert) would make a
+        # forged confirmation dearer, but this gate's price for one (C, above) is derived from the
+        # floor, and turning the rule on here waits for its own review.
+        difficulty_rule=False,
     )
     if v.state != VERIFIED or v.verified_depth is None or v.blockhash is None:
         raise refuse(

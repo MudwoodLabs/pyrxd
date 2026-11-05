@@ -55,7 +55,7 @@ from pyrxd.hash import radiant_block_hash
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.spv import radiant_checkpoints
-from pyrxd.spv.radiant import radiant_header_work
+from pyrxd.spv.radiant import radiant_header_work, verify_radiant_header_pow
 
 ROOT = Path(__file__).resolve().parent.parent
 _FIX = json.loads((ROOT / "tests/fixtures/mark_block_fixtures_2026-09-30.json").read_text(encoding="utf-8"))["fixtures"]
@@ -1911,3 +1911,41 @@ def test_saving_the_same_chain_again_is_allowed_and_keeps_both_records(tmp_path)
     header_store.save(_chain(START, TOP), table=_table(START), record={"n": 2}, path=path)
     got = header_store.load("mainnet", _table(START), path=path)
     assert got.chain.top == TOP and got.syncs == ({"n": 1}, {"n": 2})  # type: ignore[union-attr]
+
+
+# ── Radiant's difficulty rule (pyrxd.spv.asert) ──────────────────────────────────────────────────
+
+#: A header mined on top of the real 460,580 for tests/test_mark_block_verification.py: it links,
+#: and meets its OWN target, but states a far easier difficulty than Radiant requires there.
+_RULE_BREAKER = bytes.fromhex(
+    "0000002031c1b00e932262cdb79cae0bf1b7858e4b9deea88a31e8b861000000000000009ec81346e48cd566ad4232"
+    "b77b74ab9a21b5611e8d7dffbd59a3bc941f97674a60ea966affff7f1d98ef3b03"
+)
+
+
+def test_a_header_breaking_the_difficulty_rule_is_never_cached() -> None:
+    """Premise: it links to 460,580 and its own proof-of-work holds, so only the rule refuses it."""
+    assert _RULE_BREAKER[4:36][::-1].hex() == _hash(TOP)
+    verify_radiant_header_pow(_RULE_BREAKER)
+    chain = _chain(START, TOP)
+    with pytest.raises(HeaderCacheRefusal, match=r"the header at 460581 states difficulty bits 0x1d7fffff"):
+        extend_verified_headers(chain, [_RULE_BREAKER])
+    stored = [BY_HEIGHT[h] for h in range(START, TOP + 1)] + [_RULE_BREAKER]
+    again, why = verify_header_chain("mainnet", START, stored, table=_table(START))
+    assert again is None and "Radiant's difficulty rule requires" in (why or "")
+
+
+def test_the_real_headers_meet_the_difficulty_rule_into_the_cache() -> None:
+    """The honest half: every real fixture header passes the rule on the way in and on read-back."""
+    for cp, top in ((START, TOP), (min(HEADERS2), max(HEADERS2))):
+        chain = _chain(cp, top)
+        again, why = verify_header_chain("mainnet", cp, list(chain.headers), table=_table(cp))
+        assert again is not None and why is None and again.top == top
+
+
+def test_the_difficulty_rule_is_not_applied_off_mainnet() -> None:
+    """Regtest does not retarget and testnet has no checkpoints: no rule is modelled there, so the
+    same header is held only to its own proof-of-work and the floor."""
+    chain = start_verified_headers("regtest", BY_HEIGHT[TOP], table=_table(TOP))
+    extended, stopped = extend_verified_headers(chain, [_RULE_BREAKER])
+    assert extended.top == TOP and stopped is not None and "less work than the floor" in stopped
