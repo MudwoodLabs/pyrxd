@@ -466,12 +466,6 @@ dev = [
     # (GHSA-6v7p-g79w-8964). cachecontrol allows < 2.0.0, so pin the patched floor. Dev-scope only —
     # msgpack is not a pyrxd runtime dependency and never ships in the published package.
     "msgpack>=1.2.4",
-    # Transitive security floor (dev-only): virtualenv, python-discovery and pytest-xdist pull
-    # filelock, which has a cluster of local symlink / hard-link / lock-directory races in <= 4.2.0
-    # (GHSA-v4x8-3wr5-3wq8, GHSA-69hj-f68j-2879 and others), patched in 4.2.1. Dev-scope only —
-    # filelock is not a pyrxd runtime dependency and never ships in the published package.
-    # filelock 4.2.0+ requires Python >= 3.11, so on 3.10 no patched release exists.
-    "filelock>=4.2.1; python_version >= '3.11'",
     # Transitive security floor (dev-only): cosmic-ray pulls gitpython, which has drawn repeated
     # clusters of HIGH advisories — env-var exfiltration via Repo.clone_from() (GHSA-rwj8-pgh3-r573,
     # patched 3.1.52), command injection via Repo.archive()/git.ls_remote() and short/long-option gate
