@@ -13,3 +13,9 @@ cryptography>=50.0.2
 #             before use.
 # CI installs this pin, so it must not resolve to a flagged version.
 virtualenv>=21.15.0
+# Floor for the transitive filelock dep (Dependabot alerts #37, #45, #46, #55-#60):
+#   <=4.2.0  symlink, hard-link and directory-swap races in its lock files
+#            (GHSA-v4x8-3wr5-3wq8, GHSA-69hj-f68j-2879 and others), patched in 4.2.1.
+# filelock 4.2.0+ requires Python >= 3.11, so no patched release installs on 3.10: the floor
+# applies from 3.11, and the 3.10 CI job keeps the newest filelock 3.10 can resolve.
+filelock>=4.2.1; python_version >= "3.11"
