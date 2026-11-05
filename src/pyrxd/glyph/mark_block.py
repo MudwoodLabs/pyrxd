@@ -804,7 +804,11 @@ def _verify(
         below_header = _header(headers, newest_h)
         linked.add(newest_h)
         reached = newest_h
-        ruled = False  # whether any header was held to Radiant's difficulty rule
+        # The difficulty step passes only if EVERY header above the anchor was held to Radiant's rule: a
+        # walk that crosses 410,000 from a caller's table holds the headers below it to nothing more
+        # than their own proof-of-work, and the claim must not say "each" then.
+        ruled = False  # some header was held to the rule
+        unruled = False  # some header was not
         # A header that starts a request did not come in the same reply as the one below it.
         request_starts = {start for start, _count in plan.header_ranges}
         for h in range(newest_h + 1, top + 1):
@@ -839,7 +843,11 @@ def _verify(
                         f"difficulty rule requires {want:#010x} on top of the header at {h - 1}",
                     )
                 ruled = True
-                steps["difficulty"] = "passed"  # so far: every header up to this one
+                if not unruled:
+                    steps["difficulty"] = "passed"  # so far: every header up to this one
+            else:
+                unruled = True
+                steps["difficulty"] = "not run"
             try:
                 below = verify_radiant_header_pow(hdr, pow_limit=pow_limit)
             except (SpvVerificationError, ValidationError) as exc:
@@ -866,7 +874,7 @@ def _verify(
         if required_above or reached > newest_h:
             facts["floor_work_log2"] = max(floor.bit_length() - 1, 0)
             steps["linkage"] = "passed"
-            if ruled:
+            if ruled and not unruled:
                 steps["difficulty"] = "passed"
             steps["proof_of_work"] = "passed"
             steps["floor"] = "passed"

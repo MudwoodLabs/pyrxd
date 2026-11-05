@@ -377,6 +377,27 @@ def test_the_real_chain_meets_radiants_difficulty_rule() -> None:
         assert "or that each difficulty is the one Radiant's rules require" not in (v.claim or "")
 
 
+def test_the_claim_does_not_say_each_when_some_headers_were_not_ruled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A walk that crosses block 410,000 from a caller's table (newest checkpoint below 409,999)
+    holds the headers below 410,000 to their own proof-of-work only. Simulated here by a rule that
+    covers only the upper headers: the result may verify by work, but the claim must not say that
+    EACH header carries the required difficulty."""
+    real = mark_block.required_nbits
+    for m in MARKS.values():
+        first_ruled_parent = m.start + 3
+
+        def partial(network: str, prev_height: int, prev_header: bytes, _from: int = first_ruled_parent) -> int | None:
+            return None if prev_height < _from else real(network, prev_height, prev_header)
+
+        monkeypatch.setattr(mark_block, "required_nbits", partial)
+        v = m.run(m.cp(m.start), min_confirmations=1, target_confirmations=8)
+        assert v.state == VERIFIED, v.reason
+        assert _step(v, "difficulty") == "not run"
+        assert "carries exactly the difficulty Radiant's rule requires" not in (v.claim or "")
+        assert "or that each difficulty is the one Radiant's rules require" in (v.claim or "")
+    monkeypatch.setattr(mark_block, "required_nbits", real)
+
+
 def test_the_same_forgery_unmined_is_contradicted() -> None:
     h = bytearray(_MINED_HEADER)
     h[76] ^= 0x01

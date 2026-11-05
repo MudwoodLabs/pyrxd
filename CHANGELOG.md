@@ -20,8 +20,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the block. Results gain a `difficulty` step, between `linkage` and `proof_of_work`, and
   work-level claims say the rule held. `verify_mark_block` takes `difficulty_rule=True`; the swap
   taker gate passes `False` for now, so its behaviour and pricing are unchanged until that money
-  path has its own review. The rule is modelled for mainnet from block 410,000 only (every shipped
-  checkpoint is above it); other networks get no rule. Parity: Radiant Core's constants are read
+  path has its own review. The rule is modelled for mainnet from block 410,000 only (the newest
+  shipped checkpoint, where the walk starts, is above it); other networks get no rule. It is
+  Radiant's rule as of v3.1.2: if Radiant changes its difficulty rule, honest headers above the
+  change are reported `CONTRADICTED` and `headers sync` refuses them until a pyrxd release ships
+  the new rule. The rule raises the cost of the first forged header only; the ones after it can
+  still sit at the floor, as before. Parity: Radiant Core's constants are read
   from the vendored sources, the arithmetic matches all 4,000 of Bitcoin Cash Node's aserti3-2d
   vectors kept in `tests/vendor/bchn_aserti3_2d`, and a replay over mainnet blocks 410,000 to
   478,483 (2026-11-03, both shipped operators, outside the suite) matched all 68,484. The caps and

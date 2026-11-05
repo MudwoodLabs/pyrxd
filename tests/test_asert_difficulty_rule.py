@@ -39,6 +39,7 @@ from pyrxd.spv.asert import (
     required_nbits,
     target_from_compact,
 )
+from pyrxd.spv.radiant_checkpoints import CHECKPOINTS
 
 ROOT = Path(__file__).resolve().parent.parent
 RADIANT = ROOT / "tests/vendor/radiant_core"
@@ -160,3 +161,28 @@ def test_calculate_asert_refuses_what_the_cpp_asserts() -> None:
             calculate_asert(*args)
     with pytest.raises(ValueError, match="time difference"):
         calculate_asert(1, 300, 1 << 48, 0, lim, 1)
+
+
+def test_the_walk_starts_where_the_rule_is_modelled() -> None:
+    """The rule is applied above the NEWEST checkpoint only, so that one must be at or above the
+    anchor; older entries in the table may sit below 410,000 (most do) and are never walked from."""
+    assert CHECKPOINTS["mainnet"], "no mainnet checkpoints"
+    newest = max(h for h, _hash in CHECKPOINTS["mainnet"])
+    assert newest >= MAINNET_ANCHOR.height, newest
+    assert required_nbits("mainnet", newest, b"\x00" * 80) is not None
+
+
+def test_a_parent_far_ahead_of_schedule_clamps_to_pow_limit() -> None:
+    """pow.cpp:278-287: a shift that would overflow 256 bits gives powLimit. A parent stamped 60 days
+    ahead of schedule at height 469,999 reaches that branch; without the clamp the shifted value
+    wraps and the port would require a far harder target than Radiant does."""
+    prev_height = 469_999
+    on_schedule = MAINNET_ANCHOR.prev_time + SPACING_SECONDS * (prev_height - MAINNET_ANCHOR.height + 1)
+    ahead = on_schedule + 60 * 86_400
+    assert next_nbits(prev_height, ahead) == compact_from_target(MAINNET_POW_LIMIT) == 0x1D00FFFF
+    # The branch, not the final min(): the unshifted product times 2**shifts overflows 256 bits.
+    ref = target_from_compact(MAINNET_ANCHOR.nbits)
+    exponent = (
+        (ahead - MAINNET_ANCHOR.prev_time - SPACING_SECONDS * (prev_height - MAINNET_ANCHOR.height + 1)) * 65536
+    ) // HALF_LIFE_SECONDS
+    assert (ref * 65536) << ((exponent >> 16) - 16) >= 1 << 256

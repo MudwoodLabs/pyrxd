@@ -24,20 +24,29 @@ headers (2026-11-03, served byte for byte alike by two operators); they equal Ph
 ``anchorV2``. A wrong anchor makes every honest header fail the rule, which the parity tests
 (``tests/test_asert_difficulty_rule.py``) would show: they replay real mainnet headers.
 
-WHAT IS NOT COVERED. Heights below 410,000 (the original 2022 anchor and two-day half-life): every
-shipped checkpoint is far above them, and headers at or below a checkpoint are pinned by its hash.
+WHAT IS NOT COVERED. Heights below 410,000 (the original 2022 anchor and two-day half-life). The
+rule is applied only above the NEWEST checkpoint, which is far above them (477,792 in 0.27.1;
+``tests/test_asert_difficulty_rule.py`` asserts it is at least 409,999); headers at or below it are
+pinned by hash. Older checkpoints in the table sit below 410,000, but nothing is walked from them.
+Radiant's rule as of v3.1.2 only: Radiant changed it once by height (``pow.cpp:126-151``). If it
+changes again, honest headers above the change fail this rule and are reported CONTRADICTED until
+pyrxd ships the new rule. That fails closed, and it needs a release.
 Networks other than mainnet: regtest does not retarget (``fPowNoRetargeting``,
 ``chainparams.cpp``), and pyrxd ships no checkpoints for testnet, so :func:`required_nbits` returns
 ``None`` there and callers apply no rule. Testnet's min-difficulty exception (``pow.cpp:116-121``)
 is therefore never modelled.
 
-PARITY WITH THE C++. Three details decide equality, and each is mirrored deliberately:
+PARITY WITH THE C++. These details are mirrored deliberately:
 
 * the exponent's division TRUNCATES toward zero (C++ ``/`` on int64), while its split into whole
   and fractional parts is an arithmetic shift, which FLOORS. A port using Python's ``//`` for the
   division differs on every block ahead of schedule (measured 2026-11-03: 23,057 of 68,484 mainnet
   blocks from 410,000 to 478,483);
-* the cubic's accumulator is a uint64, so it is taken modulo 2**64;
+* the cubic's accumulator is a uint64, so it is taken modulo 2**64. This is for fidelity only:
+  its largest value (``frac`` = 65535) is about 2**47 below the wrap, so the mask never changes
+  the result;
+* a shift that would overflow 256 bits clamps to powLimit, as ``pow.cpp:278-287`` does (a parent
+  stamped weeks ahead of schedule reaches it);
 * compact encoding is ``arith_uint256::GetCompact``, including the sign-bit renormalisation.
 """
 
