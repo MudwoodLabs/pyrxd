@@ -82,10 +82,19 @@ from pyrxd.gravity.htlc_spend import (
 )
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
+from pyrxd.hash import hash256
 from pyrxd.network._guards import finite_int
+from pyrxd.network.failover import _is_already_have
 from pyrxd.network.quorum_depth import depth_vouched_by_quorum
-from pyrxd.network.source_identity import SourceKey, source_key_of
-from pyrxd.security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
+from pyrxd.network.source_identity import SourceKey, require_distinct_sources, source_key_of
+from pyrxd.security.errors import (
+    BroadcastEchoMismatch,
+    InsufficientFundsError,
+    NetworkError,
+    PolicyRejection,
+    TlsPinMismatchError,
+    ValidationError,
+)
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.security.units import ChainHeight, Confirmations, PhotonValue
 
@@ -249,6 +258,26 @@ def _split_outpoint(outpoint: object) -> tuple[str, int]:
     return txid, int(vout)
 
 
+def _checked_second_opinion(client: Any, second_opinion: tuple[Any, ...]) -> tuple[Any, ...]:
+    """*second_opinion* as a tuple, refused unless every client can broadcast and read a transaction
+    back, says which operator runs it, and is run by an operator no other entry (nor ``client``, when
+    ``client`` names one) is run by. See :meth:`RadiantChainIO.with_second_opinion`."""
+    if not isinstance(second_opinion, tuple):
+        raise ValidationError("RadiantChainIO second_opinion must be a tuple of clients")
+    for index, other in enumerate(second_opinion):
+        for m in ("broadcast", "get_transaction"):
+            if not callable(getattr(other, m, None)):
+                raise ValidationError(f"RadiantChainIO second_opinion #{index} must provide {m}()")
+    keys = require_distinct_sources(second_opinion, what="RadiantChainIO second_opinion")
+    primary = getattr(client, "source_key", None)
+    if isinstance(primary, SourceKey) and primary in keys:
+        raise ValidationError(
+            f"RadiantChainIO second_opinion #{keys.index(primary)} is run by the same operator as the "
+            "broadcast client; asking that operator again is not a second opinion"
+        )
+    return second_opinion
+
+
 class RadiantChainIO:
     """Thin chain helper over an ``ElectrumXClient``-like object.
 
@@ -277,6 +306,15 @@ class RadiantChainIO:
     operator sent it. The sources are asked CONCURRENTLY, each under ``depth_timeout_s`` (default
     :data:`DEPTH_SOURCE_TIMEOUT_S`): a source that does not answer in time is dropped, as one that
     fails is, and costs the call one timeout, not one per unresponsive source.
+
+    ``second_opinion`` (default empty: off) are broadcast clients, one per operator, that
+    :meth:`broadcast` asks when ``client`` answers with a node rejection (#937). Without them one
+    endpoint's verdict is the only verdict, so a lagging, stricter or lying server refuses a
+    transaction alone. With them a rejection is raised only after every second-opinion client has
+    also failed to take the transaction; the first one that takes it (its reply checked against the
+    txid hashed from the bytes sent) makes the broadcast a success. Only the autonomous claim leg
+    turns this on (:func:`pyrxd.gravity.watch.claim_executor.make_radiant_claim_leg`); see
+    :meth:`with_second_opinion` for the rules on which clients qualify.
     """
 
     def __init__(
@@ -286,10 +324,12 @@ class RadiantChainIO:
         proof_client: Any = None,
         depth_sources: tuple[Any, ...] = (),
         depth_timeout_s: float = DEPTH_SOURCE_TIMEOUT_S,
+        second_opinion: tuple[Any, ...] = (),
     ) -> None:
         for m in ("broadcast", "get_transaction_verbose", "get_utxos"):
             if not hasattr(client, m):
                 raise ValidationError(f"RadiantChainIO client must provide {m}()")
+        second_opinion = _checked_second_opinion(client, second_opinion)
         if (
             not isinstance(depth_timeout_s, (int, float))
             or isinstance(depth_timeout_s, bool)
@@ -301,10 +341,37 @@ class RadiantChainIO:
         self._proof_client = client if proof_client is None else proof_client
         self._depth_sources = tuple(depth_sources)
         self._depth_timeout_s = float(depth_timeout_s)
+        self._second_opinion = second_opinion
+
+    def with_second_opinion(self, second_opinion: tuple[Any, ...]) -> RadiantChainIO:
+        """A NEW chain IO over the same clients whose :meth:`broadcast` asks *second_opinion* after a
+        node rejection (#937). This one is unchanged, so a chain IO shared with attended callers keeps
+        today's behaviour.
+
+        Each client must provide ``broadcast`` and ``get_transaction`` and say which operator runs it
+        (``source_key``, as an ``ElectrumXClient`` over one operator's URLs does), and no two may be
+        the same operator (:func:`pyrxd.network.source_identity.require_distinct_sources`). A client
+        run by the same operator as ``client`` is refused: asking that operator again is not a second
+        opinion. A ``client`` over several operators' URLs cannot say which one answered, so its
+        ``per_source_clients()`` is the wiring that asks every operator once. Empty turns it off.
+        """
+        return RadiantChainIO(
+            self._client,
+            proof_client=self._proof_client,
+            depth_sources=self._depth_sources,
+            depth_timeout_s=self._depth_timeout_s,
+            second_opinion=second_opinion,
+        )
+
+    @property
+    def second_opinion(self) -> tuple[Any, ...]:
+        """The clients :meth:`broadcast` asks after a node rejection; empty when off."""
+        return self._second_opinion
 
     async def broadcast(self, raw_tx: bytes) -> str:
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
             raise ValidationError("raw_tx must be non-empty bytes")
+        rejection: PolicyRejection | None = None
         try:
             return str(await self._client.broadcast(bytes(raw_tx)))
         except Exception as exc:
@@ -313,11 +380,73 @@ class RadiantChainIO:
                 # Idempotent: the node already has it. Re-derive nothing; the caller
                 # tracks the txid from the builder. Surface a sentinel for the leg.
                 raise _AlreadyKnown() from exc
-            if isinstance(exc, PolicyRejection):
+            if not isinstance(exc, PolicyRejection):
+                raise NetworkError(f"radiant broadcast failed: {exc}") from exc
+            if not self._second_opinion:
                 # The node's verdict, raised as itself: ClaimExecutor tells a permanent rejection
                 # from a transient one only by this type and its reason.
                 raise
-            raise NetworkError(f"radiant broadcast failed: {exc}") from exc
+            rejection = exc
+        # Asked outside the except block, so nothing is chained onto the rejection raised below.
+        txid = await self._ask_second_opinion(bytes(raw_tx), rejection)
+        if txid is None:
+            raise rejection
+        return txid
+
+    async def _ask_second_opinion(self, raw: bytes, rejection: PolicyRejection) -> str | None:
+        """The txid of *raw* if a second-opinion client takes it after ``client`` rejected it, else None.
+
+        Asked one at a time, in order, stopping at the first that takes it. A client "takes" the
+        transaction when its reply names the txid hashed from *raw* (never the reply as such), or when
+        it says it already has the transaction AND serves the same bytes back on a read; an
+        uncorroborated "already have" is a claim any server can make for free (the rule
+        :meth:`pyrxd.network.failover.FailoverElectrumXClient.broadcast` keeps, audit B6). A rejection,
+        a transport failure or a wrong echo moves on to the next client. A TLS pin mismatch raises:
+        a substituted server is never routed around silently.
+        """
+        expected = str(Txid(hash256(raw)[::-1].hex()))
+        for client in self._second_opinion:
+            label = str(source_key_of(client))
+            try:
+                got = await client.broadcast(raw)
+            except TlsPinMismatchError:
+                raise
+            except PolicyRejection as exc:
+                if _is_already_have(exc) and await self._holds_tx(client, expected, raw):
+                    got = expected
+                else:
+                    _LOG.warning(
+                        "broadcast: second opinion from %s also rejected tx %s: %s", label, expected, exc.reason or exc
+                    )
+                    continue
+            except (NetworkError, BroadcastEchoMismatch) as exc:
+                _LOG.warning("broadcast: second opinion from %s failed for tx %s: %s", label, expected, exc)
+                continue
+            if str(got) != expected:
+                _LOG.warning(
+                    "broadcast: second opinion from %s answered txid %r for tx %s; not believed",
+                    label,
+                    got,
+                    expected,
+                )
+                continue
+            _LOG.warning(
+                "broadcast: the first endpoint rejected tx %s (%s) and %s took it",
+                expected,
+                rejection.reason or rejection,
+                label,
+            )
+            return expected
+        return None
+
+    @staticmethod
+    async def _holds_tx(client: Any, txid: str, raw: bytes) -> bool:
+        """True only if *client* serves exactly *raw* for *txid*."""
+        try:
+            served = await client.get_transaction(Txid(txid))
+        except (NetworkError, ValidationError):
+            return False
+        return isinstance(served, (bytes, bytearray)) and bytes(served) == raw
 
     async def confirmations(self, txid: str) -> Confirmations:
         info = await self._client.get_transaction_verbose(txid)

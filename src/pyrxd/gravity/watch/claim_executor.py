@@ -153,7 +153,13 @@ def load_claim_context(blobs_dir: str | Path, swap_id: str) -> CovenantClaimCont
 
 
 def make_radiant_claim_leg(
-    context: CovenantClaimContext, *, chain_io, fee_source, network: str, audit_cleared: bool = False
+    context: CovenantClaimContext,
+    *,
+    chain_io,
+    fee_source,
+    network: str,
+    audit_cleared: bool = False,
+    second_opinion: tuple = (),
 ):
     """Build the per-swap ``RadiantCovenantLeg`` from a covenant sidecar + the operator's SHARED
     ``chain_io`` (a ``RadiantChainIO``) and ``fee_source``.
@@ -174,9 +180,18 @@ def make_radiant_claim_leg(
     compromised/buggy hot fee key is bounded to a small pool rather than an arbitrary wallet — this is
     *recommended, not enforced* (the same posture: the library hands you the safe tool, it doesn't refuse
     your fee source). Imported lazily to keep the watch package free of a hard ``gravity.radiant_leg``
-    dependency until autonomy is actually armed."""
+    dependency until autonomy is actually armed.
+
+    ``second_opinion`` (#937; default empty: off) are broadcast clients, one per operator, that the
+    claim's broadcast asks when the first endpoint rejects it, so one lagging, stricter or lying
+    server cannot hold the claim back alone while the maker's refund timelock runs. The leg gets its
+    own chain IO (:meth:`~pyrxd.gravity.radiant_leg.RadiantChainIO.with_second_opinion`); the shared
+    ``chain_io`` is unchanged, so attended broadcasts through it still take the first rejection as
+    final. For a client over pyrxd's shipped mainnet endpoints, pass its ``per_source_clients()``."""
     from pyrxd.gravity.radiant_leg import RadiantCovenantLeg
 
+    if second_opinion:
+        chain_io = chain_io.with_second_opinion(second_opinion)
     return RadiantCovenantLeg(
         network=network,
         taker_pkh=context.taker_pkh,
@@ -187,18 +202,35 @@ def make_radiant_claim_leg(
     )
 
 
-def sidecar_leg_resolver(blobs_dir: str | Path, *, chain_io, fee_source, network: str, audit_cleared: bool = False):
+def sidecar_leg_resolver(
+    blobs_dir: str | Path,
+    *,
+    chain_io,
+    fee_source,
+    network: str,
+    audit_cleared: bool = False,
+    second_opinion: tuple = (),
+):
     """An async ``resolve_leg(swap_id, record)`` for the :class:`ClaimExecutor` that loads the per-swap
     covenant sidecar and builds the leg with the SHARED chain_io + fee_source. Returns ``None`` for a swap
     with no sidecar (→ the executor declines, dormant for that swap). This is the wiring the shell uses to
-    arm the claim executor; until a sidecar exists for a swap, that swap stays alert-only."""
+    arm the claim executor; until a sidecar exists for a swap, that swap stays alert-only.
+    ``second_opinion`` is forwarded to :func:`make_radiant_claim_leg`."""
+    if second_opinion:
+        # Refuse a bad set at wiring time, not on the first claim tick.
+        chain_io.with_second_opinion(second_opinion)
 
     async def _resolve(swap_id: str, record: SwapRecord):
         ctx = load_claim_context(blobs_dir, swap_id)
         if ctx is None:
             return None
         return make_radiant_claim_leg(
-            ctx, chain_io=chain_io, fee_source=fee_source, network=network, audit_cleared=audit_cleared
+            ctx,
+            chain_io=chain_io,
+            fee_source=fee_source,
+            network=network,
+            audit_cleared=audit_cleared,
+            second_opinion=second_opinion,
         )
 
     return _resolve
@@ -567,7 +599,8 @@ class ClaimExecutor:
         except PolicyRejection as exc:
             # PolicyRejection subclasses NetworkError, so this clause must precede the NetworkError
             # one below. Never marked seen, whatever the reason: a node's verdict can come from one
-            # endpoint (failover never asks a second after a rejection), from one node's policy,
+            # endpoint (failover never asks a second after a rejection; a leg built with
+            # `second_opinion` asks one per operator first, #937), from one node's policy,
             # or from this tick's fee input (an immature coinbase, an operator-typed value the
             # signature commits to), and nothing clears a seen mark (Mythos pass on #934 and its
             # re-review). The next tick rebuilds with a new fee input, bounded by the capped,
