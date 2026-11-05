@@ -441,7 +441,7 @@ async def test_a_held_claim_every_server_refuses_ends_the_hold(tick) -> None:
 
 async def test_a_held_claim_re_send_transport_failure_counts_down(tick) -> None:
     primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
-    ex, rec, fees = await _with_second_opinion(primary, second, SeenStore(), resend_ticks=1)
+    ex, rec, _fees = await _with_second_opinion(primary, second, SeenStore(), resend_ticks=1)
     primary.reject = (-26, _SCRIPT_FAILED)
     outcome, said = await tick(ex, rec)
     assert outcome is ExecOutcome.BROADCAST, said
