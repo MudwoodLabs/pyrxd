@@ -718,6 +718,24 @@ def test_real_mainnet_headers_and_transaction_verify_at_the_gate():
         verify_maker_funding(_two_operators(ev), value_at_stake_photons=9 * cost // 2 + 1, **common)
 
 
+def test_the_gate_keeps_radiants_difficulty_rule_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate's price for a forged confirmation is derived from the floor, so it runs the
+    verifier with the difficulty rule OFF until that money path has its own review. Pinned here:
+    the gate's own fixtures sit where the rule returns nothing, so its verdicts alone cannot show
+    the flag. Runs the real-mainnet gate test above through a spy on the verifier."""
+    calls: list[object] = []
+    real = funding_spv.verify_mark_block
+
+    def spy(*args: object, **kwargs: object) -> object:
+        calls.append(kwargs.get("difficulty_rule", "default"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(funding_spv, "verify_mark_block", spy)
+    test_real_mainnet_headers_and_transaction_verify_at_the_gate()
+    assert calls, "the gate never reached the verifier"
+    assert all(flag is False for flag in calls), calls
+
+
 # --------------------------------------------------------------------------- (c) the rule
 
 

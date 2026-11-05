@@ -15,10 +15,11 @@ Bitcoin's (folding a live ``blockchain.transaction.get_merkle`` branch from the 
 
 What this module does NOT do: it does not check that an nBits value is the one Radiant's
 difficulty algorithm requires at that height. Radiant retargets every block (17 consecutive
-mainnet headers carry 17 distinct nBits), and its difficulty algorithm is not vendored here, so
-each header is checked only against ITS OWN stated target. A caller that needs more than "this
-header cost about ``2**256 / target`` hash evaluations" must bound the target itself — see
-:mod:`pyrxd.glyph.mark_block`, which does so with a floor.
+mainnet headers carry 17 distinct nBits), so each header is checked here only against ITS OWN
+stated target. A caller that needs more than "this header cost about ``2**256 / target`` hash
+evaluations" must bound the target itself: :mod:`pyrxd.spv.asert` computes the nBits Radiant
+requires on mainnet, and :mod:`pyrxd.glyph.mark_block` applies it above the checkpoint together
+with a floor.
 
 Import-light on purpose (stdlib, :mod:`pyrxd.hash`, :mod:`pyrxd.security`): the browser pages run
 under Pyodide, where ``pyrxd.network`` cannot be imported.
@@ -90,8 +91,8 @@ def radiant_header_target(header: bytes, *, pow_limit: int | None = None) -> int
     With a *pow_limit* (a network's ``consensus.powLimit``, from
     :mod:`pyrxd.gravity.funding_spv`), the decode follows Radiant Core's own rule instead:
     ``arith_uint256::SetCompact``'s negative and overflow tests, then ``CheckProofOfWork``'s
-    ``bnTarget == 0 || bnTarget > powLimit`` refusal (both inherited from Bitcoin Core; ``pow.cpp``
-    and ``arith_uint256.cpp`` are not vendored). The exponent cap above cannot be used there:
+    ``bnTarget == 0 || bnTarget > powLimit`` refusal (``tests/vendor/radiant_core/pow.cpp:385-403``;
+    ``arith_uint256.cpp`` is not vendored). The exponent cap above cannot be used there:
     regtest's own genesis states ``0x207fffff`` (``tests/vendor/radiant_core/chainparams.cpp``),
     which that cap refuses although Radiant Core accepts it.
     """
@@ -135,7 +136,7 @@ def verify_radiant_header_pow(header: bytes, *, pow_limit: int | None = None) ->
     Returns the block hash in display hex. Raises ``ValidationError`` for a header that is not 80
     bytes or carries a malformed nBits, and ``SpvVerificationError`` when the hash is above the
     target. ``hash <= target`` passes: that is Bitcoin Core's ``CheckProofOfWork`` rule, which
-    Radiant Core inherits (assumed from lineage; ``pow.cpp`` is not vendored). A hash EQUAL to the
+    Radiant Core keeps (``tests/vendor/radiant_core/pow.cpp:398``). A hash EQUAL to the
     target has probability 2**-256 per evaluation, and about 2**-201 for a header that meets its
     target at the newest shipped checkpoint's difficulty (one in ``target + 1``, a target near
     2**200.9), so the choice changes nothing in practice. (About 2**-55 is the chance a hash MEETS

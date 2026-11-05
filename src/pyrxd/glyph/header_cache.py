@@ -7,7 +7,9 @@ newest checkpoint. This cache holds headers this machine has already linked to t
 so verification can link forward from the newest cached header instead, with the same cap.
 
 NOTHING NEW IS TRUSTED. Every cached header is linked hash by hash to the newest checkpoint shipped
-with pyrxd, meets its own proof-of-work target, and carries at least the floor (below). The two
+with pyrxd, carries exactly the difficulty Radiant's rule requires on top of the header below it
+(:mod:`pyrxd.spv.asert`; mainnet), meets its own proof-of-work target, and carries at least the
+floor (below). The two
 rules that decide what may ENTER the cache are applied by :func:`agreed_headers` and the caller's
 depth bound (``pyrxd headers sync``): a header is cached only when at least
 :data:`MIN_OPERATORS` distinct operators served it byte for byte alike, and only when it sits at
@@ -83,6 +85,7 @@ from typing import Any
 
 from pyrxd.hash import radiant_block_hash
 from pyrxd.security.errors import SpvVerificationError, ValidationError
+from pyrxd.spv.asert import header_nbits, required_nbits
 from pyrxd.spv.radiant import radiant_header_prev_hash, radiant_header_work, verify_radiant_header_pow
 from pyrxd.spv.radiant_checkpoints import MIN_DEPTH_BELOW_TIP
 
@@ -157,7 +160,9 @@ class VerifiedHeaders:
     """Headers linked hash by hash from the newest shipped checkpoint, each above it checked.
 
     ``headers[0]`` is the checkpoint's own header (``base_height == checkpoint_height``); every
-    later header names the one before it, meets its own proof-of-work target and carries at least
+    later header names the one before it, carries the difficulty Radiant's rule requires (on the
+    networks :func:`pyrxd.spv.asert.required_nbits` covers), meets its own proof-of-work target and
+    carries at least
     :attr:`floor_work`. Built ONLY by :func:`verify_header_chain`, :func:`extend_verified_headers`
     and :func:`start_verified_headers`: constructing one directly, or deriving one with
     ``dataclasses.replace``, raises (each seal admits one construction), so a :class:`VerifiedHeaders`
@@ -222,23 +227,26 @@ def _floor_of(work: int) -> int:
 
 
 def _walk(
-    below_hash: str,
+    below_header: bytes,
     start: int,
     headers: Sequence[Any],
     floor: int,
     *,
+    network: str,
     pow_limit: int | None,
     floor_of: str = "the newest shipped checkpoint's",
 ) -> tuple[list[str], str | None, str | None]:
-    """Check *headers* (heights ``start``, ``start+1``, ...) above a header hashing to *below_hash*.
+    """Check *headers* (heights ``start``, ``start+1``, ...) above *below_header* (at ``start - 1``).
 
     Returns ``(hashes of the accepted prefix, kind, reason)``. ``kind`` is ``None`` when every
     header passed; ``"lie"`` for a header that is not 80 bytes, does not link to the one below it,
-    or fails its own proof-of-work (no honest source serves one); ``"floor"`` for a header below
-    the floor, where the accepted prefix ends (an honest difficulty drop can do that).
+    does not carry the nBits Radiant's difficulty rule requires on top of it (on the networks
+    :func:`pyrxd.spv.asert.required_nbits` covers), or fails its own proof-of-work (no honest source
+    serves one); ``"floor"`` for a header below the floor, where the accepted prefix ends (an honest
+    difficulty drop can do that).
     """
     hashes: list[str] = []
-    below = below_hash
+    below = radiant_block_hash(below_header)
     for i, hdr in enumerate(headers):
         h = start + i
         if not isinstance(hdr, (bytes, bytearray)) or len(hdr) != 80:
@@ -246,6 +254,14 @@ def _walk(
         hdr = bytes(hdr)
         if radiant_header_prev_hash(hdr) != below:
             return hashes, "lie", f"the header at {h} does not link to the header at {h - 1}"
+        want = required_nbits(network, h - 1, below_header)
+        if want is not None and header_nbits(hdr) != want:
+            return (
+                hashes,
+                "lie",
+                f"the header at {h} states difficulty bits {header_nbits(hdr):#010x}, but Radiant's difficulty "
+                f"rule requires {want:#010x} on top of the header at {h - 1}",
+            )
         try:
             got = verify_radiant_header_pow(hdr, pow_limit=pow_limit)
         except (SpvVerificationError, ValidationError) as exc:
@@ -258,7 +274,7 @@ def _walk(
                 f"{floor_of}); its difficulty may be honest, but it is not cached",
             )
         hashes.append(got)
-        below = got
+        below, below_header = got, hdr
     return hashes, None, None
 
 
@@ -274,9 +290,9 @@ def verify_header_chain(
 
     *headers* start at *base_height*, which must be a checkpoint in *table* whose hash the first
     header has. Every header links to the one below it; every checkpoint of *table* the headers
-    reach must match; every header above the NEWEST checkpoint meets its own proof-of-work and the
-    floor. The result is rebased onto the newest checkpoint (headers below it are dropped: the
-    shipped table covers them).
+    reach must match; every header above the NEWEST checkpoint carries the difficulty Radiant's
+    rule requires, meets its own proof-of-work and the floor. The result is rebased onto the newest
+    checkpoint (headers below it are dropped: the shipped table covers them).
 
     ``(None, reason)`` when the headers cannot be trusted at all (they do not start at a
     checkpoint, a link or a checkpoint does not match, a proof-of-work fails) or add nothing (they
@@ -313,7 +329,7 @@ def verify_header_chain(
     base = bytes(headers[cp_h - base_height])
     floor = _floor_of(radiant_header_work(base, pow_limit=pow_limit))
     above = headers[cp_h - base_height + 1 :]
-    hashes, kind, reason = _walk(cp_hash, cp_h + 1, above, floor, pow_limit=pow_limit)
+    hashes, kind, reason = _walk(base, cp_h + 1, above, floor, network=network, pow_limit=pow_limit)
     if kind == "lie":
         return None, f"the store is not a verified chain: {reason}"
     kept = (base, *(bytes(x) for x in above[: len(hashes)]))
@@ -382,7 +398,9 @@ def extend_verified_headers(
         raise ValidationError("a sync floor may never be below the shipped checkpoint's (VerifiedHeaders.floor_work)")
     else:
         floor_of = "the greater of the newest shipped checkpoint's and the recent cached median"
-    hashes, kind, reason = _walk(chain.hashes[-1], chain.top + 1, new, floor, pow_limit=pow_limit, floor_of=floor_of)
+    hashes, kind, reason = _walk(
+        chain.headers[-1], chain.top + 1, new, floor, network=chain.network, pow_limit=pow_limit, floor_of=floor_of
+    )
     if kind == "lie":
         raise HeaderCacheRefusal(str(reason))
     added = tuple(bytes(x) for x in new[: len(hashes)])
