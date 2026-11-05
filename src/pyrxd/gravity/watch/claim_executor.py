@@ -384,8 +384,8 @@ class ClaimExecutor:
         self._rxd_depth_corroborator = rxd_depth_corroborator
         self._claim_dust_ceiling = int(claim_dust_ceiling)
         # A claim only a second-opinion server took (#937), by covenant outpoint: its exact bytes and the
-        # ticks left to re-send them before the next rebuild. In memory only: a restart forgets it, which
-        # costs one rebuild (one fee input), never a disarmed claim.
+        # ticks left to re-send them before the next rebuild. In memory only: a restart forgets it and
+        # rebuilds (see _resend_held for what that costs), which never disarms the claim.
         self._resend_ticks = int(second_opinion_resend_ticks)
         self._held: dict[str, tuple[bytes, int]] = {}
 
@@ -686,7 +686,13 @@ class ClaimExecutor:
         they are re-sent for ``second_opinion_resend_ticks`` ticks; then the hold ends and the next tick
         rebuilds on a new fee input, so a lying second opinion (one that keeps nothing) delays a claim by
         at most that many ticks per rebuild, and the broadcast client sees a fresh claim each time. A
-        refusal from every client also ends the hold."""
+        refusal from every client also ends the hold.
+
+        What the hold does NOT remove: once it ends while the claim is still unmined and the broadcast
+        client still refuses, each later rebuild conflicts with the relayed claim on the second opinion,
+        is refused by every client, and dispenses one fee input per tick until the claim is mined. That
+        is the cost every refused claim already had before #937 (the PolicyRejection arm in ``_run``);
+        the hold only spends nothing for its first ``second_opinion_resend_ticks`` ticks."""
         from pyrxd.gravity.radiant_leg import SecondOpinionTxid, _AlreadyKnown
 
         raw, left = held

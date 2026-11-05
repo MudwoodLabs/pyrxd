@@ -395,6 +395,28 @@ async def test_a_lying_second_opinion_cannot_disarm_the_claim(tick) -> None:
     assert _assert_paid_once(primary, fees) == _txid(claim)
 
 
+async def test_a_held_claim_the_first_endpoint_already_has_is_marked_seen(tick) -> None:
+    """The normal honest relay: the second node relayed the claim and the first endpoint now holds
+    it, so the re-send gets "already have" from the first endpoint itself."""
+    primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
+    seen = SeenStore()
+    ex, rec, fees = await _with_second_opinion(primary, second, seen)
+    primary.reject = (-26, "txn-mempool-conflict (code 18)")
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    claim = second.broadcasts[0]
+
+    primary.reject = None
+    primary.mempool[_txid(claim)] = claim  # relayed peer to peer
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED and "now taken by the broadcast client" in said, said
+    assert second.broadcasts == [claim], "the first endpoint's own answer ends it"
+    assert ex._held == {}
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED and "already broadcast" in said, said
+    assert len(fees.outpoints) == 1
+
+
 async def test_a_held_claim_is_rebuilt_once_its_re_sends_run_out(tick) -> None:
     """A liar that keeps nothing while the first endpoint refuses THESE bytes (say, for their fee
     input) delays the claim by the re-send count, then a rebuild on a new fee input goes to the
