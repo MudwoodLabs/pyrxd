@@ -64,6 +64,10 @@
     "chain.h": {
       "upstream_path": "src/chain.h",
       "sha256": "65469ba8d3f3b44583f44dc496507c081d095b51f4abc1f24ba30519734c2ab6"
+    },
+    "pow.cpp": {
+      "upstream_path": "src/pow.cpp",
+      "sha256": "e2a47d16a30551301a7d03a4bfc711dcccd270cda7366d0c5e4c4c06204cef3e"
     }
   }
 }

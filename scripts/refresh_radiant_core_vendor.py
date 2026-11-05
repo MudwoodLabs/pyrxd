@@ -97,6 +97,9 @@ FILES = {
     # after (validation.cpp uses it and declares it nowhere). The swap taker gate's elapsed-depth
     # bound measures its time term from it, so the rule must be readable here.
     "chain.h": "src/chain.h",
+    # The difficulty rule (ASERT, CalculateASERT and the 410,000 half-life re-anchor) that
+    # pyrxd.spv.asert ports bit for bit; tests/test_asert_difficulty_rule.py reads its constants here.
+    "pow.cpp": "src/pow.cpp",
 }
 
 
