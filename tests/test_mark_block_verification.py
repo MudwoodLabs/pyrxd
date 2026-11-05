@@ -379,7 +379,7 @@ def test_the_real_chain_meets_radiants_difficulty_rule() -> None:
 
 def test_the_claim_does_not_say_each_when_some_headers_were_not_ruled(monkeypatch: pytest.MonkeyPatch) -> None:
     """A walk that crosses block 410,000 from a caller's table (newest checkpoint below 409,999)
-    holds the headers below 410,000 to their own proof-of-work only. Simulated here by a rule that
+    holds the headers below 410,000 to their own proof-of-work and the floor only. Simulated here by a rule that
     covers only the upper headers: the result may verify by work, but the claim must not say that
     EACH header carries the required difficulty."""
     real = mark_block.required_nbits

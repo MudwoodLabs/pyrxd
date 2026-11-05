@@ -40,7 +40,8 @@ fetched or checked.
 * **work** — ``H`` is above the newest checkpoint ``C``. The headers ``C+1 .. H`` (and above, for
   burial) are linked hash by hash to ``C``'s header, whose hash must equal the shipped one, and
   EACH must (a) carry exactly the nBits Radiant's difficulty rule computes from the header below
-  it (:mod:`pyrxd.spv.asert`; mainnet, unless the caller passes ``difficulty_rule=False``), (b)
+  it (:mod:`pyrxd.spv.asert`; mainnet from block 410,000, unless the caller passes
+  ``difficulty_rule=False``), (b)
   hash at or below the target its own nBits states and (c) state a target whose work is at least
   :data:`FLOOR_WORK_DIVISOR`-th of ``C``'s.
 
@@ -107,7 +108,9 @@ cache. With no cache, nothing here changes.
 
 WHAT IS NOT CLAIMED, at any level: that the chain is Radiant's most-work chain; at the checkpoint
 level, or with ``difficulty_rule=False``, that any header's nBits is the value Radiant's difficulty
-rule requires (at the checkpoint level the checkpoint's hash pins every header instead); that the
+rule requires (at the checkpoint level the checkpoint's hash pins every header instead); on a walk
+from a caller's table that starts below block 410,000, that EACH header's nBits is (the claim then
+says so, and the ``difficulty`` step is ``"not run"``); that the
 block's timestamp is accurate (a forger chooses timestamps, within what the rule lets the next
 header's difficulty follow); that the transaction's scripts are valid. And the checkpoint table
 is only as good as its sources — see its docstring for who vouched for it.
@@ -549,7 +552,9 @@ def verify_mark_block(
     anchor at a cached header instead (module docstring); ``None`` changes nothing.
     ``difficulty_rule`` (default ``True``) requires each header above the anchor to carry exactly
     the nBits Radiant's difficulty rule computes from its parent (:mod:`pyrxd.spv.asert`), on the
-    networks that rule covers (mainnet); a header that does not is CONTRADICTED. The swap taker
+    networks and heights that rule covers (mainnet from block 410,000); a header that does not is
+    CONTRADICTED. The ``difficulty`` step is ``"passed"`` only if every header above the anchor
+    was held to the rule. The swap taker
     gate passes ``False`` until that money path has had its own review of the change.
 
     ``cached_floor`` (``(height, work)`` of a cached header) keeps the floor at least that header's
@@ -805,8 +810,8 @@ def _verify(
         linked.add(newest_h)
         reached = newest_h
         # The difficulty step passes only if EVERY header above the anchor was held to Radiant's rule: a
-        # walk that crosses 410,000 from a caller's table holds the headers below it to nothing more
-        # than their own proof-of-work, and the claim must not say "each" then.
+        # walk that crosses 410,000 from a caller's table holds the headers below it only to their
+        # own proof-of-work and the floor, and the claim must not say "each" then.
         ruled = False  # some header was held to the rule
         unruled = False  # some header was not
         # A header that starts a request did not come in the same reply as the one below it.

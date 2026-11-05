@@ -91,7 +91,7 @@ def radiant_header_target(header: bytes, *, pow_limit: int | None = None) -> int
     With a *pow_limit* (a network's ``consensus.powLimit``, from
     :mod:`pyrxd.gravity.funding_spv`), the decode follows Radiant Core's own rule instead:
     ``arith_uint256::SetCompact``'s negative and overflow tests, then ``CheckProofOfWork``'s
-    ``bnTarget == 0 || bnTarget > powLimit`` refusal (``tests/vendor/radiant_core/pow.cpp:385-402``;
+    ``bnTarget == 0 || bnTarget > powLimit`` refusal (``tests/vendor/radiant_core/pow.cpp:385-403``;
     ``arith_uint256.cpp`` is not vendored). The exponent cap above cannot be used there:
     regtest's own genesis states ``0x207fffff`` (``tests/vendor/radiant_core/chainparams.cpp``),
     which that cap refuses although Radiant Core accepts it.

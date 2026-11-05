@@ -18,7 +18,7 @@ no window of earlier headers: only the parent's height and timestamp and three a
 
 THE ANCHOR. From height :data:`HALF_LIFE_UPGRADE_HEIGHT` (410,000) Radiant uses a 12-hour half-life
 and re-anchors on block 409,999: its nBits, and the timestamp of ITS parent, 409,998
-(``pow.cpp:126-147``). ``chainparams.cpp:124`` still states the old two-day half-life; the 12 hours
+(``pow.cpp:125-151``). ``chainparams.cpp:124`` still states the old two-day half-life; the 12 hours
 is in ``pow.cpp:138`` only. :data:`MAINNET_ANCHOR` holds the two values read from those mainnet
 headers (2026-11-03, served byte for byte alike by two operators); they equal Photonic Wallet's
 ``anchorV2``. A wrong anchor makes every honest header fail the rule, which the parity tests
@@ -28,7 +28,7 @@ WHAT IS NOT COVERED. Heights below 410,000 (the original 2022 anchor and two-day
 rule is applied only above the NEWEST checkpoint, which is far above them (477,792 in 0.27.1;
 ``tests/test_asert_difficulty_rule.py`` asserts it is at least 409,999); headers at or below it are
 pinned by hash. Older checkpoints in the table sit below 410,000, but nothing is walked from them.
-Radiant's rule as of v3.1.2 only: Radiant changed it once by height (``pow.cpp:126-151``). If it
+Radiant's rule as of v3.1.2 only: Radiant changed it once by height (``pow.cpp:125-151``). If it
 changes again, honest headers above the change fail this rule and are reported CONTRADICTED until
 pyrxd ships the new rule. That fails closed, and it needs a release.
 Networks other than mainnet: regtest does not retarget (``fPowNoRetargeting``,
@@ -46,7 +46,7 @@ PARITY WITH THE C++. These details are mirrored deliberately:
   its largest value (``frac`` = 65535) is about 2**47 below the wrap, so the mask never changes
   the result;
 * a shift that would overflow 256 bits clamps to powLimit, as ``pow.cpp:278-287`` does (a parent
-  stamped weeks ahead of schedule reaches it);
+  stamped weeks behind schedule (a timestamp far later than the ideal) reaches it);
 * compact encoding is ``arith_uint256::GetCompact``, including the sign-bit renormalisation.
 """
 

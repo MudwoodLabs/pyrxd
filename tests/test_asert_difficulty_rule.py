@@ -172,17 +172,18 @@ def test_the_walk_starts_where_the_rule_is_modelled() -> None:
     assert required_nbits("mainnet", newest, b"\x00" * 80) is not None
 
 
-def test_a_parent_far_ahead_of_schedule_clamps_to_pow_limit() -> None:
+def test_a_parent_far_behind_schedule_clamps_to_pow_limit() -> None:
     """pow.cpp:278-287: a shift that would overflow 256 bits gives powLimit. A parent stamped 60 days
-    ahead of schedule at height 469,999 reaches that branch; without the clamp the shifted value
-    wraps and the port would require a far harder target than Radiant does."""
+    behind schedule (60 days later than the ideal) at height 469,999 reaches that branch; without
+    the clamp the shifted value wraps and the port would require a far harder target than Radiant
+    does."""
     prev_height = 469_999
     on_schedule = MAINNET_ANCHOR.prev_time + SPACING_SECONDS * (prev_height - MAINNET_ANCHOR.height + 1)
-    ahead = on_schedule + 60 * 86_400
-    assert next_nbits(prev_height, ahead) == compact_from_target(MAINNET_POW_LIMIT) == 0x1D00FFFF
+    late = on_schedule + 60 * 86_400
+    assert next_nbits(prev_height, late) == compact_from_target(MAINNET_POW_LIMIT) == 0x1D00FFFF
     # The branch, not the final min(): the unshifted product times 2**shifts overflows 256 bits.
     ref = target_from_compact(MAINNET_ANCHOR.nbits)
     exponent = (
-        (ahead - MAINNET_ANCHOR.prev_time - SPACING_SECONDS * (prev_height - MAINNET_ANCHOR.height + 1)) * 65536
+        (late - MAINNET_ANCHOR.prev_time - SPACING_SECONDS * (prev_height - MAINNET_ANCHOR.height + 1)) * 65536
     ) // HALF_LIFE_SECONDS
     assert (ref * 65536) << ((exponent >> 16) - 16) >= 1 << 256
