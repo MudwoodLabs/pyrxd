@@ -486,7 +486,7 @@ test = [
     "pytest>=9.2.0",
     "pytest-cov==7.1.0",
     "pytest-github-actions-annotate-failures",
-    "pytest-mock<3.16.1",
+    "pytest-mock<3.17.1",
     "pytest-runner",
     # `-n auto` for the offline suite in CI (`ci.yml`) and `task test` / `task coverage-overall`.
     "pytest-xdist==3.8.0",
