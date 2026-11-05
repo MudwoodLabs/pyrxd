@@ -107,9 +107,9 @@ __all__ = [
     "FeeUtxoSource",
     "RadiantBroadcaster",
     "RadiantChainIO",
-    "SecondOpinionTxid",
     "RadiantCovenantLeg",
     "RxinDexerRefAdapter",
+    "SecondOpinionTxid",
     "SeenStore",
     "blocks_to_claim_deadline",
 ]
