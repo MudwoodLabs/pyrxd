@@ -690,9 +690,10 @@ class ClaimExecutor:
 
         What the hold does NOT remove: once it ends while the claim is still unmined and the broadcast
         client still refuses, each later rebuild conflicts with the relayed claim on the second opinion,
-        is refused by every client, and dispenses one fee input per tick until the claim is mined. That
-        is the cost every refused claim already had before #937 (the PolicyRejection arm in ``_run``);
-        the hold only spends nothing for its first ``second_opinion_resend_ticks`` ticks."""
+        is refused by every client, and dispenses one fee input per tick until the claim is mined or the
+        capped pool runs out. A refused claim paid the same per-tick cost before #937 (the
+        PolicyRejection arm in ``_run``); the hold only spends nothing for its first
+        ``second_opinion_resend_ticks`` ticks."""
         from pyrxd.gravity.radiant_leg import SecondOpinionTxid, _AlreadyKnown
 
         raw, left = held
