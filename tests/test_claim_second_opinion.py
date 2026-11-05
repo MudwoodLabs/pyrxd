@@ -23,7 +23,7 @@ import pytest
 from pyrxd.gravity.radiant_leg import RadiantChainIO, SecondOpinionTxid, SeenStore
 from pyrxd.gravity.watch import ExecOutcome
 from pyrxd.gravity.watch.claim_executor import CovenantClaimContext, make_radiant_claim_leg, sidecar_leg_resolver
-from pyrxd.network.electrumx import ElectrumXClient
+from pyrxd.network.electrumx import ElectrumXClient, _rpc_error
 from pyrxd.network.source_identity import source_key
 from pyrxd.security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError
 
@@ -58,6 +58,15 @@ class _OpNode(_Node):
         if method == "blockchain.transaction.broadcast" and self.fail is not None:
             self.broadcasts.append(bytes.fromhex(params[0]))
             raise self.fail
+        if (
+            method == "blockchain.transaction.broadcast"
+            and self.reject is None
+            and _txid(bytes.fromhex(params[0])) in self.mempool
+        ):
+            # What Radiant-Core answers for a transaction it already holds (validation.cpp,
+            # "txn-already-in-mempool"), wrapped by ElectrumX as code 1.
+            self.broadcasts.append(bytes.fromhex(params[0]))
+            raise _rpc_error(1, "the transaction was rejected by network rules.\n\ntxn-already-in-mempool\n[]")
         if method == "blockchain.transaction.get" and params[1:] == [False]:
             self.reads.append(params[0])
             raw = self.mempool.get(params[0]) if self.serves else None
@@ -310,11 +319,25 @@ def tick(caplog):
     return _tick
 
 
-async def _with_second_opinion(primary: _OpNode, second: _OpNode, seen: SeenStore | None = None):
+async def _with_second_opinion(
+    primary: _OpNode, second: _OpNode, seen: SeenStore | None = None, *, resend_ticks: int | None = None
+):
     ex, rec, fees = await _armed(primary, seen)
     leg = await ex._resolve_leg("swap-1", rec)
     leg.chain_io = leg.chain_io.with_second_opinion((second,))
+    if resend_ticks is not None:
+        ex._resend_ticks = resend_ticks
     return ex, rec, fees
+
+
+def _one_chain(*nodes: _OpNode) -> None:
+    """Mine every node's mempool into one block that every node sees."""
+    block: dict[str, bytes] = {}
+    for node in nodes:
+        block.update(node.mempool)
+        node.mempool.clear()
+    for node in nodes:
+        node.confirmed.update(block)
 
 
 async def test_a_claim_one_endpoint_refuses_lands_through_a_second_operator(tick) -> None:
@@ -327,26 +350,28 @@ async def test_a_claim_one_endpoint_refuses_lands_through_a_second_operator(tick
     assert outcome is ExecOutcome.BROADCAST, said
     assert len(primary.broadcasts) == 1 and second.broadcasts == primary.broadcasts
     assert "first endpoint rejected" in said and "beta.example took it" in said
-    assert len(fees.outpoints) == 1
     assert "not marked seen" in said
+    claim = second.broadcasts[0]
 
-    # Not marked seen, so the next tick rebuilds; the rebuild conflicts with the relayed claim on
-    # the second node and the first endpoint still refuses, so nothing more is sent anywhere.
-    outcome, said = await tick(ex, rec)
-    assert outcome is ExecOutcome.DECLINED, said
-    assert set(second.mempool) == {_txid(second.broadcasts[0])}
+    # Later ticks re-send the SAME bytes: no new fee input, nothing new relayed. The second node
+    # answers "already have" and serves them back.
+    for _ in range(3):
+        outcome, said = await tick(ex, rec)
+        assert outcome is ExecOutcome.DECLINED and "re-sent the same bytes" in said, said
+    assert len(fees.outpoints) == 1, "the shared fee pool is not drained while the claim waits"
+    assert set(primary.broadcasts) == {claim} and set(second.broadcasts) == {claim}
+    assert set(second.mempool) == {_txid(claim)}
 
-    second.mine()
-    primary.confirmed.update(second.confirmed)  # one chain: the block reaches the first endpoint too
+    _one_chain(primary, second)
     outcome, said = await tick(ex, rec)
     assert outcome is ExecOutcome.DECLINED and "already spent" in said, said
-    assert _assert_paid_once(second, fees) == _txid(second.broadcasts[0])
+    assert _assert_paid_once(second, fees) == _txid(claim)
 
 
 async def test_a_lying_second_opinion_cannot_disarm_the_claim(tick) -> None:
-    """The reviewer's case: the first endpoint refuses for a passing reason, and a second-opinion
+    """A first review's case: the first endpoint refuses for a passing reason, and a second-opinion
     server answers with the right txid but keeps nothing. Marking that seen would stop every later
-    tick and leave the asset to the maker's refund."""
+    tick and leave the asset to the maker's refund. The held bytes go to the first endpoint first."""
     primary, liar = _OpNode("wss://electrum.alpha.example/"), _second()
     liar.relay = False
     seen = SeenStore()
@@ -356,13 +381,91 @@ async def test_a_lying_second_opinion_cannot_disarm_the_claim(tick) -> None:
     outcome, said = await tick(ex, rec)
     assert outcome is ExecOutcome.BROADCAST, said
     assert liar.mempool == {} and primary.mempool == {}
+    claim = primary.broadcasts[0]
+
+    primary.reject = None
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED and "now taken by the broadcast client" in said, said
+    assert primary.broadcasts == [claim, claim] and len(fees.outpoints) == 1
+    assert set(primary.mempool) == {_txid(claim)}
+
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED and "already broadcast" in said, said
+    _one_chain(primary, liar)
+    assert _assert_paid_once(primary, fees) == _txid(claim)
+
+
+async def test_a_held_claim_is_rebuilt_once_its_re_sends_run_out(tick) -> None:
+    """A liar that keeps nothing while the first endpoint refuses THESE bytes (say, for their fee
+    input) delays the claim by the re-send count, then a rebuild on a new fee input goes to the
+    first endpoint again."""
+    primary, liar = _OpNode("wss://electrum.alpha.example/"), _second()
+    liar.relay = False
+    ex, rec, fees = await _with_second_opinion(primary, liar, SeenStore(), resend_ticks=2)
+    primary.reject = (-26, "bad-txns-premature-spend-of-coinbase")
+
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    for left in (1, 0):
+        outcome, said = await tick(ex, rec)
+        assert outcome is ExecOutcome.DECLINED and f"({left} re-sends left)" in said, said
+    assert len(fees.outpoints) == 1
 
     primary.reject = None
     outcome, said = await tick(ex, rec)
     assert outcome is ExecOutcome.BROADCAST, said
-    assert len(fees.outpoints) == 2 and liar.broadcasts == liar.broadcasts[:1], "the primary took it"
-    primary.mine()
-    assert _assert_paid_once(primary, fees) == _txid(primary.broadcasts[-1])
+    assert len(fees.outpoints) == 2, "rebuilt on a new fee input after the hold ended"
+    rebuilt = primary.broadcasts[-1]
+    assert rebuilt != primary.broadcasts[0]
+    _one_chain(primary, liar)
+    assert _assert_paid_once(primary, fees) == _txid(rebuilt)
+
+
+async def test_a_held_claim_every_server_refuses_ends_the_hold(tick) -> None:
+    primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
+    ex, rec, fees = await _with_second_opinion(primary, second, SeenStore())
+    primary.reject = (-26, _SCRIPT_FAILED)
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+
+    second.mempool.clear()  # evicted
+    second.reject = (-26, "the second endpoint's reason")
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "rebuilding next tick" in said, said
+
+    primary.reject = second.reject = None
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    assert len(fees.outpoints) == 2
+
+
+async def test_a_held_claim_re_send_transport_failure_counts_down(tick) -> None:
+    primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
+    ex, rec, fees = await _with_second_opinion(primary, second, SeenStore(), resend_ticks=1)
+    primary.reject = (-26, _SCRIPT_FAILED)
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+
+    primary.fail = NetworkError("connection reset")
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "re-send failed (transient)" in said, said
+    assert ex._held == {}, "the last re-send ends the hold even when it fails"
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "10"])
+def test_the_re_send_count_must_be_a_positive_int(bad) -> None:
+    from pyrxd.gravity.swap_coordinator import MarginPolicy
+    from pyrxd.gravity.watch import ClaimExecutor
+
+    with pytest.raises(ValidationError, match="second_opinion_resend_ticks"):
+        ClaimExecutor(
+            resolve_leg=None,
+            claim_status_source=None,
+            claim_bytes_source=None,
+            policy=MarginPolicy.estimated(),
+            network="bcrt",
+            second_opinion_resend_ticks=bad,
+        )
 
 
 async def test_a_claim_every_operator_refuses_is_still_retried_and_never_disarmed(tick) -> None:

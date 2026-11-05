@@ -267,10 +267,16 @@ class SecondOpinionTxid(str):
     caller that stops retrying on success: the one client that answered may be lying (a reply equal
     to the txid, and an "already have" with the bytes served back, cost a liar nothing, since it was
     just handed the bytes), so its answer alone must not end the retries. :class:`ClaimExecutor
-    <pyrxd.gravity.watch.claim_executor.ClaimExecutor>` does not mark the claim seen on one.
+    <pyrxd.gravity.watch.claim_executor.ClaimExecutor>` does not mark the claim seen on one; it
+    re-sends :attr:`raw`, the exact bytes that client took, on later ticks instead of rebuilding.
     """
 
-    __slots__ = ()
+    raw: bytes
+
+    def __new__(cls, txid: str, raw: bytes) -> SecondOpinionTxid:
+        self = super().__new__(cls, txid)
+        self.raw = bytes(raw)
+        return self
 
 
 def _checked_second_opinion(client: Any, second_opinion: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -456,7 +462,7 @@ class RadiantChainIO:
                 rejection.reason or rejection,
                 label,
             )
-            return SecondOpinionTxid(expected)
+            return SecondOpinionTxid(expected, raw)
         return None
 
     @staticmethod

@@ -16,8 +16,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `make_radiant_claim_leg` and `sidecar_leg_resolver` take `second_opinion` and give the claim leg
   its own chain IO (`RadiantChainIO.with_second_opinion`), so a chain IO shared with attended
   callers keeps taking the first rejection as final. A claim only a second-opinion client took
-  comes back as a `SecondOpinionTxid` and is not marked seen, so it is retried until the covenant
-  is spent: one lying server cannot disarm it. Off by default.
+  comes back as a `SecondOpinionTxid` and is not marked seen, so one lying server cannot disarm
+  it. `ClaimExecutor` re-sends those exact bytes (first endpoint first) for
+  `second_opinion_resend_ticks` ticks (default 10) without a new fee input, then rebuilds. Off by
+  default.
 
 ## [0.27.1] — 2026-11-03
 
