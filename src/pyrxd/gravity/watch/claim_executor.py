@@ -183,8 +183,11 @@ def make_radiant_claim_leg(
     dependency until autonomy is actually armed.
 
     ``second_opinion`` (#937; default empty: off) are broadcast clients, one per operator, that the
-    claim's broadcast asks when the first endpoint rejects it, so one lagging, stricter or lying
-    server cannot hold the claim back alone while the maker's refund timelock runs. The leg gets its
+    claim's broadcast asks when the first endpoint rejects it, so a refusal from one lagging,
+    stricter or lying server does not hold the claim back while another operator would relay it and
+    the maker's refund timelock runs. A claim only a second-opinion client took is never marked seen
+    (:class:`~pyrxd.gravity.radiant_leg.SecondOpinionTxid`), so a lying second opinion cannot
+    disarm it either: the claim is retried until it is spent. The leg gets its
     own chain IO (:meth:`~pyrxd.gravity.radiant_leg.RadiantChainIO.with_second_opinion`); the shared
     ``chain_io`` is unchanged, so attended broadcasts through it still take the first rejection as
     final. For a client over pyrxd's shipped mainnet endpoints, pass its ``per_source_clients()``."""
@@ -624,7 +627,20 @@ class ClaimExecutor:
             return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
         # Mark the covenant outpoint seen ONLY AFTER a successful broadcast (fire-once; see step 7) — so a
         # transient failure above still retries, and a crash here costs at most ONE re-carve, not per-tick.
-        if self._seen is not None:
+        # Not when only a second-opinion client took it (#937): the broadcast client refused it, and the
+        # one client that answered may be lying, so its word alone must not end the retries. The next
+        # tick rebuilds on a new fee input, bounded by the capped, dispense-once pool, as above; once the
+        # claim is spent, the covenant read ends it.
+        from pyrxd.gravity.radiant_leg import SecondOpinionTxid
+
+        if isinstance(txid, SecondOpinionTxid):
+            logger.warning(
+                "autonomous claim swap %s: claim %s was taken only by a second-opinion server after the "
+                "first endpoint refused it; not marked seen, so it is retried until the covenant is spent",
+                swap_id,
+                txid,
+            )
+        elif self._seen is not None:
             await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
         logger.warning(
             "autonomous claim swap %s: covenant claim broadcast txid=%s value=%d (asset → taker holder)",

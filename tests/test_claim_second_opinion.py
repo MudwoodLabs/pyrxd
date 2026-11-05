@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from pyrxd.gravity.radiant_leg import RadiantChainIO, SeenStore
+from pyrxd.gravity.radiant_leg import RadiantChainIO, SecondOpinionTxid, SeenStore
 from pyrxd.gravity.watch import ExecOutcome
 from pyrxd.gravity.watch.claim_executor import CovenantClaimContext, make_radiant_claim_leg, sidecar_leg_resolver
 from pyrxd.network.electrumx import ElectrumXClient
@@ -85,6 +85,7 @@ async def test_a_second_operator_that_takes_a_rejected_transaction_makes_the_bro
     raw = os.urandom(80)
     txid = await RadiantChainIO(primary).with_second_opinion((second,)).broadcast(raw)
     assert txid == _txid(raw)
+    assert isinstance(txid, SecondOpinionTxid), "the caller can tell only a second opinion took it"
     assert primary.broadcasts == [raw] and second.broadcasts == [raw], "the same bytes, once each"
     assert set(second.mempool) == {_txid(raw)}
 
@@ -105,7 +106,8 @@ async def test_an_accepted_broadcast_never_asks_the_second_operator() -> None:
     primary, second = _primary(), _second()
     primary.reject = None
     raw = os.urandom(80)
-    assert await RadiantChainIO(primary).with_second_opinion((second,)).broadcast(raw) == _txid(raw)
+    txid = await RadiantChainIO(primary).with_second_opinion((second,)).broadcast(raw)
+    assert txid == _txid(raw) and type(txid) is str
     assert second.broadcasts == []
 
 
@@ -174,6 +176,24 @@ async def test_already_have_counts_only_when_the_bytes_are_served_back() -> None
 
     second.serves = True
     assert await io.broadcast(raw) == _txid(raw)
+
+
+async def test_a_custom_client_that_serves_other_bytes_back_is_not_believed() -> None:
+    """The read-back compares bytes itself; a custom client need not hash-check what it serves."""
+    raw = os.urandom(80)
+
+    class _Claims:
+        source_key = source_key("wss://electrum.beta.example/")
+
+        async def broadcast(self, raw_tx: bytes) -> str:
+            raise PolicyRejection("already", code=-27, reason="txn-already-known")
+
+        async def get_transaction(self, txid: str) -> bytes:
+            return os.urandom(80)
+
+    with pytest.raises(PolicyRejection) as info:
+        await RadiantChainIO(_primary()).with_second_opinion((_Claims(),)).broadcast(raw)
+    assert info.value.reason == _REJECTED
 
 
 async def test_a_tls_pin_mismatch_on_a_second_operator_is_raised() -> None:
@@ -308,9 +328,41 @@ async def test_a_claim_one_endpoint_refuses_lands_through_a_second_operator(tick
     assert len(primary.broadcasts) == 1 and second.broadcasts == primary.broadcasts
     assert "first endpoint rejected" in said and "beta.example took it" in said
     assert len(fees.outpoints) == 1
+    assert "not marked seen" in said
+
+    # Not marked seen, so the next tick rebuilds; the rebuild conflicts with the relayed claim on
+    # the second node and the first endpoint still refuses, so nothing more is sent anywhere.
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED, said
+    assert set(second.mempool) == {_txid(second.broadcasts[0])}
 
     second.mine()
+    primary.confirmed.update(second.confirmed)  # one chain: the block reaches the first endpoint too
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED and "already spent" in said, said
     assert _assert_paid_once(second, fees) == _txid(second.broadcasts[0])
+
+
+async def test_a_lying_second_opinion_cannot_disarm_the_claim(tick) -> None:
+    """The reviewer's case: the first endpoint refuses for a passing reason, and a second-opinion
+    server answers with the right txid but keeps nothing. Marking that seen would stop every later
+    tick and leave the asset to the maker's refund."""
+    primary, liar = _OpNode("wss://electrum.alpha.example/"), _second()
+    liar.relay = False
+    seen = SeenStore()
+    ex, rec, fees = await _with_second_opinion(primary, liar, seen)
+    primary.reject = (-26, "txn-mempool-conflict (code 18)")
+
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    assert liar.mempool == {} and primary.mempool == {}
+
+    primary.reject = None
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    assert len(fees.outpoints) == 2 and liar.broadcasts == liar.broadcasts[:1], "the primary took it"
+    primary.mine()
+    assert _assert_paid_once(primary, fees) == _txid(primary.broadcasts[-1])
 
 
 async def test_a_claim_every_operator_refuses_is_still_retried_and_never_disarmed(tick) -> None:

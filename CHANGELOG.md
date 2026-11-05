@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The autonomous claim can ask a second operator before it takes a node rejection as final
+  (#937).** `RadiantChainIO` takes an opt-in `second_opinion`: broadcast clients, one per operator,
+  each run by an operator other than the broadcast client's. After a node rejection each is asked
+  in turn, and the first that takes the same bytes (its reply checked against the txid hashed from
+  them) makes the broadcast a success; otherwise the first rejection is raised, as before.
+  `make_radiant_claim_leg` and `sidecar_leg_resolver` take `second_opinion` and give the claim leg
+  its own chain IO (`RadiantChainIO.with_second_opinion`), so a chain IO shared with attended
+  callers keeps taking the first rejection as final. A claim only a second-opinion client took
+  comes back as a `SecondOpinionTxid` and is not marked seen, so it is retried until the covenant
+  is spent: one lying server cannot disarm it. Off by default.
+
 ## [0.27.1] — 2026-11-03
 
 A checkpoint-only release. Upgrade to keep verifying new HashMarks.

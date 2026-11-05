@@ -262,6 +262,9 @@ _EXEMPT = {
     ("gravity/trade.py", "GravityTrade._broadcast_radiant"): "injected Radiant client",
     ("gravity/radiant_leg.py", "RadiantChainIO.broadcast"): "injected Radiant client",
     ("gravity/radiant_leg.py", "RadiantCovenantLeg._broadcast"): "injected Radiant client (via RadiantChainIO)",
+    # Opt-in second-opinion clients (#937): the reply is compared with the local txid inline, and a
+    # pyrxd ElectrumX client checks it first through the funnel.
+    ("gravity/radiant_leg.py", "RadiantChainIO._ask_second_opinion"): "injected Radiant clients, inline echo compare",
     # GlyphMinter compares the echo inline with its own post-broadcast policy (a commit record is
     # filed under both keys; a reveal waits on the local txid). With a pyrxd client the funnel
     # raises first.

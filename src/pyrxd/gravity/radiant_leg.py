@@ -107,6 +107,7 @@ __all__ = [
     "FeeUtxoSource",
     "RadiantBroadcaster",
     "RadiantChainIO",
+    "SecondOpinionTxid",
     "RadiantCovenantLeg",
     "RxinDexerRefAdapter",
     "SeenStore",
@@ -258,6 +259,20 @@ def _split_outpoint(outpoint: object) -> tuple[str, int]:
     return txid, int(vout)
 
 
+class SecondOpinionTxid(str):
+    """A txid :meth:`RadiantChainIO.broadcast` returns when ONLY a second-opinion client took the
+    transaction, after the broadcast client rejected it (#937).
+
+    It is a ``str`` like any other txid, so callers need not change. The difference matters to a
+    caller that stops retrying on success: the one client that answered may be lying (a reply equal
+    to the txid, and an "already have" with the bytes served back, cost a liar nothing, since it was
+    just handed the bytes), so its answer alone must not end the retries. :class:`ClaimExecutor
+    <pyrxd.gravity.watch.claim_executor.ClaimExecutor>` does not mark the claim seen on one.
+    """
+
+    __slots__ = ()
+
+
 def _checked_second_opinion(client: Any, second_opinion: tuple[Any, ...]) -> tuple[Any, ...]:
     """*second_opinion* as a tuple, refused unless every client can broadcast and read a transaction
     back, says which operator runs it, and is run by an operator no other entry (nor ``client``, when
@@ -312,7 +327,8 @@ class RadiantChainIO:
     endpoint's verdict is the only verdict, so a lagging, stricter or lying server refuses a
     transaction alone. With them a rejection is raised only after every second-opinion client has
     also failed to take the transaction; the first one that takes it (its reply checked against the
-    txid hashed from the bytes sent) makes the broadcast a success. Only the autonomous claim leg
+    txid hashed from the bytes sent) makes the broadcast a success, returned as a
+    :class:`SecondOpinionTxid` because that one client's word is all there is. Only the autonomous claim leg
     turns this on (:func:`pyrxd.gravity.watch.claim_executor.make_radiant_claim_leg`); see
     :meth:`with_second_opinion` for the rules on which clients qualify.
     """
@@ -398,11 +414,15 @@ class RadiantChainIO:
 
         Asked one at a time, in order, stopping at the first that takes it. A client "takes" the
         transaction when its reply names the txid hashed from *raw* (never the reply as such), or when
-        it says it already has the transaction AND serves the same bytes back on a read; an
-        uncorroborated "already have" is a claim any server can make for free (the rule
-        :meth:`pyrxd.network.failover.FailoverElectrumXClient.broadcast` keeps, audit B6). A rejection,
-        a transport failure or a wrong echo moves on to the next client. A TLS pin mismatch raises:
-        a substituted server is never routed around silently.
+        it says it already has the transaction AND serves the same bytes back on a read (the rule
+        :meth:`pyrxd.network.failover.FailoverElectrumXClient.broadcast` keeps, audit B6). Neither
+        check proves anything against a liar, which was just handed the bytes; they catch a confused
+        or broken server. That is why the txid comes back as a :class:`SecondOpinionTxid`. A
+        rejection, a transport failure or a wrong echo moves on to the next client. A TLS pin mismatch
+        raises and ends the round: a substituted server is never routed around silently.
+
+        There is no overall time budget: each client is asked under its own timeouts, one after
+        another, so the worst case grows with the number of clients.
         """
         expected = str(Txid(hash256(raw)[::-1].hex()))
         for client in self._second_opinion:
@@ -436,7 +456,7 @@ class RadiantChainIO:
                 rejection.reason or rejection,
                 label,
             )
-            return expected
+            return SecondOpinionTxid(expected)
         return None
 
     @staticmethod
