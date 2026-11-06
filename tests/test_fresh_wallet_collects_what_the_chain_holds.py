@@ -508,7 +508,11 @@ class TestEverySpendPathCrossesTheScan:
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "collect_spendable":
                     defs.append(path.relative_to(_SRC).as_posix())
-        assert defs == ["hd/wallet.py"]
+        # `pyrxd.testing.RegtestWallet` is the one other implementation, looked at when it was
+        # added: it holds ONE key on a regtest node and reads that address's whole confirmed UTXO
+        # set with `scantxoutset`, so there is no address scan for it to skip. It never sees a
+        # mainnet address (it encodes with the testnet prefix regtest uses).
+        assert defs == ["hd/wallet.py", "testing/regtest.py"]
 
     def test_only_the_named_callers_accept_a_partial_view(self) -> None:
         """``collect_spendable`` is strict by default, so a caller that turns "nothing found"

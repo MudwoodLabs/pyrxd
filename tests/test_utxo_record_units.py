@@ -57,6 +57,8 @@ _REGISTERED_PRODUCERS: frozenset[tuple[str, str]] = frozenset(
         ("src/pyrxd/network/electrumx.py", "ElectrumXClient.get_utxos"),
         # tested by test_sshtr_shim_reports_the_block_height_not_the_confirmation_count
         ("scripts/radiant_mainnet_chainio.py", "SshTrRadiantClient.get_utxos"),
+        # tested by test_regtest_wallet_reports_the_block_height_not_the_confirmation_count
+        ("src/pyrxd/testing/regtest.py", "RegtestWallet.utxos"),
     }
 )
 
@@ -222,6 +224,36 @@ async def test_electrumx_client_reports_the_servers_block_height_unchanged() -> 
         confirmed, unconfirmed = await client.get_utxos("ab" * 32)
     assert confirmed.height == _FUND_HEIGHT
     assert unconfirmed.height == 0
+
+
+def test_regtest_wallet_reports_the_block_height_not_the_confirmation_count() -> None:
+    """``pyrxd.testing.RegtestWallet.utxos`` reads ``scantxoutset``, whose ``height`` is the
+    block the output confirmed in. The scripted node also answers ``getblockcount`` and
+    ``gettxout`` (which carries ``confirmations``), so a regression to tip arithmetic fails on
+    the unit assertion rather than on a missing reply."""
+    from pyrxd.constants import Network
+    from pyrxd.keys import PrivateKey
+    from pyrxd.testing import RegtestWallet
+
+    replies: dict[str, object] = {
+        "scantxoutset": {
+            "success": True,
+            "unspents": [{"txid": "ee" * 32, "vout": 3, "amount": 0.001, "height": _FUND_HEIGHT}],
+        },
+        "getblockcount": _TIP,
+        "gettxout": {"confirmations": _TIP - _FUND_HEIGHT + 1},
+    }
+
+    class _Node:
+        def cli(self, *args: str, wallet: bool = False) -> object:
+            return replies[args[0]]
+
+    wallet = RegtestWallet(_Node(), PrivateKey(network=Network.TESTNET))  # type: ignore[arg-type]
+    (record,) = wallet.utxos()
+    assert record.height == _FUND_HEIGHT, (
+        f"UtxoRecord.height must be the block height ({_FUND_HEIGHT}), got {record.height}"
+    )
+    assert (record.tx_hash, record.tx_pos, record.value) == ("ee" * 32, 3, 100_000)
 
 
 # ---------------------------------------------------------------------------------------

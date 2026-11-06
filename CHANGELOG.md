@@ -8,6 +8,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd new NAME`: a starter project with a Glyph mint and a test on a local regtest chain.**
+  It writes `pyproject.toml` (depending on the generating pyrxd's minor series),
+  `src/<package>/mint.py`, `tests/test_mint.py`, a GitHub Actions workflow and a README, and
+  refuses names that would shadow `pyrxd`, the tests directory or a standard-library module, and
+  directories that are not empty. `pyrxd.starter.render_project` returns the same files as text,
+  with `overrides` for a caller's own code, so the template can be produced without the CLI.
+- **`pyrxd.testing`: public helpers and opt-in pytest fixtures for testing against a real
+  regtest node** (`pytest_plugins = ["pyrxd.testing.pytest_plugin"]`). `regtest_node` starts a
+  fresh node per session in its own `pyrxd-test-<random>` container and refuses one that does not
+  enforce mainnet's relay floor; `regtest_wallet` is a pyrxd-generated key funded from the node's
+  faucet, found through `scantxoutset`, that the node's own wallet cannot spend; `regtest_client`
+  mines a block after each broadcast. Missing docker or a missing image fails the test with the
+  fix rather than skipping it.
+- `RegtestNode(container=...)` names a node other than the CLI's `pyrxd-devnet`. The name is
+  checked against docker's container-name rule.
+- **The autonomous claim can ask a second operator before it takes a node rejection as final
+  (#937).** `RadiantChainIO` takes an opt-in `second_opinion`: broadcast clients, one per operator,
+  no two run by the same operator, and, when the broadcast client names its operator (one
+  `source_key`), none run by that operator or on its host. After a node rejection all are asked at
+  once, within `second_opinion_timeout_s` (default 10 s), and the first that takes the same bytes
+  (its reply checked against the txid hashed from them) makes the broadcast a success; otherwise
+  the first rejection is raised, as before.
+  `make_radiant_claim_leg` and `sidecar_leg_resolver` take `second_opinion` and give the claim leg
+  its own chain IO (`RadiantChainIO.with_second_opinion`), so a chain IO shared with attended
+  callers keeps taking the first rejection as final. A claim only a second-opinion client took
+  comes back as a `SecondOpinionTxid` and is not marked seen, so one lying server cannot disarm
+  it. `ClaimExecutor` re-sends those exact bytes (first endpoint first) for
+  `second_opinion_resend_ticks` ticks (default 10) without a new fee input, then rebuilds. A
+  re-send ends the hold at once when the first endpoint refuses it and no second opinion takes it
+  in time (any of their failures, apart from a pin mismatch on a broadcast that arrives in time,
+  counts as not taking it). It spends one tick instead when the first endpoint fails in transport
+  or that pin mismatch is raised. A
+  rebuild every server refuses still dispenses a fee input per tick until the claim is mined or the
+  capped pool runs out, the per-tick cost a refused claim already had. Off by default.
+
 - **Radiant Playground, a docs page for learning pyrxd in the browser.** `playground/` on the docs
   site runs pyrxd under Pyodide against a sandbox chain that lives in the tab: six lessons (make a
   wallet, send RXD, mint a Glyph NFT, send it, deploy and send an FT, try to copy an NFT), each with

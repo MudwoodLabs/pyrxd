@@ -176,7 +176,8 @@ jobs:
             tests/test_fresh_wallet_spends_regtest_e2e.py \
             tests/test_glyph_timelock_regtest_e2e.py \
             tests/test_dat_and_burn_regtest_e2e.py \
-            tests/test_delegate_regtest_e2e.py
+            tests/test_delegate_regtest_e2e.py \
+            tests/test_starter_kit_regtest_e2e.py
 
   # ---------------------------------------------------------------- nightly
   nightly-rswp:

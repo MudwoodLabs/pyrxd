@@ -67,6 +67,13 @@ _OUT_OF_SCOPE_MODULES = {
     # module, so the day this file grows a second definition that test fails and this
     # entry stops being true out loud.
     "network/_guards": "pure re-export of security/json_guards, which is mutated in the network group",
+    # `pyrxd.testing` and `pyrxd.starter` are developer tooling in the same sense as `devnet`:
+    # they drive a throwaway regtest node or write a template project, and no value path
+    # imports them. Their behaviour is pinned by tests/test_pyrxd_testing.py,
+    # tests/test_starter_template.py and the real-node tests/test_starter_kit_regtest_e2e.py.
+    "testing/regtest": "regtest-only test helper (docker node, faucet-funded key), never on a value path",
+    "testing/pytest_plugin": "pytest fixtures wrapping testing/regtest, never on a value path",
+    "starter/_template": "text of the `pyrxd new` template project, no logic",
 }
 
 #: The cli/ modules that are mutated ANYWAY, because they print verdicts or enforce a rule rather
