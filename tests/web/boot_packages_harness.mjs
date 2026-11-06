@@ -59,6 +59,8 @@ import vm from "node:vm";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STATIC = resolve(HERE, "../../docs/inspect_static");
 const INSPECT_DIR = resolve(STATIC, "inspect");
+// The /playground/ page also fetches its own Python, SHA-checked against the same manifest.
+const PLAYGROUND_DIR = resolve(STATIC, "playground");
 
 const args = process.argv.slice(2);
 const sharedPath = args.includes("--shared") ? resolve(args[args.indexOf("--shared") + 1]) : resolve(INSPECT_DIR, "shared.js");
@@ -79,6 +81,9 @@ const manifest = {
   glue_sha256: sha256(await readFile(resolve(INSPECT_DIR, "glue.py"))),
   curve_sha256: sha256(await readFile(resolve(INSPECT_DIR, "vendor/noble-secp256k1.js"))),
   curve_bridge_sha256: sha256(await readFile(resolve(INSPECT_DIR, "secp256k1-bridge.js"))),
+  playground_sha256: sha256(await readFile(resolve(PLAYGROUND_DIR, "playground.py"))),
+  playground_curve_sha256: sha256(await readFile(resolve(PLAYGROUND_DIR, "sandbox_curve.py"))),
+  playground_lessons_sha256: sha256(await readFile(resolve(PLAYGROUND_DIR, "lessons.py"))),
   git_sha: "0000000",
   git_sha_full: "0".repeat(40),
 };
@@ -107,7 +112,10 @@ async function bytesFor(url) {
   if (u.pathname === `/inspect/wheels/${WHEEL}`) return placeholder(WHEEL);
   if (u.pathname === `/inspect/wheels/${CBOR2}`) return placeholder(CBOR2);
   const path = resolve(STATIC, "." + u.pathname);
-  if (!path.startsWith(INSPECT_DIR + "/")) throw new Error(`the boot fetched ${u.pathname}, outside /inspect/`);
+  const playgroundPython = path.startsWith(PLAYGROUND_DIR + "/") && path.endsWith(".py");
+  if (!path.startsWith(INSPECT_DIR + "/") && !playgroundPython) {
+    throw new Error(`the boot fetched ${u.pathname}, outside /inspect/ and /playground/*.py`);
+  }
   return readFile(path);
 }
 

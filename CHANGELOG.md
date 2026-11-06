@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Radiant Playground, a docs page for learning pyrxd in the browser.** `playground/` on the docs
+  site runs pyrxd under Pyodide against a sandbox chain that lives in the tab: six lessons (make a
+  wallet, send RXD, mint a Glyph NFT, send it, deploy and send an FT, try to copy an NFT), each with
+  an edit that breaks it on purpose, plus a scratch page. The sandbox checks parsing, values, the
+  relay fee floor, P2PKH, NFT and FT signatures, commit reveals, ref rules and FT conservation; it
+  does not run Radiant's script interpreter, and says so on the page. Keys come from a pure-Python
+  secp256k1 written for the page (it is not constant-time and holds only throwaway keys), checked
+  against coincurve in the tests. Nothing in the library changes. Export as a project is a stub
+  for now.
+
 ### Changed (breaking)
 
 - **Headers above a checkpoint must carry the difficulty Radiant requires.** `pyrxd verify`, the

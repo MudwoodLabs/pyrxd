@@ -126,6 +126,11 @@ jobs:
           # silently turning signature checking off for every visitor.
           curve_sha=$(sha256sum ../vendor/noble-secp256k1.js | awk '{print $1}')
           curve_bridge_sha=$(sha256sum ../secp256k1-bridge.js | awk '{print $1}')
+          # The playground's own Python (docs/inspect_static/playground/), fetched and
+          # SHA-checked by playground.js before it runs, the same as glue.py.
+          pg_sha=$(sha256sum ../../playground/playground.py | awk '{print $1}')
+          pg_curve_sha=$(sha256sum ../../playground/sandbox_curve.py | awk '{print $1}')
+          pg_lessons_sha=$(sha256sum ../../playground/lessons.py | awk '{print $1}')
           git_sha="${GITHUB_SHA:-unknown}"
           export WHEEL="$wheel"
           export WHEEL_SHA="$wheel_sha"
@@ -134,6 +139,9 @@ jobs:
           export CURVE_SHA="$curve_sha"
           export CURVE_BRIDGE_SHA="$curve_bridge_sha"
           export GIT_SHA="$git_sha"
+          export PG_SHA="$pg_sha"
+          export PG_CURVE_SHA="$pg_curve_sha"
+          export PG_LESSONS_SHA="$pg_lessons_sha"
           script=$(mktemp)
           cat > "$script" <<'PY'
           import json, os
@@ -145,6 +153,9 @@ jobs:
               "glue_sha256": os.environ["GLUE_SHA"],
               "curve_sha256": os.environ["CURVE_SHA"],
               "curve_bridge_sha256": os.environ["CURVE_BRIDGE_SHA"],
+              "playground_sha256": os.environ["PG_SHA"],
+              "playground_curve_sha256": os.environ["PG_CURVE_SHA"],
+              "playground_lessons_sha256": os.environ["PG_LESSONS_SHA"],
               "git_sha": os.environ["GIT_SHA"][:7],
               "git_sha_full": os.environ["GIT_SHA"],
           }

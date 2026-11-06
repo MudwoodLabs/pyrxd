@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <!-- Content-Security-Policy — /inspect/'s, NARROWED.
+       default-src 'none'        — deny everything not whitelisted below
+       script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net
+                                — Pyodide from jsdelivr with SRI; runs WASM. 'unsafe-eval'
+                                  for the reason /inspect/'s CSP gives. No blob: — this
+                                  page installs no JavaScript curve (it signs with
+                                  playground/sandbox_curve.py inside Python).
+       style-src 'self'          — only our own CSS
+       connect-src 'self' https://cdn.jsdelivr.net
+                                — page-relative (the wheels, manifest and Python files,
+                                  every one SHA-256 checked) and the Pyodide CDN. NO
+                                  node and NO ElectrumX: the sandbox chain lives in this
+                                  tab, and nothing built here can be sent anywhere.
+       img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none';
+       object-src 'none'.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'none';
+    script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net;
+    style-src 'self';
+    connect-src 'self' https://cdn.jsdelivr.net;
+    img-src 'self' data:;
+    font-src 'self';
+    base-uri 'none';
+    form-action 'none';
+    object-src 'none';
+  " />
+  <title>Radiant Playground</title>
+  <meta name="description" content="Learn to build on Radiant with pyrxd, in your browser: make a wallet, send RXD, mint and send Glyph tokens on a sandbox chain that lives in this tab." />
+  <link rel="stylesheet" href="playground.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="banner" role="note">
+      <b>Sandbox chain.</b> Everything here happens inside this browser tab. The keys are throwaway,
+      the coins have no value, and nothing can be sent to a real network.
+      <a href="#about-sandbox">What the sandbox checks</a>
+    </div>
+
+    <header class="top">
+      <div class="brand">
+        <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><circle cx="17" cy="17" r="6" class="sun"/><g class="rays" stroke-width="2" stroke-linecap="round"><path d="M17 3v5M17 26v5M3 17h5M26 17h5M7 7l3.5 3.5M23.5 23.5L27 27M27 7l-3.5 3.5M10.5 23.5L7 27"/></g></svg>
+        <div><h1>Radiant Playground</h1><small>Learn to build on Radiant with pyrxd, in your browser</small></div>
+      </div>
+      <div class="net" aria-live="polite">
+        <span class="pill safe"><span class="dot"></span>Sandbox · no real value</span>
+        <span class="pill">Block <b id="height">0</b></span>
+        <span class="pill">You <b id="bal">0 RXD</b></span>
+        <span class="pill" id="runtime-pill">loading…</span>
+      </div>
+    </header>
+
+    <section id="loading" class="loading" aria-live="polite">
+      <p>Loading Python and pyrxd (about 12 MB the first time, cached after that)…</p>
+      <progress id="load-progress" max="100" value="0"></progress>
+    </section>
+    <section id="error-content" class="loading" hidden>
+      <p id="error-block" class="load-error" role="alert"></p>
+    </section>
+
+    <div class="bench" id="ready-content" hidden>
+      <nav class="rail" aria-label="Lessons">
+        <h2>Lessons</h2>
+        <div id="lessons"></div>
+        <h2>Your own code</h2>
+        <div id="scratch-slot"></div>
+        <div class="next">Ready for your own machine?<br><code>pip install pyrxd</code><br><code>pyrxd regtest up</code></div>
+      </nav>
+
+      <main class="desk">
+        <section class="brief" id="brief"></section>
+        <section class="editor" aria-label="Code editor">
+          <div class="ed-bar">
+            <span class="file" id="fname"></span>
+            <span class="runtime">Python · Pyodide · your edits are kept in this browser</span>
+            <span class="sp"></span>
+            <button class="btn" id="export" type="button">Export as project</button>
+            <button class="btn" id="reset-code" type="button">Reset code</button>
+            <button class="btn run" id="run" type="button"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z" fill="currentColor"/></svg><span>Run</span></button>
+          </div>
+          <div class="code-area">
+            <div class="gutter" id="gutter" aria-hidden="true"></div>
+            <div class="code-stack">
+              <pre class="hl" id="hl" aria-hidden="true"></pre>
+              <textarea id="code" spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off" aria-label="Python code" wrap="off"></textarea>
+            </div>
+          </div>
+        </section>
+        <div class="export-note" id="export-note" hidden role="status"></div>
+        <div class="try" id="try"></div>
+      </main>
+
+      <aside class="instr" aria-label="Results">
+        <div class="tabs" role="tablist">
+          <button class="tab" role="tab" aria-selected="true" aria-controls="p-console" data-tab="console" id="t-console">Console</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="p-tx" data-tab="tx" id="t-tx">Transaction</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="p-chain" data-tab="chain" id="t-chain">Chain &amp; wallet</button>
+        </div>
+        <div class="pane" id="p-console" role="tabpanel" aria-labelledby="t-console">
+          <pre class="console" id="console" aria-live="polite"></pre>
+        </div>
+        <div class="pane" id="p-tx" role="tabpanel" aria-labelledby="t-tx" hidden></div>
+        <div class="pane" id="p-chain" role="tabpanel" aria-labelledby="t-chain" hidden></div>
+      </aside>
+    </div>
+
+    <section class="about" id="about-sandbox">
+      <h2>What the sandbox checks, and what it does not</h2>
+      <p>pyrxd builds and signs real Radiant transactions in this tab. A small Python "node" decides whether to accept each one, then mines a block. It checks:</p>
+      <ul id="rules-list"></ul>
+      <p><b>It does not run Radiant's script interpreter.</b> A script it does not recognise is accepted with a warning that its input was <i>not evaluated</i>. Timelocks are not enforced, and faucet coins can be spent at once. The real node is the authority on all of this: <code>pip install pyrxd</code>, then <code>pyrxd regtest up</code> gives you one on your own machine.</p>
+      <p>The keys are made by a pure-Python secp256k1 written for this page, because the C library pyrxd normally uses cannot run in a browser. It is checked against that library in pyrxd's tests, but it is not constant-time and must never hold a key that matters.</p>
+    </section>
+
+    <footer class="foot"><span id="build-version"></span> · <span id="runtime-info"></span> · <a href="../index.html">pyrxd docs</a> · <a href="../inspect/">inspect</a></footer>
+  </div>
+
+  <script
+    src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"
+    integrity="sha384-i3R37b3tF+HWudsUf1VSEOY2YxwSNMqY8DQa9Z0O3xh+NkJ9o+yjcGyIi5huj+nB"
+    crossorigin="anonymous"
+  ></script>
+  <!-- shared.js first, as a classic script, exactly as /inspect/ and /verify/ load it: the
+       one audited boot (SHA-checked wheel, manifest, Pyodide package set). -->
+  <script src="../inspect/shared.js"></script>
+  <script src="playground.js" type="module"></script>
+</body>
+</html>

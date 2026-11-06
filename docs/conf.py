@@ -76,8 +76,8 @@ html_static_path = ["_static"]
 # ``docs/inspect_static/`` must therefore live in a SUBFOLDER: a file at
 # the top level of that directory lands at the site root, and an
 # ``index.html`` there would overwrite the docs landing page. Today the
-# subfolders are ``inspect/`` and ``verify/``, reproduced at the site
-# root as ``/inspect/`` and ``/verify/``.
+# subfolders are ``inspect/``, ``verify/`` and ``playground/``, reproduced
+# at the site root as ``/inspect/``, ``/verify/`` and ``/playground/``.
 #
 # ``inspect/`` is the developer tool — paste anything, see every field.
 # ``verify/`` is the public HashMark check — one input, four questions,
@@ -87,6 +87,10 @@ html_static_path = ["_static"]
 # wheel into ``inspect_static/inspect/wheels/`` before ``sphinx-build``
 # runs, and ``verify/`` fetches it from there rather than having a second
 # copy staged for it. One artefact, SHA-256 pinned once.
+#
+# ``playground/`` teaches building on Radiant: lessons and a scratch editor that run
+# pyrxd against a sandbox chain living in the tab. It boots through the same wheel
+# and manifest, plus three Python files of its own the manifest also pins.
 html_extra_path = ["inspect_static"]
 html_theme_options = {
     "source_repository": "https://github.com/MudwoodLabs/pyrxd",
