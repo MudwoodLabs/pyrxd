@@ -687,10 +687,11 @@ class ClaimExecutor:
         rebuilds on a new fee input, so a lying second opinion (one that keeps nothing) delays a claim by
         at most that many ticks per rebuild, and the broadcast client sees a fresh claim each time. A
         round in which no client takes them ends the hold at once when the broadcast client refuses
-        them and every second opinion refuses, fails or has not answered when the chain IO's
-        ``second_opinion_timeout_s`` runs out (a server that timed out may still have relayed them).
-        When the broadcast client fails in transport instead, or a second opinion's TLS pin
-        mismatch is raised, the re-send only spends one tick. Every other outcome of a re-send, an
+        them and no second opinion has taken them when the chain IO's ``second_opinion_timeout_s``
+        runs out (a server that timed out may still have relayed them). A second opinion's refusal
+        or failure counts as not taking them, with one exception: a TLS pin mismatch on its
+        broadcast that arrives in time is raised (see ``RadiantChainIO._ask_second_opinion``), and
+        then, as when the broadcast client fails in transport, the re-send only spends one tick. Every other outcome of a re-send, an
         unexpected exception or a cancelled tick included, spends one of those ticks.
 
         What the hold does NOT remove: once it ends while the claim is still unmined and the broadcast
@@ -872,5 +873,5 @@ def _is_missing_utxo(exc: Exception) -> bool:
     """True ONLY if a NetworkError signals an ABSENT covenant UTXO (the SPK has no live UTXO = spent/
     settled or not-yet-funded), vs a transient read fault OR a fail-closed anomaly (a value mismatch, which
     must NOT read as benign settlement; several matches are selected, never raised). Matches the exact 'no
-    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:288), not the mismatch."""
+    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:646), not the mismatch."""
     return "no utxo found" in str(exc).lower()
