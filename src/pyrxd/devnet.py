@@ -18,6 +18,7 @@ present locally (see :data:`RegtestNode.IMAGE`).
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess  # nosec B404  # only ever runs a fixed `docker` argv (see call sites)
 import tempfile
@@ -152,6 +153,21 @@ class RegtestNode:
     RPC_PASSWORD = "pyrxd"  # nosec B105  # localhost-only regtest sandbox cred (docker exec), not a secret
     WALLET = "devnet"
     _RPC_READY_TIMEOUT_S = 30
+
+    def __init__(self, *, container: str | None = None) -> None:
+        """``container`` names a node other than the CLI's ``pyrxd-devnet``.
+
+        ``pyrxd.testing`` uses it so a test session gets its own throwaway chain and never
+        touches (or force-removes) the node a developer started with ``pyrxd regtest up``.
+        Omitted, every instance shares :attr:`CONTAINER`, which is what lets separate CLI
+        invocations reach the same node.
+        """
+        if container is not None:
+            # Docker's own rule for a container name. It is also what keeps the name a single,
+            # flag-free argv element in every `docker` call below.
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]+", container):
+                raise DevnetError(f"invalid container name {container!r}")
+            self.CONTAINER = container
 
     # ----------------------------------------------------------------- docker
 
