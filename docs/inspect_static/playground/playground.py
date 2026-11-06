@@ -689,7 +689,7 @@ class SandboxChain:
                     Check(
                         "ft",
                         "warn",
-                        f"{_ref_label(r)}: {outs[r]:,} units minted by a contract input the sandbox did NOT evaluate",
+                        f"{_ref_label(r)}: {outs[r]:,} units minted through an input script the sandbox did NOT evaluate",
                     )
                 )
         return checks

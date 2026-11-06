@@ -169,7 +169,9 @@ class TestSingletonEdges:
         assert [c.status for c in refs] == ["warn"] and "no output keeps it as a singleton" in refs[0].detail
 
     def test_a_normal_ref_cannot_be_promoted_back_to_a_singleton(self, pg, sb):
-        """Re-review: split an NFT into two normal pushes, then make each a singleton again = two NFTs."""
+        """Re-review: split an NFT into two normal pushes, then make each a singleton again = two NFTs.
+        Radiant's input singleton set is the inputs' outpoints plus their singleton refs (read from
+        tests/vendor/radiant_core/validation.h; not run on a node)."""
         from pyrxd.glyph.script import build_nft_locking_script
 
         result, nft = _mint_nft(sb)
