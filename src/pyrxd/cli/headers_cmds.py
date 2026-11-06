@@ -13,10 +13,12 @@ to ``lowest tip - 288``, where the lowest tip is the lowest any operator reporte
   Operators are counted as everywhere else in pyrxd (:attr:`pyrxd.network.registry.Endpoint.source`:
   a declared operator, a shipped one, or the registered domain), so two servers of one operator
   are one source;
-* link hash by hash to the header below it, meet its own proof-of-work target, and carry at least
-  the floor (:mod:`pyrxd.glyph.header_cache`).
+* link hash by hash to the header below it, carry exactly the difficulty Radiant's rule requires
+  on top of it (:mod:`pyrxd.spv.asert`, mainnet), meet its own proof-of-work target, and carry at
+  least the floor (:mod:`pyrxd.glyph.header_cache`).
 
-Fewer than two operators, any disagreement, a broken link or a failed proof-of-work refuses the
+Fewer than two operators, any disagreement, a broken link, a wrong difficulty or a failed
+proof-of-work refuses the
 sync and writes nothing. A header below the floor ends the sync there; a plain sync caches the
 agreed headers below it, a ``--reset`` only when they reach past the existing cache's top, and the
 reason is reported.
@@ -468,9 +470,10 @@ def headers_sync_cmd(ctx: CliContext, json_flag: bool, reset: bool) -> None:
     A header is cached only when every operator that answered (at least two different operators;
     two servers of one operator count once) served it byte for byte alike, it is at least 288
     blocks below the lowest tip they reported, it links hash by hash to the header below it back
-    to the newest checkpoint pyrxd ships, and it meets its own proof-of-work and the floor (never
-    below 1/16 of that checkpoint's work). A refusal (too few operators, a disagreement, a broken
-    link, a failed proof-of-work) writes nothing. A header below the floor STOPS the sync: a plain
+    to the newest checkpoint pyrxd ships, it carries the difficulty Radiant's rule requires, and it
+    meets its own proof-of-work and the floor (never below 1/16 of that checkpoint's work). A
+    refusal (too few operators, a disagreement, a broken link, a wrong difficulty, a failed
+    proof-of-work) writes nothing. A header below the floor STOPS the sync: a plain
     sync writes the headers below it, a --reset only when they reach past the existing cache's top,
     and the reason says what was kept and what gets past that header, computed from the cache on
     disk afterwards. Exit 2 when the servers' answers refuse the sync, 1 when the local cache cannot

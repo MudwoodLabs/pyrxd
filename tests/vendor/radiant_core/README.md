@@ -52,6 +52,7 @@ files**, not by trusting a Python transcription of them:
 | the per-script stack-memory and opcode-cost budgets | `MAX_SCRIPT_STACK_MEMORY_USAGE` / `MAX_SCRIPT_OPCODE_COST` in `consensus.h` |
 | the order refs are hashed into `hashOutputHashes` | `base_blob::Compare` and `operator<` in `uint256.h` |
 | `nMedianTimeSpan` and `GetMedianTimePast` (the swap taker gate's reference time) | `chain.h` |
+| the difficulty rule: ASERT's 12-hour half-life from block 410,000 and `CalculateASERT`'s cubic coefficients (`pyrxd.spv.asert`, `tests/test_asert_difficulty_rule.py`) | `pow.cpp` |
 
 A hand-maintained Python table of the same facts would reintroduce exactly the transcription step
 that produced the bugs.

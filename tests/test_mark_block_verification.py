@@ -342,12 +342,60 @@ def test_the_mined_forgery_is_real_proof_of_work_on_the_real_chain() -> None:
 
 
 def test_a_cheaply_mined_block_fails_the_floor() -> None:
-    """The attack the floor exists for. Everything else passes: inclusion, linkage, genuine PoW."""
-    v = _forged()
+    """The attack the floor exists for, with Radiant's difficulty rule off (as the swap taker gate
+    runs it). Everything else passes: inclusion, linkage, genuine PoW."""
+    v = _forged(difficulty_rule=False)
     assert v.state == NOT_VERIFIED
     assert _step(v, "merkle") == _step(v, "proof_of_work") == "passed"
+    assert _step(v, "difficulty") == "not run"
     assert _step(v, "floor") == "failed"
     assert "less work than the floor" in (v.reason or "")
+
+
+def test_a_cheaply_mined_block_breaks_radiants_difficulty_rule() -> None:
+    """The same forgery with the rule on (the default): its nBits is not the difficulty Radiant
+    requires on top of the real 460,580, so no Radiant node would accept it — CONTRADICTED, before
+    its proof-of-work or the floor is even looked at."""
+    v = _forged()
+    assert v.state == CONTRADICTED, v.reason
+    assert _step(v, "merkle") == "passed"
+    assert _step(v, "difficulty") == "failed"
+    assert _step(v, "proof_of_work") == _step(v, "floor") == "not run"
+    assert (v.reason or "").startswith(
+        "the header at 460581 states difficulty bits 0x1d7fffff, but Radiant's difficulty rule requires 0x1a00aa08"
+    )
+
+
+def test_the_real_chain_meets_radiants_difficulty_rule() -> None:
+    """The honest half: the real headers above the checkpoint carry exactly the required nBits, so
+    the rule passes and the claim says what it established."""
+    for m in MARKS.values():
+        v = m.run(m.cp(m.start), min_confirmations=1, target_confirmations=8)
+        assert v.state == VERIFIED, v.reason
+        assert _step(v, "difficulty") == "passed"
+        assert "carries exactly the difficulty Radiant's rule requires" in (v.claim or "")
+        assert "or that each difficulty is the one Radiant's rules require" not in (v.claim or "")
+
+
+def test_the_claim_does_not_say_each_when_some_headers_were_not_ruled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A walk that crosses block 410,000 from a caller's table (newest checkpoint below 409,999)
+    holds the headers below 410,000 to their own proof-of-work and the floor only. Simulated here by a rule that
+    covers only the upper headers: the result may verify by work, but the claim must not say that
+    EACH header carries the required difficulty."""
+    real = mark_block.required_nbits
+    for m in MARKS.values():
+        first_ruled_parent = m.start + 3
+
+        def partial(network: str, prev_height: int, prev_header: bytes, _from: int = first_ruled_parent) -> int | None:
+            return None if prev_height < _from else real(network, prev_height, prev_header)
+
+        monkeypatch.setattr(mark_block, "required_nbits", partial)
+        v = m.run(m.cp(m.start), min_confirmations=1, target_confirmations=8)
+        assert v.state == VERIFIED, v.reason
+        assert _step(v, "difficulty") == "not run"
+        assert "carries exactly the difficulty Radiant's rule requires" not in (v.claim or "")
+        assert "or that each difficulty is the one Radiant's rules require" in (v.claim or "")
+    monkeypatch.setattr(mark_block, "required_nbits", real)
 
 
 def test_the_same_forgery_unmined_is_contradicted() -> None:
@@ -598,13 +646,25 @@ def test_a_header_below_the_floor_past_the_required_depth_ends_the_run() -> None
     """The honest half of the pair above. A header with genuine proof-of-work but less work than
     the floor may be an honest difficulty drop, so past the required depth it ends the proved run
     below it — VERIFIED at nine, the steps describing the nine proved, the reason recorded."""
-    aimed = C.run(C.cp(C.start), headers=_mined_on_top(), min_confirmations=1, target_confirmations=10)
+    off = {"difficulty_rule": False}  # as the swap taker gate runs it; with the rule on, see below
+    aimed = C.run(C.cp(C.start), headers=_mined_on_top(), min_confirmations=1, target_confirmations=10, **off)
     assert aimed.state == VERIFIED and aimed.verified_depth == 9, aimed.reason
     assert _step(aimed, "floor") == _step(aimed, "proof_of_work") == "passed"
     assert (aimed.short_of_target or "").startswith("the header at 460581 carries less work than the floor")
-    required = C.run(C.cp(C.start), headers=_mined_on_top(), min_confirmations=10)
+    required = C.run(C.cp(C.start), headers=_mined_on_top(), min_confirmations=10, **off)
     assert required.state == NOT_VERIFIED and _step(required, "floor") == "failed"
     assert "the header at 460581 carries less work than the floor" in (required.reason or "")
+
+
+def test_a_header_breaking_the_difficulty_rule_past_the_required_depth_is_contradicted() -> None:
+    """A wrong nBits is a lie at any depth, as a failed proof-of-work is: no honest server serves a
+    header Radiant rejects, so past the required depth it does not merely end the run."""
+    for over in ({"min_confirmations": 1, "target_confirmations": 10}, {"min_confirmations": 10}):
+        v = C.run(C.cp(C.start), headers=_mined_on_top(), **over)
+        assert v.state == CONTRADICTED, v.reason
+        assert _step(v, "difficulty") == "failed"
+        assert (v.reason or "").startswith("the header at 460581 states difficulty bits")
+        assert v.short_of_target is None
 
 
 def test_a_header_served_short_past_the_required_depth_ends_the_run() -> None:
