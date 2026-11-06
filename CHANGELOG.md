@@ -21,7 +21,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   comes back as a `SecondOpinionTxid` and is not marked seen, so one lying server cannot disarm
   it. `ClaimExecutor` re-sends those exact bytes (first endpoint first) for
   `second_opinion_resend_ticks` ticks (default 10) without a new fee input, then rebuilds. A
-  re-send that no client takes (all refuse or fail, or the time runs out) ends the hold at once. A
+  re-send the first endpoint refuses and no second opinion takes (they refuse, fail or run out of
+  time) ends the hold at once; a transport failure or TLS pin mismatch spends one tick. A
   rebuild every server refuses still dispenses a fee input per tick until the claim is mined or the
   capped pool runs out, the per-tick cost a refused claim already had. Off by default.
 

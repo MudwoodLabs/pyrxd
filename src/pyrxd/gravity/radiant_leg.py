@@ -205,7 +205,8 @@ class RadiantBroadcaster(Protocol):
 DEPTH_SOURCE_TIMEOUT_S = 20.0
 
 #: How long :meth:`RadiantChainIO.broadcast` waits for its second-opinion clients after a node
-#: rejection (#937). They are asked at once, so this bounds the whole round, not each client; when
+#: rejection (#937). They are asked at once, so this bounds the whole round (for clients that honour
+#: cancellation), not each client; when
 #: it runs out the round ends as if none had taken the transaction. Without it a hanging client held
 #: the round for its own timeouts (30 s per request for an ``ElectrumXClient``), and the reconciler
 #: cancels a tick that outruns its budget (``tick_timeout_s``; ``pyrxd gravity watch`` defaults it
@@ -462,14 +463,18 @@ class RadiantChainIO:
         rejection, a wrong echo or any other failure of one client (a custom client's unexpected
         exception included) means that client did not take it.
 
-        A :class:`TlsPinMismatchError` from a client's broadcast is logged as an error and, when no
-        other client takes the transaction, raised in place of None. When another client does take
-        it, the round still succeeds. A pin mismatch on the "already have" read-back counts only as
+        A :class:`TlsPinMismatchError` from a client's broadcast that arrives before the round ends is
+        logged as an error and, when no other client takes the transaction, raised in place of None.
+        When another client takes it first, the round succeeds and the asks still open are cancelled:
+        a pin mismatch that had not arrived yet (an ``ElectrumXClient`` checks its pin while it
+        connects) is then never seen, and the success log names those operators as cancelled with
+        their outcome unknown. A pin mismatch on the "already have" read-back counts only as
         "did not take it", and a client that fails over internally on any ``NetworkError``
         (``SameSourceFailover``) may pass one over inside itself.
 
         The round runs under ``second_opinion_timeout_s``. When it runs out, the clients still asking
-        are cancelled and the round ends with None, as if none took the transaction. A cancelled
+        are cancelled and the round ends with None, as if none took the transaction. The bound holds
+        for clients that honour cancellation; the round waits for each cancelled ask to finish. A cancelled
         client may already have received the bytes and relayed them; the caller is told only that
         no client took them in time.
         """
@@ -507,10 +512,12 @@ class RadiantChainIO:
                 for ask in finished:
                     if ask.exception() is None and ask.result():
                         _LOG.warning(
-                            "broadcast: the first endpoint rejected tx %s (%s) and %s took it",
+                            "broadcast: the first endpoint rejected tx %s (%s) and %s took it; asks still "
+                            "open (cancelled, their outcome unknown): %s",
                             expected,
                             rejection.reason or rejection,
                             asks[ask],
+                            ", ".join(sorted(asks[a] for a in pending)) or "none",
                         )
                         return SecondOpinionTxid(expected, raw)
             if pending:

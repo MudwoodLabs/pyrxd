@@ -686,9 +686,11 @@ class ClaimExecutor:
         they are re-sent for ``second_opinion_resend_ticks`` ticks; then the hold ends and the next tick
         rebuilds on a new fee input, so a lying second opinion (one that keeps nothing) delays a claim by
         at most that many ticks per rebuild, and the broadcast client sees a fresh claim each time. A
-        round in which no client takes them ends the hold at once: the broadcast client refuses and
-        every second opinion refuses, fails or has not answered when the chain IO's
-        ``second_opinion_timeout_s`` runs out (a server that timed out may still have relayed them). Every other outcome of a re-send, an
+        round in which no client takes them ends the hold at once when the broadcast client refuses
+        them and every second opinion refuses, fails or has not answered when the chain IO's
+        ``second_opinion_timeout_s`` runs out (a server that timed out may still have relayed them).
+        When the broadcast client fails in transport instead, or a second opinion's TLS pin
+        mismatch is raised, the re-send only spends one tick. Every other outcome of a re-send, an
         unexpected exception or a cancelled tick included, spends one of those ticks.
 
         What the hold does NOT remove: once it ends while the claim is still unmined and the broadcast

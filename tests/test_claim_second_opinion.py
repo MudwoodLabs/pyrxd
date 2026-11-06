@@ -141,7 +141,7 @@ async def test_a_later_operator_is_asked_after_an_earlier_one_fails() -> None:
     assert set(third.mempool) == {_txid(raw)}
 
 
-async def test_the_first_operator_that_takes_it_ends_the_round() -> None:
+async def test_the_first_operator_that_takes_it_ends_the_round(caplog) -> None:
     """Every operator is asked at once; the first that takes it ends the round and the rest are
     cancelled, so a slower one never finishes its ask."""
     primary, quick, slow = (
@@ -152,8 +152,11 @@ async def test_the_first_operator_that_takes_it_ends_the_round() -> None:
     slow.delay = 5.0
     raw = os.urandom(80)
     io = RadiantChainIO(primary).with_second_opinion((slow, quick))
-    assert await asyncio.wait_for(io.broadcast(raw), 2.0) == _txid(raw)
+    with caplog.at_level(logging.WARNING):
+        assert await asyncio.wait_for(io.broadcast(raw), 2.0) == _txid(raw)
     assert set(quick.mempool) == {_txid(raw)} and slow.broadcasts == [], "the slow ask was cancelled"
+    said = " | ".join(r.getMessage() for r in caplog.records)
+    assert "beta.example took it" in said and "outcome unknown): gamma.example" in said, said
 
 
 async def test_a_second_operator_that_echoes_another_txid_is_not_believed() -> None:
@@ -720,3 +723,17 @@ def test_the_default_budget_and_with_second_opinion_keeps_it() -> None:
 def test_the_budget_must_be_a_finite_positive_number(bad) -> None:
     with pytest.raises(ValidationError, match="second_opinion_timeout_s"):
         RadiantChainIO(_primary(), second_opinion_timeout_s=bad)
+
+
+async def test_a_held_re_send_with_a_pin_mismatch_only_counts_down(tick) -> None:
+    primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
+    ex, rec, _fees = await _with_second_opinion(primary, second, SeenStore(), resend_ticks=3)
+    primary.reject = (-26, _SCRIPT_FAILED)
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    (outpoint,) = ex._held
+
+    second.fail = TlsPinMismatchError("pin mismatch")
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "re-send failed (transient)" in said, said
+    assert ex._held[outpoint][1] == 2, "one tick spent; the hold goes on"
