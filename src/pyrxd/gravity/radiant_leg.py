@@ -204,11 +204,13 @@ class RadiantBroadcaster(Protocol):
 #: it. The sources are asked concurrently, so this bounds the whole call, not each source in turn.
 DEPTH_SOURCE_TIMEOUT_S = 20.0
 
-#: The whole time :meth:`RadiantChainIO.broadcast` spends asking second-opinion clients after a node
-#: rejection (#937), across all of them: each ask gets what is left, and when it runs out the round
-#: ends as if none had taken the transaction. A hanging client would otherwise hold the round for its
-#: own timeouts, one client after another, and the reconciler cancels a tick that outruns its budget
-#: (``tick_timeout_s``, at least 30 s by default in ``pyrxd gravity watch``) mid-broadcast.
+#: How long :meth:`RadiantChainIO.broadcast` waits for its second-opinion clients after a node
+#: rejection (#937). They are asked at once, so this bounds the whole round, not each client; when
+#: it runs out the round ends as if none had taken the transaction. Without it a hanging client held
+#: the round for its own timeouts (30 s per request for an ``ElectrumXClient``), and the reconciler
+#: cancels a tick that outruns its budget (``tick_timeout_s``; ``pyrxd gravity watch`` defaults it
+#: to max(4 x poll interval, 30 s)) mid-broadcast. A tick that re-sends or builds several claims can
+#: spend this once per claim, so a ``tick_timeout_s`` set by hand should leave room for that.
 SECOND_OPINION_TIMEOUT_S = 10.0
 
 #: How many headers, ending at its own tip, :meth:`RadiantChainIO.depth_reports` asks each source for
@@ -346,10 +348,10 @@ class RadiantChainIO:
     ``second_opinion`` (default empty: off) are broadcast clients, one per operator, that
     :meth:`broadcast` asks when ``client`` answers with a node rejection (#937). Without them one
     endpoint's verdict is the only verdict, so a lagging, stricter or lying server refuses a
-    transaction alone. With them the rejection is raised once no second-opinion client has taken
-    the transaction: every one was asked, or ``second_opinion_timeout_s`` (default
-    :data:`SECOND_OPINION_TIMEOUT_S`, for the whole round) ran out first. A TLS pin mismatch raised
-    by one ends the round with that error. The first one that takes it (its reply checked against the
+    transaction alone. With them every second-opinion client is asked at once, and the rejection is
+    raised when none has taken the transaction: each answered without taking it, or
+    ``second_opinion_timeout_s`` (default :data:`SECOND_OPINION_TIMEOUT_S`) ran out first. A TLS pin
+    mismatch from one is raised instead when no other takes it. The first one that takes it (its reply checked against the
     txid hashed from the bytes sent) makes the broadcast a success, returned as a
     :class:`SecondOpinionTxid` because that one client's word is all there is. Only the autonomous claim leg
     turns this on (:func:`pyrxd.gravity.watch.claim_executor.make_radiant_claim_leg`); see
@@ -448,48 +450,83 @@ class RadiantChainIO:
     async def _ask_second_opinion(self, raw: bytes, rejection: PolicyRejection) -> str | None:
         """The txid of *raw* if a second-opinion client takes it after ``client`` rejected it, else None.
 
-        Asked one at a time, in order, stopping at the first that takes it. A client "takes" the
-        transaction when its reply names the txid hashed from *raw* (never the reply as such), or when
-        it says it already has the transaction AND serves the same bytes back on a read (the rule
+        Every client is asked AT ONCE, and the first that takes the transaction ends the round; the
+        others are then cancelled. Asked one after another, a client that hangs would spend the round's
+        budget before the next operator was asked, so any one second-opinion server could switch the
+        check off (re-review of the Mythos #947 fix round). A client "takes" the transaction when its
+        reply names the txid hashed from *raw* (never the reply as such), or when it says it already
+        has the transaction AND serves the same bytes back on a read (the rule
         :meth:`pyrxd.network.failover.FailoverElectrumXClient.broadcast` keeps, audit B6). Neither
         check proves anything against a liar, which was just handed the bytes; they catch a confused
         or broken server. That is why the txid comes back as a :class:`SecondOpinionTxid`. A
         rejection, a wrong echo or any other failure of one client (a custom client's unexpected
-        exception included) moves on to the next client. A :class:`TlsPinMismatchError` that reaches
-        this round raises and ends it; a client that fails over internally on any ``NetworkError``
-        (``SameSourceFailover``) may pass a pin mismatch over inside itself before it gets here.
+        exception included) means that client did not take it.
 
-        The whole round runs under ``second_opinion_timeout_s``: each ask gets what is left, and when
-        it runs out the round ends with None, as if no client took the transaction.
+        A :class:`TlsPinMismatchError` from a client's broadcast is logged as an error and, when no
+        other client takes the transaction, raised in place of None. When another client does take
+        it, the round still succeeds. A pin mismatch on the "already have" read-back counts only as
+        "did not take it", and a client that fails over internally on any ``NetworkError``
+        (``SameSourceFailover``) may pass one over inside itself.
+
+        The round runs under ``second_opinion_timeout_s``. When it runs out, the clients still asking
+        are cancelled and the round ends with None, as if none took the transaction. A cancelled
+        client may already have received the bytes and relayed them; the caller is told only that
+        no client took them in time.
         """
         expected = str(Txid(hash256(raw)[::-1].hex()))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._second_opinion_timeout_s
-        for client in self._second_opinion:
-            label = str(source_key_of(client))
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                _LOG.warning("broadcast: second-opinion time budget spent before asking %s for tx %s", label, expected)
-                return None
-            try:
-                took = await asyncio.wait_for(self._second_opinion_takes(client, label, expected, raw), remaining)
-            except asyncio.TimeoutError:
+        asks = {
+            asyncio.ensure_future(self._second_opinion_takes(c, str(source_key_of(c)), expected, raw)): str(
+                source_key_of(c)
+            )
+            for c in self._second_opinion
+        }
+        pin_error: TlsPinMismatchError | None = None
+        pending = set(asks)
+        try:
+            while pending:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                # Errors first, so a pin mismatch that finished with a taker is still logged.
+                finished = [ask for ask in done if not ask.cancelled()]
+                for ask in finished:
+                    error = ask.exception()
+                    if isinstance(error, TlsPinMismatchError):
+                        _LOG.error(
+                            "broadcast: second opinion from %s failed its TLS pin for tx %s: %s",
+                            asks[ask],
+                            expected,
+                            error,
+                        )
+                        pin_error = pin_error or error
+                    elif error is not None:
+                        raise error
+                for ask in finished:
+                    if ask.exception() is None and ask.result():
+                        _LOG.warning(
+                            "broadcast: the first endpoint rejected tx %s (%s) and %s took it",
+                            expected,
+                            rejection.reason or rejection,
+                            asks[ask],
+                        )
+                        return SecondOpinionTxid(expected, raw)
+            if pending:
                 _LOG.warning(
-                    "broadcast: second opinion from %s did not answer for tx %s within the round's %.1f s budget",
-                    label,
+                    "broadcast: second opinions from %s did not answer for tx %s within the round's %.1f s budget",
+                    ", ".join(sorted(asks[a] for a in pending)),
                     expected,
                     self._second_opinion_timeout_s,
                 )
-                return None
-            if not took:
-                continue
-            _LOG.warning(
-                "broadcast: the first endpoint rejected tx %s (%s) and %s took it",
-                expected,
-                rejection.reason or rejection,
-                label,
-            )
-            return SecondOpinionTxid(expected, raw)
+        finally:
+            for ask in asks:
+                ask.cancel()
+            if asks:
+                await asyncio.wait(asks)
+        if pin_error is not None:
+            raise pin_error
         return None
 
     async def _second_opinion_takes(self, client: Any, label: str, expected: str, raw: bytes) -> bool:

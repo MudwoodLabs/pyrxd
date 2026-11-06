@@ -142,10 +142,18 @@ async def test_a_later_operator_is_asked_after_an_earlier_one_fails() -> None:
 
 
 async def test_the_first_operator_that_takes_it_ends_the_round() -> None:
-    primary, second, third = _primary(), _second("beta"), _second("gamma")
+    """Every operator is asked at once; the first that takes it ends the round and the rest are
+    cancelled, so a slower one never finishes its ask."""
+    primary, quick, slow = (
+        _primary(),
+        _SlowNode("wss://electrum.beta.example/"),
+        _SlowNode("wss://electrum.gamma.example/"),
+    )
+    slow.delay = 5.0
     raw = os.urandom(80)
-    assert await RadiantChainIO(primary).with_second_opinion((second, third)).broadcast(raw) == _txid(raw)
-    assert third.broadcasts == []
+    io = RadiantChainIO(primary).with_second_opinion((slow, quick))
+    assert await asyncio.wait_for(io.broadcast(raw), 2.0) == _txid(raw)
+    assert set(quick.mempool) == {_txid(raw)} and slow.broadcasts == [], "the slow ask was cancelled"
 
 
 async def test_a_second_operator_that_echoes_another_txid_is_not_believed() -> None:
@@ -206,12 +214,24 @@ async def test_a_custom_client_that_serves_other_bytes_back_is_not_believed() ->
     assert info.value.reason == _REJECTED
 
 
-async def test_a_tls_pin_mismatch_on_a_second_operator_is_raised() -> None:
+async def test_a_tls_pin_mismatch_on_a_second_operator_is_raised_when_no_other_takes_it() -> None:
     primary, second, third = _primary(), _second("beta"), _second("gamma")
     second.fail = TlsPinMismatchError("pin mismatch")
+    third.reject = (-26, "the third endpoint's reason")
     with pytest.raises(TlsPinMismatchError):
         await RadiantChainIO(primary).with_second_opinion((second, third)).broadcast(os.urandom(80))
-    assert third.broadcasts == [], "a substituted server is not routed around"
+    assert third.broadcasts, "the other operator was still asked"
+
+
+async def test_a_tls_pin_mismatch_is_logged_but_another_operator_may_still_take_it(caplog) -> None:
+    primary, second, third = _primary(), _second("beta"), _SlowNode("wss://electrum.gamma.example/")
+    second.fail = TlsPinMismatchError("pin mismatch")
+    third.delay = 0.05  # the pin mismatch is in before the taker answers
+    raw = os.urandom(80)
+    with caplog.at_level(logging.ERROR):
+        txid = await RadiantChainIO(primary).with_second_opinion((second, third)).broadcast(raw)
+    assert txid == _txid(raw) and isinstance(txid, SecondOpinionTxid)
+    assert any(r.levelno == logging.ERROR and "TLS pin" in r.getMessage() for r in caplog.records)
 
 
 # --------------------------------------------------------------------------- which clients qualify
@@ -638,9 +658,24 @@ async def test_a_cancelled_re_send_still_counts_down(tick) -> None:
 # F5: the whole round runs under one time budget.
 
 
-async def test_a_hanging_second_opinion_ends_the_round_at_the_budget() -> None:
+async def test_a_hanging_second_opinion_does_not_stop_another_from_taking_it() -> None:
+    """The re-review's MEDIUM: asked in turn under one budget, a hanging first client spent it all
+    and the next operator was never asked."""
     primary, hung, third = _primary(), _SlowNode("wss://electrum.beta.example/"), _second("gamma")
     hung.delay = float("inf")
+    raw = os.urandom(80)
+    io = RadiantChainIO(primary, second_opinion=(hung, third), second_opinion_timeout_s=0.5)
+    assert await asyncio.wait_for(io.broadcast(raw), 5.0) == _txid(raw)
+    assert set(third.mempool) == {_txid(raw)}
+
+
+async def test_hanging_second_opinions_end_the_round_at_the_budget() -> None:
+    primary, hung, third = (
+        _primary(),
+        _SlowNode("wss://electrum.beta.example/"),
+        _SlowNode("wss://electrum.gamma.example/"),
+    )
+    hung.delay = third.delay = float("inf")
     io = RadiantChainIO(primary, second_opinion=(hung, third), second_opinion_timeout_s=0.1)
     loop = asyncio.get_running_loop()
     began = loop.time()
@@ -650,19 +685,18 @@ async def test_a_hanging_second_opinion_ends_the_round_at_the_budget() -> None:
     took = loop.time() - began
     assert info.value.reason == _REJECTED
     assert 0.1 <= took < 1.0, took
-    assert third.broadcasts == [], "the budget is spent; nothing more is asked"
 
 
-async def test_the_budget_is_for_the_whole_round_not_each_ask() -> None:
+async def test_the_operators_are_asked_at_once_not_in_turn() -> None:
+    """Two operators that each answer after 0.25 s fit a 0.4 s round only when asked together."""
     primary = _primary()
     slow1, slow2 = _SlowNode("wss://electrum.beta.example/"), _SlowNode("wss://electrum.gamma.example/")
     slow1.reject = (-26, "the second endpoint's reason")
-    slow1.delay = slow2.delay = 0.15
-    io = RadiantChainIO(primary, second_opinion=(slow1, slow2), second_opinion_timeout_s=0.25)
-    with pytest.raises(PolicyRejection) as info:
-        await asyncio.wait_for(io.broadcast(os.urandom(80)), 5.0)
-    assert info.value.reason == _REJECTED
-    assert slow2.mempool == {}, "the second ask had only what the first left of the budget"
+    slow1.delay = slow2.delay = 0.25
+    raw = os.urandom(80)
+    io = RadiantChainIO(primary, second_opinion=(slow1, slow2), second_opinion_timeout_s=0.4)
+    assert await asyncio.wait_for(io.broadcast(raw), 5.0) == _txid(raw)
+    assert set(slow2.mempool) == {_txid(raw)}
 
 
 async def test_a_slow_second_opinion_inside_the_budget_still_takes_it() -> None:

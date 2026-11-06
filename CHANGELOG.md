@@ -11,16 +11,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The autonomous claim can ask a second operator before it takes a node rejection as final
   (#937).** `RadiantChainIO` takes an opt-in `second_opinion`: broadcast clients, one per operator,
   no two run by the same operator, and, when the broadcast client names its operator (one
-  `source_key`), none run by that operator or on its host. After a node rejection each is asked in
-  turn, within `second_opinion_timeout_s` (default 10 s) for the whole round, and the first that
-  takes the same bytes (its reply checked against the txid hashed from them) makes the broadcast a
-  success; otherwise the first rejection is raised, as before.
+  `source_key`), none run by that operator or on its host. After a node rejection all are asked at
+  once, within `second_opinion_timeout_s` (default 10 s), and the first that takes the same bytes
+  (its reply checked against the txid hashed from them) makes the broadcast a success; otherwise
+  the first rejection is raised, as before.
   `make_radiant_claim_leg` and `sidecar_leg_resolver` take `second_opinion` and give the claim leg
   its own chain IO (`RadiantChainIO.with_second_opinion`), so a chain IO shared with attended
   callers keeps taking the first rejection as final. A claim only a second-opinion client took
   comes back as a `SecondOpinionTxid` and is not marked seen, so one lying server cannot disarm
   it. `ClaimExecutor` re-sends those exact bytes (first endpoint first) for
-  `second_opinion_resend_ticks` ticks (default 10) without a new fee input, then rebuilds; a
+  `second_opinion_resend_ticks` ticks (default 10) without a new fee input, then rebuilds. A
+  re-send that no client takes (all refuse or fail, or the time runs out) ends the hold at once. A
   rebuild every server refuses still dispenses a fee input per tick until the claim is mined or the
   capped pool runs out, the per-tick cost a refused claim already had. Off by default.
 
