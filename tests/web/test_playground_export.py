@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+
 from pyrxd.starter import ProjectNameError, render_project
 
 _DIR = Path(__file__).resolve().parents[2] / "docs" / "inspect_static" / "playground"
