@@ -142,8 +142,9 @@ RULES: tuple[tuple[str, str], ...] = (
     ("refs", "Every ref an output holds comes from an input; a singleton's ref is in one output only."),
     (
         "ft",
-        "A Glyph FT's outputs hold no more units than its inputs (a deploy mints its supply once), and "
-        "when an FT is spent, every output that pushes its ref is an FT output.",
+        "A Glyph FT's outputs hold no more units than its inputs (a deploy mints its supply once; a "
+        "contract the sandbox does not run may mint more, with a warning), and when an FT is spent, "
+        "every output that pushes its ref is an FT output.",
     ),
 )
 
@@ -324,7 +325,7 @@ class SandboxChain:
                 raise SandboxRejected(
                     "parse",
                     f"output {j}'s script does not decode: a push runs past its end",
-                    hint="A node will not relay an output script like this. Build scripts with pyrxd's builders.",
+                    hint="pyrxd's own script parser refuses it as Radiant's GetScriptOp would. Build scripts with pyrxd's builders.",
                 ) from None
         txid = tx.txid()
         if txid in self.accepted:
@@ -553,6 +554,20 @@ class SandboxChain:
                         "refs",
                         f"output {j} pushes ref {_ref_label(ref)}, which no input provides",
                         hint="A token's ref can only move from an input that holds it, or be minted from an outpoint this transaction spends.",
+                    )
+        # A singleton push needs a singleton to come from: an input that held the ref as a
+        # singleton, or an outpoint this transaction spends (a mint). A normal push does not.
+        outpoints = {
+            bytes.fromhex(t.source_txid)[::-1] + t.source_output_index.to_bytes(4, "little") for t in tx.inputs
+        }
+        singleton_in = outpoints | {bytes(o) for coin in spent for op, o in iter_input_refs(coin.script) if op == 0xD8}
+        for j, out in enumerate(tx.outputs):
+            for op, operand in iter_input_refs(out.locking_script.serialize()):
+                if op == 0xD8 and bytes(operand) not in singleton_in:
+                    raise SandboxRejected(
+                        "refs",
+                        f"output {j} pushes {_ref_label(bytes(operand))} as a singleton, but no input holds it as one",
+                        hint="A singleton can only come from an input that holds it as a singleton, or be minted from an outpoint this transaction spends.",
                     )
         # Every push of a ref (0xd0 or 0xd8) in every output, not just the first in each: a
         # singleton is one push in the whole transaction's outputs, so the same ref pushed

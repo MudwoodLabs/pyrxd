@@ -168,6 +168,34 @@ class TestSingletonEdges:
         refs = [c for c in sb.chain.accepted[txid].checks if c.rule == "refs"]
         assert [c.status for c in refs] == ["warn"] and "no output keeps it as a singleton" in refs[0].detail
 
+    def test_a_normal_ref_cannot_be_promoted_back_to_a_singleton(self, pg, sb):
+        """Re-review: split an NFT into two normal pushes, then make each a singleton again = two NFTs."""
+        from pyrxd.glyph.script import build_nft_locking_script
+
+        result, nft = _mint_nft(sb)
+        fee = sb.faucet(rxd=1)
+        k = sb.wallet.key
+        normal = b"\xd0" + _wire(result.ref) + b"\x75\x51"  # pushes the ref, then OP_1
+        split = sb.broadcast(
+            _tx(sb, [(nft, k), (fee, k)], [(normal, nft.value), (normal, nft.value), _change(sb, fee, nft.value)])
+        )
+        half = sb.chain.utxos[(split, 0)]
+        fee2 = sb.faucet(rxd=1)
+        from pyrxd.script.script import Script
+
+        tx = _tx(
+            sb,
+            [(half, k), (fee2, k)],
+            [(build_nft_locking_script(sb.wallet.pkh, result.ref), half.value), _change(sb, fee2)],
+            sign=False,
+        )
+        tx.inputs[0].unlocking_script_template = None
+        tx.inputs[0].unlocking_script = Script(b"")
+        tx.sign()
+        with pytest.raises(pg.SandboxRejected) as exc:
+            sb.broadcast(tx)
+        assert exc.value.rule == "refs" and "no input holds it as one" in str(exc.value)
+
 
 class TestMalformed:
     @pytest.mark.parametrize("script", [b"\x05ab", b"\x4c", b"\xd0" + b"\x00" * 10])
