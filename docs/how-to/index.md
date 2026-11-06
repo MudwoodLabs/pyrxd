@@ -6,6 +6,7 @@ you already know the basics and want a focused answer to "how do I X."
 ```{toctree}
 :maxdepth: 1
 
+start-a-project
 receive-and-check-balance
 export-a-watch-only-descriptor
 transfer-a-glyph-token
@@ -27,6 +28,10 @@ troubleshoot-common-errors
 
 ## Available now
 
+- **[Start a project and test it on a local chain](start-a-project.md)** — `pyrxd new`
+  writes a small app with a Glyph mint and a test that runs it on a throwaway regtest node,
+  using the `pyrxd.testing` fixtures (`regtest_client`, `regtest_wallet`). Also how to load
+  those fixtures in any project, and how to render the template from code.
 - **[Receive funds and check your balance](receive-and-check-balance.md)** — the
   read-only wallet basics: `pyrxd address` for a receive address, `pyrxd balance`
   to confirm money arrived, `pyrxd utxos` to see exactly what you hold, and

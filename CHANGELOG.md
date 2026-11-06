@@ -6,6 +6,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`pyrxd new NAME`: a starter project with a Glyph mint and a test on a local regtest chain.**
+  It writes `pyproject.toml` (depending on the generating pyrxd's minor series),
+  `src/<package>/mint.py`, `tests/test_mint.py`, a GitHub Actions workflow and a README, and
+  refuses names that would shadow `pyrxd`, the tests directory or a standard-library module, and
+  directories that are not empty. `pyrxd.starter.render_project` returns the same files as text,
+  with `overrides` for a caller's own code, so the template can be produced without the CLI.
+- **`pyrxd.testing`: public helpers and opt-in pytest fixtures for testing against a real
+  regtest node** (`pytest_plugins = ["pyrxd.testing.pytest_plugin"]`). `regtest_node` starts a
+  fresh node per session in its own `pyrxd-test-<random>` container and refuses one that does not
+  enforce mainnet's relay floor; `regtest_wallet` is a pyrxd-generated key funded from the node's
+  faucet, found through `scantxoutset`, that the node's own wallet cannot spend; `regtest_client`
+  mines a block after each broadcast. Missing docker or a missing image fails the test with the
+  fix rather than skipping it.
+- `RegtestNode(container=...)` names a node other than the CLI's `pyrxd-devnet`. The name is
+  checked against docker's container-name rule.
+
 ## [0.27.0] — 2026-10-31
 
 ### Added

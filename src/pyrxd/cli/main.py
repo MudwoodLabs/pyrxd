@@ -247,6 +247,7 @@ from . import (  # noqa: E402
     glyph_cmds,
     hashmark_cmds,
     headers_cmds,
+    new_cmd,
     query_cmds,
     regtest_cmds,
     setup_cmd,
@@ -266,6 +267,7 @@ cli.add_command(hashmark_cmds.mark_cmd)
 # never had — not a second implementation of it.
 cli.add_command(hashmark_cmds.verify_cmd)
 cli.add_command(headers_cmds.headers_group)
+cli.add_command(new_cmd.new_cmd)
 cli.add_command(query_cmds.address_cmd)
 cli.add_command(query_cmds.balance_cmd)
 cli.add_command(query_cmds.utxos_cmd)
