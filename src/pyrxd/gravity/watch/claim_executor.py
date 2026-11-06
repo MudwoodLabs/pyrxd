@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAINNET_DUST_CEILING_PHOTONS",
+    "SECOND_OPINION_RESEND_TICKS",
     "ClaimBytesSource",
     "ClaimExecutor",
     "CovenantClaimContext",
@@ -89,6 +90,11 @@ __all__ = [
 # do not read "10_000" as a market-value judgement — it is not one, and the previous comment implied
 # it was. Raise ``claim_dust_ceiling`` explicitly, with the magnitude you mean, to arm the executor.
 MAINNET_DUST_CEILING_PHOTONS = 10_000
+
+#: Ticks a claim only a second-opinion server took is re-sent as the same bytes before the next rebuild
+#: (#937). At the watchtower's documented 30 s poll that is about 5 minutes, one Radiant block
+#: (PROJECTED from the 300 s block target, not measured against a live tower).
+SECOND_OPINION_RESEND_TICKS = 10
 
 # Test/regtest networks (no real value) == the audit-cleared set. Aliased so the executor's value-bearing
 # seam is named for its own intent, not the (now-advisory) audit gate (security panel #244): editing the
@@ -153,7 +159,13 @@ def load_claim_context(blobs_dir: str | Path, swap_id: str) -> CovenantClaimCont
 
 
 def make_radiant_claim_leg(
-    context: CovenantClaimContext, *, chain_io, fee_source, network: str, audit_cleared: bool = False
+    context: CovenantClaimContext,
+    *,
+    chain_io,
+    fee_source,
+    network: str,
+    audit_cleared: bool = False,
+    second_opinion: tuple = (),
 ):
     """Build the per-swap ``RadiantCovenantLeg`` from a covenant sidecar + the operator's SHARED
     ``chain_io`` (a ``RadiantChainIO``) and ``fee_source``.
@@ -174,9 +186,21 @@ def make_radiant_claim_leg(
     compromised/buggy hot fee key is bounded to a small pool rather than an arbitrary wallet — this is
     *recommended, not enforced* (the same posture: the library hands you the safe tool, it doesn't refuse
     your fee source). Imported lazily to keep the watch package free of a hard ``gravity.radiant_leg``
-    dependency until autonomy is actually armed."""
+    dependency until autonomy is actually armed.
+
+    ``second_opinion`` (#937; default empty: off) are broadcast clients, one per operator, that the
+    claim's broadcast asks when the first endpoint rejects it, so a refusal from one lagging,
+    stricter or lying server does not hold the claim back while another operator would relay it and
+    the maker's refund timelock runs. A claim only a second-opinion client took is never marked seen
+    (:class:`~pyrxd.gravity.radiant_leg.SecondOpinionTxid`), so a lying second opinion cannot
+    disarm it either: the claim is retried until it is spent. The leg gets its
+    own chain IO (:meth:`~pyrxd.gravity.radiant_leg.RadiantChainIO.with_second_opinion`); the shared
+    ``chain_io`` is unchanged, so attended broadcasts through it still take the first rejection as
+    final. For a client over pyrxd's shipped mainnet endpoints, pass its ``per_source_clients()``."""
     from pyrxd.gravity.radiant_leg import RadiantCovenantLeg
 
+    if second_opinion:
+        chain_io = chain_io.with_second_opinion(second_opinion)
     return RadiantCovenantLeg(
         network=network,
         taker_pkh=context.taker_pkh,
@@ -187,18 +211,35 @@ def make_radiant_claim_leg(
     )
 
 
-def sidecar_leg_resolver(blobs_dir: str | Path, *, chain_io, fee_source, network: str, audit_cleared: bool = False):
+def sidecar_leg_resolver(
+    blobs_dir: str | Path,
+    *,
+    chain_io,
+    fee_source,
+    network: str,
+    audit_cleared: bool = False,
+    second_opinion: tuple = (),
+):
     """An async ``resolve_leg(swap_id, record)`` for the :class:`ClaimExecutor` that loads the per-swap
     covenant sidecar and builds the leg with the SHARED chain_io + fee_source. Returns ``None`` for a swap
     with no sidecar (→ the executor declines, dormant for that swap). This is the wiring the shell uses to
-    arm the claim executor; until a sidecar exists for a swap, that swap stays alert-only."""
+    arm the claim executor; until a sidecar exists for a swap, that swap stays alert-only.
+    ``second_opinion`` is forwarded to :func:`make_radiant_claim_leg`."""
+    if second_opinion:
+        # Refuse a bad set at wiring time, not on the first claim tick.
+        chain_io.with_second_opinion(second_opinion)
 
     async def _resolve(swap_id: str, record: SwapRecord):
         ctx = load_claim_context(blobs_dir, swap_id)
         if ctx is None:
             return None
         return make_radiant_claim_leg(
-            ctx, chain_io=chain_io, fee_source=fee_source, network=network, audit_cleared=audit_cleared
+            ctx,
+            chain_io=chain_io,
+            fee_source=fee_source,
+            network=network,
+            audit_cleared=audit_cleared,
+            second_opinion=second_opinion,
         )
 
     return _resolve
@@ -256,6 +297,7 @@ class ClaimExecutor:
         seen_store=None,
         rxd_depth_corroborator=None,
         claim_dust_ceiling: int = MAINNET_DUST_CEILING_PHOTONS,
+        second_opinion_resend_ticks: int = SECOND_OPINION_RESEND_TICKS,
     ) -> None:
         if not isinstance(policy, MarginPolicy):
             raise ValidationError("ClaimExecutor requires a MarginPolicy")
@@ -279,6 +321,12 @@ class ClaimExecutor:
             raise ValidationError("reorg_safety_factor must be a finite float >= 1.0")
         if not isinstance(claim_dust_ceiling, int) or isinstance(claim_dust_ceiling, bool) or claim_dust_ceiling <= 0:
             raise ValidationError("claim_dust_ceiling must be a positive int ('no cap' can never mean unlimited)")
+        if (
+            not isinstance(second_opinion_resend_ticks, int)
+            or isinstance(second_opinion_resend_ticks, bool)
+            or second_opinion_resend_ticks <= 0
+        ):
+            raise ValidationError("second_opinion_resend_ticks must be a positive int")
         # The sole affirmative arming gate: reject a non-bool so a truthy string (``bool("false")`` is True)
         # from a config/env/YAML layer can never silently arm unattended mainnet custody (security panel #244).
         if not isinstance(enable_autonomous_mainnet_custody, bool):
@@ -335,6 +383,11 @@ class ClaimExecutor:
         # DEEPER of single-node and quorum; a None/raise (below quorum) fails CLOSED. None → single-source posture.
         self._rxd_depth_corroborator = rxd_depth_corroborator
         self._claim_dust_ceiling = int(claim_dust_ceiling)
+        # A claim only a second-opinion server took (#937), by covenant outpoint: its exact bytes and the
+        # ticks left to re-send them before the next rebuild. In memory only: a restart forgets it and
+        # rebuilds (see _resend_held for what that costs), which never disarms the claim.
+        self._resend_ticks = int(second_opinion_resend_ticks)
+        self._held: dict[str, tuple[bytes, int]] = {}
 
     @property
     def _value_bearing(self) -> bool:
@@ -536,6 +589,9 @@ class ClaimExecutor:
             return ExecOutcome.DECLINED, f"fresh re-assess is {finality.value} (window not safe to claim now)"
 
         # 8. Broadcast the covenant claim (reuses the mainnet-proven leg path; logs txid+value, never p).
+        held = self._held.get(outpoint)
+        if held is not None:
+            return await self._resend_held(swap_id, outpoint, held, leg)
         try:
             txid = await leg.claim_asset(record, bytes(p))
         except InsufficientFundsError as exc:
@@ -567,7 +623,8 @@ class ClaimExecutor:
         except PolicyRejection as exc:
             # PolicyRejection subclasses NetworkError, so this clause must precede the NetworkError
             # one below. Never marked seen, whatever the reason: a node's verdict can come from one
-            # endpoint (failover never asks a second after a rejection), from one node's policy,
+            # endpoint (failover never asks a second after a rejection; a leg built with
+            # `second_opinion` asks one per operator first, #937), from one node's policy,
             # or from this tick's fee input (an immature coinbase, an operator-typed value the
             # signature commits to), and nothing clears a seen mark (Mythos pass on #934 and its
             # re-review). The next tick rebuilds with a new fee input, bounded by the capped,
@@ -591,7 +648,21 @@ class ClaimExecutor:
             return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
         # Mark the covenant outpoint seen ONLY AFTER a successful broadcast (fire-once; see step 7) — so a
         # transient failure above still retries, and a crash here costs at most ONE re-carve, not per-tick.
-        if self._seen is not None:
+        # Not when only a second-opinion client took it (#937): the broadcast client refused it, and the
+        # one client that answered may be lying, so its word alone must not end the retries. Instead the
+        # exact bytes are held and re-sent on later ticks (see _resend_held), which spends no new fee input.
+        from pyrxd.gravity.radiant_leg import SecondOpinionTxid
+
+        if isinstance(txid, SecondOpinionTxid):
+            self._held[outpoint] = (txid.raw, self._resend_ticks)
+            logger.warning(
+                "autonomous claim swap %s: claim %s was taken only by a second-opinion server after the "
+                "first endpoint refused it; not marked seen, its bytes are re-sent for up to %d ticks",
+                swap_id,
+                txid,
+                self._resend_ticks,
+            )
+        elif self._seen is not None:
             await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
         logger.warning(
             "autonomous claim swap %s: covenant claim broadcast txid=%s value=%d (asset → taker holder)",
@@ -600,6 +671,76 @@ class ClaimExecutor:
             record.terms.radiant_amount,
         )
         return ExecOutcome.BROADCAST, None
+
+    async def _resend_held(
+        self, swap_id: str, outpoint: str, held: tuple[bytes, int], leg
+    ) -> tuple[ExecOutcome | None, str | None]:
+        """Re-send the exact bytes of a claim only a second-opinion server took (#937), instead of
+        rebuilding it on a new fee input.
+
+        Rebuilding every tick would dispense a fee input from the SHARED capped pool per tick until the
+        claim is mined, though every rebuild conflicts with the relayed claim and is refused: an honest
+        second opinion could drain the pool other swaps' claims are funded from. Re-sending spends
+        nothing new. The bytes are re-sent through the same chain IO, so the broadcast client is asked
+        first: if it now takes them, the claim is marked seen. While only a second opinion takes them,
+        they are re-sent for ``second_opinion_resend_ticks`` ticks; then the hold ends and the next tick
+        rebuilds on a new fee input, so a lying second opinion (one that keeps nothing) delays a claim by
+        at most that many ticks per rebuild, and the broadcast client sees a fresh claim each time. A
+        round in which no client takes them ends the hold at once when the broadcast client refuses
+        them and no second opinion has taken them when the chain IO's ``second_opinion_timeout_s``
+        runs out (a server that timed out may still have relayed them). A second opinion's refusal
+        or failure counts as not taking them, with one exception: a TLS pin mismatch on its
+        broadcast that arrives in time is raised (see ``RadiantChainIO._ask_second_opinion``), and
+        then, as when the broadcast client fails in transport, the re-send only spends one tick. Every other outcome of a re-send, an
+        unexpected exception or a cancelled tick included, spends one of those ticks.
+
+        What the hold does NOT remove: once it ends while the claim is still unmined and the broadcast
+        client still refuses, each later rebuild conflicts with the relayed claim on the second opinion,
+        is refused by every client, and dispenses one fee input per tick until the claim is mined or the
+        capped pool runs out. A refused claim paid the same per-tick cost before #937 (the
+        PolicyRejection arm in ``_run``); the hold only spends nothing for its first
+        ``second_opinion_resend_ticks`` ticks."""
+        from pyrxd.gravity.radiant_leg import SecondOpinionTxid, _AlreadyKnown
+
+        raw, left = held
+        try:
+            txid = await leg.chain_io.broadcast(raw)
+        except _AlreadyKnown:
+            txid = None  # the broadcast client itself holds the claim
+        except PolicyRejection as exc:
+            self._held.pop(outpoint, None)
+            return ExecOutcome.FAILED, f"held claim refused by every server; rebuilding next tick: {exc}"
+        except NetworkError as exc:
+            self._count_down(outpoint, raw, left)
+            return ExecOutcome.FAILED, f"held claim re-send failed (transient): {exc}"
+        except BaseException:
+            # Anything else (a custom client's own exception, or the reconciler's tick watchdog
+            # cancelling this tick) still spends a re-send, so the hold always ends and the claim is
+            # rebuilt; without this one recurring error kept it held until a restart (Mythos #947 F4).
+            self._count_down(outpoint, raw, left)
+            raise
+        if isinstance(txid, SecondOpinionTxid):
+            self._count_down(outpoint, raw, left)
+            return (
+                ExecOutcome.DECLINED,
+                f"claim {txid} held only by a second-opinion server; re-sent the same bytes ({left - 1} re-sends left)",
+            )
+        self._held.pop(outpoint, None)
+        if self._seen is not None:
+            await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
+        logger.warning(
+            "autonomous claim swap %s: the broadcast client now holds the held claim (%s); marked seen",
+            swap_id,
+            txid or "already known",
+        )
+        return ExecOutcome.DECLINED, "held claim now taken by the broadcast client — awaiting confirmation"
+
+    def _count_down(self, outpoint: str, raw: bytes, left: int) -> None:
+        """Spend one re-send of a held claim; the last one ends the hold."""
+        if left > 1:
+            self._held[outpoint] = (raw, left - 1)
+        else:
+            self._held.pop(outpoint, None)
 
     def _check_value_cap(self, record: SwapRecord) -> str | None:
         """Return a decline reason if the swap's value exceeds the reorg-protected ceiling, else None.
@@ -732,5 +873,5 @@ def _is_missing_utxo(exc: Exception) -> bool:
     """True ONLY if a NetworkError signals an ABSENT covenant UTXO (the SPK has no live UTXO = spent/
     settled or not-yet-funded), vs a transient read fault OR a fail-closed anomaly (a value mismatch, which
     must NOT read as benign settlement; several matches are selected, never raised). Matches the exact 'no
-    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:288), not the mismatch."""
+    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:646), not the mismatch."""
     return "no utxo found" in str(exc).lower()
