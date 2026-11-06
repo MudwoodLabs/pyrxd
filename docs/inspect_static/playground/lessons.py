@@ -130,7 +130,7 @@ print("reveal:", result.reveal_txid)
 print("genesis ref:", f"{result.ref.txid}:{result.ref.vout}")
 """,
         "try_it": {
-            "text": "Change GlyphProtocol.NFT to GlyphProtocol.FT. pyrxd refuses before anything is sent: commit_nft needs the NFT protocol.",
+            "text": "Change GlyphProtocol.NFT to GlyphProtocol.FT. pyrxd refuses before the commit is sent: commit_nft needs the NFT protocol.",
             "find": "protocol=[GlyphProtocol.NFT]",
             "replace": "protocol=[GlyphProtocol.FT]",
             "expect": "ValidationError",
@@ -169,7 +169,7 @@ build = await build_nft_transfer(
 print("transfer:", sandbox.broadcast(build.tx))
 """,
         "try_it": {
-            "text": "Set fee_rate=1_000. pyrxd refuses before signing, because that is below the 10,000 photons per byte floor.",
+            "text": "Set fee_rate=1_000. The mint still goes through; pyrxd then refuses the transfer before signing it, because that is below the 10,000 photons per byte floor.",
             "find": "fee_rate=MIN_FEE_RATE",
             "replace": "fee_rate=1_000",
             "expect": "ValidationError",
@@ -211,7 +211,7 @@ build = await build_ft_transfer(
 print("sent 2,500 PLAY:", sandbox.broadcast(build.tx))
 """,
         "try_it": {
-            "text": "Ask to send 20_000 units, more than exist. pyrxd refuses before signing anything.",
+            "text": "Ask to send 20_000 units, more than exist. The deploy still goes through; pyrxd then refuses the transfer before signing it.",
             "find": "token.ref, 2_500,",
             "replace": "token.ref, 20_000,",
             "expect": "InsufficientFundsError",

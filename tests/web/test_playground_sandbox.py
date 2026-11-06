@@ -4,8 +4,8 @@ Run under CPython with the real coincurve. Every refusal test is paired with the
 path it sits beside, so a rule that refuses everything fails here as loudly as one that
 refuses nothing.
 
-The page runs the same module under Pyodide; ``tests/web/test_playground_pyodide.py``
-covers that runtime.
+The page runs the same module under Pyodide; the Pyodide-shape subprocess in
+``tests/web/test_playground_lessons.py`` covers that runtime's import graph and shims.
 """
 
 from __future__ import annotations

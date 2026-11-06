@@ -141,3 +141,26 @@ def test_secret_range_is_enforced_like_coincurve(sc):
 def test_install_refuses_when_the_real_library_is_present(sc):
     with pytest.raises(RuntimeError, match="real coincurve"):
         sc.install()
+
+
+def test_a_prehashed_digest_at_or_above_the_order_signs_as_libsecp256k1_does(sc):
+    """libsecp256k1 reduces the digest mod n before seeding RFC 6979 (review F5)."""
+    n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    rng = random.Random(949)
+    digests = [n.to_bytes(32, "big"), (n + 1).to_bytes(32, "big"), b"\xff" * 32]
+    digests += [(n + rng.randrange(2**256 - n)).to_bytes(32, "big") for _ in range(5)]
+    for _ in range(3):
+        secret = os.urandom(32)
+        real, ours = coincurve.PrivateKey(secret), sc.PrivateKey(secret)
+        for d in digests:
+            assert ours.sign(d, hasher=None) == real.sign(d, hasher=None), d.hex()
+            assert ours.sign_recoverable(d, hasher=None) == real.sign_recoverable(d, hasher=None), d.hex()
+
+
+def test_a_secret_longer_than_32_bytes_is_refused(sc):
+    """Deliberately stricter than coincurve, which takes b'\\x00' + k and signs as another key."""
+    k = os.urandom(31) + b"\x01"
+    assert coincurve.PrivateKey(b"\x00" + k).public_key.format() != coincurve.PrivateKey(k).public_key.format()
+    with pytest.raises(ValueError):
+        sc.PrivateKey(b"\x00" + k)
+    assert sc.PrivateKey(k).public_key.format() == coincurve.PrivateKey(k).public_key.format()

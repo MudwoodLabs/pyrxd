@@ -25,7 +25,11 @@ Behaviour copied from libsecp256k1 as coincurve exposes it:
   ``secp256k1_ecdsa_signature_parse_der`` does. An r or s at or above the group order parses,
   and then never verifies.
 * hasher semantics: a callable is applied to the message; ``None`` means the message is
-  already the 32-byte digest.
+  already the 32-byte digest. A digest at or above the group order is reduced mod n before
+  it seeds the nonce, as libsecp256k1 does.
+
+Not here, because pyrxd's Radiant paths do not call them: Schnorr, ECDH, x-only keys and
+tweaks. pyrxd's Bitcoin and Taproot code needs those, so it does not work in the playground.
 """
 
 from __future__ import annotations
@@ -301,8 +305,10 @@ def _rfc6979_nonces(secret: bytes, msg32: bytes):
 
 def _sign(secret: bytes, msg32: bytes) -> tuple[int, int, int]:
     d = _int32(secret)
-    z = _int32(msg32)
-    for k in _rfc6979_nonces(secret, msg32):
+    z = _int32(msg32) % N
+    # libsecp256k1 reduces the digest mod n before it seeds the nonce, so a digest >= n gets
+    # the same k (and the same signature) as its reduction.
+    for k in _rfc6979_nonces(secret, z.to_bytes(32, "big")):
         R = _g_mul(k)
         assert R is not None  # k is in [1, n-1]
         r = R[0] % N
@@ -349,6 +355,9 @@ def _recover(msg32: bytes, r: int, s: int, recid: int) -> tuple[int, int]:
 
 
 def _validate_secret(secret: bytes) -> bytes:
+    # Deliberately stricter than coincurve: it accepts a secret longer than 32 bytes and then
+    # signs with some other key (a 33-byte b"\x00" + k gives a public key that is not k's),
+    # so this refuses anything over 32 bytes instead of copying that.
     if not isinstance(secret, (bytes, bytearray)):
         raise TypeError("secret must be bytes")
     secret = bytes(secret)

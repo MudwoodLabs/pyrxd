@@ -139,8 +139,12 @@ RULES: tuple[tuple[str, str], ...] = (
     ("value", "Outputs spend no more than the inputs bring in."),
     ("fee", "The fee meets the relay floor for the transaction's size."),
     ("scripts", "Each P2PKH, Glyph NFT, Glyph FT and Glyph commit input is unlocked correctly."),
-    ("refs", "Every ref an output holds comes from an input; a singleton is in one output at most."),
-    ("ft", "A Glyph FT's outputs hold no more units than its inputs."),
+    ("refs", "Every ref an output holds comes from an input; a singleton's ref is in one output only."),
+    (
+        "ft",
+        "A Glyph FT's outputs hold no more units than its inputs (a deploy mints its supply once), and "
+        "when an FT is spent, every output that pushes its ref is an FT output.",
+    ),
 )
 
 
@@ -310,6 +314,18 @@ class SandboxChain:
             raise SandboxRejected("parse", "the bytes are not exactly one well-formed transaction")
         if not tx.inputs or not tx.outputs:
             raise SandboxRejected("parse", "a transaction needs at least one input and one output")
+        from pyrxd.glyph.script import iter_script_ops_strict
+
+        for j, out in enumerate(tx.outputs):
+            try:
+                for _ in iter_script_ops_strict(out.locking_script.serialize()):
+                    pass
+            except Exception:  # a push or ref operand runs past the end of the script
+                raise SandboxRejected(
+                    "parse",
+                    f"output {j}'s script does not decode: a push runs past its end",
+                    hint="A node will not relay an output script like this. Build scripts with pyrxd's builders.",
+                ) from None
         txid = tx.txid()
         if txid in self.accepted:
             raise SandboxRejected("inputs", f"transaction {txid} is already on the sandbox chain")
@@ -420,6 +436,9 @@ class SandboxChain:
             self._check_sig(tx, i, pushes, bytes(extract_owner_pkh_from_ft_script(script)), "Glyph FT", extra=0)
             return None
         if is_commit_script(hexs):
+            from pyrxd.glyph.script import split_delegate_commit_prefix
+
+            delegate = split_delegate_commit_prefix(script)[0] is not None
             owner = bytes(extract_owner_pkh_from_commit_script(script))
             self._check_sig(tx, i, pushes, owner, "Glyph commit", extra=2)
             assert pushes is not None
@@ -435,6 +454,11 @@ class SandboxChain:
                     hint="The reveal must carry the exact CBOR the commit hashed. Changing metadata after commit strands the commit.",
                 )
             self._check_commit_output(tx, i, script)
+            if delegate:
+                return (
+                    f"input {i} is a delegate commit: its signature, reveal and token output were checked, but "
+                    "the delegate burn its prefix demands was NOT evaluated. Test it on `pyrxd regtest up`."
+                )
             return None
         return (
             f"input {i}'s script was NOT evaluated: the sandbox does not run Radiant's script "
@@ -453,6 +477,12 @@ class SandboxChain:
                 hint="Did you forget tx.sign()? An unsigned input has an empty unlocking script.",
             )
         sig, pub = pushes[0], pushes[1]
+        if not ((len(pub) == 33 and pub[0] in (2, 3)) or (len(pub) == 65 and pub[0] == 4)):
+            # STRICTENC: a node accepts only compressed (02/03) and uncompressed (04) keys;
+            # libsecp256k1 alone would also parse hybrid (06/07) ones.
+            raise SandboxRejected(
+                "scripts", f"input {i} ({kind}): the public key is not a compressed or uncompressed key"
+            )
         if len(sig) < 9 or sig[-1] != SIGHASH_ALL_FORKID:
             raise SandboxRejected(
                 "scripts", f"input {i} ({kind}): the sandbox accepts only SIGHASH_ALL|FORKID (0x41) signatures"
@@ -468,10 +498,16 @@ class SandboxChain:
         except Exception as exc:  # malformed key or DER
             raise SandboxRejected("scripts", f"input {i} ({kind}): signature or key is malformed ({exc})") from None
         if not ok:
+            token = kind in ("Glyph NFT", "Glyph FT")
             raise SandboxRejected(
                 "scripts",
                 f"input {i} ({kind}): the signature does not verify",
-                hint="Changing any output or input after tx.sign() invalidates the signature. Sign last.",
+                hint=(
+                    "This input holds a token. If a builder took it as plain RXD to pay with, it signed it as a "
+                    "plain coin; spend tokens only with pyrxd's token builders."
+                    if token
+                    else "Changing any output or input after tx.sign() invalidates the signature. Sign last."
+                ),
             )
 
     def _check_commit_output(self, tx, i: int, script: bytes) -> None:
@@ -504,7 +540,8 @@ class SandboxChain:
             for ref in _get_push_refs(coin.script):
                 available.add(bytes(ref))
                 held_in[bytes(ref)] = held_in.get(bytes(ref), 0) + 1
-        singleton_outputs: dict[bytes, list[int]] = {}
+        from pyrxd.glyph.script import iter_input_refs
+
         out_refs: set[bytes] = set()
         for j, out in enumerate(tx.outputs):
             body = out.locking_script.serialize()
@@ -517,16 +554,38 @@ class SandboxChain:
                         f"output {j} pushes ref {_ref_label(ref)}, which no input provides",
                         hint="A token's ref can only move from an input that holds it, or be minted from an outpoint this transaction spends.",
                     )
-                if _first_ref_opcode(body, ref) == 0xD8:
-                    singleton_outputs.setdefault(ref, []).append(j)
-        for ref, outs in singleton_outputs.items():
-            if len(outs) > 1:
+        # Every push of a ref (0xd0 or 0xd8) in every output, not just the first in each: a
+        # singleton is one push in the whole transaction's outputs, so the same ref pushed
+        # again anywhere, by either opcode, copies it.
+        pushes: dict[bytes, list[tuple[int, int]]] = {}
+        for j, out in enumerate(tx.outputs):
+            for op, operand in iter_input_refs(out.locking_script.serialize()):
+                if op in (0xD0, 0xD8):
+                    pushes.setdefault(bytes(operand), []).append((j, op))
+        # Consensus reads each output's refs as a set, and refuses a singleton ref in more than
+        # one output, by either opcode (Radiant Core validation.h, the disallowed-siblings rule).
+        for ref, where in pushes.items():
+            outs = sorted({j for j, _ in where})
+            if any(op == 0xD8 for _, op in where) and len(outs) > 1:
                 raise SandboxRejected(
                     "refs",
-                    f"singleton ref {_ref_label(ref)} is in outputs {outs}; a singleton may be in one output only",
-                    hint="An NFT is one of a kind. It can move to one output, never be copied into two.",
+                    f"singleton ref {_ref_label(ref)} is in outputs {outs}; a singleton's ref may be in one output only",
+                    hint="A singleton ref is one of a kind. It can move to one output, never be copied into two.",
                 )
         checks = []
+        held_singleton = {
+            bytes(operand) for coin in spent for op, operand in iter_input_refs(coin.script) if op == 0xD8
+        }
+        kept_singleton = {ref for ref, where in pushes.items() if any(op == 0xD8 for _, op in where)}
+        for ref in sorted(held_singleton & out_refs - kept_singleton):
+            checks.append(
+                Check(
+                    "refs",
+                    "warn",
+                    f"singleton {_ref_label(ref)} was held by an input and no output keeps it as a singleton: "
+                    "the NFT is gone, even though its ref is still pushed",
+                )
+            )
         burned = [r for r in held_in if r not in out_refs]
         for ref in burned:
             checks.append(
@@ -534,25 +593,67 @@ class SandboxChain:
                     "refs", "warn", f"token {_ref_label(ref)} was held by an input and no output keeps it: it is burned"
                 )
             )
-        if not burned:
+        if not burned and not checks:
             n = len(out_refs)
             checks.append(Check("refs", "pass", f"{n} ref(s) carried, all provided by inputs" if n else "no refs"))
         return checks
 
     def _check_ft(self, tx, spent: list[Coin]) -> list[Check]:
-        from pyrxd.glyph.script import extract_ref_from_ft_script, is_ft_script
+        from pyrxd.glyph.script import (
+            extract_ref_from_ft_script,
+            is_commit_script,
+            is_ft_script,
+            split_delegate_commit_prefix,
+        )
+        from pyrxd.transaction.transaction_preimage import _get_push_refs
 
         ins: dict[bytes, int] = {}
         for coin in spent:
             if is_ft_script(coin.script.hex()):
                 ref = extract_ref_from_ft_script(coin.script).to_bytes()
                 ins[ref] = ins.get(ref, 0) + coin.value
+        # An FT is minted only by revealing an FT commit: its ref is that commit's outpoint.
+        minted: set[bytes] = set()
+        for txin, coin in zip(tx.inputs, spent):
+            core = split_delegate_commit_prefix(coin.script)[1]
+            if is_commit_script(coin.script.hex()) and len(core) >= 27 and core[-27] != 0x52:
+                minted.add(bytes.fromhex(txin.source_txid)[::-1] + txin.source_output_index.to_bytes(4, "little"))
+        # A ref an unrecognised input script pushes normally (a dMint contract, say) may mint FT
+        # units under that contract's own rules, which the sandbox does not run.
+        contract_held: set[bytes] = set()
+        for coin in spent:
+            h = coin.script.hex()
+            if is_ft_script(h) or _owner_pkh(coin.script) is not None or is_commit_script(h):
+                continue
+            from pyrxd.glyph.script import iter_input_refs
+
+            contract_held |= {bytes(o) for op, o in iter_input_refs(coin.script) if op == 0xD0}
         outs: dict[bytes, int] = {}
-        for out in tx.outputs:
+        ft_outputs: dict[bytes, set[int]] = {}
+        for j, out in enumerate(tx.outputs):
             body = out.locking_script.serialize()
             if is_ft_script(body.hex()):
                 ref = extract_ref_from_ft_script(body).to_bytes()
                 outs[ref] = outs.get(ref, 0) + out.satoshis
+                ft_outputs.setdefault(ref, set()).add(j)
+        for ref in outs:
+            if ref not in ins and ref not in minted and ref not in contract_held:
+                raise SandboxRejected(
+                    "ft",
+                    f"an FT output holds ref {_ref_label(ref)}, which is neither an FT this transaction spends "
+                    "nor one it deploys",
+                    hint="FT units come from FT inputs, or from revealing an FT commit. Another token's ref does not become an FT.",
+                )
+        # The FT covenant counts outputs: every output that pushes the FT's ref must be an FT output.
+        for j, out in enumerate(tx.outputs):
+            for ref in _get_push_refs(out.locking_script.serialize()):
+                ref = bytes(ref)
+                if ref in ins and j not in ft_outputs.get(ref, set()):
+                    raise SandboxRejected(
+                        "ft",
+                        f"output {j} pushes FT ref {_ref_label(ref)} but is not an FT output",
+                        hint="A spent FT's covenant requires as many FT outputs as outputs pushing its ref.",
+                    )
         for ref, n in outs.items():
             if ref in ins and n > ins[ref]:
                 raise SandboxRejected(
@@ -562,10 +663,21 @@ class SandboxChain:
                 )
         if not outs and not ins:
             return [Check("ft", "pass", "no fungible tokens")]
-        return [
-            Check("ft", "pass", f"{_ref_label(r)}: in {ins.get(r, 0):,}, out {outs.get(r, 0):,} units")
-            for r in set(ins) | set(outs)
-        ]
+        checks = []
+        for r in sorted(set(ins) | set(outs)):
+            if r in ins:
+                checks.append(Check("ft", "pass", f"{_ref_label(r)}: in {ins[r]:,}, out {outs.get(r, 0):,} units"))
+            elif r in minted:
+                checks.append(Check("ft", "pass", f"{_ref_label(r)}: deployed, {outs[r]:,} units minted"))
+            else:
+                checks.append(
+                    Check(
+                        "ft",
+                        "warn",
+                        f"{_ref_label(r)}: {outs[r]:,} units minted by a contract input the sandbox did NOT evaluate",
+                    )
+                )
+        return checks
 
 
 def _script(b: bytes):
@@ -813,7 +925,8 @@ async def run_program(source: str) -> dict:
     ``error`` is ``None`` on success, else ``{"type", "message", "line", "rule", "hint"}``,
     where ``line`` is the line in the visitor's code that raised (or ``None``), and ``rule``
     and ``hint`` are set when the sandbox refused a transaction. ``txids`` lists the
-    transactions this run added to the chain, oldest first.
+    transactions this run added to the chain, oldest first, and ``warnings`` every check on
+    them that passed with a warning (an unevaluated script, a burned token).
     """
     _install_playground_module()
     if not isinstance(source, str):
@@ -859,7 +972,19 @@ def _err(type_: str, message: str, line: int | None, *, rule: str = "", hint: st
 
 
 def _result(stdout: str, error: dict | None, txids: list[str]) -> dict:
-    return {"stdout": stdout, "error": error, "txids": list(txids), "height": sandbox.chain.height}
+    warnings = []
+    for txid in txids:
+        acc = sandbox.chain.accepted.get(txid)
+        for c in acc.checks if acc is not None else ():
+            if c.status == "warn":
+                warnings.append({"txid": txid, "rule": c.rule, "detail": c.detail})
+    return {
+        "stdout": stdout,
+        "error": error,
+        "txids": list(txids),
+        "warnings": warnings,
+        "height": sandbox.chain.height,
+    }
 
 
 def lesson_list() -> list[dict]:

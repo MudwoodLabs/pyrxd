@@ -378,7 +378,7 @@ async function runCodeInner() {
   try {
     result = toJs(await py.pg.run_program($("code").value));
   } catch (err) {
-    result = { stdout: "", error: { type: "InternalError", message: String(err), line: null, rule: "", hint: "" }, txids: [] };
+    result = { stdout: "", error: { type: "InternalError", message: String(err), line: null, rule: "", hint: "" }, txids: [], warnings: [] };
   }
   if (result.stdout) out.append(result.stdout);
   const e = result.error;
@@ -392,7 +392,14 @@ async function runCodeInner() {
       out.append(el("span", { class: "c-bad" }, `\n${e.type}${where}: ${e.message}\n`));
     }
     if (e.hint) out.append(el("span", { class: "c-hint" }, `  hint: ${e.hint}\n`));
-  } else {
+  }
+  const warnings = result.warnings || [];
+  for (const w of warnings) {
+    out.append(el("span", { class: "c-hint" }, `\n⚠ ${w.txid.slice(0, 12)}… ${w.rule}: ${w.detail}\n`));
+  }
+  if (!e && warnings.length) {
+    out.append(el("span", { class: "c-hint" }, `\n⚠ finished with ${warnings.length} warning(s): the sandbox accepted ${result.txids.length} transaction(s) but did not fully check them\n`));
+  } else if (!e) {
     out.append(el("span", { class: "c-ok" }, `\n✓ finished${result.txids.length ? `, ${result.txids.length} transaction(s) added to the sandbox chain` : ""}\n`));
     if (l.id !== "scratch") {
       store(`done:${l.id}`, "1");
