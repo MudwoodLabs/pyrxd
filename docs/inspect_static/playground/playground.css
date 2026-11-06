@@ -182,3 +182,7 @@ button.io:hover { background: var(--sunk); }
 .about h2 { font-size: 17px; margin: 0 0 8px; }
 .about p, .about ul { max-width: 80ch; }
 .foot { color: var(--muted); font-size: 12.5px; }
+.export-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.export-row .btn { margin-top: 0; }
+.export-row input { font: inherit; font-family: var(--mono, monospace); padding: 4px 8px; border: 1px solid currentColor; border-radius: 6px; background: transparent; color: inherit; min-width: 0; flex: 1 1 12em; }
+.export-status { margin-top: 6px; }

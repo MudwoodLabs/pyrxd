@@ -1062,3 +1062,86 @@ def describe_tx(txid: str | None = None) -> dict | None:
         "rules": [{"rule": k, "text": v} for k, v in RULES],
         "order": list(chain.order),
     }
+
+
+# ---------------------------------------------------------------------------
+# Export as project
+# ---------------------------------------------------------------------------
+
+EXPORT_NOTE = """\
+# {file}: exported from the Radiant Playground.
+#
+# This ran against the playground's sandbox chain, which lives in a browser tab. The
+# `playground` module it imports does not exist outside that page, so this file does not
+# run as it is. It is here so you keep what you wrote. To run the same steps on a real
+# local node, start from src/{package}/mint.py and tests/test_mint.py, which use
+# `pyrxd regtest up` and pyrxd.testing (see README.md).
+
+"""
+
+EXPORT_README = """\
+# playground/
+
+`{file}` is the code you had in the Radiant Playground when you pressed Export.
+
+It imports `from playground import sandbox`, the in-tab sandbox chain, so it does not run
+outside the page. The rest of this project is what `pyrxd new {name}` makes: a Glyph NFT
+mint in `src/{package}/mint.py` and a test, `tests/test_mint.py`, that mints on a
+throwaway regtest node and checks the result with the node. Swap the sandbox objects for
+the ones those files use:
+
+| playground              | local regtest chain (`main()` in mint.py) | tests                 |
+|-------------------------|-------------------------------------------|-----------------------|
+| `sandbox.client`        | `RegtestClient(RegtestNode())`            | `regtest_client`      |
+| `sandbox.wallet`        | `RegtestWallet.funded(node, 1.0)`         | `regtest_wallet`      |
+| `sandbox.faucet(rxd=1)` | funded by `RegtestWallet.funded`          | funded by the fixture |
+| `sandbox.minter()`      | `GlyphMinter(client, wallet, JsonFilePendingStore(dir))` | as in mint.py |
+
+For mainnet, mint.py's docstring says what to pass instead.
+
+The sandbox does not run Radiant's script interpreter; a real node does, so a transaction
+the sandbox accepted can still be refused there.
+"""
+
+
+def export_available() -> bool:
+    """True when the loaded pyrxd has the starter kit (`pyrxd new`) the export builds on."""
+    try:
+        import pyrxd.starter  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def export_project(project_name: str, lesson_id: str, code: str) -> dict:
+    """The starter project for ``project_name`` with the visitor's code added, as a zip.
+
+    Returns ``{"zip": bytes, "filename": str, "files": [paths]}``. The project is
+    ``pyrxd.starter.render_project`` unchanged, plus ``playground/<lesson file>`` (the code,
+    under a note that it needs the sandbox) and ``playground/README.md``. Raises
+    ``pyrxd.starter.ProjectNameError`` for an unusable name and ``KeyError`` for an
+    unknown lesson.
+    """
+    import zipfile
+
+    from pyrxd.starter import package_name_for, render_project
+
+    lesson = {x["id"]: x for x in lesson_list()}[lesson_id]
+    package = package_name_for(project_name)
+    fname = lesson["file"]
+    fields = {"file": fname, "package": package, "name": project_name}
+    files = render_project(
+        project_name,
+        overrides={
+            f"playground/{fname}": EXPORT_NOTE.format(**fields) + code,
+            "playground/README.md": EXPORT_README.format(**fields),
+        },
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(files):
+            info = zipfile.ZipInfo(f"{project_name}/{path}", date_time=(2026, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, files[path].encode("utf-8"))
+    return {"zip": buf.getvalue(), "filename": f"{project_name}.zip", "files": sorted(files)}

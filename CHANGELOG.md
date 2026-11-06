@@ -15,8 +15,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   relay fee floor, P2PKH, NFT and FT signatures, commit reveals, ref rules and FT conservation; it
   does not run Radiant's script interpreter, and says so on the page. Keys come from a pure-Python
   secp256k1 written for the page (it is not constant-time and holds only throwaway keys), checked
-  against coincurve in the tests. Nothing in the library changes. Export as a project is a stub
-  for now.
+  against coincurve in the tests. Nothing in the library changes. "Export as project" downloads
+  a zip of the project `pyrxd new` makes, with the visitor's code added under `playground/`.
 
 ### Changed (breaking)
 

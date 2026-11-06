@@ -121,6 +121,7 @@ for lesson in lessons.lesson_list():
     playground.reset_sandbox()
     r = asyncio.run(playground.run_program(lesson["code"]))
     out["runs"][lesson["id"]] = r["error"]
+out["export"] = playground.export_project("demo-app", "wallet", "print(1)\n")["files"]
 out["curve"] = type(sys.modules["coincurve"]).__name__, getattr(sys.modules["coincurve"], "_PYRXD_PLAYGROUND_SHIM", False)
 print(json.dumps(out))
 """
@@ -140,3 +141,4 @@ def test_every_lesson_runs_in_the_pyodide_shape():
     assert "pbkdf2_hmac: pure Python" in out["changed"]
     assert set(out["runs"]) == {x["id"] for x in LESSONS}
     assert all(err is None for err in out["runs"].values()), out["runs"]
+    assert "playground/wallet.py" in out["export"] and "tests/test_mint.py" in out["export"]

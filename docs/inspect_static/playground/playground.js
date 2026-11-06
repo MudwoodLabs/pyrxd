@@ -284,28 +284,66 @@ function wireEditor() {
   $("export").addEventListener("click", showExport);
 }
 
-// The starter kit (`pyrxd new`) is being built separately. Until it ships, this says so and
-// offers the one thing that already works: copying the code.
+function copyButton() {
+  return el("button", {
+    type: "button",
+    class: "btn",
+    onclick: async (e) => {
+      try {
+        await navigator.clipboard.writeText($("code").value);
+        e.target.textContent = "Copied";
+      } catch (_) {
+        e.target.textContent = "Copy failed: select the code and copy it by hand";
+      }
+    },
+  }, "Copy code");
+}
+
+// Export builds the project `pyrxd new` makes (pyrxd.starter.render_project, inside Python
+// here, no network) with this code added under playground/, and hands it over as a zip.
+// A pyrxd wheel without the starter kit gets the copy button only.
 function showExport() {
   const note = $("export-note");
   note.hidden = false;
+  if (!py || !py.pg.export_available()) {
+    note.replaceChildren(
+      el("div", null, "This build of pyrxd has no starter kit, so there is no project to export. Copy the code and run it against ",
+        el("code", null, "pyrxd regtest up"), ", swapping the sandbox objects for a real client and wallet."),
+      copyButton(),
+    );
+    return;
+  }
+  const l = LESSONS[cur];
+  const input = el("input", { type: "text", id: "export-name", value: "my-radiant-app", spellcheck: "false", "aria-label": "Project name" });
+  const status = el("div", { class: "export-status", role: "status" });
+  const go = el("button", {
+    type: "button",
+    class: "btn",
+    onclick: () => {
+      let out;
+      try {
+        out = toJs(py.pg.export_project(input.value.trim(), l.id, $("code").value));
+      } catch (e) {
+        const lines = String(e && e.message ? e.message : e).trim().split("\n");
+        status.textContent = lines[lines.length - 1];
+        return;
+      }
+      const url = URL.createObjectURL(new Blob([out.zip], { type: "application/zip" }));
+      const a = el("a", { href: url, download: out.filename });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      status.textContent = `Saved ${out.filename}: ${out.files.length} files. Unzip it and follow its README.md (it needs Python 3.10+ and docker).`;
+    },
+  }, "Download project");
   note.replaceChildren(
-    el("div", null, el("b", null, "Coming with the pyrxd starter kit. "),
-      "This button will hand you a ready-made project (made by ", el("code", null, "pyrxd new"),
-      ") with this code in it and a test that runs it on a local regtest chain. Until then, copy the code and run it against ",
-      el("code", null, "pyrxd regtest up"), ", swapping the sandbox objects for a real client and wallet."),
-    el("button", {
-      type: "button",
-      class: "btn",
-      onclick: async (e) => {
-        try {
-          await navigator.clipboard.writeText($("code").value);
-          e.target.textContent = "Copied";
-        } catch (_) {
-          e.target.textContent = "Copy failed: select the code and copy it by hand";
-        }
-      },
-    }, "Copy code"),
+    el("div", null, "A project made by ", el("code", null, "pyrxd new"),
+      ": a mint, a test that runs it on a throwaway local regtest node, and CI. Your code goes in ",
+      el("code", null, `playground/${l.file}`),
+      ". It imports the sandbox, so it will not run there as it is; playground/README.md says what to swap."),
+    el("div", { class: "export-row" }, el("label", { for: "export-name" }, "Project name"), input, go, copyButton()),
+    status,
   );
 }
 
