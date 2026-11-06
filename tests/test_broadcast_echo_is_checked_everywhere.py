@@ -264,7 +264,7 @@ _EXEMPT = {
     ("gravity/radiant_leg.py", "RadiantCovenantLeg._broadcast"): "injected Radiant client (via RadiantChainIO)",
     # Opt-in second-opinion clients (#937): the reply is compared with the local txid inline, and a
     # pyrxd ElectrumX client checks it first through the funnel.
-    ("gravity/radiant_leg.py", "RadiantChainIO._ask_second_opinion"): "injected Radiant clients, inline echo compare",
+    ("gravity/radiant_leg.py", "RadiantChainIO._second_opinion_takes"): "injected Radiant clients, inline echo compare",
     # Re-sends a held claim's bytes through the leg's RadiantChainIO (#937), the site listed above.
     ("gravity/watch/claim_executor.py", "ClaimExecutor._resend_held"): "injected Radiant client (via RadiantChainIO)",
     # GlyphMinter compares the echo inline with its own post-broadcast policy (a commit record is

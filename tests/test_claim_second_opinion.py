@@ -13,6 +13,7 @@ its operator (``source_key``) comes from ``pyrxd.network.source_identity``, not 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -506,3 +507,182 @@ async def test_a_claim_every_operator_refuses_is_still_retried_and_never_disarme
     assert len(fees.outpoints) == 2
     claim = primary.broadcasts[-1]
     assert _COVENANT in _spends(claim)
+
+
+# --------------------------------------------------------------------------- Mythos #947 fix round
+
+
+class _SlowNode(_OpNode):
+    """An ``_OpNode`` whose broadcast waits *delay* seconds first (``None``: no wait; ``inf``: hangs)."""
+
+    def __init__(self, url: str) -> None:
+        super().__init__(url)
+        self.delay: float | None = None
+
+    async def _call(self, method: str, params: list[Any]) -> Any:
+        if method == "blockchain.transaction.broadcast" and self.delay is not None:
+            if self.delay == float("inf"):
+                await asyncio.Event().wait()
+            await asyncio.sleep(self.delay)
+        return await super()._call(method, params)
+
+
+class _Custom:
+    """A custom second-opinion client: says its operator, and raises *error* from every call."""
+
+    def __init__(self, key, error: BaseException | None = None) -> None:
+        self.source_key = key
+        self.error = error
+        self.broadcasts: list[bytes] = []
+
+    async def broadcast(self, raw: bytes) -> str:
+        self.broadcasts.append(raw)
+        if self.error is not None:
+            raise self.error
+        return _txid(raw)
+
+    async def get_transaction(self, txid: str) -> bytes:  # pragma: no cover - not a read-back case
+        raise AssertionError("not a read-back case")
+
+
+# F1: one host is one operator, whatever key a client on it declares.
+
+
+def test_a_client_on_the_broadcast_clients_host_is_refused_whatever_key_it_declares() -> None:
+    disguised = _Custom(source_key("wss://electrum.alpha.example:50004/", operator="beta-op"))
+    assert str(disguised.source_key) != str(_primary().source_key), "a key unequal by value"
+    with pytest.raises(ValidationError, match="counted as two sources"):
+        RadiantChainIO(_primary()).with_second_opinion((disguised,))
+    with pytest.raises(ValidationError, match="counted as two sources"):
+        RadiantChainIO(_primary(), second_opinion=(disguised,))
+
+
+def test_a_declared_operator_on_another_host_is_still_accepted() -> None:
+    """Honest path for F1: a declaration on a host of its own is a second opinion."""
+    declared = _Custom(source_key("wss://electrum.beta.example/", operator="beta-op"))
+    assert RadiantChainIO(_primary()).with_second_opinion((declared,)).second_opinion == (declared,)
+
+
+# F4: any failure of one client is "did not take it", and a held claim always counts down.
+
+
+async def test_a_custom_client_that_raises_its_own_error_is_passed_over() -> None:
+    primary, third = _primary(), _second("gamma")
+    broken = _Custom(source_key("wss://electrum.beta.example/"), RuntimeError("custom client bug"))
+    raw = os.urandom(80)
+    io = RadiantChainIO(primary).with_second_opinion((broken, third))
+    assert await io.broadcast(raw) == _txid(raw), "the next operator is still asked"
+    assert broken.broadcasts == [raw]
+
+    alone = RadiantChainIO(_primary()).with_second_opinion((broken,))
+    with pytest.raises(PolicyRejection) as info:
+        await alone.broadcast(raw)
+    assert info.value.reason == _REJECTED and info.value.__context__ is None
+
+
+async def test_a_read_back_that_raises_its_own_error_is_not_taken() -> None:
+    class _BrokenRead(_Custom):
+        async def broadcast(self, raw: bytes) -> str:
+            raise PolicyRejection("already", code=-27, reason="txn-already-known")
+
+        async def get_transaction(self, txid: str) -> bytes:
+            raise RuntimeError("custom client bug")
+
+    io = RadiantChainIO(_primary()).with_second_opinion((_BrokenRead(source_key("wss://electrum.beta.example/")),))
+    with pytest.raises(PolicyRejection) as info:
+        await io.broadcast(os.urandom(80))
+    assert info.value.reason == _REJECTED
+
+
+async def test_a_held_claim_whose_second_opinion_breaks_ends_the_hold(tick) -> None:
+    """The Mythos #947 F4 case: a custom second opinion that starts raising its own error during a
+    hold used to skip the count-down, holding the claim until a restart."""
+    primary = _OpNode("wss://electrum.alpha.example/")
+    custom = _Custom(source_key("wss://electrum.beta.example/"))
+    ex, rec, fees = await _armed(primary, SeenStore())
+    leg = await ex._resolve_leg("swap-1", rec)
+    leg.chain_io = leg.chain_io.with_second_opinion((custom,))
+    primary.reject = (-26, _SCRIPT_FAILED)
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST and ex._held, said
+
+    custom.error = RuntimeError("custom client bug")
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "rebuilding next tick" in said, said
+    assert ex._held == {}
+
+    primary.reject = None
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    assert len(fees.outpoints) == 2, "rebuilt once the hold ended"
+
+
+async def test_a_cancelled_re_send_still_counts_down(tick) -> None:
+    """The reconciler's tick watchdog cancels a tick that outruns its budget; that re-send is spent."""
+    primary, second = _OpNode("wss://electrum.alpha.example/"), _SlowNode("wss://electrum.beta.example/")
+    ex, rec, _fees = await _with_second_opinion(primary, second, SeenStore(), resend_ticks=2)
+    primary.reject = (-26, _SCRIPT_FAILED)
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    (outpoint,) = ex._held
+
+    second.delay = float("inf")
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(tick(ex, rec), 0.2)
+    assert ex._held[outpoint][1] == 1, "one re-send spent"
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(tick(ex, rec), 0.2)
+    assert ex._held == {}, "the last one ends the hold"
+
+
+# F5: the whole round runs under one time budget.
+
+
+async def test_a_hanging_second_opinion_ends_the_round_at_the_budget() -> None:
+    primary, hung, third = _primary(), _SlowNode("wss://electrum.beta.example/"), _second("gamma")
+    hung.delay = float("inf")
+    io = RadiantChainIO(primary, second_opinion=(hung, third), second_opinion_timeout_s=0.1)
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    with pytest.raises(PolicyRejection) as info:
+        # The outer bound only keeps a broken budget from hanging the suite; it is not the subject.
+        await asyncio.wait_for(io.broadcast(os.urandom(80)), 5.0)
+    took = loop.time() - began
+    assert info.value.reason == _REJECTED
+    assert 0.1 <= took < 1.0, took
+    assert third.broadcasts == [], "the budget is spent; nothing more is asked"
+
+
+async def test_the_budget_is_for_the_whole_round_not_each_ask() -> None:
+    primary = _primary()
+    slow1, slow2 = _SlowNode("wss://electrum.beta.example/"), _SlowNode("wss://electrum.gamma.example/")
+    slow1.reject = (-26, "the second endpoint's reason")
+    slow1.delay = slow2.delay = 0.15
+    io = RadiantChainIO(primary, second_opinion=(slow1, slow2), second_opinion_timeout_s=0.25)
+    with pytest.raises(PolicyRejection) as info:
+        await asyncio.wait_for(io.broadcast(os.urandom(80)), 5.0)
+    assert info.value.reason == _REJECTED
+    assert slow2.mempool == {}, "the second ask had only what the first left of the budget"
+
+
+async def test_a_slow_second_opinion_inside_the_budget_still_takes_it() -> None:
+    """Honest path for F5."""
+    primary, slow = _primary(), _SlowNode("wss://electrum.beta.example/")
+    slow.delay = 0.05
+    raw = os.urandom(80)
+    io = RadiantChainIO(primary, second_opinion=(slow,), second_opinion_timeout_s=2.0)
+    assert await io.broadcast(raw) == _txid(raw)
+
+
+def test_the_default_budget_and_with_second_opinion_keeps_it() -> None:
+    from pyrxd.gravity.radiant_leg import SECOND_OPINION_TIMEOUT_S
+
+    assert RadiantChainIO(_primary())._second_opinion_timeout_s == SECOND_OPINION_TIMEOUT_S
+    io = RadiantChainIO(_primary(), second_opinion_timeout_s=3.0).with_second_opinion((_second(),))
+    assert io._second_opinion_timeout_s == 3.0
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("inf"), float("nan"), True, "10"])
+def test_the_budget_must_be_a_finite_positive_number(bad) -> None:
+    with pytest.raises(ValidationError, match="second_opinion_timeout_s"):
+        RadiantChainIO(_primary(), second_opinion_timeout_s=bad)

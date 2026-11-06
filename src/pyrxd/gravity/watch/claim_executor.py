@@ -686,7 +686,9 @@ class ClaimExecutor:
         they are re-sent for ``second_opinion_resend_ticks`` ticks; then the hold ends and the next tick
         rebuilds on a new fee input, so a lying second opinion (one that keeps nothing) delays a claim by
         at most that many ticks per rebuild, and the broadcast client sees a fresh claim each time. A
-        refusal from every client also ends the hold.
+        round in which no client takes them (every one refuses, or the chain IO's
+        ``second_opinion_timeout_s`` runs out) also ends the hold. Every other outcome of a re-send, an
+        unexpected exception or a cancelled tick included, spends one of those ticks.
 
         What the hold does NOT remove: once it ends while the claim is still unmined and the broadcast
         client still refuses, each later rebuild conflicts with the relayed claim on the second opinion,
@@ -707,6 +709,12 @@ class ClaimExecutor:
         except NetworkError as exc:
             self._count_down(outpoint, raw, left)
             return ExecOutcome.FAILED, f"held claim re-send failed (transient): {exc}"
+        except BaseException:
+            # Anything else (a custom client's own exception, or the reconciler's tick watchdog
+            # cancelling this tick) still spends a re-send, so the hold always ends and the claim is
+            # rebuilt; without this one recurring error kept it held until a restart (Mythos #947 F4).
+            self._count_down(outpoint, raw, left)
+            raise
         if isinstance(txid, SecondOpinionTxid):
             self._count_down(outpoint, raw, left)
             return (
