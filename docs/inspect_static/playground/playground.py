@@ -326,14 +326,24 @@ class SandboxChain:
 
         for j, out in enumerate(tx.outputs):
             try:
-                for _ in iter_script_ops_strict(out.locking_script.serialize()):
-                    pass
+                ops = [op.opcode for op in iter_script_ops_strict(out.locking_script.serialize())]
             except Exception:  # a push or ref operand runs past the end of the script
                 raise SandboxRejected(
                     "parse",
                     f"output {j}'s script does not decode: a push runs past its end",
                     hint="pyrxd's own script parser refuses it as Radiant's GetScriptOp would. Build scripts with pyrxd's builders.",
                 ) from None
+            # Radiant Core's CScript::GetPushRefs (tests/vendor/radiant_core/script.cpp, the
+            # OP_STATESEPARATOR branch) fails on a second OP_STATESEPARATOR, or on one after an
+            # OP_RETURN. Read from the source; not run on a node.
+            seps = [k for k, op in enumerate(ops) if op == 0xBD]
+            if len(seps) > 1 or (seps and 0x6A in ops[: seps[0]]):
+                raise SandboxRejected(
+                    "parse",
+                    f"output {j}'s script has "
+                    + ("more than one OP_STATESEPARATOR" if len(seps) > 1 else "an OP_STATESEPARATOR after OP_RETURN"),
+                    hint="Radiant allows one OP_STATESEPARATOR per script, and none after an OP_RETURN.",
+                )
         txid = tx.txid()
         if txid in self.accepted:
             raise SandboxRejected("inputs", f"transaction {txid} is already on the sandbox chain")
@@ -728,7 +738,7 @@ class SandboxChain:
                         "ft",
                         "warn",
                         f"{_ref_label(r)}: an FT-shaped output with {outs[r]:,} units, made with no FT input and "
-                        "no FT deploy. A node accepts this, but no Glyph reveal stands behind the ref",
+                        "no FT deploy. A node accepts this, but no FT reveal stands behind the ref",
                     )
                 )
             else:
@@ -743,9 +753,11 @@ class SandboxChain:
 
 
 def _code_script(script: bytes) -> bytes:
-    """The part of *script* after its first top-level ``OP_STATESEPARATOR``, or all of it.
+    """The part of *script* after its top-level ``OP_STATESEPARATOR``, or all of it.
 
-    ``OP_CODESCRIPTHASH*`` hashes this part. A script that does not decode is returned whole.
+    ``OP_CODESCRIPTHASH*`` hashes this part. The parse rule has already refused an output with
+    more than one separator, so "first" is the only one. A script that does not decode is
+    returned whole.
     """
     from pyrxd.glyph.script import TruncatedScriptError, iter_script_ops_strict
 
