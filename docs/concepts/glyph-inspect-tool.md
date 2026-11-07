@@ -663,6 +663,7 @@ narrower than they look.
 | `glue.py` (Python bootstrap) | same-origin | SHA-256 compared against `manifest.json` before evaluation. |
 | `secp256k1-bridge.js` (the one curve operation, in JavaScript) | same-origin (`/inspect/`) | SHA-256 compared against `manifest.json`, then the **checked bytes** are imported from a `blob:` URL — with one edit: the bridge's single import specifier is pointed at the `blob:` URL of the checked library below. The file's own URL is never imported. |
 | `vendor/noble-secp256k1.js` (vendored `@noble/secp256k1`) | same-origin (`/inspect/vendor/`) | SHA-256 compared against `manifest.json`, then the checked bytes are imported from a `blob:` URL, unedited. Which upstream release these bytes are is pinned separately, in git (`tests/fixtures/noble_secp256k1_upstream_pin.json`). |
+| `playground.py`, `sandbox_curve.py`, `lessons.py` (the `/playground/` page's own Python) | same-origin (`/playground/`) | SHA-256 compared against `manifest.json`, and the checked bytes are what is written into Pyodide and imported. Only the playground loads them; `/inspect/` and `/verify/` do not. `sandbox_curve.py` is a pure-Python secp256k1 that signs throwaway sandbox keys; it is not constant-time and is compared with coincurve by `tests/web/test_playground_curve_matches_coincurve.py`. |
 | `manifest.json` itself | same-origin | **Not hashed.** It is fetched with no integrity check, and every expected SHA-256 above is read out of it. |
 
 If a wheel's or `glue.py`'s SHA-256 mismatches the manifest, the install

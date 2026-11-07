@@ -3,10 +3,11 @@
 #
 # Run this when bumping Pyodide. It fetches the requested version from jsdelivr,
 # computes the SHA-384 hash, and updates EVERY place the version or the hash is
-# pinned. Today that is three files:
+# pinned. Today that is four files:
 #
-#   docs/inspect_static/inspect/index.html   <script src=… integrity=…>
-#   docs/inspect_static/verify/index.html    <script src=… integrity=…>
+#   docs/inspect_static/inspect/index.html     <script src=… integrity=…>
+#   docs/inspect_static/verify/index.html      <script src=… integrity=…>
+#   docs/inspect_static/playground/index.html  <script src=… integrity=…>
 #   docs/inspect_static/inspect/shared.js    PYODIDE_INDEX_URL (loadPyodide's indexURL)
 #
 # Why this exists: the Subresource Integrity (SRI) hash on the Pyodide <script>
@@ -63,6 +64,7 @@ echo "Pyodide v${VERSION}: ${HASH}"
 PAGES=(
   "docs/inspect_static/inspect/index.html"
   "docs/inspect_static/verify/index.html"
+  "docs/inspect_static/playground/index.html"
 )
 RUNTIME="docs/inspect_static/inspect/shared.js"
 
