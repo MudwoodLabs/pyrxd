@@ -310,9 +310,8 @@ def test_a_split_singleton_cannot_be_promoted_back(node, pg):
 def test_an_nft_ref_carried_into_an_ft_output(node, pg):
     """Shape 9 (review F12, NFT form). NFT input; an FT-shaped output carries the NFT's ref.
 
-    DISAGREE: the sandbox refuses ("Another token's ref does not become an FT"), the node
-    ACCEPTS. The NFT is gone (no output keeps its singleton) and an FT-shaped output now holds
-    its ref. If the sandbox is changed to accept this, update the sandbox pin.
+    The node ACCEPTS. The NFT is gone (no output keeps its singleton) and an FT-shaped output now
+    holds its ref. The sandbox used to refuse this; it now accepts it and warns on both counts.
     """
     nft, fee = _nft(node), _plain(node)
     pkh = Hex20(fee["key"].public_key().hash160())
@@ -321,7 +320,7 @@ def test_an_nft_ref_carried_into_an_ft_output(node, pg):
         [(build_ft_locking_script(pkh, nft["ref"]), 50_000_000), _fee_out(fee, 50_000_000 - nft["value"])],
     )
     sandbox, verdict = _judge(node, pg, "9 NFT ref into an FT-shaped output", tx)
-    assert sandbox.startswith("refused ft"), sandbox
+    assert sandbox == "accepted, warn ft refs", sandbox
     assert verdict == "accepted", verdict
 
 
@@ -350,17 +349,16 @@ def test_f12_an_ft_output_whose_ref_no_ft_input_or_deploy_provides(node, pg):
 
     No FT input, no FT commit: the FT script appears with no deploy behind it.
 
-    DISAGREE: the sandbox refuses, the node ACCEPTS. The FT script is a covenant on SPENDING,
-    so nothing in consensus checks how an FT-shaped output was created; a normal ref minted
-    from a spent outpoint is allowed in any output. If the sandbox is changed to accept this,
-    update the sandbox pin.
+    The node ACCEPTS. The FT script is a covenant on SPENDING, so nothing in consensus checks how
+    an FT-shaped output was created; a normal ref minted from a spent outpoint is allowed in any
+    output. The sandbox used to refuse this; it now accepts it with an ``ft`` warning.
     """
     fee = _plain(node)
     pkh = Hex20(fee["key"].public_key().hash160())
     ref = GlyphRef(txid=fee["txid"], vout=fee["vout"])
     tx = _tx([_input(fee)], [(build_ft_locking_script(pkh, ref), 50_000_000), _fee_out(fee, 50_000_000)])
     sandbox, verdict = _judge(node, pg, "6 F12 FT output minted from a plain outpoint", tx)
-    assert sandbox.startswith("refused ft"), sandbox
+    assert sandbox == "accepted, warn ft", sandbox
     assert verdict == "accepted", verdict
 
 

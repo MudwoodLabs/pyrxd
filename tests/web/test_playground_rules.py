@@ -254,8 +254,9 @@ class TestFtOutputs:
         assert exc.value.rule == "ft" and "not an FT output" in str(exc.value)
         sb.broadcast(_tx(sb, [(ft, k), (fee, k)], honest))
 
-    def test_an_nft_ref_does_not_become_an_ft(self, pg, sb):
-        """Review F12. What a node does with this is not measured; the sandbox refuses it."""
+    def test_an_nft_ref_in_an_ft_output_is_accepted_with_a_warning(self, pg, sb):
+        """Review F12. A regtest node ACCEPTS this (tests/test_playground_node_verdicts_regtest_e2e.py),
+        so the sandbox accepts it too, and warns that nothing deployed the units and the NFT is gone."""
         from pyrxd.glyph.script import build_ft_locking_script
 
         result, nft = _mint_nft(sb)
@@ -266,9 +267,27 @@ class TestFtOutputs:
             [(nft, k), (fee, k)],
             [(build_ft_locking_script(sb.wallet.pkh, result.ref), 50_000_000), _change(sb, fee, 50_000_000)],
         )
-        with pytest.raises(pg.SandboxRejected) as exc:
-            sb.broadcast(tx)
-        assert exc.value.rule == "ft" and "neither an FT" in str(exc.value)
+        checks = sb.chain.accepted[sb.broadcast(tx)].checks
+        ft = [c for c in checks if c.rule == "ft"]
+        assert [c.status for c in ft] == ["warn"] and "nothing deployed these units" in ft[0].detail
+        refs = [c for c in checks if c.rule == "refs"]
+        assert [c.status for c in refs] == ["warn"] and "no output keeps it as a singleton" in refs[0].detail
+
+    def test_an_ft_output_minted_from_a_plain_outpoint_is_accepted_with_a_warning(self, pg, sb):
+        """Review F12. A regtest node ACCEPTS an FT-shaped output whose ref is the outpoint the
+        transaction spends, with no FT commit behind it; the sandbox warns rather than passing it."""
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+
+        coin = sb.faucet(rxd=1)
+        ref = GlyphRef(txid=coin.txid, vout=coin.vout)
+        tx = _tx(
+            sb,
+            [(coin, sb.wallet.key)],
+            [(build_ft_locking_script(sb.wallet.pkh, ref), 50_000_000), _change(sb, coin, 50_000_000)],
+        )
+        ft = [c for c in sb.chain.accepted[sb.broadcast(tx)].checks if c.rule == "ft"]
+        assert [c.status for c in ft] == ["warn"] and "no FT commit was revealed" in ft[0].detail
 
     def test_a_deploy_says_it_minted_rather_than_passing_in_zero(self, pg, sb):
         """Review F6: the check line said 'in 0, out 10,000' beside a rule that forbids exactly that."""

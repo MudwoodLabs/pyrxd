@@ -52,6 +52,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   secp256k1 written for the page (it is not constant-time and holds only throwaway keys), checked
   against coincurve in the tests. Nothing in the library changes. "Export as project" downloads
   a zip of the project `pyrxd new` makes, with the visitor's code added under `playground/`.
+  The sandbox's ref, FT, delegate and public-key verdicts are checked against a regtest node by
+  `tests/test_playground_node_verdicts_regtest_e2e.py` (operator-run). Where the node accepts an
+  FT output that nothing deployed (another token's ref, or a spent outpoint), the sandbox accepts
+  it too, with a warning.
 
 ### Changed (breaking)
 

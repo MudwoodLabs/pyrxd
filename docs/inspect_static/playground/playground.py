@@ -143,8 +143,9 @@ RULES: tuple[tuple[str, str], ...] = (
     (
         "ft",
         "A Glyph FT's outputs hold no more units than its inputs (a deploy mints its supply once; a "
-        "contract the sandbox does not run may mint more, with a warning), and when an FT is spent, "
-        "every output that pushes its ref is an FT output.",
+        "contract the sandbox does not run may mint more, with a warning; an FT output with nothing "
+        "behind it is allowed by Radiant and gets a warning), and when an FT is spent, every output "
+        "that pushes its ref is an FT output.",
     ),
 )
 
@@ -651,14 +652,6 @@ class SandboxChain:
                 ref = extract_ref_from_ft_script(body).to_bytes()
                 outs[ref] = outs.get(ref, 0) + out.satoshis
                 ft_outputs.setdefault(ref, set()).add(j)
-        for ref in outs:
-            if ref not in ins and ref not in minted and ref not in contract_held:
-                raise SandboxRejected(
-                    "ft",
-                    f"an FT output holds ref {_ref_label(ref)}, which is neither an FT this transaction spends "
-                    "nor one it deploys",
-                    hint="FT units come from FT inputs, or from revealing an FT commit. Another token's ref does not become an FT.",
-                )
         # The FT covenant counts outputs: every output that pushes the FT's ref must be an FT output.
         for j, out in enumerate(tx.outputs):
             for ref in _get_push_refs(out.locking_script.serialize()):
@@ -684,6 +677,19 @@ class SandboxChain:
                 checks.append(Check("ft", "pass", f"{_ref_label(r)}: in {ins[r]:,}, out {outs.get(r, 0):,} units"))
             elif r in minted:
                 checks.append(Check("ft", "pass", f"{_ref_label(r)}: deployed, {outs[r]:,} units minted"))
+            elif r not in contract_held:
+                # Measured on a regtest node (tests/test_playground_node_verdicts_regtest_e2e.py): Radiant
+                # accepts an FT output whose ref is a spent outpoint or another token's ref. The FT script
+                # restricts spending the output, not creating it.
+                checks.append(
+                    Check(
+                        "ft",
+                        "warn",
+                        f"{_ref_label(r)}: {outs[r]:,} units in an FT output that no FT input, deploy or contract "
+                        "provides. Radiant accepts this, but no FT commit was revealed here, so nothing deployed "
+                        "these units",
+                    )
+                )
             else:
                 checks.append(
                     Check(
