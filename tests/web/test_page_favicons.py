@@ -59,8 +59,9 @@ def test_each_icon_is_the_type_and_size_its_link_declares(page: str):
             assert link.get("type") == "image/svg+xml"
             svg = path.read_text(encoding="utf-8")
             assert svg.startswith("<svg ") and 'viewBox="0 0 64 64"' in svg
-            # A static picture: no script, no external reference, nothing for img-src to refuse.
-            assert not re.search(r"<script|href=|url\(|<foreignObject", svg), svg[:200]
+            # A static picture: no script and no external reference, nothing for img-src to refuse.
+            # url(#id) points at a gradient defined in the same file, so it is allowed.
+            assert not re.search(r"<script|href=|url\((?!#)|<foreignObject", svg), svg[:200]
         else:
             width, height = _png_size(path)
             assert width == height, f"{path.name} is {width}x{height}"
