@@ -79,6 +79,9 @@ async function boot() {
       wheelsBase: WHEELS_BASE,
       glueUrl: GLUE_URL,
       onProgress: (p) => { bar.value = Math.min(p, 90); },
+      // No JS curve: the sandbox checks signatures in Python (sandbox_curve.py), so the
+      // boot's "signature checking is off" warning would be false on this page.
+      signatureCheck: "not-used",
     });
     const footer = buildLine(runtime);
     if (footer) $("build-version").textContent = footer;
