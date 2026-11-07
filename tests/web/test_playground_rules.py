@@ -227,8 +227,9 @@ class TestMalformed:
         with pytest.raises(pg.SandboxRejected) as exc:
             sb.broadcast(_tx(sb, [(coin, k)], [(script, 1_000), _change(sb, coin, 1_000)]))
         assert exc.value.rule == "parse" and why in str(exc.value)
-        coin = sb.faucet(rxd=1)
-        sb.broadcast(_tx(sb, [(coin, k)], [(b"\x51\xbd\x51", 1_000), _change(sb, coin, 1_000)]))
+        for honest in (b"\x51\xbd\x51", b"\x51\xbd\x6a"):  # one separator; OP_RETURN after it is allowed
+            coin = sb.faucet(rxd=1)
+            sb.broadcast(_tx(sb, [(coin, k)], [(honest, 1_000), _change(sb, coin, 1_000)]))
 
 
 class TestFtOutputs:
