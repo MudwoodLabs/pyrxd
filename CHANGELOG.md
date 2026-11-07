@@ -62,7 +62,8 @@ for the autonomous claim, and the Radiant Playground docs page.
   `tests/test_playground_node_verdicts_regtest_e2e.py`). Where the two differed, the sandbox now
   follows the node: an FT-shaped output with no FT input or deploy behind it is accepted with a
   warning, and a delegate commit's reveal is refused unless it burns the delegate ref in exactly
-  one burn output.
+  one burn output. An output script Radiant cannot split into state and code (two
+  OP_STATESEPARATORs, or one after OP_RETURN) is refused at parse.
 
 ### Changed (breaking)
 
