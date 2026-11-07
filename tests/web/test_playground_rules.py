@@ -212,6 +212,25 @@ class TestMalformed:
         assert exc.value.rule == "parse" and "does not decode" in str(exc.value)
         sb.chain.submit(raw)
 
+    @pytest.mark.parametrize(
+        ("script", "why"),
+        [
+            (b"\x51\xbd\x51\xbd\x51", "more than one OP_STATESEPARATOR"),
+            (b"\x6a\xbd\x51", "after OP_RETURN"),
+        ],
+    )
+    def test_a_script_radiant_cannot_split_into_state_and_code_is_refused(self, pg, sb, script, why):
+        """GetPushRefs fails on a second OP_STATESEPARATOR or one after OP_RETURN (vendored
+        script.cpp, read only). The honest case, one separator, is accepted."""
+        coin = sb.faucet(rxd=1)
+        k = sb.wallet.key
+        with pytest.raises(pg.SandboxRejected) as exc:
+            sb.broadcast(_tx(sb, [(coin, k)], [(script, 1_000), _change(sb, coin, 1_000)]))
+        assert exc.value.rule == "parse" and why in str(exc.value)
+        for honest in (b"\x51\xbd\x51", b"\x51\xbd\x6a"):  # one separator; OP_RETURN after it is allowed
+            coin = sb.faucet(rxd=1)
+            sb.broadcast(_tx(sb, [(coin, k)], [(honest, 1_000), _change(sb, coin, 1_000)]))
+
 
 class TestFtOutputs:
     def test_units_minted_by_a_contract_input_are_a_warning_not_a_refusal(self, pg, sb):
@@ -272,6 +291,7 @@ class TestFtOutputs:
         ft = [c for c in checks if c.rule == "ft"]
         assert [c.status for c in ft] == ["warn"]
         assert "no FT input and no FT deploy" in ft[0].detail and "A node accepts this" in ft[0].detail
+        assert "no FT reveal stands behind" in ft[0].detail
         refs = [c for c in checks if c.rule == "refs"]
         assert any(c.status == "warn" and "the NFT is gone" in c.detail for c in refs)
         assert sorted({c.rule for c in checks if c.status != "pass"}) == ["ft", "refs"]
@@ -320,7 +340,7 @@ class TestFtOutputs:
 
 
 class TestScripts:
-    def _delegate_reveal(self, sb, *, gly=b"gly", delegate=True, burns=1, carry=False, state_prefix=False):
+    def _delegate_reveal(self, sb, *, gly=b"gly", delegate=True, burns=1, carry=None, state_prefix=False):
         """Commit to a payload (behind a delegate prefix), then reveal it into the new NFT.
 
         ``burns`` delegate burn outputs go beside the NFT; ``carry`` adds an output that pushes
@@ -343,14 +363,19 @@ class TestScripts:
         txid = sb.broadcast(_tx(sb, [(coin, k)], [(commit, 50_000_000), _change(sb, coin, 50_000_000)]))
         held = sb.chain.utxos[(txid, 0)]
         new_ref = GlyphRef(txid=txid, vout=0)
-        outs = [(build_nft_locking_script(sb.wallet.pkh, new_ref), held.value - FEE - (1_000_000 if carry else 0))]
+        outs = [
+            (
+                build_nft_locking_script(sb.wallet.pkh, new_ref),
+                held.value - FEE - (1_000_000 if carry is not None else 0),
+            )
+        ]
         if delegate:
             burn = build_delegate_burn_script(dref)
             if state_prefix:
                 burn = encode_pushdata(b"st") + b"\xbd" + burn
             outs += [(burn, 0)] * burns
-            if carry:
-                outs.append((b"\xd0" + dref.to_bytes() + b"\x75" + _p2pkh(sb.wallet.pkh), 1_000_000))
+            if carry is not None:
+                outs.append((bytes([carry]) + dref.to_bytes() + b"\x75" + _p2pkh(sb.wallet.pkh), 1_000_000))
         tx = _tx(sb, [(held, k)], outs, sign=False)
         sig = k.sign(tx.preimage(0)) + b"\x41"
         pub = k.public_key().serialize()
@@ -375,10 +400,12 @@ class TestScripts:
             sb.broadcast(self._delegate_reveal(sb, burns=burns))
         assert exc.value.rule == "scripts" and f"and has {burns}" in str(exc.value)
 
-    def test_a_delegate_reveal_must_not_carry_the_delegate_ref_forward(self, pg, sb):
-        """The prefix's OP_REFOUTPUTCOUNT_OUTPUTS == 0 (from reading build_delegate_commit_prefix)."""
+    @pytest.mark.parametrize("carry", [0xD0, 0xD8])
+    def test_a_delegate_reveal_must_not_carry_the_delegate_ref_forward(self, pg, sb, carry):
+        """The prefix's OP_REFOUTPUTCOUNT_OUTPUTS == 0 (from reading build_delegate_commit_prefix),
+        by either push opcode."""
         with pytest.raises(pg.SandboxRejected) as exc:
-            sb.broadcast(self._delegate_reveal(sb, carry=True))
+            sb.broadcast(self._delegate_reveal(sb, carry=carry))
         assert exc.value.rule == "scripts" and "carry its delegate ref" in str(exc.value)
 
     def test_a_burn_behind_a_state_script_counts(self, pg, sb):
