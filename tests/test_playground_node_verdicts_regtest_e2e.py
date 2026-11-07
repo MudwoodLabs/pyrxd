@@ -310,9 +310,9 @@ def test_a_split_singleton_cannot_be_promoted_back(node, pg):
 def test_an_nft_ref_carried_into_an_ft_output(node, pg):
     """Shape 9 (review F12, NFT form). NFT input; an FT-shaped output carries the NFT's ref.
 
-    DISAGREE: the sandbox refuses ("Another token's ref does not become an FT"), the node
-    ACCEPTS. The NFT is gone (no output keeps its singleton) and an FT-shaped output now holds
-    its ref. If the sandbox is changed to accept this, update the sandbox pin.
+    The node ACCEPTS. The NFT is gone (no output keeps its singleton) and an FT-shaped output
+    now holds its ref. The sandbox used to refuse this ("Another token's ref does not become an
+    FT"); it now accepts it with an ``ft`` warning and a ``refs`` warning that the NFT is gone.
     """
     nft, fee = _nft(node), _plain(node)
     pkh = Hex20(fee["key"].public_key().hash160())
@@ -321,7 +321,7 @@ def test_an_nft_ref_carried_into_an_ft_output(node, pg):
         [(build_ft_locking_script(pkh, nft["ref"]), 50_000_000), _fee_out(fee, 50_000_000 - nft["value"])],
     )
     sandbox, verdict = _judge(node, pg, "9 NFT ref into an FT-shaped output", tx)
-    assert sandbox.startswith("refused ft"), sandbox
+    assert sandbox == "accepted, warn ft refs", sandbox
     assert verdict == "accepted", verdict
 
 
@@ -350,17 +350,16 @@ def test_f12_an_ft_output_whose_ref_no_ft_input_or_deploy_provides(node, pg):
 
     No FT input, no FT commit: the FT script appears with no deploy behind it.
 
-    DISAGREE: the sandbox refuses, the node ACCEPTS. The FT script is a covenant on SPENDING,
-    so nothing in consensus checks how an FT-shaped output was created; a normal ref minted
-    from a spent outpoint is allowed in any output. If the sandbox is changed to accept this,
-    update the sandbox pin.
+    The node ACCEPTS. The FT script is a covenant on SPENDING, so nothing in consensus checks
+    how an FT-shaped output was created; a normal ref minted from a spent outpoint is allowed in
+    any output. The sandbox used to refuse this; it now accepts it with an ``ft`` warning.
     """
     fee = _plain(node)
     pkh = Hex20(fee["key"].public_key().hash160())
     ref = GlyphRef(txid=fee["txid"], vout=fee["vout"])
     tx = _tx([_input(fee)], [(build_ft_locking_script(pkh, ref), 50_000_000), _fee_out(fee, 50_000_000)])
     sandbox, verdict = _judge(node, pg, "6 F12 FT output minted from a plain outpoint", tx)
-    assert sandbox.startswith("refused ft"), sandbox
+    assert sandbox == "accepted, warn ft", sandbox
     assert verdict == "accepted", verdict
 
 
@@ -406,23 +405,21 @@ def _delegate_reveal(node, *, burn: bool) -> Transaction:
 
 
 def test_f3_a_delegate_reveal_without_its_burn(node, pg):
-    """Shape 7 (review F3). The sandbox does not run the delegate burn and says so with a warning.
-
-    DISAGREE in verdict, by design: the sandbox ACCEPTS with a ``scripts`` warning that the
-    burn was NOT evaluated (and a ``refs`` warning that the delegate ref is burned), the node
-    REFUSES on the prefix's output count. The warnings are the sandbox's whole claim here.
+    """Shape 7 (review F3). The node REFUSES a delegate reveal without its burn, on the prefix's
+    output count. The sandbox used to accept it with a ``scripts`` warning that the burn was NOT
+    evaluated; it now checks the prefix's two conditions and refuses it under ``scripts``.
     """
     sandbox, verdict = _judge(
         node, pg, "7 F3 delegate reveal WITHOUT the burn output", _delegate_reveal(node, burn=False)
     )
-    assert sandbox == "accepted, warn refs scripts", sandbox
+    assert sandbox.startswith("refused scripts") and "and has 0" in sandbox, sandbox
     assert _COVENANT_COUNT in verdict, verdict
 
     honest = _delegate_reveal(node, burn=True)
     # The refs warning is true here too: OP_REQUIREINPUTREF is not a push, so the burn consumes
     # the delegate ref, which is the point of a delegate burn.
     assert _judge(node, pg, "7 honest: delegate reveal WITH the burn output", honest) == (
-        "accepted, warn refs scripts",
+        "accepted, warn refs",
         "accepted",
     )
 

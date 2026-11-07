@@ -52,6 +52,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   secp256k1 written for the page (it is not constant-time and holds only throwaway keys), checked
   against coincurve in the tests. Nothing in the library changes. "Export as project" downloads
   a zip of the project `pyrxd new` makes, with the visitor's code added under `playground/`.
+  The sandbox's ref, FT, delegate and key rules were then put to a regtest node (new operator-run
+  `tests/test_playground_node_verdicts_regtest_e2e.py`). Where the two differed, the sandbox now
+  follows the node: an FT-shaped output with no FT input or deploy behind it is accepted with a
+  warning, and a delegate commit's reveal is refused unless it burns the delegate ref in exactly
+  one burn output.
 
 ### Changed (breaking)
 

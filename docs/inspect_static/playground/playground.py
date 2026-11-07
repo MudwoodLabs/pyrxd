@@ -16,7 +16,8 @@ that list beside every transaction, so a visitor never has to guess what "accept
 * plain P2PKH, Glyph NFT and Glyph FT inputs carry a valid signature by the owning key,
   over the preimage pyrxd signs (``SIGHASH_ALL | FORKID`` only);
 * Glyph commit inputs reveal a payload whose hash the commit locked, and produce an
-  output holding the new token with the ref type the commit demands;
+  output holding the new token with the ref type the commit demands; a delegate commit's
+  reveal carries its delegate ref into no output and has exactly one delegate burn output;
 * the ref rules: every ref an output pushes with ``OP_PUSHINPUTREF`` or
   ``OP_PUSHINPUTREFSINGLETON`` comes from an input (its outpoint, or a ref an input's
   script pushes), and a singleton ref lands in at most one output;
@@ -32,7 +33,8 @@ The ref and FT rules here are the sandbox's own statement of them, written from 
 docstrings (``pyrxd.glyph.script.script_carries_ref``,
 ``pyrxd.transaction.transaction_preimage._get_push_refs``,
 ``pyrxd.glyph.script.build_ft_locking_script``), not from Radiant-Core. Nothing here should
-be cited as what consensus does.
+be cited as what consensus does. ``tests/test_playground_node_verdicts_regtest_e2e.py`` (operator-run)
+puts the ref, FT, delegate and key rules to a regtest node and pins where the two agree.
 
 This module is plain Python. ``tests/web/test_playground_sandbox.py`` runs it under CPython
 with the real coincurve; the page runs it under Pyodide with ``sandbox_curve`` standing in.
@@ -138,13 +140,18 @@ RULES: tuple[tuple[str, str], ...] = (
     ("inputs", "Every input exists, is unspent, and is spent once."),
     ("value", "Outputs spend no more than the inputs bring in."),
     ("fee", "The fee meets the relay floor for the transaction's size."),
-    ("scripts", "Each P2PKH, Glyph NFT, Glyph FT and Glyph commit input is unlocked correctly."),
+    (
+        "scripts",
+        "Each P2PKH, Glyph NFT, Glyph FT and Glyph commit input is unlocked correctly, and a delegate "
+        "commit's reveal burns its delegate ref in exactly one burn output.",
+    ),
     ("refs", "Every ref an output holds comes from an input; a singleton's ref is in one output only."),
     (
         "ft",
         "A Glyph FT's outputs hold no more units than its inputs (a deploy mints its supply once; a "
         "contract the sandbox does not run may mint more, with a warning), and when an FT is spent, "
-        "every output that pushes its ref is an FT output.",
+        "every output that pushes its ref is an FT output. An FT-shaped output with no FT input and "
+        "no deploy behind it is accepted, as a node accepts it, with a warning.",
     ),
 )
 
@@ -439,7 +446,7 @@ class SandboxChain:
         if is_commit_script(hexs):
             from pyrxd.glyph.script import split_delegate_commit_prefix
 
-            delegate = split_delegate_commit_prefix(script)[0] is not None
+            delegate = split_delegate_commit_prefix(script)[0]
             owner = bytes(extract_owner_pkh_from_commit_script(script))
             self._check_sig(tx, i, pushes, owner, "Glyph commit", extra=2)
             assert pushes is not None
@@ -455,16 +462,50 @@ class SandboxChain:
                     hint="The reveal must carry the exact CBOR the commit hashed. Changing metadata after commit strands the commit.",
                 )
             self._check_commit_output(tx, i, script)
-            if delegate:
-                return (
-                    f"input {i} is a delegate commit: its signature, reveal and token output were checked, but "
-                    "the delegate burn its prefix demands was NOT evaluated. Test it on `pyrxd regtest up`."
-                )
+            if delegate is not None:
+                self._check_delegate_burn(tx, i, delegate.to_bytes())
             return None
         return (
             f"input {i}'s script was NOT evaluated: the sandbox does not run Radiant's script "
             "interpreter, so this spend is unchecked. Test it on `pyrxd regtest up`."
         )
+
+    def _check_delegate_burn(self, tx, i: int, base_ref: bytes) -> None:
+        """The two things a delegate commit's prefix asserts about its reveal.
+
+        The prefix (``pyrxd.glyph.script.build_delegate_commit_prefix``) runs
+        ``OP_REFOUTPUTCOUNT_OUTPUTS == 0`` on the base ref and then
+        ``OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS == 1`` on the burn script
+        ``OP_REQUIREINPUTREF <base_ref> OP_RETURN "del"``. A regtest node refuses a reveal without
+        the burn output (``tests/test_playground_node_verdicts_regtest_e2e.py``, shape 7).
+        """
+        from pyrxd.glyph.script import build_delegate_burn_script, iter_input_refs
+        from pyrxd.glyph.types import GlyphRef
+
+        label = _ref_label(base_ref)
+        carriers = [
+            j
+            for j, out in enumerate(tx.outputs)
+            if any(
+                op in (0xD0, 0xD8) and bytes(o) == base_ref for op, o in iter_input_refs(out.locking_script.serialize())
+            )
+        ]
+        if carriers:
+            raise SandboxRejected(
+                "scripts",
+                f"input {i} is a delegate commit, and outputs {carriers} carry its delegate ref {label} forward",
+                hint="A delegate commit's reveal must consume the delegate ref: no output may push it.",
+            )
+        burn = build_delegate_burn_script(GlyphRef.from_bytes(base_ref))
+        burns = [j for j, out in enumerate(tx.outputs) if _code_script(out.locking_script.serialize()) == burn]
+        if len(burns) != 1:
+            raise SandboxRejected(
+                "scripts",
+                f"input {i} is a delegate commit: its reveal needs exactly one delegate burn output for "
+                f"{label}, and has {len(burns)}",
+                hint='Add one output OP_REQUIREINPUTREF <ref> OP_RETURN "del" '
+                "(pyrxd.glyph.script.build_delegate_burn_script).",
+            )
 
     def _check_sig(self, tx, i: int, pushes, pkh: bytes, kind: str, *, extra: int) -> None:
         from pyrxd.hash import hash160
@@ -651,14 +692,11 @@ class SandboxChain:
                 ref = extract_ref_from_ft_script(body).to_bytes()
                 outs[ref] = outs.get(ref, 0) + out.satoshis
                 ft_outputs.setdefault(ref, set()).add(j)
-        for ref in outs:
-            if ref not in ins and ref not in minted and ref not in contract_held:
-                raise SandboxRejected(
-                    "ft",
-                    f"an FT output holds ref {_ref_label(ref)}, which is neither an FT this transaction spends "
-                    "nor one it deploys",
-                    hint="FT units come from FT inputs, or from revealing an FT commit. Another token's ref does not become an FT.",
-                )
+        # An FT-shaped output whose ref is neither a spent FT nor a deploy is still valid on a node
+        # (tests/test_playground_node_verdicts_regtest_e2e.py, shapes 6 and 9): the FT script is a
+        # covenant on SPENDING, and nothing checks how an FT-shaped output was created. The refs
+        # rule has already checked that some input provides the ref.
+        unbacked = {ref for ref in outs if ref not in ins and ref not in minted and ref not in contract_held}
         # The FT covenant counts outputs: every output that pushes the FT's ref must be an FT output.
         for j, out in enumerate(tx.outputs):
             for ref in _get_push_refs(out.locking_script.serialize()):
@@ -684,6 +722,15 @@ class SandboxChain:
                 checks.append(Check("ft", "pass", f"{_ref_label(r)}: in {ins[r]:,}, out {outs.get(r, 0):,} units"))
             elif r in minted:
                 checks.append(Check("ft", "pass", f"{_ref_label(r)}: deployed, {outs[r]:,} units minted"))
+            elif r in unbacked:
+                checks.append(
+                    Check(
+                        "ft",
+                        "warn",
+                        f"{_ref_label(r)}: an FT-shaped output with {outs[r]:,} units, made with no FT input and "
+                        "no FT deploy. A node accepts this, but no Glyph reveal stands behind the ref",
+                    )
+                )
             else:
                 checks.append(
                     Check(
@@ -693,6 +740,22 @@ class SandboxChain:
                     )
                 )
         return checks
+
+
+def _code_script(script: bytes) -> bytes:
+    """The part of *script* after its first top-level ``OP_STATESEPARATOR``, or all of it.
+
+    ``OP_CODESCRIPTHASH*`` hashes this part. A script that does not decode is returned whole.
+    """
+    from pyrxd.glyph.script import TruncatedScriptError, iter_script_ops_strict
+
+    try:
+        for op in iter_script_ops_strict(script):
+            if op.opcode == 0xBD:  # OP_STATESEPARATOR
+                return script[op.next_pos :]
+    except TruncatedScriptError:
+        return script
+    return script
 
 
 def _script(b: bytes):
