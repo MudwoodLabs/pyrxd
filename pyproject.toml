@@ -208,6 +208,9 @@ include = [
     { path = "docs/runbooks", format = ["sdist"] },
     { path = "docs/research", format = ["sdist"] },
     { path = "docs/solutions", format = ["sdist"] },
+    # The docs site's icon (`docs/conf.py`, `html_favicon`) and the licence of the Radiant logo in it.
+    { path = "docs/_static/favicon.svg", format = ["sdist"] },
+    { path = "docs/_static/RADIANT-LOGO-LICENSE.txt", format = ["sdist"] },
     # The browser-hosted pages' SOURCE only -- `/inspect/` (the developer tool) and
     # `/verify/` (the public HashMark check). Listed by EXTENSION rather than as the whole
     # directory on purpose: `docs/inspect_static/inspect/wheels/*.whl` are GITIGNORED build

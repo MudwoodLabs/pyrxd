@@ -1,9 +1,9 @@
 The favicons in this folder (favicon.svg, favicon-32.png,
-apple-touch-icon.png) contain the Radiant "R" logo, taken from Radiant-Core/Radiant-Core
-doc/images/RXD_dark_logo.svg at commit 0e88cf0049 (https://github.com/Radiant-Core/Radiant-Core),
-drawn in that file's cyan-to-cream colours on a navy disc, as Radiant Core's app icon
-(src/icons/radiant.ico) draws it. That repository is distributed under the MIT licence below,
-copied from its COPYING file.
+apple-touch-icon.png) contain the Radiant "R" logo, taken from
+Radiant-Core/Radiant-Core doc/images/RXD_light_logo.svg at commit 9cd72aa98e
+(https://github.com/Radiant-Core/Radiant-Core) and recoloured for this page. That repository is
+distributed under the MIT licence below, copied from its COPYING file. The licence covers the
+copyright in the image; it is not a trademark licence.
 
 Copyright (c) 2022-2026 The Radiant Developers
 Copyright (c) 2009-2022 The Bitcoin developers

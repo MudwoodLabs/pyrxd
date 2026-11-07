@@ -7,6 +7,7 @@ editing this file.
 
 from __future__ import annotations
 
+import ast
 import re
 import struct
 from pathlib import Path
@@ -89,3 +90,29 @@ def test_the_csp_lets_the_icons_load(page: str):
     assert csp, f"{page}: no CSP meta tag"
     img_src = next((c.split() for c in csp.group(1).split(";") if c.split()[:1] == ["img-src"]), None)
     assert img_src is not None and "'self'" in img_src, f"{page}: img-src {img_src} would block its own icons"
+
+
+def test_each_page_has_its_own_icon():
+    """Each page's R is drawn in that page's own colour, so the tabs can be told apart."""
+    svgs = {page: (_STATIC / page / "favicon.svg").read_bytes() for page in _PAGES}
+    assert len(set(svgs.values())) == len(svgs), "two pages share one icon"
+
+
+def test_the_docs_site_icon_is_the_one_conf_py_names_and_is_credited():
+    docs = _STATIC.parent
+    tree = ast.parse((docs / "conf.py").read_text(encoding="utf-8"))
+    names = [
+        n.value.value
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "html_favicon" for t in n.targets)
+        and isinstance(n.value, ast.Constant)
+    ]
+    assert names, "docs/conf.py sets no html_favicon"
+    icon = docs / names[0]
+    svg = icon.read_text(encoding="utf-8")
+    assert svg.startswith("<svg ") and not re.search(r"<script|href=|url\((?!#)|<foreignObject", svg)
+    assert "The Radiant Developers" in svg and _LICENCE in svg
+    text = (icon.parent / _LICENCE).read_text(encoding="utf-8")
+    assert "Copyright (c) 2022-2026 The Radiant Developers" in text
+    assert "The above copyright notice and this permission notice shall be included" in text

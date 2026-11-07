@@ -71,6 +71,9 @@ intersphinx_mapping = {
 html_theme = "furo"
 html_title = f"pyrxd {version}"
 html_static_path = ["_static"]
+# The Radiant R, light on navy. Each page under ``inspect_static/`` has its own icon in its own
+# colour; the logo's MIT licence is ``_static/RADIANT-LOGO-LICENSE.txt``.
+html_favicon = "_static/favicon.svg"
 # ``html_extra_path`` directories have their *contents* copied verbatim
 # into the built site root without Sphinx parsing. Every page under
 # ``docs/inspect_static/`` must therefore live in a SUBFOLDER: a file at
