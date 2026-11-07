@@ -226,10 +226,11 @@ include = [
     { path = "docs/inspect_static/*/*.html", format = ["sdist"] },
     { path = "docs/inspect_static/*/*.css", format = ["sdist"] },
     { path = "docs/inspect_static/*/*.js", format = ["sdist"] },
-    # A page's favicon (the playground's, today): reviewed source, not a build output. No
-    # build step writes a .svg or .png into these folders.
+    # Each page's favicon: reviewed source, not a build output. No build step writes a .svg
+    # or .png into these folders. The licence of the Radiant logo they carry sits beside them.
     { path = "docs/inspect_static/*/*.svg", format = ["sdist"] },
     { path = "docs/inspect_static/*/*.png", format = ["sdist"] },
+    { path = "docs/inspect_static/*/RADIANT-LOGO-LICENSE.txt", format = ["sdist"] },
     # One segment deeper, and named rather than wildcarded: the vendored secp256k1
     # the pages install so a browser can check a signature, plus the MIT notice that
     # must travel with it. A `*/*/*.js` rule would have covered it, but it would also
