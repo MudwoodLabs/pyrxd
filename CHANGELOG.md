@@ -6,6 +6,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-11-07
+
+Header verification is stricter (see Changed (breaking)): read that entry before upgrading code that
+verifies HashMarks or caches headers. New: `pyrxd new`, `pyrxd.testing`, an opt-in second opinion
+for the autonomous claim, and the Radiant Playground docs page.
+
 ### Added
 
 - **`pyrxd new NAME`: a starter project with a Glyph mint and a test on a local regtest chain.**
