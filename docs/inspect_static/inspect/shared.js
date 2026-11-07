@@ -352,6 +352,16 @@ async function installCurveBackend(bridges, manifest, curveUrl) {
 // Boot — Pyodide, the pyrxd wheel, and the glue module's entry points
 // ---------------------------------------------------------------------
 
+// What the console says about this tab's signature check, or null for nothing. A page
+// whose verdicts never use the JS curve passes `signatureCheck: "not-used"` and gets no
+// warning: the playground checks its sandbox's signatures in Python, and "signature
+// checking is off" in its console was false there. Every other page that ends up with
+// no curve, including one that forgot `curveUrl`, is still warned about.
+function signatureCheckWarning(signatureCheck, opts) {
+  if (signatureCheck.installed || (opts && opts.signatureCheck === "not-used")) return null;
+  return `signature checking is off in this tab: ${signatureCheck.reason}`;
+}
+
 // Bring up pyrxd inside this tab and return the bridge functions.
 //
 // Takes NO DOM handles and writes nothing to the page: progress is reported
@@ -544,13 +554,12 @@ _pyrxd_version_blob = (
     throw new Error(`Could not load inspect glue: ${err.message}`);
   }
 
-  if (!signatureCheck.installed) {
-    // Console only. The READER is told by the verdict itself, which says NOT CHECKED
-    // and why, in words that come out of `_inspect_core` — a second explanation
-    // written here could drift from it, and a banner about a library is not what
-    // someone who was handed a transaction number came to read.
-    console.warn(`signature checking is off in this tab: ${signatureCheck.reason}`);
-  }
+  // Console only. The READER is told by the verdict itself, which says NOT CHECKED
+  // and why, in words that come out of `_inspect_core` — a second explanation
+  // written here could drift from it, and a banner about a library is not what
+  // someone who was handed a transaction number came to read.
+  const warning = signatureCheckWarning(signatureCheck, opts);
+  if (warning) console.warn(warning);
 
   onProgress(100);
   const hashing = readHashingBackend(bridges);
