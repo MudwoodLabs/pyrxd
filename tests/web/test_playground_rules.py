@@ -115,7 +115,7 @@ class TestSingletonIsPushedOnce:
         )
 
     def test_a_singleton_plus_a_normal_push_in_another_output_is_refused(self, pg, sb):
-        """H1. pyrxd's own inspect docs record a node refusing this shape (#743, round 2)."""
+        """H1. A regtest node refuses this shape (tests/test_playground_node_verdicts_regtest_e2e.py)."""
         from pyrxd.glyph.script import build_nft_locking_script
 
         result, nft = _mint_nft(sb)
@@ -136,7 +136,7 @@ class TestSingletonIsPushedOnce:
         assert exc.value.rule == "refs" and "in outputs [0, 1]" in str(exc.value)
 
     def test_two_outputs_each_pushing_normal_then_singleton_are_refused(self, pg, sb):
-        """H2. Not measured on a node; refused because a singleton pushed twice is a copy."""
+        """H2. A regtest node refuses this shape too (node module); a singleton pushed twice is a copy."""
         result, nft = _mint_nft(sb)
         fee = sb.faucet(rxd=1)
         k = sb.wallet.key
@@ -242,7 +242,7 @@ class TestFtOutputs:
         assert [c.status for c in ft] == ["warn"] and "did NOT evaluate" in ft[0].detail
 
     def test_an_extra_non_ft_output_pushing_the_ft_ref_is_refused(self, pg, sb):
-        """Review F2. The FT covenant counts outputs pushing the ref (read from its bytes, not run on a node)."""
+        """Review F2. The FT covenant counts outputs pushing the ref; a regtest node refuses this with OP_NUMEQUALVERIFY (node module, shape 5)."""
         res, ft = _deploy_ft(sb)
         fee = sb.faucet(rxd=1)
         k = sb.wallet.key
@@ -254,8 +254,10 @@ class TestFtOutputs:
         assert exc.value.rule == "ft" and "not an FT output" in str(exc.value)
         sb.broadcast(_tx(sb, [(ft, k), (fee, k)], honest))
 
-    def test_an_nft_ref_does_not_become_an_ft(self, pg, sb):
-        """Review F12. What a node does with this is not measured; the sandbox refuses it."""
+    def test_an_nft_ref_carried_into_an_ft_shaped_output_is_accepted_with_warnings(self, pg, sb):
+        """Review F12, settled on a node: a regtest node ACCEPTS this
+        (tests/test_playground_node_verdicts_regtest_e2e.py, shape 9). The FT script is a covenant
+        on spending; nothing checks how an FT-shaped output was made. The sandbox used to refuse it."""
         from pyrxd.glyph.script import build_ft_locking_script
 
         result, nft = _mint_nft(sb)
@@ -266,9 +268,48 @@ class TestFtOutputs:
             [(nft, k), (fee, k)],
             [(build_ft_locking_script(sb.wallet.pkh, result.ref), 50_000_000), _change(sb, fee, 50_000_000)],
         )
+        checks = sb.chain.accepted[sb.broadcast(tx)].checks
+        ft = [c for c in checks if c.rule == "ft"]
+        assert [c.status for c in ft] == ["warn"]
+        assert "no FT input and no FT deploy" in ft[0].detail and "A node accepts this" in ft[0].detail
+        refs = [c for c in checks if c.rule == "refs"]
+        assert any(c.status == "warn" and "the NFT is gone" in c.detail for c in refs)
+        assert sorted({c.rule for c in checks if c.status != "pass"}) == ["ft", "refs"]
+
+    def test_an_ft_shaped_output_minted_from_a_plain_outpoint_is_accepted_with_a_warning(self, pg, sb):
+        """Review F12, settled on a node: a regtest node ACCEPTS this (shape 6 of the node module)."""
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+
+        coin = sb.faucet(rxd=1)
+        k = sb.wallet.key
+        ref = GlyphRef(txid=coin.txid, vout=coin.vout)
+        tx = _tx(
+            sb,
+            [(coin, k)],
+            [(build_ft_locking_script(sb.wallet.pkh, ref), 50_000_000), _change(sb, coin, 50_000_000)],
+        )
+        checks = sb.chain.accepted[sb.broadcast(tx)].checks
+        ft = [c for c in checks if c.rule == "ft"]
+        assert [c.status for c in ft] == ["warn"] and "50,000,000 units" in ft[0].detail
+        assert sorted({c.rule for c in checks if c.status != "pass"}) == ["ft"]
+
+    def test_an_ft_shaped_output_still_needs_its_ref_from_an_input(self, pg, sb):
+        """The honest limit beside the two above: the refs rule still refuses a ref no input provides."""
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+
+        coin = sb.faucet(rxd=1)
+        k = sb.wallet.key
+        ref = GlyphRef(txid="ab" * 32, vout=0)
+        tx = _tx(
+            sb,
+            [(coin, k)],
+            [(build_ft_locking_script(sb.wallet.pkh, ref), 50_000_000), _change(sb, coin, 50_000_000)],
+        )
         with pytest.raises(pg.SandboxRejected) as exc:
             sb.broadcast(tx)
-        assert exc.value.rule == "ft" and "neither an FT" in str(exc.value)
+        assert exc.value.rule == "refs"
 
     def test_a_deploy_says_it_minted_rather_than_passing_in_zero(self, pg, sb):
         """Review F6: the check line said 'in 0, out 10,000' beside a rule that forbids exactly that."""
@@ -279,9 +320,17 @@ class TestFtOutputs:
 
 
 class TestScripts:
-    def _delegate_reveal(self, sb, *, gly=b"gly", delegate=True):
-        """Commit to a payload (behind a delegate prefix), then reveal it into the new NFT."""
-        from pyrxd.glyph.script import build_commit_locking_script, build_nft_locking_script
+    def _delegate_reveal(self, sb, *, gly=b"gly", delegate=True, burns=1, carry=False, state_prefix=False):
+        """Commit to a payload (behind a delegate prefix), then reveal it into the new NFT.
+
+        ``burns`` delegate burn outputs go beside the NFT; ``carry`` adds an output that pushes
+        the delegate ref with OP_PUSHINPUTREF; ``state_prefix`` puts a state script and
+        OP_STATESEPARATOR in front of each burn."""
+        from pyrxd.glyph.script import (
+            build_commit_locking_script,
+            build_delegate_burn_script,
+            build_nft_locking_script,
+        )
         from pyrxd.glyph.types import GlyphRef
         from pyrxd.hash import hash256
         from pyrxd.script.script import Script, encode_pushdata
@@ -294,23 +343,53 @@ class TestScripts:
         txid = sb.broadcast(_tx(sb, [(coin, k)], [(commit, 50_000_000), _change(sb, coin, 50_000_000)]))
         held = sb.chain.utxos[(txid, 0)]
         new_ref = GlyphRef(txid=txid, vout=0)
-        tx = _tx(sb, [(held, k)], [(build_nft_locking_script(sb.wallet.pkh, new_ref), held.value - FEE)], sign=False)
+        outs = [(build_nft_locking_script(sb.wallet.pkh, new_ref), held.value - FEE - (1_000_000 if carry else 0))]
+        if delegate:
+            burn = build_delegate_burn_script(dref)
+            if state_prefix:
+                burn = encode_pushdata(b"st") + b"\xbd" + burn
+            outs += [(burn, 0)] * burns
+            if carry:
+                outs.append((b"\xd0" + dref.to_bytes() + b"\x75" + _p2pkh(sb.wallet.pkh), 1_000_000))
+        tx = _tx(sb, [(held, k)], outs, sign=False)
         sig = k.sign(tx.preimage(0)) + b"\x41"
         pub = k.public_key().serialize()
         tx.inputs[0].unlocking_script = Script(b"".join(encode_pushdata(x) for x in (sig, pub, gly, payload)))
         return tx
 
-    def test_a_delegate_commit_is_checked_and_warns_about_its_burn(self, pg, sb):
-        """Review F3: never 'pass', since the burn is unchecked; but what can be checked still is."""
+    def test_a_delegate_reveal_with_its_burn_passes(self, pg, sb):
+        """Review F3, settled on a node: a reveal WITH the burn is accepted, WITHOUT it refused
+        (tests/test_playground_node_verdicts_regtest_e2e.py, shape 7)."""
         txid = sb.broadcast(self._delegate_reveal(sb))
-        scripts = [c for c in sb.chain.accepted[txid].checks if c.rule == "scripts"]
-        assert [c.status for c in scripts] == ["warn"]
-        assert "delegate burn" in scripts[0].detail and "NOT evaluated" in scripts[0].detail
+        checks = sb.chain.accepted[txid].checks
+        assert [c.status for c in checks if c.rule == "scripts"] == ["pass"]
+        assert sorted({c.rule for c in checks if c.status != "pass"}) == ["refs"]
+        plain = sb.broadcast(self._delegate_reveal(sb, delegate=False))
+        assert [c.status for c in sb.chain.accepted[plain].checks if c.rule == "scripts"] == ["pass"]
+
+    @pytest.mark.parametrize("burns", [0, 2])
+    def test_a_delegate_reveal_needs_exactly_one_burn(self, pg, sb, burns):
+        """The prefix's OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS == 1. Zero burns is measured on a node
+        (shape 7); two is from reading build_delegate_commit_prefix."""
+        with pytest.raises(pg.SandboxRejected) as exc:
+            sb.broadcast(self._delegate_reveal(sb, burns=burns))
+        assert exc.value.rule == "scripts" and f"and has {burns}" in str(exc.value)
+
+    def test_a_delegate_reveal_must_not_carry_the_delegate_ref_forward(self, pg, sb):
+        """The prefix's OP_REFOUTPUTCOUNT_OUTPUTS == 0 (from reading build_delegate_commit_prefix)."""
+        with pytest.raises(pg.SandboxRejected) as exc:
+            sb.broadcast(self._delegate_reveal(sb, carry=True))
+        assert exc.value.rule == "scripts" and "carry its delegate ref" in str(exc.value)
+
+    def test_a_burn_behind_a_state_script_counts(self, pg, sb):
+        """OP_CODESCRIPTHASH* hashes the code script after OP_STATESEPARATOR, so a state script in
+        front of the burn does not hide it. From reading the opcode's definition; not run on a node."""
+        sb.broadcast(self._delegate_reveal(sb, state_prefix=True))
+
+    def test_a_delegate_reveal_still_checks_its_reveal(self, pg, sb):
         with pytest.raises(pg.SandboxRejected) as exc:
             sb.broadcast(self._delegate_reveal(sb, gly=b"glx"))
         assert "'gly'" in str(exc.value)
-        plain = sb.broadcast(self._delegate_reveal(sb, delegate=False))
-        assert [c.status for c in sb.chain.accepted[plain].checks if c.rule == "scripts"] == ["pass"]
 
     def _spend_with_pub(self, sb, pub: bytes):
         """Fund hash160(pub), then spend it with a signature from the wallet key and ``pub`` pushed."""
@@ -327,7 +406,7 @@ class TestScripts:
         return tx
 
     def test_a_hybrid_public_key_is_refused(self, pg, sb):
-        """Review F4. A node's STRICTENC refuses 06/07 keys (by reading the node's rules; not run here)."""
+        """Review F4. A regtest node's STRICTENC refuses 06/07 keys (node module, shape 8)."""
         pub = sb.wallet.key.public_key()
         point = pub.serialize(compressed=False)
         compressed = pub.serialize()
