@@ -4,6 +4,7 @@ A single static page that charts PyPI downloads and GitHub traffic for pyrxd.
 
 It holds no data. When it loads, it fetches:
 - `pypi.json` and `traffic.json` from the `traffic-data` branch, which the daily `traffic.yml` job updates;
+- `web.json` from the same branch: the docs site's page views from Cloudflare Web Analytics (`scripts/collect_web_analytics.py`), from 2026-11-09 on. The page still loads without it;
 - the release list from the GitHub API, for the release markers.
 
 So it is current without being rebuilt. Redeploy only when this page's own code changes.

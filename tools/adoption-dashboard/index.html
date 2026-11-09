@@ -205,7 +205,7 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
   <header>
     <div class="eyebrow">MudwoodLabs / pyrxd</div>
     <h1>pyrxd Adoption Signals</h1>
-    <p class="lede" id="lede">Downloads from PyPI and traffic on GitHub, side by side. Loaded live from the pyrxd traffic-data branch, which a daily job updates. The notes below say what each number can and cannot tell you.</p>
+    <p class="lede" id="lede">Downloads from PyPI, traffic on GitHub and page views on the docs site, side by side. Loaded live from the pyrxd traffic-data branch, which a daily job updates. The notes below say what each number can and cannot tell you.</p>
     <p class="status" id="status" role="status">Loading the latest data…</p>
   </header>
 
@@ -263,6 +263,20 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
     </div>
   </section>
 
+  <section class="panel" aria-labelledby="site-h">
+    <div class="titles">
+      <h2 id="site-h">Docs site page views per day</h2>
+      <p class="caption" id="site-caption">mudwoodlabs.github.io/pyrxd, from Cloudflare Web Analytics. Counting started 2026-11-09.</p>
+    </div>
+    <div class="legend">
+      <span><i class="key-bar" style="background:var(--series-1)"></i>Page views</span>
+      <span><i class="key-line" style="border-color:var(--series-2)"></i>Visits</span>
+    </div>
+    <div class="chart" id="chart-site" tabindex="0" aria-label="Docs site page views per day chart"></div>
+    <div class="tbl"><table id="t-site-pages" aria-label="Docs site page views by page"></table></div>
+    <p class="note" id="site-note"></p>
+  </section>
+
   <section class="notes" aria-label="Reading these numbers">
     <div>
       <h3>Downloads are not users</h3>
@@ -314,6 +328,7 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
     <div class="tables">
       <div class="tbl"><table id="t-pypi" aria-label="PyPI downloads per day"></table></div>
       <div class="tbl"><table id="t-gh" aria-label="GitHub traffic per day"></table></div>
+      <div class="tbl"><table id="t-site" aria-label="Docs site page views per day"></table></div>
     </div>
   </details>
 
@@ -627,6 +642,43 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
   table("t-gh", ["Date", "Views", "Uniq", "Clones", "Uniq"], gDays.map(function (d, i) {
     return [d, fmt.format(views[i]), fmt.format(viewU[i]), fmt.format(clones[i]), fmt.format(cloneU[i])];
   }).reverse());
+
+  // ---------------------------------------------------------------- docs site (Cloudflare)
+  // A tool page counts through its own sandboxed count.html, so its views arrive under that path.
+  function sitePage(path) {
+    if (/\/playground\//.test(path)) return "Playground";
+    if (/\/inspect\//.test(path)) return "Inspect";
+    if (/\/verify\//.test(path)) return "Verify";
+    return "Docs pages";
+  }
+  var siteNote = document.getElementById("site-note");
+  var web = DATA.web;
+  var sDays = web ? Object.keys(web.pageviews || {}).sort() : [];
+  if (!sDays.length) {
+    siteNote.textContent = web === null
+      ? "The page-view file could not be loaded, or the daily job has not written it yet."
+      : "No days recorded yet.";
+  } else {
+    function daySum(metric, d) { var o = (web[metric] || {})[d] || {}, t = 0; for (var k in o) t += o[k]; return t; }
+    var sViews = sDays.map(function (d) { return daySum("pageviews", d); });
+    var sVisits = sDays.map(function (d) { return daySum("visits", d); });
+    new TimeChart(document.getElementById("chart-site"), {
+      label: "Docs site page views per day", height: 220, days: sDays, bars: sViews, line: sVisits,
+      lineClass: "s2", barLabel: "Page views", lineLabel: "Visits"
+    });
+    var byPage = {};
+    sDays.forEach(function (d) {
+      var o = web.pageviews[d] || {};
+      for (var path in o) { var k = sitePage(path); byPage[k] = (byPage[k] || 0) + o[path]; }
+    });
+    table("t-site-pages", ["Page", "Page views, " + shortDay(sDays[0]) + " – " + shortDay(sDays[sDays.length - 1])],
+      ["Playground", "Inspect", "Verify", "Docs pages"].map(function (k) { return [k, fmt.format(byPage[k] || 0)]; }));
+    table("t-site", ["Date", "Page views", "Visits"], sDays.map(function (d, i) {
+      return [d, fmt.format(sViews[i]), fmt.format(sVisits[i])];
+    }).reverse());
+    siteNote.textContent = "A page view is a browser loading a page, not a person, and visits do not add up across days. " +
+      "Cloudflare samples at high volume. The newest day is partial.";
+  }
   }
 
 var RAW = "https://raw.githubusercontent.com/MudwoodLabs/pyrxd/traffic-data/";
@@ -649,13 +701,15 @@ var statusEl = document.getElementById("status");
 Promise.all([
   getJSON(RAW + "pypi.json"),
   getJSON(RAW + "traffic.json"),
-  getJSON(RELEASES).catch(function () { return null; })  // release ticks are optional
+  getJSON(RELEASES).catch(function () { return null; }),  // release ticks are optional
+  getJSON(RAW + "web.json").catch(function () { return null; })  // docs-site views are optional
 ]).then(function (res) {
   var pypi = res[0], traffic = res[1], rel = res[2];
   var DATA = {
     fetched: new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC",
     pypi_daily: zeroFill(pypi.without_mirrors || {}),
     github: { views: traffic.views || {}, clones: traffic.clones || {} },
+    web: res[3],
     releases: (rel || []).filter(function (r) { return !r.draft; })
       .map(function (r) { return { tag: r.tag_name, date: (r.published_at || "").slice(0, 10) }; })
       .sort(function (a, b) { return a.date < b.date ? -1 : 1; }),

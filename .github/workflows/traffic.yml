@@ -51,6 +51,14 @@
 # no token). pyrxd's first downloads (2026-04-29) were ~150 days back when this was
 # added, so without it the start of the history would age out in about a month.
 #
+# DOCS-SITE PAGE VIEWS go to `web.json`, from Cloudflare's GraphQL Analytics API
+# (scripts/collect_web_analytics.py). Setup (maintainer, once): a Cloudflare API token
+# with Account -> Account Analytics -> Read and nothing else, stored with
+# `gh secret set CF_ANALYTICS_TOKEN --repo MudwoodLabs/pyrxd`; and two repository
+# variables, which are not secret: CF_ACCOUNT_ID (the Mudwood account) and CF_SITE_TAG
+# (the Web Analytics site, shown in the dashboard URL as siteTag). Until they are set,
+# that collector fails and the run is red; the other two still commit their day.
+#
 # FAILURE IS RED, NOT QUIET. An auth failure and a genuinely idle fortnight both
 # produce "no new rows". The collector treats a non-200, a shape change and an
 # empty day list as errors and writes nothing, so a broken run can never be
@@ -84,6 +92,7 @@ on:
     paths:
       - "scripts/collect_traffic.py"
       - "scripts/collect_pypi_downloads.py"
+      - "scripts/collect_web_analytics.py"
       - ".github/workflows/traffic.yml"
 
 concurrency:
@@ -133,6 +142,9 @@ jobs:
               spec = importlib.util.spec_from_file_location(name, path)
               m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
               print(path, 'imports cleanly; merge() is pure:', m.merge({}, {})[1] == 0)
+          spec = importlib.util.spec_from_file_location('cw', 'scripts/collect_web_analytics.py')
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          print('scripts/collect_web_analytics.py imports cleanly; merge() is pure:', m.merge({}, {}, [])[1] == 0)
           "
 
   collect:
@@ -244,6 +256,19 @@ jobs:
           PYPI_DOWNLOADS_FILE: data/pypi.json
         run: python scripts/collect_pypi_downloads.py
 
+      - name: Collect Cloudflare page views for the docs site
+        id: web
+        continue-on-error: true
+        env:
+          # A Cloudflare API token, Account -> Account Analytics -> Read and nothing
+          # else, kept as a repository secret like TRAFFIC_TOKEN. The account ID and the
+          # Web Analytics site tag are not secret, so they are repository variables.
+          CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_SITE_TAG: ${{ vars.CF_SITE_TAG }}
+          WEB_ANALYTICS_FILE: data/web.json
+        run: python scripts/collect_web_analytics.py
+
       # A failed collector writes nothing (both scripts exit 2 before any write), and
       # a successful one replaces its file atomically, so committing whatever changed
       # can never commit a failed or half-written fetch. Runs when one collector
@@ -253,7 +278,7 @@ jobs:
         if: ${{ !cancelled() && steps.data.outcome == 'success' }}
         working-directory: data
         run: |
-          if git diff --quiet -- traffic.json pypi.json && [ -z "$(git ls-files --others --exclude-standard -- pypi.json)" ]; then
+          if git diff --quiet -- traffic.json pypi.json web.json && [ -z "$(git ls-files --others --exclude-standard -- pypi.json web.json)" ]; then
             echo "no change today"
             exit 0
           fi
@@ -261,6 +286,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add traffic.json
           if [ -f pypi.json ]; then git add pypi.json; fi
+          if [ -f web.json ]; then git add web.json; fi
           git commit -m "traffic: $(date -u +%Y-%m-%d)"
           git push origin HEAD:traffic-data
           echo "committed $(git rev-parse --short HEAD)"
@@ -268,10 +294,11 @@ jobs:
       # continue-on-error keeps one source's outage from losing the other's day, but
       # it also turns a failed collector green. This puts the red back.
       - name: Fail the run if a collector failed
-        if: ${{ !cancelled() && (steps.traffic.outcome == 'failure' || steps.pypi.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.traffic.outcome == 'failure' || steps.pypi.outcome == 'failure' || steps.web.outcome == 'failure') }}
         env:
           TRAFFIC_OUTCOME: ${{ steps.traffic.outcome }}
           PYPI_OUTCOME: ${{ steps.pypi.outcome }}
+          WEB_OUTCOME: ${{ steps.web.outcome }}
         run: |
-          echo "traffic: $TRAFFIC_OUTCOME · pypi: $PYPI_OUTCOME"
+          echo "traffic: $TRAFFIC_OUTCOME · pypi: $PYPI_OUTCOME · web: $WEB_OUTCOME"
           exit 1
