@@ -11,10 +11,10 @@ them into ``web.json`` on the ``traffic-data`` branch, beside ``traffic.json`` a
 
 WHAT IS STORED. Page loads and visits per day per path, as Cloudflare reports them:
 
-    {"pageviews": {"YYYY-MM-DD": {"/playground.html": n, "/pyrxd/": n, ...}},
+    {"pageviews": {"YYYY-MM-DD": {"/playground": n, "/pyrxd/": n, ...}},
      "visits":    {"YYYY-MM-DD": {...}}}
 
-A tool page shows up as ``/<tool>.html`` (the counter page the beacon runs in); the
+A tool page shows up as ``/<tool>`` (the counter page the beacon runs in; Pages drops ``.html``); the
 docs pages show up under ``/pyrxd/...``. A page view is a browser loading a page, not a person, and Cloudflare
 samples ("adaptive") at high volume. The honest read is trend, not magnitude.
 
