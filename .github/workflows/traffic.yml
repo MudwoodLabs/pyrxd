@@ -56,7 +56,8 @@
 # with Account -> Account Analytics -> Read and nothing else, stored with
 # `gh secret set CF_ANALYTICS_TOKEN --repo MudwoodLabs/pyrxd`; and two repository
 # variables, which are not secret: CF_ACCOUNT_ID (the Mudwood account) and CF_SITE_TAG
-# (the Web Analytics site, shown in the dashboard URL as siteTag). Until they are set,
+# (the Web Analytics sites' tags, comma-separated: the docs site and count.mudwoodlabs.com,
+# each shown in the dashboard URL as siteTag). Until they are set,
 # that collector fails and the run is red; the other two still commit their day.
 #
 # FAILURE IS RED, NOT QUIET. An auth failure and a genuinely idle fortnight both

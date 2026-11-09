@@ -97,7 +97,8 @@ html_favicon = "_static/favicon.svg"
 html_extra_path = ["inspect_static"]
 # Cloudflare Web Analytics on every Sphinx page (cookieless page-view counts). These pages
 # set no CSP and handle no keys. The tool pages under ``inspect_static/`` do not load this
-# script; each counts through its own sandboxed ``count.html`` frame instead. The token is
+# script; each counts through a frame from count.mudwoodlabs.com instead
+# (``tools/visit-counter/``), a different origin that cannot read the page. The token is
 # public by design: it names the site in Cloudflare and grants no access.
 html_js_files = [
     (

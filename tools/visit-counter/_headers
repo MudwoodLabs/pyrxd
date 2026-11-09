@@ -1,0 +1,4 @@
+/*
+  Content-Security-Policy: default-src 'none'; script-src https://static.cloudflareinsights.com; connect-src https://cloudflareinsights.com; base-uri 'none'; form-action 'none'; frame-ancestors https://mudwoodlabs.github.io
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Content-Type-Options: nosniff

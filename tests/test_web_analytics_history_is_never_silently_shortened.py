@@ -35,7 +35,7 @@ def _load(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WEB_ANALYTICS_FILE", str(tmp_path / "web.json"))
     monkeypatch.setenv("CF_ANALYTICS_TOKEN", _TOKEN)
     monkeypatch.setenv("CF_ACCOUNT_ID", "acct")
-    monkeypatch.setenv("CF_SITE_TAG", "site")
+    monkeypatch.setenv("CF_SITE_TAG", "docs, count")
     spec = importlib.util.spec_from_file_location(f"collect_web_{tmp_path.name}", _SCRIPT)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -99,7 +99,7 @@ def test_an_honest_answer_is_merged_and_older_days_are_kept(tmp_path, monkeypatc
         monkeypatch,
         _answer(
             [
-                _row("2026-11-20", "/pyrxd/playground/count.html", 4, 2),
+                _row("2026-11-20", "/playground.html", 4, 2),
                 _row("2026-11-19", "/pyrxd/", 1, 1),
             ]
         ),
@@ -107,12 +107,17 @@ def test_an_honest_answer_is_merged_and_older_days_are_kept(tmp_path, monkeypatc
     assert mod.main() == 0
     data = json.loads(mod._OUT.read_text())
     assert data["pageviews"]["2026-10-01"] == {"/pyrxd/": 3}, "a day outside the window was dropped"
-    assert data["pageviews"]["2026-11-20"] == {"/pyrxd/playground/count.html": 4}
+    assert data["pageviews"]["2026-11-20"] == {"/playground.html": 4}
     assert data["visits"]["2026-11-19"] == {"/pyrxd/": 1}
     assert data["pageviews"]["2026-11-14"] == {}, "an answered day with no rows must read as zero, not missing"
     assert len([d for d in data["pageviews"] if d >= "2026-11-14"]) == mod._LOOKBACK_DAYS
     body = json.loads(sent[0].data)
-    assert body["variables"] == {"account": "acct", "site": "site", "start": "2026-11-14", "end": "2026-11-20"}
+    assert body["variables"] == {
+        "account": "acct",
+        "sites": ["docs", "count"],
+        "start": "2026-11-14",
+        "end": "2026-11-20",
+    }
 
 
 def test_days_before_counting_started_are_not_written_as_zero(tmp_path, monkeypatch):
@@ -182,3 +187,10 @@ def test_the_workflow_runs_the_collector_and_commits_its_file():
     assert "WEB_ANALYTICS_FILE: data/web.json" in text
     assert "git add web.json" in text
     assert "steps.web.outcome == 'failure'" in text, "a failed page-view fetch must turn the run red"
+
+
+def test_a_site_named_twice_fails_without_a_request(tmp_path, monkeypatch):
+    mod = _load(tmp_path, monkeypatch)
+    sent = _serve(mod, monkeypatch, _answer([]))
+    monkeypatch.setenv("CF_SITE_TAG", "docs,docs")
+    assert mod.main() == 2 and sent == []
