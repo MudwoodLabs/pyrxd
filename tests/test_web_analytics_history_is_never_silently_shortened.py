@@ -131,13 +131,24 @@ def test_days_before_counting_started_are_not_written_as_zero(tmp_path, monkeypa
         401,
         500,
         {"data": None, "errors": [{"message": "not authorized for that account"}]},
+        {**_answer([_row("2026-11-20", "/pyrxd/", 1, 1)]), "errors": [{"message": "partial: quota exceeded"}]},
         {"data": {"viewer": {"accounts": []}}, "errors": None},
         {"data": {"viewer": {"accounts": [{}]}}, "errors": None},
         _answer([{"count": 1, "sum": {"visits": 1}, "dimensions": {"date": "11/09/2026", "requestPath": "/"}}]),
         _answer([_row("2026-11-09", "/", -1, 0)]),
         _answer([{"count": True, "sum": {"visits": 1}, "dimensions": {"date": "2026-11-09", "requestPath": "/"}}]),
     ],
-    ids=["http-401", "http-500", "graphql-errors", "no-account", "no-dataset", "bad-date", "negative", "bool-count"],
+    ids=[
+        "http-401",
+        "http-500",
+        "graphql-errors",
+        "errors-with-partial-data",
+        "no-account",
+        "no-dataset",
+        "bad-date",
+        "negative",
+        "bool-count",
+    ],
 )
 def test_a_failed_or_malformed_answer_writes_nothing(tmp_path, monkeypatch, capsys, answer):
     mod = _load(tmp_path, monkeypatch)
