@@ -644,11 +644,12 @@ footer { font-size: 12px; color: var(--muted); font-family: var(--mono); }
   }).reverse());
 
   // ---------------------------------------------------------------- docs site (Cloudflare)
-  // A tool page counts through its frame on count.mudwoodlabs.com, so its views arrive as /<tool>.html.
+  // A tool page counts through its frame on count.mudwoodlabs.com. The frame loads /<tool>.html, which
+  // Cloudflare Pages redirects (308) to /<tool>, so the beacon reports the path without the extension.
   function sitePage(path) {
-    if (/^\/playground\.html$|\/playground\//.test(path)) return "Playground";
-    if (/^\/inspect\.html$|\/inspect\//.test(path)) return "Inspect";
-    if (/^\/verify\.html$|\/verify\//.test(path)) return "Verify";
+    if (/^\/playground(\.html)?$|\/playground\//.test(path)) return "Playground";
+    if (/^\/inspect(\.html)?$|\/inspect\//.test(path)) return "Inspect";
+    if (/^\/verify(\.html)?$|\/verify\//.test(path)) return "Verify";
     return "Docs pages";
   }
   var siteNote = document.getElementById("site-note");
