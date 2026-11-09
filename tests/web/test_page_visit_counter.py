@@ -41,7 +41,9 @@ def test_the_page_set_is_not_empty():
 def test_the_page_frames_its_counter_with_scripts_only(page: str):
     frames = _frames((_STATIC / page / "index.html").read_text(encoding="utf-8"))
     assert [f.get("src") for f in frames] == ["count.html"], f"{page}: expected exactly one frame, count.html"
-    assert frames[0].get("sandbox") == "allow-scripts", f"{page}: the counter frame must be sandboxed with allow-scripts only"
+    assert frames[0].get("sandbox") == "allow-scripts", (
+        f"{page}: the counter frame must be sandboxed with allow-scripts only"
+    )
     assert (_STATIC / page / "count.html").is_file()
 
 
