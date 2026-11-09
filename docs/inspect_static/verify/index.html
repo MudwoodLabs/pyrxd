@@ -43,7 +43,7 @@
        base-uri 'none'           — block <base> tag injection
        form-action 'none'        — no form posts
        object-src 'none'         — no plugins
-       frame-src 'self'          — only count.html, the sandboxed visit counter
+       frame-src https://count.mudwoodlabs.com — only the visit counter, a different origin
        Note: frame-ancestors is intentionally absent — meta-tag CSP cannot
        enforce it; documented as a known limitation. Read-only tool with no
        keys; clickjacking has no payload to steal.
@@ -58,7 +58,7 @@
     base-uri 'none';
     form-action 'none';
     object-src 'none';
-    frame-src 'self';
+    frame-src https://count.mudwoodlabs.com;
   " />
 
   <title>Check a HashMark</title>
@@ -218,8 +218,8 @@
        so its bindings exist by the time verify.js's top level does. -->
   <script src="../inspect/shared.js"></script>
   <script src="verify.js" type="module"></script>
-  <!-- Visit counter: count.html runs Cloudflare Web Analytics in a frame that is sandboxed with
-       allow-scripts only, so it has an opaque origin and cannot reach this page (frame-src 'self'). -->
-  <iframe src="count.html" sandbox="allow-scripts" hidden aria-hidden="true" tabindex="-1" title="Visit counter"></iframe>
+  <!-- Visit counter: Cloudflare Web Analytics runs in a frame from count.mudwoodlabs.com, a
+       different origin, so it cannot read or script this page (tools/visit-counter/README.md). -->
+  <iframe src="https://count.mudwoodlabs.com/verify.html" sandbox="allow-scripts allow-same-origin" hidden aria-hidden="true" tabindex="-1" title="Visit counter"></iframe>
 </body>
 </html>

@@ -3,18 +3,19 @@
 
 The docs site (``mudwoodlabs.github.io/pyrxd``) reports page views to Cloudflare Web
 Analytics: the Sphinx pages load the beacon directly, and ``/inspect/``, ``/verify/`` and
-``/playground/`` each count through their own sandboxed ``count.html``. This script reads
+``/playground/`` each count through a frame from ``count.mudwoodlabs.com``
+(``tools/visit-counter/``), which is a second Web Analytics site. This script reads
 the last few days of those page views from Cloudflare's GraphQL Analytics API and merges
 them into ``web.json`` on the ``traffic-data`` branch, beside ``traffic.json`` and
 ``pypi.json``, for the adoption dashboard.
 
 WHAT IS STORED. Page loads and visits per day per path, as Cloudflare reports them:
 
-    {"pageviews": {"YYYY-MM-DD": {"/pyrxd/playground/count.html": n, ...}},
+    {"pageviews": {"YYYY-MM-DD": {"/playground.html": n, "/pyrxd/": n, ...}},
      "visits":    {"YYYY-MM-DD": {...}}}
 
-A tool page shows up under its ``count.html`` path, because that is the document the
-beacon runs in. A page view is a browser loading a page, not a person, and Cloudflare
+A tool page shows up as ``/<tool>.html`` (the counter page the beacon runs in); the
+docs pages show up under ``/pyrxd/...``. A page view is a browser loading a page, not a person, and Cloudflare
 samples ("adaptive") at high volume. The honest read is trend, not magnitude.
 
 AN EMPTY ANSWER IS NOT AN ERROR here, unlike the PyPI collector: a site this size can
@@ -22,8 +23,8 @@ have a day with no visits. What separates a failure from a quiet day is the API 
 a non-200, a GraphQL ``errors`` list, or a changed shape raises, and nothing is written.
 
 TOKEN. ``CF_ANALYTICS_TOKEN`` is a Cloudflare API token with Account -> Account Analytics
--> Read and nothing else. ``CF_ACCOUNT_ID`` and ``CF_SITE_TAG`` name the account and the
-Web Analytics site; neither is secret. The script never prints the token.
+-> Read and nothing else. ``CF_ACCOUNT_ID`` names the account and ``CF_SITE_TAG`` the Web
+Analytics sites, comma-separated; neither is secret. The script never prints the token.
 
 THE WRITE IS ATOMIC, for the same reason as the other collectors: the merged history
 goes to a temporary file and replaces the target with ``os.replace``.
@@ -54,12 +55,12 @@ _LOOKBACK_DAYS = 7
 _LIMIT = 5000
 
 _QUERY = """
-query PageViews($account: String!, $site: String!, $start: Date!, $end: Date!) {
+query PageViews($account: String!, $sites: [String!]!, $start: Date!, $end: Date!) {
   viewer {
     accounts(filter: { accountTag: $account }) {
       rumPageloadEventsAdaptiveGroups(
         limit: __LIMIT__
-        filter: { siteTag: $site, date_geq: $start, date_leq: $end }
+        filter: { siteTag_in: $sites, date_geq: $start, date_leq: $end }
       ) {
         count
         sum { visits }
@@ -80,6 +81,14 @@ def _env(name: str) -> str:
     if not value:
         raise WebAnalyticsError(f"{name} is not set — see the header of scripts/collect_web_analytics.py")
     return value
+
+
+def _site_tags() -> list[str]:
+    """CF_SITE_TAG, comma-separated: the docs site and the tool-page counter site."""
+    tags = [t.strip() for t in _env("CF_SITE_TAG").split(",") if t.strip()]
+    if len(set(tags)) != len(tags):
+        raise WebAnalyticsError("CF_SITE_TAG names the same site twice")
+    return tags
 
 
 def _post(token: str, variables: dict) -> dict:
@@ -163,7 +172,7 @@ def fetch(today: datetime.date | None = None) -> tuple[dict, list[str]]:
     days = [d for d in days if d >= _FIRST_DAY] or [today.isoformat()]
     payload = _post(
         _env("CF_ANALYTICS_TOKEN"),
-        {"account": _env("CF_ACCOUNT_ID"), "site": _env("CF_SITE_TAG"), "start": days[0], "end": days[-1]},
+        {"account": _env("CF_ACCOUNT_ID"), "sites": _site_tags(), "start": days[0], "end": days[-1]},
     )
     return parse(payload), days
 

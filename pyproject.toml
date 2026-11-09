@@ -287,6 +287,10 @@ ignore = [
     # from this directory. It reads public data at load time and is not part of the
     # package, its docs, or anything needed to build or audit it.
     "tools/adoption-dashboard/**",
+
+    # The tool pages' visit counter, a static site deployed to Cloudflare Pages
+    # (count.mudwoodlabs.com) from this directory. Not part of the package.
+    "tools/visit-counter/**",
 ]
 
 [tool.taskipy.tasks]
