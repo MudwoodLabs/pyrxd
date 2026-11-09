@@ -95,6 +95,16 @@ html_favicon = "_static/favicon.svg"
 # pyrxd against a sandbox chain living in the tab. It boots through the same wheel
 # and manifest, plus three Python files of its own the manifest also pins.
 html_extra_path = ["inspect_static"]
+# Cloudflare Web Analytics on every Sphinx page (cookieless page-view counts). These pages
+# set no CSP and handle no keys. The tool pages under ``inspect_static/`` do not load this
+# script; each counts through its own sandboxed ``count.html`` frame instead. The token is
+# public by design: it names the site in Cloudflare and grants no access.
+html_js_files = [
+    (
+        "https://static.cloudflareinsights.com/beacon.min.js",
+        {"defer": "defer", "data-cf-beacon": '{"token": "d37bb2438c90442da245a4877264640b"}'},
+    ),
+]
 html_theme_options = {
     "source_repository": "https://github.com/MudwoodLabs/pyrxd",
     "source_branch": "main",

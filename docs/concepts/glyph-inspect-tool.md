@@ -770,6 +770,13 @@ and each has a cost:
   every page that installs a curve, and requires it to go if the page
   ever stops importing from object URLs.
 
+**`frame-src 'self'`** admits one frame, `count.html`, the visit counter. It runs
+Cloudflare Web Analytics in a frame sandboxed with `allow-scripts` only, so the frame
+has an opaque origin: the beacon cannot read or script the page, and the page's own
+`script-src` and `connect-src` admit no Cloudflare host. Cloudflare does learn that
+someone loaded the page, from the visitor's IP address and browser, as for any request.
+`tests/web/test_page_visit_counter.py` pins the sandbox and all three policies.
+
 `'self'` is the page's origin, which for a GitHub Pages project site is
 `https://mudwoodlabs.github.io` — shared by every Pages site published
 from the same account, not only this one. Documents on one origin can

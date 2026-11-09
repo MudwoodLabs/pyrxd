@@ -19,6 +19,8 @@
                                   tab, and nothing built here can be sent anywhere.
        img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none';
        object-src 'none'.
+       frame-src 'self'          — only count.html, the sandboxed visit counter. Its
+                                  frame has an opaque origin and cannot read this tab.
   -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
@@ -30,6 +32,7 @@
     base-uri 'none';
     form-action 'none';
     object-src 'none';
+    frame-src 'self';
   " />
   <title>Radiant Playground</title>
   <meta name="description" content="Learn to build on Radiant with pyrxd, in your browser: make a wallet, send RXD, mint and send Glyph tokens on a sandbox chain that lives in this tab." />
@@ -136,5 +139,8 @@
        one audited boot (SHA-checked wheel, manifest, Pyodide package set). -->
   <script src="../inspect/shared.js"></script>
   <script src="playground.js" type="module"></script>
+  <!-- Visit counter: count.html runs Cloudflare Web Analytics in a frame that is sandboxed with
+       allow-scripts only, so it has an opaque origin and cannot reach this page (frame-src 'self'). -->
+  <iframe src="count.html" sandbox="allow-scripts" hidden aria-hidden="true" tabindex="-1" title="Visit counter"></iframe>
 </body>
 </html>

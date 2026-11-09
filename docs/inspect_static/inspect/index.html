@@ -37,6 +37,7 @@
        base-uri 'none'           — block <base> tag injection
        form-action 'none'        — no form posts
        object-src 'none'         — no plugins
+       frame-src 'self'          — only count.html, the sandboxed visit counter
        Note: frame-ancestors is intentionally absent — meta-tag CSP cannot
        enforce it; documented as a known limitation. Read-only tool with no
        keys; clickjacking has no payload to steal.
@@ -51,6 +52,7 @@
     base-uri 'none';
     form-action 'none';
     object-src 'none';
+    frame-src 'self';
   " />
 
   <title>pyrxd inspect — Glyph script & transaction inspector</title>
@@ -169,5 +171,8 @@
        the time inspect.js's top level does. -->
   <script src="shared.js"></script>
   <script src="inspect.js" type="module"></script>
+  <!-- Visit counter: count.html runs Cloudflare Web Analytics in a frame that is sandboxed with
+       allow-scripts only, so it has an opaque origin and cannot reach this page (frame-src 'self'). -->
+  <iframe src="count.html" sandbox="allow-scripts" hidden aria-hidden="true" tabindex="-1" title="Visit counter"></iframe>
 </body>
 </html>
