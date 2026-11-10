@@ -21,9 +21,6 @@ import os
 import pathlib
 import re
 import shutil
-import socket
-import subprocess
-import time
 import urllib.request
 
 import pytest
@@ -38,6 +35,7 @@ from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
+from tests._anvil import start_anvil
 
 pytestmark = pytest.mark.integration
 
@@ -52,41 +50,11 @@ _AMOUNT_WEI = 10**15  # 0.001 ETH
 _ARTIFACT = json.loads((pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 def _start_anvil(*extra_args: str, chain_id: int = _CHAIN_ID):
-    """Start a fresh, isolated anvil (so evm_increaseTime cannot leak across tests); yield its URL."""
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    proc = subprocess.Popen(
-        ["anvil", "--port", str(port), "--chain-id", str(chain_id), "--silent", *extra_args],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        body = b'{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
-        for _ in range(100):
-            try:
-                req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
-                urllib.request.urlopen(req, timeout=0.5).read()
-                break
-            except Exception:
-                time.sleep(0.1)
-        else:  # pragma: no cover
-            pytest.fail("anvil did not become ready")
+    """Start a fresh, isolated anvil (so evm_increaseTime cannot leak across tests); yield its URL.
+    The URL is the one that anvil reported binding (``tests._anvil``, #933)."""
+    with start_anvil(["--chain-id", str(chain_id), *extra_args], ready_timeout_s=10) as url:
         yield url
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
 
 
 @pytest.fixture()

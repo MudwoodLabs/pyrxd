@@ -79,7 +79,6 @@ import math
 import os
 import pathlib
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -110,6 +109,7 @@ from pyrxd.security.types import Hex20
 # The runner inputs every scenario negotiates under (amounts, the measured 36 s fast tail, the 3600 s
 # stall floor, the maker-stall window) and the two deadlines: ONE copy, shared with the offline test
 # that runs the MAINNET construction checks on exactly these terms (regtest skips them).
+from tests._anvil import start_anvil
 from tests.test_runners_build_the_coordinator_first import (
     ERC20_LIFECYCLE_E2E_DEADLINES_S,
     ERC20_LIFECYCLE_E2E_INPUTS,
@@ -168,12 +168,6 @@ _ADDR_MAKER = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 #: 12.345678 USDC. Non-round on purpose: a 6-vs-18 decimal bug cannot hide in a round number.
 _AMOUNT = 12_345_678
 _RXD_CARRIER = 100_000
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 def _rpc(url: str, method: str, params=None):
@@ -321,59 +315,33 @@ def env(request, tmp_path_factory):
 
     node = _RxdNode()
     node.start()
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
     # `--slots-in-an-epoch 1` so the `finalized` checkpoint tracks latest-2. Without a consensus
     # layer anvil pins it at 0, the ETH-claim finality verdict is never FINAL, and the reorg gate
     # never returns SAFE — the swap would stall for a reason that has nothing to do with the code.
-    anvil = subprocess.Popen(
-        [
-            "anvil",
-            "--fork-url",
-            fork_rpc,
-            "--port",
-            str(port),
-            "--chain-id",
-            str(_DEVNET_CHAIN_ID),
-            "--slots-in-an-epoch",
-            "1",
-            "--silent",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # The URL is the one this anvil reported binding, not a port picked beforehand (#933).
     try:
-        for _ in range(160):
-            try:
-                _rpc(url, "eth_chainId")
-                break
-            except Exception:
-                time.sleep(0.25)
-        else:  # pragma: no cover
-            pytest.fail("anvil fork did not become ready")
-        node.clock = lambda: _now(url)  # one clock for both chains; see _RxdNode.rxd_mine
-        # The anvil dev addresses carry EIP-7702 delegation designators on a mainnet fork; they are
-        # deliberately left in place, because the token leg's ERC-20 sweep calls the token and never
-        # the recipient, so it must work WITH them present (#478).
-        for who in (_ADDR_TAKER, _ADDR_MAKER):
-            _rpc(url, "anvil_setBalance", [who, hex(10**19)])
-        token = _TOKENS[request.param]
-        # Guard the PARAMETRIZATION itself, at the only place it can collapse. Asserting the
-        # token inside a test compares the record against the same variable that produced it —
-        # self-consistent whatever the fixture yielded, so it cannot notice both runs quietly
-        # exercising one token. Verified by planting exactly that collapse here.
-        assert token.symbol == request.param, (
-            f"fixture param {request.param!r} yielded {token.symbol!r}: the suite would run one "
-            "token twice and read as coverage for two"
-        )
-        _seed_token(url, token, _ADDR_TAKER, _AMOUNT * 10)
-        yield node, url, tmp_path_factory.mktemp("erc20e2e"), token
+        with start_anvil(
+            ["--fork-url", fork_rpc, "--chain-id", str(_DEVNET_CHAIN_ID), "--slots-in-an-epoch", "1"],
+            ready_timeout_s=40,
+        ) as url:
+            node.clock = lambda: _now(url)  # one clock for both chains; see _RxdNode.rxd_mine
+            # The anvil dev addresses carry EIP-7702 delegation designators on a mainnet fork; they are
+            # deliberately left in place, because the token leg's ERC-20 sweep calls the token and never
+            # the recipient, so it must work WITH them present (#478).
+            for who in (_ADDR_TAKER, _ADDR_MAKER):
+                _rpc(url, "anvil_setBalance", [who, hex(10**19)])
+            token = _TOKENS[request.param]
+            # Guard the PARAMETRIZATION itself, at the only place it can collapse. Asserting the
+            # token inside a test compares the record against the same variable that produced it —
+            # self-consistent whatever the fixture yielded, so it cannot notice both runs quietly
+            # exercising one token. Verified by planting exactly that collapse here.
+            assert token.symbol == request.param, (
+                f"fixture param {request.param!r} yielded {token.symbol!r}: the suite would run one "
+                "token twice and read as coverage for two"
+            )
+            _seed_token(url, token, _ADDR_TAKER, _AMOUNT * 10)
+            yield node, url, tmp_path_factory.mktemp("erc20e2e"), token
     finally:
-        anvil.terminate()
-        try:
-            anvil.wait(timeout=10)
-        except subprocess.TimeoutExpired:  # pragma: no cover
-            anvil.kill()
         node.stop()
 
 

@@ -41,8 +41,6 @@ import json
 import os
 import pathlib
 import shutil
-import socket
-import subprocess
 import time
 import urllib.request
 
@@ -62,6 +60,7 @@ from pyrxd.eth_wallet.locator import Erc20HtlcLocator
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.eth_wallet.tokens import token_for
 from pyrxd.security.secrets import PrivateKeyMaterial
+from tests._anvil import start_anvil
 
 pytestmark = pytest.mark.integration
 
@@ -86,25 +85,8 @@ def _rpc_call(url: str, method: str, params: list) -> dict:
 
 @pytest.fixture(scope="module")
 def fork_url():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    url = f"http://127.0.0.1:{port}"
-    proc = subprocess.Popen(
-        ["anvil", "--fork-url", _FORK_RPC, "--port", str(port), "--silent"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        for _ in range(200):
-            try:
-                _rpc_call(url, "eth_chainId", [])
-                break
-            except Exception:
-                time.sleep(0.25)
-        else:  # pragma: no cover
-            pytest.fail("anvil fork did not become ready")
+    # The URL is the one this anvil reported binding, not a port picked beforehand (#933).
+    with start_anvil(["--fork-url", _FORK_RPC], ready_timeout_s=50) as url:
         # Give the taker USDC by impersonating a holder — no storage-slot derivation needed.
         # NOTE: the delegations are deliberately LEFT IN PLACE. On a mainnet fork both anvil dev
         # addresses carry an EIP-7702 delegation designator (0xef0100 + delegate) — 23 bytes of
@@ -130,12 +112,6 @@ def fork_url():
             pytest.fail(f"seeding transfer {tx_hash} was not mined within 30s on the fork")
         assert int(receipt["status"], 16) == 1, f"seeding transfer {tx_hash} reverted on the fork"
         yield url
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:  # pragma: no cover
-            proc.kill()
 
 
 def _leg(fork_url: str) -> Erc20HtlcLeg:
