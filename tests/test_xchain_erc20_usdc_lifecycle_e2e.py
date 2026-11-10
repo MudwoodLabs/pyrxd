@@ -159,10 +159,8 @@ _SEL_MASTER_MINTER = "0x35d99f35"  # masterMinter()
 _SEL_CONFIGURE_MINTER = "0x4e44d956"  # configureMinter(address,uint256)
 _SEL_MINT = "0x40c10f19"  # mint(address,uint256)
 _SEL_TRANSFER = "0xa9059cbb"  # transfer(address,uint256)
-#: A large L1 holder to impersonate, for the one token that can be seeded no other way (see
-#: `_seed_token`) — avoids deriving the balances storage slot, whose packed layout is exactly the
-#: sort of detail a test should not encode.
-_WHALE = "0x28C6c06298d514Db089934071355E5743bf21d60"
+_SEL_OWNER = "0x8da5cb5b"  # owner()
+_SEL_ISSUE = "0xcc872b66"  # issue(uint256), Tether: credits the owner
 #: Anvil's deterministic PUBLIC dev keys. Local fork only; no real value.
 _KEY_TAKER = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 _ADDR_TAKER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -283,9 +281,15 @@ def _seed_token(url: str, token, holder: str, amount: int) -> None:
         _send_as(url, master_minter, token.address, _SEL_CONFIGURE_MINTER + _word(master_minter) + _word(amount))
         _send_as(url, master_minter, token.address, _SEL_MINT + _word(holder) + _word(amount))
     else:
-        # Tether on L1 is neither: no masterMinter, and `issue` credits only the owner. Impersonating
-        # a pinned large holder is what is left.
-        _send_as(url, _WHALE, token.address, _SEL_TRANSFER + _word(holder) + _word(amount))
+        # Tether on L1 is neither: no masterMinter, and `issue` credits only the owner. So the owner
+        # (read from the contract, not typed here) issues `amount` to itself and transfers it on.
+        # This used to impersonate a pinned large holder; from the 2026-10-30 nightly on, that
+        # holder's transfer reverted on every Ethereum fork with no change on our side (#971), which
+        # is what a hand-picked live account does when its owner moves the funds.
+        owner = _getter_address(url, token.address, _SEL_OWNER)
+        assert owner is not None, f"cannot seed {token.symbol}: no l2Bridge, masterMinter or owner getter"
+        _send_as(url, owner, token.address, _SEL_ISSUE + _word(amount))
+        _send_as(url, owner, token.address, _SEL_TRANSFER + _word(holder) + _word(amount))
     got = _usdc_balance(url, holder, token)
     assert got >= amount, (
         f"seeding {token.symbol} on chain {token.chain_id} left {got} base units, wanted {amount}: "
