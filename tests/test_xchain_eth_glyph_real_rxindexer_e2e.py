@@ -39,7 +39,6 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
-import time
 
 import pytest
 
@@ -67,6 +66,7 @@ from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests._anvil import start_anvil
 
 # tests.* is importable thanks to tests/conftest.py adding the repo root to sys.path (the
 # console-script pytest only puts ``src`` on the path). Reuse the ETH e2e's anvil helpers + the
@@ -79,8 +79,6 @@ from tests.test_xchain_eth_swap_regtest_e2e import (
     _KEY,
     _anvil_mine,
     _anvil_now,
-    _anvil_rpc,
-    _free_port,
     _MemSeen,
     _RecordingEthLeg,
 )
@@ -342,25 +340,9 @@ def env():
     if not isinstance(node.rxd("getblockchaininfo"), dict) or node.rxd("getblockchaininfo")["chain"] != "regtest":
         pytest.skip("RXD_NODE_CT is not a reachable regtest node")
     ws_url = os.environ.get("RXINDEXER_WS", "ws://127.0.0.1:50011")
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    anvil = subprocess.Popen(
-        ["anvil", "--port", str(port), "--chain-id", str(_CHAIN_ID), "--slots-in-an-epoch", "1", "--silent"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        for _ in range(100):
-            try:
-                _anvil_rpc(url, "eth_chainId")
-                break
-            except Exception:
-                time.sleep(0.1)
-        else:
-            pytest.fail("anvil did not become ready")
+    # The URL is the one this anvil reported binding, not a port picked beforehand (#933).
+    with start_anvil(["--chain-id", str(_CHAIN_ID), "--slots-in-an-epoch", "1"], ready_timeout_s=10) as url:
         yield node, url, ws_url
-    finally:
-        anvil.terminate()
 
 
 class TestEthRealGlyphSwap:
