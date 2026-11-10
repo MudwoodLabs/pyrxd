@@ -12,7 +12,7 @@ cryptography>=50.0.2
 #   <21.7.12  does not integrity-check the downloaded seed wheels (pip/setuptools)
 #             before use.
 # CI installs this pin, so it must not resolve to a flagged version.
-virtualenv>=21.15.0
+virtualenv>=21.15.5
 # Floor for the transitive filelock dep (Dependabot alerts #37, #45, #46, #55-#60):
 #   <=4.2.0  symlink, hard-link and directory-swap races in its lock files
 #            (GHSA-v4x8-3wr5-3wq8, GHSA-69hj-f68j-2879 and others), patched in 4.2.1.
