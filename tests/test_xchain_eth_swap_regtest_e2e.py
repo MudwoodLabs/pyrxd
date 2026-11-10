@@ -26,7 +26,6 @@ import math
 import os
 import secrets
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
@@ -62,6 +61,7 @@ from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from tests._anvil import start_anvil
 
 # A fake ref-authenticity indexer (resolves a genesis ref to a clean ResolvedRef — gly marker,
 # deep confs, genesis-outpoint == ref). For FT/NFT the coordinator's pre-lock gate requires one;
@@ -206,14 +206,6 @@ class _RxdNode:
 # --------------------------------------------------------------------------- anvil + helpers
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 def _anvil_rpc(url, method, params=None):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
     req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
@@ -275,26 +267,12 @@ def env():
         pytest.skip(f"{_RXD_IMAGE} image not available")
     node = _RxdNode()
     node.start()
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    anvil = subprocess.Popen(
-        ["anvil", "--port", str(port), "--chain-id", str(_CHAIN_ID), "--slots-in-an-epoch", "1", "--silent"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
     try:
-        for _ in range(100):
-            try:
-                _anvil_rpc(url, "eth_chainId")
-                break
-            except Exception:
-                time.sleep(0.1)
-        else:
-            pytest.fail("anvil did not become ready")
-        node.clock = lambda: _anvil_now(url)
-        yield node, url
+        # The URL is the one this anvil reported binding, not a port picked beforehand (#933).
+        with start_anvil(["--chain-id", str(_CHAIN_ID), "--slots-in-an-epoch", "1"], ready_timeout_s=10) as url:
+            node.clock = lambda: _anvil_now(url)
+            yield node, url
     finally:
-        anvil.terminate()
         node.stop()
 
 
