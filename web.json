@@ -4,13 +4,23 @@
       "/playground": 4,
       "/pyrxd/": 3
     },
-    "2026-11-10": {}
+    "2026-11-10": {
+      "/playground": 2
+    },
+    "2026-11-11": {
+      "/pyrxd/reference/mutation-survivors/glyph.html": 2
+    }
   },
   "visits": {
     "2026-11-09": {
       "/playground": 4,
       "/pyrxd/": 3
     },
-    "2026-11-10": {}
+    "2026-11-10": {
+      "/playground": 2
+    },
+    "2026-11-11": {
+      "/pyrxd/reference/mutation-survivors/glyph.html": 2
+    }
   }
 }
