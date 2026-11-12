@@ -507,6 +507,24 @@ class TestGlyphListAsksASecondOperator:
         disputed = sorted(line.split()[1] for line in _shown(result).splitlines() if line.startswith("DISPUTED"))
         assert disputed == sorted([f"{ft_tx.txid()}:0", f"{spent_tx.txid()}:0"])
 
+    def test_a_list_read_from_a_third_server_is_held_to_both_operators(self, tmp_path, monkeypatch) -> None:
+        """The two operators agree, but the list was read through failover from a server that is
+        neither of them, and it re-lists a spent output. Two honest operators that agree with
+        each other do not confirm a row neither lists."""
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        third = _ElectrumX({first: [_plain(first), nft_tx, ft_tx, spent_tx]})
+        a, b = _ElectrumX(held), _ElectrumX(held)
+        machine = _run(tmp_path, monkeypatch, third, mnemonic, "glyph", "list", pair=(a, b))
+        assert machine.exit_code == 2, machine.output
+        assert _shown(machine) == ""
+        human = _run(tmp_path, monkeypatch, third, mnemonic, "glyph", "list", mode="human", pair=(a, b))
+        assert human.exit_code == 2, human.output
+        assert [line for line in _shown(human).splitlines() if line.startswith("DISPUTED")] == [
+            f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by the server this list was read from, "
+            "but by neither wss://first.example:50022 nor wss://second.example:50022"
+        ]
+
     def test_the_check_reads_the_scanned_addresses_not_just_the_first(self, tmp_path, monkeypatch) -> None:
         """A decoy at a second used address is caught as well: every scanned address's owner is asked."""
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)

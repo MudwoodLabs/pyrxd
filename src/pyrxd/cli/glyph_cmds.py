@@ -89,7 +89,7 @@ from ..glyph.fees import (
 from ..glyph.mint import JsonFilePendingStore, PendingMint
 from ..glyph.payload import encode_payload
 from ..glyph.scanner import GlyphScanner
-from ..glyph.spentness import UnspentCrossCheck, cross_check_unspent
+from ..glyph.spentness import Outpoint, UnspentCrossCheck, cross_check_unspent, outpoint_of
 from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, build_ft_airdrop
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
 from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
@@ -3564,8 +3564,14 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
         what="this list",
         view=_human_glyph_list(rows, columns, note) if rows else "",
     )
-    if checked and check.disputed:
-        _refuse_disputed(ctx, check, _human_glyph_list(rows, columns, note) if rows else "")
+    if checked:
+        # Every token shown must be one BOTH operators list. The list itself is read through the
+        # failover client, which may have answered from neither of the two (a third operator, or
+        # a failover mid-scan), so the two agreeing with each other is not enough on its own.
+        shown = {outpoint_of(h.txid, h.vout) for _address, held_items in reads.answered for h in held_items}
+        unconfirmed = shown - check.agreed - check.disputed
+        if check.disputed or unconfirmed:
+            _refuse_disputed(ctx, check, unconfirmed, _human_glyph_list(rows, columns, note) if rows else "")
     if ctx.output_mode == "human":
         click.echo(_human_glyph_list(rows, columns, note))
     else:
@@ -3621,8 +3627,11 @@ def _human_glyph_list(rows: list[dict], columns: list[str], note: str = _SPENT_S
     return f"{table}\n{note}" if rows else table
 
 
-def _refuse_disputed(ctx: CliContext, check: UnspentCrossCheck, view: str) -> None:
+def _refuse_disputed(ctx: CliContext, check: UnspentCrossCheck, unconfirmed: set[Outpoint], view: str) -> None:
     """Exit 2: the two operators disagree on which of this wallet's token outputs are unspent.
+
+    *unconfirmed* is what the list was read as holding but neither operator lists: the server
+    the list came from is then a third voice, and it is outvoted, not believed.
 
     Same shape as :func:`~pyrxd.cli.query_cmds.refuse_if_incomplete`: the human output shows the
     list with a DISPUTED line per disputed outpoint, on stdout; JSON and quiet print nothing,
@@ -3637,11 +3646,16 @@ def _refuse_disputed(ctx: CliContext, check: UnspentCrossCheck, view: str) -> No
             [(o, first, second) for o in check.only_first] + [(o, second, first) for o in check.only_second]
         ):
             click.echo(f"DISPUTED: {txid}:{vout} is listed as unspent by {lister} but not by {silent}")
+        for txid, vout in sorted(unconfirmed):
+            click.echo(
+                f"DISPUTED: {txid}:{vout} is listed as unspent by the server this list was read from, "
+                f"but by neither {first} nor {second}"
+            )
     raise NetworkBoundaryError(
         "two ElectrumX operators disagree on which of this wallet's token outputs are unspent",
         cause=(
-            f"{len(check.only_first)} listed only by {first}, {len(check.only_second)} only by {second}; "
-            "one of them is wrong, or a transaction has reached only one so far"
+            f"{len(check.only_first)} listed only by {first}, {len(check.only_second)} only by {second}, "
+            f"{len(unconfirmed)} by neither; a server is wrong, or a transaction has not reached them all yet"
         ),
         fix="retry in a minute; if it persists, one of the two operators is not to be trusted for this wallet",
     )
