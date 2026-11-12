@@ -537,7 +537,9 @@ async def test_an_ack_before_the_resume_does_not_carry_over_to_the_recorded_swap
     assert len(w.channel.sent) == 1, "the ACK held while the situation was open"
     w.record_the_lock()
     (res,) = await rec.tick()
-    assert res.decision.situation == SITUATION_CLAIM_RACE
+    # The recorded swap's claim may be armed, so #976 suffixes the executor's outcome (claim_race:none).
+    situation = res.decision.situation
+    assert situation == SITUATION_CLAIM_RACE or situation.startswith(SITUATION_CLAIM_RACE + ":"), situation
     assert len(w.channel.sent) == 2, "the recorded swap's claim page was silenced by the unrecorded one's ACK"
     assert w.alerter.unacked_critical_count() == 1
 
