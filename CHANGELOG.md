@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **An armed claim page says what the autonomous claim executor did, and why, and its ACK key names
+  that** (#935). The `PAGE_CLAIM` page now ends with the executor's outcome (broadcast with its txid,
+  declined, failed, or no executor) and its reason, including the node's sanitized rejection reason
+  for a consensus refusal; URLs in a reason are cut to scheme and host. Its situation tag, and so the
+  `ack:` key, is `claim_race:<outcome>:<kind>` (`claim_race:none` with no executor), where the kind
+  is the executor's own label for the reason: an ACK written for the bare `claim_race` situation no
+  longer matches an armed claim page, and a new outcome or kind pages again. The heartbeat line gains
+  `exec_declined=` (it stays INFO; `exec_failed` still raises it to ERROR).
+  `ClaimExecutor.take_reason`, `pyrxd.gravity.watch.executor.ExecReason` and `take_exec_reason`
+  carry the reason to the reconciler.
+- **An exhausted capped fee pool is named on the claim page** (#936). `ClaimExecutor` catches
+  `FeePoolExhaustedError` and returns `FAILED` (kind `fee_pool_exhausted`) with the pool's cap,
+  dispensed and remaining photons, instead of letting it escape as a generic `FAILED`. The claim is
+  not marked seen, so a funded pool claims on the next tick.
+
 ### Changed
 
 - **`pyrxd glyph list` asks a second operator whether each token output is unspent (#788).**
