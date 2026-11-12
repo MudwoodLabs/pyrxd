@@ -23,12 +23,16 @@ Glyph tokens
 - ``pyrxd glyph list`` — list the Glyph tokens a wallet holds. Each token's owner and amount are
   checked against its own transaction. Whether each output is still **unspent** is asked of two
   ElectrumX operators when two are configured (the shipped mainnet default is two): each lists
-  the wallet's token outputs itself, under script hashes derived from the wallet's keys, and the
-  two lists are compared. If they disagree, the command exits 2 and only the human output shows
-  the list, with a ``DISPUTED`` line per outpoint. Agreement is **two operators' word, not a
-  proof**. With one operator configured (``--electrumx URL``, for one), or when the second cannot
-  be read, it is one server's word, and the output says so. Each ``--json`` row carries
-  ``"spent_status_source"``: ``"two-operators"`` or ``"server"``.
+  the wallet's token outputs itself, under script hashes derived from the wallet's keys, and
+  each list is compared, in both directions, with the one the inventory was read from. If any
+  disagree, the command exits 2 and only the human output shows the list, with a ``DISPUTED``
+  line per outpoint (at most 20). When one operator cannot be read, the list is held to the
+  other; an operator whose TLS pin fails, or that is on another chain, refuses the list.
+  Agreement is **two operators' word, not a proof**. With one operator configured
+  (``--electrumx URL``, for one), or when neither can be read, it is one server's word, and the
+  output says so. Each ``--json`` row carries ``"spent_status_source"``: ``"two-operators"`` or
+  ``"server"``. **Not covered:** only the addresses the gap-limit scan finds are checked, so a
+  server that hides a whole address from that scan is not caught.
 - ``pyrxd glyph timelock-mint`` / ``timelock-reveal`` — seal content behind a timelock,
   and later publish the key that opens it. See below.
 

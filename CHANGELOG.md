@@ -10,13 +10,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`pyrxd glyph list` asks a second operator whether each token output is unspent (#788).**
   With two operators configured (the shipped mainnet default), each lists the wallet's token
-  outputs itself, under script hashes derived from the wallet's keys, and the two lists are
-  compared, so a server that re-lists an output the wallet has spent, or leaves out one it holds,
-  is caught whichever side it is on. A disagreement exits 2 (the human output shows the list
-  with a `DISPUTED` line per outpoint; JSON and quiet print nothing). Agreement sets each JSON
-  row's `spent_status_source` to `"two-operators"`; with one operator, or when the second cannot
-  be read, it stays `"server"` and the human note says why. Two operators that agree can still
-  both be wrong: this is a cross-check, not a proof.
+  outputs itself, under script hashes derived from the wallet's keys, and each list is compared,
+  in both directions, with the one the inventory was read from. So a server that re-lists an
+  output the wallet has spent, or leaves out one it holds, is caught whichever server it is,
+  including a third that served the inventory. A disagreement exits 2 (the human output shows the
+  list with a `DISPUTED` line per outpoint, at most 20; JSON and quiet print no rows, and the
+  error names the first outpoints). When one operator cannot be read, the list is still held to
+  the other. An operator whose TLS pin fails, or that is on another chain, refuses the list
+  (exit 2). Agreement of both sets each JSON row's `spent_status_source` to `"two-operators"`;
+  otherwise it stays `"server"` and the human note says why. Two operators that agree can still
+  both be wrong: this is a cross-check, not a proof. Only the addresses the gap-limit scan finds
+  are checked: a server that hides a whole address from that scan is not caught.
 
 ### Added
 
@@ -37,9 +41,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refund should not be refused on.
 - An `EthRpc` transport error now carries the HTTP status (`status`) even when its chain is cut to
   keep a keyed URL out, so the swap CLI prints `HTTP 401` / `HTTP 429` for it.
-- `GlyphScanner.scan_address_held` returns each token with the outpoint it was found at, and
-  `pyrxd.glyph.spentness.cross_check_unspent` compares two clients' unspent token listings for
-  a set of owners. `CliContext.make_operator_pair` builds two clients pinned to two operators.
+- `GlyphScanner.scan_address_held` returns each token with the outpoint it was found at, and the
+  server's whole listing. `pyrxd.glyph.spentness.cross_check_unspent` asks two clients for their
+  unspent token listings for a set of owners, and `judge_listing` compares a listing with them.
+  `CliContext.make_operator_pair` builds two clients pinned to two operators.
 
 ## [0.28.0] — 2026-11-07
 
