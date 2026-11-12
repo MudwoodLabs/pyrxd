@@ -6,6 +6,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`pyrxd swap build-eth-refund`: sign the taker's refund of an ETH or ERC-20 counter leg, and
+  print it (#818).** For a swap whose resume was refused, there was no command for the ETH leg's
+  refund. This one reads the contract from the swap record beside the recovery file, checks that
+  the code on chain is exactly the runtime the record's terms imply and that it is not settled,
+  then builds the refund through the leg's own `refund()` (maturity, the ERC-20 refundee/deployer
+  rule, the empty-contract refusal, the gas ceiling, fee affordability and the preflight all
+  apply) and prints the signed transaction. It never broadcasts. `swap status` now names it as
+  the next action for an ETH counter leg.
+- `EthHtlcContractLeg.check_refund_target(locator)`: the identity half of `verify_funded` (chain
+  id, exact runtime, getters) plus the settled flag, without the recipient and balance checks a
+  refund should not be refused on.
+- An `EthRpc` transport error now carries the HTTP status (`status`) even when its chain is cut to
+  keep a keyed URL out, so the swap CLI prints `HTTP 401` / `HTTP 429` for it.
+
 ## [0.28.0] — 2026-11-07
 
 Header verification is stricter (see Changed (breaking)): read that entry before upgrading code that

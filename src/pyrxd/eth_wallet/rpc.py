@@ -73,7 +73,27 @@ def _scrubbed(kind: type[RxdSdkError], message: str, exc: BaseException, url: st
     err = kind(str(redact_endpoints_in(message, url)))
     err.__cause__ = None if _chain_quotes_a_secret(exc, url) else exc
     err.__suppress_context__ = True
+    # The HTTP status survives a cut chain: it is a number, never part of the URL, and it is what
+    # tells an operator a 401 (key refused) from a 429 (rate limited). ``describe_network_error``
+    # in the swap CLI reads it from here (#818: ``build-eth-refund`` reaches its RPC this way).
+    status = _http_status(exc)
+    if status is not None:
+        err.status = status  # type: ignore[attr-defined]
     return err
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """The first integer ``status`` on *exc* or anything chained under it (aiohttp's
+    ``ClientResponseError`` carries one), else ``None``."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        status = getattr(cur, "status", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+        cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+    return None
 
 
 class _RedactingLogger:
