@@ -246,7 +246,8 @@ human sizing the fee is the only remaining control.
   ``--eth-key-file`` (mode 0600), else ``PYRXD_ETH_REFUND_KEY``, else the recovery file's
   ``eth_key_hex``. Repeat ``--eth-rpc-url`` (distinct operators): the contract checks, the maturity
   head and the key's nonce must then agree on every endpoint, with nothing of the key's in flight,
-  and the fees, which the first endpoint sets, may be at most twice what any other suggests. On a
+  and the max fee, which the first endpoint sets, may be at most twice what any other suggests
+  and no lower than the lowest base fee they report. On a
   value-bearing chain one ``--eth-rpc-url`` is refused unless ``--single-endpoint`` is passed: one
   endpoint alone could report a claimed contract as unsettled and hide that the secret is public.
   Test chains accept one. The signed bytes are decoded and must match the printed nonce, gas and

@@ -287,8 +287,9 @@ _EARLIER_REFUND_BLOCKS = {
 _REFUND_SELECTOR = bytes.fromhex("590e1ae3")
 
 
-#: A signed fee may be at most this many times the highest that an endpoint other than the one the leg
-#: built with suggests. The leg reads its fees from one endpoint (``MultiSourceEthRpc.fee_fields`` is
+#: The signed ``maxFeePerGas`` may be at most this many times the highest that an endpoint other than
+#: the one the leg built with suggests, and no lower than the lowest base fee they report. The tip is
+#: not checked on its own: EIP-1559 caps it at ``maxFeePerGas``, and tip oracles differ (some report 0). The leg reads its fees from one endpoint (``MultiSourceEthRpc.fee_fields`` is
 #: primary-only), so this is the check that a lying first endpoint did not set them.
 _FEE_TOLERANCE = 2
 
@@ -312,20 +313,31 @@ async def _assert_every_endpoint_agrees_to_send(rpc: Any, sender: str, tx: dict[
             raise ValidationError(
                 f"endpoint {i + 1} of {len(sources)} reads this key's nonce as {latest} mined, {pending} with "
                 f"pending, and the refund was built at nonce {nonce}. Either a transaction of this key is "
-                "still in flight (wait for it, or for an earlier refund this command printed, to mine or drop) "
-                "or the endpoints disagree. Nothing is printed"
+                "still in flight (wait for it, or for an earlier refund this command printed, to mine or drop, or "
+                "replace that nonce from the wallet that holds this key) or the endpoints disagree. Nothing is "
+                "printed"
             )
     if len(sources) < 2:
         return
     others = [await src.fee_fields() for src in sources[1:]]
-    for field in ("maxPriorityFeePerGas", "maxFeePerGas"):
-        ceiling = _FEE_TOLERANCE * max(int(o[field]) for o in others)
-        if int(tx[field]) > ceiling:
-            raise ValidationError(
-                f"the refund was signed with {field} {int(tx[field])} wei, more than {_FEE_TOLERANCE}x the "
-                f"highest the other endpoints suggest ({ceiling // _FEE_TOLERANCE} wei). The first "
-                "--eth-rpc-url sets the fees; nothing is printed"
-            )
+    signed_max = int(tx["maxFeePerGas"])
+    ceiling = _FEE_TOLERANCE * max(int(o["maxFeePerGas"]) for o in others)
+    if signed_max > ceiling:
+        raise ValidationError(
+            f"the refund was signed with maxFeePerGas {signed_max} wei, more than {_FEE_TOLERANCE}x the highest "
+            f"the other endpoints suggest ({ceiling // _FEE_TOLERANCE} wei). The first --eth-rpc-url sets the "
+            "fees; put another endpoint first, or check the first one. Nothing is printed"
+        )
+    # ``fee_fields`` is ``2 * base + tip`` (rpc.py), so each endpoint's base fee is recoverable from it.
+    floor = min(
+        (int(o["maxFeePerGas"]) - int(o["maxPriorityFeePerGas"])) // 2 for o in others
+    )  # floor-is-deliberate: the lowest base any other endpoint reports; refusing only below it
+    if signed_max < floor:
+        raise ValidationError(
+            f"the refund was signed with maxFeePerGas {signed_max} wei, below the base fee every other endpoint "
+            f"reports (at least {floor} wei), so it could not mine and would hold this key's nonce. The first "
+            "--eth-rpc-url sets the fees; put another endpoint first, or check the first one. Nothing is printed"
+        )
 
 
 def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to: str) -> None:

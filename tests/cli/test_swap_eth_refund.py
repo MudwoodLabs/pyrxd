@@ -587,7 +587,7 @@ def test_a_refund_this_command_printed_and_sent_blocks_the_next_run(monkeypatch)
 def test_a_tip_the_first_endpoint_inflated_is_not_printed(monkeypatch) -> None:
     rich = {**_TX, "maxPriorityFeePerGas": 10**15, "maxFeePerGas": 10**15 + 2}
     _stub_leg(monkeypatch, rich)
-    with pytest.raises(ValidationError, match="maxPriorityFeePerGas .* more than 2x"):
+    with pytest.raises(ValidationError, match="maxFeePerGas .* more than 2x"):
         _build(_Multi(_Rpc(), _Rpc()))
 
 
@@ -755,3 +755,22 @@ def test_check_refund_target_runs_all_three_then_reads_settled(monkeypatch, sett
     leg, calls = _wire_identity_checks(monkeypatch, failing=None, settled=settled)
     assert asyncio.run(leg.check_refund_target(_locator())) is expected
     assert calls == ["assert_chain", "_assert_runtime_exact", "_assert_immutables_bind"]
+
+
+def test_a_max_fee_below_every_other_endpoints_base_fee_is_not_printed(monkeypatch) -> None:
+    """A lying first endpoint suggests 1 wei: the refund could never mine and would hold the nonce."""
+    _stub_leg(monkeypatch, {**_TX, "maxPriorityFeePerGas": 0, "maxFeePerGas": 1})
+    with pytest.raises(ValidationError, match="below the base fee"):
+        _build(_Multi(_Rpc(tip=0, max_fee=1), _Rpc(tip=1, max_fee=2 * 10 + 1)))
+
+
+def test_an_honest_tip_beside_an_endpoint_that_suggests_tip_zero_is_printed(monkeypatch) -> None:
+    """Base 10, the other endpoint's tip oracle says 0: an honest tip of 2 within the max fee signs."""
+    _stub_leg(monkeypatch, {**_TX, "maxPriorityFeePerGas": 2, "maxFeePerGas": 22})
+    out = _build(_Multi(_Rpc(tip=2, max_fee=22), _Rpc(tip=0, max_fee=20)))
+    assert (out.max_priority_fee_per_gas, out.max_fee_per_gas) == (2, 22)
+
+
+def test_a_max_fee_at_the_other_endpoints_base_fee_is_printed(monkeypatch) -> None:
+    _stub_leg(monkeypatch, {**_TX, "maxPriorityFeePerGas": 0, "maxFeePerGas": 10})
+    assert _build(_Multi(_Rpc(), _Rpc(tip=0, max_fee=20))).max_fee_per_gas == 10

@@ -16,9 +16,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rule, the empty-contract refusal, the gas ceiling, fee affordability and the preflight all
   apply) and prints the signed transaction. It never broadcasts. On a value-bearing chain it
   needs two `--eth-rpc-url` endpoints from distinct operators, or `--single-endpoint`. Every
-  endpoint must read the key's nonce as free at the signed nonce, the fees (set by the first
-  endpoint) may be at most twice what any other suggests, and the record's refundee and timeout
-  must match the recovery file. `swap
+  endpoint must read the key's nonce as free at the signed nonce; the max fee (set by the first
+  endpoint) must be no lower than the lowest base fee the others report and no higher than twice
+  the highest max fee they suggest; and the record's refundee and timeout must match the recovery
+  file. `swap
   status` now names it as the next action for an ETH counter leg.
 - `EthHtlcContractLeg.check_refund_target(locator)`: the identity half of `verify_funded` (chain
   id, exact runtime, getters) plus the settled flag, without the recipient and balance checks a
