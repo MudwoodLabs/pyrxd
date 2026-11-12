@@ -176,9 +176,25 @@ def _new_wallet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, H
     return mnemonic, HdWallet.from_mnemonic(mnemonic)
 
 
-def _run(tmp_path, monkeypatch, server: _ElectrumX, mnemonic: str, *args: str, mode: str = "json"):
-    """A command against the real wallet file. Only the transport is swapped."""
+def _run(
+    tmp_path,
+    monkeypatch,
+    server: _ElectrumX,
+    mnemonic: str,
+    *args: str,
+    mode: str = "json",
+    pair: tuple[_ElectrumX, _ElectrumX] | None = None,
+):
+    """A command against the real wallet file. Only the transport is swapped.
+
+    *pair* is the two operators ``glyph list`` asks whether its outputs are unspent (#788);
+    ``None`` is a single-operator configuration.
+    """
     monkeypatch.setattr(CliContext, "make_client", lambda self: server)
+    labelled = (
+        None if pair is None else (("wss://first.example:50022", pair[0]), ("wss://second.example:50022", pair[1]))
+    )
+    monkeypatch.setattr(CliContext, "make_operator_pair", lambda self: labelled)
     return CliRunner().invoke(cli, [*_base(tmp_path, mode), *args], input=mnemonic + "\n")
 
 
@@ -366,10 +382,13 @@ _SPENT_NOTE = (
 )
 
 
+_ONE_OPERATOR = "only one ElectrumX operator is configured, so no second one was asked"
+
+
 class TestGlyphListSaysUnspentIsTheServersWord:
-    """Nothing checks that a listed token output is still unspent: a server can re-list one the
-    wallet has spent and it passes every check the scanner makes. Until a second source is asked,
-    the output says whose word "unspent" is. The JSON gains a field; no existing field changes."""
+    """With one operator configured, nothing checks that a listed token output is still unspent:
+    a server can re-list one the wallet has spent and it passes every check the scanner makes.
+    The output says whose word "unspent" is. The JSON gains a field; no existing field changes."""
 
     def _held(self, tmp_path, monkeypatch):
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)
@@ -383,9 +402,9 @@ class TestGlyphListSaysUnspentIsTheServersWord:
         result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list", mode="human")
         assert result.exit_code == 0, (result.output, result.exception)
         lines = _shown(result).splitlines()
-        assert lines[-1] == _SPENT_NOTE
-        assert any(nft_ref in line for line in lines[:-1])
-        assert any(ft_ref in line for line in lines[:-1])
+        assert lines[-2:] == [_SPENT_NOTE, f"({_ONE_OPERATOR}.)"]
+        assert any(nft_ref in line for line in lines[:-2])
+        assert any(ft_ref in line for line in lines[:-2])
 
     def test_an_empty_human_list_has_no_note(self, tmp_path, monkeypatch) -> None:
         """No output is listed, so there is no "unspent" to qualify."""
@@ -415,6 +434,161 @@ class TestGlyphListSaysUnspentIsTheServersWord:
         result = _run(tmp_path, monkeypatch, server, mnemonic, "glyph", "list", mode="quiet")
         assert result.exit_code == 0, (result.output, result.exception)
         assert sorted(_shown(result).splitlines()) == sorted([nft_ref, ft_ref])
+
+
+class TestGlyphListAsksASecondOperator:
+    """With two operators configured, each lists the wallet's token outputs itself, under hashes
+    derived from the wallet's keys, and the two lists are compared (#788). Neither the inventory
+    scan nor either operator picks what the other is asked about, so a liar on EITHER side shows
+    up, whether it re-lists a spent output (a decoy) or leaves out one it holds (a withholding).
+
+    The re-listed output here is a real token transaction of this wallet that only the liar
+    still lists: everything the scanner checks (owner, script hash, amount) passes for it."""
+
+    def _wallet_and_txs(self, tmp_path, monkeypatch):
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        first = w.derive_address(0, 0)
+        nft_tx, nft_ref = _nft(w, 0, 0, "ab")
+        ft_tx, ft_ref = _ft(w, 0, 0, "cd", 5_000)
+        spent_tx, spent_ref = _ft(w, 0, 0, "ef", 9_000)  # a different ref, so a different tx
+        return mnemonic, first, (nft_tx, nft_ref), (ft_tx, ft_ref), (spent_tx, spent_ref)
+
+    def test_two_operators_that_agree_confirm_every_row(self, tmp_path, monkeypatch) -> None:
+        """The honest path: both list exactly what the wallet holds."""
+        mnemonic, first, (nft_tx, nft_ref), (ft_tx, ft_ref), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        a, b = _ElectrumX(held), _ElectrumX(held)
+        machine = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", pair=(a, b))
+        assert machine.exit_code == 0, (machine.output, machine.exception)
+        rows = _json(machine)
+        assert sorted(r["ref"] for r in rows) == sorted([nft_ref, ft_ref])
+        assert {r["spent_status_source"] for r in rows} == {"two-operators"}
+        human = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", mode="human", pair=(a, b))
+        assert human.exit_code == 0, (human.output, human.exception)
+        assert _shown(human).splitlines()[-1] == (
+            "Note: two ElectrumX operators (wss://first.example:50022 and wss://second.example:50022) each list "
+            "these outputs as unspent. That is their word, not a proof: two operators can agree and both be wrong."
+        )
+        assert "DISPUTED" not in human.output
+
+    def test_a_lying_primary_that_adds_a_decoy_and_withholds_a_token_is_caught(self, tmp_path, monkeypatch) -> None:
+        """The inventory is read from the liar, which is also the first operator: it re-lists a
+        spent FT output and leaves out the NFT. Both outpoints are disputed, each named with the
+        operator that lists it, and nothing is shown as the wallet's in JSON."""
+        mnemonic, first, (nft_tx, _nft_ref), (ft_tx, _ft_ref), (spent_tx, _sref) = self._wallet_and_txs(
+            tmp_path, monkeypatch
+        )
+        liar = _ElectrumX({first: [_plain(first), ft_tx, spent_tx]})
+        honest = _ElectrumX({first: [_plain(first), nft_tx, ft_tx]})
+        machine = _run(tmp_path, monkeypatch, liar, mnemonic, "glyph", "list", pair=(liar, honest))
+        assert machine.exit_code == 2, machine.output
+        assert _shown(machine) == "", "no rows, not even '[]'"
+        assert "two ElectrumX operators disagree" in machine.output
+        human = _run(tmp_path, monkeypatch, liar, mnemonic, "glyph", "list", mode="human", pair=(liar, honest))
+        assert human.exit_code == 2, human.output
+        disputed = sorted(line for line in _shown(human).splitlines() if line.startswith("DISPUTED"))
+        assert disputed == sorted(
+            [
+                f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by wss://first.example:50022 "
+                "but not by wss://second.example:50022",
+                f"DISPUTED: {nft_tx.txid()}:0 is listed as unspent by wss://second.example:50022 "
+                "but not by wss://first.example:50022",
+            ]
+        )
+
+    def test_a_lying_second_operator_is_caught_too(self, tmp_path, monkeypatch) -> None:
+        """The inventory is read from an honest server; the second operator withholds the FT and
+        re-lists a spent one. Its word does not silently confirm or drop anything."""
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
+        honest = _ElectrumX({first: [_plain(first), nft_tx, ft_tx]})
+        liar = _ElectrumX({first: [_plain(first), nft_tx, spent_tx]})
+        result = _run(tmp_path, monkeypatch, honest, mnemonic, "glyph", "list", mode="human", pair=(honest, liar))
+        assert result.exit_code == 2, result.output
+        disputed = sorted(line.split()[1] for line in _shown(result).splitlines() if line.startswith("DISPUTED"))
+        assert disputed == sorted([f"{ft_tx.txid()}:0", f"{spent_tx.txid()}:0"])
+
+    def test_the_check_reads_the_scanned_addresses_not_just_the_first(self, tmp_path, monkeypatch) -> None:
+        """A decoy at a second used address is caught as well: every scanned address's owner is asked."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        a0, a1 = w.derive_address(0, 0), w.derive_address(0, 1)
+        nft_tx, _ref = _nft(w, 0, 0, "ab")
+        spent_tx, _sref = _ft(w, 0, 1, "cd", 7_000)
+        liar = _ElectrumX({a0: [_plain(a0), nft_tx], a1: [_plain(a1, salt=2), spent_tx]})
+        honest = _ElectrumX({a0: [_plain(a0), nft_tx], a1: [_plain(a1, salt=2)]})
+        result = _run(tmp_path, monkeypatch, liar, mnemonic, "glyph", "list", mode="human", pair=(liar, honest))
+        assert result.exit_code == 2, result.output
+        assert [line.split()[1] for line in _shown(result).splitlines() if line.startswith("DISPUTED")] == [
+            f"{spent_tx.txid()}:0"
+        ]
+
+    def test_a_second_operator_that_cannot_be_read_leaves_the_list_unchecked(self, tmp_path, monkeypatch) -> None:
+        """Not a dispute and not an agreement: the list is shown as one server's word, and says why."""
+        mnemonic, first, (nft_tx, nft_ref), (ft_tx, ft_ref), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        a = _ElectrumX(held)
+        down = _ElectrumX(held, unreadable={first})
+        machine = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", pair=(a, down))
+        assert machine.exit_code == 0, (machine.output, machine.exception)
+        rows = _json(machine)
+        assert sorted(r["ref"] for r in rows) == sorted([nft_ref, ft_ref])
+        assert {r["spent_status_source"] for r in rows} == {"server"}
+        human = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", mode="human", pair=(a, down))
+        assert human.exit_code == 0, (human.output, human.exception)
+        assert _shown(human).splitlines()[-2:] == [
+            _SPENT_NOTE,
+            "(the cross-check against a second operator could not be read "
+            "(wss://first.example:50022, wss://second.example:50022).)",
+        ]
+
+
+class TestTheOperatorPair:
+    """``CliContext.make_operator_pair`` gives two operators or none, counted by source."""
+
+    def _ctx(self, tmp_path, monkeypatch, body: str, network: str = "mainnet", override: str | None = None):
+        from pyrxd.cli import config as cfg_mod
+
+        for var in ("PYRXD_NETWORK", "PYRXD_ELECTRUMX"):
+            monkeypatch.delenv(var, raising=False)
+        path = tmp_path / "config.toml"
+        path.write_text(body)
+        return CliContext(config=cfg_mod.load(path).for_network(network, electrumx_override=override))
+
+    def test_the_shipped_mainnet_default_is_two_operators(self, tmp_path, monkeypatch) -> None:
+        from pyrxd.network.registry import default_endpoints
+        from pyrxd.network.source_identity import source_key
+
+        pair = self._ctx(tmp_path, monkeypatch, "").make_operator_pair()
+        assert pair is not None
+        (_la, a), (_lb, b) = pair
+        sources_a = {e.source for e in a.profile.endpoints}
+        sources_b = {e.source for e in b.profile.endpoints}
+        assert len(sources_a) == 1 and len(sources_b) == 1 and sources_a != sources_b
+        # Every shipped endpoint of each of the two operators, and nothing of the other's.
+        shipped = default_endpoints("mainnet")
+        assert {e.url for e in a.profile.endpoints} == {u for u in shipped if source_key(u) in sources_a}
+        assert {e.url for e in b.profile.endpoints} == {u for u in shipped if source_key(u) in sources_b}
+
+    def test_one_url_on_the_command_line_is_no_pair(self, tmp_path, monkeypatch) -> None:
+        ctx = self._ctx(tmp_path, monkeypatch, "", override="wss://one.example:50022")
+        assert ctx.make_operator_pair() is None
+
+    def test_two_urls_of_one_operator_are_no_pair(self, tmp_path, monkeypatch) -> None:
+        body = 'electrumx_servers = ["wss://a.example.com:50022", "wss://b.example.com:50022"]\n'
+        assert self._ctx(tmp_path, monkeypatch, body).make_operator_pair() is None
+
+    def test_two_declared_operators_are_a_pair(self, tmp_path, monkeypatch) -> None:
+        body = (
+            'electrumx_servers = [{ url = "wss://a.example.com:50022", operator = "alice" }, '
+            '{ url = "wss://b.example.com:50022", operator = "bob" }]\n'
+        )
+        pair = self._ctx(tmp_path, monkeypatch, body).make_operator_pair()
+        assert pair is not None
+        assert [label for label, _c in pair] == ["wss://a.example.com:50022", "wss://b.example.com:50022"]
+
+    def test_an_injected_client_factory_is_no_pair(self, tmp_path, monkeypatch) -> None:
+        ctx = self._ctx(tmp_path, monkeypatch, "")
+        ctx.client_factory = lambda: None  # type: ignore[assignment,return-value]
+        assert ctx.make_operator_pair() is None
 
 
 # --------------------------------------------------------------------------- utxos, same rule
