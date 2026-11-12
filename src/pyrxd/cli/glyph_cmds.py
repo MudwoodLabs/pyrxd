@@ -89,6 +89,13 @@ from ..glyph.fees import (
 from ..glyph.mint import JsonFilePendingStore, PendingMint
 from ..glyph.payload import encode_payload
 from ..glyph.scanner import GlyphScanner
+from ..glyph.spentness import (
+    ListingVerdict,
+    OperatorNotTrusted,
+    UnspentCrossCheck,
+    cross_check_unspent,
+    judge_listing,
+)
 from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, build_ft_airdrop
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
 from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
@@ -131,7 +138,7 @@ from ..security.types import Hex20, Txid
 from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
-from ..utils import validate_address
+from ..utils import address_to_public_key_hash, validate_address
 from .config import DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_PATH
 from .context import CliContext
 from .errors import CliError, NetworkBoundaryError, UserError
@@ -3468,17 +3475,28 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
     never listed as holding nothing: the command exits 2, and only the human output shows what
     the other addresses hold, marked INCOMPLETE.
 
-    Each token's owner and amount are checked against its own transaction, but that the output
-    is still unspent is the ElectrumX server's word: it is not verified, and a server can list
-    an output this wallet has already spent. The human output says so under the table, and each
-    JSON row carries "spent_status_source": "server".
+    Each token's owner and amount are checked against its own transaction. Whether the output is
+    still unspent is asked of two ElectrumX operators when two are configured (the mainnet
+    default ships two): each lists this wallet's token outputs itself, and each list is compared
+    with the one the inventory was read from, both ways. Agreement is two operators' word, not a
+    proof. If any of them disagree (an output one lists and another does not: a re-listed spent
+    output, a withheld one, or a transaction one has not seen yet), the command exits 2, and
+    only the human output shows the list, marked DISPUTED. That holds when one of the two
+    operators cannot be read, too: the list is then held to the one that answered. An operator
+    whose TLS pin fails, or that is on another chain, refuses the list. With one operator
+    configured, or when neither can be read, "unspent" is one server's word, and the output says
+    so. Only the addresses the gap-limit scan finds are checked: a server that hides a whole
+    address from that scan is not caught here.
+
+    Each JSON row carries "spent_status_source": "two-operators" when both agree, or "server"
+    when only one was asked.
     """
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
     # The per-address reader logs a failed read and keeps only the address, which would report a
     # server that contradicts its own transactions as one that could not be reached.
     inconsistent: list[str] = []
 
-    async def _do_scan() -> AddressReads:
+    async def _do_scan() -> tuple[AddressReads, UnspentCrossCheck | str]:
         client = ctx.make_client()
         async with client:
             scanner = GlyphScanner(client)
@@ -3489,15 +3507,23 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
             # address) fails it rather than being shown as the wallet's (#782).
             async def _read(address: str) -> list:
                 try:
-                    return await scanner.scan_address(address, strict=True)
+                    return await scanner.scan_address_held(address, strict=True)
                 except ServerInconsistencyError as exc:
                     inconsistent.append(str(exc))
                     raise
 
-            return await scan_then_read(wallet, client, _read, what="glyph scan")
+            reads = await scan_then_read(wallet, client, _read, what="glyph scan")
+        owners = [Hex20(address_to_public_key_hash(address)) for address, _items in reads.answered]
+        return reads, await _cross_check_unspent(ctx, owners)
 
     try:
-        reads = asyncio.run(_do_scan())
+        reads, check = asyncio.run(_do_scan())
+    except OperatorNotTrusted as exc:
+        raise NetworkBoundaryError(
+            f"refusing the list: the ElectrumX operator {exc.label} is not the server configured for it",
+            cause=exc.why,
+            fix=f"check {exc.label}'s pin and network in the config, or remove it",
+        ) from exc
     except NetworkError as exc:
         raise NetworkBoundaryError(
             "could not reach ElectrumX",
@@ -3514,9 +3540,17 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
             "that its own transaction shows is not",
         )
 
+    verdict = None
+    if isinstance(check, UnspentCrossCheck):
+        # The whole listing the inventory was read from, held or not, for every answered address:
+        # the same owners the operators were asked about. Compared both ways (judge_listing).
+        listed = frozenset().union(*(holdings.listed for _address, holdings in reads.answered))
+        verdict = judge_listing(listed, check)
+    status = _SPENT_STATUS_TWO_OPERATORS if verdict is not None and verdict.confirmed else _SPENT_STATUS_SOURCE
     rows: list[dict] = []
-    for address, items in reads.answered:
-        for item in items:
+    for address, holdings in reads.answered:
+        for held in holdings.held:
+            item = held.item
             if isinstance(item, GlyphNft) and kind in ("nft", "all"):
                 rows.append(
                     {
@@ -3525,7 +3559,7 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
                         "address": address,
                         "amount": "1",
                         "name": (item.metadata.name if item.metadata else ""),
-                        "spent_status_source": _SPENT_STATUS_SOURCE,
+                        "spent_status_source": status,
                     }
                 )
             elif isinstance(item, GlyphFt) and kind in ("ft", "all"):
@@ -3536,38 +3570,119 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
                         "address": address,
                         "amount": str(item.amount),
                         "name": (item.metadata.name if item.metadata else ""),
-                        "spent_status_source": _SPENT_STATUS_SOURCE,
+                        "spent_status_source": status,
                     }
                 )
 
     columns = ["type", "ref", "address", "amount", "name"]
+    # The note under the table is about "unspent", so it is for this check's outcome. A dispute
+    # is not stated there: it is refused below, with its own lines.
+    note = _spent_status_note(check, verdict)
     refuse_if_incomplete(
         ctx,
         reads.unread,
         reads.used,
         what="this list",
-        view=_human_glyph_list(rows, columns) if rows else "",
+        view=_human_glyph_list(rows, columns, note) if rows else "",
     )
+    if verdict is not None and verdict.disputes:
+        _refuse_disputed(ctx, verdict, _human_glyph_list(rows, columns, note) if rows else "")
     if ctx.output_mode == "human":
-        click.echo(_human_glyph_list(rows, columns))
+        click.echo(_human_glyph_list(rows, columns, note))
     else:
         click.echo(emit_table(rows, columns, mode=ctx.output_mode, quiet_field="ref"))
 
 
-# Who says a listed token output is unspent (#788). Nothing checks it: the scanner binds each
-# listed output to its transaction (owner, amount), but no second source is asked whether the
-# outpoint has been spent since. A field, so a script can tell; a future check would change it.
+async def _cross_check_unspent(ctx: CliContext, owners: list[Hex20]) -> UnspentCrossCheck | str:
+    """Ask two operators which of *owners*' token outputs are unspent (#788), or say why not.
+
+    Returns each operator's answer, or the reason there is none (a single-operator configuration).
+    An operator that cannot be read is kept as such in the answer, never as a reason to drop the
+    other's: :func:`~pyrxd.glyph.spentness.judge_listing` still holds the list to the one that
+    answered. Each operator lists the outputs itself, under hashes derived from the wallet's keys;
+    neither the inventory scan nor either operator picks what the other is asked about.
+    """
+    pair = ctx.make_operator_pair()
+    if pair is None:
+        return "only one ElectrumX operator is configured, so no second one was asked"
+    (first_label, first), (second_label, second) = pair
+    async with first, second:
+        return await cross_check_unspent(first, second, owners, labels=(first_label, second_label))
+
+
+# Who says a listed token output is unspent (#788). The scanner binds each listed output to its
+# transaction (owner, amount); whether it is still unspent is asked of two operators when two are
+# configured (`_cross_check_unspent`). A field, so a script can tell which happened.
 _SPENT_STATUS_SOURCE = "server"
+_SPENT_STATUS_TWO_OPERATORS = "two-operators"
 _SPENT_STATUS_NOTE = (
     "Note: the ElectrumX server says these outputs are unspent; pyrxd did not check that, "
     "and a server can list an output this wallet has already spent."
 )
 
 
-def _human_glyph_list(rows: list[dict], columns: list[str]) -> str:
+def _spent_status_note(check: UnspentCrossCheck | str, verdict: ListingVerdict | None) -> str:
+    """The line under the table: who says the listed outputs are unspent."""
+    if not isinstance(check, UnspentCrossCheck):
+        return f"{_SPENT_STATUS_NOTE}\n({check}.)"
+    first, second = check.labels
+    if verdict is not None and verdict.confirmed:
+        return (
+            f"Note: two ElectrumX operators ({first} and {second}) each list these outputs as unspent. "
+            "That is their word, not a proof: two operators can agree and both be wrong."
+        )
+    if verdict is not None and verdict.disputes:
+        return "Note: the servers do not agree on which of these outputs are unspent; see DISPUTED below."
+    answered = list(check.answered)
+    if answered and check.unreadable:
+        return (
+            f"{_SPENT_STATUS_NOTE}\n({check.unreadable[0]} could not be read; {answered[0]} lists the same "
+            "outputs, but one other operator is not a second opinion.)"
+        )
+    return f"{_SPENT_STATUS_NOTE}\n(neither {first} nor {second} could be read, so no second operator was asked.)"
+
+
+def _human_glyph_list(rows: list[dict], columns: list[str], note: str = _SPENT_STATUS_NOTE) -> str:
     """The human table, with the unspent caveat under it when anything is listed."""
     table = emit_table(rows, columns, mode="human")
-    return f"{table}\n{_SPENT_STATUS_NOTE}" if rows else table
+    return f"{table}\n{note}" if rows else table
+
+
+#: At most this many DISPUTED lines: a server can make the disagreement as long as it likes.
+_MAX_DISPUTED_LINES = 20
+
+
+def _refuse_disputed(ctx: CliContext, verdict: ListingVerdict, view: str) -> None:
+    """Exit 2: the servers disagree on which of this wallet's token outputs are unspent.
+
+    Same shape as :func:`~pyrxd.cli.query_cmds.refuse_if_incomplete`: the human output shows the
+    list with one DISPUTED line per disputed outpoint (at most :data:`_MAX_DISPUTED_LINES`), on
+    stdout; JSON and quiet print no rows, since neither has a place to say that a row is in
+    dispute, and the error names the first disputed outpoints instead. No party is taken as
+    right: a disagreement can be a lie by any of them, or a transaction not all have seen yet.
+    """
+    disputes = list(verdict.disputes.items())
+    lines = [
+        f"DISPUTED: {txid}:{vout} is listed as unspent by {' and '.join(by)} but not by {' or '.join(not_by)}"
+        for (txid, vout), (by, not_by) in disputes
+    ]
+    if ctx.output_mode == "human":
+        if view:
+            click.echo(view)
+        for line in lines[:_MAX_DISPUTED_LINES]:
+            click.echo(line)
+        if len(lines) > _MAX_DISPUTED_LINES:
+            click.echo(f"DISPUTED: ... and {len(lines) - _MAX_DISPUTED_LINES} more")
+    unread = f"; {', '.join(verdict.unreadable)} could not be read" if verdict.unreadable else ""
+    named = ", ".join(f"{txid}:{vout}" for (txid, vout), _parties in disputes[:3])
+    raise NetworkBoundaryError(
+        "the ElectrumX servers disagree on which of this wallet's token outputs are unspent",
+        cause=(
+            f"{len(disputes)} outpoint(s) in dispute ({named}{', ...' if len(disputes) > 3 else ''}){unread}; "
+            "a server is wrong, or a transaction has not reached them all yet"
+        ),
+        fix="retry in a minute; if it persists, one of the servers is not to be trusted for this wallet",
+    )
 
 
 # ---------------------------------------------------------------------------

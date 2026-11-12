@@ -465,8 +465,8 @@ class RadiantChainIO:
             if not isinstance(exc, PolicyRejection):
                 raise NetworkError(f"radiant broadcast failed: {exc}") from exc
             if not self._second_opinion:
-                # The node's verdict, raised as itself: ClaimExecutor tells a permanent rejection
-                # from a transient one only by this type and its reason.
+                # The node's verdict, raised as itself: ClaimExecutor tells a consensus rejection
+                # from any other only by this type and its reason, and retries both (#934).
                 raise
             rejection = exc
         # Asked outside the except block, so nothing is chained onto the rejection raised below.

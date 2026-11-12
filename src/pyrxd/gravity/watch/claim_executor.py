@@ -47,7 +47,7 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import TimeUnit, btc_input_outpoints_from_raw, btc_txid_from_raw, scrape_secret
@@ -55,9 +55,10 @@ from pyrxd.gravity.finality import CounterClaimFinality
 from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_claim_finality, max_protected_value
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
-from pyrxd.gravity.watch.executor import ExecOutcome
+from pyrxd.gravity.watch.executor import ExecOutcome, ExecReason
 from pyrxd.security.errors import (
     BroadcastEchoMismatch,
+    FeePoolExhaustedError,
     InsufficientFundsError,
     NetworkError,
     PolicyRejection,
@@ -396,6 +397,9 @@ class ClaimExecutor:
         # rebuilds (see _resend_held for what that costs), which never disarms the claim.
         self._resend_ticks = int(second_opinion_resend_ticks)
         self._held: dict[str, tuple[bytes, int]] = {}
+        # Why this tick's execute() ended as it did, by swap id, for the claim page (#935). Set by
+        # execute(), taken (and so cleared) by the reconciler right after; see take_reason.
+        self._reasons: dict[str, ExecReason] = {}
 
     @property
     def _value_bearing(self) -> bool:
@@ -406,7 +410,12 @@ class ClaimExecutor:
         return self._network not in TEST_NETWORKS
 
     async def execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
+        # Cleared first, so a tick that raises out of _run never leaves the last tick's reason to be
+        # read as this one's.
+        self._reasons.pop(swap_id, None)
         outcome, reason = await self._run(swap_id, record, decision)
+        if outcome is not None and reason is not None:
+            self._reasons[swap_id] = ExecReason(kind=getattr(reason, "kind", "other"), text=str(reason))
         if outcome is ExecOutcome.BROADCAST:
             logger.warning("AUTONOMOUS ASSET CLAIM BROADCAST for swap %s on %s", swap_id, self._network)
         elif outcome is ExecOutcome.DECLINED and reason is not None:
@@ -414,6 +423,14 @@ class ClaimExecutor:
         elif outcome is ExecOutcome.FAILED and reason is not None:
             logger.error("autonomous claim FAILED for %s: %s", swap_id, reason)
         return outcome
+
+    def take_reason(self, swap_id: str) -> ExecReason | None:
+        """The reason the last :meth:`execute` for *swap_id* gave for its outcome, once: a second call
+        returns ``None``. The reconciler puts it on the claim page (#935), so an operator can tell a
+        broadcast from a retry, a consensus refusal (with the node's reason) or an exhausted fee pool
+        without reading the log, and keys the page's situation on its kind. ``None`` when that execute
+        raised or did nothing."""
+        return self._reasons.pop(swap_id, None)
 
     async def _run(self, swap_id: str, record: SwapRecord, decision: Decision) -> tuple[ExecOutcome | None, str | None]:
         # 1. TYPED discriminator — never the display string (closes the ETH false-arm).
@@ -425,7 +442,9 @@ class ClaimExecutor:
             return ExecOutcome.DECLINED, f"autonomous claim is BTC-only, not {record.terms.counter_chain!r}"
         # 2. Dormancy — no claim sources wired → structurally cannot fire.
         if self._resolve_leg is None or self._status is None or self._bytes is None:
-            return ExecOutcome.DECLINED, f"DORMANT: network {self._network!r} not armed (broadcasts nothing)"
+            return ExecOutcome.DECLINED, _why(
+                "dormant", f"DORMANT: network {self._network!r} not armed (broadcasts nothing)"
+            )
         # 2b. AS-IS POSTURE arming gate — unattended mainnet money-movement requires the explicit
         #     affirmative opt-in (the "tell it" that 0.9.0's now-advisory require_audit_cleared no longer
         #     demands). A wired-but-un-armed executor on a value-bearing network broadcasts nothing.
@@ -513,7 +532,9 @@ class ClaimExecutor:
             # The covenant UTXO is gone → already claimed (by us on a prior tick, the taker, or any
             # third party — the keyless claim is broadcastable by anyone). Benign, idempotent no-op.
             if _is_missing_utxo(exc):
-                return ExecOutcome.DECLINED, "covenant already spent (asset claimed) — idempotent no-op"
+                return ExecOutcome.DECLINED, _why(
+                    "covenant_spent", "covenant reads as already spent (asset claimed?) — no-op"
+                )
             return ExecOutcome.FAILED, f"covenant read failed (transient): {exc}"
         except ValidationError as exc:
             return ExecOutcome.DECLINED, f"covenant could not be built/located: {exc}"
@@ -629,7 +650,27 @@ class ClaimExecutor:
                 swap_id,
                 exc,
             )
-            return ExecOutcome.DECLINED, f"fee input below the deadline-aware relay requirement: {exc}"
+            return ExecOutcome.DECLINED, _why(
+                "fee_below_floor", f"fee input below the deadline-aware relay requirement: {exc}"
+            )
+        except FeePoolExhaustedError as exc:
+            # The capped, dispense-once pool has nothing left under its cap (#936): every earlier
+            # refusal spent an input, by design. Nothing was built or broadcast. Not marked seen, like
+            # every other refusal, so a funded pool claims on the next tick. FAILED, as it was when this
+            # escaped to the reconciler, so the heartbeat goes to ERROR, and its own kind, so an ACK of
+            # an earlier consensus refusal does not hide it (Mythos combo 2.1). The page names the
+            # pool's state so the operator knows the fix is to fund it before the maker's refund opens.
+            pool = _fee_pool_state(getattr(leg, "fee_source", None))
+            logger.error(
+                "autonomous claim swap %s: the fee pool is EXHAUSTED (%s; %s) — nothing broadcast; operator "
+                "must fund the fee pool, or claim by hand, before the maker's CSV refund opens",
+                swap_id,
+                exc,
+                pool,
+            )
+            return ExecOutcome.FAILED, _why(
+                "fee_pool_exhausted", f"fee pool exhausted or at its cap, nothing broadcast ({pool}): {exc}"
+            )
         except PolicyRejection as exc:
             # PolicyRejection subclasses NetworkError, so this clause must precede the NetworkError
             # one below. Never marked seen, whatever the reason: a node's verdict can come from one
@@ -641,22 +682,26 @@ class ClaimExecutor:
             # dispense-once pool, the same trade the InsufficientFundsError arm makes.
             if not _is_consensus_rejection(exc):
                 # A conflict, a missing input, a fee, policy or unrecognised answer: a plain retry.
-                return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
+                return ExecOutcome.FAILED, _why("broadcast_refused", f"claim broadcast failed: {exc}")
             # A consensus verdict: still retried. DECLINED and an ERROR log with the node's reason, every
             # tick, so the operator can see the claim itself may be unusable before the deadline. The
-            # claim page (PAGE_CLAIM) fires either way; it does not carry this outcome or reason.
+            # claim page (PAGE_CLAIM) fires either way and carries this outcome and reason (#935).
             logger.error(
                 "autonomous claim swap %s: node rejected the covenant claim on a consensus rule (%s) — "
                 "retrying with a new fee input; operator must check the claim before the deadline",
                 swap_id,
                 exc,
             )
-            return ExecOutcome.DECLINED, f"node rejected the claim on a consensus rule (retrying): {exc}"
+            return ExecOutcome.DECLINED, _why(
+                "consensus_rejection", f"node rejected the claim on a consensus rule (retrying): {exc}"
+            )
         except BroadcastEchoMismatch as exc:
             if not isinstance(exc, RadiantEchoMismatch):
                 # Only a custom chain IO raises a bare one, without the bytes it sent: nothing to
                 # re-send, so the next tick rebuilds, as it did for every mismatch before #789.
-                return ExecOutcome.FAILED, f"claim broadcast echo mismatch; rebuilding next tick: {exc}"
+                return ExecOutcome.FAILED, _why(
+                    "echo_mismatch", f"claim broadcast echo mismatch; rebuilding next tick: {exc}"
+                )
             # The broadcast client answered with another txid (#789). The claim may have relayed, so
             # it is not rebuilt: its exact bytes are held and re-sent on later ticks (see
             # _resend_held), as for a claim only a second opinion took. A rebuild would dispense a new
@@ -673,11 +718,13 @@ class ClaimExecutor:
                 exc.local_txid,
                 self._resend_ticks,
             )
-            return ExecOutcome.FAILED, f"claim broadcast echo mismatch; re-sending the same bytes next tick: {exc}"
+            return ExecOutcome.FAILED, _why(
+                "echo_mismatch", f"claim broadcast echo mismatch; re-sending the same bytes next tick: {exc}"
+            )
         except NetworkError as exc:
             if _is_missing_utxo(exc):  # raced to spent between the check and the build → benign
-                return ExecOutcome.DECLINED, "covenant spent during claim (raced) — idempotent no-op"
-            return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
+                return ExecOutcome.DECLINED, _why("covenant_spent", "covenant spent during claim (raced?) — no-op")
+            return ExecOutcome.FAILED, _why("broadcast_failed", f"claim broadcast failed: {exc}")
         # Mark the covenant outpoint seen ONLY AFTER a successful broadcast (fire-once; see step 7) — so a
         # transient failure above still retries, and a crash here costs at most ONE re-carve, not per-tick.
         # Not when only a second-opinion client took it (#937): the broadcast client refused it, and the
@@ -702,7 +749,7 @@ class ClaimExecutor:
             txid,
             record.terms.radiant_amount,
         )
-        return ExecOutcome.BROADCAST, None
+        return ExecOutcome.BROADCAST, _why("broadcast", f"covenant claim broadcast, txid {txid}")
 
     async def _resend_held(
         self, swap_id: str, outpoint: str, held: tuple[bytes, int], leg
@@ -742,17 +789,21 @@ class ClaimExecutor:
             txid = None  # the broadcast client itself holds the claim
         except PolicyRejection as exc:
             self._held.pop(outpoint, None)
-            return ExecOutcome.FAILED, f"held claim refused by every server; rebuilding next tick: {exc}"
+            return ExecOutcome.FAILED, _why(
+                "held_claim", f"held claim refused by every server; rebuilding next tick: {exc}"
+            )
         except NetworkError as exc:
             self._count_down(outpoint, raw, left)
-            return ExecOutcome.FAILED, f"held claim re-send failed (transient): {exc}"
+            return ExecOutcome.FAILED, _why("held_claim", f"held claim re-send failed (transient): {exc}")
         except BroadcastEchoMismatch as exc:
             # The broadcast client again answered with another txid (#789), as a RadiantEchoMismatch or,
             # from a custom chain IO, a bare one: it neither took the bytes nor refused them in a way we
             # can believe, so this spends one re-send, like a transport failure, and the hold still ends
             # after its last one.
             self._count_down(outpoint, raw, left)
-            return ExecOutcome.FAILED, f"held claim re-send echo mismatch ({left - 1} re-sends left): {exc}"
+            return ExecOutcome.FAILED, _why(
+                "held_claim", f"held claim re-send echo mismatch ({left - 1} re-sends left): {exc}"
+            )
         except BaseException:
             # Anything else (a custom client's own exception, or the reconciler's tick watchdog
             # cancelling this tick) still spends a re-send, so the hold always ends and the claim is
@@ -763,7 +814,10 @@ class ClaimExecutor:
             self._count_down(outpoint, raw, left)
             return (
                 ExecOutcome.DECLINED,
-                f"claim {txid} held only by a second-opinion server; re-sent the same bytes ({left - 1} re-sends left)",
+                _why(
+                    "held_claim",
+                    f"claim {txid} held only by a second-opinion server; re-sent the same bytes ({left - 1} re-sends left)",
+                ),
             )
         self._held.pop(outpoint, None)
         if self._seen is not None:
@@ -773,7 +827,9 @@ class ClaimExecutor:
             swap_id,
             txid or "already known",
         )
-        return ExecOutcome.DECLINED, "held claim now taken by the broadcast client — awaiting confirmation"
+        return ExecOutcome.DECLINED, _why(
+            "held_claim", "held claim now taken by the broadcast client — awaiting confirmation"
+        )
 
     def _count_down(self, outpoint: str, raw: bytes, left: int) -> None:
         """Spend one re-send of a held claim; the last one ends the hold."""
@@ -847,6 +903,31 @@ class ClaimExecutor:
                 f"(burial {burial_blocks} blk × cost {self._reorg_cost_per_block} / factor {self._reorg_safety_factor})"
             )
         return None
+
+
+class _Why(str):
+    """A reason string that also carries its :class:`ExecReason` kind, chosen here, never by a server."""
+
+    kind: str
+
+
+def _why(kind: str, text: str) -> str:
+    """*text* tagged with *kind*, for :meth:`ClaimExecutor.take_reason`. An untagged reason is "other"."""
+    out = _Why(text)
+    out.kind = kind
+    return out
+
+
+def _fee_pool_state(fee_source: Any) -> str:
+    """The cap, spent and remaining photons of a capped fee source, for an exhausted-pool page (#936).
+    A source that does not report them (any ``FeeUtxoSource`` will do for the leg) says so."""
+    try:
+        cap = int(fee_source.total_cap_photons)
+        spent = int(fee_source.dispensed_photons)
+        remaining = int(fee_source.remaining_photons)
+    except Exception:
+        return "the fee source does not report its cap"
+    return f"cap {cap} photons, dispensed {spent}, remaining {remaining}"
 
 
 async def _maybe_await(fn, *args):

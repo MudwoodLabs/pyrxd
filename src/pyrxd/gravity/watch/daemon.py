@@ -46,7 +46,7 @@ def default_heartbeat(
     log: logging.Logger | None = None, *, unacked_critical: Callable[[], int] | None = None
 ) -> Heartbeat:
     """A heartbeat that logs tick count, swaps watched, pages decided, UNDELIVERED pages, the v2
-    autonomous-execution outcomes (broadcast / failed), and — when ``unacked_critical`` is wired —
+    autonomous-execution outcomes (broadcast / declined / failed), and — when ``unacked_critical`` is wired —
     the count of outstanding operator-un-ACK'd CRITICAL situations (review MEDIUM)."""
     log = log or logger
 
@@ -55,6 +55,9 @@ def default_heartbeat(
         undelivered = sum(1 for r in results if r.alert_delivered is False)
         broadcast = sum(1 for r in results if r.executed is ExecOutcome.BROADCAST)
         exec_failed = sum(1 for r in results if r.executed is ExecOutcome.FAILED)
+        # DECLINED is counted, not made loud: a dormant executor declines every tick by design. The
+        # claim page it rides on is CRITICAL and now names the outcome and reason (#935).
+        exec_declined = sum(1 for r in results if r.executed is ExecOutcome.DECLINED)
         unacked = -1
         if unacked_critical is not None:
             try:
@@ -68,12 +71,13 @@ def default_heartbeat(
         log.log(
             level,
             "watchtower heartbeat: tick=%d swaps=%d paged=%d undelivered=%d broadcast=%d "
-            "exec_failed=%d unacked_critical=%d",
+            "exec_declined=%d exec_failed=%d unacked_critical=%d",
             iteration,
             len(results),
             paged,
             undelivered,
             broadcast,
+            exec_declined,
             exec_failed,
             unacked,
         )
