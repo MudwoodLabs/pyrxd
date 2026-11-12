@@ -4706,7 +4706,11 @@ class SwapCoordinator:
         try:
             txid = await self.radiant_leg.refund_asset(self.record)
         except Exception as exc:
-            if outcome == "unknown":
+            # A broadcast echo mismatch is raised as itself: the refund went out and may have relayed,
+            # so "was not sent" would be false (#789).
+            from pyrxd.security.errors import BroadcastEchoMismatch
+
+            if outcome == "unknown" and not isinstance(exc, BroadcastEchoMismatch):
                 raise NetworkError(
                     f"what spent the covenant is unknown ({spend.reason}), and the refund was not sent: {exc}"
                 ) from exc
