@@ -84,6 +84,7 @@ from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
 from pyrxd.gravity.watch.decide import _required_btc_depth_blocks
 from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.gravity.watch.reconciler import DEFAULT_LEGACY_UNRESOLVED_PAGE_AFTER_S
+from pyrxd.gravity.watch.unrecorded_fund import DEFAULT_UNRECORDED_FUND_GRACE_BLOCKS
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.network.redaction import redacted_url
@@ -108,6 +109,8 @@ def build_reconciler(
     eth_source: EthChainSource | None = None,
     executor: Executor | None = None,
     legacy_unresolved_page_after_s: float | None = None,
+    btc_network: str = "bc",
+    unrecorded_fund_grace_blocks: int = DEFAULT_UNRECORDED_FUND_GRACE_BLOCKS,
 ) -> Reconciler:
     """Compose the real ports into a Reconciler (pure wiring — no network at call time).
 
@@ -117,7 +120,9 @@ def build_reconciler(
     ``eth_source`` (an :class:`RpcEthChainSource`, optional) adds the ETH counter-leg watch path so a
     records dir holding RXD↔ETH swaps is observed too (``None`` → ETH swaps fail closed, paging).
     ``executor`` (an :class:`RefundExecutor`, optional) adds the v2 autonomous-refund path; ``None`` →
-    a no-op ``NullExecutor`` → ALERT-ONLY, byte-identical to v1."""
+    a no-op ``NullExecutor`` → ALERT-ONLY, byte-identical to v1. ``btc_network`` labels the HTLC
+    locator the tower builds for a BTC fund a record never took, and ``unrecorded_fund_grace_blocks`` is
+    how deep (on the deepest source) such a fund must be before it pages as interrupted (#842)."""
     store = JsonDirRecordStore(records_dir)
 
     # Multi-source claim DETECTION (red-team MEDIUM): one /outspend fn per configured Esplora so a
@@ -141,6 +146,8 @@ def build_reconciler(
         # The depth our refund must be buried before it counts (#850 PR 9b): the policy's BTC reorg
         # depth, the same number the claim gate requires of the maker's claim.
         btc_burial_blocks=int(_required_btc_depth_blocks(policy)),
+        btc_network=btc_network,
+        unrecorded_fund_grace_blocks=unrecorded_fund_grace_blocks,
     )
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
@@ -970,6 +977,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # v2 AUTONOMOUS refund (opt-in; DORMANT on a value-bearing network without --audit-cleared). Without
     # --refund-spk the tower is ALERT-ONLY (broadcasts nothing), byte-identical to v1.
     p.add_argument(
+        "--unrecorded-fund-grace-blocks",
+        type=int,
+        default=DEFAULT_UNRECORDED_FUND_GRACE_BLOCKS,
+        help=(
+            "a BTC fund a swap record never took as its lock pages as interrupted once some source sees it "
+            f"this many blocks deep (default {DEFAULT_UNRECORDED_FUND_GRACE_BLOCKS}). Keep it above the fund "
+            "runner's min_confirmations: a runner still polling records the lock within a poll of that depth"
+        ),
+    )
+    p.add_argument(
         "--network",
         default="bc",
         help="BTC network the tower acts on (bc/signet/tb/bcrt); autonomy is DORMANT on a value-bearing network without --audit-cleared",
@@ -1165,6 +1182,8 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
             eth_source=eth_source,
             executor=executor,
             legacy_unresolved_page_after_s=args.legacy_unresolved_page_after_s,
+            btc_network=args.network,
+            unrecorded_fund_grace_blocks=args.unrecorded_fund_grace_blocks,
         )
         # Wire the un-ACK'd CRITICAL count into the heartbeat. Without this the emitted beat
         # carries no `unacked_critical` key at all, so an external escalation monitor has

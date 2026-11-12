@@ -52,8 +52,42 @@ __all__ = [
     "BtcConfirmedOutputReader",
     "BtcFundingReader",
     "FundingPolicy",
+    "htlc_for_terms",
+    "recorded_htlc_funding_tx",
     "require_audit_cleared",
 ]
+
+
+def htlc_for_terms(terms, *, network: str) -> t.BtcHtlc:
+    """The BTC HTLC the negotiated *terms* describe. The taker is the refund party and the maker holds
+    the claim key; the terms carry both x-only keys, so anyone holding the terms (the watchtower too)
+    rebuilds the same script tree and the same scriptPubKey."""
+    return t.build_htlc(
+        hashlock=terms.hashlock,
+        claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
+        refund_pubkey_xonly=terms.btc_refund_pubkey_xonly,
+        timeout=terms.t_btc,
+        network=network,
+    )
+
+
+def recorded_htlc_funding_tx(terms, htlc: t.BtcHtlc, tx_hex: str) -> bytes:
+    """The recorded funding bytes, refused unless output 0 pays THIS swap's HTLC its amount.
+
+    The one check that ties a record's ``pending_btc_funding_tx`` to its swap, shared by the leg's
+    resume and the watchtower's read of an unrecorded fund (#842), so the two cannot disagree on
+    which output the fund locked."""
+    try:
+        raw = bytes.fromhex(tx_hex)
+    except (TypeError, ValueError):
+        raise ValidationError("recorded funding transaction is not hex") from None
+    outputs = t.btc_spend_fields_from_raw(raw).outputs
+    if not outputs or outputs[0] != (terms.btc_sats, htlc.scriptpubkey):
+        raise ValidationError(
+            "recorded funding transaction does not pay this swap's HTLC output 0 the negotiated "
+            "amount; refusing to broadcast or adopt it (the record is corrupt or belongs to another swap)"
+        )
+    return raw
 
 
 @dataclass(frozen=True)
@@ -415,13 +449,7 @@ class BitcoinTaprootLeg:
         The taker is the refund party; the maker holds the claim key. The terms
         carry both x-only keys, so the HTLC is reconstructable for any spend.
         """
-        return t.build_htlc(
-            hashlock=terms.hashlock,
-            claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
-            refund_pubkey_xonly=terms.btc_refund_pubkey_xonly,
-            timeout=terms.t_btc,
-            network=self.network,
-        )
+        return htlc_for_terms(terms, network=self.network)
 
     def derive_funding_scriptpubkey(self, terms) -> bytes:
         """The funding SPK the taker independently re-derives from the terms."""
@@ -670,17 +698,7 @@ class BitcoinTaprootLeg:
 
     def _recorded_funding_tx(self, terms, htlc, tx_hex: str) -> bytes:
         """The recorded funding bytes, refused unless output 0 pays THIS swap's HTLC its amount."""
-        try:
-            raw = bytes.fromhex(tx_hex)
-        except (TypeError, ValueError):
-            raise ValidationError("recorded funding transaction is not hex") from None
-        outputs = t.btc_spend_fields_from_raw(raw).outputs
-        if not outputs or outputs[0] != (terms.btc_sats, htlc.scriptpubkey):
-            raise ValidationError(
-                "recorded funding transaction does not pay this swap's HTLC output 0 the negotiated "
-                "amount; refusing to broadcast or adopt it (the record is corrupt or belongs to another swap)"
-            )
-        return raw
+        return recorded_htlc_funding_tx(terms, htlc, tx_hex)
 
     async def _read_funded_amount_sats(self, funding_txid: str, vout: int) -> int:
         """Read the on-chain funded amount, polling for min_confirmations if configured.

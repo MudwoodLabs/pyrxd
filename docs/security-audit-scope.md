@@ -126,7 +126,7 @@ The audit should accept or challenge these explicitly — the code's safety argu
   wif-control + the cap, but cannot verify key isolation). See `CAPFEE-ISOLATION`.
 - **`ASSUME-AS-IS-POSTURE`** (was `ASSUME-PRE-AUDIT-GATE`). As of 0.9.0 the library-wide
   `require_audit_cleared` (`AUDIT_CLEARED_NETWORKS = {bcrt, regtest, tb, signet, rltc, tltc}`,
-  `btc_wallet/htlc_leg.py:105`) and `require_spv_sole_authority_cleared` gates are **advisory
+  `btc_wallet/htlc_leg.py:139`) and `require_spv_sole_authority_cleared` gates are **advisory
   no-ops** — verified at this commit: `spv/proof.py:39-55` documents "no longer blocks" and
   returns `None`. pyrxd "does what you tell it," like running a Radiant node: real-value safety
   is a documented operator responsibility, not a code-enforced default. An auditor should treat
