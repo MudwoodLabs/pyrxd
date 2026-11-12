@@ -97,9 +97,10 @@ __all__ = [
 # it was. Raise ``claim_dust_ceiling`` explicitly, with the magnitude you mean, to arm the executor.
 MAINNET_DUST_CEILING_PHOTONS = 10_000
 
-#: Ticks a claim only a second-opinion server took is re-sent as the same bytes before the next rebuild
-#: (#937). At the watchtower's documented 30 s poll that is about 5 minutes, one Radiant block
-#: (PROJECTED from the 300 s block target, not measured against a live tower).
+#: Ticks a held claim is re-sent as the same bytes before the next rebuild: one only a second-opinion
+#: server took (#937), or one the broadcast client answered with another txid (#789). At the
+#: watchtower's documented 30 s poll that is about 5 minutes, one Radiant block (PROJECTED from the
+#: 300 s block target, not measured against a live tower).
 SECOND_OPINION_RESEND_TICKS = 10
 
 # Test/regtest networks (no real value) == the audit-cleared set. Aliased so the executor's value-bearing
@@ -389,8 +390,9 @@ class ClaimExecutor:
         # DEEPER of single-node and quorum; a None/raise (below quorum) fails CLOSED. None → single-source posture.
         self._rxd_depth_corroborator = rxd_depth_corroborator
         self._claim_dust_ceiling = int(claim_dust_ceiling)
-        # A claim only a second-opinion server took (#937), by covenant outpoint: its exact bytes and the
-        # ticks left to re-send them before the next rebuild. In memory only: a restart forgets it and
+        # A held claim (one only a second-opinion server took, #937, or one answered with another txid,
+        # #789), by covenant outpoint: its exact bytes and the ticks left to re-send them before the next
+        # rebuild. In memory only: a restart forgets it and
         # rebuilds (see _resend_held for what that costs), which never disarms the claim.
         self._resend_ticks = int(second_opinion_resend_ticks)
         self._held: dict[str, tuple[bytes, int]] = {}
@@ -731,7 +733,7 @@ class ClaimExecutor:
         capped pool runs out. A refused claim paid the same per-tick cost before #937 (the
         PolicyRejection arm in ``_run``); the hold only spends nothing for its first
         ``second_opinion_resend_ticks`` ticks."""
-        from pyrxd.gravity.radiant_leg import RadiantEchoMismatch, SecondOpinionTxid, _AlreadyKnown
+        from pyrxd.gravity.radiant_leg import SecondOpinionTxid, _AlreadyKnown
 
         raw, left = held
         try:
@@ -744,10 +746,11 @@ class ClaimExecutor:
         except NetworkError as exc:
             self._count_down(outpoint, raw, left)
             return ExecOutcome.FAILED, f"held claim re-send failed (transient): {exc}"
-        except RadiantEchoMismatch as exc:
-            # The broadcast client again answered with another txid (#789): it neither took the bytes
-            # nor refused them in a way we can believe, so this spends one re-send, like a transport
-            # failure, and the hold still ends after its last one.
+        except BroadcastEchoMismatch as exc:
+            # The broadcast client again answered with another txid (#789), as a RadiantEchoMismatch or,
+            # from a custom chain IO, a bare one: it neither took the bytes nor refused them in a way we
+            # can believe, so this spends one re-send, like a transport failure, and the hold still ends
+            # after its last one.
             self._count_down(outpoint, raw, left)
             return ExecOutcome.FAILED, f"held claim re-send echo mismatch ({left - 1} re-sends left): {exc}"
         except BaseException:

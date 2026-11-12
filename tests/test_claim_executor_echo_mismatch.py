@@ -621,3 +621,24 @@ def test_a_retry_marker_wins_over_a_consensus_word(marker) -> None:
     assert not _is_consensus_rejection(_policy_rejection(-26, f"bad-txns-vout-negative {reason}"))
     # Honest pair: the consensus word alone is a consensus rejection.
     assert _is_consensus_rejection(_policy_rejection(-26, "bad-txns-vout-negative"))
+
+
+async def test_a_bare_mismatch_on_a_re_send_counts_down_and_does_not_escape(tick) -> None:
+    """Mythos combo pass on #977, 3.5: a bare mismatch from a custom chain IO on a RE-SEND reached
+    the catch-all arm, which re-raised it out of the executor. It spends one re-send instead."""
+    node = _Node()
+    ex, rec, fees = await _armed(node)
+    ex._resend_ticks = 1
+    node.lie, node.relay = True, False
+    outcome, _ = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and ex._held
+
+    leg = await ex._resolve_leg("swap-1", rec)
+
+    async def _bare(raw: bytes) -> str:
+        raise BroadcastEchoMismatch(_txid(raw), _LIE)
+
+    leg.chain_io.broadcast = _bare
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "re-send echo mismatch (0 re-sends left)" in reason, reason
+    assert ex._held == {} and len(fees.outpoints) == 1
