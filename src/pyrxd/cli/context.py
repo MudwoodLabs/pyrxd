@@ -96,6 +96,44 @@ class CliContext:
             raise config_error(exc, self.config.source_path) from None
         return FailoverElectrumXClient(profile)
 
+    def make_operator_pair(
+        self,
+    ) -> tuple[tuple[str, FailoverElectrumXClient], tuple[str, FailoverElectrumXClient]] | None:
+        """Two clients, each pinned to the endpoints of ONE operator, for a cross-check; else ``None``.
+
+        The first is every endpoint of the first configured endpoint's source
+        (:attr:`~pyrxd.network.registry.Endpoint.source`), the second every endpoint of the
+        next source; each fails over only within its own operator, so neither answer can come
+        from the other's servers. Each is labelled by its first endpoint's URL, redacted.
+
+        ``None`` when only one operator is configured (``--electrumx URL``, ``PYRXD_ELECTRUMX``,
+        a config naming one operator's servers, or a network with no shipped endpoint), or when
+        a ``client_factory`` is injected: there is no second operator to ask. A config that
+        cannot build a profile is ``None`` too; :meth:`make_client` reports that error.
+
+        Tests patch this to hand in fakes.
+        """
+        if self.client_factory is not None or self.config.endpoint_gap is not None:
+            return None
+        from ..network.failover import FailoverElectrumXClient
+        from ..network.redaction import redacted_url
+        from ..network.registry import NetworkProfile
+
+        try:
+            profile = self.config.require_profile()
+        except ValidationError:
+            return None
+        sources = list(dict.fromkeys(e.source for e in profile.endpoints))
+        if len(sources) < 2:
+            return None
+
+        def _pinned(source: str) -> tuple[str, FailoverElectrumXClient]:
+            endpoints = tuple(e for e in profile.endpoints if e.source == source)
+            pinned = NetworkProfile(network=profile.network, endpoints=endpoints, genesis_hash=profile.genesis_hash)
+            return redacted_url(endpoints[0].url), FailoverElectrumXClient(pinned)
+
+        return _pinned(sources[0]), _pinned(sources[1])
+
     def is_destructive_mode_safe(self) -> tuple[bool, str | None]:
         """Return (ok, reason) for whether we may run a destructive op now.
 

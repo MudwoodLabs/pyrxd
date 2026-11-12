@@ -23,6 +23,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dispensed and remaining photons, instead of letting it escape as a generic `FAILED`. The claim is
   not marked seen, so a funded pool claims on the next tick.
 
+### Changed
+
+- **`pyrxd glyph list` asks a second operator whether each token output is unspent (#788).**
+  With two operators configured (the shipped mainnet default), each lists the wallet's token
+  outputs itself, under script hashes derived from the wallet's keys, and the two lists are
+  compared, so a server that re-lists an output the wallet has spent, or leaves out one it holds,
+  is caught whichever side it is on. A disagreement exits 2 (the human output shows the list
+  with a `DISPUTED` line per outpoint; JSON and quiet print nothing). Agreement sets each JSON
+  row's `spent_status_source` to `"two-operators"`; with one operator, or when the second cannot
+  be read, it stays `"server"` and the human note says why. Two operators that agree can still
+  both be wrong: this is a cross-check, not a proof.
+
+### Added
+
+- `GlyphScanner.scan_address_held` returns each token with the outpoint it was found at, and
+  `pyrxd.glyph.spentness.cross_check_unspent` compares two clients' unspent token listings for
+  a set of owners. `CliContext.make_operator_pair` builds two clients pinned to two operators.
+
 ## [0.28.0] — 2026-11-07
 
 Header verification is stricter (see Changed (breaking)): read that entry before upgrading code that
