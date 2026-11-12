@@ -58,6 +58,15 @@ logger = logging.getLogger(__name__)
 GlyphItem = GlyphNft | GlyphFt
 
 
+#: ``(txid, vout)``, the txid lower-case hex in display order: the form outpoints are compared in.
+Outpoint = tuple[str, int]
+
+
+def outpoint_of(txid: object, vout: int) -> Outpoint:
+    """The comparable form of an outpoint: lower-case txid, int vout. Servers differ in case."""
+    return (str(txid).lower(), int(vout))
+
+
 @dataclass(frozen=True)
 class HeldGlyph:
     """A token :class:`GlyphScanner` found, and the outpoint it was found at."""
@@ -65,6 +74,20 @@ class HeldGlyph:
     item: GlyphItem
     txid: str
     vout: int
+
+
+@dataclass(frozen=True)
+class GlyphHoldings:
+    """What :meth:`GlyphScanner.scan_address_held` found, and what the server listed to find it.
+
+    ``listed`` is every outpoint the server listed under the scanned hashes, whether or not it
+    became a held token (a delegate token, a legacy container, a non-glyph output): it is the
+    server's whole answer, which is what a second operator's answer is compared with
+    (:func:`pyrxd.glyph.spentness.judge_listing`).
+    """
+
+    held: tuple[HeldGlyph, ...]
+    listed: frozenset[Outpoint]
 
 
 # Any two distinct refs will do: the server zeroes refs before hashing (see
@@ -172,12 +195,12 @@ class GlyphScanner:
             (see :meth:`_resolve_reveal_metadata`) — including transfer
             outputs whose commit-output history is unavailable.
         """
-        return [held.item for held in await self.scan_address_held(address, strict=strict)]
+        return [held.item for held in (await self.scan_address_held(address, strict=strict)).held]
 
-    async def scan_address_held(self, address: str, *, strict: bool = False) -> list[HeldGlyph]:
-        """:meth:`scan_address`, with the outpoint each token was found at.
+    async def scan_address_held(self, address: str, *, strict: bool = False) -> GlyphHoldings:
+        """:meth:`scan_address`, with the outpoint each token was found at and the server's whole listing.
 
-        The outpoint is what a second source is asked about when "unspent" must not be one
+        Both are what a second operator's answer is compared with when "unspent" must not be one
         server's word (:mod:`pyrxd.glyph.spentness`, #788). Same checks, same *strict*.
         """
         owner = Hex20(address_to_public_key_hash(address))
@@ -197,8 +220,8 @@ class GlyphScanner:
         :meth:`scan_address` was asked about. An FT's amount is the output's
         value in that transaction, never the server's ``value``. That a listed
         output is still unspent is the server's word: nothing here checks it. To ask a
-        second operator, take the outpoints from :meth:`scan_address_held` to
-        :func:`pyrxd.glyph.spentness.cross_check_unspent` (#788).
+        second operator, ask it with :func:`pyrxd.glyph.spentness.cross_check_unspent` and
+        judge :meth:`scan_address_held`'s listing against it (#788).
 
         A UTXO whose raw transaction cannot be fetched or parsed, or that is a
         server inconsistency, is logged and left out by default. For a failed
@@ -217,27 +240,28 @@ class GlyphScanner:
         batched version. Metadata is resolved once per distinct ref, so
         an FT split across many UTXOs costs one resolution, not N.
         """
-        held = await self._scan((_coerce_hex32(script_hash),), owner_pkh=None, strict=strict)
-        return [h.item for h in held]
+        holdings = await self._scan((_coerce_hex32(script_hash),), owner_pkh=None, strict=strict)
+        return [h.item for h in holdings.held]
 
-    async def _scan(self, script_hashes: Sequence[Hex32], *, owner_pkh: Hex20 | None, strict: bool) -> list[HeldGlyph]:
+    async def _scan(self, script_hashes: Sequence[Hex32], *, owner_pkh: Hex20 | None, strict: bool) -> GlyphHoldings:
         from ..transaction.transaction import Transaction
 
         listings = await asyncio.gather(*[self._client.get_utxos(sh) for sh in script_hashes])
         # Each UTXO with the script hash it was listed under, once per outpoint: a
         # server that lists an FT outpoint twice would otherwise count it twice.
         listed: list[tuple[UtxoRecord, bytes]] = []
-        seen: set[tuple[str, int]] = set()
+        seen: set[Outpoint] = set()
         for script_hash, utxos in zip(script_hashes, listings):
             for utxo in utxos:
-                key = (str(utxo.tx_hash).lower(), utxo.tx_pos)
+                key = outpoint_of(utxo.tx_hash, utxo.tx_pos)
                 if key in seen:
                     _server_inconsistency(strict, f"{utxo.tx_hash}:{utxo.tx_pos} is listed more than once")
                     continue
                 seen.add(key)
                 listed.append((utxo, bytes(script_hash)))
+        everything_listed = frozenset(seen)
         if not listed:
-            return []
+            return GlyphHoldings((), everything_listed)
 
         # Fetch all UTXO raw txs concurrently.
         raw_txs = await asyncio.gather(
@@ -332,7 +356,7 @@ class GlyphScanner:
             pending.append((utxo, g, tx))
 
         if not pending:
-            return []
+            return GlyphHoldings((), everything_listed)
 
         # One reveal-metadata resolution per distinct ref, all batched into a
         # single gather (N17 fix). Where several UTXOs share a ref, prefer a
@@ -420,7 +444,7 @@ class GlyphScanner:
                     exc,
                 )
 
-        return results
+        return GlyphHoldings(tuple(results), everything_listed)
 
     async def _resolve_reveal_metadata(self, ref: GlyphRef, source_tx: Transaction) -> GlyphMetadata | None:
         """Resolve the Glyph metadata for the token identified by *ref*.
