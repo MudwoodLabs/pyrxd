@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CompositeExecutor",
     "ExecOutcome",
+    "ExecReason",
     "Executor",
     "NullExecutor",
     "PresignedRefund",
@@ -169,6 +171,23 @@ def make_refund_broadcaster(
     return broadcaster
 
 
+#: The shape of an :class:`ExecReason` kind: it becomes part of a page's situation (its ACK key).
+_EXEC_REASON_KIND_RE = re.compile(r"\A[a-z][a-z_]{0,31}\Z")
+
+
+@dataclass(frozen=True)
+class ExecReason:
+    """Why an executor's outcome is what it is, for the page (#935).
+
+    ``kind`` is chosen by the executor's own code from a fixed set, never from what a server said: it
+    becomes part of the page's situation, so one ACK covers one kind of outcome and a different kind
+    (an exhausted fee pool after a consensus refusal, Mythos combo 2.1) is a new page. ``text`` is
+    the human-readable reason and may quote a server; it is only ever displayed."""
+
+    kind: str
+    text: str
+
+
 class ExecOutcome(Enum):
     """The autonomous-execution outcome for one swap, surfaced on ``ReconcileResult.executed``.
     ``None`` (not this enum) means nothing was attempted (no executor / not a refund)."""
@@ -215,22 +234,24 @@ class CompositeExecutor:
                 return outcome
         return None
 
-    def take_reason(self, swap_id: str) -> str | None:
-        """The first child's :func:`take_exec_reason` for *swap_id*. At most one child acted this tick,
-        and a child that did not act has none, so the first one found is the acting child's."""
+    def take_reason(self, swap_id: str) -> ExecReason | None:
+        """The first child's :func:`take_exec_reason` for *swap_id*. Every child is asked, so none keeps
+        a reason for a later tick. At most one child acted this tick, and a child that did not act has
+        none, so the one found is the acting child's."""
+        found: ExecReason | None = None
         for ex in self._executors:
             reason = take_exec_reason(ex, swap_id)
-            if reason is not None:
-                return reason
-        return None
+            if found is None:
+                found = reason
+        return found
 
 
-def take_exec_reason(executor: object, swap_id: str) -> str | None:
+def take_exec_reason(executor: object, swap_id: str) -> ExecReason | None:
     """The reason *executor* gave for its last outcome on *swap_id*, when it reports one through an
     optional ``take_reason(swap_id)`` (:class:`~pyrxd.gravity.watch.claim_executor.ClaimExecutor` does,
     #935), else ``None``. Optional so the :class:`Executor` protocol, and every executor that predates
-    it, is unchanged. A ``take_reason`` that raises or returns a non-``str`` gives ``None``: a page
-    loses detail, never fires late."""
+    it, is unchanged. A ``take_reason`` that raises, or returns anything but an :class:`ExecReason`
+    whose kind is a short lower-case word, gives ``None``: a page loses detail, never fires late."""
     take = getattr(executor, "take_reason", None)
     if not callable(take):
         return None
@@ -239,7 +260,11 @@ def take_exec_reason(executor: object, swap_id: str) -> str | None:
     except Exception:
         logger.exception("executor take_reason FAILED for swap %s", swap_id)
         return None
-    return reason if isinstance(reason, str) and reason else None
+    if not isinstance(reason, ExecReason) or not isinstance(reason.text, str) or not isinstance(reason.kind, str):
+        return None
+    if not _EXEC_REASON_KIND_RE.match(reason.kind):
+        return None
+    return reason
 
 
 class RefundExecutor:

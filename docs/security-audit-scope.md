@@ -137,7 +137,7 @@ The audit should accept or challenge these explicitly — the code's safety argu
 - **`ASSUME-WATCH-ALERT-ONLY`.** The watchtower core is **alert-only and keyless for the asset**;
   it never holds a value key and never touches `p` except to scrape the maker's already-public
   preimage. Two autonomous actions exist, both bounded: the v2 BTC refund (operator-pre-signed,
-  dust-capped 10,000 sats — `watch/executor.py:72`) and the Radiant **claim executor**
+  dust-capped 10,000 sats — `watch/executor.py:75`) and the Radiant **claim executor**
   (`watch/claim_executor.py`). The claim executor is **keyless for the asset** (`output[0]`
   pinned to the taker holder PKH → cannot redirect the asset; a stolen *fee* key burns only dust
   fees), **dormant-by-construction** (needs a wired resolver + a per-swap covenant sidecar),

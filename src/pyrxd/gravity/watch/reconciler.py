@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -42,7 +43,7 @@ from pyrxd.gravity.watch.decide import (
     decide,
     decide_legacy,
 )
-from pyrxd.gravity.watch.executor import ExecOutcome, Executor, NullExecutor, take_exec_reason
+from pyrxd.gravity.watch.executor import ExecOutcome, ExecReason, Executor, NullExecutor, take_exec_reason
 from pyrxd.security.errors import ValidationError
 
 logger = logging.getLogger(__name__)
@@ -180,13 +181,20 @@ def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
 
 #: The most characters of an executor's reason a page carries (#935). The reason can hold a node's
 #: rejection text, already sanitized and clipped by the ElectrumX client; this bounds every other kind.
-_MAX_PAGE_REASON_CHARS = 300
+#: Long enough for the longest reason the executor writes itself plus a node's clipped reason.
+_MAX_PAGE_REASON_CHARS = 600
+
+#: A URL in a reason: an HTTP client's error can name the endpoint it called, path and query included,
+#: and an endpoint's key often rides in either (Mythos combo 2.2). The page keeps scheme and host only.
+_URL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)(?:[^/\s@]*@)?([^/\s?#]+)[^\s]*")
 
 
 def _page_text(reason: str) -> str:
     """*reason* as one line of a page: non-printables as spaces, runs of whitespace as one, ``|`` (the
-    page's field separator, so a reason cannot fake an ``ack:`` field) as ``/``, clipped."""
+    page's field separator, so a reason cannot fake an ``ack:`` field) as ``/``, each URL cut to its
+    scheme and host, clipped."""
     cleaned = "".join(ch if ch.isprintable() else " " for ch in reason).replace("|", "/")
+    cleaned = _URL_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}/...", cleaned)
     out = " ".join(cleaned.split())
     if len(out) > _MAX_PAGE_REASON_CHARS:
         out = out[:_MAX_PAGE_REASON_CHARS] + "..."
@@ -198,8 +206,9 @@ def _claim_outcome_note(outcome: ExecOutcome | None, reason: str | None) -> str:
     ``None`` means no executor acted (the alert-only default).
 
     The reason can quote one endpoint's answer, so no wording here tells the operator to stand down on
-    what it says: every outcome but a broadcast says to check the chain and claim by hand."""
-    detail = f" ({_page_text(reason)})" if reason else ""
+    what it says: every outcome but a broadcast says to check the chain and claim by hand, and the
+    reason is labelled as the tower's report, which may quote a server."""
+    detail = f" (tower's report, may quote a server: {_page_text(reason)})" if reason else ""
     if outcome is ExecOutcome.BROADCAST:
         return f" This tick the tower broadcast the covenant claim{detail}; check that it confirms before the deadline."
     if outcome is ExecOutcome.FAILED:
@@ -209,7 +218,7 @@ def _claim_outcome_note(outcome: ExecOutcome | None, reason: str | None) -> str:
         )
     if outcome is ExecOutcome.DECLINED:
         return (
-            f" This tick the tower did NOT broadcast a claim{detail}. Check on chain that the asset is "
+            f" This tick the tower's covenant claim was DECLINED{detail}. Check on chain that the asset is "
             "claimed, and claim it yourself if not, before the deadline."
         )
     return " This tick the tower did NOT attempt a claim (no executor acted): claim the asset yourself."
@@ -466,10 +475,14 @@ class Reconciler:
                     # and the situation names the outcome, so a change of outcome is a new page.
                     decision = dataclasses.replace(
                         decision,
-                        reason=decision.reason + _claim_outcome_note(executed, exec_reason),
+                        reason=decision.reason
+                        + _claim_outcome_note(executed, exec_reason.text if exec_reason else None),
+                        # The kind is the executor's own word for the reason, never a server's, so an ACK
+                        # of one kind of outcome does not hide another (Mythos combo 2.1, 4.3).
                         situation=(
                             f"{decision.situation or SITUATION_CLAIM_RACE}:"
                             f"{executed.value if executed is not None else 'none'}"
+                            + (f":{exec_reason.kind}" if exec_reason is not None and executed is not None else "")
                         ),
                     )
                 elif decision.autonomous_btc_refund:
@@ -492,7 +505,7 @@ class Reconciler:
 
     async def _safe_execute(
         self, swap_id: str, record: SwapRecord, decision: Decision
-    ) -> tuple[ExecOutcome | None, str | None]:
+    ) -> tuple[ExecOutcome | None, ExecReason | None]:
         """Run the autonomous executor for an autonomy-eligible decision. A broadcast failure must NOT
         crash the loop and must NOT silence the operator — it is recorded as ``FAILED`` and the alerter
         still pages. ``PAGE_REFUND`` (keyless refund) and ``PAGE_CLAIM`` (the asset claim) are
@@ -509,7 +522,9 @@ class Reconciler:
         except Exception as exc:
             logger.exception("autonomous executor FAILED for swap %s — alerter will still page", swap_id)
             take_exec_reason(self._executor, swap_id)  # drop anything a child left; it is not this tick's
-            return ExecOutcome.FAILED, f"the executor raised {type(exc).__name__}; see the tower log"
+            return ExecOutcome.FAILED, ExecReason(
+                kind="executor_raised", text=f"the executor raised {type(exc).__name__}; see the tower log"
+            )
         return outcome, take_exec_reason(self._executor, swap_id)
 
     def _safe_resolve(self, swap_id: str) -> None:
