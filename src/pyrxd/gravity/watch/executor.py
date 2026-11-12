@@ -64,6 +64,7 @@ __all__ = [
     "RefundExecutor",
     "load_presigned_refund",
     "make_refund_broadcaster",
+    "take_exec_reason",
 ]
 
 # Autonomy on a value-bearing network is hard-bound to this dust ceiling until an external audit lifts
@@ -213,6 +214,32 @@ class CompositeExecutor:
             if outcome is not None:
                 return outcome
         return None
+
+    def take_reason(self, swap_id: str) -> str | None:
+        """The first child's :func:`take_exec_reason` for *swap_id*. At most one child acted this tick,
+        and a child that did not act has none, so the first one found is the acting child's."""
+        for ex in self._executors:
+            reason = take_exec_reason(ex, swap_id)
+            if reason is not None:
+                return reason
+        return None
+
+
+def take_exec_reason(executor: object, swap_id: str) -> str | None:
+    """The reason *executor* gave for its last outcome on *swap_id*, when it reports one through an
+    optional ``take_reason(swap_id)`` (:class:`~pyrxd.gravity.watch.claim_executor.ClaimExecutor` does,
+    #935), else ``None``. Optional so the :class:`Executor` protocol, and every executor that predates
+    it, is unchanged. A ``take_reason`` that raises or returns a non-``str`` gives ``None``: a page
+    loses detail, never fires late."""
+    take = getattr(executor, "take_reason", None)
+    if not callable(take):
+        return None
+    try:
+        reason = take(swap_id)
+    except Exception:
+        logger.exception("executor take_reason FAILED for swap %s", swap_id)
+        return None
+    return reason if isinstance(reason, str) and reason else None
 
 
 class RefundExecutor:

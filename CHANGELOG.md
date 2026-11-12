@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **An armed claim page says what the autonomous claim executor did, and why** (#935). The
+  `PAGE_CLAIM` page now ends with the executor's outcome (broadcast with its txid, declined, failed,
+  or no executor) and its reason, including the node's sanitized rejection reason for a consensus
+  refusal. Its situation tag is `claim_race:<outcome>`, so a change of outcome is a new page, and an
+  operator ACK names that tag. The heartbeat line gains `exec_declined=`. `ClaimExecutor.take_reason`
+  and `pyrxd.gravity.watch.executor.take_exec_reason` carry the reason to the reconciler.
+- **An exhausted capped fee pool is named on the claim page** (#936). `ClaimExecutor` catches
+  `FeePoolExhaustedError` and returns `DECLINED` with the pool's cap, dispensed and remaining
+  photons, instead of letting it escape as a generic `FAILED`. The claim is not marked seen, so a
+  funded pool claims on the next tick.
+
 ## [0.28.0] — 2026-11-07
 
 Header verification is stricter (see Changed (breaking)): read that entry before upgrading code that

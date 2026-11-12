@@ -47,7 +47,7 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import TimeUnit, btc_input_outpoints_from_raw, btc_txid_from_raw, scrape_secret
@@ -56,7 +56,13 @@ from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_c
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
 from pyrxd.gravity.watch.executor import ExecOutcome
-from pyrxd.security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
+from pyrxd.security.errors import (
+    FeePoolExhaustedError,
+    InsufficientFundsError,
+    NetworkError,
+    PolicyRejection,
+    ValidationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +394,9 @@ class ClaimExecutor:
         # rebuilds (see _resend_held for what that costs), which never disarms the claim.
         self._resend_ticks = int(second_opinion_resend_ticks)
         self._held: dict[str, tuple[bytes, int]] = {}
+        # Why this tick's execute() ended as it did, by swap id, for the claim page (#935). Set by
+        # execute(), taken (and so cleared) by the reconciler right after; see take_reason.
+        self._reasons: dict[str, str] = {}
 
     @property
     def _value_bearing(self) -> bool:
@@ -398,7 +407,12 @@ class ClaimExecutor:
         return self._network not in TEST_NETWORKS
 
     async def execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
+        # Cleared first, so a tick that raises out of _run never leaves the last tick's reason to be
+        # read as this one's.
+        self._reasons.pop(swap_id, None)
         outcome, reason = await self._run(swap_id, record, decision)
+        if outcome is not None and reason is not None:
+            self._reasons[swap_id] = reason
         if outcome is ExecOutcome.BROADCAST:
             logger.warning("AUTONOMOUS ASSET CLAIM BROADCAST for swap %s on %s", swap_id, self._network)
         elif outcome is ExecOutcome.DECLINED and reason is not None:
@@ -406,6 +420,13 @@ class ClaimExecutor:
         elif outcome is ExecOutcome.FAILED and reason is not None:
             logger.error("autonomous claim FAILED for %s: %s", swap_id, reason)
         return outcome
+
+    def take_reason(self, swap_id: str) -> str | None:
+        """The reason the last :meth:`execute` for *swap_id* gave for its outcome, once: a second call
+        returns ``None``. The reconciler puts it on the claim page (#935), so an operator can tell a
+        broadcast from a retry, a consensus refusal (with the node's reason) or an exhausted fee pool
+        without reading the log. ``None`` when that execute raised or did nothing."""
+        return self._reasons.pop(swap_id, None)
 
     async def _run(self, swap_id: str, record: SwapRecord, decision: Decision) -> tuple[ExecOutcome | None, str | None]:
         # 1. TYPED discriminator — never the display string (closes the ETH false-arm).
@@ -620,6 +641,21 @@ class ClaimExecutor:
                 exc,
             )
             return ExecOutcome.DECLINED, f"fee input below the deadline-aware relay requirement: {exc}"
+        except FeePoolExhaustedError as exc:
+            # The capped, dispense-once pool has nothing left under its cap (#936): every earlier
+            # refusal spent an input, by design. Nothing was built or broadcast. Not marked seen, like
+            # every other refusal: a re-funded pool (a new source) claims on the next tick. DECLINED,
+            # not FAILED, because no retry on this pool can succeed; the page names the pool's state so
+            # the operator knows the fix is to fund it before the maker's refund opens.
+            pool = _fee_pool_state(getattr(leg, "fee_source", None))
+            logger.error(
+                "autonomous claim swap %s: the fee pool is EXHAUSTED (%s; %s) — nothing broadcast; operator "
+                "must fund the fee pool, or claim by hand, before the maker's CSV refund opens",
+                swap_id,
+                exc,
+                pool,
+            )
+            return ExecOutcome.DECLINED, f"fee pool exhausted, nothing broadcast ({pool}): {exc}"
         except PolicyRejection as exc:
             # PolicyRejection subclasses NetworkError, so this clause must precede the NetworkError
             # one below. Never marked seen, whatever the reason: a node's verdict can come from one
@@ -634,7 +670,7 @@ class ClaimExecutor:
                 return ExecOutcome.FAILED, f"claim broadcast failed: {exc}"
             # A consensus verdict: still retried. DECLINED and an ERROR log with the node's reason, every
             # tick, so the operator can see the claim itself may be unusable before the deadline. The
-            # claim page (PAGE_CLAIM) fires either way; it does not carry this outcome or reason.
+            # claim page (PAGE_CLAIM) fires either way and carries this outcome and reason (#935).
             logger.error(
                 "autonomous claim swap %s: node rejected the covenant claim on a consensus rule (%s) — "
                 "retrying with a new fee input; operator must check the claim before the deadline",
@@ -670,7 +706,7 @@ class ClaimExecutor:
             txid,
             record.terms.radiant_amount,
         )
-        return ExecOutcome.BROADCAST, None
+        return ExecOutcome.BROADCAST, f"covenant claim broadcast, txid {txid}"
 
     async def _resend_held(
         self, swap_id: str, outpoint: str, held: tuple[bytes, int], leg
@@ -807,6 +843,18 @@ class ClaimExecutor:
                 f"(burial {burial_blocks} blk × cost {self._reorg_cost_per_block} / factor {self._reorg_safety_factor})"
             )
         return None
+
+
+def _fee_pool_state(fee_source: Any) -> str:
+    """The cap, spent and remaining photons of a capped fee source, for an exhausted-pool page (#936).
+    A source that does not report them (any ``FeeUtxoSource`` will do for the leg) says so."""
+    try:
+        cap = int(fee_source.total_cap_photons)
+        spent = int(fee_source.dispensed_photons)
+        remaining = int(fee_source.remaining_photons)
+    except Exception:
+        return "the fee source does not report its cap"
+    return f"cap {cap} photons, dispensed {spent}, remaining {remaining}"
 
 
 async def _maybe_await(fn, *args):
