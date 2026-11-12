@@ -436,14 +436,65 @@ class TestGlyphListSaysUnspentIsTheServersWord:
         assert sorted(_shown(result).splitlines()) == sorted([nft_ref, ft_ref])
 
 
+_A = "wss://first.example:50022"
+_B = "wss://second.example:50022"
+_INV = "the server this list was read from"
+
+
+def _disputed(result) -> list[str]:
+    return [line for line in _shown(result).splitlines() if line.startswith("DISPUTED")]
+
+
+class _PinFails(_ElectrumX):
+    """An operator whose TLS certificate does not match its pin: every read raises the pin error."""
+
+    async def get_utxos(self, script_hash):
+        from pyrxd.security.errors import TlsPinMismatchError
+
+        raise TlsPinMismatchError("simulated: certificate does not match the pin")
+
+
+class _WrongChain(_ElectrumX):
+    """An operator on another chain: the failover client's chain check raises ValidationError."""
+
+    async def get_utxos(self, script_hash):
+        from pyrxd.security.errors import ValidationError
+
+        raise ValidationError("simulated: ElectrumX endpoint is on the wrong chain")
+
+
+class _Broken(_ElectrumX):
+    """A bug, not a fault: anything that is not a NetworkError must not be read as "unreachable"."""
+
+    async def get_utxos(self, script_hash):
+        raise RuntimeError("simulated: a bug in the read")
+
+
+class _UpperCase(_ElectrumX):
+    """An honest server whose listing spells txids in upper case. (A plain record: ``Txid``
+    itself would refuse the spelling, but nothing makes every client's records use it.)"""
+
+    async def get_utxos(self, script_hash):
+        from types import SimpleNamespace
+
+        return [
+            SimpleNamespace(tx_hash=str(u.tx_hash).upper(), tx_pos=u.tx_pos, value=u.value, height=u.height)
+            for u in await super().get_utxos(script_hash)
+        ]
+
+
 class TestGlyphListAsksASecondOperator:
     """With two operators configured, each lists the wallet's token outputs itself, under hashes
-    derived from the wallet's keys, and the two lists are compared (#788). Neither the inventory
-    scan nor either operator picks what the other is asked about, so a liar on EITHER side shows
-    up, whether it re-lists a spent output (a decoy) or leaves out one it holds (a withholding).
+    derived from the wallet's keys, and each listing is compared with the one the inventory was
+    read from, in both directions (#788). So a liar shows up whichever server it is (either
+    operator, or a third that served the inventory), whether it re-lists a spent output (a
+    decoy) or leaves out one it holds (a withholding), and whether or not the other operator
+    can be read.
 
-    The re-listed output here is a real token transaction of this wallet that only the liar
-    still lists: everything the scanner checks (owner, script hash, amount) passes for it."""
+    The inventory server and the two operators are three separate fakes unless a test says
+    otherwise: the fix for the review's 5.1 is exactly that the inventory is a party of its own.
+    A re-listed output is a real token transaction of this wallet that only the liar still
+    lists, so everything the scanner checks (owner, script hash, amount) passes for it."""
 
     def _wallet_and_txs(self, tmp_path, monkeypatch):
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)
@@ -453,110 +504,290 @@ class TestGlyphListAsksASecondOperator:
         spent_tx, spent_ref = _ft(w, 0, 0, "ef", 9_000)  # a different ref, so a different tx
         return mnemonic, first, (nft_tx, nft_ref), (ft_tx, ft_ref), (spent_tx, spent_ref)
 
+    # -- honest paths
+
     def test_two_operators_that_agree_confirm_every_row(self, tmp_path, monkeypatch) -> None:
-        """The honest path: both list exactly what the wallet holds."""
         mnemonic, first, (nft_tx, nft_ref), (ft_tx, ft_ref), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
         held = {first: [_plain(first), nft_tx, ft_tx]}
-        a, b = _ElectrumX(held), _ElectrumX(held)
-        machine = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", pair=(a, b))
+        inv, a, b = _ElectrumX(held), _ElectrumX(held), _ElectrumX(held)
+        machine = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", pair=(a, b))
         assert machine.exit_code == 0, (machine.output, machine.exception)
         rows = _json(machine)
         assert sorted(r["ref"] for r in rows) == sorted([nft_ref, ft_ref])
         assert {r["spent_status_source"] for r in rows} == {"two-operators"}
-        human = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", mode="human", pair=(a, b))
+        human = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", mode="human", pair=(a, b))
         assert human.exit_code == 0, (human.output, human.exception)
         assert _shown(human).splitlines()[-1] == (
-            "Note: two ElectrumX operators (wss://first.example:50022 and wss://second.example:50022) each list "
+            f"Note: two ElectrumX operators ({_A} and {_B}) each list "
             "these outputs as unspent. That is their word, not a proof: two operators can agree and both be wrong."
         )
         assert "DISPUTED" not in human.output
 
-    def test_a_lying_primary_that_adds_a_decoy_and_withholds_a_token_is_caught(self, tmp_path, monkeypatch) -> None:
-        """The inventory is read from the liar, which is also the first operator: it re-lists a
-        spent FT output and leaves out the NFT. Both outpoints are disputed, each named with the
-        operator that lists it, and nothing is shown as the wallet's in JSON."""
-        mnemonic, first, (nft_tx, _nft_ref), (ft_tx, _ft_ref), (spent_tx, _sref) = self._wallet_and_txs(
-            tmp_path, monkeypatch
-        )
-        liar = _ElectrumX({first: [_plain(first), ft_tx, spent_tx]})
-        honest = _ElectrumX({first: [_plain(first), nft_tx, ft_tx]})
-        machine = _run(tmp_path, monkeypatch, liar, mnemonic, "glyph", "list", pair=(liar, honest))
-        assert machine.exit_code == 2, machine.output
-        assert _shown(machine) == "", "no rows, not even '[]'"
-        assert "two ElectrumX operators disagree" in machine.output
-        human = _run(tmp_path, monkeypatch, liar, mnemonic, "glyph", "list", mode="human", pair=(liar, honest))
-        assert human.exit_code == 2, human.output
-        disputed = sorted(line for line in _shown(human).splitlines() if line.startswith("DISPUTED"))
-        assert disputed == sorted(
-            [
-                f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by wss://first.example:50022 "
-                "but not by wss://second.example:50022",
-                f"DISPUTED: {nft_tx.txid()}:0 is listed as unspent by wss://second.example:50022 "
-                "but not by wss://first.example:50022",
-            ]
-        )
-
-    def test_a_lying_second_operator_is_caught_too(self, tmp_path, monkeypatch) -> None:
-        """The inventory is read from an honest server; the second operator withholds the FT and
-        re-lists a spent one. Its word does not silently confirm or drop anything."""
-        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
-        honest = _ElectrumX({first: [_plain(first), nft_tx, ft_tx]})
-        liar = _ElectrumX({first: [_plain(first), nft_tx, spent_tx]})
-        result = _run(tmp_path, monkeypatch, honest, mnemonic, "glyph", "list", mode="human", pair=(honest, liar))
-        assert result.exit_code == 2, result.output
-        disputed = sorted(line.split()[1] for line in _shown(result).splitlines() if line.startswith("DISPUTED"))
-        assert disputed == sorted([f"{ft_tx.txid()}:0", f"{spent_tx.txid()}:0"])
-
-    def test_a_list_read_from_a_third_server_is_held_to_both_operators(self, tmp_path, monkeypatch) -> None:
-        """The two operators agree, but the list was read through failover from a server that is
-        neither of them, and it re-lists a spent output. Two honest operators that agree with
-        each other do not confirm a row neither lists."""
-        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
+    def test_servers_that_spell_txids_in_different_cases_agree(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
         held = {first: [_plain(first), nft_tx, ft_tx]}
-        third = _ElectrumX({first: [_plain(first), nft_tx, ft_tx, spent_tx]})
-        a, b = _ElectrumX(held), _ElectrumX(held)
-        machine = _run(tmp_path, monkeypatch, third, mnemonic, "glyph", "list", pair=(a, b))
-        assert machine.exit_code == 2, machine.output
-        assert _shown(machine) == ""
-        human = _run(tmp_path, monkeypatch, third, mnemonic, "glyph", "list", mode="human", pair=(a, b))
-        assert human.exit_code == 2, human.output
-        assert [line for line in _shown(human).splitlines() if line.startswith("DISPUTED")] == [
-            f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by the server this list was read from, "
-            "but by neither wss://first.example:50022 nor wss://second.example:50022"
-        ]
+        result = _run(
+            tmp_path,
+            monkeypatch,
+            _ElectrumX(held),
+            mnemonic,
+            "glyph",
+            "list",
+            pair=(_UpperCase(held), _ElectrumX(held)),
+        )
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert {r["spent_status_source"] for r in _json(result)} == {"two-operators"}
 
-    def test_the_check_reads_the_scanned_addresses_not_just_the_first(self, tmp_path, monkeypatch) -> None:
-        """A decoy at a second used address is caught as well: every scanned address's owner is asked."""
+    def test_a_delegate_token_both_list_is_no_dispute(self, tmp_path, monkeypatch) -> None:
+        """An output the inventory listed but did not return as a token (a delegate token) is
+        still in its listing: the comparison is of listings, so it is not a withholding."""
+        from pyrxd.glyph.script import build_delegate_token_script
+
         mnemonic, w = _new_wallet(tmp_path, monkeypatch)
-        a0, a1 = w.derive_address(0, 0), w.derive_address(0, 1)
-        nft_tx, _ref = _nft(w, 0, 0, "ab")
-        spent_tx, _sref = _ft(w, 0, 1, "cd", 7_000)
-        liar = _ElectrumX({a0: [_plain(a0), nft_tx], a1: [_plain(a1, salt=2), spent_tx]})
-        honest = _ElectrumX({a0: [_plain(a0), nft_tx], a1: [_plain(a1, salt=2)]})
-        result = _run(tmp_path, monkeypatch, liar, mnemonic, "glyph", "list", mode="human", pair=(liar, honest))
-        assert result.exit_code == 2, result.output
-        assert [line.split()[1] for line in _shown(result).splitlines() if line.startswith("DISPUTED")] == [
-            f"{spent_tx.txid()}:0"
-        ]
+        first = w.derive_address(0, 0)
+        nft_tx, _nr = _nft(w, 0, 0, "ab")
+        ref = GlyphRef(txid=Txid("12" * 32), vout=0)
+        delegate = _paying(build_delegate_token_script(_pkh(w, 0, 0), ref), 1, 400)
+        held = {first: [_plain(first), nft_tx, delegate]}
+        result = _run(
+            tmp_path,
+            monkeypatch,
+            _ElectrumX(held),
+            mnemonic,
+            "glyph",
+            "list",
+            pair=(_ElectrumX(held), _ElectrumX(held)),
+        )
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert len(_json(result)) == 1
 
-    def test_a_second_operator_that_cannot_be_read_leaves_the_list_unchecked(self, tmp_path, monkeypatch) -> None:
-        """Not a dispute and not an agreement: the list is shown as one server's word, and says why."""
+    def test_one_operator_unreadable_and_the_other_agreeing_is_one_servers_word(self, tmp_path, monkeypatch) -> None:
+        """Not a dispute and not a confirmation: shown, as "server", naming who could not be read."""
         mnemonic, first, (nft_tx, nft_ref), (ft_tx, ft_ref), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
         held = {first: [_plain(first), nft_tx, ft_tx]}
-        a = _ElectrumX(held)
+        inv, b = _ElectrumX(held), _ElectrumX(held)
         down = _ElectrumX(held, unreadable={first})
-        machine = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", pair=(a, down))
+        machine = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", pair=(down, b))
         assert machine.exit_code == 0, (machine.output, machine.exception)
         rows = _json(machine)
         assert sorted(r["ref"] for r in rows) == sorted([nft_ref, ft_ref])
         assert {r["spent_status_source"] for r in rows} == {"server"}
-        human = _run(tmp_path, monkeypatch, a, mnemonic, "glyph", "list", mode="human", pair=(a, down))
+        human = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", mode="human", pair=(down, b))
         assert human.exit_code == 0, (human.output, human.exception)
         assert _shown(human).splitlines()[-2:] == [
             _SPENT_NOTE,
-            "(the cross-check against a second operator could not be read "
-            "(wss://first.example:50022, wss://second.example:50022).)",
+            f"({_A} could not be read; {_B} lists the same outputs, but one other operator is not a second opinion.)",
         ]
+
+    def test_neither_operator_readable_is_one_servers_word(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        down = (_ElectrumX(held, unreadable={first}), _ElectrumX(held, unreadable={first}))
+        human = _run(tmp_path, monkeypatch, _ElectrumX(held), mnemonic, "glyph", "list", mode="human", pair=down)
+        assert human.exit_code == 0, (human.output, human.exception)
+        assert (
+            _shown(human).splitlines()[-1] == f"(neither {_A} nor {_B} could be read, so no second operator was asked.)"
+        )
+
+    # -- decoys (re-listed spent outputs)
+
+    def test_an_inventory_decoy_neither_operator_lists_is_caught(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        inv = _ElectrumX({first: [_plain(first), nft_tx, ft_tx, spent_tx]})
+        machine = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", pair=(_ElectrumX(held), _ElectrumX(held)))
+        assert machine.exit_code == 2, machine.output
+        assert _shown(machine) == "", "no rows, not even '[]'"
+        assert "the ElectrumX servers disagree" in machine.output
+        assert f"{spent_tx.txid()}:0" in machine.output, "the error names the disputed outpoint"
+        human = _run(
+            tmp_path,
+            monkeypatch,
+            inv,
+            mnemonic,
+            "glyph",
+            "list",
+            mode="human",
+            pair=(_ElectrumX(held), _ElectrumX(held)),
+        )
+        assert human.exit_code == 2, human.output
+        assert _disputed(human) == [
+            f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by {_INV} but not by {_A} or {_B}"
+        ]
+
+    def test_a_decoy_only_the_second_operator_lists_is_caught(self, tmp_path, monkeypatch) -> None:
+        """The second operator alone re-lists a spent output. Nothing else differs."""
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        liar = _ElectrumX({first: [_plain(first), nft_tx, ft_tx, spent_tx]})
+        result = _run(
+            tmp_path,
+            monkeypatch,
+            _ElectrumX(held),
+            mnemonic,
+            "glyph",
+            "list",
+            mode="human",
+            pair=(_ElectrumX(held), liar),
+        )
+        assert result.exit_code == 2, result.output
+        assert _disputed(result) == [
+            f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by {_B} but not by {_INV} or {_A}"
+        ]
+
+    def test_a_decoy_only_the_first_operator_lists_is_caught(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        liar = _ElectrumX({first: [_plain(first), nft_tx, ft_tx, spent_tx]})
+        result = _run(
+            tmp_path,
+            monkeypatch,
+            _ElectrumX(held),
+            mnemonic,
+            "glyph",
+            "list",
+            mode="human",
+            pair=(liar, _ElectrumX(held)),
+        )
+        assert result.exit_code == 2, result.output
+        assert _disputed(result) == [
+            f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by {_A} but not by {_INV} or {_B}"
+        ]
+
+    # -- withholdings (5.1)
+
+    def test_a_token_the_inventory_leaves_out_but_both_operators_list_is_caught(self, tmp_path, monkeypatch) -> None:
+        """Review 5.1: the inventory withholds the NFT; both operators list it. Before the fix the
+        FT row was stamped "two-operators" and the NFT was silently missing."""
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        inv = _ElectrumX({first: [_plain(first), ft_tx]})
+        machine = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", pair=(_ElectrumX(held), _ElectrumX(held)))
+        assert machine.exit_code == 2, machine.output
+        assert _shown(machine) == ""
+        human = _run(
+            tmp_path,
+            monkeypatch,
+            inv,
+            mnemonic,
+            "glyph",
+            "list",
+            mode="human",
+            pair=(_ElectrumX(held), _ElectrumX(held)),
+        )
+        assert human.exit_code == 2, human.output
+        assert _disputed(human) == [
+            f"DISPUTED: {nft_tx.txid()}:0 is listed as unspent by {_A} and {_B} but not by {_INV}"
+        ]
+
+    def test_the_first_operator_serving_the_inventory_and_withholding_is_caught(self, tmp_path, monkeypatch) -> None:
+        """One fake is both the inventory and the first operator, and it withholds the NFT from
+        both; the second operator lists it."""
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        liar = _ElectrumX({first: [_plain(first), ft_tx]})
+        honest = _ElectrumX({first: [_plain(first), nft_tx, ft_tx]})
+        result = _run(tmp_path, monkeypatch, liar, mnemonic, "glyph", "list", mode="human", pair=(liar, honest))
+        assert result.exit_code == 2, result.output
+        assert _disputed(result) == [
+            f"DISPUTED: {nft_tx.txid()}:0 is listed as unspent by {_B} but not by {_INV} or {_A}"
+        ]
+
+    # -- one operator unreadable (5.2)
+
+    def test_a_liar_that_fails_its_own_check_is_held_to_the_other_operator(self, tmp_path, monkeypatch) -> None:
+        """Review 5.2: the first operator serves a decoy in the inventory, then fails every read on
+        its pinned connection. The second operator's answer contradicts the list, and is not
+        thrown away: exit 2, naming who could not be read."""
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), (spent_tx, _sr) = self._wallet_and_txs(tmp_path, monkeypatch)
+        inv = _ElectrumX({first: [_plain(first), nft_tx, ft_tx, spent_tx]})
+        silent = _ElectrumX({first: [_plain(first)]}, unreadable={first})
+        honest = _ElectrumX({first: [_plain(first), nft_tx, ft_tx]})
+        machine = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", pair=(silent, honest))
+        assert machine.exit_code == 2, machine.output
+        assert f"{_A} could not be read" in machine.output
+        human = _run(tmp_path, monkeypatch, inv, mnemonic, "glyph", "list", mode="human", pair=(silent, honest))
+        assert human.exit_code == 2, human.output
+        assert _disputed(human) == [f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by {_INV} but not by {_B}"]
+
+    # -- operators that are not merely unreachable (5.4, 5.5) and bugs (P07)
+
+    @pytest.mark.parametrize("fake", [_PinFails, _WrongChain], ids=["tls-pin", "wrong-chain"])
+    def test_an_operator_that_is_not_the_configured_server_refuses_the_list(self, tmp_path, monkeypatch, fake) -> None:
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        for mode in ("json", "human"):
+            result = _run(
+                tmp_path,
+                monkeypatch,
+                _ElectrumX(held),
+                mnemonic,
+                "glyph",
+                "list",
+                mode=mode,
+                pair=(_ElectrumX(held), fake(held)),
+            )
+            assert result.exit_code == 2, result.output
+            assert _shown(result) == ""
+            assert f"the ElectrumX operator {_B} is not the server configured for it" in result.output
+
+    def test_a_bug_in_the_second_read_is_not_taken_as_unreachable(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first, (nft_tx, _nr), (ft_tx, _fr), _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        held = {first: [_plain(first), nft_tx, ft_tx]}
+        result = _run(
+            tmp_path, monkeypatch, _ElectrumX(held), mnemonic, "glyph", "list", pair=(_ElectrumX(held), _Broken(held))
+        )
+        # The bug path: the exception escapes the command (``main.run`` turns it into exit 4).
+        assert isinstance(result.exception, RuntimeError), (result.output, result.exception)
+        assert "Note:" not in result.output
+
+    # -- scope
+
+    def test_every_scanned_address_is_asked_about(self, tmp_path, monkeypatch) -> None:
+        """The only disagreement is at the SECOND used address, between the operators; the
+        inventory is honest. Asking about the first address alone would see none."""
+        mnemonic, w = _new_wallet(tmp_path, monkeypatch)
+        a0, a1 = w.derive_address(0, 0), w.derive_address(0, 1)
+        nft_tx, _ref = _nft(w, 0, 0, "ab")
+        spent_tx, _sref = _ft(w, 0, 1, "cd", 7_000)
+        honest = {a0: [_plain(a0), nft_tx], a1: [_plain(a1, salt=2)]}
+        liar = _ElectrumX({a0: [_plain(a0), nft_tx], a1: [_plain(a1, salt=2), spent_tx]})
+        result = _run(
+            tmp_path,
+            monkeypatch,
+            _ElectrumX(honest),
+            mnemonic,
+            "glyph",
+            "list",
+            mode="human",
+            pair=(liar, _ElectrumX(honest)),
+        )
+        assert result.exit_code == 2, result.output
+        assert _disputed(result) == [
+            f"DISPUTED: {spent_tx.txid()}:0 is listed as unspent by {_A} but not by {_INV} or {_B}"
+        ]
+
+    def test_the_disputed_lines_are_capped(self, tmp_path, monkeypatch) -> None:
+        mnemonic, first, (nft_tx, _nr), _ft_pair, _spent = self._wallet_and_txs(tmp_path, monkeypatch)
+        w = HdWallet.from_mnemonic(mnemonic)
+        decoys = [
+            _paying(build_ft_locking_script(_pkh(w, 0, 0), GlyphRef(txid=Txid(f"{i:064x}"), vout=0)), 10, 500 + i)
+            for i in range(25)
+        ]
+        held = {first: [_plain(first), nft_tx]}
+        liar = _ElectrumX({first: [_plain(first), nft_tx, *decoys]})
+        result = _run(
+            tmp_path,
+            monkeypatch,
+            _ElectrumX(held),
+            mnemonic,
+            "glyph",
+            "list",
+            mode="human",
+            pair=(_ElectrumX(held), liar),
+        )
+        assert result.exit_code == 2, result.output
+        lines = _disputed(result)
+        assert len(lines) == 21 and lines[-1] == "DISPUTED: ... and 5 more"
 
 
 class TestTheOperatorPair:
@@ -598,6 +829,16 @@ class TestTheOperatorPair:
         body = (
             'electrumx_servers = [{ url = "wss://a.example.com:50022", operator = "alice" }, '
             '{ url = "wss://b.example.com:50022", operator = "bob" }]\n'
+        )
+        pair = self._ctx(tmp_path, monkeypatch, body).make_operator_pair()
+        assert pair is not None
+        assert [label for label, _c in pair] == ["wss://a.example.com:50022", "wss://b.example.com:50022"]
+
+    def test_labels_are_redacted(self, tmp_path, monkeypatch) -> None:
+        """A label is printed: an endpoint's credentials and path never reach it."""
+        body = (
+            'electrumx_servers = [{ url = "wss://user:hunter2@a.example.com:50022/k3y", operator = "alice" }, '
+            '{ url = "wss://b.example.com:50022/?token=s3cret", operator = "bob" }]\n'
         )
         pair = self._ctx(tmp_path, monkeypatch, body).make_operator_pair()
         assert pair is not None
