@@ -14,9 +14,8 @@ Measured here, on ``radiant-core`` at :data:`pyrxd.devnet.DEFAULT_RADIANT_VERSIO
 
 * (a) a re-send of a transaction the mempool holds is ACCEPTED: ``sendrawtransaction`` returns the
   txid and ElectrumX answers ``{"result": "<txid>"}``. It is NOT a "txn-already-in-mempool"
-  rejection, which is what the unit test's modelled server says. Both reach the executor as "the
-  broadcast client took it", so the outcome is the same; the wording the model uses is not what
-  this stack sends.
+  rejection, which the unit tests' modelled server used to answer before this run; the model now
+  answers as this stack does. Either reaches the executor as "the broadcast client took it".
 * (b) a re-send of a mined transaction is refused, ``-27 transaction already in block chain``, which
   ElectrumX wraps as code 1, ``"the transaction was rejected by network rules.\\n\\ntransaction
   already in block chain\\n[<raw hex>]"``. ``ElectrumXClient`` raises ``PolicyRejection`` and

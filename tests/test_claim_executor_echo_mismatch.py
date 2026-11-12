@@ -19,7 +19,7 @@ because:
 Everything here is production code except the SERVER: the executor drives a real
 ``RadiantCovenantLeg`` over a real ``RadiantChainIO`` over a real ``ElectrumXClient`` whose ``_call``
 (the JSON-RPC wire) is answered by :class:`_Node`, which models a mempool that refuses a second
-spend of an outpoint, answers "already in mempool" for bytes it holds, and a block that confirms
+spend of an outpoint, answers bytes it already holds as a regtest node does, and a block that confirms
 the mempool. The BTC claim the executor scrapes ``p`` from is a real one, built by the BTC HTLC leg.
 """
 
@@ -131,10 +131,14 @@ class _Node(ElectrumXClient):
             if self.reject is not None:
                 code, reason = self.reject
                 raise _rpc_error(code, _wrapped(reason, params[0]) if code == 1 else reason)
+            # What radiant-core v3.1.2 behind RXinDexer ElectrumX answers for bytes it already holds,
+            # measured on regtest (tests/test_claim_executor_echo_mismatch_regtest_e2e.py): a re-send
+            # of a mempool transaction is accepted and answered with its txid; a re-send of a mined
+            # one is refused, -27 "transaction already in block chain", wrapped by ElectrumX as code 1.
+            if _txid(raw) in self.confirmed:
+                raise _rpc_error(1, _wrapped("transaction already in block chain", params[0]))
             if _txid(raw) in self.mempool:
-                # What Radiant-Core answers for a transaction it already holds (validation.cpp,
-                # "txn-already-in-mempool"), wrapped by ElectrumX as code 1.
-                raise _rpc_error(1, _wrapped("txn-already-in-mempool", ""))
+                return _LIE if self.lie else _txid(raw)
             if _spends(raw) & self._spent():
                 raise _rpc_error(1, _wrapped("txn-mempool-conflict (code 18)", params[0]))
             if self.relay:

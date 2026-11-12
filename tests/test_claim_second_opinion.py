@@ -369,7 +369,7 @@ async def test_a_claim_one_endpoint_refuses_lands_through_a_second_operator(tick
     claim = second.broadcasts[0]
 
     # Later ticks re-send the SAME bytes: no new fee input, nothing new relayed. The second node
-    # answers "already have" and serves them back.
+    # already holds them and answers with their txid, as a regtest node does.
     for _ in range(3):
         outcome, said = await tick(ex, rec)
         assert outcome is ExecOutcome.DECLINED and "re-sent the same bytes" in said, said
@@ -412,7 +412,7 @@ async def test_a_lying_second_opinion_cannot_disarm_the_claim(tick) -> None:
 
 async def test_a_held_claim_the_first_endpoint_already_has_is_marked_seen(tick) -> None:
     """The normal honest relay: the second node relayed the claim and the first endpoint now holds
-    it, so the re-send gets "already have" from the first endpoint itself."""
+    it, so the first endpoint itself takes the re-send (it answers with the txid of bytes it holds)."""
     primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
     seen = SeenStore()
     ex, rec, fees = await _with_second_opinion(primary, second, seen)
