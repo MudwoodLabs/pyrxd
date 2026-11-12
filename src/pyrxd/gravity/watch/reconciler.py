@@ -195,7 +195,10 @@ def _page_text(reason: str) -> str:
 
 def _claim_outcome_note(outcome: ExecOutcome | None, reason: str | None) -> str:
     """What this tick's executor did with an armed claim page, and why, appended to the page (#935).
-    ``None`` means no executor acted (the alert-only default)."""
+    ``None`` means no executor acted (the alert-only default).
+
+    The reason can quote one endpoint's answer, so no wording here tells the operator to stand down on
+    what it says: every outcome but a broadcast says to check the chain and claim by hand."""
     detail = f" ({_page_text(reason)})" if reason else ""
     if outcome is ExecOutcome.BROADCAST:
         return f" This tick the tower broadcast the covenant claim{detail}; check that it confirms before the deadline."
@@ -206,8 +209,8 @@ def _claim_outcome_note(outcome: ExecOutcome | None, reason: str | None) -> str:
         )
     if outcome is ExecOutcome.DECLINED:
         return (
-            f" This tick the tower did NOT broadcast a claim{detail}. Unless that says the covenant is already "
-            "spent or a claim awaits confirmation, claim the asset yourself before the deadline."
+            f" This tick the tower did NOT broadcast a claim{detail}. Check on chain that the asset is "
+            "claimed, and claim it yourself if not, before the deadline."
         )
     return " This tick the tower did NOT attempt a claim (no executor acted): claim the asset yourself."
 
