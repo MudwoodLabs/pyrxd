@@ -416,3 +416,43 @@ def test_the_key_file_goes_through_the_guarded_read(monkeypatch, tmp_path) -> No
     with pytest.raises(ValidationError) as caught:
         mod._resolve_key_source(str(raw))
     assert "0xfe" not in str(caught.value) and "position" not in str(caught.value)
+
+
+def _value_bearing_ids() -> list[int]:
+    from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS
+
+    ids = [c.chain_id for c in KNOWN_EVM_CHAINS.values() if not c.is_testnet]
+    assert ids
+    return ids
+
+
+def test_one_endpoint_on_a_value_bearing_chain_is_refused_without_the_flag() -> None:
+    for chain_id in _value_bearing_ids():
+        with pytest.raises(ValidationError, match="--single-endpoint"):
+            mod._open_rpc(("https://a.example",), chain_id)
+
+
+def test_one_endpoint_on_a_value_bearing_chain_opens_with_the_flag_or_a_second_operator() -> None:
+    for chain_id in _value_bearing_ids():
+        assert mod._open_rpc(("https://a.example",), chain_id, single_endpoint=True) is not None
+        assert len(mod._open_rpc(("https://a.example", "https://b.example.org"), chain_id).sources) == 2
+
+
+def test_one_endpoint_on_a_test_chain_needs_no_flag() -> None:
+    from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS
+
+    test_ids = [c.chain_id for c in KNOWN_EVM_CHAINS.values() if c.is_testnet]
+    assert test_ids
+    for chain_id in [*test_ids, 31337]:
+        assert mod._open_rpc(("https://a.example",), chain_id) is not None
+
+
+def test_the_command_refuses_one_mainnet_endpoint_before_any_read(swap, monkeypatch) -> None:
+    monkeypatch.setenv(mod.KEY_ENV, os.urandom(32).hex())
+    doc = json.loads(swap["keys"].read_text())
+    doc.update(eth_chain="ethereum", eth_chain_id=1)
+    swap["keys"].write_text(json.dumps(doc))
+    write_record(swap["keys"], eth_record(_locator(chain_id=1)))
+    res = _cmd(swap)
+    assert res.exit_code == 1, res.output
+    assert "could not prepare" in res.output and "--single-endpoint" in res.output

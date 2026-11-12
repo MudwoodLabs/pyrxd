@@ -244,7 +244,11 @@ human sizing the fee is the only remaining control.
   as the lowest head across endpoints), a key an ERC-20 contract would refuse, an empty token
   contract, and a refund already on the record that is mined or pending. The key comes from
   ``--eth-key-file`` (mode 0600), else ``PYRXD_ETH_REFUND_KEY``, else the recovery file's
-  ``eth_key_hex``. Repeat ``--eth-rpc-url`` (distinct operators) to have the reads agree. The
+  ``eth_key_hex``. Repeat ``--eth-rpc-url`` (distinct operators) to have the reads agree. On a
+  value-bearing chain one ``--eth-rpc-url`` is refused unless ``--single-endpoint`` is passed: one
+  endpoint alone could report a claimed contract as unsettled and hide that the secret is public.
+  Test chains accept one. The signed bytes are decoded and must match the printed nonce, gas and
+  fees, the contract, the chain and ``refund()`` calldata. The
   record is not changed; the runner's next ``reconcile_counter_leg`` or ``mutual_refund`` reads
   the refund from the chain.
 

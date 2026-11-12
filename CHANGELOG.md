@@ -14,8 +14,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the code on chain is exactly the runtime the record's terms imply and that it is not settled,
   then builds the refund through the leg's own `refund()` (maturity, the ERC-20 refundee/deployer
   rule, the empty-contract refusal, the gas ceiling, fee affordability and the preflight all
-  apply) and prints the signed transaction. It never broadcasts. `swap status` now names it as
-  the next action for an ETH counter leg.
+  apply) and prints the signed transaction. It never broadcasts. On a value-bearing chain it
+  needs two `--eth-rpc-url` endpoints from distinct operators, or `--single-endpoint`. `swap
+  status` now names it as the next action for an ETH counter leg.
 - `EthHtlcContractLeg.check_refund_target(locator)`: the identity half of `verify_funded` (chain
   id, exact runtime, getters) plus the settled flag, without the recipient and balance checks a
   refund should not be refused on.

@@ -205,6 +205,20 @@ def parse_eth_key(text: str) -> Any:
         raise ValidationError("the ETH key is not a valid secp256k1 private key") from None
 
 
+def is_value_bearing(chain_id: int) -> bool:
+    """True for a chain the registry knows and does not mark as a testnet.
+
+    A chain the registry does not know (anvil's 31337) counts as a test chain: a runner cannot have
+    opened a value-bearing swap on it, since ``evm_chain_by_id`` refuses an unknown chain id.
+    """
+    from ..eth_wallet.chains import evm_chain_by_id
+
+    try:
+        return not evm_chain_by_id(chain_id).is_testnet
+    except ValidationError:
+        return False
+
+
 def _token_for(locator: Any) -> Any:
     """The :class:`Erc20Token` a token locator is denominated in.
 
@@ -213,17 +227,12 @@ def _token_for(locator: Any) -> Any:
     know, such as anvil's 31337), an unpinned address is used as it stands: the refund reads only the
     token's address (its balance, and the ``token`` immutable the exact runtime check binds).
     """
-    from ..eth_wallet.chains import evm_chain_by_id
     from ..eth_wallet.tokens import Erc20Token, token_by_address
 
     try:
         return token_by_address(locator.token_address, locator.chain_id)
     except ValidationError:
-        try:
-            value_bearing = not evm_chain_by_id(locator.chain_id).is_testnet
-        except ValidationError:
-            value_bearing = False
-        if value_bearing:
+        if is_value_bearing(locator.chain_id):
             raise
         return Erc20Token("UNPINNED", locator.token_address, 0, locator.chain_id, has_blacklist=False)
 
@@ -443,9 +452,22 @@ def _lines(r: ColdEthRefund) -> list[str]:
     return lines
 
 
-def _open_rpc(urls: tuple[str, ...], chain_id: int) -> Any:
+def _open_rpc(urls: tuple[str, ...], chain_id: int, *, single_endpoint: bool = False) -> Any:
+    """One RPC over every URL. On a value-bearing chain one URL is refused unless ``single_endpoint``.
+
+    With one endpoint, its word alone decides whether the contract is still unsettled. A lying one
+    cannot redirect value (the contract fixes the refundee), but it can hide a claim, so the operator
+    signs a refund that reverts and misses that the secret is public and their own claim is due.
+    """
     from ..eth_wallet.multi_rpc import MultiSourceEthRpc
     from ..eth_wallet.rpc import EthRpc
+
+    if len(urls) == 1 and not single_endpoint and is_value_bearing(chain_id):
+        raise ValidationError(
+            f"one --eth-rpc-url on value-bearing chain {chain_id}: pass it again with an endpoint from a "
+            "different operator, so the contract checks need their agreement, or pass --single-endpoint to "
+            "accept one endpoint's word"
+        )
 
     sources = [EthRpc(u, expected_chain_id=chain_id) for u in urls]
     return sources[0] if len(sources) == 1 else MultiSourceEthRpc(sources)
@@ -487,6 +509,13 @@ def _open_rpc(urls: tuple[str, ...], chain_id: int) -> Any:
     help=f"File holding the refund key as hex (mode 0600, owner-only). Else ${KEY_ENV}, else the "
     "swap file's eth_key_hex.",
 )
+@click.option(
+    "--single-endpoint",
+    is_flag=True,
+    default=False,
+    help="Allow one --eth-rpc-url on a value-bearing chain (refused by default: one endpoint could hide a "
+    "claim of the contract). Test chains accept one without it.",
+)
 @click.pass_obj
 def swap_build_eth_refund_cmd(
     ctx: CliContext,
@@ -495,6 +524,7 @@ def swap_build_eth_refund_cmd(
     eth_rpc_urls: tuple[str, ...],
     artifact_path: Path,
     eth_key_file: str | None,
+    single_endpoint: bool,
 ) -> None:
     """Sign the TAKER's refund of the ETH counter-leg HTLC and PRINT it. Never broadcasts.
 
@@ -525,7 +555,7 @@ def swap_build_eth_refund_cmd(
                 "eth_key_hex"
             )
         key = parse_eth_key(str(secret))
-        rpc = _open_rpc(eth_rpc_urls, locator.chain_id)
+        rpc = _open_rpc(eth_rpc_urls, locator.chain_id, single_endpoint=single_endpoint)
     except (ValidationError, ValueError, OSError) as exc:
         raise UserError(
             "could not prepare the ETH refund",
