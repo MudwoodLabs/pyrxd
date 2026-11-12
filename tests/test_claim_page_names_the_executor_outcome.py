@@ -332,3 +332,24 @@ def test_a_well_formed_reason_passes() -> None:
             return ExecReason(kind="consensus_rejection", text="t")
 
     assert take_exec_reason(_Ok(), _SWAP) == ExecReason(kind="consensus_rejection", text="t")
+
+
+def test_the_composite_executor_takes_every_childs_reason() -> None:
+    """Every child is asked, so a reason one child kept cannot reach a later tick's page."""
+
+    class _Holds:
+        def __init__(self, text: str) -> None:
+            self.left: ExecReason | None = ExecReason(kind="other", text=text)
+
+        async def execute(self, swap_id, record, decision):
+            return None
+
+        def take_reason(self, swap_id):
+            out, self.left = self.left, None
+            return out
+
+    first, second = _Holds("first"), _Holds("second")
+    composite = CompositeExecutor(first, second)
+    assert composite.take_reason(_SWAP) == ExecReason(kind="other", text="first")
+    assert second.left is None, "the second child's reason was taken too"
+    assert composite.take_reason(_SWAP) is None
