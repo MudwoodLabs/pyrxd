@@ -419,11 +419,16 @@ def test_the_key_file_goes_through_the_guarded_read(monkeypatch, tmp_path) -> No
 
 
 def _value_bearing_ids() -> list[int]:
+    """Registry mainnets, plus chain ids the registry does not know (BSC 56, Polygon 137, and one
+    no chain uses), which count as value-bearing as in the swap coordinator."""
     from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS
 
+    known = {c.chain_id for c in KNOWN_EVM_CHAINS.values()}
     ids = [c.chain_id for c in KNOWN_EVM_CHAINS.values() if not c.is_testnet]
     assert ids
-    return ids
+    unknown = [i for i in (56, 137, 987_654_321) if i not in known]
+    assert unknown
+    return [*ids, *unknown]
 
 
 def test_one_endpoint_on_a_value_bearing_chain_is_refused_without_the_flag() -> None:
@@ -456,3 +461,53 @@ def test_the_command_refuses_one_mainnet_endpoint_before_any_read(swap, monkeypa
     res = _cmd(swap)
     assert res.exit_code == 1, res.output
     assert "could not prepare" in res.output and "--single-endpoint" in res.output
+
+
+def test_an_unpinned_token_on_an_unlisted_chain_is_refused() -> None:
+    base = dataclasses.asdict(_locator(chain_id=56))
+    with pytest.raises(ValidationError):
+        mod._token_for(Erc20HtlcLocator(**base, token_address="0x" + "70" * 20, deployer=None))
+
+
+def test_the_value_bearing_rule_is_the_swap_coordinators() -> None:
+    from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS
+    from pyrxd.gravity.swap_coordinator import SwapCoordinator
+
+    ids = [c.chain_id for c in KNOWN_EVM_CHAINS.values()] + [31337, 56, 137, 987_654_321]
+    for chain_id in ids:
+        assert mod.is_value_bearing(chain_id) is (not SwapCoordinator._single_source_may_decide(chain_id))
+
+
+def test_a_type_1_signed_transaction_is_refused_as_a_validation_error() -> None:
+    from eth_account import Account
+    from eth_utils import to_checksum_address
+
+    key = mod.parse_eth_key(os.urandom(32).hex())
+    raw = Account.sign_transaction(
+        {
+            "type": 1,
+            "chainId": _CHAIN,
+            "to": to_checksum_address(_locator().contract_address),
+            "value": 0,
+            "nonce": 8,
+            "gas": 150_000,
+            "gasPrice": 3,
+            "data": mod._REFUND_SELECTOR,
+            "accessList": [],
+        },
+        key.unsafe_raw_bytes(),
+    ).raw_transaction
+    tx = {"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
+    with pytest.raises(ValidationError, match="type 1"):
+        mod._assert_signed_matches(bytes(raw), tx, chain_id=_CHAIN, to=_locator().contract_address)
+
+
+def test_a_key_file_readable_by_others_is_refused(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv(mod.KEY_ENV, raising=False)
+    loose = tmp_path / "k"
+    loose.write_text("ab" * 32)
+    loose.chmod(0o644)
+    with pytest.raises(ValidationError):
+        mod._resolve_key_source(str(loose))
+    loose.chmod(0o600)
+    assert mod._resolve_key_source(str(loose)) == "ab" * 32

@@ -206,25 +206,23 @@ def parse_eth_key(text: str) -> Any:
 
 
 def is_value_bearing(chain_id: int) -> bool:
-    """True for a chain the registry knows and does not mark as a testnet.
+    """True unless one endpoint may decide on this chain: anvil's 31337 or a registry testnet.
 
-    A chain the registry does not know (anvil's 31337) counts as a test chain: a runner cannot have
-    opened a value-bearing swap on it, since ``evm_chain_by_id`` refuses an unknown chain id.
+    The swap coordinator's rule (``SwapCoordinator._single_source_may_decide``), reused so the two
+    cannot drift. A chain id the registry does not know counts as value-bearing: runners and the
+    library accept chains outside the registry (BSC and Polygon are left out of it on purpose).
     """
-    from ..eth_wallet.chains import evm_chain_by_id
+    from ..gravity.swap_coordinator import SwapCoordinator
 
-    try:
-        return not evm_chain_by_id(chain_id).is_testnet
-    except ValidationError:
-        return False
+    return not SwapCoordinator._single_source_may_decide(int(chain_id))
 
 
 def _token_for(locator: Any) -> Any:
     """The :class:`Erc20Token` a token locator is denominated in.
 
     The pinned registry entry when there is one. A swap on a value-bearing chain can only have used a
-    pinned token, so an unpinned one there is refused. On a test chain (or one the registry does not
-    know, such as anvil's 31337), an unpinned address is used as it stands: the refund reads only the
+    pinned token, so an unpinned one there is refused. On a test chain (a registry testnet, or
+    anvil's 31337; see :func:`is_value_bearing`), an unpinned address is used as it stands: the refund reads only the
     token's address (its balance, and the ``token`` immutable the exact runtime check binds).
     """
     from ..eth_wallet.tokens import Erc20Token, token_by_address
@@ -292,6 +290,10 @@ def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to:
         signed = TypedTransaction.from_bytes(HexBytes(raw)).as_dict()
     except (ValueError, TypeError) as exc:
         raise ValidationError(f"the signed refund is not an EIP-1559 transaction ({exc}); nothing is printed") from exc
+    if signed.get("type") != 2:
+        raise ValidationError(
+            f"the signed refund is a type {signed.get('type')} transaction, not EIP-1559; nothing is printed"
+        )
     want: dict[str, Any] = {
         "type": 2,
         "value": 0,
