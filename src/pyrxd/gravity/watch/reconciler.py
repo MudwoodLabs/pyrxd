@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import (
     SITUATION_ARMED_BTC_REFUND,
+    SITUATION_CLAIM_RACE,
     Decision,
     Intent,
     LegacyCheck,
@@ -41,7 +43,7 @@ from pyrxd.gravity.watch.decide import (
     decide,
     decide_legacy,
 )
-from pyrxd.gravity.watch.executor import ExecOutcome, Executor, NullExecutor
+from pyrxd.gravity.watch.executor import ExecOutcome, ExecReason, Executor, NullExecutor, take_exec_reason
 from pyrxd.security.errors import ValidationError
 
 logger = logging.getLogger(__name__)
@@ -175,6 +177,51 @@ def _executor_outcome_note(outcome: ExecOutcome | None) -> str:
         " This tick the tower did NOT broadcast a refund (no executor, dormant, or one of its gates refused): "
         "refund the BTC yourself (taker_refund_btc)."
     )
+
+
+#: The most characters of an executor's reason a page carries (#935). The reason can hold a node's
+#: rejection text, already sanitized and clipped by the ElectrumX client; this bounds every other kind.
+#: Long enough for the longest reason the executor writes itself plus a node's clipped reason.
+_MAX_PAGE_REASON_CHARS = 600
+
+#: A URL in a reason: an HTTP client's error can name the endpoint it called, path and query included,
+#: and an endpoint's key often rides in either (Mythos combo 2.2). The page keeps scheme and host only.
+_URL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)(?:[^/\s@]*@)?([^/\s?#]+)[^\s]*")
+
+
+def _page_text(reason: str) -> str:
+    """*reason* as one line of a page: non-printables as spaces, runs of whitespace as one, ``|`` (the
+    page's field separator, so a reason cannot fake an ``ack:`` field) as ``/``, each URL cut to its
+    scheme and host, clipped."""
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in reason).replace("|", "/")
+    cleaned = _URL_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}/...", cleaned)
+    out = " ".join(cleaned.split())
+    if len(out) > _MAX_PAGE_REASON_CHARS:
+        out = out[:_MAX_PAGE_REASON_CHARS] + "..."
+    return out
+
+
+def _claim_outcome_note(outcome: ExecOutcome | None, reason: str | None) -> str:
+    """What this tick's executor did with an armed claim page, and why, appended to the page (#935).
+    ``None`` means no executor acted (the alert-only default).
+
+    The reason can quote one endpoint's answer, so no wording here tells the operator to stand down on
+    what it says: every outcome but a broadcast says to check the chain and claim by hand, and the
+    reason is labelled as the tower's report, which may quote a server."""
+    detail = f" (tower's report, may quote a server: {_page_text(reason)})" if reason else ""
+    if outcome is ExecOutcome.BROADCAST:
+        return f" This tick the tower broadcast the covenant claim{detail}; check that it confirms before the deadline."
+    if outcome is ExecOutcome.FAILED:
+        return (
+            f" This tick the tower's covenant claim FAILED{detail}; it tries again next tick. Claim the asset "
+            "yourself if it has not landed well before the deadline."
+        )
+    if outcome is ExecOutcome.DECLINED:
+        return (
+            f" This tick the tower's covenant claim was DECLINED{detail}. Check on chain that the asset is "
+            "claimed, and claim it yourself if not, before the deadline."
+        )
+    return " This tick the tower did NOT attempt a claim (no executor acted): claim the asset yourself."
 
 
 class Reconciler:
@@ -421,8 +468,24 @@ class Reconciler:
             if decision.intent in _ROUTED_INTENTS:
                 # Autonomy (v2) runs FIRST but is ADDITIVE — the alerter ALWAYS still fires, so a
                 # dormant/declined/failed broadcast never silences the operator.
-                executed = await self._safe_execute(swap_id, record, decision)
-                if decision.autonomous_btc_refund:
+                executed, exec_reason = await self._safe_execute(swap_id, record, decision)
+                if decision.autonomous_asset_claim:
+                    # The same for the armed claim (#935): the page says what the claim executor did and
+                    # why (a consensus refusal carries the node's reason, an exhausted fee pool its cap),
+                    # and the situation names the outcome, so a change of outcome is a new page.
+                    decision = dataclasses.replace(
+                        decision,
+                        reason=decision.reason
+                        + _claim_outcome_note(executed, exec_reason.text if exec_reason else None),
+                        # The kind is the executor's own word for the reason, never a server's, so an ACK
+                        # of one kind of outcome does not hide another (Mythos combo 2.1, 4.3).
+                        situation=(
+                            f"{decision.situation or SITUATION_CLAIM_RACE}:"
+                            f"{executed.value if executed is not None else 'none'}"
+                            + (f":{exec_reason.kind}" if exec_reason is not None and executed is not None else "")
+                        ),
+                    )
+                elif decision.autonomous_btc_refund:
                     # decide() cannot know whether this tower broadcasts; the page says what it did
                     # (#850 PR 9b, Mythos F2), so an alert-only or dormant tower never claims a broadcast.
                     # The situation names the outcome too, so a FAILED broadcast after a BROADCAST is a new
@@ -440,20 +503,29 @@ class Reconciler:
         finally:
             self._inflight.discard(swap_id)
 
-    async def _safe_execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
+    async def _safe_execute(
+        self, swap_id: str, record: SwapRecord, decision: Decision
+    ) -> tuple[ExecOutcome | None, ExecReason | None]:
         """Run the autonomous executor for an autonomy-eligible decision. A broadcast failure must NOT
         crash the loop and must NOT silence the operator — it is recorded as ``FAILED`` and the alerter
         still pages. ``PAGE_REFUND`` (keyless refund) and ``PAGE_CLAIM`` (the asset claim) are
         autonomy-eligible; every other routed intent is observed-only. Each executor self-gates on its
         own typed discriminator, so a wired RefundExecutor/ClaimExecutor only acts on its own intent.
-        With the default :class:`NullExecutor` this is always a no-op (returns ``None``)."""
+        With the default :class:`NullExecutor` this is always a no-op (returns ``None``).
+
+        Also returns the executor's reason for the outcome, when it reports one (#935). When it raised,
+        the reason names only the exception's class: its message goes to the log, not to the page."""
         if decision.intent not in (Intent.PAGE_REFUND, Intent.PAGE_CLAIM):
-            return None
+            return None, None
         try:
-            return await self._executor.execute(swap_id, record, decision)
-        except Exception:
+            outcome = await self._executor.execute(swap_id, record, decision)
+        except Exception as exc:
             logger.exception("autonomous executor FAILED for swap %s — alerter will still page", swap_id)
-            return ExecOutcome.FAILED
+            take_exec_reason(self._executor, swap_id)  # drop anything a child left; it is not this tick's
+            return ExecOutcome.FAILED, ExecReason(
+                kind="executor_raised", text=f"the executor raised {type(exc).__name__}; see the tower log"
+            )
+        return outcome, take_exec_reason(self._executor, swap_id)
 
     def _safe_resolve(self, swap_id: str) -> None:
         """Tell an alerter that can hear it that the swap's decision is quiet this tick (WATCH or NOOP
