@@ -116,6 +116,7 @@ class _PendingSource(FakeBtcSource):
     def __init__(self, chain: _PendingChain, *, lie_funding_depth: int | None = None, **kw) -> None:
         super().__init__(chain, **kw)
         self.lie_funding_depth = lie_funding_depth
+        self.funding_reads_fail = False
 
     def _height_of(self, txid: str) -> int | None:
         if txid == self.chain.funding_txid:
@@ -126,6 +127,8 @@ class _PendingSource(FakeBtcSource):
         return super()._height_of(txid)
 
     async def confirmations(self, txid: str) -> int:
+        if txid == self.chain.funding_txid and self.funding_reads_fail:
+            raise NetworkError("tx status: 503")
         if txid == self.chain.funding_txid and self.lie_funding_depth is not None:
             self._up()
             return self.lie_funding_depth
@@ -371,6 +374,54 @@ async def test_one_source_reporting_the_grace_depth_is_enough_to_page(tmp_path):
     d = await w.decide()
     assert d.intent is Intent.PAGE_RESUME_FUND, d.reason
     assert (await w.observe()).btc_funding_confirmations == 0, "the quorum depth is still 0"
+
+
+async def test_the_observer_reads_the_covenant_when_only_the_deepest_source_reaches_the_grace(tmp_path):
+    """The observer and decide() must engage on the same depth: decide() reads the deepest source, so an
+    observer gating on the quorum depth would leave the covenant unread under rules that need it."""
+    w = _Tower(tmp_path, depth=0)
+    w.sources[0].lie_funding_depth = G
+    obs = await w.observe()
+    assert w.rxd.covenant_reads == 1
+    assert obs.asset_locked_at_height == ChainHeight(LOCKED_AT)
+
+
+async def test_the_observer_reads_the_covenant_when_a_spender_is_named_that_is_not_a_claim(tmp_path):
+    """Our own refund in the mempool names a spender without setting the claim trigger. decide() engages
+    on it, so the observer must read the covenant too."""
+    w = _Tower(tmp_path, depth=w_depth_past_t_btc())
+    w.chain.submit(w.chain.refund_tx())
+    for s in w.sources:
+        s.funding_reads_fail = True  # no depth at all: only the spender engages
+    obs = await w.observe()
+    assert obs.btc_spenders_named and not obs.maker_has_claimed_btc and obs.btc_unrecorded_fund_deepest is None
+    assert w.rxd.covenant_reads == 1
+
+
+async def test_one_source_claiming_an_unseen_fund_near_t_rxd_pages_critical_and_never_broadcasts(tmp_path):
+    """Pinned on purpose (review of #842): one source is then the only evidence that BTC sits in an HTLC
+    the maker can claim after refunding the covenant at t_rxd. The tower fails toward the page, which
+    says the maturity could not be read; it never arms a broadcast."""
+    w = _Tower(tmp_path, depth=0)
+    w.chain.funding_seen = False
+    w.sources[0].lie_funding_depth = G
+    w.near_t_rxd()
+    w.presign()
+    (res,) = await w.reconciler(executor=w.executor()).tick()
+    d = res.decision
+    assert d.intent is Intent.PAGE_REFUND and d.urgent is True, d.reason
+    assert "could not be read" in d.reason
+    assert d.autonomous_btc_refund is False and res.executed is None
+    assert [p.severity for p in w.channel.sent] == [Severity.CRITICAL]
+
+
+async def test_an_unseen_fund_near_t_rxd_with_no_source_claiming_it_is_watched(tmp_path):
+    """The honest twin: with every source saying "not found", nothing pages, near t_rxd or not."""
+    w = _Tower(tmp_path, depth=0)
+    w.chain.funding_seen = False
+    w.near_t_rxd()
+    (res,) = await w.reconciler().tick()
+    assert res.decision.intent is Intent.WATCH and w.channel.sent == []
 
 
 async def test_the_deepest_source_survives_the_others_failing(tmp_path):

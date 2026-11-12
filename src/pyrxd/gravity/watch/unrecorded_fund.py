@@ -16,8 +16,8 @@ The tower now treats such a record as an UNRECORDED lock:
   ``resume_interrupted_fund``, both autonomy flags False, and its own situation tags;
 * those rules run only once the BTC side gives a reason (:func:`unrecorded_fund_engaged`): a spender
   is seen, or some source reports the funding at least ``min(G, t_btc)`` deep. Before that the record
-  is watched and nothing else is read, so a healthy fund pages nothing and reads no covenant (Mythos
-  review of #891, F3);
+  is watched: the BTC reads still run every tick, but the covenant is not read and nothing pages, so a
+  healthy fund pages nothing (Mythos review of #891, F3);
 * a fund that went quiet (BTC confirmed at least ``G`` deep on some source, nothing else due) pages
   ``PAGE_RESUME_FUND`` once, at WARN.
 
@@ -25,6 +25,12 @@ The tower now treats such a record as an UNRECORDED lock:
 the funding runner's ``min_confirmations``: a healthy runner records the lock within one poll of that
 depth, so a fund still unrecorded at ``G`` has stopped. The tower cannot read that setting, so it is
 the operator's to keep consistent.
+
+One lying source can engage the rules: it can report a fund no other source has seen. The rules then
+fail toward paging. With the covenant pinned and t_rxd near, the refund's maturity cannot be read (the
+quorum depth is unread), and that pages CRITICAL until it is ACKed. This is deliberate: one source is
+then the only evidence that BTC sits in an HTLC the maker can soon claim after refunding the covenant,
+and a false page is the cheap mistake. It cannot arm a broadcast.
 """
 
 from __future__ import annotations

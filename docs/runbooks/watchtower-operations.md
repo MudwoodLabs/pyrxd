@@ -505,9 +505,11 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
   under new situation keys, so an ACK given before the resume does not silence them.
 
   Set `--unrecorded-fund-grace-blocks` above the fund runner's `min_confirmations` (both shipped
-  runners use 1). The WARN reads the deepest depth any one source reports, so one source can raise it
-  and only every source lagging can hold it down. A fund no source has seen (evicted, or its input
-  spent elsewhere) is watched and never paged: no BTC moved. `abandon_unfunded` refuses a record that
+  runners use 1). Engaging these rules reads the deepest depth any one source reports, so only every
+  source lagging can hold a page down, and one lying source can raise one. Near t_rxd that page is a
+  CRITICAL refund page saying the refund's maturity could not be read; check the fund's depth on
+  sources you trust before acting. A fund no source has seen (evicted, or its input spent elsewhere)
+  is watched and never paged: no BTC moved. `abandon_unfunded` refuses a record that
   holds the funding bytes, so such a record is left at `negotiated` until a resume re-sends them.
 - The heartbeat JSON carries `schema_version` (currently `1`). The escalation monitor refuses a version
   it does not know, so **upgrade the tower before the monitor**, not the other way round.

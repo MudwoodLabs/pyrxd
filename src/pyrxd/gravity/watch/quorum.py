@@ -104,7 +104,7 @@ class BtcClaimSource(Protocol):
 
     # OPTIONAL capability (#842): ``deepest_funding_confirmations(funding_txid) -> Confirmations | None``,
     # the deepest depth ANY one source reports (None when none answers). It decides only whether an
-    # unrecorded fund pages as interrupted, so one source can raise it (a spurious page) and only every
+    # unrecorded fund is decided as a lock, so one source can raise it (a spurious page) and only every
     # source lagging can hold it down. A source without it is read through ``funding_confirmations``.
     # OPTIONAL capability (duck-typed, probed like the ETH source's ``finality_checkpoint``): a source
     # MAY expose ``spend_disposition(locator, *, hashlock, burial_blocks) -> BtcCounterDisposition``,

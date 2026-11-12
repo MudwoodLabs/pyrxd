@@ -712,7 +712,7 @@ this "maker-**promised** params match the locally re-derived BTC funding SPK" (`
 shipped legs the two methods call the same function on the same input:
 
 - BTC — `src/pyrxd/btc_wallet/htlc_leg.py:456` and `:466`, both return `self._htlc(terms).scriptpubkey`; the
-  docstring at `:433-436` says so plainly ("there is no separate maker-side derivation").
+  docstring at `:459-464` says so plainly ("there is no separate maker-side derivation").
 - ETH — `eth_leg.py:93-107`, both return `self._commitment(terms)`, computed from the leg's *own*
   local `claim_to`/`refund_to`/`timeout`.
 

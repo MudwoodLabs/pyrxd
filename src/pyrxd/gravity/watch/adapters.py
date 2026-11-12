@@ -436,8 +436,9 @@ class OutspendBtcClaimSource:
         """The deepest depth any ONE of the funding reader's sources reports for *funding_txid*, or
         ``None`` when none answers (#842).
 
-        Not a value gate: it only decides whether a fund the record never took pages as interrupted, so
-        it errs toward paging. One source over-reporting raises a spurious page; a source that lags,
+        Not a value gate: it only decides whether the tower applies the lock rules to a fund the record
+        never took, so it errs toward paging. One source over-reporting raises a spurious page (CRITICAL
+        near t_rxd, where the refund's maturity is then unread; ``unrecorded_fund``); a source that lags,
         withholds or errors is outvoted by any one that answers. Read per source through ``panel()``,
         the same sources :meth:`spend_disposition` asks."""
         panel = getattr(self._reader, "panel", None)
