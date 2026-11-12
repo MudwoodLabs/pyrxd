@@ -222,6 +222,14 @@ An ACK covers the situation it was paged for. Every page that can be CRITICAL is
 and the others), so an ACK of one never silences another. Each CRITICAL page ends with an `ack:` line
 naming the swap and the situation; append that line to the inbox:
 
+An armed claim race (one the tower may claim autonomously) names what the claim executor did in its
+situation: `claim_race:<outcome>:<kind>`, for example `claim_race:declined:consensus_rejection` or
+`claim_race:failed:fee_pool_exhausted`, and `claim_race:none` when no executor is wired. The kind is
+the executor's own label for the reason, never a server's, so an ACK covers one outcome of one kind:
+an exhausted fee pool after an ACKed consensus refusal pages again. The reason text on the page is
+the tower's report and can quote a server, so check the chain before acting on it. Since #976 an ACK
+written for the bare `claim_race` situation matches no armed claim page.
+
 ```bash
 (umask 077; echo "<swap_id> <situation key>" >> /run/wt/acks)   # copy it from the page's "ack:" line
 ```
