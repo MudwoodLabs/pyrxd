@@ -25,7 +25,13 @@ from pyrxd.btc_wallet import taproot as t
 from pyrxd.gravity import swap_coordinator as sc
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
-from pyrxd.gravity.radiant_leg import MAX_COVENANT_HISTORY, CovenantSpendKind, RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.radiant_leg import (
+    MAX_COVENANT_HISTORY,
+    CovenantSpendKind,
+    RadiantChainIO,
+    RadiantCovenantLeg,
+    RadiantEchoMismatch,
+)
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import (
     AbortReason,
@@ -37,7 +43,7 @@ from pyrxd.gravity.swap_state import (
     SwapState,
 )
 from pyrxd.keys import PrivateKey
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import BroadcastEchoMismatch, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 from tests._fake_radiant_chain import FakeRadiantChain, FakeRadiantSource, payment
 from tests.test_swap_coordinator import FakeBtcLeg, FakeIndexer, FakeSeenStore
@@ -421,6 +427,36 @@ async def test_an_unknown_read_still_sends_the_refund_when_the_leg_can():
     coord = swap.coordinator(pin=True, leg=swap.leg(sources=[*swap.sources, liar]))
     rec = await coord.maker_refund_covenant()
     assert rec.state is SwapState.NEGOTIATED and rec.asset_refund_txid is not None and _broadcasts(swap) == 1
+
+
+class _EchoLiar(FakeRadiantSource):
+    """Takes the broadcast, then names some other txid, as ``ElectrumXClient`` reports it (#789)."""
+
+    async def broadcast(self, raw: bytes) -> str:
+        txid = await super().broadcast(raw)
+        raise BroadcastEchoMismatch(txid, "ee" * 32)
+
+
+async def test_an_unknown_read_with_an_echo_mismatch_does_not_say_the_refund_was_not_sent():
+    """The refund went out and may have relayed, so the mismatch is raised as itself, not as the
+    NetworkError that says nothing was sent (#789)."""
+    swap = _Swap()
+    primary = _EchoLiar(swap.chain, "https://rxd0.example-0.org")
+    liar = FakeRadiantSource(swap.chain, "https://liar.example-x.org", extra=[swap.refund_tx()])
+    coord = swap.coordinator(pin=True, leg=swap.leg(sources=[primary, *swap.sources[1:], liar]))
+    with pytest.raises(RadiantEchoMismatch) as info:
+        await coord.maker_refund_covenant()
+    assert not isinstance(info.value, NetworkError)
+    assert len(primary.broadcasts) == 1 and info.value.raw == primary.broadcasts[0]
+
+
+async def test_HONEST_an_unknown_read_with_a_transport_failure_still_says_not_sent():
+    swap = _Swap()
+    liar = FakeRadiantSource(swap.chain, "https://liar.example-x.org", extra=[swap.refund_tx()])
+    swap.sources[0].down = True
+    coord = swap.coordinator(pin=True, leg=swap.leg(sources=[*swap.sources, liar]))
+    with pytest.raises(NetworkError, match="the refund was not sent"):
+        await coord.maker_refund_covenant()
 
 
 async def test_the_read_never_raises_for_an_unreadable_chain():

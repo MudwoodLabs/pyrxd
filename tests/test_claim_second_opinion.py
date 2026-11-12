@@ -6,7 +6,7 @@ maker's refund timelock runs. ``RadiantChainIO.with_second_opinion`` (wired by
 ``make_radiant_claim_leg(..., second_opinion=...)``) asks one client per operator before raising.
 
 The servers are real ``ElectrumXClient`` objects whose wire (``_call``) is answered by the ``_Node``
-mempool model from ``test_claim_executor_echo_mismatch_rebuilds``, so the echo check, the JSON-RPC
+mempool model from ``test_claim_executor_echo_mismatch``, so the echo check, the JSON-RPC
 error mapping and the read-back hash check are production code. Each node is given its own URL, so
 its operator (``source_key``) comes from ``pyrxd.network.source_identity``, not from the test.
 """
@@ -24,11 +24,11 @@ import pytest
 from pyrxd.gravity.radiant_leg import RadiantChainIO, SecondOpinionTxid, SeenStore
 from pyrxd.gravity.watch import ExecOutcome
 from pyrxd.gravity.watch.claim_executor import CovenantClaimContext, make_radiant_claim_leg, sidecar_leg_resolver
-from pyrxd.network.electrumx import ElectrumXClient, _rpc_error
+from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.network.source_identity import source_key
 from pyrxd.security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError
 
-from test_claim_executor_echo_mismatch_rebuilds import (  # isort: skip
+from test_claim_executor_echo_mismatch import (  # isort: skip
     _COVENANT,
     _LIE,
     _SCRIPT_FAILED,
@@ -59,15 +59,6 @@ class _OpNode(_Node):
         if method == "blockchain.transaction.broadcast" and self.fail is not None:
             self.broadcasts.append(bytes.fromhex(params[0]))
             raise self.fail
-        if (
-            method == "blockchain.transaction.broadcast"
-            and self.reject is None
-            and _txid(bytes.fromhex(params[0])) in self.mempool
-        ):
-            # What Radiant-Core answers for a transaction it already holds (validation.cpp,
-            # "txn-already-in-mempool"), wrapped by ElectrumX as code 1.
-            self.broadcasts.append(bytes.fromhex(params[0]))
-            raise _rpc_error(1, "the transaction was rejected by network rules.\n\ntxn-already-in-mempool\n[]")
         if method == "blockchain.transaction.get" and params[1:] == [False]:
             self.reads.append(params[0])
             raw = self.mempool.get(params[0]) if self.serves else None
@@ -378,7 +369,7 @@ async def test_a_claim_one_endpoint_refuses_lands_through_a_second_operator(tick
     claim = second.broadcasts[0]
 
     # Later ticks re-send the SAME bytes: no new fee input, nothing new relayed. The second node
-    # answers "already have" and serves them back.
+    # already holds them and answers with their txid, as a regtest node does.
     for _ in range(3):
         outcome, said = await tick(ex, rec)
         assert outcome is ExecOutcome.DECLINED and "re-sent the same bytes" in said, said
@@ -421,7 +412,7 @@ async def test_a_lying_second_opinion_cannot_disarm_the_claim(tick) -> None:
 
 async def test_a_held_claim_the_first_endpoint_already_has_is_marked_seen(tick) -> None:
     """The normal honest relay: the second node relayed the claim and the first endpoint now holds
-    it, so the re-send gets "already have" from the first endpoint itself."""
+    it, so the first endpoint itself takes the re-send (it answers with the txid of bytes it holds)."""
     primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
     seen = SeenStore()
     ex, rec, fees = await _with_second_opinion(primary, second, seen)

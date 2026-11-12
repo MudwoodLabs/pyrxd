@@ -49,7 +49,7 @@ This repo is public and published to PyPI. Each rule below exists because the op
 - Build the image once with `pyrxd regtest setup`; run the per-push node suites with `task test-regtest`. The node version is pinned by `pyrxd.devnet.DEFAULT_RADIANT_VERSION`.
 - Start nodes at mainnet's relay floor and assert the node's effective fee, as `tests/test_htlc_regtest_e2e.py` does. Lower it only deliberately.
 - Give each module a distinct container name, and never run two regtest suites at once.
-- A new node-backed module goes into `.github/workflows/integration.yml` (and `task test-regtest` if per-push), or its docstring says it is operator-run and why. Today `tests/test_dmint_commit_echo_recovery_regtest_e2e.py`, `tests/test_dmint_deploy_integration.py` and `tests/test_erc20_leg_fork_integration.py` are in no workflow.
+- A new node-backed module goes into `.github/workflows/integration.yml` (and `task test-regtest` if per-push), or its docstring says it is operator-run and why. Today `tests/test_claim_executor_echo_mismatch_regtest_e2e.py`, `tests/test_dmint_commit_echo_recovery_regtest_e2e.py`, `tests/test_dmint_deploy_integration.py` and `tests/test_erc20_leg_fork_integration.py` are in no workflow.
 - Settle a consensus question on a regtest node before building on it. The verdict comes from the node, not from Python.
 
 ## Consensus, chains and units
