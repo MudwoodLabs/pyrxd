@@ -71,7 +71,9 @@ e.g. `age`/`gpg` to an offline key. Verify perms stay `0600` on restore.
    Anyone can pay the covenant's script, so both commands (and `swap status`) report other outputs
    there and ignore them. If the recovery file does not record `rxd_covenant_outpoint` and the
    command picked the wrong output, pass `--covenant-outpoint TXID:VOUT` (the covenant funding from
-   your run log).
+   your run log). For an ETH or ERC-20 counter leg, `pyrxd swap build-eth-refund` signs the taker's
+   `refund()` once the contract's timeout has passed and prints it the same way; it reads the
+   contract from the swap record beside the recovery file and checks it on chain first.
 
 ### Recovering the seen-store
 
@@ -95,5 +97,5 @@ never restored is a hypothesis, not a backup.
 - [`incident-response.md`](incident-response.md) — vulnerability triage → fix → disclosure.
 - `pyrxd swap status --swap-file PATH --check-chain` — per-swap situational triage (RXD covenant
   + counter-leg).
-- `pyrxd swap recover-preimage` / `build-claim` / `build-refund` — the read-only cold toolkit for
-  driving a swap by hand. Prints raw hex; never broadcasts.
+- `pyrxd swap recover-preimage` / `build-claim` / `build-refund` / `build-eth-refund` — the
+  read-only cold toolkit for driving a swap by hand. Prints raw hex; never broadcasts.

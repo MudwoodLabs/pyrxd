@@ -278,6 +278,9 @@ def counter_leg_refund_advice(facts: SwapFacts, *, now_unix_s: int | None = None
     refunds only the counter-leg. ``scripts/`` is also absent from a pip install. So the advice is
     the plain truth instead: no pyrxd command can do it from this file, the leg stays locked until refunded,
     when its refund opens, and what in THIS file the refund needs.
+
+    An ETH counter leg has one since #818: ``pyrxd swap build-eth-refund`` signs the refund from the
+    swap record the ETH runners write beside the file and prints it, so the ETH advice names it.
     """
     chain = facts.counter_chain.upper()
     if facts.writer is not None:
@@ -311,11 +314,20 @@ def counter_leg_refund_advice(facts: SwapFacts, *, now_unix_s: int | None = None
             when = f"the HTLC contract's refund() opens at unix time {ts} ({iso}; {passed})"
         else:
             when = "the HTLC contract's refund() opens at its own timeout, which this file does not record"
-        how = (
-            "Refund it by calling refund() on the HTLC contract, which pyrxd cannot send; the contract pays "
-            f"the refundee fixed at deploy (`eth_refund_to` = {sanitize_terminal(facts.eth_refund_to, max_len=64)})."
+        pays = (
+            f" The contract pays the refundee fixed at deploy (`eth_refund_to` = "
+            f"{sanitize_terminal(facts.eth_refund_to, max_len=64)})."
             if facts.eth_refund_to
-            else "Refund it with the tool that funded it."
+            else ""
+        )
+        # #818: `build-eth-refund` signs the refund from the swap record the ETH runners write beside
+        # this file, and prints it; it never sends. Named for every ETH file, because the command itself
+        # says plainly when the record is not there.
+        return (
+            f"Your ETH-side funds stay locked until refunded; {when}. Once it has opened, sign the refund with "
+            "`pyrxd swap build-eth-refund --swap-file <this file> --eth-rpc-url <url> --artifact <the HTLC "
+            "artifact>`, which reads the swap record beside this file (<this file>.swaprec.json), checks the "
+            f"contract against it, and prints the raw transaction for you to send.{pays}"
         )
     return (
         f"No pyrxd command can refund the {chain} leg from this file, and {who}. Your {chain}-side funds "

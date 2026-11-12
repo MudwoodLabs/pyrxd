@@ -416,6 +416,7 @@ jobs:
         run: |
           poetry run pytest -o "addopts=" -m integration -q \
             tests/test_eth_leg_anvil_integration.py \
+            tests/test_build_eth_refund_anvil_integration.py \
             tests/test_xchain_eth_swap_regtest_e2e.py \
             tests/test_xchain_eth_adversarial_e2e.py \
             tests/test_xchain_eth_active_adversary_e2e.py \

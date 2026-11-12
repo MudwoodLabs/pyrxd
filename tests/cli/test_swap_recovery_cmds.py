@@ -1135,7 +1135,7 @@ def _writer_record(swap, shape: str) -> dict[str, Any]:
             "eth_swap_run",
             "ETH",
             [
-                "scripts/eth_swap_run.py, which wrote this file, has no phase that refunds only that leg",
+                "`pyrxd swap build-eth-refund --swap-file <this file>",
                 f"refund() opens at unix time {_FAR_FUTURE_TS} (2096-10-02 07:06:40 UTC; still ahead by this machine's clock)",
                 f"`eth_refund_to` = {_ETH_REFUND_TO}",
             ],
@@ -1144,7 +1144,7 @@ def _writer_record(swap, shape: str) -> dict[str, Any]:
             "eth_swap_grief_run",
             "ETH",
             [
-                "scripts/eth_swap_grief_run.py, which wrote this file, has no phase that refunds only that leg",
+                "`pyrxd swap build-eth-refund --swap-file <this file>",
                 f"refund() opens at unix time {_FAR_PAST_TS} (2001-09-09 01:46:40 UTC; already passed by this machine's clock; the contract checks block time)",
                 f"`eth_refund_to` = {_ETH_REFUND_TO}",
             ],
@@ -1166,7 +1166,8 @@ def test_the_counter_leg_refund_advice_is_runnable_or_says_plainly_there_is_none
     assert res.exit_code == 0, res.output
     assert f"Counter-leg ({chain}): NOT_CHECKED" in res.output
     assert "situation  : COVENANT_SPENT" in res.output
-    assert f"No pyrxd command can refund the {chain} leg from this file" in res.output
+    # BTC has no pyrxd command for its leg and says so; ETH has had one since #818 and names it.
+    assert (f"No pyrxd command can refund the {chain} leg from this file" in res.output) is (chain == "BTC")
     assert f"Your {chain}-side funds stay locked until refunded" in res.output
     for fragment in expected:
         assert fragment in res.output, fragment

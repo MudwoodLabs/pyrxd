@@ -133,9 +133,6 @@ _KNOWN_UNREACHED: dict[str, str] = {
         "Its siblings is_nft_script / is_ft_script have 7 and 12 shipped callers; this one is "
         "consumer surface for inspecting a script, so test-only internal use is expected."
     ),
-    "src/pyrxd/eth_wallet/tokens.py::token_by_address": (
-        "FINDING 2026-08-27: new in feat/erc20-usdc-leg with test-only callers — wire or remove"
-    ),
 }
 
 

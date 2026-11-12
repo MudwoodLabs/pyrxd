@@ -84,7 +84,13 @@ def test_the_endpoint_option_derivation_finds_the_known_options() -> None:
     flags = {f for fs in derived.values() for f in fs}
     assert {"--node-rpc", "--electrumx", "--eth-rpc-url", "--btc-api-url"} <= flags
     # Membership pinned: a NEW endpoint option must be added to the sweep below, not skipped.
-    assert set(derived) == {(), ("swap", "status"), ("swap", "orders"), ("swap", "recover-preimage")}, derived
+    assert set(derived) == {
+        (),
+        ("swap", "status"),
+        ("swap", "orders"),
+        ("swap", "recover-preimage"),
+        ("swap", "build-eth-refund"),
+    }, derived
 
 
 # --------------------------------------------------------------------------- the subprocess harness
@@ -365,6 +371,34 @@ def _recover_commands(tmp_path: Path, url: str) -> dict[tuple[str, str], list[st
     }  # fmt: skip
 
 
+def _eth_refund_commands(tmp_path: Path, url: str) -> dict[tuple[str, str], list[str]]:
+    """``swap build-eth-refund`` (#818), with the swap record, key and artifact it needs to reach its RPC."""
+    from pyrxd.eth_wallet.locator import EthHtlcLocator
+    from tests._eth_refund_records import eth_record, write_record
+
+    ke = _swap_file(tmp_path, "eth")
+    d = json.loads(ke.read_text())
+    d.update(eth_chain_id=11155111, eth_key_hex=os.urandom(32).hex())
+    ke.write_text(json.dumps(d))
+    locator = EthHtlcLocator(
+        chain_id=11155111,
+        contract_address="0x" + "ab" * 20,
+        deploy_tx_hash="0x" + "11" * 32,
+        hashlock="0x" + H_TEST.hex(),
+        claimant="0x" + "44" * 20,
+        refundee="0x" + "55" * 20,
+        timeout=1780686598,
+        amount_wei=10**15,
+    )
+    write_record(ke, eth_record(locator))
+    artifact = Path(__file__).resolve().parents[1] / "fixtures" / "EthHtlc.json"
+    return {
+        ("swap build-eth-refund", "--eth-rpc-url"): [
+            "swap", "build-eth-refund", "--swap-file", str(ke), "--artifact", str(artifact), "--eth-rpc-url", url,
+        ],
+    }  # fmt: skip
+
+
 #: ``swap status`` reads the counter leg only after a successful RXD covenant read, so it is driven
 #: in-process with the fake ElectrumX client of ``test_swap_recovery_cmds`` (the counter-leg read
 #: itself is real: a real aiohttp session to the hostile server). Logged output is checked via caplog.
@@ -375,6 +409,7 @@ def test_every_derived_endpoint_option_is_swept(tmp_path) -> None:
     """Both directions: every derived (command, option) is swept, and nothing swept is stale."""
     swept = {("", "--electrumx"), ("swap orders", "--node-rpc")}
     swept |= set(_recover_commands(tmp_path, "http://x"))
+    swept |= set(_eth_refund_commands(tmp_path, "http://x"))
     swept |= {("swap status", f) for f in STATUS_OPTIONS}
     derived = {(" ".join(path), flag) for path, flags in derived_endpoint_options().items() for flag in flags}
     assert derived == swept, (derived, swept)
@@ -384,7 +419,8 @@ def test_every_derived_endpoint_option_is_swept(tmp_path) -> None:
 def test_recover_preimage_endpoint_options_never_print_their_secrets(tmp_path, hostile, mode) -> None:
     hostile.mode = mode
     url = _keyed(f"http://127.0.0.1:{hostile.server_port}")
-    for name, args in _recover_commands(tmp_path, url).items():
+    commands = {**_recover_commands(tmp_path, url), **_eth_refund_commands(tmp_path, url)}
+    for name, args in commands.items():
         for json_flag in ((), ("--json",)):
             before = hostile.hits
             rc, out, err = _pyrxd(tmp_path, *json_flag, *args)

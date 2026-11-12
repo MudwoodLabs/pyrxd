@@ -221,9 +221,10 @@ human sizing the fee is the only remaining control.
   segment that looks like a credential removed (matched as whole tokens, case-insensitively and in
   percent-encoded form).
 
-  pyrxd has no command that refunds a counter-leg, so where the taker may have to refund it the
-  next action says which harness wrote the recovery file, when that leg's refund opens, and
-  what in the file the refund needs. A two-host harness's ``--local-out`` secret file is not a recovery file
+  Where the taker may have to refund the counter-leg, the next action says when that leg's
+  refund opens. For an ETH or ERC-20 leg it names ``build-eth-refund`` (below); pyrxd has no
+  command that refunds a BTC counter-leg, so for BTC it says which harness wrote the recovery
+  file and what in the file the refund needs. A two-host harness's ``--local-out`` secret file is not a recovery file
   ``status`` reads; it is refused with that harness's own ``--phase abort`` command.
 - ``pyrxd swap recover-preimage`` — scrape the preimage ``p`` from the counterparty's own
   on-chain claim and verify it. Provenance is mandatory: the fetched bytes must re-derive to
@@ -240,6 +241,27 @@ human sizing the fee is the only remaining control.
   output is identified as ``status`` identifies it; other outputs at the covenant script are
   reported and left alone, and ``--covenant-outpoint TXID:VOUT`` names the covenant when the
   recovery file does not. A covenant that is already spent is refused as spent.
+- ``pyrxd swap build-eth-refund`` — sign the taker's ``refund()`` of the ETH or ERC-20
+  counter-leg HTLC and print the raw transaction and its hash. It never broadcasts: send the
+  printed transaction yourself (``cast publish``, or ``eth_sendRawTransaction`` on any RPC). The
+  contract and its terms come from the swap record the ETH runners write beside the recovery
+  file (``<swap-file>.swaprec.json``, or ``--record``), which must be for the same hashlock and
+  chain and not a maker's. Before signing, the code at the contract must be exactly the runtime
+  those terms imply (``--artifact`` is the EthHtlc or Erc20Htlc artifact it was deployed from),
+  its getters must return them, and it must not be settled. It refuses before the timeout (read
+  as the lowest head across endpoints), a key an ERC-20 contract would refuse, an empty token
+  contract, and a refund already on the record that is mined or pending. The key comes from
+  ``--eth-key-file`` (mode 0600), else ``PYRXD_ETH_REFUND_KEY``, else the recovery file's
+  ``eth_key_hex``. Repeat ``--eth-rpc-url`` (distinct operators): the contract checks, the maturity
+  head and the key's nonce must then agree on every endpoint, with nothing of the key's in flight,
+  and the max fee, which the first endpoint sets, may be at most twice what any other suggests
+  and no lower than the lowest base fee they report. On a
+  value-bearing chain one ``--eth-rpc-url`` is refused unless ``--single-endpoint`` is passed: one
+  endpoint alone could report a claimed contract as unsettled and hide that the secret is public.
+  Test chains accept one. The signed bytes are decoded and must match the printed nonce, gas and
+  fees, the contract, the chain and ``refund()`` calldata. The
+  record is not changed; the runner's next ``reconcile_counter_leg`` or ``mutual_refund`` reads
+  the refund from the chain.
 
 Local dev chain
 ---------------
