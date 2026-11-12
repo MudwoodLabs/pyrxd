@@ -497,6 +497,43 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
 
   Substituting a step you remember from a previous incident costs a `ValidationError` and the
   minutes it takes to read it — under a running timelock, with `p` already public.
+- **A page whose action starts with `resume_interrupted_fund` is about a BTC fund the record never
+  took (#842).** The taker's fund writes its signed transaction to the record before it broadcasts,
+  and replaces it with the lock once the fund confirms. If the runner stopped in between, the record
+  is still `negotiated` while the BTC may be on chain. The tower watches that HTLC as a lock:
+
+  | What it pages | When | What to do |
+  |---|---|---|
+  | nothing | no spender, and no source sees the fund `--unrecorded-fund-grace-blocks` deep (default 3), or `t_btc` deep if that is sooner | Nothing. A runner still polling records the lock itself. |
+  | `PAGE_RESUME_FUND` (WARN, once) | some source sees the fund at the grace depth, and nothing else is due | Check whether the fund runner is still running. If it has stopped, run `resume_interrupted_fund`; leave a runner that is still polling alone. |
+  | a claim or refund page whose action starts with `resume_interrupted_fund, then …` | a spender is seen, or the refund falls due, by the same rules as a recorded lock | Run the steps in order: the later steps need the lock on the record. If the resume says the fund is not confirmed yet, run it again after one confirmation. |
+
+  These pages are never autonomous, however the tower is armed: the lock is not on the record, and
+  a pre-signed refund cannot be built without it. After the resume the record's own pages take over,
+  under new situation keys, so an ACK given before the resume does not silence them.
+
+  Set `--unrecorded-fund-grace-blocks` above the fund runner's `min_confirmations` (both shipped
+  runners use 1). Engaging these rules reads the deepest depth any one source reports, so only every
+  source lagging can hold a page down, and one lying source can raise one. Near t_rxd that page is a
+  CRITICAL refund page saying the refund's maturity could not be read; check the fund's depth on
+  sources you trust before acting.
+
+  **Known gap: a fund that has not engaged is never paged, even past t_rxd.** That covers a fund still
+  unconfirmed, one no source has seen, and one confirmed but not yet `min(G, t_btc)` deep on any
+  source. "No source has seen it" does not mean no BTC moved: the
+  signed bytes may sit in a mempool no source reads, or be re-sent by anyone who saw them, and bytes
+  that confirm near or after t_rxd let the maker refund the covenant and still claim the BTC. Until
+  the tower pages this, check by hand any `negotiated` record that holds funding bytes and whose
+  covenant is ageing: if the fund is unconfirmed or was never sent and a fund confirming now could no
+  longer be refunded before t_rxd, double-spend its funding input to your own wallet and do not run
+  `resume_interrupted_fund`, which re-sends the bytes whenever its margin gate passes (here it should
+  refuse; do not rely on that). After the double-spend the record cannot leave `negotiated`: there
+  is no exit for it yet. Before engagement the outspend sources are
+  still read every tick, and when every one of them fails the tick is a reconcile error, which pages
+  CRITICAL as it does for a recorded lock (public Esplora servers answer an unknown txid's outspend
+  with `{"spent":false}`, not an error, so this needs the sources themselves to fail).
+  `abandon_unfunded` refuses a record that holds the funding bytes, so such a record is left at
+  `negotiated` until a resume re-sends them.
 - The heartbeat JSON carries `schema_version` (currently `1`). The escalation monitor refuses a version
   it does not know, so **upgrade the tower before the monitor**, not the other way round.
 - **What the escalation channel sends, and what each one means:**
