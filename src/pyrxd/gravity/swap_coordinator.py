@@ -4706,7 +4706,11 @@ class SwapCoordinator:
         try:
             txid = await self.radiant_leg.refund_asset(self.record)
         except Exception as exc:
-            if outcome == "unknown":
+            # A broadcast echo mismatch is raised as itself: the refund went out and may have relayed,
+            # so "was not sent" would be false (#789).
+            from pyrxd.security.errors import BroadcastEchoMismatch
+
+            if outcome == "unknown" and not isinstance(exc, BroadcastEchoMismatch):
                 raise NetworkError(
                     f"what spent the covenant is unknown ({spend.reason}), and the refund was not sent: {exc}"
                 ) from exc
@@ -6371,8 +6375,17 @@ class SwapCoordinator:
                 )
             )
             return
+        from pyrxd.security.errors import BroadcastEchoMismatch
+
         try:
             txid = await self.radiant_leg.refund_asset(self.record)
+        except BroadcastEchoMismatch as exc:
+            # The refund went out and the server named another txid (#789). Record what was sent, so
+            # a retry checks whether it landed (_recorded_asset_refund_landed) instead of re-sending
+            # into a covenant this refund already spent, which fails "no UTXO found" every time and
+            # holds the record at BOTH_LOCKED. Still reported, since nothing confirms it relayed.
+            failures.append(("radiant leg", exc))
+            txid = exc.local_txid
         except Exception as exc:
             failures.append(("radiant leg", exc))
             return

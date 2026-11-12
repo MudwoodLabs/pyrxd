@@ -31,7 +31,7 @@ from pyrxd.gravity.watch.reconciler import Reconciler, _claim_outcome_note, _pag
 from pyrxd.keys import PrivateKey
 from pyrxd.security.types import Hex20
 
-from test_claim_executor_echo_mismatch_rebuilds import _SCRIPT_FAILED, _armed, _Node, _txid  # isort: skip
+from test_claim_executor_echo_mismatch import _SCRIPT_FAILED, _armed, _Node, _txid  # isort: skip
 
 _SWAP = "swap-1"
 
