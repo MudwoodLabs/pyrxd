@@ -212,8 +212,9 @@ def test_a_recorded_refund_blocks_a_new_one_only_while_it_can_still_land(monkeyp
 
     async def refund(self, locator, **_):
         sent.append(locator.contract_address)
-        await self._rpc.preflight({"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1})
-        return await self._rpc.send_raw(b"\x02signed")
+        tx = {"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
+        await self._rpc.preflight(tx)
+        return await self._rpc.send_raw(_sign(self._key, locator, tx))
 
     async def preflight(self, tx):
         return None
@@ -228,11 +229,92 @@ def test_a_recorded_refund_blocks_a_new_one_only_while_it_can_still_land(monkeyp
     if signs:
         out = asyncio.run(go)
         assert sent and out.earlier_refund == {"tx_hash": "0x" + "ab" * 32, "nonce": 7, "progress": kind}
-        assert out.nonce == 8 and out.raw_hex == "0x02" + b"signed".hex()
+        assert out.nonce == 8 and out.raw_hex.startswith("0x02")
     else:
         with pytest.raises(ValidationError, match="already holds a refund"):
             asyncio.run(go)
         assert sent == []
+
+
+def _sign(key: Any, locator: EthHtlcLocator, tx: dict[str, Any], **over: Any) -> bytes:
+    from eth_account import Account
+    from eth_utils import to_checksum_address
+
+    full = {"chainId": locator.chain_id, "to": to_checksum_address(locator.contract_address), "value": 0,
+            "data": b"", "type": 2, **tx, **over}  # fmt: skip
+    return bytes(Account.sign_transaction(full, key.unsafe_raw_bytes()).raw_transaction)
+
+
+@pytest.mark.parametrize("field", ["nonce", "gas", "maxFeePerGas", "maxPriorityFeePerGas", "chainId", "to"])
+def test_a_signed_refund_that_differs_from_the_checked_one_is_not_printed(monkeypatch, field) -> None:
+    """The printed fields come from the preflighted dict; the signed bytes must carry the same ones."""
+    checked = {"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
+    other = {"nonce": 9, "gas": 150_001, "maxFeePerGas": 4, "maxPriorityFeePerGas": 2, "chainId": _CHAIN + 1,
+             "to": "0x" + "C1" * 20}[field]  # fmt: skip
+    if field == "to":
+        from eth_utils import to_checksum_address
+
+        other = to_checksum_address(other)
+
+    async def unsettled(self, locator):
+        return False
+
+    async def refund(self, locator, **_):
+        await self._rpc.preflight(checked)
+        return await self._rpc.send_raw(_sign(self._key, locator, checked, **{field: other}))
+
+    async def preflight(self, tx):
+        return None
+
+    monkeypatch.setattr(EthHtlcContractLeg, "check_refund_target", unsettled)
+    monkeypatch.setattr(EthHtlcContractLeg, "refund", refund)
+    monkeypatch.setattr(_Rpc, "preflight", preflight, raising=False)
+    key = mod.parse_eth_key(os.urandom(32).hex())
+    go = mod.build_cold_eth_refund(record=eth_record(_locator()), locator=_locator(), rpc=_Rpc(), key=key,
+                                   artifact=_ETH_ARTIFACT)  # fmt: skip
+    with pytest.raises(ValidationError, match=f"does not match.*{field}"):
+        asyncio.run(go)
+
+
+def test_a_signed_refund_that_matches_the_checked_one_is_printed(monkeypatch) -> None:
+    checked = {"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
+
+    async def unsettled(self, locator):
+        return False
+
+    async def refund(self, locator, **_):
+        await self._rpc.preflight(checked)
+        return await self._rpc.send_raw(_sign(self._key, locator, checked))
+
+    async def preflight(self, tx):
+        return None
+
+    monkeypatch.setattr(EthHtlcContractLeg, "check_refund_target", unsettled)
+    monkeypatch.setattr(EthHtlcContractLeg, "refund", refund)
+    monkeypatch.setattr(_Rpc, "preflight", preflight, raising=False)
+    key = mod.parse_eth_key(os.urandom(32).hex())
+    out = asyncio.run(mod.build_cold_eth_refund(record=eth_record(_locator()), locator=_locator(), rpc=_Rpc(),
+                                                key=key, artifact=_ETH_ARTIFACT))  # fmt: skip
+    assert (out.nonce, out.gas_limit, out.max_fee_per_gas, out.max_priority_fee_per_gas) == (8, 150_000, 3, 1)
+
+
+def test_an_empty_key_file_names_the_refund_key(swap, monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv(mod.KEY_ENV, raising=False)
+    write_record(swap["keys"], eth_record(_locator()))
+    empty = tmp_path / "k"
+    empty.write_text("\n")
+    empty.chmod(0o600)
+    res = _cmd(swap, "--eth-key-file", str(empty))
+    assert res.exit_code == 1, res.output
+    assert "is empty; write the refund key" in res.output and "webhook" not in res.output
+
+
+def test_an_empty_key_env_names_the_refund_key(swap, monkeypatch) -> None:
+    monkeypatch.setenv(mod.KEY_ENV, "  ")
+    write_record(swap["keys"], eth_record(_locator()))
+    res = _cmd(swap)
+    assert res.exit_code == 1, res.output
+    assert "set but empty; set the refund key" in res.output and "webhook" not in res.output
 
 
 # ── the command's own gates ─────────────────────────────────────────────────────────────────────

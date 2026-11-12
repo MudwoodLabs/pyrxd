@@ -727,7 +727,7 @@ class EthHtlcContractLeg:
 
     async def _assert_runtime_exact(self, locator: EthHtlcLocator, block_identifier: str | int | None) -> None:
         """Check 2 of :meth:`verify_funded`: the code at the contract is EXACTLY the runtime the
-        locator's terms imply (:meth:`_expected_runtime`). Shared with :meth:`verify_refund_target`."""
+        locator's terms imply (:meth:`_expected_runtime`). Shared with :meth:`check_refund_target`."""
         code = await self._rpc.get_code(locator.contract_address, block_identifier)
         if not code:
             # EMPTY is not WRONG, and conflating them is a bad diagnosis on the worst day. Reading
@@ -764,7 +764,7 @@ class EthHtlcContractLeg:
 
     async def _assert_immutables_bind(self, locator: EthHtlcLocator, block_identifier: str | int | None) -> None:
         """Check 3 of :meth:`verify_funded`: the immutables read back through the getters equal the
-        locator's. Shared with :meth:`verify_refund_target`."""
+        locator's. Shared with :meth:`check_refund_target`."""
         # Read immutables back by value and bind them to the negotiated terms.
         #
         # Through `read_contract`, so a multi-source rpc rebuilds the contract per endpoint and

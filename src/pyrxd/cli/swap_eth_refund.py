@@ -265,6 +265,45 @@ _EARLIER_REFUND_BLOCKS = {
 }
 
 
+def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to: str) -> None:
+    """Refuse unless the signed bytes carry the fields this command prints.
+
+    The printed nonce, gas and fees come from the transaction the leg preflighted; decoding the signed
+    bytes keeps a later change inside ``refund()`` from showing the operator one transaction and
+    handing them another.
+    """
+    from eth_account.typed_transactions import TypedTransaction
+    from hexbytes import HexBytes
+
+    signed = TypedTransaction.from_bytes(HexBytes(raw)).as_dict()
+    want: dict[str, Any] = {
+        "chainId": int(chain_id),
+        "to": str(to).lower(),
+        "nonce": int(tx["nonce"]),
+        "gas": int(tx["gas"]),
+        "maxFeePerGas": int(tx["maxFeePerGas"]),
+        "maxPriorityFeePerGas": int(tx["maxPriorityFeePerGas"]),
+    }
+    got: dict[str, Any] = {k: int(signed[k]) for k in want if k != "to"}
+    got["to"] = "0x" + bytes(signed["to"]).hex()
+    if got != want:
+        diff = sorted(k for k in want if got[k] != want[k])
+        raise ValidationError(
+            f"the signed refund does not match the transaction checked before signing ({', '.join(diff)}); "
+            "nothing is printed"
+        )
+
+
+def _refuse_empty_key_source(eth_key_file: str | None) -> None:
+    """Name the refund key, not a webhook, when the key file or env var is empty."""
+    import os
+
+    if eth_key_file and not Path(eth_key_file).read_text().strip():
+        raise ValidationError(f"--eth-key-file {eth_key_file} is empty; write the refund key to it, or omit the flag")
+    if KEY_ENV in os.environ and not os.environ[KEY_ENV].strip():
+        raise ValidationError(f"{KEY_ENV} is set but empty; set the refund key, or unset {KEY_ENV}")
+
+
 async def build_cold_eth_refund(
     *, record: Any, locator: Any, rpc: Any, key: Any, artifact: dict[str, Any]
 ) -> ColdEthRefund:
@@ -322,6 +361,7 @@ async def build_cold_eth_refund(
     raw, tx = sign_only.signed_raw, sign_only.signed_tx
     if raw is None or tx is None:  # pragma: no cover - refund() returns only after send_raw
         raise ValidationError("the leg returned without signing a refund; nothing was signed")
+    _assert_signed_matches(raw, tx, chain_id=locator.chain_id, to=locator.contract_address)
     return ColdEthRefund(
         chain_id=locator.chain_id,
         contract_address=locator.contract_address,
@@ -450,6 +490,7 @@ def swap_build_eth_refund_cmd(
     try:
         record, locator = load_eth_locator(record_file, facts)
         artifact = load_artifact(artifact_path)
+        _refuse_empty_key_source(eth_key_file)
         secret = resolve_secret(None, eth_key_file, KEY_ENV, flag="--eth-key")
         if not secret:
             secret = load_recovery_json(swap_file).get("eth_key_hex") or None
