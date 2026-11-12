@@ -489,6 +489,26 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
 
   Substituting a step you remember from a previous incident costs a `ValidationError` and the
   minutes it takes to read it — under a running timelock, with `p` already public.
+- **A page whose action starts with `resume_interrupted_fund` is about a BTC fund the record never
+  took (#842).** The taker's fund writes its signed transaction to the record before it broadcasts,
+  and replaces it with the lock once the fund confirms. If the runner stopped in between, the record
+  is still `negotiated` while the BTC may be on chain. The tower watches that HTLC as a lock:
+
+  | What it pages | When | What to do |
+  |---|---|---|
+  | nothing | no spender, and no source sees the fund `--unrecorded-fund-grace-blocks` deep (default 3), or `t_btc` deep if that is sooner | Nothing. A runner still polling records the lock itself. |
+  | `PAGE_RESUME_FUND` (WARN, once) | some source sees the fund at the grace depth, and nothing else is due | Check whether the fund runner is still running. If it has stopped, run `resume_interrupted_fund`; leave a runner that is still polling alone. |
+  | a claim or refund page whose action starts with `resume_interrupted_fund, then …` | a spender is seen, or the refund falls due, by the same rules as a recorded lock | Run the steps in order: the later steps need the lock on the record. If the resume says the fund is not confirmed yet, run it again after one confirmation. |
+
+  These pages are never autonomous, however the tower is armed: the lock is not on the record, and
+  a pre-signed refund cannot be built without it. After the resume the record's own pages take over,
+  under new situation keys, so an ACK given before the resume does not silence them.
+
+  Set `--unrecorded-fund-grace-blocks` above the fund runner's `min_confirmations` (both shipped
+  runners use 1). The WARN reads the deepest depth any one source reports, so one source can raise it
+  and only every source lagging can hold it down. A fund no source has seen (evicted, or its input
+  spent elsewhere) is watched and never paged: no BTC moved. `abandon_unfunded` refuses a record that
+  holds the funding bytes, so such a record is left at `negotiated` until a resume re-sends them.
 - The heartbeat JSON carries `schema_version` (currently `1`). The escalation monitor refuses a version
   it does not know, so **upgrade the tower before the monitor**, not the other way round.
 - **What the escalation channel sends, and what each one means:**

@@ -6,6 +6,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The watchtower watches a BTC fund the record never took as its lock (#842).** A taker's fund
+  writes its signed transaction to the record before the broadcast; a fund interrupted before the
+  lock was recorded left a `negotiated` record the tower read as "no action due", so a maker claim
+  with `p` on that HTLC went unobserved. The tower now watches output 0 of the record's own bytes
+  (refused unless it pays the terms' HTLC the negotiated amount) under the BTC_LOCKED rules, once a
+  spender is seen or some source reports the fund at least `min(G, t_btc)` deep. Each page's action
+  starts with `resume_interrupted_fund`, none is autonomous, and their situation keys differ from the
+  recorded swap's. A fund some source sees `G` deep with nothing else due pages the new
+  `PAGE_RESUME_FUND` (WARN, once). `G` is the new `pyrxd-watchtower --unrecorded-fund-grace-blocks`
+  (default 3; `ChainObserver(unrecorded_fund_grace_blocks=...)`, with `btc_network=` for the locator
+  it builds). `OutspendBtcClaimSource.deepest_funding_confirmations` reads the deepest depth any one
+  source reports. `htlc_for_terms` and `recorded_htlc_funding_tx` in `pyrxd.btc_wallet.htlc_leg`
+  hold the HTLC rebuild and the output-0 check the leg's resume already used.
+
 ## [0.28.0] — 2026-11-07
 
 Header verification is stricter (see Changed (breaking)): read that entry before upgrading code that
