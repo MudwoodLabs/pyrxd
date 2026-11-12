@@ -45,6 +45,7 @@ from pyrxd.gravity.swap_coordinator import (
     taker_refund_window_open,
 )
 from pyrxd.gravity.swap_state import NegotiatedTerms, RecordRole, SwapRecord, SwapState, is_terminal
+from pyrxd.gravity.watch.unrecorded_fund import is_unrecorded_btc_fund, unrecorded_fund_engaged, unrecorded_lock_view
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.units import BlockSpan, ChainHeight, Confirmations, PhotonValue, Seconds
 
@@ -67,6 +68,9 @@ class Intent(Enum):
     * ``PAGE_SQUEEZED`` — a decision is required (gate SQUEEZED / ASSET_VULNERABLE,
       or finality un-assessable): winner-take-all claim vs accept loss. Never
       auto-resolved in v1.
+    * ``PAGE_RESUME_FUND`` — a BTC fund was written to the record before its broadcast and never
+      recorded as the lock, and some source sees it confirmed at least the tower's grace depth: the
+      runner stopped. The operator runs ``resume_interrupted_fund`` (WARN; #842).
     * ``RECONCILE`` — the chain has settled the counter leg (our refund is buried) and the record
       has not caught up; the operator runs the named step to bring it up to the chain (low
       severity: nothing is at risk, #850 PR 9b, design §5.1).
@@ -78,6 +82,7 @@ class Intent(Enum):
     PAGE_CLAIM = "page_claim"
     PAGE_REFUND = "page_refund"
     PAGE_SQUEEZED = "page_squeezed"
+    PAGE_RESUME_FUND = "page_resume_fund"
     RECONCILE = "reconcile"
     RETIRE = "retire"
     NOOP = "noop"
@@ -174,6 +179,15 @@ class Observations:
     eth_single_source: bool = False
     eth_settled_at_finalized: bool = False
     eth_nonce_at_finalized: int | None = None
+    # An unrecorded BTC fund (#842; ``pyrxd.gravity.watch.unrecorded_fund``). ``btc_unrecorded_fund`` is
+    # True when the observer read a NEGOTIATED record's pending fund as a lock (the BTC fields above are
+    # then that HTLC's); ``btc_unrecorded_fund_deepest`` is the deepest depth any one source reported
+    # for the funding tx (``None``: none answered); ``btc_unrecorded_fund_grace_blocks`` is the tower's
+    # grace depth for paging it as interrupted. An observer that does not read unrecorded funds leaves
+    # all three unset, and decide() keeps the pre-#842 WATCH.
+    btc_unrecorded_fund: bool = False
+    btc_unrecorded_fund_deepest: Confirmations | None = None
+    btc_unrecorded_fund_grace_blocks: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.maker_has_claimed_btc, bool):
@@ -255,6 +269,18 @@ class Observations:
             raise ValidationError("an ETH claim read must set eth_claim_detected (the claim trigger)")
         if self.eth_settled_at_finalized and self.eth_disposition is not DispositionKind.UNKNOWN:
             raise ValidationError("Observations.eth_settled_at_finalized is the reader's flag on an UNKNOWN answer")
+        if not isinstance(self.btc_unrecorded_fund, bool):
+            raise ValidationError("Observations.btc_unrecorded_fund must be bool")
+        deepest, grace = self.btc_unrecorded_fund_deepest, self.btc_unrecorded_fund_grace_blocks
+        if deepest is not None and (not isinstance(deepest, int) or isinstance(deepest, bool) or deepest < 0):
+            raise ValidationError("Observations.btc_unrecorded_fund_deepest must be a non-negative int or None")
+        if grace is not None and (not isinstance(grace, int) or isinstance(grace, bool) or grace < 1):
+            raise ValidationError("Observations.btc_unrecorded_fund_grace_blocks must be a positive int or None")
+        if self.btc_unrecorded_fund != (grace is not None) or (deepest is not None and not self.btc_unrecorded_fund):
+            raise ValidationError(
+                "Observations.btc_unrecorded_fund_grace_blocks is set exactly when btc_unrecorded_fund, and "
+                "btc_unrecorded_fund_deepest needs it"
+            )
 
 
 @dataclass(frozen=True)
@@ -449,6 +475,7 @@ _STEP_TO_SECRET_REVEALED = "taker_observed_reveal"  # nosec B105
 _STEP_FROM_SECRET_REVEALED = "taker_scrape_and_claim_asset"  # nosec B105
 _STEP_FROM_VULNERABLE = "taker_claim_asset_from_vulnerable"
 _STEP_RECONCILE = "reconcile_counter_leg"
+_STEP_RESUME_FUND = "resume_interrupted_fund"
 
 # The BOTH_LOCKED maker-stall page, per counter chain (#850). The two differ because mutual_refund
 # does: on an ETH counter leg it reads the HTLC from the chain and keeps the record BOTH_LOCKED until
@@ -720,6 +747,11 @@ SITUATION_LEGACY_BTC_UNSPENT = "legacy_btc_unspent"
 #: Every other refund page names its own situation too, so two different refund pages on one swap
 #: are never one WARN, paged once (re-review of the third pass's fixes, finding 6).
 SITUATION_BTC_REFUND_NEVER_LOCKED = "btc_refund_never_locked"
+#: The PAGE_RESUME_FUND situation: an unrecorded BTC fund some source sees at the grace depth (#842).
+SITUATION_UNRECORDED_FUND_STOPPED = "unrecorded_fund_stopped"
+#: The prefix on every situation of a page decided over an unrecorded fund's BTC_LOCKED view (#842), so
+#: an ACK given before ``resume_interrupted_fund`` never carries over to the recorded swap's page.
+SITUATION_UNRECORDED_FUND_PREFIX = "unrecorded_fund."
 SITUATION_ETH_REFUND_TIMEOUT_PASSED = "eth_refund_timeout_passed"
 SITUATION_MAKER_REFUND_AFTER_TAKER_REFUND = "maker_refund_after_taker_refund"
 SITUATION_MAKER_REFUND_PARAMS_MISMATCH = "maker_refund_params_mismatch"
@@ -1097,6 +1129,11 @@ def decide(
         return Decision(
             Intent.NOOP, reason=f"counter_chain={terms.counter_chain} not supported", low_corroboration=corr
         )
+    # A BTC fund written before its broadcast and never recorded (#842): decided as the lock it is.
+    if is_unrecorded_btc_fund(record):
+        return _decide_unrecorded_btc_fund(
+            record=record, observations=obs, policy=policy, safety_window_blocks=safety_window_blocks
+        )
 
     # 2. Claim race. p is (becoming) public if EITHER the chain shows the maker's counter-leg claim
     #    (obs.maker_has_claimed_btc) OR the RECORD already advanced to SECRET_REVEALED — OR'd so a
@@ -1467,6 +1504,85 @@ def decide(
 
     # 3e. Other pre-lock states (NEGOTIATED): nothing time-critical.
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
+
+
+def _decide_unrecorded_btc_fund(
+    *, record: SwapRecord, observations: Observations, policy: MarginPolicy, safety_window_blocks: int
+) -> Decision:
+    """A NEGOTIATED record whose BTC fund was written before its broadcast and never recorded (#842).
+
+    Watched until the BTC side gives a reason (:func:`unrecorded_fund_engaged`); then decided by the
+    BTC_LOCKED rules over the record viewed at BTC_LOCKED, which is what it is on chain. Every page
+    names ``resume_interrupted_fund`` first (the coordinator steps the rules name need the lock on the
+    record), carries no autonomy (a pre-signed refund needs the locator, and the claim steps are
+    state-gated), and has its own situation. A fund still unrecorded at the grace depth with nothing
+    else due pages PAGE_RESUME_FUND."""
+    obs = observations
+    corr = _corroboration(obs)
+    txid = record.pending_btc_funding_txid
+    grace = obs.btc_unrecorded_fund_grace_blocks
+    if not obs.btc_unrecorded_fund or grace is None:
+        # An observer that does not read the pending fund: nothing here is evidence either way.
+        return Decision(
+            Intent.WATCH,
+            reason=f"no action due in {record.state.value}; this observer does not read the unrecorded BTC fund {txid}",
+            low_corroboration=corr,
+        )
+    deepest = obs.btc_unrecorded_fund_deepest
+    if not unrecorded_fund_engaged(
+        record,
+        spend_seen=obs.maker_has_claimed_btc or obs.btc_spenders_named,
+        deepest_confirmations=deepest,
+        grace_blocks=grace,
+    ):
+        return Decision(
+            Intent.WATCH,
+            reason=(
+                f"{record.state.value} with an unrecorded BTC fund {txid}: "
+                + ("no source reports it" if deepest is None else f"the deepest source reports {deepest} conf")
+                + "; nothing spends it"
+            ),
+            low_corroboration=corr,
+        )
+    inner = decide(
+        record=unrecorded_lock_view(record),
+        observations=obs,
+        policy=policy,
+        safety_window_blocks=safety_window_blocks,
+    )
+    lead = (
+        f"the BTC fund {txid} pays this swap's HTLC but the record never took the lock (it is still "
+        f"{record.state.value}): "
+    )
+    if inner.intent is Intent.WATCH:
+        if deepest is not None and deepest >= grace:
+            return Decision(
+                Intent.PAGE_RESUME_FUND,
+                reason=(
+                    lead + f"a source reports it {deepest} conf deep (grace {grace}), so the fund runner has "
+                    "most likely stopped. Nothing else is due yet: " + inner.reason
+                ),
+                recommended_action=(
+                    f"{_STEP_RESUME_FUND} once the fund runner has stopped (it records the lock; leave a "
+                    "runner that is still polling alone)"
+                ),
+                deadline_rxd_height=inner.deadline_rxd_height,
+                low_corroboration=corr,
+                situation=SITUATION_UNRECORDED_FUND_STOPPED,
+            )
+        return dataclasses.replace(inner, reason=lead + inner.reason)
+    action = (
+        f"{_STEP_RESUME_FUND} (records the lock; if it says the fund is not confirmed yet, run it again "
+        "after one confirmation)"
+    )
+    return dataclasses.replace(
+        inner,
+        reason=lead + inner.reason + " Not autonomous: the lock is not on the record.",
+        recommended_action=action if inner.recommended_action is None else f"{action}, then {inner.recommended_action}",
+        autonomous_btc_refund=False,
+        autonomous_asset_claim=False,
+        situation=SITUATION_UNRECORDED_FUND_PREFIX + (inner.situation or inner.intent.value),
+    )
 
 
 #: Reader answers that read the contract unsettled on every endpoint in the quorum and found no log

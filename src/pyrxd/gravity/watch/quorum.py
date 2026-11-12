@@ -35,6 +35,13 @@ from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState, Fina
 from pyrxd.gravity.swap_state import SwapRecord, SwapState
 from pyrxd.gravity.watch.decide import Observations
 from pyrxd.gravity.watch.reconciler import Observer
+from pyrxd.gravity.watch.unrecorded_fund import (
+    DEFAULT_UNRECORDED_FUND_GRACE_BLOCKS,
+    is_unrecorded_btc_fund,
+    unrecorded_btc_fund_locator,
+    unrecorded_fund_engaged,
+    unrecorded_lock_view,
+)
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.units import ChainHeight, Confirmations, Seconds
 
@@ -95,6 +102,10 @@ class BtcClaimSource(Protocol):
         delays the refund)."""
         ...
 
+    # OPTIONAL capability (#842): ``deepest_funding_confirmations(funding_txid) -> Confirmations | None``,
+    # the deepest depth ANY one source reports (None when none answers). It decides only whether an
+    # unrecorded fund pages as interrupted, so one source can raise it (a spurious page) and only every
+    # source lagging can hold it down. A source without it is read through ``funding_confirmations``.
     # OPTIONAL capability (duck-typed, probed like the ETH source's ``finality_checkpoint``): a source
     # MAY expose ``spend_disposition(locator, *, hashlock, burial_blocks) -> BtcCounterDisposition``,
     # the shared disposition reader (``pyrxd.btc_wallet.disposition``) over its sources (#850 PR 9b).
@@ -216,6 +227,8 @@ class ChainObserver(Observer):
         rxd_corroborated: bool = False,
         clock: Callable[[], float] | None = None,
         btc_burial_blocks: int | None = None,
+        btc_network: str = "bc",
+        unrecorded_fund_grace_blocks: int = DEFAULT_UNRECORDED_FUND_GRACE_BLOCKS,
     ) -> None:
         if not isinstance(rxd_corroborated, bool):
             raise ValidationError("ChainObserver.rxd_corroborated must be bool")
@@ -250,6 +263,18 @@ class ChainObserver(Observer):
                 "required (the policy's BTC reorg depth)"
             )
         self._btc_burial_blocks = btc_burial_blocks if classifies else None
+        # An unrecorded BTC fund (#842): the network its HTLC locator is built for, and the depth (on the
+        # deepest source) at which one still unrecorded pages as interrupted.
+        if not isinstance(btc_network, str) or not btc_network:
+            raise ValidationError("ChainObserver.btc_network must be a non-empty str")
+        if (
+            not isinstance(unrecorded_fund_grace_blocks, int)
+            or isinstance(unrecorded_fund_grace_blocks, bool)
+            or unrecorded_fund_grace_blocks < 1
+        ):
+            raise ValidationError("ChainObserver.unrecorded_fund_grace_blocks must be a positive int")
+        self._btc_network = btc_network
+        self._unrecorded_grace = unrecorded_fund_grace_blocks
         self._btc = btc
         self._eth = eth
         self._rxd = rxd
@@ -265,31 +290,9 @@ class ChainObserver(Observer):
         self._eth_stall_trackers: dict[str, FinalityStallTracker] = {}
 
     async def observe(self, swap_id: str, record: SwapRecord) -> Observations:
-        tip = await self._rxd.tip_height()
-        # Asset-lock height from the covenant's confirmation depth: tip - confs + 1. Shared by both
-        # directions. A depth past the tip is shifted, never dropped (below).
-        # THE depth->height conversion, and the only one on this path. It is written out rather
-        # than implied because the reverse mistake (storing the depth) is the defect this whole
-        # unit-tagging exists for: `Confirmations` in, `ChainHeight` out, with the arithmetic
-        # that justifies the re-tag visible on one line.
-        asset_locked: ChainHeight | None = None
-        # Not for a NEGOTIATED record: a taker's fund now writes the pin before its broadcast, so a
-        # crash leaves a NEGOTIATED record pinned, and decide() only WATCHes that state. Reading the
-        # covenant there turned an RXD source below quorum into a "reconcile error" page every tick
-        # for nothing it could use (Mythos review of #891, F3).
-        if record.radiant_covenant_outpoint is not None and record.state is not SwapState.NEGOTIATED:
-            cov_confs = await self._rxd.covenant_confirmations(record.radiant_covenant_outpoint)
-            if cov_confs is not None and cov_confs >= 1:
-                candidate = int(tip) - int(cov_confs) + 1
-                if candidate < 0:
-                    # The depth (MAX across sources) is past the tip (MIN across sources): one source
-                    # over-reported its depth or under-reported its tip. Dropping the height read as
-                    # unread and watched on the counter-leg clock, which quieted the near-t_rxd page
-                    # (Mythos B-1). decide() reads only the gap between the two heights, so shift both
-                    # up to keep it at ``cov_confs - 1``, the gap an in-range depth gives.
-                    tip = ChainHeight(int(cov_confs) - 1)
-                    candidate = 0
-                asset_locked = ChainHeight(candidate)
+        if self._btc is not None and is_unrecorded_btc_fund(record):
+            return await self._observe_unrecorded_btc_fund(record)
+        tip, asset_locked = await self._asset_lock(record, await self._rxd.tip_height())
         low_corr = not self._rxd_corroborated
 
         if record.terms.counter_chain == "eth":
@@ -307,6 +310,90 @@ class ChainObserver(Observer):
             )
 
         # BTC counter-leg (default). record.btc_locator is None until the BTC leg is funded.
+        if self._btc is None:
+            raise ValidationError("ChainObserver has no BtcClaimSource for a BTC swap")
+        return Observations(
+            now_rxd_height=tip,
+            asset_locked_at_height=asset_locked,
+            low_corroboration=low_corr,
+            **await self._observe_btc(record, asset_locked),
+        )
+
+    async def _observe_unrecorded_btc_fund(self, record: SwapRecord) -> Observations:
+        """Observations for a NEGOTIATED record whose BTC fund was written but never recorded (#842).
+
+        The outpoint is output 0 of the record's own bytes (:func:`unrecorded_btc_fund_locator`; a
+        record whose bytes do not pay its HTLC raises, and the reconciler pages it). It is watched as a
+        recorded lock is, over the record viewed at BTC_LOCKED. The covenant is read only once the BTC
+        side gives a reason (:func:`unrecorded_fund_engaged`): before that a healthy fund in flight
+        would turn an RXD source below quorum into a page every tick (Mythos review of #891, F3)."""
+        locator = unrecorded_btc_fund_locator(record, network=self._btc_network)
+        view = unrecorded_lock_view(record, locator)
+        tip = await self._rxd.tip_height()
+        deepest = await self._deepest_funding_confirmations(locator.funding_outpoint.txid)
+        fields = await self._observe_btc(view, None)
+        engaged = unrecorded_fund_engaged(
+            record,
+            spend_seen=bool(fields["maker_has_claimed_btc"] or fields.get("btc_spenders_named", False)),
+            deepest_confirmations=deepest,
+            grace_blocks=self._unrecorded_grace,
+        )
+        asset_locked: ChainHeight | None = None
+        if engaged:
+            tip, asset_locked = await self._asset_lock(view, tip)
+        return Observations(
+            now_rxd_height=tip,
+            asset_locked_at_height=asset_locked,
+            low_corroboration=not self._rxd_corroborated,
+            btc_unrecorded_fund=True,
+            btc_unrecorded_fund_deepest=deepest,
+            btc_unrecorded_fund_grace_blocks=self._unrecorded_grace,
+            **fields,
+        )
+
+    async def _deepest_funding_confirmations(self, funding_txid: str) -> Confirmations | None:
+        """The deepest depth any one BTC source reports for *funding_txid* (``None`` when none answers);
+        a source without that capability gives its quorum depth instead."""
+        btc = self._btc
+        if btc is None:
+            raise ValidationError("ChainObserver has no BtcClaimSource for a BTC swap")
+        deepest = getattr(btc, "deepest_funding_confirmations", None)
+        got = await (deepest(funding_txid) if callable(deepest) else btc.funding_confirmations(funding_txid))
+        return None if got is None else Confirmations(int(got))
+
+    async def _asset_lock(self, record: SwapRecord, tip: ChainHeight) -> tuple[ChainHeight, ChainHeight | None]:
+        """``(tip, asset-lock height)`` from the covenant's depth, shifted together if the depth is past
+        the tip (below). ``None`` for the height when there is no covenant to read, or it is unconfirmed."""
+        # Asset-lock height from the covenant's confirmation depth: tip - confs + 1. Shared by both
+        # directions. A depth past the tip is shifted, never dropped (below).
+        # THE depth->height conversion, and the only one on this path. It is written out rather
+        # than implied because the reverse mistake (storing the depth) is the defect this whole
+        # unit-tagging exists for: `Confirmations` in, `ChainHeight` out, with the arithmetic
+        # that justifies the re-tag visible on one line.
+        asset_locked: ChainHeight | None = None
+        # Not for a NEGOTIATED record: a taker's fund now writes the pin before its broadcast, so a
+        # crash leaves a NEGOTIATED record pinned, and decide() only WATCHes that state. Reading the
+        # covenant there turned an RXD source below quorum into a "reconcile error" page every tick
+        # for nothing it could use (Mythos review of #891, F3). An unrecorded BTC fund (#842) is read
+        # here through its BTC_LOCKED view, and only once the BTC side gives a reason.
+        if record.radiant_covenant_outpoint is not None and record.state is not SwapState.NEGOTIATED:
+            cov_confs = await self._rxd.covenant_confirmations(record.radiant_covenant_outpoint)
+            if cov_confs is not None and cov_confs >= 1:
+                candidate = int(tip) - int(cov_confs) + 1
+                if candidate < 0:
+                    # The depth (MAX across sources) is past the tip (MIN across sources): one source
+                    # over-reported its depth or under-reported its tip. Dropping the height read as
+                    # unread and watched on the counter-leg clock, which quieted the near-t_rxd page
+                    # (Mythos B-1). decide() reads only the gap between the two heights, so shift both
+                    # up to keep it at ``cov_confs - 1``, the gap an in-range depth gives.
+                    tip = ChainHeight(int(cov_confs) - 1)
+                    candidate = 0
+                asset_locked = ChainHeight(candidate)
+        return tip, asset_locked
+
+    async def _observe_btc(self, record: SwapRecord, asset_locked: ChainHeight | None) -> dict[str, Any]:
+        """The BTC counter-leg fields of :class:`Observations` for *record* (its claim, the claim's
+        depth, the funding depth when a refund is in view, and the spender classification)."""
         if self._btc is None:
             raise ValidationError("ChainObserver has no BtcClaimSource for a BTC swap")
         maker_claimed = False
@@ -340,15 +427,12 @@ class ChainObserver(Observer):
                 record.state is SwapState.BOTH_LOCKED and asset_locked is None
             ):
                 funding_confs = await self._btc.funding_confirmations(locator.funding_outpoint.txid)
-        return Observations(
-            maker_has_claimed_btc=maker_claimed,
-            now_rxd_height=tip,
-            asset_locked_at_height=asset_locked,
-            btc_claim_confirmations=btc_confs,
-            btc_funding_confirmations=funding_confs,
-            low_corroboration=low_corr,
+        return {
+            "maker_has_claimed_btc": maker_claimed,
+            "btc_claim_confirmations": btc_confs,
+            "btc_funding_confirmations": funding_confs,
             **spend,
-        )
+        }
 
     async def _classify_btc_spend(
         self, record: SwapRecord, locator: BtcHtlcLocator, status: BtcClaimStatus
