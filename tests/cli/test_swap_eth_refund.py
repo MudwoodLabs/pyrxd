@@ -774,3 +774,16 @@ def test_an_honest_tip_beside_an_endpoint_that_suggests_tip_zero_is_printed(monk
 def test_a_max_fee_at_the_other_endpoints_base_fee_is_printed(monkeypatch) -> None:
     _stub_leg(monkeypatch, {**_TX, "maxPriorityFeePerGas": 0, "maxFeePerGas": 10})
     assert _build(_Multi(_Rpc(), _Rpc(tip=0, max_fee=20))).max_fee_per_gas == 10
+
+
+def test_the_fee_floor_is_the_lowest_base_fee_among_the_other_endpoints(monkeypatch) -> None:
+    """Others report base 10 and base 40: a max fee of 20 is above the lowest, so it signs."""
+    _stub_leg(monkeypatch, {**_TX, "maxPriorityFeePerGas": 0, "maxFeePerGas": 20})
+    out = _build(_Multi(_Rpc(), _Rpc(tip=0, max_fee=20), _Rpc(tip=0, max_fee=80)))
+    assert out.max_fee_per_gas == 20
+
+
+def test_the_fee_floor_subtracts_each_endpoints_tip(monkeypatch) -> None:
+    """Base 10 with a tip of 30 (max fee 50): 12 clears the base though it is below 50 // 2."""
+    _stub_leg(monkeypatch, {**_TX, "maxPriorityFeePerGas": 0, "maxFeePerGas": 12})
+    assert _build(_Multi(_Rpc(), _Rpc(tip=30, max_fee=50))).max_fee_per_gas == 12

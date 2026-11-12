@@ -300,7 +300,7 @@ async def _assert_every_endpoint_agrees_to_send(rpc: Any, sender: str, tx: dict[
 
     The leg builds from ONE endpoint (the nonce, the fees and its read of a recorded refund are the
     primary's; ``multi_rpc.py``, "deliberately single-source"). A lying first endpoint could otherwise
-    set a tip near the key's balance, sign at the nonce of a payment still pending (replacing it), or
+    set a max fee near the key's balance or below the base fee, sign at the nonce of a payment still pending (replacing it), or
     read a pending recorded refund as gone. Requiring ``pending == latest == nonce`` on every endpoint
     also covers this command's own refund, printed and sent by an earlier run but not yet mined.
     """
