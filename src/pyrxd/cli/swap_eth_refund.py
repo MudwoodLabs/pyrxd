@@ -180,6 +180,16 @@ def load_eth_locator(record_path: Path, facts: Any) -> tuple[Any, Any]:
         )
     if locator.hashlock_bytes != record.terms.hashlock:
         raise ValidationError("the record's ETH locator names another hashlock than its own terms; refusing it")
+    if facts.eth_refund_to is not None and str(facts.eth_refund_to).lower() != str(locator.refundee).lower():
+        raise ValidationError(
+            f"the record's ETH contract refunds {locator.refundee}, the recovery file says the refundee is "
+            f"{facts.eth_refund_to}; refusing to sign for either until they agree"
+        )
+    if facts.eth_timeout_unix_s is not None and int(facts.eth_timeout_unix_s) != int(locator.timeout):
+        raise ValidationError(
+            f"the record's ETH contract times out at unix {locator.timeout}, the recovery file says "
+            f"{facts.eth_timeout_unix_s}; refusing to sign for either until they agree"
+        )
     if facts.eth_chain_id is not None and locator.chain_id != facts.eth_chain_id:
         raise ValidationError(
             f"the record's ETH contract is on chain {locator.chain_id}, the recovery file says chain "
@@ -209,8 +219,9 @@ def is_value_bearing(chain_id: int) -> bool:
     """True unless one endpoint may decide on this chain: anvil's 31337 or a registry testnet.
 
     The swap coordinator's rule (``SwapCoordinator._single_source_may_decide``), reused so the two
-    cannot drift. A chain id the registry does not know counts as value-bearing: runners and the
-    library accept chains outside the registry (BSC and Polygon are left out of it on purpose).
+    cannot drift. A chain id the registry does not know counts as value-bearing:
+    ``scripts/eth_swap_two_host.py`` and library callers accept chains outside the registry (BSC and
+    Polygon are left out of it on purpose).
     """
     from ..gravity.swap_coordinator import SwapCoordinator
 
@@ -274,6 +285,47 @@ _EARLIER_REFUND_BLOCKS = {
 
 #: ``refund()`` takes no arguments in both artifacts, so its calldata is exactly the selector.
 _REFUND_SELECTOR = bytes.fromhex("590e1ae3")
+
+
+#: A signed fee may be at most this many times the highest that an endpoint other than the one the leg
+#: built with suggests. The leg reads its fees from one endpoint (``MultiSourceEthRpc.fee_fields`` is
+#: primary-only), so this is the check that a lying first endpoint did not set them.
+_FEE_TOLERANCE = 2
+
+
+async def _assert_every_endpoint_agrees_to_send(rpc: Any, sender: str, tx: dict[str, Any]) -> None:
+    """Refuse unless every endpoint says this key has nothing in flight at the signed nonce, and no
+    endpoint but the first suggests much lower fees than were signed.
+
+    The leg builds from ONE endpoint (the nonce, the fees and its read of a recorded refund are the
+    primary's; ``multi_rpc.py``, "deliberately single-source"). A lying first endpoint could otherwise
+    set a tip near the key's balance, sign at the nonce of a payment still pending (replacing it), or
+    read a pending recorded refund as gone. Requiring ``pending == latest == nonce`` on every endpoint
+    also covers this command's own refund, printed and sent by an earlier run but not yet mined.
+    """
+    sources = list(getattr(rpc, "sources", None) or [rpc])
+    nonce = int(tx["nonce"])
+    for i, src in enumerate(sources):
+        pending = int(await src.get_transaction_count(sender, "pending"))
+        latest = int(await src.get_transaction_count(sender, "latest"))
+        if not (pending == latest == nonce):
+            raise ValidationError(
+                f"endpoint {i + 1} of {len(sources)} reads this key's nonce as {latest} mined, {pending} with "
+                f"pending, and the refund was built at nonce {nonce}. Either a transaction of this key is "
+                "still in flight (wait for it, or for an earlier refund this command printed, to mine or drop) "
+                "or the endpoints disagree. Nothing is printed"
+            )
+    if len(sources) < 2:
+        return
+    others = [await src.fee_fields() for src in sources[1:]]
+    for field in ("maxPriorityFeePerGas", "maxFeePerGas"):
+        ceiling = _FEE_TOLERANCE * max(int(o[field]) for o in others)
+        if int(tx[field]) > ceiling:
+            raise ValidationError(
+                f"the refund was signed with {field} {int(tx[field])} wei, more than {_FEE_TOLERANCE}x the "
+                f"highest the other endpoints suggest ({ceiling // _FEE_TOLERANCE} wei). The first "
+                "--eth-rpc-url sets the fees; nothing is printed"
+            )
 
 
 def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to: str) -> None:
@@ -400,6 +452,7 @@ async def build_cold_eth_refund(
     if raw is None or tx is None:  # pragma: no cover - refund() returns only after send_raw
         raise ValidationError("the leg returned without signing a refund; nothing was signed")
     _assert_signed_matches(raw, tx, chain_id=locator.chain_id, to=locator.contract_address)
+    await _assert_every_endpoint_agrees_to_send(rpc, derive_address(key), tx)
     return ColdEthRefund(
         chain_id=locator.chain_id,
         contract_address=locator.contract_address,
@@ -425,7 +478,7 @@ def _lines(r: ColdEthRefund) -> list[str]:
         "ETH counter-leg refund (signed, NOT broadcast)",
         f"  chain id      : {r.chain_id}",
         f"  contract      : {r.contract_address}",
-        f"  holds         : {r.contract_balance} {r.asset}",
+        f"  holds         : at least {r.contract_balance} {r.asset} (lowest across endpoints)",
         f"  pays          : {r.refundee} (the contract's refundee, fixed at deploy)",
         f"  sender        : {r.sender}",
         f"  refund opened : unix {r.timeout_unix} ({_iso(r.timeout_unix)}); chain head {r.chain_time_unix}",
@@ -438,8 +491,9 @@ def _lines(r: ColdEthRefund) -> list[str]:
     ]
     if r.endpoints == 1:
         lines.append(
-            "  ⚠ Read from ONE endpoint: the contract checks and the nonce are its word only. Pass --eth-rpc-url "
-            "more than once (distinct operators) to have them agree."
+            "  ⚠ Read from ONE endpoint: the contract checks, the nonce and the fees are its word only. Pass "
+            "--eth-rpc-url more than once (distinct operators): the contract checks and the nonce must then agree "
+            "on every endpoint, and the fees are checked against the others' suggestions."
         )
     if r.earlier_refund is not None:
         lines.append(
@@ -495,7 +549,9 @@ def _open_rpc(urls: tuple[str, ...], chain_id: int, *, single_endpoint: bool = F
     "eth_rpc_urls",
     multiple=True,
     required=True,
-    help="Ethereum JSON-RPC URL on the swap's chain. Repeat it (distinct operators) to require agreement.",
+    help="Ethereum JSON-RPC URL on the swap's chain. Repeat it (distinct operators): the contract checks and "
+    "the key's nonce must agree on every endpoint, and the fees, which the first one sets, are checked "
+    "against the others.",
 )
 @click.option(
     "--artifact",
@@ -573,8 +629,30 @@ def swap_build_eth_refund_cmd(
             if close is not None:
                 await close()
 
+    from web3.exceptions import Web3Exception
+
+    from .errors import NetworkBoundaryError
+
     try:
         refund = _run(_go(), url=eth_rpc_urls[0], scrub=tuple(eth_rpc_urls))
+    except NetworkBoundaryError as exc:
+        if "endpoints disagree (" not in str(exc.__cause__):
+            raise
+        raise NetworkBoundaryError(
+            "the endpoints disagree",
+            cause=sanitize_terminal(redact_endpoint_secrets(str(exc.__cause__), list(eth_rpc_urls)), max_len=500),
+            fix="one endpoint is lying or lagging and there is no telling which from here: retry once they "
+            "catch up, or replace one with an endpoint from another operator. Nothing was signed or broadcast",
+        ) from exc
+    except Web3Exception as exc:
+        # A JSON-RPC error answer (an ``error`` object) to a read the leg does not wrap as NetworkError.
+        raise NetworkBoundaryError(
+            "a chain read returned an error",
+            cause=sanitize_terminal(
+                redact_endpoint_secrets(f"{type(exc).__name__}: {exc}", list(eth_rpc_urls)), max_len=300
+            ),
+            fix="check the endpoint, or use another; nothing was signed or broadcast",
+        ) from exc
     except ValidationError as exc:
         raise UserError(
             "refused to sign the ETH refund",

@@ -42,6 +42,7 @@ def swap(request):
     _eth_swap(s)
     doc = json.loads(s["keys"].read_text())
     doc["eth_chain_id"] = _CHAIN
+    doc["eth_timeout_unix_s"] = _locator().timeout
     s["keys"].write_text(json.dumps(doc))
     return s
 
@@ -192,11 +193,29 @@ def test_the_sign_only_rpc_keeps_the_bytes_answers_their_hash_and_takes_one() ->
 class _Rpc:
     expected_chain_id = _CHAIN
 
+    def __init__(self, *, pending: int = 8, latest: int = 8, tip: int = 1, max_fee: int = 3) -> None:
+        self.counts = {"pending": pending, "latest": latest}
+        self.fees = {"maxPriorityFeePerGas": tip, "maxFeePerGas": max_fee}
+
     async def latest_block_timestamp_min(self) -> int:
         return 2_100_000_000
 
     async def get_balance(self, *_: Any) -> int:
         return 10**15
+
+    async def get_transaction_count(self, address: str, block: str = "pending") -> int:
+        return self.counts[block]
+
+    async def fee_fields(self) -> dict[str, int]:
+        return dict(self.fees)
+
+
+class _Multi(_Rpc):
+    """Several endpoints; the leg builds from ``sources[0]`` only, as MultiSourceEthRpc does."""
+
+    def __init__(self, *sources: _Rpc) -> None:
+        super().__init__()
+        self.sources = list(sources)
 
 
 @pytest.mark.parametrize(("kind", "signs"), [("mined", False), ("pending", False), ("nonce_gap", False),
@@ -465,7 +484,7 @@ def test_the_command_refuses_one_mainnet_endpoint_before_any_read(swap, monkeypa
 
 def test_an_unpinned_token_on_an_unlisted_chain_is_refused() -> None:
     base = dataclasses.asdict(_locator(chain_id=56))
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="no pinned token"):
         mod._token_for(Erc20HtlcLocator(**base, token_address="0x" + "70" * 20, deployer=None))
 
 
@@ -511,3 +530,228 @@ def test_a_key_file_readable_by_others_is_refused(monkeypatch, tmp_path) -> None
         mod._resolve_key_source(str(loose))
     loose.chmod(0o600)
     assert mod._resolve_key_source(str(loose)) == "ab" * 32
+
+
+# ── every endpoint must agree before the refund is printed (Mythos 6.1, 6.2) ───────────────────────
+
+
+def _stub_leg(monkeypatch, tx: dict[str, Any]) -> None:
+    async def unsettled(self, locator):
+        return False
+
+    async def refund(self, locator, **_):
+        await self._rpc.preflight(tx)
+        return await self._rpc.send_raw(_sign(self._key, locator, tx))
+
+    async def preflight(self, _tx):
+        return None
+
+    monkeypatch.setattr(EthHtlcContractLeg, "check_refund_target", unsettled)
+    monkeypatch.setattr(EthHtlcContractLeg, "refund", refund)
+    monkeypatch.setattr(_Rpc, "preflight", preflight, raising=False)
+
+
+_TX = {"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
+
+
+def _build(rpc: Any) -> Any:
+    key = mod.parse_eth_key(os.urandom(32).hex())
+    return asyncio.run(
+        mod.build_cold_eth_refund(
+            record=eth_record(_locator()), locator=_locator(), rpc=rpc, key=key, artifact=_ETH_ARTIFACT
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("second", "why"),
+    [
+        (dict(pending=9, latest=8), "a payment of this key pending at the signed nonce (the first endpoint hides it)"),
+        (dict(pending=9, latest=9), "the signed nonce is already used"),
+        (dict(pending=8, latest=7), "an earlier nonce is unmined"),
+    ],
+)
+def test_a_refund_is_not_printed_unless_every_endpoint_has_the_nonce_free(monkeypatch, second, why) -> None:
+    _stub_leg(monkeypatch, _TX)
+    with pytest.raises(ValidationError, match="endpoint 2 of 2 reads this key's nonce"):
+        _build(_Multi(_Rpc(), _Rpc(**second)))
+
+
+def test_a_refund_this_command_printed_and_sent_blocks_the_next_run(monkeypatch) -> None:
+    """An earlier run's refund at nonce 8 is pending; the record never learned of it."""
+    _stub_leg(monkeypatch, _TX)
+    with pytest.raises(ValidationError, match="still in flight"):
+        _build(_Rpc(pending=9, latest=8))
+
+
+def test_a_tip_the_first_endpoint_inflated_is_not_printed(monkeypatch) -> None:
+    rich = {**_TX, "maxPriorityFeePerGas": 10**15, "maxFeePerGas": 10**15 + 2}
+    _stub_leg(monkeypatch, rich)
+    with pytest.raises(ValidationError, match="maxPriorityFeePerGas .* more than 2x"):
+        _build(_Multi(_Rpc(), _Rpc()))
+
+
+def test_fees_within_the_other_endpoints_suggestion_are_printed(monkeypatch) -> None:
+    _stub_leg(monkeypatch, {**_TX, "maxPriorityFeePerGas": 2, "maxFeePerGas": 6})
+    out = _build(_Multi(_Rpc(tip=99, max_fee=99), _Rpc(tip=1, max_fee=3)))
+    assert (out.nonce, out.max_priority_fee_per_gas, out.endpoints) == (8, 2, 2)
+
+
+def test_the_fee_check_ignores_the_first_endpoints_own_suggestion(monkeypatch) -> None:
+    rich = {**_TX, "maxPriorityFeePerGas": 100, "maxFeePerGas": 300}
+    _stub_leg(monkeypatch, rich)
+    with pytest.raises(ValidationError, match="more than 2x"):
+        _build(_Multi(_Rpc(tip=100, max_fee=300), _Rpc(tip=1, max_fee=3)))
+
+
+# ── the record against the recovery file (Mythos 6.4, plant P07) ───────────────────────────────────
+
+
+def _facts(swap) -> Any:
+    return parse_recovery_file(swap["keys"])
+
+
+def test_a_record_with_another_refundee_than_the_recovery_file_is_refused(swap) -> None:
+    doc = json.loads(swap["keys"].read_text())
+    doc["eth_refund_to"] = "0x" + "66" * 20
+    swap["keys"].write_text(json.dumps(doc))
+    path = write_record(swap["keys"], eth_record(_locator()))
+    with pytest.raises(ValidationError, match="refunds 0x5555.*the refundee is"):
+        mod.load_eth_locator(path, _facts(swap))
+    doc["eth_refund_to"] = "0x" + "55" * 20
+    swap["keys"].write_text(json.dumps(doc))
+    assert mod.load_eth_locator(path, _facts(swap))[1].refundee.lower() == "0x" + "55" * 20
+
+
+def test_a_record_with_another_timeout_than_the_recovery_file_is_refused(swap) -> None:
+    path = write_record(swap["keys"], eth_record(_locator(timeout=_locator().timeout + 1)))
+    with pytest.raises(ValidationError, match="times out at unix"):
+        mod.load_eth_locator(path, _facts(swap))
+
+
+def test_a_locator_naming_another_hashlock_than_its_terms_is_refused(swap) -> None:
+    good = eth_record(_locator())
+    bad = dataclasses.replace(good, counterchain_locator=_locator(hashlock="0x" + "99" * 32))
+    path = write_record(swap["keys"], bad)
+    with pytest.raises(ValidationError, match="names another hashlock than its own terms"):
+        mod.load_eth_locator(path, _facts(swap))
+
+
+# ── the one-endpoint warning and the key order (plants P10, P14) ───────────────────────────────────
+
+
+def _refund(endpoints: int) -> Any:
+    return mod.ColdEthRefund(
+        chain_id=_CHAIN, contract_address="0x" + "c0" * 20, asset="ETH (wei)", contract_balance=1,
+        refundee="0x" + "55" * 20, sender="0x" + "77" * 20, timeout_unix=1, chain_time_unix=2, nonce=8,
+        gas_limit=1, max_fee_per_gas=1, max_priority_fee_per_gas=1, tx_hash="0x" + "ab" * 32, raw_hex="0x02",
+        endpoints=endpoints, earlier_refund=None,
+    )  # fmt: skip
+
+
+def test_one_endpoint_prints_the_warning_and_two_do_not() -> None:
+    assert any("Read from ONE endpoint" in line for line in mod._lines(_refund(1)))
+    assert not any("Read from ONE endpoint" in line for line in mod._lines(_refund(2)))
+
+
+def test_the_key_file_wins_over_the_env_and_the_env_over_the_swap_file(swap, monkeypatch, tmp_path) -> None:
+    seen: list[str] = []
+    real = mod.parse_eth_key
+
+    def spy(text: str) -> Any:
+        seen.append(text.strip())
+        return real(text)
+
+    monkeypatch.setattr(mod, "parse_eth_key", spy)
+    doc = json.loads(swap["keys"].read_text())
+    doc["eth_key_hex"] = "11" * 32
+    swap["keys"].write_text(json.dumps(doc))
+    write_record(swap["keys"], eth_record(_locator()))
+    keyfile = tmp_path / "k"
+    keyfile.write_text("33" * 32)
+    keyfile.chmod(0o600)
+    monkeypatch.setenv(mod.KEY_ENV, "22" * 32)
+    _cmd(swap, "--eth-key-file", str(keyfile))
+    _cmd(swap)
+    monkeypatch.delenv(mod.KEY_ENV)
+    _cmd(swap)
+    assert seen == ["33" * 32, "22" * 32, "11" * 32]
+
+
+# ── how a failed read is reported (Mythos 6.5) ─────────────────────────────────────────────────────
+
+
+def test_endpoint_disagreement_says_so_and_a_json_rpc_error_exits_2(swap, monkeypatch) -> None:
+    from web3.exceptions import Web3RPCError
+
+    from pyrxd.security.errors import NetworkError
+
+    monkeypatch.setenv(mod.KEY_ENV, os.urandom(32).hex())
+    write_record(swap["keys"], eth_record(_locator()))
+
+    async def disagree(**_):
+        raise NetworkError("get_code: endpoints disagree (b'1' vs b'2'). One of them is lying or lagging")
+
+    monkeypatch.setattr(mod, "build_cold_eth_refund", disagree)
+    res = _cmd(swap)
+    assert res.exit_code == 2, res.output
+    assert "the endpoints disagree" in res.output and "connectivity" not in res.output
+
+    async def rpc_error(**_):
+        raise Web3RPCError("execution error")
+
+    monkeypatch.setattr(mod, "build_cold_eth_refund", rpc_error)
+    res = _cmd(swap)
+    assert res.exit_code == 2, res.output
+    assert "returned an error" in res.output
+
+    async def down(**_):
+        raise NetworkError("eth_chainId failed: connection refused")
+
+    monkeypatch.setattr(mod, "build_cold_eth_refund", down)
+    res = _cmd(swap)
+    assert res.exit_code == 2 and "connectivity" in res.output, res.output
+
+
+# ── check_refund_target runs every identity check (plant P08) ──────────────────────────────────────
+
+
+def _wire_identity_checks(monkeypatch, *, failing: str | None, settled: int = 0) -> tuple[Any, list[str]]:
+    calls: list[str] = []
+
+    class _ChainRpc(_Rpc):
+        async def assert_chain(self) -> None:
+            calls.append("assert_chain")
+            if failing == "assert_chain":
+                raise ValidationError("assert_chain refused")
+
+    def check(name: str):
+        async def _c(self, locator, block_identifier):
+            calls.append(name)
+            if failing == name:
+                raise ValidationError(f"{name} refused")
+
+        return _c
+
+    async def word(self, locator, block_identifier):
+        return (settled,)
+
+    for name in ("_assert_runtime_exact", "_assert_immutables_bind"):
+        monkeypatch.setattr(EthHtlcContractLeg, name, check(name))
+    monkeypatch.setattr(EthHtlcContractLeg, "_settled_word", word)
+    key = mod.parse_eth_key(os.urandom(32).hex())
+    return mod._leg_for(_locator(), rpc=_ChainRpc(), key=key, artifact=_ETH_ARTIFACT), calls
+
+
+@pytest.mark.parametrize("failing", ["assert_chain", "_assert_runtime_exact", "_assert_immutables_bind"])
+def test_check_refund_target_refuses_when_any_identity_check_fails(monkeypatch, failing) -> None:
+    leg, _calls = _wire_identity_checks(monkeypatch, failing=failing)
+    with pytest.raises(ValidationError, match=f"{failing} refused"):
+        asyncio.run(leg.check_refund_target(_locator()))
+
+
+@pytest.mark.parametrize(("settled", "expected"), [(0, False), (1, True)])
+def test_check_refund_target_runs_all_three_then_reads_settled(monkeypatch, settled, expected) -> None:
+    leg, calls = _wire_identity_checks(monkeypatch, failing=None, settled=settled)
+    assert asyncio.run(leg.check_refund_target(_locator())) is expected
+    assert calls == ["assert_chain", "_assert_runtime_exact", "_assert_immutables_bind"]

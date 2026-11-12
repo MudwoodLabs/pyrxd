@@ -237,14 +237,16 @@ def test_before_the_timeout_it_refuses_and_signs_nothing(anvil_url, tmp_path) ->
 
 
 def test_a_record_naming_terms_the_contract_does_not_hold_is_refused(anvil_url, tmp_path) -> None:
-    """The record's locator says refundee = a third account, the contract on chain says the taker:
-    the exact runtime differs, so nothing is signed for a contract the record does not describe."""
+    """The record's locator says claimant = a third account, which the recovery file does not record,
+    and the contract on chain says otherwise: the exact runtime differs, so nothing is signed for a
+    contract the record does not describe. (A refundee the recovery file contradicts is refused
+    before any read; tests/cli/test_swap_eth_refund.py.)"""
     import dataclasses
 
     _, h = _secret()
     timeout = _run(_head_ts(anvil_url)) + 600
     locator = _run(_fund_native(anvil_url, h, timeout))
-    forged = dataclasses.replace(locator, refundee="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
+    forged = dataclasses.replace(locator, claimant="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
     swap_file = _swap_file(tmp_path, h)
     write_record(swap_file, eth_record(forged))
     _run(_advance(anvil_url, 601))
