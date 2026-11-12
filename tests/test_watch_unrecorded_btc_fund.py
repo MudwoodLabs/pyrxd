@@ -9,7 +9,9 @@ record's own bytes pay, as a lock, and pages:
 * a claim race or a refund that falls due through the BTC_LOCKED rules, each action starting with
   ``resume_interrupted_fund``, with no autonomy and situation tags of their own;
 * a fund that went quiet (``PAGE_RESUME_FUND``, WARN, once) when some source sees it ``G`` deep;
-* nothing for a healthy fund in flight, and no covenant read until the BTC side gives a reason.
+* nothing for a healthy fund in flight, and no covenant read until the BTC side gives a reason. A
+  fund not yet engaged stays silent near t_rxd too: a known gap (combined Mythos pass, 1.1), pinned
+  below and tracked for a design of its own.
 
 The chain is ``tests._fake_btc_chain`` with a real funding transaction paying a real Taproot HTLC
 built from the terms' keys. Reads go through the production ``MultiSourceBtcFundingReader`` (quorum 2
@@ -26,6 +28,7 @@ import os
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.gravity.swap_coordinator import assert_timelock_margin, taker_refund_window_open
 from pyrxd.gravity.swap_state import RecordRole, SwapRecord, SwapState
 from pyrxd.gravity.watch.adapters import JsonDirRecordStore, OutspendBtcClaimSource
 from pyrxd.gravity.watch.alerts import _ACK_LINE_RE, DedupAlerter, Severity
@@ -46,6 +49,7 @@ from pyrxd.gravity.watch.unrecorded_fund import (
     is_unrecorded_btc_fund,
     unrecorded_btc_fund_locator,
     unrecorded_fund_engaged,
+    unrecorded_lock_view,
 )
 from pyrxd.network.bitcoin import MultiSourceBtcFundingReader
 from pyrxd.security.errors import NetworkError, ValidationError
@@ -62,10 +66,14 @@ T_RXD_OPENS = LOCKED_AT + T_RXD
 RESUME = "resume_interrupted_fund"
 
 
-def _funding_tx(htlc_spk: bytes, *, amount: int = AMOUNT_SATS) -> bytes:
+def _funding_tx(htlc_spk: bytes, *, amount: int = AMOUNT_SATS, change_first: bool = False) -> bytes:
     """A real (unsigned, legacy-serialised) transaction whose output 0 pays *htlc_spk* *amount*, with
-    a change output: what ``taker_funds_btc`` records before its broadcast, as far as the tower reads it."""
+    a change output: what ``taker_funds_btc`` records before its broadcast, as far as the tower reads it.
+    ``change_first`` puts the change at output 0 and the HTLC at output 1."""
     change_spk = b"\x00\x14" + b"\x55" * 20
+    htlc_out = amount.to_bytes(8, "little") + bytes([len(htlc_spk)]) + htlc_spk
+    change_out = (5_000).to_bytes(8, "little") + bytes([len(change_spk)]) + change_spk
+    outs = change_out + htlc_out if change_first else htlc_out + change_out
     return (
         (2).to_bytes(4, "little")
         + b"\x01"
@@ -74,12 +82,7 @@ def _funding_tx(htlc_spk: bytes, *, amount: int = AMOUNT_SATS) -> bytes:
         + b"\x00"
         + b"\xff\xff\xff\xff"
         + b"\x02"
-        + amount.to_bytes(8, "little")
-        + bytes([len(htlc_spk)])
-        + htlc_spk
-        + (5_000).to_bytes(8, "little")
-        + bytes([len(change_spk)])
-        + change_spk
+        + outs
         + (0).to_bytes(4, "little")
     )
 
@@ -142,12 +145,15 @@ class _Rxd:
         self.tip = TIP
         self.cov_confs: int | None = COV_CONFS
         self.covenant_reads = 0
+        self.covenant_fails = False  # below quorum: every covenant read raises
 
     async def tip_height(self) -> ChainHeight:
         return ChainHeight(self.tip)
 
     async def covenant_confirmations(self, outpoint: str) -> Confirmations | None:
         self.covenant_reads += 1
+        if self.covenant_fails:
+            raise NetworkError("covenant depth below quorum")
         return None if self.cov_confs is None else Confirmations(self.cov_confs)
 
 
@@ -272,10 +278,26 @@ def test_bytes_that_do_not_pay_this_swaps_htlc_are_refused(tmp_path):
     for raw in (
         _funding_tx(b"\x51\x20" + b"\x66" * 32),
         _funding_tx(w.chain.htlc.scriptpubkey, amount=AMOUNT_SATS - 1),
+        # P12 (combined Mythos pass, 1.5): the HTLC at output 1 is not the fund's outpoint.
+        _funding_tx(w.chain.htlc.scriptpubkey, change_first=True),
     ):
         rec = dataclasses.replace(w.record(), pending_btc_funding_tx=raw.hex())
         with pytest.raises(ValidationError, match="does not pay this swap's HTLC"):
             unrecorded_btc_fund_locator(rec, network="bcrt")
+
+
+def test_the_lock_view_refuses_a_record_without_an_unrecorded_fund(tmp_path):
+    """P11 (combined Mythos pass, 1.5): the BTC_LOCKED view is only for a record that is one."""
+    w = _Tower(tmp_path)
+    rec = w.record()
+    assert unrecorded_lock_view(rec).state is SwapState.BTC_LOCKED, "the honest twin"
+    for other in (
+        dataclasses.replace(rec, pending_btc_funding_tx=None),
+        dataclasses.replace(rec, role=RecordRole.MAKER),
+        dataclasses.replace(rec, state=SwapState.BTC_LOCKED),
+    ):
+        with pytest.raises(ValidationError, match="needs a record with an unrecorded BTC fund"):
+            unrecorded_lock_view(other)
 
 
 def test_only_a_negotiated_takers_unrecorded_btc_fund_is_one(tmp_path):
@@ -340,6 +362,17 @@ async def test_a_fund_no_source_has_seen_is_watched_and_reads_no_covenant(tmp_pa
     assert w.channel.sent == [] and w.rxd.covenant_reads == 0
 
 
+async def test_a_failed_covenant_read_once_engaged_still_pages(tmp_path):
+    """Once the BTC side engages, the lock rules need the covenant, so a failed read is the reconcile
+    error it is for a recorded lock (the observer engages on the deepest depth, as decide())."""
+    w = _Tower(tmp_path, depth=0)
+    w.sources[0].lie_funding_depth = G
+    w.rxd.covenant_fails = True
+    (res,) = await w.reconciler().tick()
+    assert res.error is not None
+    assert [p.severity for p in w.channel.sent] == [Severity.CRITICAL]
+
+
 # --------------------------------------------------------------------------- a fund that went quiet
 
 
@@ -355,6 +388,17 @@ async def test_an_interrupted_fund_at_the_grace_depth_pages_warn_once_with_a_sou
         assert not (res.decision.autonomous_btc_refund or res.decision.autonomous_asset_claim)
     assert [p.severity for p in w.channel.sent] == [Severity.WARN]
     assert w.rxd.covenant_reads > 0
+
+
+async def test_the_resume_warn_quotes_the_lock_rules_without_saying_nothing_else_is_due(tmp_path):
+    """Combined Mythos pass, 1.4b: the WARN said "Nothing else is due yet: maker revealed p; awaiting
+    burial", which reads as calm while p is public. It now quotes the lock rules as what they are."""
+    w = _Tower(tmp_path, depth=G)
+    _mine_claim(w, buried=1)
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_RESUME_FUND, d.reason
+    assert "Nothing else is due" not in d.reason
+    assert "The rules for a recorded lock read: maker revealed p" in d.reason
 
 
 async def test_an_unrecorded_fund_below_the_grace_depth_does_not_page(tmp_path):
@@ -396,6 +440,14 @@ async def test_the_observer_reads_the_covenant_when_a_spender_is_named_that_is_n
     obs = await w.observe()
     assert obs.btc_spenders_named and not obs.maker_has_claimed_btc and obs.btc_unrecorded_fund_deepest is None
     assert w.rxd.covenant_reads == 1
+    # P10 (combined Mythos pass, 1.5): decide() engages on the named spender alone, so the reason is the
+    # lock rules' (behind the lead), not the pre-engagement "nothing spends it".
+    d = await w.decide()
+    assert "the record never took the lock" in d.reason and "nothing spends it" not in d.reason, d.reason
+    # ... and the observer engaged too: a failed covenant read is now the reconcile error.
+    w.rxd.covenant_fails = True
+    with pytest.raises(NetworkError):
+        await w.observe()
 
 
 async def test_one_source_claiming_an_unseen_fund_near_t_rxd_pages_critical_and_never_broadcasts(tmp_path):
@@ -415,13 +467,18 @@ async def test_one_source_claiming_an_unseen_fund_near_t_rxd_pages_critical_and_
     assert [p.severity for p in w.channel.sent] == [Severity.CRITICAL]
 
 
-async def test_an_unseen_fund_near_t_rxd_with_no_source_claiming_it_is_watched(tmp_path):
-    """The honest twin: with every source saying "not found", nothing pages, near t_rxd or not."""
+@pytest.mark.parametrize("seen", [True, False], ids=["in-mempool", "seen-by-no-source"])
+async def test_known_gap_a_fund_not_yet_engaged_near_t_rxd_is_watched(tmp_path, seen):
+    """Pinned known gap (combined Mythos pass, 1.1): a fund not yet engaged (unconfirmed, or seen by no
+    source) is watched in silence near t_rxd, though bytes that confirm then let the maker refund the
+    covenant and still claim the BTC. Two attempts to page it were wrong (too late; the tower's margin
+    is not the runner's), so it waits for a design. When that lands, this test changes."""
     w = _Tower(tmp_path, depth=0)
-    w.chain.funding_seen = False
+    w.chain.funding_seen = seen
     w.near_t_rxd()
     (res,) = await w.reconciler().tick()
     assert res.decision.intent is Intent.WATCH and w.channel.sent == []
+    assert w.rxd.covenant_reads == 0
 
 
 async def test_the_deepest_source_survives_the_others_failing(tmp_path):
@@ -499,6 +556,25 @@ async def test_a_matured_unrecorded_fund_pages_the_refund_and_never_broadcasts(t
     assert d.autonomous_btc_refund is False
     assert res.executed is None
     assert w.chain.mempool is None and all(not s.broadcasts for s in w.sources)
+    # 1.4a/1.4c: the recorded lock's armed-refund note is false here, and every sentence ends.
+    assert "If this tower is armed" not in d.reason
+    assert ". Not autonomous: the lock is not on the record." in d.reason
+
+
+async def test_a_matured_unrecorded_fund_with_no_covenant_ends_each_sentence(tmp_path):
+    """1.4c: the never-locked page's reason ends without a full stop; the suffix must not run on."""
+    w = _Tower(tmp_path, depth=w_depth_past_t_btc())
+    w.write(dataclasses.replace(w.record(), radiant_covenant_outpoint=None))
+    d = await w.decide()
+    assert d.intent is Intent.PAGE_REFUND and "maker never locked" in d.reason, d.reason
+    assert "leg. Not autonomous: the lock is not on the record." in d.reason
+    # With the spender unclassified the inner reason has no note and no full stop of its own.
+    obs = dataclasses.replace(
+        await w.observe(), btc_spend_classified=False, btc_disposition=None, btc_disposition_reason=None
+    )
+    d = decide(record=w.record(), observations=obs, policy=_policy(), safety_window_blocks=6)
+    assert d.intent is Intent.PAGE_REFUND and "If this tower is armed" not in d.reason, d.reason
+    assert "leg. Not autonomous: the lock is not on the record." in d.reason
 
 
 async def test_the_same_matured_fund_once_recorded_is_autonomous(tmp_path):
@@ -562,3 +638,32 @@ def test_the_unrecorded_fund_fields_are_validated():
     with pytest.raises(ValidationError, match="positive int"):
         Observations(**base, btc_unrecorded_fund=True, btc_unrecorded_fund_grace_blocks=0)
     Observations(**base, btc_unrecorded_fund=True, btc_unrecorded_fund_grace_blocks=3)  # the honest twin
+
+
+def test_the_resume_gate_refuses_a_re_send_wherever_the_tower_says_t_rxd_is_near(tmp_path):
+    """Combined Mythos pass, 1.3: near t_rxd the pages for an unrecorded fund start with
+    ``resume_interrupted_fund``. Pin the order of the two rules: the resume's own pre-lock gate
+    (``assert_timelock_margin`` with the covenant's age elapsed) refuses a re-send at every covenant age
+    where the tower's safety window is open, so near t_rxd a resume can only record a fund that has
+    already confirmed (``resume_interrupted_fund`` records that with no gate), never send one. The two
+    rules use different margins, so this holds for the policy here, not for every pairing."""
+    # This module's terms fail the margin at age 0 already, which would make the pin vacuous: widen t_rxd
+    # so the gate passes at a young covenant (asserted below) and the pin can fail.
+    terms = dataclasses.replace(_Tower(tmp_path).record().terms, t_rxd=t.Timelock(200, t.TimeUnit.BLOCKS))
+    policy = _policy()
+    assert_timelock_margin(terms.t_btc, terms.t_rxd, policy, elapsed_blocks=1)  # the honest twin
+    window_open_ages = []
+    for age in range(1, terms.t_rxd.value + 10):
+        if not taker_refund_window_open(
+            now_block_height=ChainHeight(LOCKED_AT + age - 1),
+            asset_locked_at_height=ChainHeight(LOCKED_AT),
+            t_rxd=terms.t_rxd,
+            safety_window_blocks=6,
+            maker_has_claimed_btc=False,
+            block_interval_s=policy.block_interval_s,
+        ):
+            continue
+        window_open_ages.append(age)
+        with pytest.raises(ValidationError):
+            assert_timelock_margin(terms.t_btc, terms.t_rxd, policy, elapsed_blocks=age)
+    assert window_open_ages, "the window never opened: the pin checked nothing"

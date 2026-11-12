@@ -508,9 +508,24 @@ key to rebuild it, so the executor declines a blob whose fee is not viable. Re-r
   runners use 1). Engaging these rules reads the deepest depth any one source reports, so only every
   source lagging can hold a page down, and one lying source can raise one. Near t_rxd that page is a
   CRITICAL refund page saying the refund's maturity could not be read; check the fund's depth on
-  sources you trust before acting. A fund no source has seen (evicted, or its input spent elsewhere)
-  is watched and never paged: no BTC moved. `abandon_unfunded` refuses a record that
-  holds the funding bytes, so such a record is left at `negotiated` until a resume re-sends them.
+  sources you trust before acting.
+
+  **Known gap: a fund that has not engaged is never paged, even past t_rxd.** That covers a fund still
+  unconfirmed, one no source has seen, and one confirmed but not yet `min(G, t_btc)` deep on any
+  source. "No source has seen it" does not mean no BTC moved: the
+  signed bytes may sit in a mempool no source reads, or be re-sent by anyone who saw them, and bytes
+  that confirm near or after t_rxd let the maker refund the covenant and still claim the BTC. Until
+  the tower pages this, check by hand any `negotiated` record that holds funding bytes and whose
+  covenant is ageing: if the fund is unconfirmed or was never sent and a fund confirming now could no
+  longer be refunded before t_rxd, double-spend its funding input to your own wallet and do not run
+  `resume_interrupted_fund`, which re-sends the bytes whenever its margin gate passes (here it should
+  refuse; do not rely on that). After the double-spend the record cannot leave `negotiated`: there
+  is no exit for it yet. Before engagement the outspend sources are
+  still read every tick, and when every one of them fails the tick is a reconcile error, which pages
+  CRITICAL as it does for a recorded lock (public Esplora servers answer an unknown txid's outspend
+  with `{"spent":false}`, not an error, so this needs the sources themselves to fail).
+  `abandon_unfunded` refuses a record that holds the funding bytes, so such a record is left at
+  `negotiated` until a resume re-sends them.
 - The heartbeat JSON carries `schema_version` (currently `1`). The escalation monitor refuses a version
   it does not know, so **upgrade the tower before the monitor**, not the other way round.
 - **What the escalation channel sends, and what each one means:**

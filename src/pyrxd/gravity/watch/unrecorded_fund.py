@@ -17,7 +17,10 @@ The tower now treats such a record as an UNRECORDED lock:
 * those rules run only once the BTC side gives a reason (:func:`unrecorded_fund_engaged`): a spender
   is seen, or some source reports the funding at least ``min(G, t_btc)`` deep. Before that the record
   is watched: the BTC reads still run every tick, but the covenant is not read and nothing pages, so a
-  healthy fund pages nothing (Mythos review of #891, F3);
+  healthy fund pages nothing (Mythos review of #891, F3). The exception is a tick whose outspend
+  sources all fail: that is a reconcile error, as for a recorded lock. The silence holds past t_rxd
+  too, a known gap (combined Mythos pass, 1.1) for a fund not yet engaged when the maker can refund the
+  covenant and claim;
 * a fund that went quiet (BTC confirmed at least ``G`` deep on some source, nothing else due) pages
   ``PAGE_RESUME_FUND`` once, at WARN.
 

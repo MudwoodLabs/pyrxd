@@ -1535,13 +1535,10 @@ def _decide_unrecorded_btc_fund(
         deepest_confirmations=deepest,
         grace_blocks=grace,
     ):
+        seen = "no source reports it" if deepest is None else f"the deepest source reports {deepest} conf"
         return Decision(
             Intent.WATCH,
-            reason=(
-                f"{record.state.value} with an unrecorded BTC fund {txid}: "
-                + ("no source reports it" if deepest is None else f"the deepest source reports {deepest} conf")
-                + "; nothing spends it"
-            ),
+            reason=f"{record.state.value} with an unrecorded BTC fund {txid}: {seen}; nothing spends it",
             low_corroboration=corr,
         )
     inner = decide(
@@ -1560,7 +1557,7 @@ def _decide_unrecorded_btc_fund(
                 Intent.PAGE_RESUME_FUND,
                 reason=(
                     lead + f"a source reports it {deepest} conf deep (grace {grace}), so the fund runner has "
-                    "most likely stopped. Nothing else is due yet: " + inner.reason
+                    "most likely stopped. The rules for a recorded lock read: " + _sentence(inner.reason)
                 ),
                 recommended_action=(
                     f"{_STEP_RESUME_FUND} once the fund runner has stopped (it records the lock; leave a "
@@ -1575,14 +1572,23 @@ def _decide_unrecorded_btc_fund(
         f"{_STEP_RESUME_FUND} (records the lock; if it says the fund is not confirmed yet, run it again "
         "after one confirmation)"
     )
+    # The inner page may carry the armed-refund note; no refund goes out here (autonomy is cleared
+    # below), so the note would be false (combined Mythos pass, 1.4a).
+    inner_reason = inner.reason.replace(_autonomous_refund_note(), "")
     return dataclasses.replace(
         inner,
-        reason=lead + inner.reason + " Not autonomous: the lock is not on the record.",
+        reason=lead + _sentence(inner_reason) + " Not autonomous: the lock is not on the record.",
         recommended_action=action if inner.recommended_action is None else f"{action}, then {inner.recommended_action}",
         autonomous_btc_refund=False,
         autonomous_asset_claim=False,
         situation=SITUATION_UNRECORDED_FUND_PREFIX + (inner.situation or inner.intent.value),
     )
+
+
+def _sentence(text: str) -> str:
+    """*text* ending in a full stop, so a page's next sentence does not run on (1.4c)."""
+    text = text.rstrip()
+    return text if text.endswith((".", "!", "?")) else text + "."
 
 
 #: Reader answers that read the contract unsettled on every endpoint in the quorum and found no log

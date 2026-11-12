@@ -38,7 +38,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (default 3; `ChainObserver(unrecorded_fund_grace_blocks=...)`, with `btc_network=` for the locator
   it builds). `OutspendBtcClaimSource.deepest_funding_confirmations` reads the deepest depth any one
   source reports. `htlc_for_terms` and `recorded_htlc_funding_tx` in `pyrxd.btc_wallet.htlc_leg`
-  hold the HTLC rebuild and the output-0 check the leg's resume already used.
+  hold the HTLC rebuild and the output-0 check the leg's resume already used. Known gap: a fund
+  that has not engaged (unconfirmed, seen by no source, or confirmed but not yet `min(G, t_btc)` deep)
+  is not paged, even near or past t_rxd; the runbook says what to check by hand.
 
 ## [0.28.0] — 2026-11-07
 
