@@ -1,10 +1,13 @@
-"""A broadcast echo mismatch on the autonomous claim is retried by REBUILDING the claim — and that
-cannot pay twice (#780, #786).
+"""A broadcast echo mismatch on the autonomous claim re-sends the SAME bytes before any rebuild
+(#789), and no path through it can pay twice (#780, #786).
 
 ``ElectrumXClient.broadcast`` raises ``BroadcastEchoMismatch`` when the server's reply names some
-other txid. ``RadiantChainIO.broadcast`` wraps every client exception except a node rejection as
-``NetworkError``, so ``ClaimExecutor`` reads the mismatch as a transient FAILED and, on a later tick, calls
-``claim_asset`` again: a NEW claim with a freshly dispensed fee input. That is safe because:
+other txid. ``RadiantChainIO.broadcast`` raises that as ``RadiantEchoMismatch``, which carries the
+bytes sent; it used to wrap it as ``NetworkError``, so ``ClaimExecutor`` rebuilt the claim on a new
+fee input every tick. If the claim had relayed, every rebuild conflicted with it and was refused,
+and each tick dispensed another fee input from the shared capped pool. Now the executor holds the
+bytes and re-sends them for ``second_opinion_resend_ticks`` ticks, then rebuilds. That stays safe
+because:
 
 * the covenant output is spendable once, and every claim pays the same fixed destination, so at
   most one claim confirms and the asset moves once;
@@ -16,8 +19,8 @@ other txid. ``RadiantChainIO.broadcast`` wraps every client exception except a n
 Everything here is production code except the SERVER: the executor drives a real
 ``RadiantCovenantLeg`` over a real ``RadiantChainIO`` over a real ``ElectrumXClient`` whose ``_call``
 (the JSON-RPC wire) is answered by :class:`_Node`, which models a mempool that refuses a second
-spend of an outpoint and a block that confirms the mempool. The BTC claim the executor scrapes ``p``
-from is a real one, built by the BTC HTLC leg.
+spend of an outpoint, answers bytes it already holds as a regtest node does, and a block that confirms
+the mempool. The BTC claim the executor scrapes ``p`` from is a real one, built by the BTC HTLC leg.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.btc_wallet.taproot import btc_txid_from_raw
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput
-from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RadiantEchoMismatch
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import ClaimExecutor, ExecOutcome
@@ -128,6 +131,14 @@ class _Node(ElectrumXClient):
             if self.reject is not None:
                 code, reason = self.reject
                 raise _rpc_error(code, _wrapped(reason, params[0]) if code == 1 else reason)
+            # What radiant-core v3.1.2 behind RXinDexer ElectrumX answers for bytes it already holds,
+            # measured on regtest (tests/test_claim_executor_echo_mismatch_regtest_e2e.py): a re-send
+            # of a mempool transaction is accepted and answered with its txid; a re-send of a mined
+            # one is refused, -27 "transaction already in block chain", wrapped by ElectrumX as code 1.
+            if _txid(raw) in self.confirmed:
+                raise _rpc_error(1, _wrapped("transaction already in block chain", params[0]))
+            if _txid(raw) in self.mempool:
+                return _LIE if self.lie else _txid(raw)
             if _spends(raw) & self._spent():
                 raise _rpc_error(1, _wrapped("txn-mempool-conflict (code 18)", params[0]))
             if self.relay:
@@ -241,46 +252,61 @@ def _assert_paid_once(node: _Node, fees: _CountingFeeSource) -> str:
     return _txid(claims[0])
 
 
-async def test_the_mismatch_reaches_the_executor_as_a_network_error() -> None:
-    """The premise of the retry: ``RadiantChainIO`` wraps the mismatch, and the local txid survives."""
+async def test_the_mismatch_reaches_the_executor_as_itself_with_the_bytes_sent() -> None:
+    """The premise of the re-send: ``RadiantChainIO`` raises the mismatch as itself, not as a
+    ``NetworkError`` (#789), and carries the exact bytes sent, with the txid hashed from them."""
     node = _Node()
     node.lie = True
     raw = os.urandom(80)
-    with pytest.raises(NetworkError) as info:
+    with pytest.raises(RadiantEchoMismatch) as info:
         await RadiantChainIO(node).broadcast(raw)
+    assert not isinstance(info.value, NetworkError), "a mismatch must not read as 'could not reach the server'"
+    assert isinstance(info.value, BroadcastEchoMismatch)
     assert isinstance(info.value.__cause__, BroadcastEchoMismatch)
+    assert info.value.raw == raw
+    assert info.value.local_txid == _txid(raw) and info.value.echoed == _LIE
     assert _txid(raw) in str(info.value), "the reason names the transaction actually sent"
 
 
-async def test_a_lie_about_a_relayed_claim_is_rebuilt_and_cannot_pay_twice(tick) -> None:
+def _seen_key() -> bytes:
+    return f"claim:{_COVENANT}".encode()
+
+
+async def test_a_lie_about_a_relayed_claim_is_re_sent_not_rebuilt(tick) -> None:
+    from pyrxd.gravity.radiant_leg import SeenStore
+
+    seen = SeenStore()
     node = _Node()
-    ex, rec, fees = await _armed(node)
+    ex, rec, fees = await _armed(node, seen)
     node.lie = True  # admits the claim to the mempool, then lies about it
 
     outcome, reason = await tick(ex, rec)
-    assert outcome is ExecOutcome.FAILED
+    assert outcome is ExecOutcome.FAILED, reason
     first = node.broadcasts[0]
-    assert _txid(first) in reason and "claim broadcast failed" in reason
+    assert _txid(first) in reason and "re-sending the same bytes" in reason
     assert set(node.mempool) == {_txid(first)}
+    assert not seen.has_seen(_seen_key()), "the server whose reply was wrong does not end the retries"
 
-    # The next tick rebuilds: a new fee input, a different claim over the SAME covenant output.
+    # The next tick re-sends the SAME bytes: no new fee input, no conflicting rebuild. The node
+    # already holds them, so the claim is marked seen.
     node.lie = False
     outcome, reason = await tick(ex, rec)
-    assert outcome is ExecOutcome.FAILED, reason
-    assert len(fees.outpoints) == 2, "rebuilt with a freshly dispensed fee input"
-    second = node.broadcasts[1]
-    assert second != first and _COVENANT in _spends(first) & _spends(second)
-    assert set(node.mempool) == {_txid(first)}, "the rebuild conflicts with the relayed claim and is refused"
+    assert outcome is ExecOutcome.DECLINED and "now taken by the broadcast client" in reason, reason
+    assert node.broadcasts == [first, first]
+    assert len(fees.outpoints) == 1, "no fee input dispensed for a rebuild"
+    assert seen.has_seen(_seen_key()) and ex._held == {}
+
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.DECLINED and "already broadcast" in reason, reason
+    assert len(node.broadcasts) == 2
 
     node.mine()
     outcome, reason = await tick(ex, rec)
-    assert outcome is ExecOutcome.DECLINED, reason
-    assert "already spent" in reason
-    assert len(node.broadcasts) == 2, "a spent covenant sends nothing"
+    assert outcome is ExecOutcome.DECLINED and "already spent" in reason, reason
     assert _assert_paid_once(node, fees) == _txid(first)
 
 
-async def test_a_lie_about_a_dropped_claim_is_rebuilt_and_the_rebuild_lands(tick) -> None:
+async def test_a_lie_about_a_dropped_claim_is_re_sent_and_the_same_claim_lands(tick) -> None:
     node = _Node()
     ex, rec, fees = await _armed(node)
     node.lie, node.relay = True, False  # drops the claim AND lies
@@ -288,20 +314,103 @@ async def test_a_lie_about_a_dropped_claim_is_rebuilt_and_the_rebuild_lands(tick
     outcome, _ = await tick(ex, rec)
     assert outcome is ExecOutcome.FAILED
     assert node.mempool == {}
+    first = node.broadcasts[0]
 
     node.lie, node.relay = False, True
     outcome, reason = await tick(ex, rec)
-    assert outcome is ExecOutcome.BROADCAST, reason
-    rebuilt = node.broadcasts[1]
-    assert rebuilt != node.broadcasts[0] and len(fees.outpoints) == 2
+    assert outcome is ExecOutcome.DECLINED and "now taken by the broadcast client" in reason, reason
+    assert node.broadcasts == [first, first] and set(node.mempool) == {_txid(first)}
+    assert len(fees.outpoints) == 1
 
     node.mine()
     outcome, _ = await tick(ex, rec)
     assert outcome is ExecOutcome.DECLINED
+    assert _assert_paid_once(node, fees) == _txid(first)
+
+
+async def test_a_server_that_keeps_lying_ends_the_hold_and_the_claim_is_rebuilt(tick) -> None:
+    """A liar that drops every re-send delays the claim by the re-send count, then a rebuild on a
+    new fee input goes out, as every mismatch did before #789."""
+    node = _Node()
+    ex, rec, fees = await _armed(node)
+    ex._resend_ticks = 2
+    node.lie, node.relay = True, False
+
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "re-sending the same bytes" in reason, reason
+    first = node.broadcasts[0]
+    for left in (1, 0):
+        outcome, reason = await tick(ex, rec)
+        assert outcome is ExecOutcome.FAILED and f"re-send echo mismatch ({left} re-sends left)" in reason, reason
+    assert node.broadcasts == [first, first, first] and len(fees.outpoints) == 1
+    assert ex._held == {}, "the last re-send ends the hold"
+
+    node.lie, node.relay = False, True
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, reason
+    assert len(fees.outpoints) == 2, "rebuilt on a new fee input after the hold ended"
+    rebuilt = node.broadcasts[-1]
+    assert rebuilt != first
+    node.mine()
     assert _assert_paid_once(node, fees) == _txid(rebuilt)
-    assert fees.outpoints[0] not in {o for raw in node.confirmed.values() for o in _spends(raw)}, (
-        "the dropped claim's fee input was never committed"
-    )
+
+
+class _DownNode(_Node):
+    """A ``_Node`` whose broadcast fails in transport while ``down`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.down = False
+
+    async def _call(self, method: str, params: list[Any]) -> Any:
+        if method == "blockchain.transaction.broadcast" and self.down:
+            self.broadcasts.append(bytes.fromhex(params[0]))
+            raise NetworkError("connection reset by peer")
+        return await super()._call(method, params)
+
+
+async def test_a_genuine_network_failure_still_rebuilds(tick) -> None:
+    """Honest pair for the hold: a transport failure is not a mismatch, holds nothing, and the next
+    tick builds a new claim, as before."""
+    node = _DownNode()
+    ex, rec, fees = await _armed(node)
+    node.down = True
+
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "claim broadcast failed" in reason, reason
+    assert "echo mismatch" not in reason
+    assert ex._held == {}
+
+    node.down = False
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, reason
+    assert len(fees.outpoints) == 2 and node.broadcasts[1] != node.broadcasts[0]
+    node.mine()
+    assert _assert_paid_once(node, fees) == _txid(node.broadcasts[1])
+
+
+async def test_a_bare_mismatch_from_a_custom_chain_io_rebuilds(tick) -> None:
+    """A custom chain IO that raises the plain ``BroadcastEchoMismatch`` gives no bytes to re-send:
+    the executor holds nothing and rebuilds next tick, instead of letting the exception escape."""
+    node = _Node()
+    ex, rec, fees = await _armed(node)
+    leg = await ex._resolve_leg("swap-1", rec)
+    real = leg.chain_io.broadcast
+    calls: list[bytes] = []
+
+    async def _bare(raw: bytes) -> str:
+        calls.append(raw)
+        raise BroadcastEchoMismatch(_txid(raw), _LIE)
+
+    leg.chain_io.broadcast = _bare
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "rebuilding next tick" in reason, reason
+    assert ex._held == {}
+
+    leg.chain_io.broadcast = real
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, reason
+    assert len(fees.outpoints) == 2 and node.broadcasts[0] != calls[0]
 
 
 async def test_an_honest_broadcast_is_unchanged(tick) -> None:
@@ -459,6 +568,8 @@ async def test_a_conflict_with_an_evicted_claim_still_claims(tick) -> None:
 
     outcome, _ = await tick(ex, rec)
     assert outcome is ExecOutcome.FAILED
+    # A restart forgets the held bytes (they are kept in memory only), so the next tick rebuilds.
+    ex._held.clear()
     node.lie = False
     outcome, reason = await tick(ex, rec)
     assert outcome is ExecOutcome.FAILED, reason
@@ -468,7 +579,7 @@ async def test_a_conflict_with_an_evicted_claim_still_claims(tick) -> None:
     outcome, reason = await tick(ex, rec)
     assert outcome is ExecOutcome.BROADCAST, reason
     node.mine()
-    assert _assert_paid_once(node, fees) == _txid(node.broadcasts[2])
+    assert _assert_paid_once(node, fees) == _txid(node.broadcasts[-1])
 
 
 #: Each reason that must retry although it sits beside a consensus word, keyed by the marker that
@@ -510,3 +621,24 @@ def test_a_retry_marker_wins_over_a_consensus_word(marker) -> None:
     assert not _is_consensus_rejection(_policy_rejection(-26, f"bad-txns-vout-negative {reason}"))
     # Honest pair: the consensus word alone is a consensus rejection.
     assert _is_consensus_rejection(_policy_rejection(-26, "bad-txns-vout-negative"))
+
+
+async def test_a_bare_mismatch_on_a_re_send_counts_down_and_does_not_escape(tick) -> None:
+    """Mythos combo pass on #977, 3.5: a bare mismatch from a custom chain IO on a RE-SEND reached
+    the catch-all arm, which re-raised it out of the executor. It spends one re-send instead."""
+    node = _Node()
+    ex, rec, fees = await _armed(node)
+    ex._resend_ticks = 1
+    node.lie, node.relay = True, False
+    outcome, _ = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and ex._held
+
+    leg = await ex._resolve_leg("swap-1", rec)
+
+    async def _bare(raw: bytes) -> str:
+        raise BroadcastEchoMismatch(_txid(raw), _LIE)
+
+    leg.chain_io.broadcast = _bare
+    outcome, reason = await tick(ex, rec)
+    assert outcome is ExecOutcome.FAILED and "re-send echo mismatch (0 re-sends left)" in reason, reason
+    assert ex._held == {} and len(fees.outpoints) == 1

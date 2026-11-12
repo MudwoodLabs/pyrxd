@@ -645,3 +645,42 @@ async def test_the_real_chain_reader_answers_whether_the_covenant_outpoint_is_un
     assert await RadiantChainIO(_Client([])).covenant_outpoint_unspent(b"\x51", "ab" * 32 + ":0") is False
     with pytest.raises(NetworkError):
         await RadiantChainIO(_Client(NetworkError("down"))).covenant_outpoint_unspent(b"\x51", "ab" * 32 + ":0")
+
+
+@pytest.mark.parametrize(("confs", "resent"), [(1, False), (0, True)], ids=["landed", "dropped"])
+async def test_a_covenant_refund_answered_with_another_txid_is_recorded_and_followed(confs, resent):
+    """Mythos combo pass on #977, 3.1: a broadcast echo mismatch on the covenant refund was swallowed
+    and nothing recorded, so a retry re-sent into a covenant the refund had already spent ("no UTXO
+    found", every time) and the record never left BOTH_LOCKED. The txid of the bytes sent is recorded,
+    so a retry checks whether that refund landed."""
+    from pyrxd.security.errors import BroadcastEchoMismatch
+
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)  # the counter leg is refunded at F, so the covenant step runs
+    sent = "cd" * 32
+
+    async def lies(_record):
+        raise BroadcastEchoMismatch(sent, "ee" * 32)
+
+    coord.radiant_leg.refund_asset = lies
+    with pytest.raises(NetworkError, match="broadcast echoed txid"):
+        await coord.mutual_refund()
+    assert coord.record.asset_refund_txid == sent and coord.record.state is SwapState.BOTH_LOCKED
+
+    asset = _count_asset_refunds(coord)
+    coord.radiant_leg.chain_io = _ChainIO(confs)
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND and asset == ([1] if resent else [])
+
+
+async def test_HONEST_a_covenant_refund_that_failed_in_transport_records_nothing():
+    coord, chain, _leg = _setup(state=SwapState.BOTH_LOCKED, role=None, chain_kw={"finalized": 90})
+    chain.refund(85)
+
+    async def fails(_record):
+        raise NetworkError("radiant node down")
+
+    coord.radiant_leg.refund_asset = fails
+    with pytest.raises(NetworkError, match="radiant node down"):
+        await coord.mutual_refund()
+    assert coord.record.asset_refund_txid is None
