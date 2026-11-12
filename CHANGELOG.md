@@ -6,6 +6,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **`RadiantChainIO.broadcast` raises a broadcast echo mismatch as itself, not as `NetworkError`
+  (#789).** When the broadcast client's reply names a txid other than the one hashed from the
+  bytes sent, it raises the new `pyrxd.gravity.radiant_leg.RadiantEchoMismatch`, a
+  `BroadcastEchoMismatch` that carries those bytes (`raw`). `RadiantCovenantLeg.claim_asset` and
+  `refund_asset` raise it through. Code that caught `NetworkError` around these calls to retry no
+  longer catches a mismatch: the transaction may have relayed, so check `local_txid` before
+  building a new one.
+
+### Fixed
+
+- **The autonomous claim re-sends the same bytes after a broadcast echo mismatch instead of
+  rebuilding (#789).** `ClaimExecutor` used to read a mismatch as a network failure and rebuild
+  the claim on a new fee input every tick; if the claim had relayed, each rebuild conflicted with
+  it and was refused, so every tick dispensed another input from the shared capped pool. It now
+  holds the claim's bytes and re-sends them for `second_opinion_resend_ticks` ticks (the hold the
+  second-opinion path already uses), marks the claim seen once the broadcast client takes them or
+  says it already has them, and rebuilds only when the hold runs out or a server refuses them. The
+  claim is never marked seen on the mismatch itself. The hold is in memory, so a restart rebuilds,
+  as before.
+
 ## [0.28.0] — 2026-11-07
 
 Header verification is stricter (see Changed (breaking)): read that entry before upgrading code that

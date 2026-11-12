@@ -93,6 +93,7 @@ from pyrxd.network.source_identity import (
     source_key_of,
 )
 from pyrxd.security.errors import (
+    BroadcastEchoMismatch,
     InsufficientFundsError,
     NetworkError,
     PolicyRejection,
@@ -112,6 +113,7 @@ __all__ = [
     "RadiantBroadcaster",
     "RadiantChainIO",
     "RadiantCovenantLeg",
+    "RadiantEchoMismatch",
     "RxinDexerRefAdapter",
     "SecondOpinionTxid",
     "SeenStore",
@@ -273,6 +275,22 @@ def _split_outpoint(outpoint: object) -> tuple[str, int]:
     return txid, int(vout)
 
 
+class RadiantEchoMismatch(BroadcastEchoMismatch):
+    """The broadcast client's reply named a txid other than the one hashed from the bytes sent (#789).
+
+    :meth:`RadiantChainIO.broadcast` raises it in place of the client's
+    :class:`~pyrxd.security.errors.BroadcastEchoMismatch`, which it used to wrap as a
+    ``NetworkError``. The bytes may well have relayed, so a caller that rebuilds on it builds a new
+    transaction on a new fee input. :attr:`raw` is the exact bytes sent, so a caller can re-send them
+    instead (:class:`ClaimExecutor <pyrxd.gravity.watch.claim_executor.ClaimExecutor>` does).
+    :attr:`local_txid` is hashed here from :attr:`raw`, never taken from the client's exception.
+    """
+
+    def __init__(self, raw: bytes, echoed: object) -> None:
+        super().__init__(str(Txid(hash256(raw)[::-1].hex())), echoed)
+        self.raw = bytes(raw)
+
+
 class SecondOpinionTxid(str):
     """A txid :meth:`RadiantChainIO.broadcast` returns when ONLY a second-opinion client took the
     transaction, after the broadcast client rejected it (#937).
@@ -357,6 +375,11 @@ class RadiantChainIO:
     :class:`SecondOpinionTxid` because that one client's word is all there is. Only the autonomous claim leg
     turns this on (:func:`pyrxd.gravity.watch.claim_executor.make_radiant_claim_leg`); see
     :meth:`with_second_opinion` for the rules on which clients qualify.
+
+    What :meth:`broadcast` raises: a node rejection as itself (:class:`PolicyRejection`); a reply
+    naming another txid as :class:`RadiantEchoMismatch`, which carries the bytes sent (#789); any
+    other failure of ``client`` as ``NetworkError``. A second-opinion round is asked only after a
+    node rejection, not after a mismatch.
     """
 
     def __init__(
@@ -429,6 +452,10 @@ class RadiantChainIO:
         rejection: PolicyRejection | None = None
         try:
             return str(await self._client.broadcast(bytes(raw_tx)))
+        except BroadcastEchoMismatch as exc:
+            # Raised as a mismatch, not a NetworkError (#789): the bytes went out and may have
+            # relayed, so the caller must not read this as "the server could not be reached".
+            raise RadiantEchoMismatch(bytes(raw_tx), exc.echoed) from exc
         except Exception as exc:
             msg = str(exc).lower()
             if "already" in msg and ("known" in msg or "mempool" in msg or "chain" in msg):

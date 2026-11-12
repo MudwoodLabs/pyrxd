@@ -56,7 +56,13 @@ from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_c
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
 from pyrxd.gravity.watch.executor import ExecOutcome
-from pyrxd.security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
+from pyrxd.security.errors import (
+    BroadcastEchoMismatch,
+    InsufficientFundsError,
+    NetworkError,
+    PolicyRejection,
+    ValidationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -592,6 +598,8 @@ class ClaimExecutor:
         held = self._held.get(outpoint)
         if held is not None:
             return await self._resend_held(swap_id, outpoint, held, leg)
+        from pyrxd.gravity.radiant_leg import RadiantEchoMismatch
+
         try:
             txid = await leg.claim_asset(record, bytes(p))
         except InsufficientFundsError as exc:
@@ -642,6 +650,28 @@ class ClaimExecutor:
                 exc,
             )
             return ExecOutcome.DECLINED, f"node rejected the claim on a consensus rule (retrying): {exc}"
+        except BroadcastEchoMismatch as exc:
+            if not isinstance(exc, RadiantEchoMismatch):
+                # Only a custom chain IO raises a bare one, without the bytes it sent: nothing to
+                # re-send, so the next tick rebuilds, as it did for every mismatch before #789.
+                return ExecOutcome.FAILED, f"claim broadcast echo mismatch; rebuilding next tick: {exc}"
+            # The broadcast client answered with another txid (#789). The claim may have relayed, so
+            # it is not rebuilt: its exact bytes are held and re-sent on later ticks (see
+            # _resend_held), as for a claim only a second opinion took. A rebuild would dispense a new
+            # fee input every tick and, if the claim did relay, conflict with it every time. Not
+            # marked seen: the client that answered is the one whose reply was wrong, and the claim may
+            # have been dropped. The hold is in memory only; a restart rebuilds, which cannot pay
+            # twice (the covenant is spent once, to a fixed destination).
+            self._held[outpoint] = (exc.raw, self._resend_ticks)
+            logger.error(
+                "autonomous claim swap %s: the broadcast server answered txid %r for claim %s; not marked "
+                "seen, its bytes are re-sent for up to %d ticks before a rebuild",
+                swap_id,
+                exc.echoed,
+                exc.local_txid,
+                self._resend_ticks,
+            )
+            return ExecOutcome.FAILED, f"claim broadcast echo mismatch; re-sending the same bytes next tick: {exc}"
         except NetworkError as exc:
             if _is_missing_utxo(exc):  # raced to spent between the check and the build → benign
                 return ExecOutcome.DECLINED, "covenant spent during claim (raced) — idempotent no-op"
@@ -675,8 +705,9 @@ class ClaimExecutor:
     async def _resend_held(
         self, swap_id: str, outpoint: str, held: tuple[bytes, int], leg
     ) -> tuple[ExecOutcome | None, str | None]:
-        """Re-send the exact bytes of a claim only a second-opinion server took (#937), instead of
-        rebuilding it on a new fee input.
+        """Re-send the exact bytes of a claim only a second-opinion server took (#937), or one the
+        broadcast client answered with another txid (#789), instead of rebuilding it on a new fee input.
+        A mismatch on the re-send spends one re-send, like a transport failure.
 
         Rebuilding every tick would dispense a fee input from the SHARED capped pool per tick until the
         claim is mined, though every rebuild conflicts with the relayed claim and is refused: an honest
@@ -700,7 +731,7 @@ class ClaimExecutor:
         capped pool runs out. A refused claim paid the same per-tick cost before #937 (the
         PolicyRejection arm in ``_run``); the hold only spends nothing for its first
         ``second_opinion_resend_ticks`` ticks."""
-        from pyrxd.gravity.radiant_leg import SecondOpinionTxid, _AlreadyKnown
+        from pyrxd.gravity.radiant_leg import RadiantEchoMismatch, SecondOpinionTxid, _AlreadyKnown
 
         raw, left = held
         try:
@@ -713,6 +744,12 @@ class ClaimExecutor:
         except NetworkError as exc:
             self._count_down(outpoint, raw, left)
             return ExecOutcome.FAILED, f"held claim re-send failed (transient): {exc}"
+        except RadiantEchoMismatch as exc:
+            # The broadcast client again answered with another txid (#789): it neither took the bytes
+            # nor refused them in a way we can believe, so this spends one re-send, like a transport
+            # failure, and the hold still ends after its last one.
+            self._count_down(outpoint, raw, left)
+            return ExecOutcome.FAILED, f"held claim re-send echo mismatch ({left - 1} re-sends left): {exc}"
         except BaseException:
             # Anything else (a custom client's own exception, or the reconciler's tick watchdog
             # cancelling this tick) still spends a re-send, so the hold always ends and the claim is
@@ -821,7 +858,7 @@ async def _maybe_await(fn, *args):
 
 #: Reject reasons that describe the mempool or the UTXO set at this moment, not the claim. A
 #: conflicting spend can be evicted (a rebuilt claim conflicts with our own relayed one, see
-#: tests/test_claim_executor_echo_mismatch_rebuilds.py), a missing input can arrive, a non-final tx
+#: tests/test_claim_executor_echo_mismatch.py), a missing input can arrive, a non-final tx
 #: becomes final, and an over-long chain shortens as its ancestors confirm. A covenant that is really
 #: spent is caught by the next tick's spentness check. Radiant-Core's sendrawtransaction answers -26
 #: "txn-mempool-conflict" and -25 "Missing inputs" (src/node/transaction.cpp, src/validation.cpp,
@@ -873,5 +910,5 @@ def _is_missing_utxo(exc: Exception) -> bool:
     """True ONLY if a NetworkError signals an ABSENT covenant UTXO (the SPK has no live UTXO = spent/
     settled or not-yet-funded), vs a transient read fault OR a fail-closed anomaly (a value mismatch, which
     must NOT read as benign settlement; several matches are selected, never raised). Matches the exact 'no
-    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:646), not the mismatch."""
+    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:673), not the mismatch."""
     return "no utxo found" in str(exc).lower()
