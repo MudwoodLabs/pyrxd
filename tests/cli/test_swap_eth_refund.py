@@ -241,7 +241,7 @@ def _sign(key: Any, locator: EthHtlcLocator, tx: dict[str, Any], **over: Any) ->
     from eth_utils import to_checksum_address
 
     full = {"chainId": locator.chain_id, "to": to_checksum_address(locator.contract_address), "value": 0,
-            "data": b"", "type": 2, **tx, **over}  # fmt: skip
+            "data": mod._REFUND_SELECTOR, "type": 2, **tx, **over}  # fmt: skip
     return bytes(Account.sign_transaction(full, key.unsafe_raw_bytes()).raw_transaction)
 
 
@@ -338,3 +338,81 @@ def test_no_key_anywhere_is_refused_before_any_read(swap, monkeypatch) -> None:
     res = _cmd(swap)
     assert res.exit_code == 1, res.output
     assert "no refund key" in res.output
+
+
+def test_the_refund_selector_is_refund_with_no_arguments_in_both_artifacts() -> None:
+    from eth_utils import keccak
+
+    for name in ("EthHtlc.json", "Erc20Htlc.json"):
+        abi = json.loads((_FIXTURES / name).read_text())["abi"]
+        refunds = [f for f in abi if f.get("type") == "function" and f.get("name") == "refund"]
+        assert refunds and all(f["inputs"] == [] for f in refunds), name
+    assert keccak(b"refund()")[:4] == mod._REFUND_SELECTOR
+
+
+@pytest.mark.parametrize("over", [{"value": 1}, {"data": b"\x59\x0e\x1a\xe4"}, {"data": b""}])
+def test_a_signed_transaction_that_is_not_refund_is_not_printed(over) -> None:
+    key = mod.parse_eth_key(os.urandom(32).hex())
+    tx = {"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
+    raw = _sign(key, _locator(), tx, **{"data": mod._REFUND_SELECTOR, **over})
+    with pytest.raises(ValidationError, match="does not match"):
+        mod._assert_signed_matches(raw, tx, chain_id=_CHAIN, to=_locator().contract_address)
+    honest = _sign(key, _locator(), tx, data=mod._REFUND_SELECTOR)
+    mod._assert_signed_matches(honest, tx, chain_id=_CHAIN, to=_locator().contract_address)
+
+
+def test_legacy_signed_bytes_are_refused_as_a_validation_error() -> None:
+    from eth_account import Account
+    from eth_utils import to_checksum_address
+
+    key = mod.parse_eth_key(os.urandom(32).hex())
+    legacy = Account.sign_transaction(
+        {
+            "chainId": _CHAIN,
+            "to": to_checksum_address(_locator().contract_address),
+            "value": 0,
+            "nonce": 8,
+            "gas": 150_000,
+            "gasPrice": 3,
+            "data": mod._REFUND_SELECTOR,
+        },
+        key.unsafe_raw_bytes(),
+    ).raw_transaction
+    tx = {"nonce": 8, "gas": 150_000, "maxFeePerGas": 3, "maxPriorityFeePerGas": 1}
+    with pytest.raises(ValidationError, match="not an EIP-1559"):
+        mod._assert_signed_matches(bytes(legacy), tx, chain_id=_CHAIN, to=_locator().contract_address)
+
+
+def test_a_good_key_file_wins_over_an_empty_env_var(monkeypatch, tmp_path) -> None:
+    good = tmp_path / "k"
+    good.write_text("ab" * 32 + "\n")
+    good.chmod(0o600)
+    monkeypatch.setenv(mod.KEY_ENV, "")
+    assert mod._resolve_key_source(str(good)) == "ab" * 32
+
+
+def test_the_env_key_is_used_when_no_file_is_given(monkeypatch) -> None:
+    monkeypatch.setenv(mod.KEY_ENV, "cd" * 32)
+    assert mod._resolve_key_source(None) == "cd" * 32
+
+
+def test_the_key_file_goes_through_the_guarded_read(monkeypatch, tmp_path) -> None:
+    """A FIFO returns at once, a symlink is refused, and a non-UTF-8 file's bytes are not echoed."""
+    monkeypatch.delenv(mod.KEY_ENV, raising=False)
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo, 0o600)
+    with pytest.raises(ValidationError):
+        mod._resolve_key_source(str(fifo))
+    target = tmp_path / "t"
+    target.write_text("ab" * 32)
+    target.chmod(0o600)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    with pytest.raises(ValidationError):
+        mod._resolve_key_source(str(link))
+    raw = tmp_path / "raw"
+    raw.write_bytes(b"\xfe" + os.urandom(31))
+    raw.chmod(0o600)
+    with pytest.raises(ValidationError) as caught:
+        mod._resolve_key_source(str(raw))
+    assert "0xfe" not in str(caught.value) and "position" not in str(caught.value)

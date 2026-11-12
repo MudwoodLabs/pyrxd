@@ -265,6 +265,10 @@ _EARLIER_REFUND_BLOCKS = {
 }
 
 
+#: ``refund()`` takes no arguments in both artifacts, so its calldata is exactly the selector.
+_REFUND_SELECTOR = bytes.fromhex("590e1ae3")
+
+
 def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to: str) -> None:
     """Refuse unless the signed bytes carry the fields this command prints.
 
@@ -275,8 +279,14 @@ def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to:
     from eth_account.typed_transactions import TypedTransaction
     from hexbytes import HexBytes
 
-    signed = TypedTransaction.from_bytes(HexBytes(raw)).as_dict()
+    try:
+        signed = TypedTransaction.from_bytes(HexBytes(raw)).as_dict()
+    except (ValueError, TypeError) as exc:
+        raise ValidationError(f"the signed refund is not an EIP-1559 transaction ({exc}); nothing is printed") from exc
     want: dict[str, Any] = {
+        "type": 2,
+        "value": 0,
+        "data": "0x" + _REFUND_SELECTOR.hex(),
         "chainId": int(chain_id),
         "to": str(to).lower(),
         "nonce": int(tx["nonce"]),
@@ -284,8 +294,9 @@ def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to:
         "maxFeePerGas": int(tx["maxFeePerGas"]),
         "maxPriorityFeePerGas": int(tx["maxPriorityFeePerGas"]),
     }
-    got: dict[str, Any] = {k: int(signed[k]) for k in want if k != "to"}
+    got: dict[str, Any] = {k: int(signed[k]) for k in want if k not in ("to", "data")}
     got["to"] = "0x" + bytes(signed["to"]).hex()
+    got["data"] = "0x" + bytes(signed["data"]).hex()
     if got != want:
         diff = sorted(k for k in want if got[k] != want[k])
         raise ValidationError(
@@ -294,14 +305,30 @@ def _assert_signed_matches(raw: bytes, tx: dict[str, Any], *, chain_id: int, to:
         )
 
 
-def _refuse_empty_key_source(eth_key_file: str | None) -> None:
-    """Name the refund key, not a webhook, when the key file or env var is empty."""
+def _resolve_key_source(eth_key_file: str | None) -> str | None:
+    """The refund key from ``--eth-key-file`` (guarded read) or ``KEY_ENV``, in that order.
+
+    Same precedence as :func:`~pyrxd.gravity.watch.cli_secrets.resolve_secret` with no inline flag,
+    with errors that name the refund key; the file goes through ``read_secret_file`` only (no symlink,
+    FIFO, unbounded or non-0600 read), and the env var is consulted only when no file was given.
+    """
     import os
 
-    if eth_key_file and not Path(eth_key_file).read_text().strip():
-        raise ValidationError(f"--eth-key-file {eth_key_file} is empty; write the refund key to it, or omit the flag")
-    if KEY_ENV in os.environ and not os.environ[KEY_ENV].strip():
-        raise ValidationError(f"{KEY_ENV} is set but empty; set the refund key, or unset {KEY_ENV}")
+    from ..gravity.watch.cli_secrets import read_secret_file
+
+    if eth_key_file:
+        value = read_secret_file(eth_key_file, label="--eth-key-file").strip()
+        if not value:
+            raise ValidationError(
+                f"--eth-key-file {eth_key_file} is empty; write the refund key to it, or omit the flag"
+            )
+        return value
+    if KEY_ENV in os.environ:
+        raw = os.environ[KEY_ENV]
+        if not raw.strip():
+            raise ValidationError(f"{KEY_ENV} is set but empty; set the refund key, or unset {KEY_ENV}")
+        return raw
+    return None
 
 
 async def build_cold_eth_refund(
@@ -476,7 +503,6 @@ def swap_build_eth_refund_cmd(
     the swap record, and the contract on chain must match them exactly before anything is signed.
     """
     from ..eth_wallet.htlc_leg import load_artifact
-    from ..gravity.watch.cli_secrets import resolve_secret
     from .swap_recovery import load_recovery_json, redact_endpoint_secrets
     from .swap_recovery_cmds import _load, _run
 
@@ -490,8 +516,7 @@ def swap_build_eth_refund_cmd(
     try:
         record, locator = load_eth_locator(record_file, facts)
         artifact = load_artifact(artifact_path)
-        _refuse_empty_key_source(eth_key_file)
-        secret = resolve_secret(None, eth_key_file, KEY_ENV, flag="--eth-key")
+        secret = _resolve_key_source(eth_key_file)
         if not secret:
             secret = load_recovery_json(swap_file).get("eth_key_hex") or None
         if not secret:
