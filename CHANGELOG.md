@@ -100,7 +100,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sending again; the maker-stall refund records a mismatched refund as `asset_refund_txid`, as the
   mutual refund already did. Either counts as landed only when every configured source reads the
   covenant spent by that leaf, one confirmation deep (`RadiantCovenantLeg.covenant_spend`), with two
-  operators on a network that carries value; the txid is kept until a later send returns.
+  operators on a network that carries value; the txid is kept until a later send returns. A spend
+  by the other leaf raises `ValidationError` naming it. A leg whose sources cannot read a script's
+  history falls back to the chain IO's own reads, as before.
 - **The watchtower watches a BTC fund the record never took as its lock (#842).** A taker's fund
   writes its signed transaction to the record before the broadcast; a fund interrupted before the
   lock was recorded left a `negotiated` record the tower read as "no action due", so a maker claim
