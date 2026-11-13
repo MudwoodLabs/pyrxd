@@ -64,6 +64,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   says it already has them, and rebuilds only when the hold runs out or a server refuses them. The
   claim is never marked seen on the mismatch itself. The hold is in memory, so a restart rebuilds,
   as before.
+- **A held autonomous claim is rebuilt, not re-sent, as its window closes.** A server that drops the
+  held bytes and answers every re-send with another txid could keep the claim off the network for
+  the whole hold, and a re-send skips the deadline-aware fee gate. `ClaimExecutor` now ends the hold
+  once its finality re-assess, run the leg fee policy's `urgency_horizon_blocks` ahead, no longer
+  reads SAFE (the last 6 blocks it claims in, with `MarginPolicy.estimated()` and the default fee
+  policy); from then on each tick rebuilds.
+- **A broadcast echo mismatch is offered to the second-opinion servers.** With
+  `RadiantChainIO.with_second_opinion` (the autonomous claim's `second_opinion`), bytes the broadcast
+  client answered with another txid now go to the second-opinion clients too, as a rejection's do;
+  one that takes them returns a `SecondOpinionTxid`, and otherwise the mismatch is raised.
+- **A coordinator claim or maker-stall refund answered with another txid can be retried.** A retry
+  used to rebuild into the covenant the first send had spent and fail "no UTXO found" every time.
+  `SwapCoordinator` now keeps a mismatched taker claim's txid (in memory) and checks it before
+  sending again; the maker-stall refund records a mismatched refund as `asset_refund_txid`, as the
+  mutual refund already did.
 
 ## [0.28.0] — 2026-11-07
 

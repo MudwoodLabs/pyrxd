@@ -331,3 +331,39 @@ async def test_a_mismatched_stall_refund_that_did_not_land_is_sent_again() -> No
     await coord._refund_asset_on_stall_once()
     assert leg.refunds == 2
     assert coord.record.asset_refund_txid is None, "a dropped refund's record is cleared before the re-send"
+
+
+def _callers_of(attr: str) -> set[str]:
+    """The SwapCoordinator methods whose bodies call ``self.radiant_leg.<attr>(...)``, read from the
+    source, so a new call site that skips the helper is found without a hand-kept list."""
+    import ast
+    import inspect
+
+    from pyrxd.gravity import swap_coordinator
+
+    tree = ast.parse(inspect.getsource(swap_coordinator.SwapCoordinator))
+    found: set[str] = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == attr
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "radiant_leg"
+            ):
+                found.add(fn.name)
+    return found
+
+
+def test_every_coordinator_claim_goes_through_the_mismatch_aware_helper() -> None:
+    assert _callers_of("claim_asset") == {"_claim_asset_once"}
+
+
+def test_the_stall_refund_goes_through_the_mismatch_aware_helper() -> None:
+    callers = _callers_of("refund_asset")
+    assert callers, "the coordinator refunds the covenant somewhere"
+    assert "_refund_asset_on_stall_once" in callers
+    assert "maybe_refund_asset_on_maker_stall" not in callers
