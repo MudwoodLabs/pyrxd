@@ -2,8 +2,9 @@
 
 The behaviour against a real contract (the signed refund settles it, nothing reaches the node, and
 each on-chain refusal) is in ``tests/test_build_eth_refund_anvil_integration.py``. Here: the record
-and key gates, the artifact pairing, the sign-only rpc, and the refusal of a recorded refund that
-is mined, pending or queued. Each refusal has its honest pair.
+and key gates, the artifact pairing, the sign-only rpc, the refusal of a recorded refund that
+is mined, pending or queued, and the command's settled and maturity refusals over a stubbed leg
+(so they run on every push, not only nightly). Each refusal has its honest pair.
 """
 
 from __future__ import annotations
@@ -602,6 +603,68 @@ def test_the_fee_check_ignores_the_first_endpoints_own_suggestion(monkeypatch) -
     _stub_leg(monkeypatch, rich)
     with pytest.raises(ValidationError, match="more than 2x"):
         _build(_Multi(_Rpc(tip=100, max_fee=300), _Rpc(tip=1, max_fee=3)))
+
+
+# ── the contract's own state: settled and maturity (anvil plants P02 and P03) ──────────────────────
+# The anvil file proves the leg reads these off a real contract; these hold the command's refusals
+# in the per-push suite, so removing either guard fails a PR rather than the next nightly run.
+
+
+def _counting_leg(monkeypatch, *, settled: bool) -> list[str]:
+    signed: list[str] = []
+
+    async def check_refund_target(self, locator):
+        return settled
+
+    async def refund(self, locator, **_):
+        signed.append(locator.contract_address)
+        await self._rpc.preflight(_TX)
+        return await self._rpc.send_raw(_sign(self._key, locator, _TX))
+
+    async def preflight(self, _tx):
+        return None
+
+    monkeypatch.setattr(EthHtlcContractLeg, "check_refund_target", check_refund_target)
+    monkeypatch.setattr(EthHtlcContractLeg, "refund", refund)
+    monkeypatch.setattr(_Rpc, "preflight", preflight, raising=False)
+    return signed
+
+
+class _HeadAt(_Rpc):
+    def __init__(self, head: int) -> None:
+        super().__init__()
+        self.head = head
+
+    async def latest_block_timestamp_min(self) -> int:
+        return self.head
+
+
+def test_a_settled_contract_is_refused_with_nothing_signed(monkeypatch) -> None:
+    signed = _counting_leg(monkeypatch, settled=True)
+    with pytest.raises(ValidationError, match="already SETTLED"):
+        _build(_Rpc())
+    assert signed == []
+
+
+def test_an_unsettled_mature_contract_is_signed(monkeypatch) -> None:
+    signed = _counting_leg(monkeypatch, settled=False)
+    out = _build(_Rpc())
+    assert signed == [_locator().contract_address] and out.raw_hex.startswith("0x02")
+
+
+@pytest.mark.parametrize("early", [1, 3600])
+def test_a_refund_before_the_timeout_is_refused_with_nothing_signed(monkeypatch, early) -> None:
+    signed = _counting_leg(monkeypatch, settled=False)
+    with pytest.raises(ValidationError, match="not open yet"):
+        _build(_HeadAt(_locator().timeout - early))
+    assert signed == []
+
+
+def test_a_refund_at_the_timeout_is_signed(monkeypatch) -> None:
+    """refund() opens at ``block.timestamp >= timeout``, so the head at the timeout itself signs."""
+    signed = _counting_leg(monkeypatch, settled=False)
+    out = _build(_HeadAt(_locator().timeout))
+    assert signed and out.chain_time_unix == out.timeout_unix == _locator().timeout
 
 
 # ── the record against the recovery file (Mythos 6.4, plant P07) ───────────────────────────────────
