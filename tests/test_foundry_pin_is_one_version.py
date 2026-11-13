@@ -24,7 +24,7 @@ def _foundry_steps() -> list[tuple[str, str, dict]]:
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         for job_id, job in (doc.get("jobs") or {}).items():
             for step in job.get("steps") or []:
-                if str(step.get("uses", "")).startswith(_ACTION):
+                if str(step.get("uses", "")).lower().startswith(_ACTION):  # owners resolve case-insensitively
                     found.append((f"{path.name}:{job_id}", step["uses"], step.get("with") or {}))
     return found
 

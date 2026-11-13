@@ -181,18 +181,21 @@ jobs:
             tests/test_starter_kit_regtest_e2e.py
       # The ETH leg against a real EVM, on every PR. These two files need anvil and nothing else
       # (no Radiant node, no fork RPC), and take seconds. Before this step they ran only in
-      # `nightly-cross-chain`, and two of build-eth-refund's refusals (a settled contract, a head
-      # before the timeout) were held by them alone, so a PR that removed either merged green
-      # (combined Mythos pass, host check H6.5). They stay in the nightly step as well. Same
-      # installer pin and anvil version as `nightly-cross-chain`;
+      # `nightly-cross-chain`. They stay in the nightly step as well. This job is NOT a required
+      # check, so a red step here shows on the PR but does not block its merge; the default-lane
+      # unit tests in tests/cli/test_swap_eth_refund.py are what a merge needs to pass. Both
+      # steps run even when an earlier step failed, so a Radiant-suite failure does not hide
+      # this verdict. Same installer pin and anvil version as `nightly-cross-chain`;
       # tests/test_foundry_pin_is_one_version.py keeps the two equal.
       - name: Install Foundry (anvil)
+        if: ${{ !cancelled() }}
         uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: v1.8.5
       # Both modules skip as a whole when `anvil` is not on PATH, which would read as a pass, so
       # the step fails unless the JUnit report shows tests ran and none skipped.
       - name: ETH leg and build-eth-refund on a local anvil
+        if: ${{ !cancelled() }}
         run: |
           poetry run pytest -o "addopts=" -m integration -q -rap \
             --junitxml=/tmp/anvil-lane.xml \
