@@ -6481,30 +6481,34 @@ class SwapCoordinator:
             raise
 
     async def _mismatched_claim_landed(self, txid: str) -> bool | None:
-        """True when the claim *txid* has a confirmation; False when it did not land and must be sent
-        again (the covenant reads unspent, or there is no chain reader, which is what a retry did
-        before); None when neither (in the mempool, or the covenant spent by another transaction).
-        A depth read that fails with no covenant reader to fall back on raises, like
-        :meth:`_recorded_asset_refund_landed`."""
+        """True when the claim *txid* has a confirmation AND the covenant no longer reads unspent;
+        False when it did not land and must be sent again (the covenant reads unspent, or there is no
+        chain reader, which is what a retry did before); None when neither (in the mempool, or the
+        covenant spent by another transaction). The covenant is read even when a depth comes back:
+        the client asked is the one that just answered this claim with another txid, so its depth
+        alone does not end the retries. A depth read that fails with no covenant reader to fall back
+        on raises, like :meth:`_recorded_asset_refund_landed`."""
         chain_io = getattr(self.radiant_leg, "chain_io", None)
         if chain_io is None:
             return False
         failure: Exception | None = None
+        confirmed = False
         try:
             confs = await chain_io.confirmations(txid)
-            if isinstance(confs, int) and not isinstance(confs, bool) and confs >= 1:
-                return True
+            confirmed = isinstance(confs, int) and not isinstance(confs, bool) and confs >= 1
         except Exception as exc:  # a node that never saw the tx answers an error, like an outage
             failure = exc
         unspent = getattr(chain_io, "covenant_outpoint_unspent", None)
         outpoint, spk_hex = self.record.radiant_covenant_outpoint, self.record.radiant_covenant_spk_hex
         if unspent is None or outpoint is None or spk_hex is None:
+            if confirmed:
+                return True
             if failure is not None:
                 raise failure
             return False
         if await unspent(bytes.fromhex(spk_hex), outpoint):
             return False
-        return None
+        return True if confirmed else None
 
     async def _refund_asset_on_stall_once(self) -> None:
         """Send the maker-stall covenant refund, unless one recorded as ``asset_refund_txid`` is on
@@ -6516,7 +6520,9 @@ class SwapCoordinator:
         from pyrxd.security.errors import BroadcastEchoMismatch
 
         if self.record.asset_refund_txid is not None:
-            if await self._recorded_asset_refund_landed():
+            # Without a chain reader _recorded_asset_refund_landed takes a recorded refund as sent;
+            # one recorded here was answered with another txid, so it is sent again instead.
+            if getattr(self.radiant_leg, "chain_io", None) is not None and await self._recorded_asset_refund_landed():
                 return
             # Recorded, but not on chain (dropped or replaced): send it again.
             self.record = dataclasses.replace(self.record, asset_refund_txid=None)

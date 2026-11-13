@@ -620,7 +620,9 @@ class ClaimExecutor:
 
         # 8. Broadcast the covenant claim (reuses the mainnet-proven leg path; logs txid+value, never p).
         held = self._held.get(outpoint)
-        if held is not None and self._hold_ends_near_deadline(swap_id, outpoint, record, verdict, now_rxd, funded_h, leg):
+        if held is not None and self._hold_ends_near_deadline(
+            swap_id, outpoint, record, verdict, now_rxd, funded_h, leg
+        ):
             held = None
         if held is not None:
             return await self._resend_held(swap_id, outpoint, held, leg)
@@ -842,7 +844,7 @@ class ClaimExecutor:
         verdict: CounterClaimFinality,
         now_rxd: int,
         funded_h: int,
-        leg,
+        leg: Any,
     ) -> bool:
         """End the hold on *outpoint* when the claim window is about to close, so this tick rebuilds
         the claim instead of re-sending the held bytes (Mythos combo 3.2).
@@ -859,7 +861,8 @@ class ClaimExecutor:
         rebuilds, as before #937 and #789: a fresh claim through the fee gate, on a new fee input. That
         costs one input per tick if the held claim did relay and each rebuild conflicts with it. With
         :meth:`MarginPolicy.estimated` (6-block burial, 6-block horizon) that is the last 6 blocks the
-        executor still claims in, measured by ``tests/test_claim_executor_echo_mismatch.py``. The
+        executor still claims in, as ``tests/test_claim_hold_mythos_combo_lows.py`` pins (13 blocks left
+        re-sends; 12 and 7 rebuild; 6 declines). The
         re-assess counts from ``now_rxd``, built from the deeper of the single node's and the quorum's
         depth, so a lagging source cannot keep the hold alive."""
         horizon = _urgency_horizon_blocks(leg)

@@ -437,7 +437,7 @@ the covenant; they are bound only transitively, by recomputing
 `holder_hash(pkh, variant=…, genesis_ref=…)` and comparing it to the dest hash baked into the
 covenant bytecode (`holder_hash`, `htlc_covenant.py:202-222`; the same mechanism proves a credential's owner is the
 payout recipient at `swap_coordinator.py:3588-3592`). A pkh that does not reproduce the dest hash
-is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:1532-1510`).
+is rejected fail-closed when the leg builds the covenant (`radiant_leg.py:1532-1535`).
 Holder-script layouts, from `htlc_covenant.py:190-199`:
 
 | variant | holder script | bytes |
@@ -465,10 +465,10 @@ one-sided taker loss because the claim leaf does not cap value.
 
 All three additionally pin `OP_TXOUTPUTCOUNT OP_1` (exactly one output) and the destination hash.
 The leg re-reads the on-chain value rather than trusting a self-report, filtering the covenant UTXO
-set on the expected value and failing closed when nothing matches (`radiant_leg.py:699-677`). When
+set on the expected value and failing closed when nothing matches (`radiant_leg.py:699-702`). When
 **several** outputs match it does **not** refuse: it selects the earliest-confirmed one (unconfirmed
 sorts last; ties break on txid, then index), and once the funded outpoint is recorded, the claim
-pins to it instead of scanning again (`radiant_leg.py:703-723`). Refusing was the weakness this
+pins to it instead of scanning again (`radiant_leg.py:703-748`). Refusing was the weakness this
 replaced. The covenant SPK is a pure function of public terms, so a second payment to it can come
 from anyone who can build one, and a refusal would let that payment block the taker's claim until
 the maker's CSV refund opens. That is a one-sided taker loss. Selecting is safe because every

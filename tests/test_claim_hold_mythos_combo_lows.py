@@ -136,10 +136,10 @@ async def test_the_horizon_comes_from_the_legs_fee_policy(tick) -> None:
     already rebuilds."""
     from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 
-    node, ex, rec, fees = await _held_by_a_liar(tick, 13)
+    _node, ex, rec, fees = await _held_by_a_liar(tick, 13)
     leg = await ex._resolve_leg("swap-1", rec)
     leg.fee_policy = dataclasses.replace(DeadlineFeePolicy(), urgency_horizon_blocks=20)
-    outcome, said = await tick(ex, rec)
+    _outcome, said = await tick(ex, rec)
     assert "no longer re-sent" in said, said
     assert len(fees.outpoints) == 2
 
@@ -169,14 +169,15 @@ async def test_a_mismatch_no_second_opinion_takes_is_raised_as_the_mismatch() ->
     assert second.broadcasts == [raw], "the second operator was asked"
 
 
-async def test_a_pin_mismatch_in_the_round_still_raises_the_mismatch() -> None:
+async def test_a_pin_mismatch_in_the_round_still_raises_the_mismatch(caplog) -> None:
     """The bytes went out to the broadcast client, so a pin failure on the second opinion must not
-    turn the answer into a transport failure, which the executor would rebuild on."""
+    turn the answer into a transport failure, which the executor would rebuild on. It is still logged."""
     primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
     primary.lie = True
     second.fail = TlsPinMismatchError("pin mismatch")
-    with pytest.raises(RadiantEchoMismatch):
+    with caplog.at_level(logging.ERROR), pytest.raises(RadiantEchoMismatch):
         await RadiantChainIO(primary).with_second_opinion((second,)).broadcast(os.urandom(80))
+    assert any(r.levelno == logging.ERROR and "TLS pin" in r.getMessage() for r in caplog.records)
 
 
 async def test_without_a_second_opinion_the_mismatch_is_raised_as_before() -> None:
@@ -278,6 +279,54 @@ async def test_a_mismatched_claim_that_confirms_is_not_sent_again() -> None:
     leg.confs[sent] = 1
     await coord._claim_asset_once(_P)  # returns: the caller advances the record
     assert len(leg.claims) == 1, "nothing sent again"
+
+
+async def test_a_depth_from_the_mis_echoing_client_alone_does_not_end_the_retries() -> None:
+    """The client that answered the claim with another txid also reports it one deep, but the
+    covenant still reads unspent: the claim did not land, so it is sent again."""
+    leg = _Leg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.confs[_txid(leg.claims[0])] = 1  # the covenant still reads unspent
+    leg.lie = False
+    await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 2
+
+
+async def test_a_mismatched_claim_with_no_chain_reader_is_sent_again() -> None:
+    leg = _Leg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.chain_io = None
+    leg.lie = False
+    await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 2
+
+
+async def test_a_failed_depth_read_with_no_covenant_reader_raises_and_sends_nothing() -> None:
+    class _NoCovenantReader(_Leg):
+        covenant_outpoint_unspent = None  # type: ignore[assignment]
+
+    leg = _NoCovenantReader()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    with pytest.raises(NetworkError, match="No such mempool"):
+        await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 1
+
+
+async def test_a_mismatched_stall_refund_with_no_chain_reader_is_sent_again() -> None:
+    leg = _Leg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._refund_asset_on_stall_once()
+    leg.chain_io = None
+    leg.lie = False
+    await coord._refund_asset_on_stall_once()
+    assert leg.refunds == 2
 
 
 async def test_a_mismatched_claim_in_the_mempool_waits_and_sends_nothing() -> None:
