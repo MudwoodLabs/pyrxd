@@ -81,6 +81,12 @@ def _second(name: str = "beta") -> _OpNode:
 # --------------------------------------------------------------------------- RadiantChainIO.broadcast
 
 
+def _rebuild_due(ex) -> bool:
+    """Every held claim has used its re-sends: the next tick rebuilds. The bytes are kept until a
+    rebuild is sent (re-review of the Mythos #986 fixes), so the hold is not empty."""
+    return bool(ex._held) and all(left == 0 for _raw, left in ex._held.values())
+
+
 async def test_a_second_operator_that_takes_a_rejected_transaction_makes_the_broadcast_succeed() -> None:
     primary, second = _primary(), _second()
     raw = os.urandom(80)
@@ -486,7 +492,7 @@ async def test_a_held_claim_re_send_transport_failure_counts_down(tick) -> None:
     primary.fail = NetworkError("connection reset")
     outcome, said = await tick(ex, rec)
     assert outcome is ExecOutcome.FAILED and "re-send failed (transient)" in said, said
-    assert ex._held == {}, "the last re-send ends the hold even when it fails"
+    assert _rebuild_due(ex), "the last re-send makes the next tick rebuild even when it fails"
 
 
 @pytest.mark.parametrize("bad", [0, -1, True, 1.5, "10"])
@@ -646,7 +652,7 @@ async def test_a_cancelled_re_send_still_counts_down(tick) -> None:
     assert ex._held[outpoint][1] == 1, "one re-send spent"
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(tick(ex, rec), 0.2)
-    assert ex._held == {}, "the last one ends the hold"
+    assert _rebuild_due(ex), "the last one makes the next tick rebuild"
 
 
 # F5: the whole round runs under one time budget.

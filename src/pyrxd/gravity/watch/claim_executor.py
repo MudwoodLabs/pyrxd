@@ -399,10 +399,11 @@ class ClaimExecutor:
         # rebuilds (see _resend_held for what that costs), which never disarms the claim.
         self._resend_ticks = int(second_opinion_resend_ticks)
         self._held: dict[str, tuple[bytes, int]] = {}
-        # The covenant height, by the lower of the single node's and the quorum's depth, at which each
-        # outpoint's claim was last built: near the deadline a held claim is rebuilt at most once per
-        # new block by that height (_near_deadline). And the outpoints already logged as near it.
-        self._built_at: dict[str, int] = {}
+        # The covenant heights, by the shallower and by the deeper of the single node's and the quorum's
+        # depth, at which each outpoint's claim was last built: near the deadline a held claim is rebuilt
+        # at most once per new block, by both heights (_near_deadline). And the outpoints already
+        # logged as near it.
+        self._built_at: dict[str, tuple[int, int]] = {}
         self._near_logged: set[str] = set()
         # Why this tick's execute() ended as it did, by swap id, for the claim page (#935). Set by
         # execute(), taken (and so cleared) by the reconciler right after; see take_reason.
@@ -632,13 +633,16 @@ class ClaimExecutor:
         near = self._near_deadline(swap_id, outpoint, record, verdict, now_rxd, funded_h, leg)
         low_rxd = funded_h + max(low_confs, 1) - 1
         held = self._held.get(outpoint)
-        if held is not None and (not near or low_rxd <= self._built_at.get(outpoint, low_rxd - 1)):
+        built = self._built_at.get(outpoint)
+        new_block = built is None or (low_rxd > built[0] and now_rxd > built[1])
+        # A hold whose re-sends ran out (0 left) keeps its bytes but is due a rebuild.
+        if held is not None and held[1] > 0 and (not near or not new_block):
             return await self._resend_held(swap_id, outpoint, held, leg)
         from pyrxd.gravity.radiant_leg import RadiantEchoMismatch
 
         # Kept until a rebuild is sent: when the pool cannot fund one, these bytes are re-sent instead.
         prior = held
-        self._built_at[outpoint] = low_rxd
+        self._built_at[outpoint] = (low_rxd, now_rxd)
         try:
             txid = await leg.claim_asset(record, bytes(p))
         except asyncio.CancelledError as exc:
@@ -796,8 +800,8 @@ class ClaimExecutor:
         second opinion could drain the pool other swaps' claims are funded from. Re-sending spends
         nothing new. The bytes are re-sent through the same chain IO, so the broadcast client is asked
         first: if it now takes them, the claim is marked seen. While only a second opinion takes them,
-        they are re-sent for ``second_opinion_resend_ticks`` ticks; then the hold ends and the next tick
-        rebuilds on a new fee input, so a lying second opinion (one that keeps nothing) delays a claim by
+        they are re-sent for ``second_opinion_resend_ticks`` ticks; then each tick rebuilds on a new fee
+        input (the bytes are kept until a rebuild is sent, and re-sent when the pool cannot fund one), so a lying second opinion (one that keeps nothing) delays a claim by
         at most that many ticks per rebuild, and the broadcast client sees a fresh claim each time. A
         round in which no client takes them ends the hold at once when the broadcast client refuses
         them and no second opinion has taken them when the chain IO's ``second_opinion_timeout_s``
@@ -835,7 +839,7 @@ class ClaimExecutor:
             # after its last one.
             self._count_down(outpoint, raw, left)
             return ExecOutcome.FAILED, _why(
-                "held_claim", f"held claim re-send echo mismatch ({left - 1} re-sends left): {exc}"
+                "held_claim", f"held claim re-send echo mismatch ({max(left - 1, 0)} re-sends left): {exc}"
             )
         except BaseException:
             # Anything else (a custom client's own exception, or the reconciler's tick watchdog
@@ -849,7 +853,7 @@ class ClaimExecutor:
                 ExecOutcome.DECLINED,
                 _why(
                     "held_claim",
-                    f"claim {txid} held only by a second-opinion server; re-sent the same bytes ({left - 1} re-sends left)",
+                    f"claim {txid} held only by a second-opinion server; re-sent the same bytes ({max(left - 1, 0)} re-sends left)",
                 ),
             )
         self._held.pop(outpoint, None)
@@ -895,10 +899,13 @@ class ClaimExecutor:
         shared capped pool, so a broadcast client that lies for a few ticks drained it to its cap and
         nothing was sent (F2.1). So, in ``_run``:
 
-        * The held bytes are rebuilt only when the covenant's height, by the SHALLOWER of the single
-          node's and the quorum's depth, has passed the height the claim was last built at, so one
-          source that over-reports depth cannot force a rebuild per tick (F2.2); or when the hold's
-          re-sends run out, as anywhere in the window. Otherwise they are re-sent.
+        * The held bytes are rebuilt only when the covenant's height has passed the height the claim
+          was last built at by BOTH the shallower and the deeper of the single node's and the quorum's
+          depth, so neither a source that over-reports depth (F2.2) nor a primary that under-reports
+          and then climbs (re-review of this fix) can force a rebuild per tick; or when the hold's
+          re-sends run out, as anywhere in the window. Otherwise they are re-sent. Without a quorum both
+          heights are the single node's: one that climbs a block per tick walks the window into
+          SQUEEZED within the horizon, where the executor declines.
         * The held bytes are kept until a rebuild is sent. When the pool refuses the rebuild
           (``InsufficientFundsError``, ``FeePoolExhaustedError``) they are re-sent in the same tick.
 
@@ -939,11 +946,10 @@ class ClaimExecutor:
         return True
 
     def _count_down(self, outpoint: str, raw: bytes, left: int) -> None:
-        """Spend one re-send of a held claim; the last one ends the hold."""
-        if left > 1:
-            self._held[outpoint] = (raw, left - 1)
-        else:
-            self._held.pop(outpoint, None)
+        """Spend one re-send of a held claim. The last one makes the next tick rebuild, but the bytes
+        are kept (0 re-sends left) until a rebuild is sent, so a pool that cannot fund the rebuild
+        still has them to re-send (re-review of the fix for the Mythos pass on #986)."""
+        self._held[outpoint] = (raw, max(left - 1, 0))
 
     def _check_value_cap(self, record: SwapRecord) -> str | None:
         """Return a decline reason if the swap's value exceeds the reorg-protected ceiling, else None.

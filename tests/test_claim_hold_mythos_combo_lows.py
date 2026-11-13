@@ -213,6 +213,58 @@ async def test_the_horizon_comes_from_the_legs_fee_policy(tick) -> None:
     assert len(fees.outpoints) == 2
 
 
+async def test_a_primary_that_under_reports_then_climbs_cannot_force_a_rebuild_per_tick(tick) -> None:
+    """Re-review of the fix: the primary (the client that mis-echoes) under-reports the covenant's
+    depth and then raises it one block per tick, while an honest quorum puts the window in the last
+    horizon. A rebuild needs the deeper height to move too, so there is one per real block."""
+    node, ex, rec, fees = await _held_by_a_liar(tick, 30)
+    node.depth = 2
+
+    class _Honest:
+        async def covenant_confirmations(self, outpoint: str) -> int:
+            return _left(10)
+
+    ex._rxd_depth_corroborator = _Honest()
+    for _ in range(8):
+        node.depth += 1
+        await tick(ex, rec)
+    assert len(fees.outpoints) == 2, fees.outpoints
+
+
+async def test_an_exhausted_pool_keeps_the_held_bytes_after_the_re_sends_run_out(tick) -> None:
+    """Re-review of the fix: with the pool exhausted, a liar that answers more re-sends than the hold
+    allows must not cost the signed claim. Once the client stops lying, the held bytes land."""
+    from pyrxd.security.errors import FeePoolExhaustedError
+
+    node, ex, rec, fees = await _held_by_a_liar(tick, 12)
+    first = node.broadcasts[0]
+
+    def _empty():
+        raise FeePoolExhaustedError("the pool is at its cap")
+
+    fees.next_fee_input = _empty
+    for _ in range(ex._resend_ticks + 1):
+        node.depth += 1 if node.depth < _left(7) else 0
+        await tick(ex, rec)
+    assert ex._held, "the bytes are kept"
+    node.lie, node.relay = False, True
+    await tick(ex, rec)
+    assert node.broadcasts[-1] == first
+    node.mine()
+    assert _assert_paid_once(node, fees) == _txid(first)
+
+
+async def test_a_rebuild_the_broadcast_client_takes_ends_the_hold(tick) -> None:
+    """Re-review LOW 2: with no seen store, a rebuilt claim the broadcast client takes must drop the
+    older held bytes, or the next tick would re-send them and conflict with the rebuild."""
+    node, ex, rec, _fees = await _held_by_a_liar(tick, 10)
+    assert ex._seen is None
+    node.lie, node.relay = False, True
+    outcome, said = await tick(ex, rec)
+    assert outcome is ExecOutcome.BROADCAST, said
+    assert ex._held == {}
+
+
 async def test_a_huge_horizon_is_logged_and_still_bounded_per_block(tick) -> None:
     """F1.1: a hand-built fee policy with a horizon wider than the window puts the whole window in
     the last horizon. That is logged, once, and rebuilds stay at one per block."""
@@ -540,7 +592,13 @@ def _spend(kind: str, *, buried: bool = True, operators: int = 2):
     from pyrxd.gravity.radiant_leg import CovenantSpend, CovenantSpendKind
 
     return CovenantSpend(
-        CovenantSpendKind(kind), "test", txid="ee" * 32, depth=1 if buried else 0, buried=buried, operators=operators
+        CovenantSpendKind(kind),
+        "test",
+        txid="ee" * 32,
+        depth=1 if buried else 0,
+        buried=buried,
+        sources=("wss://electrum.alpha.example/", "wss://electrum.beta.example/"),
+        operators=operators,
     )
 
 
@@ -573,10 +631,9 @@ async def test_a_claim_every_source_reads_buried_is_not_sent_again() -> None:
     [
         _spend("claimed", buried=False),
         _spend("claimed", operators=1),
-        _spend("refunded"),
         _spend("unknown"),
     ],
-    ids=["in-the-mempool", "one-operator-on-value", "refunded", "unknown"],
+    ids=["in-the-mempool", "one-operator-on-value", "unknown"],
 )
 async def test_a_claim_not_shown_landed_by_every_source_sends_nothing(spend) -> None:
     leg = _SpendLeg(network="mainnet")
@@ -584,6 +641,63 @@ async def test_a_claim_not_shown_landed_by_every_source_sends_nothing(spend) -> 
     with pytest.raises(RadiantEchoMismatch):
         await coord._claim_asset_once(_P)
     leg.spend = spend
+    with pytest.raises(NetworkError, match="Nothing was sent again"):
+        await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 1
+
+
+async def test_a_stall_refund_the_taker_claimed_says_so() -> None:
+    """Re-review LOW 1: a recorded refund, then the covenant reads CLAIMED: the refund can never land,
+    and the error says the claim leaf spent it, not "not confirmed"."""
+    from pyrxd.security.errors import ValidationError
+
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._refund_asset_on_stall_once()
+    leg.spend = _spend("claimed")
+    with pytest.raises(ValidationError, match="p is public"):
+        await coord._refund_asset_on_stall_once()
+    assert leg.refunds == 1
+
+
+async def test_a_claim_the_maker_refunded_says_so() -> None:
+    from pyrxd.security.errors import ValidationError
+
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.spend = _spend("refunded")
+    with pytest.raises(ValidationError, match="CSV refund leaf"):
+        await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 1
+
+
+async def test_sources_that_cannot_read_history_fall_back_to_the_chain_io() -> None:
+    """Re-review LOW 3: no source can read a script's history (none answers, none failed), so the one
+    chain IO's reads decide, as before, rather than waiting forever."""
+    from pyrxd.gravity.radiant_leg import CovenantSpend, CovenantSpendKind
+
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.spend = CovenantSpend(CovenantSpendKind.UNKNOWN, "no source answered")
+    leg.unspent, leg.confs[_txid(leg.claims[0])] = False, 1
+    await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 1
+
+
+async def test_sources_that_all_failed_send_nothing() -> None:
+    """Honest-path pair of the fallback: sources that failed are an outage, not a missing reader."""
+    from pyrxd.gravity.radiant_leg import CovenantSpend, CovenantSpendKind
+
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.spend = CovenantSpend(CovenantSpendKind.UNKNOWN, "no source answered", failed=("alpha",))
     with pytest.raises(NetworkError, match="Nothing was sent again"):
         await coord._claim_asset_once(_P)
     assert len(leg.claims) == 1
@@ -662,14 +776,15 @@ def _callers_in(tree: Any, attr: str) -> set[str]:
 
 
 def _callers_of(attr: str) -> set[str]:
-    """The SwapCoordinator methods that call *attr*, read from the source, so a new call site that
-    skips the helper is found without a hand-kept list of receivers."""
+    """The functions in ``swap_coordinator`` (methods and module-level helpers alike) that call
+    *attr*, read from the module's source, so a new call site that skips the helper is found without
+    a hand-kept list of receivers."""
     import ast
     import inspect
 
     from pyrxd.gravity import swap_coordinator
 
-    return _callers_in(ast.parse(inspect.getsource(swap_coordinator.SwapCoordinator)), attr)
+    return _callers_in(ast.parse(inspect.getsource(swap_coordinator)), attr)
 
 
 def _calls(fn_name: str) -> set[str]:

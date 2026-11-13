@@ -6497,20 +6497,37 @@ class SwapCoordinator:
         (Mythos pass on #986, F4.1): every answering source must name the same spender, and on a
         network that carries value at least :data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`
         operators must answer, or this is None. The leaf is read from the spender's bytes, so a spend
-        by another transaction of the same leaf counts: consensus binds each leaf to its output. A leg
-        without that reader falls back to :meth:`_mismatched_claim_landed`."""
+        by another transaction of the same leaf counts: consensus binds each leaf to its output. A
+        spend by the OTHER leaf raises :class:`ValidationError`, since this send can never land. A leg
+        without that reader, or whose sources cannot read a script's history (none answers and none
+        failed), falls back to the one chain IO's reads (:meth:`_mismatched_claim_landed`,
+        :meth:`_recorded_asset_refund_landed`), as before."""
+        from .radiant_leg import CovenantSpendKind
+
         read = getattr(self.radiant_leg, "covenant_spend", None)
-        if not callable(read):
-            if kind.value == "refunded":
+        spend = await read(self.record, burial_blocks=1) if callable(read) else None
+        if spend is None or (spend.kind is CovenantSpendKind.UNKNOWN and not spend.sources and not spend.failed):
+            # No reader, or no source that can read a script's history: the one chain IO's word, as before.
+            if kind is CovenantSpendKind.REFUNDED:
                 if getattr(self.radiant_leg, "chain_io", None) is None:
                     return False
                 return await self._recorded_asset_refund_landed()
             return await self._mismatched_claim_landed(txid)
-        from .radiant_leg import CovenantSpendKind
-
-        spend = await read(self.record, burial_blocks=1)
         if spend.kind is CovenantSpendKind.UNSPENT:
             return False
+        if spend.kind in (CovenantSpendKind.CLAIMED, CovenantSpendKind.REFUNDED) and spend.kind is not kind:
+            # The other leaf spent the covenant: this send can never land, and retrying cannot help.
+            which = "claim" if kind is CovenantSpendKind.CLAIMED else "refund"
+            other = (
+                "the taker's claim leaf, so p is public and the taker has the asset"
+                if spend.kind is CovenantSpendKind.CLAIMED
+                else "the maker's CSV refund leaf, so the maker has the asset back"
+            )
+            raise ValidationError(
+                f"the covenant {which} sent as {txid} (the server answered another txid) cannot land: the covenant "
+                f"was spent by {spend.txid} through {other} ({spend.reason}). Nothing was sent again and the record "
+                "is unchanged."
+            )
         if spend.kind is not kind or not spend.buried:
             return None
         if spend.operators < MIN_REPORTING_OPERATORS and _leg_is_value_bearing(self.radiant_leg):
