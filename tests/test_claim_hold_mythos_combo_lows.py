@@ -237,13 +237,17 @@ async def test_a_primary_that_drops_back_cannot_restart_the_rebuilds(tick) -> No
     node, ex, rec, fees = await _held_by_a_liar(tick, 10)
     await tick(ex, rec)
     assert len(fees.outpoints) == 2
-    for depth in (_left(30), _left(20), _left(12), _left(10)):
+    node.depth = _left(30)  # far from the deadline: the re-sends run out and one rebuild follows
+    for _ in range(ex._resend_ticks + 1):
+        await tick(ex, rec)
+    assert len(fees.outpoints) == 3, fees.outpoints
+    for depth in (_left(20), _left(12), _left(10)):  # climbing back, no higher than the last build
         node.depth = depth
         await tick(ex, rec)
-    assert len(fees.outpoints) == 2, fees.outpoints
+    assert len(fees.outpoints) == 3, fees.outpoints
     node.depth = _left(9)  # past the last build: one more
     await tick(ex, rec)
-    assert len(fees.outpoints) == 3
+    assert len(fees.outpoints) == 4
 
 
 async def test_an_exhausted_pool_keeps_the_held_bytes_after_the_re_sends_run_out(tick) -> None:
