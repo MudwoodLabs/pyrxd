@@ -698,6 +698,25 @@ async def test_one_source_cannot_end_the_claims_retries_with_the_other_leaf(spen
     assert len(leg.claims) == 1
 
 
+@pytest.mark.parametrize(
+    "spend",
+    [_spend("claimed", buried=False), _spend("claimed", operators=1)],
+    ids=["unburied", "one-operator-on-value"],
+)
+async def test_one_source_cannot_end_the_stall_refunds_retries_with_the_other_leaf(spend) -> None:
+    """The refund side of the same rule: a CLAIMED read that is not buried, or comes from one operator
+    on a network that carries value, is a retry, and the recorded refund is kept."""
+    leg = _SpendLeg(network="mainnet")
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._refund_asset_on_stall_once()
+    recorded = coord.record.asset_refund_txid
+    leg.spend = spend
+    with pytest.raises(NetworkError, match="Nothing was sent again"):
+        await coord._refund_asset_on_stall_once()
+    assert leg.refunds == 1 and coord.record.asset_refund_txid == recorded
+
+
 async def test_a_claim_the_maker_refunded_says_so() -> None:
     from pyrxd.security.errors import ValidationError
 
