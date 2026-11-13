@@ -481,12 +481,16 @@ class RadiantChainIO:
             # and re-sends exactly as it holds a mismatch; no taker raises the mismatch. A TLS pin
             # failure in the round is logged by the round and the mismatch is raised in its place:
             # the bytes went out, so the caller must not read it as a transport failure and rebuild.
+            # A cancellation in the round carries the mismatch as its cause, so a caller that holds
+            # mismatched bytes still can (Mythos pass on #986, F3.1).
             try:
                 taken = await self._ask_second_opinion(
                     bytes(raw_tx), verb="mis-echoed", detail=f"answered txid {mismatch.echoed!r}"
                 )
             except TlsPinMismatchError:
                 taken = None
+            except asyncio.CancelledError as cancelled:
+                raise cancelled from mismatch
             if taken is None:
                 raise mismatch
             return taken

@@ -81,12 +81,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   says it already has them, and rebuilds only when the hold runs out or a server refuses them. The
   claim is never marked seen on the mismatch itself. The hold is in memory, so a restart rebuilds,
   as before.
-- **A held autonomous claim is rebuilt, not re-sent, as its window closes.** A server that drops the
-  held bytes and answers every re-send with another txid could keep the claim off the network for
-  the whole hold, and a re-send skips the deadline-aware fee gate. `ClaimExecutor` now ends the hold
-  once its finality re-assess, run the leg fee policy's `urgency_horizon_blocks` ahead, no longer
-  reads SAFE (the last 6 blocks it claims in, with `MarginPolicy.estimated()` and the default fee
-  policy); from then on each tick rebuilds.
+- **A held autonomous claim is rebuilt once per block as its window closes.** A server that drops
+  the held bytes and answers every re-send with another txid could keep the claim off the network
+  for the whole hold. Once `ClaimExecutor`'s finality re-assess, run the leg fee policy's
+  `urgency_horizon_blocks` ahead, no longer reads SAFE (the last 6 blocks it claims in, with
+  `MarginPolicy.estimated()` and the default fee policy), a held claim is rebuilt on a new fee input
+  when the covenant's shallower depth reaches a new block, and re-sent in between. The held bytes are
+  kept until a rebuild is sent, and re-sent when the fee pool cannot fund one. At the default fee
+  policy a rebuild there pays no urgency premium. A tick cancelled while the second opinions are
+  asked after a mismatch keeps the hold.
 - **A broadcast echo mismatch is offered to the second-opinion servers.** With
   `RadiantChainIO.with_second_opinion` (the autonomous claim's `second_opinion`), bytes the broadcast
   client answered with another txid now go to the second-opinion clients too, as a rejection's do;
@@ -95,7 +98,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   used to rebuild into the covenant the first send had spent and fail "no UTXO found" every time.
   `SwapCoordinator` now keeps a mismatched taker claim's txid (in memory) and checks it before
   sending again; the maker-stall refund records a mismatched refund as `asset_refund_txid`, as the
-  mutual refund already did.
+  mutual refund already did. Either counts as landed only when every configured source reads the
+  covenant spent by that leaf, one confirmation deep (`RadiantCovenantLeg.covenant_spend`), with two
+  operators on a network that carries value; the txid is kept until a later send returns.
 - **The watchtower watches a BTC fund the record never took as its lock (#842).** A taker's fund
   writes its signed transaction to the record before the broadcast; a fund interrupted before the
   lock was recorded left a `negotiated` record the tower read as "no action due", so a maker claim

@@ -1,9 +1,10 @@
 """Three LOW findings of the combined Mythos pass of 2026-11-12 on the #789 echo-mismatch fix.
 
 * 3.2: a held claim (one the broadcast client answered with another txid, or only a second opinion
-  took) was re-sent for the whole hold whatever the deadline, and a re-send skips the deadline-aware
-  fee gate. Now the hold ends once the executor's own finality re-assess, run the fee policy's
-  urgency horizon ahead, no longer reads SAFE: from then on each tick rebuilds.
+  took) was re-sent for the whole hold whatever the deadline. Now, once the executor's own finality
+  re-assess, run the fee policy's urgency horizon ahead, no longer reads SAFE, a held claim is
+  rebuilt once per new block and re-sent in between; the held bytes are kept until a rebuild is
+  sent, and re-sent when the pool cannot fund one (the Mythos pass on #986, F2.1/F2.2).
 * 3.3: after a mismatch no second opinion was asked. Now ``RadiantChainIO.broadcast`` offers the
   same bytes to the second-opinion clients, so an honest operator relays a claim the broadcast
   client dropped.
@@ -103,23 +104,91 @@ async def test_far_from_the_deadline_the_held_bytes_are_re_sent(tick) -> None:
 
 
 @pytest.mark.parametrize("blocks_left", [12, 7])
-async def test_near_the_deadline_the_held_claim_is_rebuilt_not_re_sent(tick, blocks_left) -> None:
+async def test_near_the_deadline_the_held_claim_is_rebuilt_once_per_block(tick, blocks_left) -> None:
     """Inside the last urgency horizon the executor still claims in, a liar that drops the held bytes
-    must not keep the claim off the network for the whole hold: every tick rebuilds."""
+    must not keep the claim off the network for the whole hold: a new block rebuilds it. In the same
+    block the rebuilt bytes are re-sent, not rebuilt again."""
     node, ex, rec, fees = await _held_by_a_liar(tick, blocks_left)
     first = node.broadcasts[0]
 
     outcome, said = await tick(ex, rec)
-    assert "no longer re-sent, the claim is rebuilt" in said, said
+    assert "rebuilt once per new block" in said, said
+    assert "until the next block, then rebuilding" in said, said
     assert len(fees.outpoints) == 2, "rebuilt on a new fee input"
-    assert node.broadcasts[-1] != first
+    rebuilt = node.broadcasts[-1]
+    assert rebuilt != first
 
     node.lie, node.relay = False, True
     outcome, said = await tick(ex, rec)
-    assert outcome is ExecOutcome.BROADCAST, said
-    assert len(fees.outpoints) == 3
+    assert outcome is ExecOutcome.DECLINED and "now taken by the broadcast client" in said, said
+    assert node.broadcasts[-1] == rebuilt and len(fees.outpoints) == 2, "re-sent, not rebuilt"
+    node.mine()
+    assert _assert_paid_once(node, fees) == _txid(rebuilt)
+
+
+async def test_a_liar_near_the_deadline_spends_one_input_per_block_not_per_tick(tick) -> None:
+    """F2.1: a broadcast client that lies for eight ticks in the last horizon used to take a fee
+    input every tick. In one block it now takes one, and the rebuilt claim lands once the client
+    stops lying."""
+    node, ex, rec, fees = await _held_by_a_liar(tick, 10)
+    for _ in range(8):
+        await tick(ex, rec)
+    assert len(fees.outpoints) == 2, fees.outpoints
+    assert len(set(node.broadcasts[1:])) == 1, "the one rebuild is re-sent, not rebuilt"
+    node.lie, node.relay = False, True
+    await tick(ex, rec)
     node.mine()
     assert _assert_paid_once(node, fees) == _txid(node.broadcasts[-1])
+
+
+async def test_the_next_block_allows_one_more_rebuild(tick) -> None:
+    """Honest path of the per-block bound: a new block lets a held claim be rebuilt again."""
+    node, ex, rec, fees = await _held_by_a_liar(tick, 10)
+    await tick(ex, rec)
+    assert len(fees.outpoints) == 2
+    node.depth += 1
+    await tick(ex, rec)
+    assert len(fees.outpoints) == 3
+
+
+async def test_an_exhausted_pool_near_the_deadline_re_sends_the_held_bytes(tick) -> None:
+    """F2.1: when the pool cannot fund the rebuild, the held claim is re-sent instead of dropped, and
+    the page still says the pool is exhausted."""
+    from pyrxd.security.errors import FeePoolExhaustedError
+
+    node, ex, rec, fees = await _held_by_a_liar(tick, 10)
+    first = node.broadcasts[0]
+
+    def _empty():
+        raise FeePoolExhaustedError("the pool is at its cap")
+
+    fees.next_fee_input = _empty
+    node.lie, node.relay = False, True
+    outcome, _said = await tick(ex, rec)
+    why = ex.take_reason("swap-1")
+    assert outcome is ExecOutcome.FAILED and why.kind == "fee_pool_exhausted", why
+    assert "the held claim was re-sent instead" in why.text, why
+    assert node.broadcasts[-1] == first, "the held bytes went out again"
+    node.mine()
+    assert _assert_paid_once(node, fees) == _txid(first)
+
+
+async def test_one_over_reporting_depth_source_cannot_force_a_rebuild_per_tick(tick) -> None:
+    """F2.2: a quorum source that over-reports depth (and keeps raising it) puts every tick in the
+    last horizon. Rebuilds follow the SHALLOWER depth, which does not move, so there is one."""
+    _node, ex, rec, fees = await _held_by_a_liar(tick, 30)  # the single node: far from the deadline
+
+    class _Liar:
+        depth = _left(10)
+
+        async def covenant_confirmations(self, outpoint: str) -> int:
+            self.depth += 1
+            return self.depth
+
+    ex._rxd_depth_corroborator = _Liar()
+    for _ in range(4):
+        await tick(ex, rec)
+    assert len(fees.outpoints) == 2, fees.outpoints
 
 
 async def test_inside_the_squeeze_the_executor_still_declines(tick) -> None:
@@ -132,16 +201,63 @@ async def test_inside_the_squeeze_the_executor_still_declines(tick) -> None:
 
 
 async def test_the_horizon_comes_from_the_legs_fee_policy(tick) -> None:
-    """A wider urgency horizon ends the hold earlier: with 20 blocks of horizon, 13 blocks left
-    already rebuilds."""
+    """A wider urgency horizon reaches the last horizon earlier: with 20 blocks of horizon, 13 blocks
+    left already rebuilds."""
     from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 
     _node, ex, rec, fees = await _held_by_a_liar(tick, 13)
     leg = await ex._resolve_leg("swap-1", rec)
     leg.fee_policy = dataclasses.replace(DeadlineFeePolicy(), urgency_horizon_blocks=20)
     _outcome, said = await tick(ex, rec)
-    assert "no longer re-sent" in said, said
+    assert "rebuilt once per new block" in said, said
     assert len(fees.outpoints) == 2
+
+
+async def test_a_huge_horizon_is_logged_and_still_bounded_per_block(tick) -> None:
+    """F1.1: a hand-built fee policy with a horizon wider than the window puts the whole window in
+    the last horizon. That is logged, once, and rebuilds stay at one per block."""
+    from pyrxd.gravity.fee_policy import DeadlineFeePolicy
+
+    _node, ex, rec, fees = await _held_by_a_liar(tick, 60)
+    leg = await ex._resolve_leg("swap-1", rec)
+    leg.fee_policy = dataclasses.replace(DeadlineFeePolicy(), urgency_horizon_blocks=1000)
+    _outcome, said = await tick(ex, rec)
+    assert "1000 block(s) from now" in said, said
+    for _ in range(3):
+        _outcome, said = await tick(ex, rec)
+        assert "1000 block(s)" not in said, "logged once"
+    assert len(fees.outpoints) == 2
+
+
+async def test_an_un_assessable_look_ahead_counts_as_near_the_deadline(tick, monkeypatch) -> None:
+    """P04: a look-ahead that cannot be assessed reads as near the deadline (fail closed toward the
+    rebuild), not as SAFE. The first assess of each tick is the real gate; the second is the look-ahead."""
+    from pyrxd.gravity.watch import claim_executor
+    from pyrxd.security.errors import ValidationError
+
+    _node, ex, rec, fees = await _held_by_a_liar(tick, 30)
+    real, calls = claim_executor.assess_claim_finality, []
+
+    def _second_raises(**kw):
+        calls.append(kw)
+        if len(calls) % 2 == 0:
+            raise ValidationError("cannot assess")
+        return real(**kw)
+
+    monkeypatch.setattr(claim_executor, "assess_claim_finality", _second_raises)
+    _outcome, said = await tick(ex, rec)
+    assert "un-assessable" in said, said
+    assert len(fees.outpoints) == 2, "rebuilt, as near the deadline"
+
+
+def test_the_default_fee_policy_adds_no_premium_where_the_executor_rebuilds() -> None:
+    """F1.3: the docs say a near-deadline rebuild takes a new fee input and, at the default policy, no
+    urgency premium: the rebuild zone under ``MarginPolicy.estimated`` is 12 down to 7 blocks left,
+    and the premium starts inside the 6-block horizon."""
+    from pyrxd.gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY as policy
+
+    assert all(policy.urgency_multiplier(b) == 1.0 for b in range(7, 13))
+    assert policy.urgency_multiplier(1) > 1.0
 
 
 # --------------------------------------------------------------------------- 3.3: a second opinion after a mismatch
@@ -204,6 +320,29 @@ async def test_a_claim_the_broadcast_client_drops_and_lies_about_lands_through_a
     assert len(fees.outpoints) == 1
     _one_chain(primary, second)
     assert _assert_paid_once(second, fees) == _txid(claim)
+
+
+async def test_a_tick_cancelled_in_the_second_opinion_round_keeps_the_hold(tick, monkeypatch) -> None:
+    """F3.1: the broadcast client answered with another txid, then the tick was cancelled while the
+    second opinions were asked. The bytes went out, so they are held, not lost to a rebuild."""
+    import asyncio
+
+    primary, second = _OpNode("wss://electrum.alpha.example/"), _second()
+    ex, rec, fees = await _with_second_opinion(primary, second)
+    primary.lie, primary.relay = True, False
+
+    async def _cancelled(self, raw, **kw):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(RadiantChainIO, "_ask_second_opinion", _cancelled)
+    with pytest.raises(asyncio.CancelledError) as info:
+        await tick(ex, rec)
+    assert isinstance(info.value.__cause__, RadiantEchoMismatch)
+    held = next(iter(ex._held.values()))
+    assert held[0] == primary.broadcasts[0]
+    monkeypatch.undo()
+    await tick(ex, rec)
+    assert len(fees.outpoints) == 1, "re-sent, not rebuilt"
 
 
 # --------------------------------------------------------------------------- 3.4: the coordinator's claim and stall refund
@@ -382,29 +521,167 @@ async def test_a_mismatched_stall_refund_that_did_not_land_is_sent_again() -> No
     assert coord.record.asset_refund_txid is None, "a dropped refund's record is cleared before the re-send"
 
 
-def _callers_of(attr: str) -> set[str]:
-    """The SwapCoordinator methods whose bodies call ``self.radiant_leg.<attr>(...)``, read from the
-    source, so a new call site that skips the helper is found without a hand-kept list."""
+class _SpendLeg(_Leg):
+    """A ``_Leg`` that also reads what spent the covenant from every source, as
+    ``RadiantCovenantLeg.covenant_spend`` does; ``spend`` is what that read answers."""
+
+    def __init__(self, network: str = "bcrt") -> None:
+        super().__init__()
+        self.network = network
+        self.spend: Any = None
+        self.reads: list[int] = []
+
+    async def covenant_spend(self, record, *, burial_blocks: int):
+        self.reads.append(burial_blocks)
+        return self.spend
+
+
+def _spend(kind: str, *, buried: bool = True, operators: int = 2):
+    from pyrxd.gravity.radiant_leg import CovenantSpend, CovenantSpendKind
+
+    return CovenantSpend(
+        CovenantSpendKind(kind), "test", txid="ee" * 32, depth=1 if buried else 0, buried=buried, operators=operators
+    )
+
+
+async def test_the_mis_echoing_client_alone_cannot_mark_the_claim_landed() -> None:
+    """F4.1: the client that answered with another txid says the claim is one deep and the covenant
+    spent, but every source together reads the covenant unspent: the claim is sent again."""
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.confs[_txid(leg.claims[0])], leg.unspent = 1, False  # the one client's word
+    leg.spend, leg.lie = _spend("unspent"), False
+    await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 2 and leg.reads == [1]
+
+
+async def test_a_claim_every_source_reads_buried_is_not_sent_again() -> None:
+    """Honest path of F4.1."""
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.spend = _spend("claimed")
+    await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 1
+
+
+@pytest.mark.parametrize(
+    "spend",
+    [
+        _spend("claimed", buried=False),
+        _spend("claimed", operators=1),
+        _spend("refunded"),
+        _spend("unknown"),
+    ],
+    ids=["in-the-mempool", "one-operator-on-value", "refunded", "unknown"],
+)
+async def test_a_claim_not_shown_landed_by_every_source_sends_nothing(spend) -> None:
+    leg = _SpendLeg(network="mainnet")
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.spend = spend
+    with pytest.raises(NetworkError, match="Nothing was sent again"):
+        await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 1
+
+
+async def test_a_failed_re_send_keeps_the_first_claims_txid() -> None:
+    """F4.2: the covenant reads unspent (the first claim is in a mempool the reader cannot see), so
+    the claim is sent again and the node refuses the conflict. The first claim's txid is kept, so
+    once it confirms a retry sees it and sends nothing."""
+    from pyrxd.security.errors import PolicyRejection
+
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    first = coord._mismatched_claim_txid
+    leg.spend = _spend("unspent")
+
+    async def _conflict(record, preimage):
+        leg.claims.append(b"conflict")
+        raise PolicyRejection("txn-mempool-conflict")
+
+    leg.claim_asset = _conflict
+    with pytest.raises(PolicyRejection):
+        await coord._claim_asset_once(_P)
+    assert coord._mismatched_claim_txid == first
+    leg.spend = _spend("claimed")
+    await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 2 and coord._mismatched_claim_txid is None
+
+
+async def test_a_stall_refund_every_source_reads_buried_is_not_sent_again() -> None:
+    """N7.C: the recorded refund counts as landed only on every source's read, not on one depth."""
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._refund_asset_on_stall_once()
+    leg.confs[leg.last_refund] = 1  # the mis-echoing client's depth alone
+    leg.spend = _spend("unspent")
+    leg.lie = False
+    await coord._refund_asset_on_stall_once()
+    assert leg.refunds == 2
+    assert coord.record.asset_refund_txid is None
+
+
+async def test_a_stall_refund_in_the_mempool_sends_nothing() -> None:
+    leg = _SpendLeg()
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._refund_asset_on_stall_once()
+    recorded = coord.record.asset_refund_txid
+    leg.spend = _spend("refunded", buried=False)
+    with pytest.raises(NetworkError, match="Nothing was sent again"):
+        await coord._refund_asset_on_stall_once()
+    assert leg.refunds == 1 and coord.record.asset_refund_txid == recorded
+    leg.spend = _spend("refunded")
+    await coord._refund_asset_on_stall_once()
+    assert leg.refunds == 1
+
+
+def _callers_in(tree: Any, attr: str) -> set[str]:
+    """The functions in *tree* whose bodies call ``<anything>.<attr>(...)`` or name *attr* in a string
+    (a ``getattr``): any receiver, so an alias of ``self.radiant_leg`` counts (Mythos pass on #986, F4.3)."""
     import ast
-    import inspect
 
-    from pyrxd.gravity import swap_coordinator
-
-    tree = ast.parse(inspect.getsource(swap_coordinator.SwapCoordinator))
     found: set[str] = set()
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for node in ast.walk(fn):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == attr
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == "radiant_leg"
+            if (isinstance(node, ast.Attribute) and node.attr == attr) or (
+                isinstance(node, ast.Constant) and node.value == attr
             ):
                 found.add(fn.name)
     return found
+
+
+def _callers_of(attr: str) -> set[str]:
+    """The SwapCoordinator methods that call *attr*, read from the source, so a new call site that
+    skips the helper is found without a hand-kept list of receivers."""
+    import ast
+    import inspect
+
+    from pyrxd.gravity import swap_coordinator
+
+    return _callers_in(ast.parse(inspect.getsource(swap_coordinator.SwapCoordinator)), attr)
+
+
+def _calls(fn_name: str) -> set[str]:
+    """The attribute names *fn_name* (a SwapCoordinator method) calls."""
+    import ast
+    import inspect
+    import textwrap
+
+    from pyrxd.gravity import swap_coordinator
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(swap_coordinator.SwapCoordinator, fn_name))))
+    return {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
 
 
 def test_every_coordinator_claim_goes_through_the_mismatch_aware_helper() -> None:
@@ -412,7 +689,24 @@ def test_every_coordinator_claim_goes_through_the_mismatch_aware_helper() -> Non
 
 
 def test_the_stall_refund_goes_through_the_mismatch_aware_helper() -> None:
-    callers = _callers_of("refund_asset")
-    assert callers, "the coordinator refunds the covenant somewhere"
-    assert "_refund_asset_on_stall_once" in callers
-    assert "maybe_refund_asset_on_maker_stall" not in callers
+    """Pinned as a set: a refund moved to a new method is a new caller (F4.3). The other two are the
+    mutual refund and the maker's covenant refund, which record their own txid."""
+    assert _callers_of("refund_asset") == {
+        "_refund_asset_on_stall_once",
+        "_refund_the_covenant_once",
+        "maker_refund_covenant",
+    }
+    assert "_refund_asset_on_stall_once" in _calls("maybe_refund_asset_on_maker_stall")
+
+
+def test_the_guard_sees_an_alias_of_the_leg() -> None:
+    """The F4.3 plants: ``leg = self.radiant_leg; await leg.claim_asset(...)`` and a ``getattr`` by
+    name are still callers."""
+    import ast
+
+    src = (
+        "class C:\n"
+        "    async def f(self):\n        leg = self.radiant_leg\n        await leg.claim_asset(1, 2)\n"
+        "    async def g(self):\n        await getattr(self.radiant_leg, 'claim_asset')(1, 2)\n"
+    )
+    assert _callers_in(ast.parse(src), "claim_asset") == {"f", "g"}

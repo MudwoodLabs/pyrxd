@@ -40,6 +40,7 @@ Safety properties (mirroring the v2 refund discipline + the divergent-review har
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -101,8 +102,8 @@ MAINNET_DUST_CEILING_PHOTONS = 10_000
 #: Ticks a held claim is re-sent as the same bytes before the next rebuild: one only a second-opinion
 #: server took (#937), or one the broadcast client answered with another txid (#789). At the
 #: watchtower's documented 30 s poll that is about 5 minutes, one Radiant block (PROJECTED from the
-#: 300 s block target, not measured against a live tower). Near the end of the claim window the hold
-#: ends early and each tick rebuilds (``ClaimExecutor._hold_ends_near_deadline``).
+#: 300 s block target, not measured against a live tower). Near the end of the claim window a held
+#: claim is also rebuilt once per new block (``ClaimExecutor._near_deadline``).
 SECOND_OPINION_RESEND_TICKS = 10
 
 # Test/regtest networks (no real value) == the audit-cleared set. Aliased so the executor's value-bearing
@@ -398,6 +399,11 @@ class ClaimExecutor:
         # rebuilds (see _resend_held for what that costs), which never disarms the claim.
         self._resend_ticks = int(second_opinion_resend_ticks)
         self._held: dict[str, tuple[bytes, int]] = {}
+        # The covenant height, by the lower of the single node's and the quorum's depth, at which each
+        # outpoint's claim was last built: near the deadline a held claim is rebuilt at most once per
+        # new block by that height (_near_deadline). And the outpoints already logged as near it.
+        self._built_at: dict[str, int] = {}
+        self._near_logged: set[str] = set()
         # Why this tick's execute() ended as it did, by swap id, for the claim page (#935). Set by
         # execute(), taken (and so cleared) by the reconciler right after; see take_reason.
         self._reasons: dict[str, ExecReason] = {}
@@ -575,6 +581,7 @@ class ClaimExecutor:
         except Exception as exc:
             return ExecOutcome.FAILED, f"fresh depth read failed: {type(exc).__name__}: {exc}"
         cov_confs = single_node_confs
+        low_confs = single_node_confs  # the SHALLOWER read: only it may let a held claim be rebuilt
         # MAX-depth RXD quorum (review HIGH): a single lagging node can UNDER-report cov_confs → larger
         # blocks_left → false-SAFE. When a corroborator is wired, take the DEEPER of the single node and the
         # quorum (the quorum already returns the conservative MAX across sources); below-quorum/unresolvable
@@ -591,6 +598,7 @@ class ClaimExecutor:
             if corro is None:
                 return ExecOutcome.DECLINED, "RXD depth not corroborated by quorum — refusing to auto-claim"
             cov_confs = max(single_node_confs, corro)  # the DEEPER read; a lagging single node can't false-SAFE
+            low_confs = min(single_node_confs, corro)
         now_rxd = funded_h + max(cov_confs, 1) - 1
         # ONE CONVERSION, the gate's — see the same note in `swap_coordinator`. `normalize_to`
         # FLOORS, which under-counts a reserve and would declare the maker's BTC claim final a
@@ -619,17 +627,27 @@ class ClaimExecutor:
             return ExecOutcome.DECLINED, f"fresh re-assess is {finality.value} (window not safe to claim now)"
 
         # 8. Broadcast the covenant claim (reuses the mainnet-proven leg path; logs txid+value, never p).
+        # A held claim is re-sent, not rebuilt. Near the deadline it is rebuilt once per new block
+        # (Mythos combo 3.2 and the Mythos pass on #986): see _near_deadline.
+        near = self._near_deadline(swap_id, outpoint, record, verdict, now_rxd, funded_h, leg)
+        low_rxd = funded_h + max(low_confs, 1) - 1
         held = self._held.get(outpoint)
-        if held is not None and self._hold_ends_near_deadline(
-            swap_id, outpoint, record, verdict, now_rxd, funded_h, leg
-        ):
-            held = None
-        if held is not None:
+        if held is not None and (not near or low_rxd <= self._built_at.get(outpoint, low_rxd - 1)):
             return await self._resend_held(swap_id, outpoint, held, leg)
         from pyrxd.gravity.radiant_leg import RadiantEchoMismatch
 
+        # Kept until a rebuild is sent: when the pool cannot fund one, these bytes are re-sent instead.
+        prior = held
+        self._built_at[outpoint] = low_rxd
         try:
             txid = await leg.claim_asset(record, bytes(p))
+        except asyncio.CancelledError as exc:
+            # The tick was cancelled after the broadcast client answered with another txid, while the
+            # second opinions were asked (RadiantChainIO.broadcast chains the mismatch as the cause):
+            # the bytes went out, so they are held as on a mismatch, not lost (Mythos pass on #986, F3.1).
+            if isinstance(exc.__cause__, RadiantEchoMismatch):
+                self._held[outpoint] = (exc.__cause__.raw, self._resend_ticks)
+            raise
         except InsufficientFundsError as exc:
             # PRE-BROADCAST fee gate (gap-closure A1): the dispensed fee input is below the
             # node's relay floor, so the leg refused to broadcast. Nothing went on-chain and no
@@ -656,7 +674,9 @@ class ClaimExecutor:
                 exc,
             )
             return ExecOutcome.DECLINED, _why(
-                "fee_below_floor", f"fee input below the deadline-aware relay requirement: {exc}"
+                "fee_below_floor",
+                f"fee input below the deadline-aware relay requirement: {exc}"
+                + await self._resend_prior(swap_id, outpoint, prior, leg),
             )
         except FeePoolExhaustedError as exc:
             # The capped, dispense-once pool has nothing left under its cap (#936): every earlier
@@ -674,7 +694,9 @@ class ClaimExecutor:
                 pool,
             )
             return ExecOutcome.FAILED, _why(
-                "fee_pool_exhausted", f"fee pool exhausted or at its cap, nothing broadcast ({pool}): {exc}"
+                "fee_pool_exhausted",
+                f"fee pool exhausted or at its cap, nothing broadcast ({pool}): {exc}"
+                + await self._resend_prior(swap_id, outpoint, prior, leg),
             )
         except PolicyRejection as exc:
             # PolicyRejection subclasses NetworkError, so this clause must precede the NetworkError
@@ -723,9 +745,12 @@ class ClaimExecutor:
                 exc.local_txid,
                 self._resend_ticks,
             )
-            return ExecOutcome.FAILED, _why(
-                "echo_mismatch", f"claim broadcast echo mismatch; re-sending the same bytes next tick: {exc}"
+            then = (
+                "re-sending the same bytes until the next block, then rebuilding"
+                if near
+                else "re-sending the same bytes next tick"
             )
+            return ExecOutcome.FAILED, _why("echo_mismatch", f"claim broadcast echo mismatch; {then}: {exc}")
         except NetworkError as exc:
             if _is_missing_utxo(exc):  # raced to spent between the check and the build → benign
                 return ExecOutcome.DECLINED, _why("covenant_spent", "covenant spent during claim (raced?) — no-op")
@@ -746,8 +771,11 @@ class ClaimExecutor:
                 txid,
                 self._resend_ticks,
             )
-        elif self._seen is not None:
-            await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
+        else:
+            # The broadcast client took this claim: a claim held from an earlier build is done with.
+            self._held.pop(outpoint, None)
+            if self._seen is not None:
+                await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
         logger.warning(
             "autonomous claim swap %s: covenant claim broadcast txid=%s value=%d (asset → taker holder)",
             swap_id,
@@ -836,7 +864,16 @@ class ClaimExecutor:
             "held_claim", "held claim now taken by the broadcast client — awaiting confirmation"
         )
 
-    def _hold_ends_near_deadline(
+    async def _resend_prior(self, swap_id: str, outpoint: str, prior: tuple[bytes, int] | None, leg: Any) -> str:
+        """Re-send the held claim *prior* when the pool could not fund its rebuild, and say so for the
+        reason text; ``""`` when nothing was held. Without this, near the deadline a pool that cannot
+        fund a rebuild left nothing on the network at all (Mythos pass on #986, F2.1)."""
+        if prior is None:
+            return ""
+        _outcome, said = await self._resend_held(swap_id, outpoint, prior, leg)
+        return f"; the held claim was re-sent instead ({said})"
+
+    def _near_deadline(
         self,
         swap_id: str,
         outpoint: str,
@@ -846,25 +883,36 @@ class ClaimExecutor:
         funded_h: int,
         leg: Any,
     ) -> bool:
-        """End the hold on *outpoint* when the claim window is about to close, so this tick rebuilds
-        the claim instead of re-sending the held bytes (Mythos combo 3.2).
+        """Whether the claim window for *outpoint* is about to close: the executor's own finality
+        re-assess, run ``urgency_horizon_blocks`` (the leg's fee policy's) blocks ahead, does not read
+        SAFE, or cannot be assessed (Mythos combo 3.2, reworked after the Mythos pass on #986).
 
-        The hold saves fee inputs, but near the end of the window it costs too much. A broadcast client
-        that drops the held bytes and answers each re-send with a wrong txid keeps the claim off the
-        network for the whole hold, which does not shrink as the window closes; once the fresh
-        re-assess above stops reading SAFE the executor declines and only a person can claim. And the
-        held bytes were fee'd when they were built: the deadline-aware gate
-        (``RadiantCovenantLeg._assert_affordable``) does not run on a re-send.
+        Near the deadline a held claim is rebuilt once per new block, and re-sent in between. The
+        hold alone costs too much there: a broadcast client that drops the held bytes and answers each
+        re-send with a wrong txid keeps the claim off the network for the whole hold, which does not
+        shrink as the window closes, and once the fresh re-assess stops reading SAFE only a person can
+        claim. A rebuild every tick costs too much as well: each one dispenses an input from the
+        shared capped pool, so a broadcast client that lies for a few ticks drained it to its cap and
+        nothing was sent (F2.1). So, in ``_run``:
 
-        So the hold ends once the same re-assess, run ``urgency_horizon_blocks`` (the leg's fee
-        policy's) blocks ahead, no longer reads SAFE, or cannot be assessed. From then on every tick
-        rebuilds, as before #937 and #789: a fresh claim through the fee gate, on a new fee input. That
-        costs one input per tick if the held claim did relay and each rebuild conflicts with it. With
-        :meth:`MarginPolicy.estimated` (6-block burial, 6-block horizon) that is the last 6 blocks the
-        executor still claims in, as ``tests/test_claim_hold_mythos_combo_lows.py`` pins (13 blocks left
-        re-sends; 12 and 7 rebuild; 6 declines). The
-        re-assess counts from ``now_rxd``, built from the deeper of the single node's and the quorum's
-        depth, so a lagging source cannot keep the hold alive."""
+        * The held bytes are rebuilt only when the covenant's height, by the SHALLOWER of the single
+          node's and the quorum's depth, has passed the height the claim was last built at, so one
+          source that over-reports depth cannot force a rebuild per tick (F2.2); or when the hold's
+          re-sends run out, as anywhere in the window. Otherwise they are re-sent.
+        * The held bytes are kept until a rebuild is sent. When the pool refuses the rebuild
+          (``InsufficientFundsError``, ``FeePoolExhaustedError``) they are re-sent in the same tick.
+
+        That bounds the cost near the deadline at about one input per block (one per
+        ``second_opinion_resend_ticks`` ticks when blocks are slower than that). A rebuild takes a new
+        fee input; at the default fee policy it pays no urgency premium, since the premium starts
+        inside the horizon where :meth:`MarginPolicy.estimated` already reads SQUEEZED.
+
+        With :meth:`MarginPolicy.estimated` (6-block burial) and the default 6-block horizon, this
+        reads True from 12 blocks left down to 7 (6 declines), and False at 13, as
+        ``tests/test_claim_hold_mythos_combo_lows.py`` pins. A wider horizon only makes this read True
+        earlier; the per-block bound still holds, and the first time is logged. The re-assess counts
+        from ``now_rxd``, built from the DEEPER depth, so a lagging source cannot keep this False.
+        The executor acts only on ticks: one that comes after the window closed declines, held or not."""
         horizon = _urgency_horizon_blocks(leg)
         try:
             ahead = assess_claim_finality(
@@ -879,15 +927,15 @@ class ClaimExecutor:
             ahead = None
         if ahead is ClaimFinality.SAFE:
             return False
-        self._held.pop(outpoint, None)
-        logger.error(
-            "autonomous claim swap %s: the claim window reads %s %d block(s) from now (the fee policy's "
-            "urgency horizon); the held claim is no longer re-sent, the claim is rebuilt this tick on a "
-            "new fee input",
-            swap_id,
-            ahead.value if ahead is not None else "un-assessable",
-            horizon,
-        )
+        if outpoint not in self._near_logged:
+            self._near_logged.add(outpoint)
+            logger.warning(
+                "autonomous claim swap %s: the claim window reads %s %d block(s) from now (the fee policy's "
+                "urgency horizon); a held claim is now rebuilt once per new block and re-sent in between",
+                swap_id,
+                ahead.value if ahead is not None else "un-assessable",
+                horizon,
+            )
         return True
 
     def _count_down(self, outpoint: str, raw: bytes, left: int) -> None:
@@ -972,7 +1020,7 @@ class _Why(str):
 
 def _urgency_horizon_blocks(leg: Any) -> int:
     """The leg's fee policy's ``urgency_horizon_blocks``, or the default policy's when the leg has none
-    (a custom leg): how far ahead :meth:`ClaimExecutor._hold_ends_near_deadline` looks."""
+    (a custom leg): how far ahead :meth:`ClaimExecutor._near_deadline` looks."""
     from pyrxd.gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 
     horizon = getattr(getattr(leg, "fee_policy", None), "urgency_horizon_blocks", None)
@@ -1064,5 +1112,5 @@ def _is_missing_utxo(exc: Exception) -> bool:
     """True ONLY if a NetworkError signals an ABSENT covenant UTXO (the SPK has no live UTXO = spent/
     settled or not-yet-funded), vs a transient read fault OR a fail-closed anomaly (a value mismatch, which
     must NOT read as benign settlement; several matches are selected, never raised). Matches the exact 'no
-    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:698), not the mismatch."""
+    UTXO found' message radiant_leg raises at find_covenant_utxo (radiant_leg.py:702), not the mismatch."""
     return "no utxo found" in str(exc).lower()
