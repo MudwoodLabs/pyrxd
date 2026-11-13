@@ -22,7 +22,8 @@ name: Integration (node-backed)
 # The split
 # ---------
 #   regtest-core  — per push/PR (path-filtered). One Radiant node image, one container
-#                   per module, the fast Radiant suites. Budget: a few minutes.
+#                   per module, the fast Radiant suites, then the ETH leg's anvil-only
+#                   files. Budget: a few minutes.
 #   nightly-*     — schedule + manual only. The slow and the multi-chain: dMint's PoW
 #                   grinds, the SPV covenant differential matrix, RSWP, bitcoind/litecoind,
 #                   and the cross-chain legs. Parallel jobs, so nightly wall-clock is the
@@ -178,6 +179,40 @@ jobs:
             tests/test_dat_and_burn_regtest_e2e.py \
             tests/test_delegate_regtest_e2e.py \
             tests/test_starter_kit_regtest_e2e.py
+      # The ETH leg against a real EVM, on every PR. These two files need anvil and nothing else
+      # (no Radiant node, no fork RPC), and take seconds. Before this step they ran only in
+      # `nightly-cross-chain`. They stay in the nightly step as well. This job is NOT a required
+      # check, so a red step here shows on the PR but does not block its merge; the default-lane
+      # unit tests in tests/cli/test_swap_eth_refund.py are what a merge needs to pass. Both
+      # steps run even when an earlier step failed, so a Radiant-suite failure does not hide
+      # this verdict. Same installer pin and anvil version as `nightly-cross-chain`;
+      # tests/test_foundry_pin_is_one_version.py keeps the two equal.
+      - name: Install Foundry (anvil)
+        if: ${{ !cancelled() }}
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: v1.8.5
+      # Both modules skip as a whole when `anvil` is not on PATH, which would read as a pass, so
+      # the step fails unless the JUnit report shows tests ran and none skipped.
+      - name: ETH leg and build-eth-refund on a local anvil
+        if: ${{ !cancelled() }}
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q -rap \
+            --junitxml=/tmp/anvil-lane.xml \
+            tests/test_eth_leg_anvil_integration.py \
+            tests/test_build_eth_refund_anvil_integration.py
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("/tmp/anvil-lane.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root)
+          ran = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          if ran == 0 or skipped:
+              sys.exit(f"::error::anvil lane: {ran} tests, {skipped} skipped; it must run them all")
+          print(f"anvil lane: {ran} tests, none skipped")
+          PY
 
   # ---------------------------------------------------------------- nightly
   nightly-rswp:
