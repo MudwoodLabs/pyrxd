@@ -6498,7 +6498,8 @@ class SwapCoordinator:
         network that carries value at least :data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`
         operators must answer, or this is None. The leaf is read from the spender's bytes, so a spend
         by another transaction of the same leaf counts: consensus binds each leaf to its output. A
-        spend by the OTHER leaf raises :class:`ValidationError`, since this send can never land. A leg
+        spend by the OTHER leaf, buried and (on value) from enough operators, raises :class:`ValidationError`,
+        since this send can never land. A leg
         without that reader, or whose sources cannot read a script's history (none answers and none
         failed), falls back to the one chain IO's reads (:meth:`_mismatched_claim_landed`,
         :meth:`_recorded_asset_refund_landed`), as before."""
@@ -6515,6 +6516,11 @@ class SwapCoordinator:
             return await self._mismatched_claim_landed(txid)
         if spend.kind is CovenantSpendKind.UNSPENT:
             return False
+        if not spend.buried or (spend.operators < MIN_REPORTING_OPERATORS and _leg_is_value_bearing(self.radiant_leg)):
+            # Not yet buried, or too few operators to decide on a network that carries value: retry
+            # later. Checked BEFORE the other-leaf verdict below, which ends the retries, so one source
+            # that alone answers cannot end them (re-review of the #986 fix round).
+            return None
         if spend.kind in (CovenantSpendKind.CLAIMED, CovenantSpendKind.REFUNDED) and spend.kind is not kind:
             # The other leaf spent the covenant: this send can never land, and retrying cannot help.
             which = "claim" if kind is CovenantSpendKind.CLAIMED else "refund"
@@ -6528,11 +6534,7 @@ class SwapCoordinator:
                 f"was spent by {spend.txid} through {other} ({spend.reason}). Nothing was sent again and the record "
                 "is unchanged."
             )
-        if spend.kind is not kind or not spend.buried:
-            return None
-        if spend.operators < MIN_REPORTING_OPERATORS and _leg_is_value_bearing(self.radiant_leg):
-            return None
-        return True
+        return True if spend.kind is kind else None
 
     async def _mismatched_claim_landed(self, txid: str) -> bool | None:
         """True when the claim *txid* has a confirmation AND the covenant no longer reads unspent;

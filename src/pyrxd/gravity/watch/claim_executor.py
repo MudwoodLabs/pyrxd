@@ -642,7 +642,10 @@ class ClaimExecutor:
 
         # Kept until a rebuild is sent: when the pool cannot fund one, these bytes are re-sent instead.
         prior = held
-        self._built_at[outpoint] = (low_rxd, now_rxd)
+        # Never lowered: a source that reports a shallower depth at a rebuild must not reset the
+        # per-block gate and climb through the last horizon again (re-review of the #986 fix round).
+        was = self._built_at.get(outpoint, (low_rxd, now_rxd))
+        self._built_at[outpoint] = (max(was[0], low_rxd), max(was[1], now_rxd))
         try:
             txid = await leg.claim_asset(record, bytes(p))
         except asyncio.CancelledError as exc:
@@ -904,8 +907,9 @@ class ClaimExecutor:
           depth, so neither a source that over-reports depth (F2.2) nor a primary that under-reports
           and then climbs (re-review of this fix) can force a rebuild per tick; or when the hold's
           re-sends run out, as anywhere in the window. Otherwise they are re-sent. Without a quorum both
-          heights are the single node's: one that climbs a block per tick walks the window into
-          SQUEEZED within the horizon, where the executor declines.
+          heights are the single node's, and the gate's heights are never lowered: one that climbs a
+          block per tick walks the window into SQUEEZED within the horizon, where the executor
+          declines, and cannot drop back to start again.
         * The held bytes are kept until a rebuild is sent. When the pool refuses the rebuild
           (``InsufficientFundsError``, ``FeePoolExhaustedError``) they are re-sent in the same tick.
 

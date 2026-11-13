@@ -231,6 +231,21 @@ async def test_a_primary_that_under_reports_then_climbs_cannot_force_a_rebuild_p
     assert len(fees.outpoints) == 2, fees.outpoints
 
 
+async def test_a_primary_that_drops_back_cannot_restart_the_rebuilds(tick) -> None:
+    """Re-review of the fix round: with no quorum, a primary that reports far from the deadline and
+    climbs back must not get a second burst of rebuilds; the gate's heights are never lowered."""
+    node, ex, rec, fees = await _held_by_a_liar(tick, 10)
+    await tick(ex, rec)
+    assert len(fees.outpoints) == 2
+    for depth in (_left(30), _left(20), _left(12), _left(10)):
+        node.depth = depth
+        await tick(ex, rec)
+    assert len(fees.outpoints) == 2, fees.outpoints
+    node.depth = _left(9)  # past the last build: one more
+    await tick(ex, rec)
+    assert len(fees.outpoints) == 3
+
+
 async def test_an_exhausted_pool_keeps_the_held_bytes_after_the_re_sends_run_out(tick) -> None:
     """Re-review of the fix: with the pool exhausted, a liar that answers more re-sends than the hold
     allows must not cost the signed claim. Once the client stops lying, the held bytes land."""
@@ -659,6 +674,24 @@ async def test_a_stall_refund_the_taker_claimed_says_so() -> None:
     with pytest.raises(ValidationError, match="p is public"):
         await coord._refund_asset_on_stall_once()
     assert leg.refunds == 1
+
+
+@pytest.mark.parametrize(
+    "spend",
+    [_spend("refunded", buried=False), _spend("refunded", operators=1)],
+    ids=["unburied", "one-operator-on-value"],
+)
+async def test_one_source_cannot_end_the_claims_retries_with_the_other_leaf(spend) -> None:
+    """Re-review of the fix round: an other-leaf spend that is not buried, or comes from one operator
+    on a network that carries value, is a retry (NetworkError), not a verdict (ValidationError)."""
+    leg = _SpendLeg(network="mainnet")
+    coord = _coordinator(leg)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(_P)
+    leg.spend = spend
+    with pytest.raises(NetworkError, match="Nothing was sent again"):
+        await coord._claim_asset_once(_P)
+    assert len(leg.claims) == 1
 
 
 async def test_a_claim_the_maker_refunded_says_so() -> None:
