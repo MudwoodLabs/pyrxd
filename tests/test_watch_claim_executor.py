@@ -569,7 +569,7 @@ async def test_fresh_reassess_passes_per_record_value_at_risk(monkeypatch):
     photons/block needs 13 blocks of burial against the flat 6 — the value is now what decides the
     verdict, and dropping the kwarg turns this BROADCAST into a DECLINED.
 
-    Measured, with `value_at_risk_photons=None` planted at the call site (claim_executor.py:622
+    Measured, with `value_at_risk_photons=None` planted at the call site (claim_executor.py:623
     — the CLAIM-1 regression itself): on `MarginPolicy.estimated()` the executor still returns
     BROADCAST, so only the spy line below noticed; on the value-scaled policy it returns
     DECLINED, so the outcome assertion carries the test.
