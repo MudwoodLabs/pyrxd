@@ -48,7 +48,7 @@ re-derive from it.
 | Preimage-length pin, BTC leg | `src/pyrxd/btc_wallet/taproot.py:334-356` (`claim_leaf_script`) |
 | Preimage-length pin, Radiant leg | `src/pyrxd/gravity/artifacts/GravityHtlcCovenantRxd.artifact.json` (`OP_SWAP OP_SIZE 20 OP_EQUALVERIFY OP_SHA256 …`), and `src/pyrxd/gravity/htlc_spend.py:330-331` (`len(preimage) != 32` ⇒ raise, in `build_htlc_claim_tx`) |
 | Radiant covenant parameter binding | `src/pyrxd/gravity/htlc_covenant.py:202-222` (`holder_hash`), `src/pyrxd/gravity/htlc_covenant.py:404-419` (`_validate_common`), `src/pyrxd/gravity/htlc_covenant.py:429-566` (the three `build_htlc_covenant_*` builders) |
-| BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:412-438` (`BitcoinTaprootLeg._htlc`, `derive_funding_scriptpubkey` and `promised_funding_scriptpubkey`) |
+| BTC counter-leg funding derivation | `src/pyrxd/btc_wallet/htlc_leg.py:446-466` (`BitcoinTaprootLeg._htlc`, `derive_funding_scriptpubkey` and `promised_funding_scriptpubkey`) |
 | ETH counter-leg binding | `src/pyrxd/gravity/eth_leg.py:121-213` (`EthLeg.fund`), `src/pyrxd/gravity/eth_leg.py:276-346` (`EthLeg.verify_counterparty_funded`), `src/pyrxd/eth_wallet/locator.py:125-228` (`EthHtlcLocator`) |
 | Counter-leg locators (durable, JSON) | `src/pyrxd/btc_wallet/taproot.py:616-691` (`BtcHtlcLocator`), `src/pyrxd/eth_wallet/locator.py:125-228` (`EthHtlcLocator`) |
 | The two shipped reference harnesses (the *de facto* handshake) | `scripts/btc_swap_two_host.py:42-50` (the exchanged files), `scripts/btc_swap_two_host.py:574-949` (the five phases, `taker_phase_intro` through `maker_phase_lock_claim`), `scripts/eth_swap_two_host.py:504-948` (the same five) |
@@ -711,8 +711,8 @@ Step 4 of the pre-fund gate compares `derive_funding_scriptpubkey(terms)` with
 this "maker-**promised** params match the locally re-derived BTC funding SPK" (`:2032`). On both
 shipped legs the two methods call the same function on the same input:
 
-- BTC — `src/pyrxd/btc_wallet/htlc_leg.py:428` and `:438`, both return `self._htlc(terms).scriptpubkey`; the
-  docstring at `:433-436` says so plainly ("there is no separate maker-side derivation").
+- BTC — `src/pyrxd/btc_wallet/htlc_leg.py:456` and `:466`, both return `self._htlc(terms).scriptpubkey`; the
+  docstring at `:459-464` says so plainly ("there is no separate maker-side derivation").
 - ETH — `eth_leg.py:93-107`, both return `self._commitment(terms)`, computed from the leg's *own*
   local `claim_to`/`refund_to`/`timeout`.
 

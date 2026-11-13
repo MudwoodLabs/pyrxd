@@ -595,6 +595,14 @@ def _plant_eth_quorum(a: str, b: str, _mp) -> int:
     return _refused_as_one_host(build)
 
 
+def _plant_build_eth_refund_rpc(a: str, b: str, _mp) -> int:
+    """`pyrxd swap build-eth-refund --eth-rpc-url a --eth-rpc-url b` (#818): the command's own factory."""
+    pytest.importorskip("web3")
+    from pyrxd.cli.swap_eth_refund import _open_rpc
+
+    return _refused_as_one_host(lambda: len(_open_rpc((_https(a), _https(b)), 1).sources))
+
+
 def _plant_disposition_panel(a: str, b: str, _mp) -> int:
     """The disposition reader's panel, built from a duck-typed multi-source rpc (the real
     ``MultiSourceEthRpc`` refuses one host first, so it cannot reach this check)."""
@@ -878,6 +886,7 @@ PLANTERS: dict[str, Callable] = {
     "scripts.eth_swap_run:_eth_rpc": _plant_eth_swap_run_rpc,
     "scripts.swap_run_verify:_MultiEthFetcher.__init__": _plant_verify_eth_fetcher,
     "pyrxd.eth_wallet.disposition:_panel_of": _plant_disposition_panel,
+    "pyrxd.cli.swap_eth_refund:_open_rpc": _plant_build_eth_refund_rpc,
     "pyrxd.btc_wallet.disposition:read_btc_counter_disposition": _plant_btc_disposition,
 }
 

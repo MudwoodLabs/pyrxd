@@ -48,6 +48,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd swap build-eth-refund`: sign the taker's refund of an ETH or ERC-20 counter leg, and
+  print it (#818).** For a swap whose resume was refused, there was no command for the ETH leg's
+  refund. This one reads the contract from the swap record beside the recovery file, checks that
+  the code on chain is exactly the runtime the record's terms imply and that it is not settled,
+  then builds the refund through the leg's own `refund()` (maturity, the ERC-20 refundee/deployer
+  rule, the empty-contract refusal, the gas ceiling, fee affordability and the preflight all
+  apply) and prints the signed transaction. It never broadcasts. On a value-bearing chain it
+  needs two `--eth-rpc-url` endpoints from distinct operators, or `--single-endpoint`. Every
+  endpoint must read the key's nonce as free at the signed nonce; the max fee (set by the first
+  endpoint) must be no lower than the lowest base fee the others report and no higher than twice
+  the highest max fee they suggest; and the record's refundee and timeout must match the recovery
+  file. `swap status` now names it as the next action for an ETH counter leg.
+- `EthHtlcContractLeg.check_refund_target(locator)`: the identity half of `verify_funded` (chain
+  id, exact runtime, getters) plus the settled flag, without the recipient and balance checks a
+  refund should not be refused on.
+- An `EthRpc` transport error now carries the HTTP status (`status`) even when its chain is cut to
+  keep a keyed URL out, so the swap CLI prints `HTTP 401` / `HTTP 429` for it.
 - `GlyphScanner.scan_address_held` returns each token with the outpoint it was found at, and the
   server's whole listing. `pyrxd.glyph.spentness.cross_check_unspent` asks two clients for their
   unspent token listings for a set of owners, and `judge_listing` compares a listing with them.
@@ -79,6 +96,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SwapCoordinator` now keeps a mismatched taker claim's txid (in memory) and checks it before
   sending again; the maker-stall refund records a mismatched refund as `asset_refund_txid`, as the
   mutual refund already did.
+- **The watchtower watches a BTC fund the record never took as its lock (#842).** A taker's fund
+  writes its signed transaction to the record before the broadcast; a fund interrupted before the
+  lock was recorded left a `negotiated` record the tower read as "no action due", so a maker claim
+  with `p` on that HTLC went unobserved. The tower now watches output 0 of the record's own bytes
+  (refused unless it pays the terms' HTLC the negotiated amount) under the BTC_LOCKED rules, once a
+  spender is seen or some source reports the fund at least `min(G, t_btc)` deep. Each page's action
+  starts with `resume_interrupted_fund`, none is autonomous, and their situation keys differ from the
+  recorded swap's. A fund some source sees `G` deep with nothing else due pages the new
+  `PAGE_RESUME_FUND` (WARN, once). `G` is the new `pyrxd-watchtower --unrecorded-fund-grace-blocks`
+  (default 3; `ChainObserver(unrecorded_fund_grace_blocks=...)`, with `btc_network=` for the locator
+  it builds). `OutspendBtcClaimSource.deepest_funding_confirmations` reads the deepest depth any one
+  source reports. `htlc_for_terms` and `recorded_htlc_funding_tx` in `pyrxd.btc_wallet.htlc_leg`
+  hold the HTLC rebuild and the output-0 check the leg's resume already used. Known gap: a fund
+  that has not engaged (unconfirmed, seen by no source, or confirmed but not yet `min(G, t_btc)` deep)
+  is not paged, even near or past t_rxd; the runbook says what to check by hand.
 
 ## [0.28.0] — 2026-11-07
 

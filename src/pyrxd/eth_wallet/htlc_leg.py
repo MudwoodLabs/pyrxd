@@ -657,71 +657,10 @@ class EthHtlcContractLeg:
         a finalized deploy is non-reorgable. All getters + get_code + get_balance honour it.
         """
         await self._rpc.assert_chain()
-        code = await self._rpc.get_code(locator.contract_address, block_identifier)
-        if not code:
-            # EMPTY is not WRONG, and conflating them is a bad diagnosis on the worst day. Reading
-            # at the `finalized` checkpoint returns no code for a contract deployed after it — the
-            # ordinary state for the ~13 minutes between deploy and finality. The old message
-            # accused an attacker, which on a live mainnet run reads as "you have been robbed"
-            # when the truth is "wait". Both are refusals; only one is a reason to panic.
-            raise ValidationError(
-                f"no contract code at {locator.contract_address} as of block_identifier="
-                f"{block_identifier!r}. If that is 'finalized', the deploy is most likely simply "
-                "NOT YET FINALIZED — compare against 'latest' and retry once it buries. Empty code "
-                "at a checkpoint is not evidence of a wrong or attacker contract."
-            )
-        code, expected = bytes(code), self._expected_runtime(locator)
-        if code != expected:
-            # Say HOW it differs: a length mismatch is a different contract altogether, while a
-            # same-length difference at an immutable offset is the #798 forged-copy shape.
-            if len(code) != len(expected):
-                # A different contract build is a different length too: the canonical build changed
-                # after 0.26.1 (#846), so two hosts on different pyrxd releases disagree here.
-                how = (
-                    f"{len(code)} bytes present, {len(expected)} expected; if the counterparty runs a "
-                    "different pyrxd release, its contract build may differ (the canonical build changed "
-                    "after 0.26.1), so check both hosts run the same release"
-                )
-            else:
-                first = next(i for i, (a, b) in enumerate(zip(code, expected)) if a != b)
-                how = f"same length ({len(code)} bytes), first difference at byte {first}"
-            raise ValidationError(
-                f"on-chain runtime at {locator.contract_address} does not EXACTLY equal the runtime "
-                f"expected for the negotiated terms ({how}) — "
-                "wrong/attacker contract, or an immutable copy the getters cannot see was forged"
-            )
+        await self._assert_runtime_exact(locator, block_identifier)
         # Code is exact; storage is not code. Same pinned block as every other read here.
         await self._assert_not_settled(locator, block_identifier)
-        # Read immutables back by value and bind them to the negotiated terms.
-        #
-        # Through `read_contract`, so a multi-source rpc rebuilds the contract per endpoint and
-        # every one of these becomes a quorum read. They are IDENTITY reads — no `combine` — because
-        # an endpoint disagreeing about a contract's hashlock is describing a different contract,
-        # and these four binds are what stand between a maker and revealing the preimage to a
-        # look-alike. Single-source callers are unchanged: `read_contract` calls straight through.
-        web3 = _require_web3()
-        _bid = "latest" if block_identifier is None else block_identifier
-
-        def _immutable(name: str):
-            def _call(r):
-                c = r.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-                return getattr(c.functions, name)().call(block_identifier=_bid)
-
-            return _call
-
-        addr = locator.contract_address
-        on_h = bytes(await read_contract(self._rpc, _immutable("hashlock"), label=f"{addr}.hashlock()"))
-        on_claimant = await read_contract(self._rpc, _immutable("claimant"), label=f"{addr}.claimant()")
-        on_refundee = await read_contract(self._rpc, _immutable("refundee"), label=f"{addr}.refundee()")
-        on_timeout = int(await read_contract(self._rpc, _immutable("timeout"), label=f"{addr}.timeout()"))
-        if on_h != locator.hashlock_bytes:
-            raise ValidationError("on-chain hashlock != negotiated H")
-        if web3.Web3.to_checksum_address(on_claimant) != web3.Web3.to_checksum_address(locator.claimant):
-            raise ValidationError("on-chain claimant != negotiated maker")
-        if web3.Web3.to_checksum_address(on_refundee) != web3.Web3.to_checksum_address(locator.refundee):
-            raise ValidationError("on-chain refundee != negotiated taker")
-        if on_timeout != locator.timeout:
-            raise ValidationError("on-chain timeout != negotiated timeout")
+        await self._assert_immutables_bind(locator, block_identifier)
         # EOA-only claimant/refundee: empty code == EOA. A contract recipient that reverts on
         # receive would lock the funds via the HTLC's require(ok) on the ETH transfer.
         # Pin these to the SAME block as the code/immutables reads above (audit LOW-R1): at
@@ -766,6 +705,96 @@ class EthHtlcContractLeg:
         # full balance, so over-funding only ever benefits the eventual recipient.
         if bal < expected_amount_wei:
             raise ValidationError(f"funded balance {bal} wei < negotiated {expected_amount_wei} wei (under-funded)")
+
+    async def check_refund_target(self, locator: EthHtlcLocator) -> bool:
+        """Before a refund is signed: the contract at ``locator`` is the one the locator describes.
+        Returns whether its ``settled`` flag is set; raises :class:`ValidationError` if it is not that contract.
+
+        The identity half of :meth:`verify_funded` (#818): the chain id, the exact runtime for the
+        locator's terms (which for a token leg also binds ``token``, ``amount`` and ``deployer``), and
+        the four getters, all at ``latest``. It leaves out the rest of that gate on purpose. The
+        recipient EOA checks and the balance floor protect a lock or a reveal; a refund is the way
+        out, and refusing it because the claimant later gained code, or because the contract holds
+        less than was negotiated, would only leave the value where it is.
+
+        Read-only. ``settled`` is returned rather than raised so the caller words it: a settled
+        contract was claimed or refunded, and which one decides what the operator does next.
+        """
+        await self._rpc.assert_chain()
+        await self._assert_runtime_exact(locator, None)
+        await self._assert_immutables_bind(locator, None)
+        return any(await self._settled_word(locator, None))
+
+    async def _assert_runtime_exact(self, locator: EthHtlcLocator, block_identifier: str | int | None) -> None:
+        """Check 2 of :meth:`verify_funded`: the code at the contract is EXACTLY the runtime the
+        locator's terms imply (:meth:`_expected_runtime`). Shared with :meth:`check_refund_target`."""
+        code = await self._rpc.get_code(locator.contract_address, block_identifier)
+        if not code:
+            # EMPTY is not WRONG, and conflating them is a bad diagnosis on the worst day. Reading
+            # at the `finalized` checkpoint returns no code for a contract deployed after it — the
+            # ordinary state for the ~13 minutes between deploy and finality. The old message
+            # accused an attacker, which on a live mainnet run reads as "you have been robbed"
+            # when the truth is "wait". Both are refusals; only one is a reason to panic.
+            raise ValidationError(
+                f"no contract code at {locator.contract_address} as of block_identifier="
+                f"{block_identifier!r}. If that is 'finalized', the deploy is most likely simply "
+                "NOT YET FINALIZED — compare against 'latest' and retry once it buries. Empty code "
+                "at a checkpoint is not evidence of a wrong or attacker contract."
+            )
+        code, expected = bytes(code), self._expected_runtime(locator)
+        if code != expected:
+            # Say HOW it differs: a length mismatch is a different contract altogether, while a
+            # same-length difference at an immutable offset is the #798 forged-copy shape.
+            if len(code) != len(expected):
+                # A different contract build is a different length too: the canonical build changed
+                # after 0.26.1 (#846), so two hosts on different pyrxd releases disagree here.
+                how = (
+                    f"{len(code)} bytes present, {len(expected)} expected; if the counterparty runs a "
+                    "different pyrxd release, its contract build may differ (the canonical build changed "
+                    "after 0.26.1), so check both hosts run the same release"
+                )
+            else:
+                first = next(i for i, (a, b) in enumerate(zip(code, expected)) if a != b)
+                how = f"same length ({len(code)} bytes), first difference at byte {first}"
+            raise ValidationError(
+                f"on-chain runtime at {locator.contract_address} does not EXACTLY equal the runtime "
+                f"expected for the negotiated terms ({how}) — "
+                "wrong/attacker contract, or an immutable copy the getters cannot see was forged"
+            )
+
+    async def _assert_immutables_bind(self, locator: EthHtlcLocator, block_identifier: str | int | None) -> None:
+        """Check 3 of :meth:`verify_funded`: the immutables read back through the getters equal the
+        locator's. Shared with :meth:`check_refund_target`."""
+        # Read immutables back by value and bind them to the negotiated terms.
+        #
+        # Through `read_contract`, so a multi-source rpc rebuilds the contract per endpoint and
+        # every one of these becomes a quorum read. They are IDENTITY reads — no `combine` — because
+        # an endpoint disagreeing about a contract's hashlock is describing a different contract,
+        # and these four binds are what stand between a maker and revealing the preimage to a
+        # look-alike. Single-source callers are unchanged: `read_contract` calls straight through.
+        web3 = _require_web3()
+        _bid = "latest" if block_identifier is None else block_identifier
+
+        def _immutable(name: str):
+            def _call(r):
+                c = r.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+                return getattr(c.functions, name)().call(block_identifier=_bid)
+
+            return _call
+
+        addr = locator.contract_address
+        on_h = bytes(await read_contract(self._rpc, _immutable("hashlock"), label=f"{addr}.hashlock()"))
+        on_claimant = await read_contract(self._rpc, _immutable("claimant"), label=f"{addr}.claimant()")
+        on_refundee = await read_contract(self._rpc, _immutable("refundee"), label=f"{addr}.refundee()")
+        on_timeout = int(await read_contract(self._rpc, _immutable("timeout"), label=f"{addr}.timeout()"))
+        if on_h != locator.hashlock_bytes:
+            raise ValidationError("on-chain hashlock != negotiated H")
+        if web3.Web3.to_checksum_address(on_claimant) != web3.Web3.to_checksum_address(locator.claimant):
+            raise ValidationError("on-chain claimant != negotiated maker")
+        if web3.Web3.to_checksum_address(on_refundee) != web3.Web3.to_checksum_address(locator.refundee):
+            raise ValidationError("on-chain refundee != negotiated taker")
+        if on_timeout != locator.timeout:
+            raise ValidationError("on-chain timeout != negotiated timeout")
 
     async def _settled_word(self, locator: EthHtlcLocator, block_identifier: str | int | None) -> bytes:
         """The 32-byte word at :data:`SETTLED_SLOT`, read through :func:`read_contract` so a

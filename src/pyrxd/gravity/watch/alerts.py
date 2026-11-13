@@ -56,6 +56,9 @@ _SEVERITY: dict[Intent, Severity] = {
     Intent.PAGE_CLAIM: Severity.CRITICAL,
     Intent.PAGE_SQUEEZED: Severity.CRITICAL,
     Intent.PAGE_REFUND: Severity.WARN,
+    # A BTC fund the record never took, confirmed past the grace depth (#842): the runner stopped. Nothing
+    # is due yet; the claim and refund pages over the same fund carry their own severities.
+    Intent.PAGE_RESUME_FUND: Severity.WARN,
     # The chain settled the counter leg and the record lags it (#850 PR 9b): nothing is at risk.
     Intent.RECONCILE: Severity.INFO,
     Intent.RETIRE: Severity.INFO,

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -597,7 +599,41 @@ def _args_for(cmd: Any, case: dict[str, Any], url: str) -> list[str]:
         args += ["--btc-funding-outpoint", _OUTPOINT]
     if "--eth-contract" in opts:
         args += ["--eth-contract", ETH_CONTRACT]
+    if "--artifact" in opts:
+        args += ["--artifact", str(_ETH_ARTIFACT)]
     return args
+
+
+#: The native HTLC artifact, for a command that needs one to reach its URL (``build-eth-refund``).
+_ETH_ARTIFACT = Path(__file__).resolve().parents[1] / "fixtures" / "EthHtlc.json"
+
+
+def _reads_only_eth(cmd: Any) -> bool:
+    """A command whose every URL flag is an Ethereum one, so a BTC swap never reaches its URL."""
+    urls = [o for p in cmd.params for o in getattr(p, "opts", ()) if o.endswith("-url")]
+    return bool(urls) and all(o.startswith("--eth-") for o in urls)
+
+
+def _eth_refund_record(case) -> None:
+    """The swap record ``build-eth-refund`` reads beside the recovery file, and a refund key in the
+    file, so that command gets as far as its RPC (#818)."""
+    from pyrxd.eth_wallet.locator import EthHtlcLocator
+    from tests._eth_refund_records import eth_record, write_record
+
+    doc = json.loads(case["keys"].read_text())
+    doc["eth_key_hex"] = os.urandom(32).hex()
+    case["keys"].write_text(json.dumps(doc))
+    locator = EthHtlcLocator(
+        chain_id=11155111,
+        contract_address=ETH_CONTRACT,
+        deploy_tx_hash="0x" + "11" * 32,
+        hashlock="0x" + H.hex(),
+        claimant="0x" + "44" * 20,
+        refundee="0x" + "55" * 20,
+        timeout=1_780_686_598,
+        amount_wei=10**15,
+    )
+    write_record(case["keys"], eth_record(locator))
 
 
 @pytest.mark.parametrize("chain", ["btc", "eth"])
@@ -610,9 +646,12 @@ def test_no_command_prints_the_keyed_url_on_an_http_error(case, refusing, chain,
 
     if chain == "eth":
         _eth_swap(case)
+        _eth_refund_record(case)
     url = _keyed_url(refusing)
     commands = _url_taking_commands()
     for name, cmd in commands.items():
+        if chain == "btc" and _reads_only_eth(cmd):
+            continue
         refusing.seen.clear()  # type: ignore[attr-defined]
         res = _invoke([name, *_args_for(cmd, case, url)], _ctx(_client(case), output_mode=output_mode))
         rendered = res.output + (repr(res.exception) if res.exception else "")

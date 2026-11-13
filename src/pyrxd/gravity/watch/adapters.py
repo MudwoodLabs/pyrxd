@@ -432,6 +432,27 @@ class OutspendBtcClaimSource:
             readers, locator, hashlock=hashlock, burial_blocks=burial_blocks, quorum=quorum
         )
 
+    async def deepest_funding_confirmations(self, funding_txid: str) -> Confirmations | None:
+        """The deepest depth any ONE of the funding reader's sources reports for *funding_txid*, or
+        ``None`` when none answers (#842).
+
+        Not a value gate: it only decides whether the tower applies the lock rules to a fund the record
+        never took, so it errs toward paging. One source over-reporting raises a spurious page (CRITICAL
+        near t_rxd, where the refund's maturity is then unread; ``unrecorded_fund``); a source that lags,
+        withholds or errors is outvoted by any one that answers. Read per source through ``panel()``,
+        the same sources :meth:`spend_disposition` asks."""
+        panel = getattr(self._reader, "panel", None)
+        readers = panel()[0] if callable(panel) else (self._reader,)
+        results = await asyncio.gather(*(r.confirmations(funding_txid) for r in readers), return_exceptions=True)
+        depths: list[int] = []
+        for got in results:
+            if isinstance(got, BaseException):
+                logger.debug("funding-depth read failed for %s on one source: %r", funding_txid, got)
+                continue
+            if isinstance(got, int) and not isinstance(got, bool) and got >= 0:
+                depths.append(got)
+        return Confirmations(max(depths)) if depths else None
+
     async def funding_confirmations(self, funding_txid: str) -> Confirmations | None:
         """Funding-tx depth via the SAME quorum reader (the depth a quorum vouches for). Returns ``None`` if the read
         fails (down/unknown) so decide() fails closed (no autonomous refund) instead of guessing — a

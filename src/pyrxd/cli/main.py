@@ -253,6 +253,7 @@ from . import (  # noqa: E402
     setup_cmd,
     swap_book_cmds,
     swap_cmds,
+    swap_eth_refund,
     swap_recovery_cmds,
     wallet_cmds,
 )
@@ -285,12 +286,14 @@ swap_cmds.swap_group.add_command(swap_book_cmds.swap_take_cmd)
 swap_cmds.swap_group.add_command(swap_book_cmds.swap_cancel_cmd)
 swap_cmds.swap_group.add_command(swap_book_cmds.swap_refund_cmd)
 
-# The COLD (offline) cross-chain recovery toolkit. Strictly read-only — these three
+# The COLD (offline) cross-chain recovery toolkit. Strictly read-only — these four
 # print raw transaction hex and never broadcast, which is what keeps them (like
-# `swap status`) outside the external swap audit gate. See swap_recovery_cmds.
+# `swap status`) outside the external swap audit gate. See swap_recovery_cmds and,
+# for the ETH counter leg's refund, swap_eth_refund.
 swap_cmds.swap_group.add_command(swap_recovery_cmds.swap_recover_preimage_cmd)
 swap_cmds.swap_group.add_command(swap_recovery_cmds.swap_build_claim_cmd)
 swap_cmds.swap_group.add_command(swap_recovery_cmds.swap_build_refund_cmd)
+swap_cmds.swap_group.add_command(swap_eth_refund.swap_build_eth_refund_cmd)
 
 
 if __name__ == "__main__":
