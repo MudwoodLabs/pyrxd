@@ -895,10 +895,11 @@ def _real_reader_swap(*, lag: bool = False):
     source leaves mempool transactions out of its reads (an indexer behind the node's mempool, the
     likely cause of what the re-check of 52f74ad measured on regtest), and the primary refuses a
     second spend of the covenant as the node does."""
+    from _fake_radiant_chain import FakeRadiantSource
+    from test_maker_covenant_exit import _Swap
+
     from pyrxd.gravity.swap_state import SwapRole, SwapState
     from pyrxd.security.errors import PolicyRejection
-    from tests._fake_radiant_chain import FakeRadiantSource
-    from tests.test_maker_covenant_exit import _Swap
 
     class _Lagging(FakeRadiantSource):
         def _view(self):
@@ -927,6 +928,11 @@ def _real_reader_swap(*, lag: bool = False):
     return swap, coord, sources[0]
 
 
+def _read_by_every_source(swap) -> bool:
+    """The depth sources were asked too: the real reader decided, not the primary-only fallback."""
+    return all(s.history_reads > 0 for s in swap.sources[1:])
+
+
 async def test_real_reader_a_mismatched_claim_that_is_mined_is_not_sent_again() -> None:
     """Honest path: the claim relayed, the primary lied about its txid, and once it is mined every
     source names it as the claim leaf's spend. The retry returns without sending."""
@@ -936,6 +942,7 @@ async def test_real_reader_a_mismatched_claim_that_is_mined_is_not_sent_again() 
     swap.chain.mine()
     await coord._claim_asset_once(swap.p)
     assert len(primary.broadcasts) == 1 and coord._mismatched_claim_txid is None
+    assert _read_by_every_source(swap)
 
 
 async def test_real_reader_a_claim_still_in_the_mempool_sends_nothing() -> None:
@@ -945,7 +952,7 @@ async def test_real_reader_a_claim_still_in_the_mempool_sends_nothing() -> None:
         await coord._claim_asset_once(swap.p)
     with pytest.raises(NetworkError, match="Nothing was sent again"):
         await coord._claim_asset_once(swap.p)
-    assert len(primary.broadcasts) == 1
+    assert len(primary.broadcasts) == 1 and _read_by_every_source(swap)
 
 
 async def test_real_reader_residual_a_lagging_index_costs_one_refused_rebuild() -> None:
@@ -964,3 +971,4 @@ async def test_real_reader_residual_a_lagging_index_costs_one_refused_rebuild() 
     swap.chain.mine()
     await coord._claim_asset_once(swap.p)
     assert len(primary.broadcasts) == 2 and coord._mismatched_claim_txid is None
+    assert _read_by_every_source(swap)
