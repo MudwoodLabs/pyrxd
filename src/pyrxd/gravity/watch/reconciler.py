@@ -233,8 +233,9 @@ def _claim_outcome_note(outcome: ExecOutcome | None, reason: str | None) -> str:
 
 class Reconciler:
     """Reconciler. Inject the store/observer/alerter ports. Its only state across ticks is when each
-    legacy record's D9 read became unresolved (#921) and when each swap's observe/decide began failing
-    (F-1), kept in memory: a restart starts both over."""
+    legacy record's D9 read became unresolved (#921), when each swap's observe/decide began failing
+    (F-1) and when each armed claim outcome first appeared (#988), kept in memory: a restart starts
+    them over."""
 
     def __init__(
         self,
@@ -290,6 +291,10 @@ class Reconciler:
         # swap_id -> clock reading when its observe/decide began failing (re-review of the 0.27 fixes, F-1).
         self._error_since: dict[str, float] = {}
         self._error_repage_s = reconcile_error_repage_s(policy, safety_window_blocks)
+        # swap_id -> {armed-claim situation: clock reading when it first appeared} (#988). Never dropped
+        # while the process runs, so no tick in between (quiet, an error, another page, or a store that
+        # leaves the swap out) restarts a count. One float per outcome a swap has had.
+        self._claim_since: dict[str, dict[str, float]] = {}
 
     @property
     def alerter(self) -> Alerter:
@@ -444,6 +449,23 @@ class Reconciler:
         period = int((now - since) // self._error_repage_s)
         return f"{SITUATION_RECONCILE_ERROR}:{type(exc).__name__}:{period}"
 
+    def _claim_situation(self, swap_id: str, situation: str) -> str:
+        """The armed claim page's situation, with how many :func:`reconcile_error_repage_s` bounds it has
+        lasted once it has lasted one (#988).
+
+        The executor's outcome and kind are its whole situation, so one outcome that never changes kept
+        one ACK key: an ACK of "claim already broadcast (awaiting confirmation)" for a claim the server
+        dropped silenced the swap until ``PAGE_SQUEEZED``, 122 blocks later on regtest. Each further bound
+        of the same outcome is a new situation, so an ACK holds for at most one safety window, as for a
+        reconcile error (F-1). The first bound keeps the bare key, so a page's ACK key is unchanged until
+        then. Each outcome keeps its own count from when it first appeared, so a quiet tick, an error,
+        another page or another outcome in between does not restart it, nor does a store that leaves
+        the swap out for a tick (a count that restarted would hand the earlier ACK back its key)."""
+        now = self._clock()
+        since = self._claim_since.setdefault(swap_id, {}).setdefault(situation, now)
+        period = int((now - since) // self._error_repage_s)
+        return situation if period == 0 else f"{situation}:{period}"
+
     async def _reconcile_one(self, swap_id: str, record: SwapRecord) -> ReconcileResult:
         if swap_id in self._inflight:
             # Another (overlapping) tick is already on this swap — skip, don't double-act.
@@ -486,10 +508,11 @@ class Reconciler:
                         + _claim_outcome_note(executed, exec_reason.text if exec_reason else None),
                         # The kind is the executor's own word for the reason, never a server's, so an ACK
                         # of one kind of outcome does not hide another (Mythos combo 2.1, 4.3).
-                        situation=(
+                        situation=self._claim_situation(
+                            swap_id,
                             f"{decision.situation or SITUATION_CLAIM_RACE}:"
                             f"{executed.value if executed is not None else 'none'}"
-                            + (f":{exec_reason.kind}" if exec_reason is not None and executed is not None else "")
+                            + (f":{exec_reason.kind}" if exec_reason is not None and executed is not None else ""),
                         ),
                     )
                 elif decision.autonomous_btc_refund:

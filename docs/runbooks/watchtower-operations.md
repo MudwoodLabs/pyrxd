@@ -230,6 +230,15 @@ an exhausted fee pool after an ACKed consensus refusal pages again. The reason t
 the tower's report and can quote a server, so check the chain before acting on it. Since #976 an ACK
 written for the bare `claim_race` situation matches no armed claim page.
 
+An ACK of an armed claim page holds for at most one safety window (#988). Once one outcome has lasted
+a window (the safety window in blocks, at the shorter of the policy's block intervals), its situation gains a
+count, `claim_race:declined:awaiting_confirmation:1`, then `claim_race:declined:awaiting_confirmation:2`
+and so on, and pages again. Each outcome counts from the first tick it appeared on for that swap, and a
+tower restart starts the counts over (ACKs are not kept across a restart either, so it pages again). `claim_race:declined:awaiting_confirmation` means the tower already broadcast a
+claim for this covenant and it has not confirmed. A server can accept the claim, answer with its
+txid and drop it, and the tower does not re-send a claim it marked as broadcast, so check that the
+claim txid is known to a node you trust.
+
 ```bash
 (umask 077; echo "<swap_id> <situation key>" >> /run/wt/acks)   # copy it from the page's "ack:" line
 ```
