@@ -365,7 +365,8 @@ class RadiantChainIO:
     fails is, and costs the call one timeout, not one per unresponsive source.
 
     ``second_opinion`` (default empty: off) are broadcast clients, one per operator, that
-    :meth:`broadcast` asks when ``client`` answers with a node rejection (#937). Without them one
+    :meth:`broadcast` asks when ``client`` answers with a node rejection (#937), or with a reply that
+    names another txid (Mythos combo 3.3: the bytes may not have relayed). Without them one
     endpoint's verdict is the only verdict, so a lagging, stricter or lying server refuses a
     transaction alone. With them every second-opinion client is asked at once, and the rejection is
     raised when none has taken the transaction: each answered without taking it, or
@@ -378,8 +379,8 @@ class RadiantChainIO:
 
     What :meth:`broadcast` raises: a node rejection as itself (:class:`PolicyRejection`); a reply
     naming another txid as :class:`RadiantEchoMismatch`, which carries the bytes sent (#789); any
-    other failure of ``client`` as ``NetworkError``. A second-opinion round is asked only after a
-    node rejection, not after a mismatch.
+    other failure of ``client`` as ``NetworkError``. A second-opinion round is asked after a node
+    rejection and after a mismatch; the mismatch is raised when no second opinion takes the bytes.
     """
 
     def __init__(
@@ -419,7 +420,7 @@ class RadiantChainIO:
 
     def with_second_opinion(self, second_opinion: tuple[Any, ...]) -> RadiantChainIO:
         """A NEW chain IO over the same clients whose :meth:`broadcast` asks *second_opinion* after a
-        node rejection (#937). This one is unchanged, so a chain IO shared with attended callers keeps
+        node rejection (#937) or a reply naming another txid. This one is unchanged, so a chain IO shared with attended callers keeps
         today's behaviour.
 
         Each client must provide ``broadcast`` and ``get_transaction`` and say which operator runs it
@@ -450,12 +451,16 @@ class RadiantChainIO:
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
             raise ValidationError("raw_tx must be non-empty bytes")
         rejection: PolicyRejection | None = None
+        mismatch: RadiantEchoMismatch | None = None
         try:
             return str(await self._client.broadcast(bytes(raw_tx)))
         except BroadcastEchoMismatch as exc:
             # Raised as a mismatch, not a NetworkError (#789): the bytes went out and may have
             # relayed, so the caller must not read this as "the server could not be reached".
-            raise RadiantEchoMismatch(bytes(raw_tx), exc.echoed) from exc
+            mismatch = RadiantEchoMismatch(bytes(raw_tx), exc.echoed)
+            mismatch.__cause__ = exc
+            if not self._second_opinion:
+                raise mismatch from exc
         except Exception as exc:
             msg = str(exc).lower()
             if "already" in msg and ("known" in msg or "mempool" in msg or "chain" in msg):
@@ -469,14 +474,37 @@ class RadiantChainIO:
                 # from any other only by this type and its reason, and retries both (#934).
                 raise
             rejection = exc
+        if mismatch is not None:
+            # The broadcast client answered with another txid. The same bytes go to the second
+            # opinions too (Mythos combo 3.3): if that client dropped them, an honest operator still
+            # relays them. A taker comes back as a SecondOpinionTxid, which the claim executor holds
+            # and re-sends exactly as it holds a mismatch; no taker raises the mismatch. A TLS pin
+            # failure in the round is logged by the round and the mismatch is raised in its place:
+            # the bytes went out, so the caller must not read it as a transport failure and rebuild.
+            # A cancellation in the round carries the mismatch as its cause, so a caller that holds
+            # mismatched bytes still can (Mythos pass on #986, F3.1).
+            try:
+                taken = await self._ask_second_opinion(
+                    bytes(raw_tx), verb="mis-echoed", detail=f"answered txid {mismatch.echoed!r}"
+                )
+            except TlsPinMismatchError:
+                taken = None
+            except asyncio.CancelledError as cancelled:
+                raise cancelled from mismatch
+            if taken is None:
+                raise mismatch
+            return taken
         # Asked outside the except block, so nothing is chained onto the rejection raised below.
-        txid = await self._ask_second_opinion(bytes(raw_tx), rejection)
+        if rejection is None:  # pragma: no cover - every path above returns or raises
+            raise NetworkError("radiant broadcast: the client neither answered nor failed")
+        txid = await self._ask_second_opinion(bytes(raw_tx), verb="rejected", detail=rejection.reason or str(rejection))
         if txid is None:
             raise rejection
         return txid
 
-    async def _ask_second_opinion(self, raw: bytes, rejection: PolicyRejection) -> str | None:
-        """The txid of *raw* if a second-opinion client takes it after ``client`` rejected it, else None.
+    async def _ask_second_opinion(self, raw: bytes, *, verb: str, detail: str) -> str | None:
+        """The txid of *raw* if a second-opinion client takes it after ``client`` rejected it, or
+        answered with another txid (*verb* and *detail* say which, for the log), else None.
 
         Every client is asked AT ONCE, and the first that takes the transaction ends the round; the
         others are then cancelled. Asked one after another, a client that hangs would spend the round's
@@ -539,10 +567,11 @@ class RadiantChainIO:
                 for ask in finished:
                     if ask.exception() is None and ask.result():
                         _LOG.warning(
-                            "broadcast: the first endpoint rejected tx %s (%s) and %s took it; asks still "
+                            "broadcast: the first endpoint %s tx %s (%s) and %s took it; asks still "
                             "open (cancelled, their outcome unknown): %s",
+                            verb,
                             expected,
-                            rejection.reason or rejection,
+                            detail,
                             asks[ask],
                             ", ".join(sorted(asks[a] for a in pending)) or "none",
                         )

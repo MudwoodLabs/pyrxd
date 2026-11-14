@@ -4278,7 +4278,7 @@ class SwapCoordinator:
             return self.record
 
         # SAFE: the BTC claim is reorg-deep and our own burial still fits the window.
-        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        await self._claim_asset_once(bytes(p))
         await self._assert_claim_reached_the_mempool()
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
@@ -4348,7 +4348,7 @@ class SwapCoordinator:
             return self.record
 
         # SAFE: the ETH claim is finalized and our own RXD burial still fits the window.
-        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        await self._claim_asset_once(bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
@@ -4378,7 +4378,7 @@ class SwapCoordinator:
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
         self._assert_claim_tx_spends_our_htlc(maker_claim_tx_bytes)
-        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        await self._claim_asset_once(bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
@@ -4400,7 +4400,7 @@ class SwapCoordinator:
         await self.counter_leg.assert_claim_provenance(
             claim_tx_hash, contract_address=locator.contract_address, preimage=bytes(p)
         )
-        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        await self._claim_asset_once(bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
@@ -4489,7 +4489,7 @@ class SwapCoordinator:
         # the broadcast transiently fails. Broadcast FIRST — a raising refund leaves the record at
         # BOTH_LOCKED and the call is safely retryable — then advance both FSM steps + persist once
         # (matches taker_refund_btc / mutual_refund). The taker refunds rather than wait (NEVER waits).
-        await self.radiant_leg.refund_asset(self.record)
+        await self._refund_asset_on_stall_once()
         self._advance(SwapEvent.MAKER_STALL_DETECTED)
         self._advance(SwapEvent.TAKER_REFUNDS_ASSET_PROACTIVELY)
         await self._persist_record(self.record, shield=True)
@@ -6443,6 +6443,168 @@ class SwapCoordinator:
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+    # -- a covenant claim or stall refund the broadcast server answered with another txid ------------
+
+    async def _claim_asset_once(self, p: bytes) -> None:
+        """Send the taker's covenant claim, unless one sent earlier in this process was answered with
+        another txid and may have landed (Mythos combo 3.4).
+
+        A :class:`~pyrxd.security.errors.BroadcastEchoMismatch` means the bytes went out and may have
+        relayed. It is raised, so the record does not advance on it, but the claim's own txid is kept.
+        Before #789's fix a retry rebuilt the claim: if the first one had relayed, the covenant read as
+        spent, the rebuild failed "no UTXO found" every time, and the record never reached COMPLETED.
+        Now a retry asks first (:meth:`_mismatched_send_landed`). Landed: the call returns and the
+        caller advances, without sending again. The covenant still unspent: it did not land, so it is
+        sent again. Anything else (in the mempool, spent but not yet buried, or too few sources)
+        raises and sends nothing. The txid is kept until a send after it returns, so a retry whose
+        re-send fails (a conflict with the first claim, still in a mempool the reader cannot see)
+        still checks the first claim next time (Mythos pass on #986, F4.2). It is kept in memory only,
+        so after a restart a retry rebuilds, as before. Residual: a retry before the first claim is
+        mined can read the covenant unspent (seen once on regtest; an index that lags the node's
+        mempool is the likely cause, not established), rebuild on a new fee input, and have the node
+        refuse the conflict. ``test_real_reader_residual_a_lagging_index_costs_one_refused_rebuild``
+        pins that. No asset is lost; the fee pool is charged one input per such retry, and the retry
+        after mining ends without a send."""
+        from pyrxd.security.errors import BroadcastEchoMismatch
+
+        from .radiant_leg import CovenantSpendKind
+
+        sent = getattr(self, "_mismatched_claim_txid", None)
+        if sent is not None:
+            landed = await self._mismatched_send_landed(sent, CovenantSpendKind.CLAIMED)
+            if landed is None:
+                raise NetworkError(
+                    f"the covenant claim sent as {sent} (the server answered another txid) is not confirmed "
+                    "and the covenant no longer reads unspent: it is in the mempool or another transaction "
+                    "spent the covenant. Nothing was sent again. Retry later; if this persists, check the "
+                    "covenant on chain."
+                )
+            if landed:
+                self._mismatched_claim_txid: str | None = None
+                logger.warning("the covenant claim %s, answered with another txid, is confirmed", sent)
+                return
+        try:
+            await self.radiant_leg.claim_asset(self.record, bytes(p))
+        except BroadcastEchoMismatch as exc:
+            self._mismatched_claim_txid = str(exc.local_txid).lower()
+            raise
+        self._mismatched_claim_txid = None
+
+    async def _mismatched_send_landed(self, txid: str, kind: Any) -> bool | None:
+        """Whether a covenant spend sent as *txid* and answered with another txid landed: True when
+        the covenant is spent by the *kind* leaf (``CLAIMED`` or ``REFUNDED``) at one confirmation or
+        more; False when it did not land and must be sent again (the covenant reads unspent, or there
+        is no chain reader, which is what a retry did before); None when neither.
+
+        The covenant is read from every configured source (:meth:`RadiantCovenantLeg.covenant_spend`)
+        when the leg can, not from the client that just answered this spend with another txid alone
+        (Mythos pass on #986, F4.1): every answering source must name the same spender, and on a
+        network that carries value at least :data:`~pyrxd.gravity.funding_spv.MIN_REPORTING_OPERATORS`
+        operators must answer, or this is None. The leaf is read from the spender's bytes, so a spend
+        by another transaction of the same leaf counts: consensus binds each leaf to its output. A
+        spend by the OTHER leaf, buried and (on value) from enough operators, raises :class:`ValidationError`,
+        since this send can never land. A leg
+        without that reader, or whose sources cannot read a script's history (none answers and none
+        failed), falls back to the one chain IO's reads (:meth:`_mismatched_claim_landed`,
+        :meth:`_recorded_asset_refund_landed`), as before."""
+        from .radiant_leg import CovenantSpendKind
+
+        read = getattr(self.radiant_leg, "covenant_spend", None)
+        spend = await read(self.record, burial_blocks=1) if callable(read) else None
+        if spend is None or (spend.kind is CovenantSpendKind.UNKNOWN and not spend.sources and not spend.failed):
+            # No reader, or no source that can read a script's history: the one chain IO's word, as before.
+            if kind is CovenantSpendKind.REFUNDED:
+                if getattr(self.radiant_leg, "chain_io", None) is None:
+                    return False
+                return await self._recorded_asset_refund_landed()
+            return await self._mismatched_claim_landed(txid)
+        if spend.kind is CovenantSpendKind.UNSPENT:
+            return False
+        if not spend.buried or (spend.operators < MIN_REPORTING_OPERATORS and _leg_is_value_bearing(self.radiant_leg)):
+            # Not yet buried, or too few operators to decide on a network that carries value: retry
+            # later. Checked BEFORE the other-leaf verdict below, which ends the retries, so one source
+            # that alone answers cannot end them (re-review of the #986 fix round).
+            return None
+        if spend.kind in (CovenantSpendKind.CLAIMED, CovenantSpendKind.REFUNDED) and spend.kind is not kind:
+            # The other leaf spent the covenant: this send can never land, and retrying cannot help.
+            which = "claim" if kind is CovenantSpendKind.CLAIMED else "refund"
+            other = (
+                "the taker's claim leaf, so p is public and the taker has the asset"
+                if spend.kind is CovenantSpendKind.CLAIMED
+                else "the maker's CSV refund leaf, so the maker has the asset back"
+            )
+            raise ValidationError(
+                f"the covenant {which} sent as {txid} (the server answered another txid) cannot land: the covenant "
+                f"was spent by {spend.txid} through {other} ({spend.reason}). Nothing was sent again and the record "
+                "is unchanged."
+            )
+        return True if spend.kind is kind else None
+
+    async def _mismatched_claim_landed(self, txid: str) -> bool | None:
+        """True when the claim *txid* has a confirmation AND the covenant no longer reads unspent;
+        False when it did not land and must be sent again (the covenant reads unspent, or there is no
+        chain reader, which is what a retry did before); None when neither (in the mempool, or the
+        covenant spent by another transaction). For a leg without
+        :meth:`RadiantCovenantLeg.covenant_spend`: both reads come from one chain IO, the one that
+        answered this claim with another txid, so with such a leg its word is still trusted. The
+        covenant is read even when a depth comes back, so its depth alone does not end the retries.
+        A depth read that fails with no covenant reader to fall back on raises, like
+        :meth:`_recorded_asset_refund_landed`."""
+        chain_io = getattr(self.radiant_leg, "chain_io", None)
+        if chain_io is None:
+            return False
+        failure: Exception | None = None
+        confirmed = False
+        try:
+            confs = await chain_io.confirmations(txid)
+            confirmed = isinstance(confs, int) and not isinstance(confs, bool) and confs >= 1
+        except Exception as exc:  # a node that never saw the tx answers an error, like an outage
+            failure = exc
+        unspent = getattr(chain_io, "covenant_outpoint_unspent", None)
+        outpoint, spk_hex = self.record.radiant_covenant_outpoint, self.record.radiant_covenant_spk_hex
+        if unspent is None or outpoint is None or spk_hex is None:
+            if confirmed:
+                return True
+            if failure is not None:
+                raise failure
+            return False
+        if await unspent(bytes.fromhex(spk_hex), outpoint):
+            return False
+        return True if confirmed else None
+
+    async def _refund_asset_on_stall_once(self) -> None:
+        """Send the maker-stall covenant refund, unless one recorded as ``asset_refund_txid`` landed
+        (Mythos combo 3.4). On a :class:`~pyrxd.security.errors.BroadcastEchoMismatch` the
+        refund's own txid is recorded and persisted before the mismatch is raised, as
+        :meth:`_refund_the_covenant_once` does, so a retry checks whether it landed
+        (:meth:`_mismatched_send_landed`, every source, as for the claim) instead of re-sending into a
+        covenant it already spent, which failed "no UTXO found" every time and held the record at
+        BOTH_LOCKED. A recorded refund that neither landed nor reads unspent raises and sends nothing;
+        the record is cleared only once a re-send returns."""
+        from pyrxd.security.errors import BroadcastEchoMismatch
+
+        from .radiant_leg import CovenantSpendKind
+
+        if self.record.asset_refund_txid is not None:
+            landed = await self._mismatched_send_landed(str(self.record.asset_refund_txid), CovenantSpendKind.REFUNDED)
+            if landed:
+                return
+            if landed is None:
+                raise NetworkError(
+                    f"the covenant refund recorded as {self.record.asset_refund_txid} (the server answered another "
+                    "txid) is not confirmed and the covenant no longer reads unspent. Nothing was sent again. "
+                    "Retry later; if this persists, check the covenant on chain."
+                )
+        try:
+            await self.radiant_leg.refund_asset(self.record)
+        except BroadcastEchoMismatch as exc:
+            self.record = dataclasses.replace(self.record, asset_refund_txid=str(exc.local_txid).lower())
+            await self._persist_record(self.record, shield=True)
+            raise
+        if self.record.asset_refund_txid is not None:
+            # Recorded, but not on chain (dropped or replaced), and now sent again.
+            self.record = dataclasses.replace(self.record, asset_refund_txid=None)
 
 
 def _claim_to_record(claims_seen: Sequence[Any]) -> Any:

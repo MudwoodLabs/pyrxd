@@ -252,6 +252,12 @@ def _assert_paid_once(node: _Node, fees: _CountingFeeSource) -> str:
     return _txid(claims[0])
 
 
+def _rebuild_due(ex) -> bool:
+    """Every held claim has used its re-sends: the next tick rebuilds. The bytes are kept until a
+    rebuild is sent (re-review of the Mythos #986 fixes), so the hold is not empty."""
+    return bool(ex._held) and all(left == 0 for _raw, left in ex._held.values())
+
+
 async def test_the_mismatch_reaches_the_executor_as_itself_with_the_bytes_sent() -> None:
     """The premise of the re-send: ``RadiantChainIO`` raises the mismatch as itself, not as a
     ``NetworkError`` (#789), and carries the exact bytes sent, with the txid hashed from them."""
@@ -343,7 +349,7 @@ async def test_a_server_that_keeps_lying_ends_the_hold_and_the_claim_is_rebuilt(
         outcome, reason = await tick(ex, rec)
         assert outcome is ExecOutcome.FAILED and f"re-send echo mismatch ({left} re-sends left)" in reason, reason
     assert node.broadcasts == [first, first, first] and len(fees.outpoints) == 1
-    assert ex._held == {}, "the last re-send ends the hold"
+    assert _rebuild_due(ex), "the last re-send makes the next tick rebuild"
 
     node.lie, node.relay = False, True
     outcome, reason = await tick(ex, rec)
@@ -641,4 +647,4 @@ async def test_a_bare_mismatch_on_a_re_send_counts_down_and_does_not_escape(tick
     leg.chain_io.broadcast = _bare
     outcome, reason = await tick(ex, rec)
     assert outcome is ExecOutcome.FAILED and "re-send echo mismatch (0 re-sends left)" in reason, reason
-    assert ex._held == {} and len(fees.outpoints) == 1
+    assert _rebuild_due(ex) and len(fees.outpoints) == 1
