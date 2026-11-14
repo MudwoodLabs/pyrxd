@@ -561,19 +561,23 @@ class ClaimExecutor:
             except NetworkError as exc:
                 return ExecOutcome.FAILED, f"mempool-aware covenant re-check failed (transient): {exc}"
             if mempool_unspent is False:
-                return (
-                    ExecOutcome.DECLINED,
+                return ExecOutcome.DECLINED, _why(
+                    "claim_in_mempool",
                     "covenant claim already in the mempool (awaiting confirmation) — idempotent no-op",
                 )
         # FIRE-ONCE (review HIGH): if we already broadcast a claim for THIS covenant outpoint on a prior tick,
         # the covenant still reads unspent (scantxoutset is mempool-blind) — return an idempotent no-op instead
         # of re-carving a fresh real-value fee tx every tick. Namespaced key so it can't collide with other
         # seen-keys. Marked AFTER a successful broadcast (below), so a broadcast failure still retries.
+        # Its own kind (#988): a server that dropped the claim and echoed its txid leaves it seen and
+        # never confirmed, so an ACK of this page must not be the generic "other" key that covers the
+        # later pages too. Nothing re-asks whether the claim exists; the reconciler re-pages it each
+        # safety window instead.
         if self._seen is not None:
             seen_key = f"claim:{outpoint}".encode()
             if await _maybe_await(self._seen.has_seen, seen_key):
-                return (
-                    ExecOutcome.DECLINED,
+                return ExecOutcome.DECLINED, _why(
+                    "awaiting_confirmation",
                     "claim already broadcast for this covenant (awaiting confirmation) — idempotent no-op",
                 )
         try:
