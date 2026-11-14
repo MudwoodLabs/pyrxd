@@ -881,3 +881,86 @@ def test_the_guard_sees_an_alias_of_the_leg() -> None:
         "    async def g(self):\n        await getattr(self.radiant_leg, 'claim_asset')(1, 2)\n"
     )
     assert _callers_in(ast.parse(src), "claim_asset") == {"f", "g"}
+
+
+# --------------------------------------------------------------------------- 3.4 through the real covenant_spend reader
+#
+# The tests above stub ``covenant_spend``. These run the real ``RadiantCovenantLeg.covenant_spend``
+# and ``RadiantChainIO.covenant_spend_answers`` over the ElectrumX-shaped sources of
+# ``tests/_fake_radiant_chain.py`` (three operators), with the production claim builder's bytes.
+
+
+def _real_reader_swap(*, lag: bool = False):
+    """A taker coordinator whose primary answers the claim with another txid. With *lag*, every
+    source leaves mempool transactions out of its reads (an indexer behind the node's mempool, the
+    likely cause of what the re-check of 52f74ad measured on regtest), and the primary refuses a
+    second spend of the covenant as the node does."""
+    from pyrxd.gravity.swap_state import SwapRole, SwapState
+    from pyrxd.security.errors import PolicyRejection
+    from tests._fake_radiant_chain import FakeRadiantSource
+    from tests.test_maker_covenant_exit import _Swap
+
+    class _Lagging(FakeRadiantSource):
+        def _view(self):
+            view = super()._view()
+            if lag:
+                view.txs = {t: v for t, v in view.txs.items() if v[1] != 0}
+            return view
+
+    class _Primary(_Lagging):
+        async def broadcast(self, raw: bytes) -> str:
+            from pyrxd.transaction.transaction import Transaction
+
+            spends = {f"{i.source_txid}:{i.source_output_index}" for i in Transaction.from_hex(raw).inputs}
+            if spends & self.chain._spent(self.chain._parsed()):
+                self.broadcasts.append(bytes(raw))
+                raise PolicyRejection("txn-mempool-conflict")
+            txid = await super().broadcast(raw)
+            raise BroadcastEchoMismatch(txid, _LIE)
+
+    swap = _Swap()
+    sources = [_Primary(swap.chain, "https://rxd0.example-0.org")] + [
+        _Lagging(swap.chain, f"https://rxd{i}.example-{i}.org") for i in (1, 2)
+    ]
+    swap.sources = sources
+    coord = swap.coordinator(state=SwapState.BOTH_LOCKED, role=SwapRole.TAKER, pin=True, leg=swap.leg())
+    return swap, coord, sources[0]
+
+
+async def test_real_reader_a_mismatched_claim_that_is_mined_is_not_sent_again() -> None:
+    """Honest path: the claim relayed, the primary lied about its txid, and once it is mined every
+    source names it as the claim leaf's spend. The retry returns without sending."""
+    swap, coord, primary = _real_reader_swap()
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(swap.p)
+    swap.chain.mine()
+    await coord._claim_asset_once(swap.p)
+    assert len(primary.broadcasts) == 1 and coord._mismatched_claim_txid is None
+
+
+async def test_real_reader_a_claim_still_in_the_mempool_sends_nothing() -> None:
+    """Sources that see the mempool name the claim at depth 0: not buried, so nothing is sent."""
+    swap, coord, primary = _real_reader_swap()
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(swap.p)
+    with pytest.raises(NetworkError, match="Nothing was sent again"):
+        await coord._claim_asset_once(swap.p)
+    assert len(primary.broadcasts) == 1
+
+
+async def test_real_reader_residual_a_lagging_index_costs_one_refused_rebuild() -> None:
+    """The documented residual: sources that do not see the mempool read the covenant unspent, so a
+    retry before mining rebuilds (one fee input) and the node refuses the conflict. The first claim's
+    txid is kept, so the retry after mining ends without another send."""
+    from pyrxd.security.errors import PolicyRejection
+
+    swap, coord, primary = _real_reader_swap(lag=True)
+    with pytest.raises(RadiantEchoMismatch):
+        await coord._claim_asset_once(swap.p)
+    first = coord._mismatched_claim_txid
+    with pytest.raises(PolicyRejection, match="conflict"):
+        await coord._claim_asset_once(swap.p)
+    assert len(primary.broadcasts) == 2 and coord._mismatched_claim_txid == first
+    swap.chain.mine()
+    await coord._claim_asset_once(swap.p)
+    assert len(primary.broadcasts) == 2 and coord._mismatched_claim_txid is None

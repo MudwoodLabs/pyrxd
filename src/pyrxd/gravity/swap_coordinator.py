@@ -6460,7 +6460,11 @@ class SwapCoordinator:
         raises and sends nothing. The txid is kept until a send after it returns, so a retry whose
         re-send fails (a conflict with the first claim, still in a mempool the reader cannot see)
         still checks the first claim next time (Mythos pass on #986, F4.2). It is kept in memory only,
-        so after a restart a retry rebuilds, as before."""
+        so after a restart a retry rebuilds, as before. Residual: sources whose index lags the node's
+        mempool read a covenant the first claim spent there as unspent, so a retry before it is mined
+        rebuilds on a new fee input and the node refuses the conflict (seen once on regtest; pinned by
+        ``test_real_reader_residual_a_lagging_index_costs_one_refused_rebuild``). That is one fee input
+        per such retry, and nothing is lost: the retry after mining ends without a send."""
         from pyrxd.security.errors import BroadcastEchoMismatch
 
         from .radiant_leg import CovenantSpendKind
