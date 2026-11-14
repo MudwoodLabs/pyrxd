@@ -291,8 +291,9 @@ class Reconciler:
         # swap_id -> clock reading when its observe/decide began failing (re-review of the 0.27 fixes, F-1).
         self._error_since: dict[str, float] = {}
         self._error_repage_s = reconcile_error_repage_s(policy, safety_window_blocks)
-        # swap_id -> {armed-claim situation: clock reading when it first appeared} (#988). Kept while the
-        # swap is active, so neither a quiet tick nor another outcome in between restarts a count.
+        # swap_id -> {armed-claim situation: clock reading when it first appeared} (#988). Never dropped
+        # while the process runs, so no tick in between (quiet, an error, another page, or a store that
+        # leaves the swap out) restarts a count. One float per outcome a swap has had.
         self._claim_since: dict[str, dict[str, float]] = {}
 
     @property
@@ -333,8 +334,6 @@ class Reconciler:
             )
             delivered = await self._safe_handle(swap_id, decision)
             results.append(ReconcileResult(swap_id, decision, error=why, alert_delivered=delivered))
-        for swap_id in set(self._claim_since) - {swap_id for swap_id, _record in active}:
-            del self._claim_since[swap_id]
         for swap_id, record in active:
             results.append(await self._reconcile_one(swap_id, record))
         for swap_id, record in list(getattr(self._store, "legacy", ()) or ()):
@@ -459,9 +458,9 @@ class Reconciler:
         dropped silenced the swap until ``PAGE_SQUEEZED``, 122 blocks later on regtest. Each further bound
         of the same outcome is a new situation, so an ACK holds for at most one safety window, as for a
         reconcile error (F-1). The first bound keeps the bare key, so a page's ACK key is unchanged until
-        then. Each outcome keeps its own count from when it first appeared while the swap was active,
-        so a quiet tick, an error or another outcome in between does not restart it (a count that
-        restarted would hand the earlier ACK back its key)."""
+        then. Each outcome keeps its own count from when it first appeared, so a quiet tick, an error,
+        another page or another outcome in between does not restart it, nor does a store that leaves
+        the swap out for a tick (a count that restarted would hand the earlier ACK back its key)."""
         now = self._clock()
         since = self._claim_since.setdefault(swap_id, {}).setdefault(situation, now)
         period = int((now - since) // self._error_repage_s)

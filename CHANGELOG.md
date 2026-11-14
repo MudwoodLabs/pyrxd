@@ -26,7 +26,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ClaimExecutor.take_reason`, `pyrxd.gravity.watch.executor.ExecReason` and `take_exec_reason`
   carry the reason to the reconciler.
 - **An ACK of an armed claim page holds for at most one safety window** (#988). Once an outcome has
-  lasted one window, the `claim_race:<outcome>:<kind>` situation gains a count (`:1`, `:2`, ...), so
+  lasted one window, the `claim_race:<outcome>:<kind>` situation gains a count (for example `claim_race:declined:awaiting_confirmation:1`), so
   the page comes back after an ACK. Before this, a claim a server dropped after echoing its txid was
   declined every tick as already broadcast, and one ACK of that page silenced the swap until
   `PAGE_SQUEEZED`. That decline now has kind `awaiting_confirmation`, and the mempool-aware decline

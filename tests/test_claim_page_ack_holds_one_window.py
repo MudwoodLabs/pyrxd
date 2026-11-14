@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from pyrxd.gravity.radiant_leg import SeenStore
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import RecordRole
@@ -41,18 +43,23 @@ class _Store:
 
 
 class _Observer:
-    """The SAFE claim race that arms ``autonomous_asset_claim``, or, with ``quiet``, a tick on which
-    the maker's BTC claim is not seen, so ``decide`` pages nothing for the claim."""
+    """The SAFE claim race that arms ``autonomous_asset_claim``, or for one tick in between:
+
+    * ``quiet``: the maker's BTC claim is not seen, so ``decide`` pages nothing;
+    * ``squeezed``: the deadline is near, so ``decide`` pages a claim race it does not arm;
+    * ``error``: the read raises, so the tick is a reconcile error."""
 
     def __init__(self) -> None:
-        self.quiet = False
+        self.mode = "armed"
 
     async def observe(self, swap_id, record):
+        if self.mode == "error":
+            raise RuntimeError("read failed")
         return Observations(
-            maker_has_claimed_btc=not self.quiet,
-            btc_claim_confirmations=0 if self.quiet else 1_000,
+            maker_has_claimed_btc=self.mode != "quiet",
+            btc_claim_confirmations=0 if self.mode == "quiet" else 1_000,
             asset_locked_at_height=100,
-            now_rxd_height=101,
+            now_rxd_height=240 if self.mode == "squeezed" else 101,
         )
 
 
@@ -135,22 +142,36 @@ async def test_an_ack_of_a_dropped_claim_holds_one_safety_window() -> None:
     assert len(node.broadcasts) == 1, "re-paging sends nothing: the claim is still seen"
 
 
-async def test_a_quiet_tick_in_between_does_not_restart_the_count() -> None:
-    """A count that restarted on a quiet tick would hand the earlier ACK back its key: a source that
-    hides the BTC claim for one tick in each window would keep the swap silent."""
+@pytest.mark.parametrize("between", ["quiet", "squeezed", "error", "left_out"])
+async def test_a_tick_in_between_does_not_restart_the_count(between) -> None:
+    """A count that restarted would hand the earlier ACK back its key: a source that hides the BTC
+    claim, or a store that leaves the swap out, for one tick in each window would keep it silent."""
     node = _Node()
-    r, pages, clock, observer, _store = await _dropped_claim_acked(node)
+    r, pages, clock, observer, store = await _dropped_claim_acked(node)
     sent = len(pages.sent)
 
     clock.now += _WINDOW - 1
-    observer.quiet = True
-    res = await _tick(r)
-    assert res.decision.intent is not Intent.PAGE_CLAIM, res.decision
-    observer.quiet = False
+    if between == "left_out":
+        held, store.active = store.active, []
+        assert await r.tick() == []
+        store.active = held
+    else:
+        observer.mode = between
+        [res] = await r.tick()
+        assert not res.decision.autonomous_asset_claim, res.decision
+        if between == "quiet":
+            assert res.decision.intent is Intent.WATCH, res.decision
+        elif between == "squeezed":
+            assert res.decision.intent is Intent.PAGE_SQUEEZED, res.decision
+        else:
+            assert res.error is not None
+        observer.mode = "armed"
+    sent_between = len(pages.sent)
     clock.now += 1
     res = await _tick(r)
     assert res.decision.situation == f"{_AWAITING}:1"
-    assert len(pages.sent) > sent, "the window ran from when the outcome first appeared"
+    assert len(pages.sent) == sent_between + 1, "the window ran from when the outcome first appeared"
+    assert sent_between >= sent
 
 
 async def test_each_outcome_keeps_its_own_count() -> None:
@@ -163,15 +184,6 @@ async def test_each_outcome_keeps_its_own_count() -> None:
     assert r._claim_situation(_SWAP, other) == other, "a new outcome starts at its bare key"
     assert r._claim_situation(_SWAP, _AWAITING) == f"{_AWAITING}:1"
     assert r._claim_since[_SWAP][_AWAITING] == first
-
-
-async def test_a_swap_that_leaves_the_store_drops_its_counts() -> None:
-    node = _Node()
-    r, _pages, _clock, _observer, store = await _dropped_claim_acked(node)
-    assert _SWAP in r._claim_since
-    store.active = []
-    assert await r.tick() == []
-    assert _SWAP not in r._claim_since
 
 
 async def test_the_mempool_aware_decline_has_its_own_kind() -> None:
