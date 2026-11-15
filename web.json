@@ -15,7 +15,30 @@
     "2026-11-13": {
       "/pyrxd/tutorials/": 1
     },
-    "2026-11-14": {}
+    "2026-11-14": {
+      "/pyrxd/api/crypto.html": 1,
+      "/pyrxd/api/devnet.html": 1,
+      "/pyrxd/api/eth_wallet.html": 1,
+      "/pyrxd/api/glyph.html": 1,
+      "/pyrxd/api/index.html": 1,
+      "/pyrxd/api/spv.html": 1,
+      "/pyrxd/api/transaction.html": 1,
+      "/pyrxd/concepts/external-miner-protocol.html": 1,
+      "/pyrxd/concepts/glyph-structures-and-terminology.html": 1,
+      "/pyrxd/concepts/parallel-mining.html": 1,
+      "/pyrxd/how-to/recover-funds-across-wallet-paths.html": 1,
+      "/pyrxd/tutorials/index.html": 1
+    },
+    "2026-11-15": {
+      "/playground": 1,
+      "/pyrxd/api/curve.html": 1,
+      "/pyrxd/api/hd.html": 1,
+      "/pyrxd/concepts/glossary.html": 1,
+      "/pyrxd/concepts/radiant-fts-are-on-chain.html": 1,
+      "/pyrxd/how-to/export-a-watch-only-descriptor.html": 1,
+      "/pyrxd/tutorials/inspect-a-radiant-transaction.html": 1,
+      "/pyrxd/tutorials/mint-a-glyph-ft.html": 1
+    }
   },
   "visits": {
     "2026-11-09": {
@@ -33,6 +56,29 @@
     "2026-11-13": {
       "/pyrxd/tutorials/": 1
     },
-    "2026-11-14": {}
+    "2026-11-14": {
+      "/pyrxd/api/crypto.html": 1,
+      "/pyrxd/api/devnet.html": 1,
+      "/pyrxd/api/eth_wallet.html": 1,
+      "/pyrxd/api/glyph.html": 1,
+      "/pyrxd/api/index.html": 1,
+      "/pyrxd/api/spv.html": 1,
+      "/pyrxd/api/transaction.html": 1,
+      "/pyrxd/concepts/external-miner-protocol.html": 1,
+      "/pyrxd/concepts/glyph-structures-and-terminology.html": 1,
+      "/pyrxd/concepts/parallel-mining.html": 1,
+      "/pyrxd/how-to/recover-funds-across-wallet-paths.html": 1,
+      "/pyrxd/tutorials/index.html": 1
+    },
+    "2026-11-15": {
+      "/playground": 1,
+      "/pyrxd/api/curve.html": 1,
+      "/pyrxd/api/hd.html": 1,
+      "/pyrxd/concepts/glossary.html": 1,
+      "/pyrxd/concepts/radiant-fts-are-on-chain.html": 1,
+      "/pyrxd/how-to/export-a-watch-only-descriptor.html": 1,
+      "/pyrxd/tutorials/inspect-a-radiant-transaction.html": 1,
+      "/pyrxd/tutorials/mint-a-glyph-ft.html": 1
+    }
   }
 }
