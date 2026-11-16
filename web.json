@@ -32,12 +32,28 @@
     "2026-11-15": {
       "/playground": 1,
       "/pyrxd/api/curve.html": 1,
+      "/pyrxd/api/dmint.html": 1,
       "/pyrxd/api/hd.html": 1,
+      "/pyrxd/api/pyrxd.html": 1,
+      "/pyrxd/api/script.html": 1,
+      "/pyrxd/api/security.html": 1,
+      "/pyrxd/api/swap.html": 1,
+      "/pyrxd/concepts/architecture.html": 1,
       "/pyrxd/concepts/glossary.html": 1,
+      "/pyrxd/concepts/glyph-inspect-tool.html": 1,
+      "/pyrxd/concepts/partial-tx-swaps.html": 1,
       "/pyrxd/concepts/radiant-fts-are-on-chain.html": 1,
       "/pyrxd/how-to/export-a-watch-only-descriptor.html": 1,
       "/pyrxd/tutorials/inspect-a-radiant-transaction.html": 1,
-      "/pyrxd/tutorials/mint-a-glyph-ft.html": 1
+      "/pyrxd/tutorials/mint-a-glyph-ft.html": 1,
+      "/pyrxd/tutorials/mint-a-glyph-nft.html": 1,
+      "/pyrxd/tutorials/your-first-radiant-transaction.html": 1
+    },
+    "2026-11-16": {
+      "/pyrxd/reference/counter-chain-support.html": 1,
+      "/pyrxd/reference/index.html": 1,
+      "/pyrxd/showcase.html": 1,
+      "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 1
     }
   },
   "visits": {
@@ -73,12 +89,28 @@
     "2026-11-15": {
       "/playground": 1,
       "/pyrxd/api/curve.html": 1,
+      "/pyrxd/api/dmint.html": 1,
       "/pyrxd/api/hd.html": 1,
+      "/pyrxd/api/pyrxd.html": 1,
+      "/pyrxd/api/script.html": 1,
+      "/pyrxd/api/security.html": 1,
+      "/pyrxd/api/swap.html": 1,
+      "/pyrxd/concepts/architecture.html": 1,
       "/pyrxd/concepts/glossary.html": 1,
+      "/pyrxd/concepts/glyph-inspect-tool.html": 1,
+      "/pyrxd/concepts/partial-tx-swaps.html": 1,
       "/pyrxd/concepts/radiant-fts-are-on-chain.html": 1,
       "/pyrxd/how-to/export-a-watch-only-descriptor.html": 1,
       "/pyrxd/tutorials/inspect-a-radiant-transaction.html": 1,
-      "/pyrxd/tutorials/mint-a-glyph-ft.html": 1
+      "/pyrxd/tutorials/mint-a-glyph-ft.html": 1,
+      "/pyrxd/tutorials/mint-a-glyph-nft.html": 1,
+      "/pyrxd/tutorials/your-first-radiant-transaction.html": 1
+    },
+    "2026-11-16": {
+      "/pyrxd/reference/counter-chain-support.html": 1,
+      "/pyrxd/reference/index.html": 1,
+      "/pyrxd/showcase.html": 1,
+      "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 1
     }
   }
 }
