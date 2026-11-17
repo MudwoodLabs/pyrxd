@@ -50,11 +50,15 @@
       "/pyrxd/tutorials/your-first-radiant-transaction.html": 1
     },
     "2026-11-16": {
+      "/pyrxd/plans/2026-05-11-ship-parallel-miner-plan.html": 1,
       "/pyrxd/reference/counter-chain-support.html": 1,
       "/pyrxd/reference/index.html": 1,
+      "/pyrxd/reference/mutation-survivors/network.html": 1,
       "/pyrxd/showcase.html": 1,
+      "/pyrxd/tutorials/cross-chain-swap.html": 1,
       "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 1
-    }
+    },
+    "2026-11-17": {}
   },
   "visits": {
     "2026-11-09": {
@@ -107,10 +111,14 @@
       "/pyrxd/tutorials/your-first-radiant-transaction.html": 1
     },
     "2026-11-16": {
+      "/pyrxd/plans/2026-05-11-ship-parallel-miner-plan.html": 1,
       "/pyrxd/reference/counter-chain-support.html": 1,
       "/pyrxd/reference/index.html": 1,
+      "/pyrxd/reference/mutation-survivors/network.html": 1,
       "/pyrxd/showcase.html": 1,
+      "/pyrxd/tutorials/cross-chain-swap.html": 1,
       "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 1
-    }
+    },
+    "2026-11-17": {}
   }
 }
