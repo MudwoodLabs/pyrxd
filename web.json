@@ -58,7 +58,10 @@
       "/pyrxd/tutorials/cross-chain-swap.html": 1,
       "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 1
     },
-    "2026-11-17": {}
+    "2026-11-17": {
+      "/pyrxd/dmint-research-mainnet.html": 1
+    },
+    "2026-11-18": {}
   },
   "visits": {
     "2026-11-09": {
@@ -119,6 +122,9 @@
       "/pyrxd/tutorials/cross-chain-swap.html": 1,
       "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 1
     },
-    "2026-11-17": {}
+    "2026-11-17": {
+      "/pyrxd/dmint-research-mainnet.html": 1
+    },
+    "2026-11-18": {}
   }
 }
