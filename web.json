@@ -68,7 +68,19 @@
       "/pyrxd/tutorials": 1
     },
     "2026-11-20": {
-      "/pyrxd/api/pyrxd.html": 1
+      "/pyrxd/api/pyrxd.html": 1,
+      "/pyrxd/how-to/build-a-cross-chain-swap.html": 1,
+      "/pyrxd/how-to/migrate-0.4-to-0.5.html": 1,
+      "/pyrxd/how-to/run-a-two-host-swap-dry-run.html": 1,
+      "/pyrxd/how-to/spv-verification-pitfalls.html": 1,
+      "/pyrxd/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.html": 1
+    },
+    "2026-11-21": {
+      "/pyrxd/how-to/index.html": 1,
+      "/pyrxd/how-to/troubleshoot-common-errors.html": 1,
+      "/pyrxd/reference/mutation-survivors/hdwallet.html": 1,
+      "/pyrxd/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.html": 1,
+      "/pyrxd/tutorials/": 2
     }
   },
   "visits": {
@@ -140,7 +152,19 @@
       "/pyrxd/tutorials": 1
     },
     "2026-11-20": {
-      "/pyrxd/api/pyrxd.html": 1
+      "/pyrxd/api/pyrxd.html": 1,
+      "/pyrxd/how-to/build-a-cross-chain-swap.html": 1,
+      "/pyrxd/how-to/migrate-0.4-to-0.5.html": 1,
+      "/pyrxd/how-to/run-a-two-host-swap-dry-run.html": 1,
+      "/pyrxd/how-to/spv-verification-pitfalls.html": 1,
+      "/pyrxd/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.html": 1
+    },
+    "2026-11-21": {
+      "/pyrxd/how-to/index.html": 1,
+      "/pyrxd/how-to/troubleshoot-common-errors.html": 1,
+      "/pyrxd/reference/mutation-survivors/hdwallet.html": 1,
+      "/pyrxd/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.html": 1,
+      "/pyrxd/tutorials/": 2
     }
   }
 }
