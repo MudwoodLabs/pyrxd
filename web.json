@@ -76,12 +76,18 @@
       "/pyrxd/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.html": 1
     },
     "2026-11-21": {
+      "/pyrxd/how-to/create-a-token-collection.html": 1,
       "/pyrxd/how-to/index.html": 1,
+      "/pyrxd/how-to/issue-a-dmint-token.html": 1,
+      "/pyrxd/how-to/scan-address-for-glyphs.html": 1,
+      "/pyrxd/how-to/start-a-project.html": 1,
       "/pyrxd/how-to/troubleshoot-common-errors.html": 1,
+      "/pyrxd/how-to/verify-an-spv-proof.html": 1,
       "/pyrxd/reference/mutation-survivors/hdwallet.html": 1,
       "/pyrxd/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.html": 1,
       "/pyrxd/tutorials/": 2
-    }
+    },
+    "2026-11-22": {}
   },
   "visits": {
     "2026-11-09": {
@@ -160,11 +166,17 @@
       "/pyrxd/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.html": 1
     },
     "2026-11-21": {
+      "/pyrxd/how-to/create-a-token-collection.html": 1,
       "/pyrxd/how-to/index.html": 1,
+      "/pyrxd/how-to/issue-a-dmint-token.html": 1,
+      "/pyrxd/how-to/scan-address-for-glyphs.html": 1,
+      "/pyrxd/how-to/start-a-project.html": 1,
       "/pyrxd/how-to/troubleshoot-common-errors.html": 1,
+      "/pyrxd/how-to/verify-an-spv-proof.html": 1,
       "/pyrxd/reference/mutation-survivors/hdwallet.html": 1,
       "/pyrxd/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.html": 1,
       "/pyrxd/tutorials/": 2
-    }
+    },
+    "2026-11-22": {}
   }
 }
