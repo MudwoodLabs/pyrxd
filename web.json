@@ -87,7 +87,20 @@
       "/pyrxd/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.html": 1,
       "/pyrxd/tutorials/": 2
     },
-    "2026-11-22": {}
+    "2026-11-22": {
+      "/pyrxd/api/glyph.html": 1,
+      "/pyrxd/reference/mutation-survivors/glyphscript.html": 1,
+      "/pyrxd/reference/mutation-survivors/network.html": 1,
+      "/pyrxd/solutions/design-decisions/griefing-is-a-liveness-residual-not-a-bond.html": 1
+    },
+    "2026-11-23": {
+      "/pyrxd/reference/mutation-survivors/swap.html": 1,
+      "/pyrxd/reference/mutation-survivors/wallet.html": 1,
+      "/pyrxd/solutions/design-decisions/spv-swap-deprecated-primitive-retained.html": 1,
+      "/pyrxd/solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.html": 1,
+      "/pyrxd/solutions/logic-errors/dmint-deploy-reveal-hashlock-reuse.html": 1,
+      "/pyrxd/solutions/logic-errors/dmint-v1-classifier-gap.html": 1
+    }
   },
   "visits": {
     "2026-11-09": {
@@ -177,6 +190,19 @@
       "/pyrxd/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.html": 1,
       "/pyrxd/tutorials/": 2
     },
-    "2026-11-22": {}
+    "2026-11-22": {
+      "/pyrxd/api/glyph.html": 1,
+      "/pyrxd/reference/mutation-survivors/glyphscript.html": 1,
+      "/pyrxd/reference/mutation-survivors/network.html": 1,
+      "/pyrxd/solutions/design-decisions/griefing-is-a-liveness-residual-not-a-bond.html": 1
+    },
+    "2026-11-23": {
+      "/pyrxd/reference/mutation-survivors/swap.html": 1,
+      "/pyrxd/reference/mutation-survivors/wallet.html": 1,
+      "/pyrxd/solutions/design-decisions/spv-swap-deprecated-primitive-retained.html": 1,
+      "/pyrxd/solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.html": 1,
+      "/pyrxd/solutions/logic-errors/dmint-deploy-reveal-hashlock-reuse.html": 1,
+      "/pyrxd/solutions/logic-errors/dmint-v1-classifier-gap.html": 1
+    }
   }
 }
