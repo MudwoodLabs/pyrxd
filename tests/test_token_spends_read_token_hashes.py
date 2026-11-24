@@ -267,3 +267,43 @@ class TestSwapTakeFtFundingReadsTokens:
         funds = await mod._collect_funds(object(), server)
         with pytest.raises(UserError, match="cannot fund 250 units"):
             await mod._ft_funding(server, funds, _ref("cd"), 250)
+
+
+# --------------------------------------------------------------------------- duck-typed wallets
+
+
+class TestDuckTypedWalletsAreCalledAsBefore:
+    """``GlyphClient`` takes "anything exposing ``collect_spendable(client)``" (its docstring),
+    and ``pyrxd.testing.RegtestWallet`` and the examples are such wallets. Passing them
+    ``include_tokens`` would raise ``TypeError`` in code that worked before this change."""
+
+    async def test_a_wallet_without_the_keyword_is_asked_the_old_way(self):
+        w = _wallet()
+        a0 = w.derive_address(0, 0)
+        nft_tx, _label = _nft(w, 0, 0, "ab")
+        server = _ElectrumX({a0: [_plain(a0), nft_tx]})
+        everything = await w.collect_spendable(server, include_tokens=True)
+        calls: list[tuple] = []
+
+        class _OwnWallet:
+            async def collect_spendable(self, client):  # no include_tokens: it lists what it lists
+                calls.append((client,))
+                return list(everything)
+
+        build = await build_nft_transfer(_OwnWallet(), _ref("ab"), _recipient(), client=server, fee_rate=_FEE_RATE)
+
+        assert calls == [(server,)]
+        assert (nft_tx.txid(), 0) in _spent_outpoints(build.tx)
+
+    async def test_a_wallet_that_takes_the_keyword_is_passed_it(self):
+        seen: list[dict] = []
+
+        class _KwWallet:
+            async def collect_spendable(self, client, **kwargs):
+                seen.append(kwargs)
+                return []
+
+        from pyrxd.glyph.transfer import collect_spendable_with_tokens
+
+        assert await collect_spendable_with_tokens(_KwWallet(), object()) == []
+        assert seen == [{"include_tokens": True}]

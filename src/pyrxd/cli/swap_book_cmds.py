@@ -54,6 +54,7 @@ from dataclasses import dataclass
 import click
 
 from ..fee_sizing import SIG_SIZE_SLACK_BYTES, fee_never_below_relay_floor
+from ..glyph.transfer import collect_spendable_with_tokens
 from ..glyph.types import GlyphRef
 from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from ..hd.wallet import raise_if_reads_failed
@@ -373,7 +374,9 @@ async def _collect_funds(ctx: CliContext, client, *, include_tokens: bool = Fals
     ``HdWallet.collect_spendable``). Only a take that pays an FT demand needs them;
     :func:`_rxd_funding` still takes only outputs whose on-chain script is plain RXD."""
     wallet = _load_wallet(ctx)
-    return _WalletFunds(triples=await wallet.collect_spendable(client, include_tokens=include_tokens), wallet=wallet)
+    if include_tokens:
+        return _WalletFunds(triples=await collect_spendable_with_tokens(wallet, client), wallet=wallet)
+    return _WalletFunds(triples=await wallet.collect_spendable(client), wallet=wallet)
 
 
 async def _rxd_funding(
