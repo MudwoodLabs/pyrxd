@@ -80,3 +80,55 @@ def test_deadman_none_skips_the_heartbeat_checks():
         deadman_max_silence_s=None,
     )
     assert all("max-silence" not in p.message for p in problems)
+
+
+def test_a_tick_budget_that_overruns_the_deadman_window_warns():
+    """poll 60 s passes the poll-vs-window checks (120 < 180), but its default 240 s tick budget lets a
+    tick that never times out beat 300 s after the last one, so the dead-man's-switch pages the tower DOWN."""
+    problems = preflight_timing(
+        poll_interval_s=60.0,
+        tick_timeout_s=240.0,
+        safety_window_blocks=6,
+        rxd_block_interval_s=300.0,
+        deadman_max_silence_s=180.0,
+    )
+    assert [p.severity for p in problems] == ["warning"]
+    assert "false-pages the tower DOWN" in problems[0].message
+
+
+def test_a_tick_budget_just_inside_the_deadman_window_is_clean():
+    """Honest path, at the boundary the warning draws: 35 s poll with its default 140 s budget beats 175 s apart."""
+    assert (
+        preflight_timing(
+            poll_interval_s=35.0,
+            tick_timeout_s=140.0,
+            safety_window_blocks=6,
+            rxd_block_interval_s=300.0,
+            deadman_max_silence_s=180.0,
+        )
+        == []
+    )
+    edge = preflight_timing(
+        poll_interval_s=36.0,
+        tick_timeout_s=144.0,
+        safety_window_blocks=6,
+        rxd_block_interval_s=300.0,
+        deadman_max_silence_s=180.0,
+    )
+    assert [p.severity for p in edge] == ["warning"]
+
+
+def test_a_nan_value_is_an_error_not_a_pass():
+    """argparse's float takes "nan", and every comparison with NaN is False, so it used to pass every check."""
+    base = {
+        "poll_interval_s": 30.0,
+        "tick_timeout_s": 120.0,
+        "safety_window_blocks": 6,
+        "rxd_block_interval_s": 300.0,
+        "deadman_max_silence_s": 180.0,
+    }
+    for key in ("poll_interval_s", "tick_timeout_s", "rxd_block_interval_s", "deadman_max_silence_s"):
+        for bad in (float("nan"), float("inf")):
+            problems = preflight_timing(**{**base, key: bad})
+            assert _sev(problems) == {"error"}, (key, bad)
+            assert "finite" in problems[0].message
