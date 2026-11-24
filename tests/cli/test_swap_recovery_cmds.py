@@ -398,7 +398,9 @@ def _two_fee_inputs_client(swap, *, funding_height: int, tip: int):
     small = POLICY.required_fee(400, blocks_to_deadline=20)  # >= the claim's no-urgency target (it is < 400 B)
     large = POLICY.required_fee(400, blocks_to_deadline=0) + 1  # >= its maximum-urgency target
     assert small < POLICY.required_fee(200, blocks_to_deadline=0)  # but `small` is short of THAT (claim > 200 B)
-    assert large <= fee_overpay_ceiling(floor=POLICY.min_relay_fee(200), target=POLICY.required_fee(200, blocks_to_deadline=0))
+    assert large <= fee_overpay_ceiling(
+        floor=POLICY.min_relay_fee(200), target=POLICY.required_fee(200, blocks_to_deadline=0)
+    )
     client = _NoBroadcastClient(
         {
             swap["cov_sh"]: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=funding_height)],
@@ -417,7 +419,7 @@ def test_an_unresolved_depth_selects_the_fee_input_for_maximum_urgency(swap) -> 
     # sizes the claim's fee as if the deadline were here. The fee input must be chosen for that
     # same deadline: choosing it for the full CSV window picked `small`, which the build then
     # reported BELOW the target, while `large` cleared it and went unused.
-    client, small, large = _two_fee_inputs_client(swap, funding_height=200, tip=150)
+    client, _small, large = _two_fee_inputs_client(swap, funding_height=200, tip=150)
     res = _build(swap, "build-claim", "--preimage", P.hex(), "--allow-unconfirmed", client=client, output_mode="json")
     assert res.exit_code == 0, res.output
     payload = json.loads(res.output)
@@ -430,7 +432,7 @@ def test_an_unresolved_depth_selects_the_fee_input_for_maximum_urgency(swap) -> 
 def test_a_measured_depth_far_from_the_deadline_still_selects_the_smaller_fee_input(swap) -> None:
     # Honest path for the test above: with the depth measured and the deadline 15 blocks away
     # (outside the urgency horizon), the smallest input that clears the target is still the pick.
-    client, small, large = _two_fee_inputs_client(swap, funding_height=100, tip=104)
+    client, small, _large = _two_fee_inputs_client(swap, funding_height=100, tip=104)
     res = _build(swap, "build-claim", "--preimage", P.hex(), client=client, output_mode="json")
     assert res.exit_code == 0, res.output
     payload = json.loads(res.output)
@@ -448,7 +450,9 @@ def test_an_upper_case_fee_utxo_names_the_same_output(swap) -> None:
 
 
 def test_an_upper_case_covenant_outpoint_names_the_same_output(swap) -> None:
-    res = _build(swap, "build-claim", "--preimage", P.hex(), "--covenant-outpoint", "AB" * 32 + ":0", output_mode="json")
+    res = _build(
+        swap, "build-claim", "--preimage", P.hex(), "--covenant-outpoint", "AB" * 32 + ":0", output_mode="json"
+    )
     assert res.exit_code == 0, res.output
     payload = json.loads(res.output)
     assert payload["covenant_outpoint"] == "ab" * 32 + ":0"
