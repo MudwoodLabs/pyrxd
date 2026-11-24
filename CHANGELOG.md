@@ -78,6 +78,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`pyrxd swap build-claim` picks the fee input for the deadline it reports when the covenant's
+  depth is unresolved.** When two chain reads disagreed on the depth, the spend was measured at
+  maximum urgency but the fee input was chosen for the full CSV window, so the command could pick
+  a smaller input and report it below the target while a larger one that cleared it went unused.
+- **An upper-case txid in `--fee-utxo`, `--covenant-outpoint` or the recovery file's outpoints
+  now names the output.** The cold recovery commands compared it against the server's lower-case
+  txids and reported the right output as not found.
+- **A non-hex `--taker-pkh` / `--maker-pkh` (or `*_rxd_pkh` in the recovery file) is reported as
+  bad input (exit 1)** instead of "unexpected failure" (exit 4).
 - **The autonomous claim re-sends the same bytes after a broadcast echo mismatch instead of
   rebuilding (#789).** `ClaimExecutor` used to read a mismatch as a network failure and rebuild
   the claim on a new fee input every tick; if the claim had relayed, each rebuild conflicted with
