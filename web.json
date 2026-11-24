@@ -94,12 +94,21 @@
       "/pyrxd/solutions/design-decisions/griefing-is-a-liveness-residual-not-a-bond.html": 1
     },
     "2026-11-23": {
+      "/pyrxd/how-to/handle-radiant-bip143-quirks.html": 1,
+      "/pyrxd/how-to/use-the-signing-agent.html": 1,
+      "/pyrxd/reference/mutation-survivors/coordinator.html": 1,
+      "/pyrxd/reference/mutation-survivors/fee.html": 1,
+      "/pyrxd/reference/mutation-survivors/index.html": 1,
       "/pyrxd/reference/mutation-survivors/swap.html": 1,
       "/pyrxd/reference/mutation-survivors/wallet.html": 1,
       "/pyrxd/solutions/design-decisions/spv-swap-deprecated-primitive-retained.html": 1,
       "/pyrxd/solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.html": 1,
       "/pyrxd/solutions/logic-errors/dmint-deploy-reveal-hashlock-reuse.html": 1,
-      "/pyrxd/solutions/logic-errors/dmint-v1-classifier-gap.html": 1
+      "/pyrxd/solutions/logic-errors/dmint-v1-classifier-gap.html": 1,
+      "/pyrxd/tutorials/": 1
+    },
+    "2026-11-24": {
+      "/pyrxd/api/pyrxd.html": 1
     }
   },
   "visits": {
@@ -197,12 +206,21 @@
       "/pyrxd/solutions/design-decisions/griefing-is-a-liveness-residual-not-a-bond.html": 1
     },
     "2026-11-23": {
+      "/pyrxd/how-to/handle-radiant-bip143-quirks.html": 1,
+      "/pyrxd/how-to/use-the-signing-agent.html": 1,
+      "/pyrxd/reference/mutation-survivors/coordinator.html": 1,
+      "/pyrxd/reference/mutation-survivors/fee.html": 1,
+      "/pyrxd/reference/mutation-survivors/index.html": 1,
       "/pyrxd/reference/mutation-survivors/swap.html": 1,
       "/pyrxd/reference/mutation-survivors/wallet.html": 1,
       "/pyrxd/solutions/design-decisions/spv-swap-deprecated-primitive-retained.html": 1,
       "/pyrxd/solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.html": 1,
       "/pyrxd/solutions/logic-errors/dmint-deploy-reveal-hashlock-reuse.html": 1,
-      "/pyrxd/solutions/logic-errors/dmint-v1-classifier-gap.html": 1
+      "/pyrxd/solutions/logic-errors/dmint-v1-classifier-gap.html": 1,
+      "/pyrxd/tutorials/": 1
+    },
+    "2026-11-24": {
+      "/pyrxd/api/pyrxd.html": 1
     }
   }
 }
