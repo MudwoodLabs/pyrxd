@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..hd.bip32 import Xpub
+from ..hd.wallet import _has_token_history, refuse_unbounded_scan
 from ..network.electrumx import ElectrumXClient, script_hash_for_address
 from ..security.errors import ValidationError
 from ..security.types import Txid
@@ -36,8 +37,15 @@ async def collect_watch_only_utxos(
 ) -> WatchOnlyScan:
     """Gap-limit scan both BIP44 chains from the public xpub and collect spendable UTXOs.
 
-    ``get_history`` marks a derived address used; ``get_utxos`` enumerates its
-    spendable outputs; ``get_transaction`` fetches each output's source tx (for the
+    An address is used by the same rule :meth:`HdWallet._scan_chain` applies: history at
+    its P2PKH script hash, or, when that is empty, at any of its token script hashes
+    (:func:`~pyrxd.hd.wallet._has_token_history`, #787). Without the second half, a run
+    of ``gap_limit`` token-only addresses ended this scan and hid the plain RXD beyond
+    them, and a token-only change address was handed out again as change. The scan stops
+    at the same depth as the HD one (:func:`~pyrxd.hd.wallet.refuse_unbounded_scan`), so
+    a server that reports history everywhere cannot keep it deriving forever.
+
+    ``get_utxos`` enumerates a used address's spendable outputs; ``get_transaction`` fetches each output's source tx (for the
     agent's C1 prevout check). Also reports the next unused internal index, so the
     caller can place change on a fresh change address. No private key is touched.
     """
@@ -53,9 +61,10 @@ async def collect_watch_only_utxos(
         consecutive_unused = 0
         index = 0
         while consecutive_unused < gap_limit:
+            refuse_unbounded_scan(client, change, index, gap_limit=gap_limit)
             address = chain_xpub.ckd(index).address()
             script_hash = script_hash_for_address(address)
-            if await client.get_history(script_hash):
+            if await client.get_history(script_hash) or await _has_token_history(client, address):
                 consecutive_unused = 0
                 if change == _INTERNAL_CHAIN:
                     next_change_index = index + 1

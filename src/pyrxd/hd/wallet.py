@@ -327,6 +327,22 @@ def raise_if_reads_failed(triples: object, shortfall: str) -> None:
         )
 
 
+def refuse_unbounded_scan(client: object, change: int, index: int, *, gap_limit: int = _GAP_LIMIT) -> None:
+    """Raise :class:`NetworkError` once a gap-limit scan has reached :data:`_MAX_SCAN_ADDRESSES_PER_CHAIN`.
+
+    Shared by :meth:`HdWallet._scan_chain` and the watch-only scan in
+    :mod:`pyrxd.agent.discover`, so both stop at the same depth with the same message (#772).
+    The cap is read from this module at call time.
+    """
+    if index >= _MAX_SCAN_ADDRESSES_PER_CHAIN:
+        raise NetworkError(
+            f"{_server_name(client)} reported history for {_MAX_SCAN_ADDRESSES_PER_CHAIN:,} "
+            f"{'change' if change else 'receive'} addresses without the {gap_limit}-address "
+            "unused gap that ends a wallet scan; refusing to keep deriving. A server that "
+            "claims history everywhere is misbehaving: use a different ElectrumX endpoint."
+        )
+
+
 @dataclass
 class AddressRecord:
     address: str
@@ -899,13 +915,7 @@ class HdWallet:
         # caching keeps that O(1) HMAC per index instead of a full master walk each call).
         account_xprv = self._xprv
         while consecutive_unused < _GAP_LIMIT:
-            if index >= _MAX_SCAN_ADDRESSES_PER_CHAIN:
-                raise NetworkError(
-                    f"{_server_name(client)} reported history for {_MAX_SCAN_ADDRESSES_PER_CHAIN:,} "
-                    f"{'change' if change else 'receive'} addresses without the {_GAP_LIMIT}-address "
-                    "unused gap that ends a wallet scan; refusing to keep deriving. A server that "
-                    "claims history everywhere is misbehaving: use a different ElectrumX endpoint."
-                )
+            refuse_unbounded_scan(client, change, index)
             # Fetch one address at a time — correct BIP44 gap-limit semantics.
             addr = self._derive_address(change, index, account_xprv)
             pkey = self._path_key(change, index)
