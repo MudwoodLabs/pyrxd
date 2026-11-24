@@ -283,7 +283,8 @@ def prepare() -> None:
     require_mineable_last_time(params.last_time, params.daa_mode, stage="dmint_v2_mainnet_run.prepare")
     contract_script = build_dmint_contract_script(params)
     state = DmintState.from_script(contract_script)
-    assert state.is_v1 is False, "deploy script did not parse as V2"
+    if state.is_v1 is not False:  # an explicit check: `python -O` would strip an assert here
+        raise RuntimeError("deploy script did not parse as V2")
 
     # deploy fee: at 0.10 RXD/kB a ~720B tx ≈ 7.2M photons; budget 8M. Change -> wallet.
     deploy_fee = 8_000_000
