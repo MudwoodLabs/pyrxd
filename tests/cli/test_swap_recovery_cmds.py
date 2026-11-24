@@ -24,6 +24,8 @@ from pyrxd.cli.config import Config
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.main import cli
 from pyrxd.cli.swap_recovery import CounterLegStatus, electrumx_script_hash
+from pyrxd.fee_sizing import fee_overpay_ceiling
+from pyrxd.gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY as POLICY
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
@@ -387,6 +389,97 @@ def test_build_claim_uses_the_persisted_covenant_amount(swap) -> None:
     res = _build(swap, "build-claim", "--preimage", P.hex())
     assert res.exit_code == 1
     assert "does not match the one in the recovery file" in res.output
+
+
+def _two_fee_inputs_client(swap, *, funding_height: int, tip: int):
+    """A covenant plus two fee inputs: one that clears only the NO-urgency target, one that clears
+    the MAXIMUM-urgency target. Both are derived from the default policy, so the boundary moves
+    with it; the asserts pin the preconditions the tests below rely on."""
+    small = POLICY.required_fee(400, blocks_to_deadline=20)  # >= the claim's no-urgency target (it is < 400 B)
+    large = POLICY.required_fee(400, blocks_to_deadline=0) + 1  # >= its maximum-urgency target
+    assert small < POLICY.required_fee(200, blocks_to_deadline=0)  # but `small` is short of THAT (claim > 200 B)
+    assert large <= fee_overpay_ceiling(floor=POLICY.min_relay_fee(200), target=POLICY.required_fee(200, blocks_to_deadline=0))
+    client = _NoBroadcastClient(
+        {
+            swap["cov_sh"]: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=funding_height)],
+            swap["fee_sh"]: [
+                UtxoRecord(tx_hash="cd" * 32, tx_pos=1, value=small, height=90),
+                UtxoRecord(tx_hash="ef" * 32, tx_pos=0, value=large, height=90),
+            ],
+        },
+        tip=tip,
+    )
+    return client, small, large
+
+
+def test_an_unresolved_depth_selects_the_fee_input_for_maximum_urgency(swap) -> None:
+    # The UTXO reports a height above every tip read, so the depth is UNRESOLVED and the build
+    # sizes the claim's fee as if the deadline were here. The fee input must be chosen for that
+    # same deadline: choosing it for the full CSV window picked `small`, which the build then
+    # reported BELOW the target, while `large` cleared it and went unused.
+    client, small, large = _two_fee_inputs_client(swap, funding_height=200, tip=150)
+    res = _build(swap, "build-claim", "--preimage", P.hex(), "--allow-unconfirmed", client=client, output_mode="json")
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["depth_unresolved"] is True
+    assert payload["blocks_to_deadline"] == 0
+    assert payload["fee_photons"] == large
+    assert payload["clears_target"] is True
+
+
+def test_a_measured_depth_far_from_the_deadline_still_selects_the_smaller_fee_input(swap) -> None:
+    # Honest path for the test above: with the depth measured and the deadline 15 blocks away
+    # (outside the urgency horizon), the smallest input that clears the target is still the pick.
+    client, small, large = _two_fee_inputs_client(swap, funding_height=100, tip=104)
+    res = _build(swap, "build-claim", "--preimage", P.hex(), client=client, output_mode="json")
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["depth_unresolved"] is False
+    assert payload["blocks_to_deadline"] == 15
+    assert payload["fee_photons"] == small
+    assert payload["clears_target"] is True
+
+
+def test_an_upper_case_fee_utxo_names_the_same_output(swap) -> None:
+    # ElectrumX reports txids in lower case; an operator may paste one in upper case.
+    res = _build(swap, "build-claim", "--preimage", P.hex(), "--fee-utxo", "CD" * 32 + ":1", output_mode="json")
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.output)["fee_outpoint"] == "cd" * 32 + ":1"
+
+
+def test_an_upper_case_covenant_outpoint_names_the_same_output(swap) -> None:
+    res = _build(swap, "build-claim", "--preimage", P.hex(), "--covenant-outpoint", "AB" * 32 + ":0", output_mode="json")
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["covenant_outpoint"] == "ab" * 32 + ":0"
+    assert payload["covenant_identified_by"] == "pinned"
+
+
+def test_a_lower_case_pin_that_is_not_the_covenant_is_still_refused(swap) -> None:
+    # Honest path for the case tests: lower-casing must not make a WRONG pin match.
+    res = _build(swap, "build-claim", "--preimage", P.hex(), "--covenant-outpoint", "ac" * 32 + ":0")
+    assert res.exit_code == 1
+    assert "was not found" in res.output
+
+
+@pytest.mark.parametrize("flag", ["--taker-pkh", "--maker-pkh"])
+def test_a_non_hex_pkh_flag_is_bad_input_not_an_unexpected_failure(swap, flag: str) -> None:
+    # `bytes.fromhex`'s ValueError is not a ValidationError, so it escaped the build's error
+    # mapping: the top-level handler reported it as "unexpected failure (ValueError)", exit 4.
+    res = _build(swap, "build-claim", "--preimage", P.hex(), flag, "zz" * 20)
+    assert isinstance(res.exception, SystemExit), repr(res.exception)
+    assert res.exit_code == 1
+    assert f"{flag} must be 20 bytes (40 hex chars)" in res.output
+
+
+def test_a_non_hex_pkh_in_the_recovery_file_is_bad_input(swap) -> None:
+    doc = json.loads(swap["keys"].read_text())
+    doc["taker_rxd_pkh"] = "zz" * 20
+    swap["keys"].write_text(json.dumps(doc))
+    res = _build(swap, "build-claim", "--preimage", P.hex())
+    assert isinstance(res.exception, SystemExit), repr(res.exception)
+    assert res.exit_code == 1
+    assert "taker_rxd_pkh must be 20 bytes (40 hex chars)" in res.output
 
 
 def test_build_claim_reports_an_unfunded_covenant_plainly(swap) -> None:
