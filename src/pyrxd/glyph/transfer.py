@@ -200,7 +200,7 @@ async def select_ft_inputs(
     # already answers. It also contradicted this function's own rule: the scanner IS
     # the index path, and holdings here are read from the on-chain locking script.
     if triples is None:
-        triples = await wallet.collect_spendable(client)
+        triples = await wallet.collect_spendable(client, include_tokens=True)
     ft_inputs: list[tuple[FtUtxo, str, PrivateKey]] = []
     total_ft = 0
     for utxo, addr, pk in triples:
@@ -470,7 +470,12 @@ async def build_ft_airdrop(
     # UTXO set, and each used to fetch it (and each candidate's parent transaction)
     # independently — doubling the round trips and opening a window in which the two
     # phases could disagree about what the wallet holds.
-    triples = await wallet.collect_spendable(client)
+    #
+    # ``include_tokens``: a Radiant ElectrumX lists a token output under the token script's
+    # hash, never under the owner's P2PKH hash, so the default collection holds no FT UTXO
+    # to select. Fee funding takes only outputs whose on-chain script is a bare P2PKH
+    # (``find_plain_rxd_utxo``), so the token outputs in the same list cannot be spent as fee.
+    triples = await wallet.collect_spendable(client, include_tokens=True)
     selected = await select_ft_inputs(wallet, ref, total, client, triples)
     first_key = single_ft_signing_key(selected, _what)
     funding = await ft_funding(
@@ -763,7 +768,10 @@ async def build_nft_transfer(
         error_type=ValidationError,
     )
 
-    triples = await wallet.collect_spendable(client)
+    # ``include_tokens``: the singleton is listed under its script's zero-ref hash, not the
+    # owner's P2PKH hash (see ``HdWallet.collect_spendable``). The fee input below is still
+    # taken only from outputs whose on-chain script is a bare P2PKH.
+    triples = await wallet.collect_spendable(client, include_tokens=True)
     found = await find_nft_utxo(triples, ref, client)
     if found is None:
         raise NoHoldingsError(f"NFT {ref.txid}:{ref.vout} is not held by this wallet")

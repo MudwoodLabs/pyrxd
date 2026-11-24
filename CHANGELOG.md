@@ -78,6 +78,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`glyph transfer-nft`, `transfer-ft`, `airdrop-ft` and `swap take` of an FT demand find the
+  wallet's tokens.** They chose the token from `HdWallet.collect_spendable`, which reads each
+  address's P2PKH script hash only, and a Radiant ElectrumX lists a token output under the token
+  script's hash with its refs zeroed (measured on both public mainnet servers, 2026-09-29, #782).
+  So against a real server each of them reported a token that `glyph list` had just shown as not
+  held by the wallet. `GlyphClient.transfer_nft`, `transfer_ft` and `airdrop_ft` and the
+  `pyrxd.glyph.transfer` builders had the same defect. `collect_spendable` takes a new
+  `include_tokens=True`, which also reads every used address's owned token hashes (the ones
+  `glyph list` reads), and these spends pass it. Fee inputs are still taken only from outputs
+  whose on-chain script is a bare P2PKH, so a token output in the same list is never spent as fee.
+  The default collection is unchanged.
+
 - **The autonomous claim re-sends the same bytes after a broadcast echo mismatch instead of
   rebuilding (#789).** `ClaimExecutor` used to read a mismatch as a network failure and rebuild
   the claim on a new fee input every tick; if the claim had relayed, each rebuild conflicted with
