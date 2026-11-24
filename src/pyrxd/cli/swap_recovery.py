@@ -629,6 +629,20 @@ def _pkh_from_wif(wif: str) -> bytes:
         ) from None
 
 
+def _pkh_bytes(text: str) -> bytes | None:
+    """*text* as a 20-byte pkh, or ``None`` when it is not 40 hex characters.
+
+    ``None`` rather than ``bytes.fromhex``'s ``ValueError``: a ValueError is not a
+    :class:`ValidationError`, so a typo'd ``--taker-pkh`` escaped the cold commands' error
+    mapping and was reported as an "unexpected failure" (exit 4) instead of bad input.
+    """
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        return None
+    return raw if len(raw) == 20 else None
+
+
 def covenant_pkhs(
     path: Path, *, taker_pkh_hex: str | None = None, maker_pkh_hex: str | None = None
 ) -> tuple[bytes, bytes]:
@@ -647,15 +661,15 @@ def covenant_pkhs(
 
     def _resolve(role: str, override: str | None) -> bytes:
         if override:
-            raw = bytes.fromhex(override)
-            if len(raw) != 20:
+            raw = _pkh_bytes(override)
+            if raw is None:
                 raise ValidationError(f"--{role}-pkh must be 20 bytes (40 hex chars)")
             return raw
         field_pkh = _opt_str(d, f"{role}_rxd_pkh")
         if field_pkh:
-            raw = bytes.fromhex(field_pkh)
-            if len(raw) != 20:
-                raise ValidationError(f"recovery file {role}_rxd_pkh must be 20 bytes")
+            raw = _pkh_bytes(field_pkh)
+            if raw is None:
+                raise ValidationError(f"recovery file {role}_rxd_pkh must be 20 bytes (40 hex chars)")
             return raw
         wif = _opt_str(d, f"{role}_rxd_wif")
         if wif:
@@ -674,6 +688,10 @@ def parse_outpoint(value: str, *, what: str = "outpoint") -> BtcOutpoint:
     if not isinstance(value, str) or value.count(":") != 1:
         raise ValidationError(f"{what} must be 'txid:vout'")
     txid, vout_s = value.split(":")
+    # Lower-case, the spelling ElectrumX, Esplora and ``Transaction.txid()`` all use: callers
+    # compare this txid as a STRING against theirs (the pinned covenant, ``--fee-utxo``, the
+    # covenant's spender), so an upper-case paste matched nothing and read as "not found".
+    txid = txid.lower()
     # ASCII digits only. `int()` also takes " 1", "+1", "1_0" and Arabic-Indic or full-width
     # digits, none of which is the documented "<txid>:<n>" form.
     if not re.fullmatch(r"[0-9]{1,10}", vout_s):
@@ -2703,6 +2721,26 @@ def _assert_covenant_confirmed(chain: CovenantChainState, *, allow_unconfirmed: 
     )
 
 
+def claim_blocks_to_deadline(chain: CovenantChainState, refund_csv: int) -> int:
+    """Blocks left for a claim to be MINED before the maker's CSV refund branch opens.
+
+    ``refund_csv - confirmations``, clamped at 0. An UNRESOLVED depth is not a depth of zero:
+    ``chain.confirmations`` is 0 there only because there is nothing honest to put in it, and
+    subtracting that 0 would report the FULL CSV window as remaining — the optimistic direction,
+    on the path where being late is unrecoverable. It counts as 0 blocks instead: maximum urgency
+    premium, which costs fee and never time.
+
+    The ONE computation for the claim's deadline: the fee input is selected against it
+    (``swap_recovery_cmds._prepare``) and the built spend is measured against it
+    (:func:`build_cold_claim`). When the two disagreed, an unresolved depth selected an input
+    for the full-window target and the build then reported it BELOW the maximum-urgency target,
+    while a larger input that cleared it sat unused.
+    """
+    if chain.depth_unresolved:
+        return 0
+    return max(0, int(refund_csv) - chain.confirmations)
+
+
 def build_cold_claim(
     *,
     covenant: HtlcCovenant,
@@ -2735,12 +2773,7 @@ def build_cold_claim(
         fee=fee,
         fee_policy=pol,
     )
-    # An unresolved depth is not a depth of zero. ``chain.confirmations`` is 0 there only
-    # because there is nothing honest to put in it, and feeding that 0 into the
-    # subtraction below would report the FULL CSV window as remaining — the optimistic
-    # direction, on the path where being late is unrecoverable. Take 0 blocks to the
-    # deadline instead: maximum urgency premium, which costs fee and never time.
-    blocks_to_deadline = 0 if chain.depth_unresolved else max(0, covenant.refund_csv - chain.confirmations)
+    blocks_to_deadline = claim_blocks_to_deadline(chain, covenant.refund_csv)
     size, floor, target, mult = _measure(tx, fee, pol, blocks_to_deadline=blocks_to_deadline)
     return ColdSpend(
         kind="claim",
