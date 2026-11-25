@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import importlib.util
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -102,7 +103,14 @@ class TestPlainPayments:
         # A DER signature's length (so the transaction's) varies by a byte with the bytes
         # signed. Pick a size, then vary the payment by a photon until a transaction of
         # exactly that size pays exactly its floor, and one pays a photon less.
-        size = len(_pay(sb, coin, sb.friend.address, 100_000_000, FEE).serialize())
+        #
+        # The size is the COMMONEST of 16 signed payments, not the first one's. Measured
+        # over 4,000 fresh signatures of this shape: 225 B 2,025 times, 226 B 1,956, 224 B
+        # 18, 223 B once. Derived from those counts: taking the first size meant that about one run in 200 aimed at
+        # a size seen ~0.5% of the time, and 256 tries then missed it about a third of the
+        # time ("no transaction of the target size", seen on CI for PR #1006).
+        sizes = Counter(len(_pay(sb, coin, sb.friend.address, 100_000_000 + k, FEE).serialize()) for k in range(16))
+        size = sizes.most_common(1)[0][0]
         floor = min_relay_fee(size)
 
         def of_size(fee):
