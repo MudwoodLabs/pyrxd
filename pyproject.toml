@@ -563,7 +563,6 @@ ignore = [
     "E501",   # line-too-long: ruff format handles wrapping; long URLs/strings are OK
     "E741",   # ambiguous variable name 'l' / 'I' — sometimes the natural choice in math
     "E702",   # multiple statements on one line with semicolon — used in compact byte parsers
-    "S101",   # assert: legitimate in src/ where used as runtime invariants
     "S105",   # hardcoded password string false positives on BIP39 passphrase=""
     "S110",   # try/except/pass — flagged when the exception is intentional swallow with explanatory comment
     "S324",   # SHA1 used in BIP32 (per spec, not for security)
@@ -609,6 +608,8 @@ ignore = [
     "E402",   # examples may reorder imports for narrative clarity
 ]
 "scripts/**" = [
+    "S101",   # assert: dev/operator scripts use it in self-checks and for type narrowing.
+              # src/ is NOT exempt: `python -O` strips asserts, so runtime checks there must raise.
     "S603",   # subprocess call with non-shell args: dev scripts trust their own argv
     "S607",   # partial executable path: `git`, `python3` etc. resolved via PATH at dev time
 ]
@@ -622,6 +623,8 @@ ignore = [
     "S607",   # `ssh` / `docker` resolved via PATH, same as scripts/** dev-script convention
 ]
 "docs/conf.py" = ["E", "F", "I"]
+"docs/brainstorms/**" = ["S101"]  # archived spike scripts, not shipped
+"docs/inspect_static/**" = ["S101"]  # Pyodide playground code, runs in the browser without -O
 
 [tool.ruff.lint.isort]
 required-imports = ["from __future__ import annotations"]
