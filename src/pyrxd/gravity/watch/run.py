@@ -802,8 +802,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--tick-timeout-s",
         type=float,
         default=None,
-        help="per-tick watchdog budget; a tick exceeding it emits a degraded heartbeat instead of "
-        "blocking past the dead-man's-switch window (defaults to 4x poll interval)",
+        help="per-tick watchdog budget; a tick exceeding it is cut short and writes no heartbeat, so a "
+        "persistently slow source shows up as staleness (defaults to 4x poll interval). Keep it plus "
+        "--poll-interval-s under --deadman-max-silence-s, or one slow tick false-pages the tower DOWN",
     )
     p.add_argument("--poll-interval-s", type=float, default=30.0)
     p.add_argument(
@@ -1197,7 +1198,13 @@ async def _amain(argv: Sequence[str] | None = None) -> int:
         # the FILE heartbeat carried the real count.
         heartbeat = default_heartbeat(logger, unacked_critical=unacked)
         if args.heartbeat_file:
-            heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file, unacked_critical=unacked))
+            # The opened counter lets the escalation monitor see a CRITICAL that opens while an older,
+            # already escalated one is still un-ACKed (the count alone never returns to zero then).
+            opened = getattr(alerter, "critical_opened_count", None)
+            heartbeat = combine_heartbeats(
+                heartbeat,
+                FileHeartbeat(args.heartbeat_file, unacked_critical=unacked, critical_opened=opened),
+            )
         # Drain the operator ACK inbox once per tick, before the reconciler decides. An ACK is
         # never double-consumed (FileAckInbox.drain renames the inbox aside atomically); one written
         # in the instant around the rename can be dropped, and its page keeps firing (see drain).

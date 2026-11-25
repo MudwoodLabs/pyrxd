@@ -23,6 +23,7 @@ from pyrxd.gravity.watch import (
     heartbeat_age_s,
     run_monitor,
 )
+from pyrxd.security.errors import ValidationError
 
 
 def _page(severity=Severity.CRITICAL, intent=Intent.PAGE_CLAIM) -> Page:
@@ -251,6 +252,27 @@ async def test_deadman_future_dated_heartbeat_is_stale(tmp_path):
     v = await sw.check(now=1000.0)  # age = -4000s → stale (fail-closed)
     assert v.alive is False
     assert len(ch.pages) == 1 and ch.pages[0].severity is Severity.CRITICAL
+
+
+@pytest.mark.parametrize("raw_ts", ["NaN", "Infinity", "-Infinity", "true"])
+async def test_deadman_non_finite_heartbeat_ts_is_stale(tmp_path, raw_ts):
+    # json parses NaN and Infinity. A NaN ts gave a NaN age, every comparison with it is False, and the
+    # switch read the tower as ALIVE while the file stayed that way (watchtower correctness hunt).
+    p = tmp_path / "hb.json"
+    p.write_text('{"ts": ' + raw_ts + "}")
+    assert heartbeat_age_s(p, now=1000.0) is None
+    ch = RecChannel()
+    sw = DeadMansSwitch(heartbeat_path=p, max_silence_s=60, channel=ch)
+    v = await sw.check(now=1000.0)
+    assert v.alive is False and v.age_s is None
+    assert len(ch.pages) == 1 and ch.pages[0].severity is Severity.CRITICAL
+    assert "absent" in ch.pages[0].message
+
+
+@pytest.mark.parametrize("bound", [float("nan"), float("inf"), 0, -1, True])
+def test_deadman_refuses_a_bound_that_can_never_go_stale(tmp_path, bound):
+    with pytest.raises(ValidationError):
+        DeadMansSwitch(heartbeat_path=tmp_path / "hb.json", max_silence_s=bound, channel=RecChannel())
 
 
 async def test_run_monitor_max_iterations(tmp_path):
