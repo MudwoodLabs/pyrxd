@@ -108,8 +108,10 @@
       "/pyrxd/tutorials/": 1
     },
     "2026-11-24": {
-      "/pyrxd/api/pyrxd.html": 1
-    }
+      "/pyrxd/api/pyrxd.html": 1,
+      "/pyrxd/reference/mutation-survivors/network.html": 1
+    },
+    "2026-11-25": {}
   },
   "visits": {
     "2026-11-09": {
@@ -220,7 +222,9 @@
       "/pyrxd/tutorials/": 1
     },
     "2026-11-24": {
-      "/pyrxd/api/pyrxd.html": 1
-    }
+      "/pyrxd/api/pyrxd.html": 1,
+      "/pyrxd/reference/mutation-survivors/network.html": 1
+    },
+    "2026-11-25": {}
   }
 }
