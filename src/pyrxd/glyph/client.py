@@ -281,7 +281,10 @@ class GlyphClient:
             calls for the gap-limit scan ``collect_spendable`` runs before every spend.
         wallet: an :class:`~pyrxd.hd.wallet.HdWallet`, or anything exposing
             ``await collect_spendable(client)``, ``privkey_for_address(address)`` and
-            ``addresses``.
+            ``addresses``. A transfer asks ``collect_spendable`` for the wallet's token
+            outputs as well when it accepts ``include_tokens=True`` (``HdWallet`` does);
+            one that does not is called as before and must list its token outputs itself
+            (:func:`~pyrxd.glyph.transfer.collect_spendable_with_tokens`).
         store: where a :class:`~pyrxd.glyph.mint.PendingMint` lives between commit and
             reveal. Required for minting, unused by transfers.
         fee_rate: photons per byte, applied to every build. A rate above the overpay

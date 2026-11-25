@@ -72,6 +72,7 @@ __all__ = [
     "assert_fee_matches_size",
     "build_ft_transfer",
     "build_nft_transfer",
+    "collect_spendable_with_tokens",
     "find_nft_utxo",
     "find_plain_rxd_utxo",
     "ft_funding",
@@ -169,6 +170,41 @@ def ft_ref_or_none(script: bytes) -> GlyphRef | None:
         return None
 
 
+async def collect_spendable_with_tokens(
+    wallet: HdWallet, client: ElectrumXClient
+) -> list[tuple[UtxoRecord, str, PrivateKey]]:
+    """The wallet's UTXOs INCLUDING its token outputs, for a spend that moves a token.
+
+    A Radiant ElectrumX lists a token output under the token script's hash with its refs
+    zeroed, never under the owner's P2PKH hash, so :meth:`HdWallet.collect_spendable`'s
+    default result holds no token at all. Every caller here that looks for a token to spend
+    used to read that default, and reported a token ``glyph list`` had just listed as "not
+    held by this wallet". An :class:`~pyrxd.hd.wallet.HdWallet` is asked with
+    ``include_tokens=True``.
+
+    A duck-typed wallet (``pyrxd.testing.RegtestWallet``, the examples, a caller's own) whose
+    ``collect_spendable`` takes no ``include_tokens`` is called as before: what it lists is its
+    own business, and passing it an argument it does not take would raise ``TypeError`` in code
+    that worked yesterday.
+
+    The result mixes plain and token outputs. Callers check each output's on-chain script
+    before spending it as one or the other (:func:`find_plain_rxd_utxo`,
+    :func:`select_ft_inputs`, :func:`find_nft_utxo`).
+    """
+    import inspect
+
+    collect = wallet.collect_spendable
+    params: list[inspect.Parameter]
+    try:
+        params = list(inspect.signature(collect).parameters.values())
+    except (TypeError, ValueError):  # a callable inspect cannot read: ask it the old way
+        params = []
+    takes_it = any(p.name == "include_tokens" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+    if takes_it:
+        return await collect(client, include_tokens=True)
+    return await collect(client)
+
+
 async def select_ft_inputs(
     wallet: HdWallet,
     ref: GlyphRef,
@@ -200,7 +236,7 @@ async def select_ft_inputs(
     # already answers. It also contradicted this function's own rule: the scanner IS
     # the index path, and holdings here are read from the on-chain locking script.
     if triples is None:
-        triples = await wallet.collect_spendable(client)
+        triples = await collect_spendable_with_tokens(wallet, client)
     ft_inputs: list[tuple[FtUtxo, str, PrivateKey]] = []
     total_ft = 0
     for utxo, addr, pk in triples:
@@ -470,7 +506,12 @@ async def build_ft_airdrop(
     # UTXO set, and each used to fetch it (and each candidate's parent transaction)
     # independently — doubling the round trips and opening a window in which the two
     # phases could disagree about what the wallet holds.
-    triples = await wallet.collect_spendable(client)
+    #
+    # ``include_tokens``: a Radiant ElectrumX lists a token output under the token script's
+    # hash, never under the owner's P2PKH hash, so the default collection holds no FT UTXO
+    # to select. Fee funding takes only outputs whose on-chain script is a bare P2PKH
+    # (``find_plain_rxd_utxo``), so the token outputs in the same list cannot be spent as fee.
+    triples = await collect_spendable_with_tokens(wallet, client)
     selected = await select_ft_inputs(wallet, ref, total, client, triples)
     first_key = single_ft_signing_key(selected, _what)
     funding = await ft_funding(
@@ -763,7 +804,10 @@ async def build_nft_transfer(
         error_type=ValidationError,
     )
 
-    triples = await wallet.collect_spendable(client)
+    # ``include_tokens``: the singleton is listed under its script's zero-ref hash, not the
+    # owner's P2PKH hash (see ``HdWallet.collect_spendable``). The fee input below is still
+    # taken only from outputs whose on-chain script is a bare P2PKH.
+    triples = await collect_spendable_with_tokens(wallet, client)
     found = await find_nft_utxo(triples, ref, client)
     if found is None:
         raise NoHoldingsError(f"NFT {ref.txid}:{ref.vout} is not held by this wallet")

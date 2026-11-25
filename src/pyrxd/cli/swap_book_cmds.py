@@ -54,6 +54,7 @@ from dataclasses import dataclass
 import click
 
 from ..fee_sizing import SIG_SIZE_SLACK_BYTES, fee_never_below_relay_floor
+from ..glyph.transfer import collect_spendable_with_tokens
 from ..glyph.types import GlyphRef
 from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from ..hd.wallet import raise_if_reads_failed
@@ -364,10 +365,17 @@ class _WalletFunds:
         return self.triples[0][2].public_key().hash160()
 
 
-async def _collect_funds(ctx: CliContext, client) -> _WalletFunds:
+async def _collect_funds(ctx: CliContext, client, *, include_tokens: bool = False) -> _WalletFunds:
     """The wallet's UTXOs, strictly: any failed read is a network error. ``swap cancel`` alone
-    collects a partial view (see there)."""
+    collects a partial view (see there).
+
+    ``include_tokens`` also reads the wallet's token outputs, which a Radiant ElectrumX lists
+    under the token script's zero-ref hash and never under the P2PKH hash (see
+    ``HdWallet.collect_spendable``). Only a take that pays an FT demand needs them;
+    :func:`_rxd_funding` still takes only outputs whose on-chain script is plain RXD."""
     wallet = _load_wallet(ctx)
+    if include_tokens:
+        return _WalletFunds(triples=await collect_spendable_with_tokens(wallet, client), wallet=wallet)
     return _WalletFunds(triples=await wallet.collect_spendable(client), wallet=wallet)
 
 
@@ -736,7 +744,7 @@ def swap_take_cmd(ctx: CliContext, advert_arg: str, fee_override: int | None) ->
                 # mnemonic. See take_covenant_order's docstring: filling at/after
                 # expiry races the maker's live refund.
                 tip_height = int(await client.get_tip_height())
-            funds = await _collect_funds(ctx, client)
+            funds = await _collect_funds(ctx, client, include_tokens=demand_asset.kind == "ft")
             taker_pkh = funds.change_pkh()
 
             async def _funding(fee: int) -> list[FundingInput]:

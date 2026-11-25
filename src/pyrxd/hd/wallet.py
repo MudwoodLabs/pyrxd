@@ -1292,10 +1292,26 @@ class HdWallet:
         tx_input.source_transaction = _SrcTx()
         return tx_input
 
-    async def collect_spendable(self, client: ElectrumXClient, *, strict: bool = True) -> Spendable:
+    async def collect_spendable(
+        self, client: ElectrumXClient, *, strict: bool = True, include_tokens: bool = False
+    ) -> Spendable:
         """Return ``(utxo, address, privkey)`` triples for every UTXO across known addresses.
 
         Address→key mapping is preserved so signing works correctly per UTXO.
+
+        By default it reads each address's P2PKH script hash only, and a Radiant ElectrumX
+        lists a Glyph token output there NOT AT ALL: it lists it under the token script's
+        hash with its refs zeroed (:func:`~pyrxd.network.electrumx.script_hash_for_output`,
+        measured against both public mainnet servers on 2026-09-29). So the default result
+        is the wallet's plain outputs, which is what a plain-RXD spend wants.
+        ``include_tokens=True`` also reads every used address's owned token script hashes
+        (:func:`~pyrxd.glyph.scanner.owned_token_script_hashes`, the ones ``glyph list``
+        reads) and adds what they list. It is for a caller looking for a token to spend:
+        without it ``transfer-nft`` and ``transfer-ft`` reported a token ``glyph list`` had
+        just shown as "not held by this wallet". A caller that takes both kinds from the
+        result must still check each output's on-chain script before spending it as one
+        kind or the other (:func:`pyrxd.glyph.transfer.find_plain_rxd_utxo` does), because
+        the listing is the server's word.
 
         Runs the gap-limit scan (:meth:`refresh`) first, every call. An address is
         read here only once it is marked ``used``, only the scan marks it, and the
@@ -1331,12 +1347,25 @@ class HdWallet:
 
         # Fan out one get_utxos call per used address; preserve the
         # address (and therefore the key derivation path) per result.
-        results = await self._read_per_address(
-            used,
-            lambda address: client.get_utxos(script_hash_for_address(address)),
-            what="collect_spendable",
-            strict=strict,
-        )
+        if include_tokens:
+            # Lazy, as in _has_token_history: pyrxd.glyph is a heavier import than this module.
+            from ..glyph.scanner import owned_token_script_hashes
+            from ..security.types import Hex20
+
+            async def _read(address: str) -> list[UtxoRecord]:
+                # One address's reads succeed or fail together, so a failed token read marks
+                # the whole address unread rather than leaving its tokens silently out.
+                utxos = list(await client.get_utxos(script_hash_for_address(address)))
+                for script_hash in owned_token_script_hashes(Hex20(address_to_public_key_hash(address))):
+                    utxos.extend(await client.get_utxos(script_hash))
+                return utxos
+
+        else:
+
+            async def _read(address: str) -> list[UtxoRecord]:
+                return await client.get_utxos(script_hash_for_address(address))
+
+        results = await self._read_per_address(used, _read, what="collect_spendable", strict=strict)
 
         # Bind the account xprv once for the whole collection (avoid re-deriving the master per
         # used address — see _scan_chain).
