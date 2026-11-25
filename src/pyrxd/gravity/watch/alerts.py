@@ -208,6 +208,9 @@ class DedupAlerter:
         self._swaps: dict[str, _SwapPages] = {}
         self._repage_every = repage_critical_every_ticks
         self._hold = situation_hold_ticks
+        # CRITICAL situations that have entered the open set since this process started (see
+        # :meth:`critical_opened_count`). Never decreases.
+        self._critical_opened = 0
 
     def _advance(self, swap_id: str) -> _SwapPages:
         """Start a tick for the swap and close the situations absent for longer than the hold."""
@@ -278,6 +281,19 @@ class DedupAlerter:
         # down otherwise counted until the situation closed (tower Mythos pass, F2).
         return sum(1 for st in self._swaps.values() if any(x not in st.acked for x in self._open_critical(st)))
 
+    def critical_opened_count(self) -> int:
+        """How many CRITICAL situations have opened since this process started: a counter that only
+        rises, by one each time a situation enters the set :meth:`unacked_critical_count` reads (its
+        first delivered CRITICAL page, a failed CRITICAL send, or a WARN turning urgent), including a
+        situation that closed and came back.
+
+        Published on the heartbeat beside the un-ACK'd count. The count alone cannot tell the escalation
+        monitor that a NEW CRITICAL opened while an older, already escalated one is still un-ACKed: the
+        count never returns to zero, so the newer page was never escalated. A rise in this counter is
+        that signal.
+        """
+        return self._critical_opened
+
     async def handle(self, swap_id: str, decision: Decision) -> None:
         if not isinstance(decision, Decision):
             raise ValidationError("DedupAlerter.handle requires a Decision")
@@ -298,6 +314,7 @@ class DedupAlerter:
                 fresh.paged[situation], fresh.seen[situation] = old.paged[situation], old.tick
             self._swaps[swap_id] = fresh
         st = self._advance(swap_id)
+        was_open = situation in self._open_critical(st)
         before = st.paged.get(situation)
         was_live = st.live == situation
         if before is not None:
@@ -336,6 +353,8 @@ class DedupAlerter:
             if severity is Severity.CRITICAL:  # new, or a WARN escalating: counts while undelivered
                 st.undelivered.add(situation)
                 st.seen[situation] = st.tick
+                if not was_open:
+                    self._critical_opened += 1
                 logger.error(
                     "CRITICAL page for swap %r was not delivered; it counts toward escalation until "
                     "ACKed. To ACK it, append this line to the ACK inbox: %s %s",
@@ -346,6 +365,8 @@ class DedupAlerter:
             raise
         st.undelivered.discard(situation)
         st.paged[situation] = severity
+        if severity is Severity.CRITICAL and not was_open:
+            self._critical_opened += 1
         st.live, st.seen[situation] = situation, st.tick
         st.critical_ticks = 0  # reset the re-page backoff after a successful (re)page
 

@@ -761,3 +761,196 @@ async def test_ack_then_escalation_to_a_different_intent_re_arms_the_count(tmp_p
     verdict = await monitor.check(now=tower_clock["ts"])
     assert verdict.escalated is True
     assert escalation_channel.severities == [Severity.CRITICAL]
+
+
+# --- a CRITICAL that opens after the escalation, while the count never returns to zero ---------
+
+
+def write_counted_beat(path: Path, *, ts: float, unacked: int, opened: int | None) -> None:
+    """A current-schema beat with the tower's `critical_opened` counter (`None` omits it: an older tower)."""
+    data: dict = {"schema_version": HEARTBEAT_SCHEMA_VERSION, "ts": ts, "unacked_critical": unacked}
+    if opened is not None:
+        data["critical_opened"] = opened
+    path.write_text(json.dumps(data))
+
+
+async def _run_beats(monitor: EscalationMonitor, hb: Path, beats: list[tuple[float, int, int | None]]) -> None:
+    for offset, unacked, opened in beats:
+        write_counted_beat(hb, ts=TOWER_TS + offset, unacked=unacked, opened=opened)
+        await monitor.check(now=TOWER_TS + offset)
+
+
+async def test_a_second_swaps_page_that_overlaps_an_escalated_one_escalates_too(tmp_path: Path) -> None:
+    """Swap A escalates; swap B's CRITICAL opens before A is ACKed, then A is ACKed. The count reads 1, 1,
+    2, 1, ... and never returns to zero, so B, un-ACKed for an hour, used to get no escalation at all."""
+    hb = tmp_path / "hb.json"
+    channel = RecordingChannel()
+    monitor = make_monitor(hb, channel, escalate_after_s=900.0)
+    await _run_beats(monitor, hb, [(0, 1, 1), (900, 1, 1), (1000, 2, 2), (1100, 1, 2), (1800, 1, 2)])
+    assert len(channel.pages) == 1  # B has been un-ACKed for 800 s: not yet
+    await _run_beats(monitor, hb, [(1900, 1, 2)])
+    assert len(channel.pages) == 2
+    assert "opened after the last escalation" in channel.pages[1].message
+    assert "900s" in channel.pages[1].message
+    # And once only: B's escalation is edge-triggered like the first.
+    await _run_beats(monitor, hb, [(2800, 1, 2), (3700, 1, 2), (9000, 1, 2)])
+    assert len(channel.pages) == 2
+
+
+async def test_an_ack_and_a_new_page_between_two_checks_still_escalates(tmp_path: Path) -> None:
+    """A is ACKed and B opens between two checks: the count the monitor reads stays 1 throughout. Only the
+    tower's opened counter shows that the page now outstanding is a different one."""
+    hb = tmp_path / "hb.json"
+    channel = RecordingChannel()
+    monitor = make_monitor(hb, channel, escalate_after_s=900.0)
+    await _run_beats(monitor, hb, [(0, 1, 1), (900, 1, 1), (960, 1, 2), (1860, 1, 2)])
+    assert len(channel.pages) == 2
+
+
+async def test_a_tower_without_the_counter_falls_back_to_a_rising_count(tmp_path: Path) -> None:
+    hb = tmp_path / "hb.json"
+    channel = RecordingChannel()
+    monitor = make_monitor(hb, channel, escalate_after_s=900.0)
+    await _run_beats(monitor, hb, [(0, 1, None), (900, 1, None), (1000, 2, None), (1100, 1, None)])
+    # The count fell back to the escalated 1, so the rise's wait is dropped (it cannot tell A from B).
+    assert monitor.state.rearm_since_ts is None
+    await _run_beats(monitor, hb, [(1200, 2, None), (2099, 2, None)])
+    assert len(channel.pages) == 1
+    await _run_beats(monitor, hb, [(2100, 2, None)])
+    assert len(channel.pages) == 2
+
+
+async def test_one_long_episode_with_an_unchanged_counter_escalates_once(tmp_path: Path) -> None:
+    """Honest path: the same page, un-ACKed for hours, with the counter where it was, is one escalation."""
+    hb = tmp_path / "hb.json"
+    channel = RecordingChannel()
+    monitor = make_monitor(hb, channel, escalate_after_s=900.0)
+    await _run_beats(monitor, hb, [(0, 2, 2), (900, 2, 2), (5000, 2, 2), (20000, 1, 2), (40000, 1, 2)])
+    assert len(channel.pages) == 1
+
+
+async def test_a_tower_restart_that_resets_the_counter_counts_as_new(tmp_path: Path) -> None:
+    """The restarted tower lost its ACKs and re-opens what is still live: its counter starts again from 0."""
+    hb = tmp_path / "hb.json"
+    channel = RecordingChannel()
+    monitor = make_monitor(hb, channel, escalate_after_s=900.0)
+    await _run_beats(monitor, hb, [(0, 1, 5), (900, 1, 5), (1000, 1, 1), (1900, 1, 1)])
+    assert len(channel.pages) == 2
+
+
+async def test_the_rearm_wait_survives_a_monitor_restart(tmp_path: Path) -> None:
+    hb = tmp_path / "hb.json"
+    channel = RecordingChannel()
+    monitor = make_monitor(hb, channel, escalate_after_s=900.0)
+    await _run_beats(monitor, hb, [(0, 1, 1), (900, 1, 1), (1000, 2, 2)])
+    restarted = make_monitor(hb, channel, escalate_after_s=900.0)
+    assert restarted.state.escalated_opened == 1
+    assert restarted.state.rearm_since_ts == TOWER_TS + 1000
+    await _run_beats(restarted, hb, [(1900, 2, 2)])
+    assert len(channel.pages) == 2
+
+
+async def test_recovery_clears_the_rearm_state(tmp_path: Path) -> None:
+    hb = tmp_path / "hb.json"
+    channel = RecordingChannel()
+    monitor = make_monitor(hb, channel, escalate_after_s=900.0)
+    await _run_beats(monitor, hb, [(0, 1, 1), (900, 1, 1), (1000, 2, 2), (1100, 0, 2)])
+    st = monitor.state
+    assert (st.fired, st.escalated_opened, st.escalated_count, st.rearm_since_ts) == (False, None, None, None)
+
+
+def test_read_beat_takes_the_opened_counter_only_as_a_non_negative_int(tmp_path: Path) -> None:
+    hb = tmp_path / "hb.json"
+    for raw, expected in ((3, 3), (0, 0), (-1, None), (True, None), ("3", None), (1.5, None)):
+        hb.write_text(json.dumps({"schema_version": HEARTBEAT_SCHEMA_VERSION, "ts": 1.0, "critical_opened": raw}))
+        assert read_beat(hb).opened == expected
+    with pytest.raises(ValidationError):
+        EscalationState(escalated_opened=-1)
+
+
+async def test_two_overlapping_swaps_end_to_end_through_the_real_producer(tmp_path: Path) -> None:
+    """DedupAlerter -> FileHeartbeat -> EscalationMonitor: swap B's page, opened while swap A's escalated
+    page is still un-ACKed, escalates once B has been un-ACKed past the threshold."""
+    hb = tmp_path / "hb.json"
+    alerter = DedupAlerter(channel=RecordingChannel())
+    tower_clock = {"ts": TOWER_TS}
+    beat = FileHeartbeat(
+        hb,
+        clock=lambda: tower_clock["ts"],
+        unacked_critical=alerter.unacked_critical_count,
+        critical_opened=alerter.critical_opened_count,
+    )
+    escalation_channel = RecordingChannel()
+    monitor = make_monitor(hb, escalation_channel, escalate_after_s=300.0)
+    claim = Decision(Intent.PAGE_CLAIM, reason="claim race", situation="claim_race")
+
+    async def tick(advance: float, *swaps: str) -> None:
+        tower_clock["ts"] += advance
+        for swap_id in swaps:
+            await alerter.handle(swap_id, claim)
+        beat(1, [])
+        await monitor.check(now=tower_clock["ts"])
+
+    await tick(0, "swap-a")
+    await tick(300, "swap-a")
+    assert len(escalation_channel.pages) == 1
+    await tick(30, "swap-a", "swap-b")
+    assert json.loads(hb.read_text())["unacked_critical"] == 2
+    assert alerter.ack("swap-a", "page_claim:claim_race") is True
+    await tick(30, "swap-a", "swap-b")
+    assert json.loads(hb.read_text())["unacked_critical"] == 1
+    await tick(240, "swap-a", "swap-b")
+    assert len(escalation_channel.pages) == 1  # B un-ACKed for 270 s of the tower's clock
+    await tick(30, "swap-a", "swap-b")
+    assert len(escalation_channel.pages) == 2
+
+
+async def test_the_opened_counter_counts_opens_not_repages(tmp_path: Path) -> None:
+    alerter = DedupAlerter(channel=RecordingChannel(), situation_hold_ticks=1)
+    claim = Decision(Intent.PAGE_CLAIM, reason="claim race", situation="claim_race")
+    for _ in range(5):  # one situation re-paged every tick
+        await alerter.handle("swap-a", claim)
+    assert alerter.critical_opened_count() == 1
+    await alerter.handle("swap-a", Decision(Intent.PAGE_SQUEEZED, reason="squeeze", situation="claim_race"))
+    assert alerter.critical_opened_count() == 2
+    for _ in range(3):  # quiet ticks close both situations
+        alerter.resolve("swap-a")
+    await alerter.handle("swap-a", claim)  # the same danger coming back is a new open
+    assert alerter.critical_opened_count() == 3
+    await alerter.handle("swap-b", Decision(Intent.PAGE_REFUND, reason="refund", situation="btc_refund_due"))
+    assert alerter.critical_opened_count() == 3  # a WARN is not CRITICAL
+    await alerter.handle(
+        "swap-b", Decision(Intent.PAGE_REFUND, reason="refund", situation="btc_refund_due", urgent=True)
+    )
+    assert alerter.critical_opened_count() == 4  # ...until it turns urgent
+
+
+async def test_an_undelivered_critical_counts_once_when_it_opens(tmp_path: Path) -> None:
+    channel = RecordingChannel()
+    alerter = DedupAlerter(channel=channel)
+    claim = Decision(Intent.PAGE_CLAIM, reason="claim race", situation="claim_race")
+    channel.fail_next = 2
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            await alerter.handle("swap-a", claim)
+    await alerter.handle("swap-a", claim)  # delivered at last: the same open situation
+    assert alerter.critical_opened_count() == 1
+
+
+@pytest.mark.parametrize("raw_ts", ["NaN", "Infinity"])
+async def test_a_non_finite_beat_ts_reads_as_no_timestamp(tmp_path: Path, raw_ts: str) -> None:
+    hb = tmp_path / "hb.json"
+    hb.write_text(f'{{"schema_version": {HEARTBEAT_SCHEMA_VERSION}, "ts": {raw_ts}, "unacked_critical": 1}}')
+    assert read_beat(hb).ts is None
+    channel = RecordingChannel()
+    verdict = await make_monitor(hb, channel).check(now=TOWER_TS)
+    assert verdict.fresh is False
+    assert "absent or unreadable" in channel.pages[0].message
+
+
+@pytest.mark.parametrize("field", ["escalate_after_s", "max_silence_s", "re_escalate_every_s"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_monitor_refuses_a_non_finite_threshold(tmp_path: Path, field: str, bad: float) -> None:
+    kwargs = {"escalate_after_s": 900.0, "max_silence_s": 180.0, "re_escalate_every_s": 0.0, field: bad}
+    with pytest.raises(ValidationError):
+        EscalationMonitor(heartbeat_path=tmp_path / "hb.json", channel=RecordingChannel(), **kwargs)

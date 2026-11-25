@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import stat
 import sys
@@ -132,12 +133,16 @@ class BeatReading:
       ``-1`` is the producer's own "my count source raised" sentinel and is passed through.
     * ``schema_version`` — ``None`` when absent or not an int.
     * ``error`` — a human-readable reason when the read failed at all.
+    * ``opened`` — the tower's ``critical_opened`` counter, ``None`` when absent, not an int, or the
+      producer's ``-1``: an older tower, or a counter that raised. Optional; without it the monitor
+      falls back to watching the un-ACK'd count rise.
     """
 
     ts: float | None
     unacked: int | None
     schema_version: int | None
     error: str | None = None
+    opened: int | None = None
 
     def __post_init__(self) -> None:
         if self.ts is not None and not isinstance(self.ts, (int, float)):
@@ -148,6 +153,10 @@ class BeatReading:
             not isinstance(self.schema_version, int) or isinstance(self.schema_version, bool)
         ):
             raise ValidationError("BeatReading schema_version must be an int or None")
+        if self.opened is not None and (
+            not isinstance(self.opened, int) or isinstance(self.opened, bool) or self.opened < 0
+        ):
+            raise ValidationError("BeatReading opened must be a non-negative int or None")
 
     @property
     def schema_known(self) -> bool:
@@ -171,7 +180,8 @@ def read_beat(path: str | Path) -> BeatReading:
     if not isinstance(data, dict):
         return BeatReading(ts=None, unacked=None, schema_version=None, error="not a JSON object")
     ts = data.get("ts")
-    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not math.isfinite(ts):
+        # json parses NaN and Infinity: neither is a time (the dead-man's-switch reads them the same way).
         ts = None
     version = data.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool):
@@ -180,7 +190,10 @@ def read_beat(path: str | Path) -> BeatReading:
     if not isinstance(unacked, int) or isinstance(unacked, bool):
         # Absent OR non-int — both mean "this beat does not carry a trustworthy count".
         unacked = None
-    return BeatReading(ts=None if ts is None else float(ts), unacked=unacked, schema_version=version)
+    opened = data.get("critical_opened")
+    if not isinstance(opened, int) or isinstance(opened, bool) or opened < 0:
+        opened = None
+    return BeatReading(ts=None if ts is None else float(ts), unacked=unacked, schema_version=version, opened=opened)
 
 
 def preflight_heartbeat(path: str | Path) -> BeatReading:
@@ -247,12 +260,23 @@ class EscalationState:
     # the episode's escalation and real un-ACKed pages after it never escalated (tower Mythos
     # pass, F3).
     blind_fired: bool = False
+    # What the last escalation covered: the tower's ``critical_opened`` counter and the un-ACK'd count
+    # on the beat it went out on. A CRITICAL that opens after it, while the count never returns to zero,
+    # is a new situation the operator has not been escalated about; ``rearm_since_ts`` is the tower-clock
+    # ts of the first beat that showed one, and it escalates once that has lasted ``escalate_after_s``.
+    escalated_opened: int | None = None
+    escalated_count: int | None = None
+    rearm_since_ts: float | None = None
 
     def __post_init__(self) -> None:
-        for name in ("first_unacked_ts", "last_escalated_ts"):
+        for name in ("first_unacked_ts", "last_escalated_ts", "rearm_since_ts"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
                 raise ValidationError(f"EscalationState {name} must be a number or None")
+        for name in ("escalated_opened", "escalated_count"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+                raise ValidationError(f"EscalationState {name} must be a non-negative int or None")
         for name in ("fired", "blind_warned", "blind_fired"):
             if not isinstance(getattr(self, name), bool):
                 raise ValidationError(f"EscalationState {name} must be a bool")
@@ -266,6 +290,9 @@ class EscalationState:
             "fired": self.fired,
             "blind_warned": self.blind_warned,
             "blind_fired": self.blind_fired,
+            "escalated_opened": self.escalated_opened,
+            "escalated_count": self.escalated_count,
+            "rearm_since_ts": self.rearm_since_ts,
         }
 
 
@@ -332,6 +359,9 @@ def _load_state(path: Path) -> EscalationState:
             fired=bool(parsed.get("fired", False)),
             blind_warned=bool(parsed.get("blind_warned", False)),
             blind_fired=bool(parsed.get("blind_fired", False)),
+            escalated_opened=parsed.get("escalated_opened"),
+            escalated_count=parsed.get("escalated_count"),
+            rearm_since_ts=parsed.get("rearm_since_ts"),
         )
     except (UnicodeDecodeError, ValueError, AttributeError, ValidationError) as exc:
         logger.error("escalation state %s is corrupt (%s) — starting FRESH", path, exc)
@@ -449,13 +479,18 @@ class EscalationVerdict:
                 raise ValidationError(f"EscalationVerdict {name} must be a bool")
 
 
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 class EscalationMonitor:
     """Escalates a persistently un-ACK'd CRITICAL situation to a second channel.
 
     Edge-triggered: one escalation per un-ACK'd episode (plus an optional
     ``re_escalate_every_s`` reminder), and one INFO recovery when the count returns to zero —
     so a stuck situation does not turn the escalation channel into the noise the operator was
-    already ignoring.
+    already ignoring. A CRITICAL that opens after the escalation, while the count stays non-zero,
+    escalates once more after its own ``escalate_after_s`` (see :meth:`_newer_unacked_for_s`).
 
     Args:
         heartbeat_path: the file the tower writes each tick.
@@ -480,12 +515,14 @@ class EscalationMonitor:
         re_escalate_every_s: float = 0.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if not isinstance(escalate_after_s, (int, float)) or escalate_after_s < 0:
-            raise ValidationError("EscalationMonitor escalate_after_s must be >= 0")
-        if not isinstance(max_silence_s, (int, float)) or max_silence_s <= 0:
-            raise ValidationError("EscalationMonitor max_silence_s must be > 0")
-        if not isinstance(re_escalate_every_s, (int, float)) or re_escalate_every_s < 0:
-            raise ValidationError("EscalationMonitor re_escalate_every_s must be >= 0")
+        # Each must be finite: `elapsed >= NaN` is always False, so a NaN threshold never escalated,
+        # and an infinite one never does either.
+        if not _finite_number(escalate_after_s) or escalate_after_s < 0:
+            raise ValidationError("EscalationMonitor escalate_after_s must be a finite number >= 0")
+        if not _finite_number(max_silence_s) or max_silence_s <= 0:
+            raise ValidationError("EscalationMonitor max_silence_s must be a finite number > 0")
+        if not _finite_number(re_escalate_every_s) or re_escalate_every_s < 0:
+            raise ValidationError("EscalationMonitor re_escalate_every_s must be a finite number >= 0")
         self._path = Path(heartbeat_path)
         self._channel = channel
         self._after = float(escalate_after_s)
@@ -573,8 +610,18 @@ class EscalationMonitor:
         elapsed = beat_ts - first
         escalated = False
         due = elapsed >= self._after and self._should_send(beat_ts)
-        if due and await self._try_send(self._escalation_page(beat, elapsed)):
-            self._state = replace(self._state, fired=True, last_escalated_ts=beat_ts)
+        newer_for_s = self._newer_unacked_for_s(beat, beat_ts)
+        newer_due = not due and newer_for_s is not None and newer_for_s >= self._after
+        page_for_s = newer_for_s if newer_due and newer_for_s is not None else elapsed
+        if (due or newer_due) and await self._try_send(self._escalation_page(beat, page_for_s, newer=newer_due)):
+            self._state = replace(
+                self._state,
+                fired=True,
+                last_escalated_ts=beat_ts,
+                escalated_opened=beat.opened,
+                escalated_count=beat.unacked,
+                rearm_since_ts=None,
+            )
             escalated = True
         return EscalationVerdict(
             unacked=beat.unacked,
@@ -584,6 +631,41 @@ class EscalationMonitor:
             blind_warned=False,
             recovered=False,
         )
+
+    def _newer_unacked_for_s(self, beat: BeatReading, beat_ts: float) -> float | None:
+        """Tower-clock seconds since the monitor first saw a CRITICAL that opened AFTER the last
+        escalation, or ``None`` when there is none (or nothing has been escalated yet).
+
+        One escalation per episode used to mean one per run of non-zero counts. Two swaps whose pages
+        overlap make one such run: the first escalated, the second opened before the first was ACKed,
+        the count never returned to zero, and the second never escalated however long it stayed
+        un-ACKed. A new situation is seen as the tower's ``critical_opened`` counter rising past the
+        value the last escalation went out on (a fall means the tower restarted, which re-opens what is
+        still live, so it counts too), or, from a tower that does not publish the counter, as the
+        un-ACK'd count rising past the count it went out on. The counter also catches an ACK of the old
+        page and the open of a new one between two checks, which the count cannot.
+
+        It errs toward paging: if the newer page is ACKed while the escalated one is not, the reminder
+        that follows is about the older page, which is still un-ACKed past the threshold.
+        """
+        st = self._state
+        if not st.fired or beat.unacked is None or beat.unacked <= 0:
+            return None
+        if beat.opened is not None and st.escalated_opened is not None:
+            newer = beat.opened != st.escalated_opened
+        else:
+            newer = st.escalated_count is not None and beat.unacked > st.escalated_count
+        if not newer:
+            if st.rearm_since_ts is not None:
+                # The count fell back to what was escalated: the newer page is gone, so a later rise
+                # starts its own wait rather than inheriting this one's.
+                self._state = replace(st, rearm_since_ts=None)
+            return None
+        since = st.rearm_since_ts
+        if since is None:
+            since = beat_ts
+            self._state = replace(st, rearm_since_ts=since)
+        return beat_ts - since
 
     def _should_send(self, beat_ts: float) -> bool:
         """First crossing of the threshold, or a due re-escalation reminder."""
@@ -625,7 +707,14 @@ class EscalationMonitor:
                 )
             recovered = True
         self._state = replace(
-            self._state, first_unacked_ts=None, last_escalated_ts=None, fired=False, blind_fired=False
+            self._state,
+            first_unacked_ts=None,
+            last_escalated_ts=None,
+            fired=False,
+            blind_fired=False,
+            escalated_opened=None,
+            escalated_count=None,
+            rearm_since_ts=None,
         )
         return EscalationVerdict(
             unacked=0, fresh=True, unacked_for_s=None, escalated=False, blind_warned=False, recovered=recovered
@@ -652,14 +741,19 @@ class EscalationMonitor:
             logger.error("escalation alert delivery FAILED (will retry next interval): %s", exc)
             return False
 
-    def _escalation_page(self, beat: BeatReading, elapsed: float) -> Page:
+    def _escalation_page(self, beat: BeatReading, elapsed: float, *, newer: bool = False) -> Page:
+        what = (
+            f"a CRITICAL watchtower page that opened after the last escalation has gone UNACKNOWLEDGED "
+            f"for {elapsed:.0f}s ({beat.unacked} un-ACK'd in all)"
+            if newer
+            else f"{beat.unacked} CRITICAL watchtower page(s) have gone UNACKNOWLEDGED for {elapsed:.0f}s"
+        )
         return Page(
             swap_id=_WATCHTOWER,
             intent=None,
             severity=Severity.CRITICAL,
             message=(
-                f"ESCALATION: {beat.unacked} CRITICAL watchtower page(s) have gone UNACKNOWLEDGED for "
-                f"{elapsed:.0f}s (threshold {self._after:.0f}s). The tower is alive and paging — the "
+                f"ESCALATION: {what} (threshold {self._after:.0f}s). The tower is alive and paging — the "
                 "primary channel is not reaching anyone. Time-critical claim/refund deadlines are "
                 "running down while nobody is acting."
             ),
@@ -842,7 +936,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--state-file",
-        help="persisted {first_unacked_ts, last_escalated_ts, fired} (0600). Defaults to the "
+        help="persisted escalation state (first_unacked_ts, last_escalated_ts, fired, ...) (0600). Defaults to the "
         "heartbeat path + '.escalation-state.json'. Persisted so a restart loop cannot rewind the "
         "escalation clock.",
     )

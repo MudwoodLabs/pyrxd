@@ -78,6 +78,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The watchtower's escalation monitor escalates a CRITICAL page that opens while an earlier,
+  already escalated one is still un-ACKed.** The un-ACKed count never returned to zero, so the
+  newer page was never escalated. The tower's heartbeat gains the additive key `critical_opened`
+  (`DedupAlerter.critical_opened_count()`), and the monitor escalates again once a page that opened
+  after the last escalation has been un-ACKed for `--escalate-after-s`. Against a tower without the
+  key, it watches the un-ACKed count rise instead.
+- **The dead-man's-switch pages on a heartbeat whose `ts` is `NaN` or infinite** instead of reading
+  the tower as alive. A non-finite `--max-silence-s`, or a non-finite escalation threshold, is
+  refused.
+- **The watchtower's timing preflight warns when `--tick-timeout-s` plus `--poll-interval-s` reaches
+  `--deadman-max-silence-s`**, where one slow tick inside its budget false-pages the tower down (at
+  the default budget, a poll interval of 36 s or more), and refuses non-finite timing values.
 - **`pyrxd swap build-claim` picks the fee input for the deadline it reports when the covenant's
   depth is unresolved.** When two chain reads disagreed on the depth, the spend was measured at
   maximum urgency but the fee input was chosen for the full CSV window, so the command could pick

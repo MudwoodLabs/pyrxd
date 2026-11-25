@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -50,7 +51,9 @@ _CLOCK_SKEW_TOLERANCE_S = 60.0
 #: need a bump, but removing or re-interpreting one does.
 #:
 #: v1 = ``{schema_version, ts, tick, swaps, paged, squeezed, undelivered, errored,
-#: min_deadline_rxd_height}`` plus ``unacked_critical`` when the count source is wired.
+#: min_deadline_rxd_height}`` plus ``unacked_critical`` when the count source is wired, and
+#: ``critical_opened`` (additive) when its counter is wired: how many CRITICAL situations have opened
+#: since the tower started, which only rises within one tower process.
 HEARTBEAT_SCHEMA_VERSION = 1
 
 
@@ -78,10 +81,12 @@ class FileHeartbeat:
         *,
         clock: Callable[[], float] = time.time,
         unacked_critical: Callable[[], int] | None = None,
+        critical_opened: Callable[[], int] | None = None,
     ) -> None:
         self._path = Path(path)
         self._clock = clock
         self._unacked = unacked_critical
+        self._opened = critical_opened
 
     def __call__(self, iteration: int, results) -> None:
         paged = sum(1 for r in results if r.decision.intent.value.startswith("page_"))
@@ -115,6 +120,13 @@ class FileHeartbeat:
                 data["unacked_critical"] = int(self._unacked())
             except Exception:  # pragma: no cover - defensive: a broken count must not stop the beat
                 data["unacked_critical"] = -1
+        if self._opened is not None:
+            # Same rule: never stop the beat. -1 reads as "not available" to the escalation monitor,
+            # which then falls back to watching the un-ACK'd count rise.
+            try:
+                data["critical_opened"] = int(self._opened())
+            except Exception:  # pragma: no cover - defensive: a broken counter must not stop the beat
+                data["critical_opened"] = -1
         tmp = self._path.with_name(self._path.name + ".tmp")
         tmp.write_text(json.dumps(data))
         os.replace(tmp, self._path)  # atomic on the same filesystem
@@ -122,13 +134,17 @@ class FileHeartbeat:
 
 def heartbeat_age_s(path: str | Path, *, now: float) -> float | None:
     """Seconds since the heartbeat file was last written, or ``None`` if it is
-    missing / unreadable / has no timestamp (treated as 'no liveness signal')."""
+    missing / unreadable / has no timestamp (treated as 'no liveness signal').
+
+    A timestamp that is not a finite number (``NaN`` or ``Infinity``, which ``json`` parses, or a
+    bool) is no timestamp. A ``NaN`` used to give a ``NaN`` age, and every comparison with it is
+    False, so :meth:`DeadMansSwitch.check` read the beat as ALIVE for as long as the file stayed so."""
     try:
         data = json.loads(Path(path).read_text())
     except (FileNotFoundError, ValueError, OSError):
         return None
     ts = data.get("ts") if isinstance(data, dict) else None
-    if not isinstance(ts, (int, float)):
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not math.isfinite(ts):
         return None
     return now - ts
 
@@ -152,8 +168,15 @@ class DeadMansSwitch:
         channel,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if not isinstance(max_silence_s, (int, float)) or max_silence_s <= 0:
-            raise ValidationError("DeadMansSwitch max_silence_s must be > 0")
+        # Finite too: a NaN bound compares False with every age (never stale) and an infinite one
+        # is never exceeded, so either turns the liveness backstop off without a word.
+        if (
+            not isinstance(max_silence_s, (int, float))
+            or isinstance(max_silence_s, bool)
+            or not math.isfinite(max_silence_s)
+            or max_silence_s <= 0
+        ):
+            raise ValidationError("DeadMansSwitch max_silence_s must be a finite number > 0")
         self._path = Path(heartbeat_path)
         self._max = float(max_silence_s)
         self._channel = channel

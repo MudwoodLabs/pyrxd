@@ -104,7 +104,7 @@ Every message is a JSON object carrying a `schema` string:
 | `eth_rxd_two_host_envelope_v1` | ETH counter leg (`scripts/eth_swap_two_host.py:858`) |
 
 **A conforming implementation MUST read `schema` and MUST refuse an unrecognised value**, exactly
-as `gravity/watch/escalation.py:210-214` does for the watchtower heartbeat's `schema_version`
+as `gravity/watch/escalation.py:223-227` does for the watchtower heartbeat's `schema_version`
 ("Refusing to guess at the meaning of the escalation count"). Be aware that **the shipped harnesses do not do this** — see
 **HZ-2**. The requirement is stated normatively here
 because the alternative is a silent misparse of a future format.
