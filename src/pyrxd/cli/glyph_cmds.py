@@ -49,13 +49,11 @@ from ..constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES, Network
 from ..fee_models import SatoshisPerKilobyte
 from ..fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, assert_fee_rate_clears_relay_floor, relay_floor_photons_per_byte
 from ..glyph.builder import (
-    AirdropFunding,
     AirdropRecipient,
     CommitParams,
     DmintV1DeployParams,
     DmintV2DeployParams,
     FtDeployRevealScripts,
-    FtUtxo,
     GlyphBuilder,
     RevealParams,
 )
@@ -100,9 +98,6 @@ from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, build_ft_airdro
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
 from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
 from ..glyph.transfer import find_plain_rxd_utxo as lib_find_plain_rxd_utxo
-from ..glyph.transfer import ft_funding as lib_ft_funding
-from ..glyph.transfer import select_ft_inputs as lib_select_ft_inputs
-from ..glyph.transfer import single_ft_signing_key as lib_single_ft_signing_key
 from ..glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
 from ..glyph.wave_rules import (
     FEE_DECLINED,
@@ -167,7 +162,7 @@ if TYPE_CHECKING:
 
     from ..glyph.dmint import DmintMintResult, PowPreimageResult
     from ..keys import PrivateKey
-    from ..network.electrumx import ElectrumXClient, UtxoRecord
+    from ..network.electrumx import ElectrumXClient
 
 
 # ---------------------------------------------------------------------------
@@ -2676,61 +2671,6 @@ def _require_address_on_network(ctx: CliContext, address: str, *, what: str) -> 
         )
 
 
-async def _select_ft_inputs(
-    wallet: HdWallet,
-    ref: GlyphRef,
-    amount: int,
-    client: ElectrumXClient,
-    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
-) -> list[tuple[FtUtxo, str, PrivateKey]]:
-    """Find this wallet's FT UTXOs for ``ref`` and greedily cover ``amount``.
-
-    Shared by ``transfer-ft`` and ``airdrop-ft``. Extracted rather than copied:
-    the two commands must agree on what counts as a spendable holding of a
-    token, and a second copy of the "is this output really an FT of this ref"
-    filter is a place for them to silently diverge.
-
-    Returns ``(FtUtxo, address, key)`` triples in the order they were selected.
-
-    The selection itself lives in :func:`pyrxd.glyph.transfer.select_ft_inputs` so the
-    SDK and the CLI cannot disagree about what counts as a spendable holding. This
-    wrapper only re-dresses the SDK error as a CLI one with a runnable fix.
-    """
-    try:
-        return await lib_select_ft_inputs(wallet, ref, amount, client, triples)
-    except NoHoldingsError as exc:
-        raise UserError(
-            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="this wallet's addresses were scanned up to the gap limit; check the ref and --wallet",
-        ) from exc
-    except InsufficientFundsError as exc:
-        raise UserError(
-            str(exc),
-            fix="check holdings with `pyrxd glyph list --type ft`",
-        ) from exc
-
-
-def _single_ft_signing_key(
-    selected: list[tuple[FtUtxo, str, PrivateKey]],
-    what: str,
-) -> PrivateKey:
-    """The one key that signs every selected FT input, or a clear refusal.
-
-    ``FtUtxoSet`` signs all inputs with a single key. If the selection spans
-    several HD-derived addresses, signing anyway would emit a transaction with
-    invalid signatures on some inputs — rejected at broadcast, but only after
-    the user has confirmed a spend. Refuse first instead.
-    """
-    try:
-        return lib_single_ft_signing_key(selected, what)
-    except ValidationError as exc:
-        raise UserError(
-            f"{what} across multiple wallet addresses isn't supported in Cut 2",
-            cause="selected FT utxos span multiple HD-derived keys",
-            fix="consolidate FT holdings to one address first (Cut 3 will lift this restriction)",
-        ) from exc
-
-
 def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
     """The commit txid derived from the bytes we signed, not the server's reply.
 
@@ -2951,46 +2891,6 @@ async def _transfer_ft_inner(
             "through and only the server's reply was wrong",
         ) from exc
     return {"txid": txid, "ref": f"{ref.txid}:{ref.vout}", "amount": amount, "to": to_address}
-
-
-async def _airdrop_funding(
-    ctx: CliContext,
-    wallet: HdWallet,
-    selected: list[tuple[FtUtxo, str, PrivateKey]],
-    *,
-    n_outputs: int,
-    client: ElectrumXClient,
-    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
-) -> AirdropFunding:
-    """Find a plain-RXD UTXO big enough to pay for ``n_outputs`` token outputs.
-
-    The token cannot pay the fee: an FT output's value IS its unit count, so
-    taking the fee from one would burn units and short a recipient. This sources
-    the fee the same way ``transfer-nft`` sources it for a dust singleton.
-
-    The estimate is deliberately generous — an unfunded build fails cleanly, but
-    a build that squeaks past and lands under the relay floor cannot be repaired
-    on Radiant (no RBF, no CPFP). ~84 B per FT output, ~148 B per input, ~50 B of
-    envelope, then doubled for headroom.
-    """
-    est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
-    needed = est_bytes * ctx.fee_rate * 2
-    try:
-        return await lib_ft_funding(
-            wallet,
-            selected,
-            n_outputs=n_outputs,
-            fee_rate=ctx.fee_rate,
-            client=client,
-            triples=triples,
-        )
-    except InsufficientFundsError as exc:
-        raise UserError(
-            "no plain-RXD UTXO large enough to fund the fee",
-            cause=f"need about {needed:,} photons on a single non-token UTXO",
-            fix="send some plain RXD to this wallet — an FT output's value is its unit count, "
-            "so the token itself cannot pay the fee without burning units",
-        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -3342,25 +3242,6 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
         click.echo(emit(result, mode="quiet", quiet_field="txid"))
     else:
         click.echo(f"\nNFT transfer broadcast: {result['txid']}")
-
-
-async def _find_plain_rxd_utxo(
-    triples: list[tuple[UtxoRecord, str, PrivateKey]],
-    client: ElectrumXClient,
-    *,
-    exclude: set[tuple[str, int]],
-    needed: int,
-) -> tuple[UtxoRecord, str, PrivateKey] | None:
-    """Pick a plain-P2PKH (non-token) wallet UTXO >= ``needed`` to fund a fee.
-
-    Verifies each candidate's on-chain script is a bare 25-byte P2PKH so a
-    token-bearing UTXO is never spent as fee (which would burn the token).
-    Excludes the given outpoints (e.g. the NFT being transferred).
-
-    Delegates to :func:`pyrxd.glyph.transfer.find_plain_rxd_utxo`; the P2PKH check is
-    a fund-safety property, so it lives in one place.
-    """
-    return await lib_find_plain_rxd_utxo(triples, client, exclude=exclude, needed=needed)
 
 
 #: The ``transfer-nft`` funding bar moved to :mod:`pyrxd.glyph.transfer` alongside the

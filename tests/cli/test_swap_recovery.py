@@ -456,6 +456,15 @@ def test_parse_outpoint_rejects_garbage() -> None:
         sr.parse_outpoint("aa" * 32 + ":x")
 
 
+def test_parse_outpoint_lower_cases_the_txid() -> None:
+    # Every caller compares the txid as a string against a server's or Transaction.txid()'s,
+    # which are lower case: an upper-case paste of the right outpoint must name it.
+    op = sr.parse_outpoint("AbCd" * 16 + ":7")
+    assert op.txid == "abcd" * 16
+    assert op.vout == 7
+    assert sr.parse_outpoint("abcd" * 16 + ":7") == op
+
+
 # --------------------------------------------------------------------------- Radiant reads
 
 

@@ -55,6 +55,7 @@ from .swap_recovery import (
     assert_covenant_matches,
     build_cold_claim,
     build_cold_refund,
+    claim_blocks_to_deadline,
     covenant_pkhs,
     describe_network_error,
     electrumx_urls,
@@ -604,7 +605,8 @@ async def _prepare(
     # The urgency premium applies to the CLAIM only: a CSV refund has no closing window
     # (see build_cold_refund), so targeting a premium for it would select a needlessly
     # large input and burn the difference as fee.
-    blocks_left = max(0, facts.t_rxd_blocks - chain.confirmations) if kind == "claim" else None
+    # The same deadline build_cold_claim measures against (an unresolved depth is 0 blocks).
+    blocks_left = claim_blocks_to_deadline(chain, facts.t_rxd_blocks) if kind == "claim" else None
     target = policy.required_fee(size_estimate, blocks_to_deadline=blocks_left)
     chosen = select_fee_utxo(utxos, floor=floor, target=target, explicit=fee_utxo, allow_overpay=allow_overpay)
     return covenant, chain, chosen
