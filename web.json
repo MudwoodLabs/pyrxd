@@ -111,7 +111,11 @@
       "/pyrxd/api/pyrxd.html": 1,
       "/pyrxd/reference/mutation-survivors/network.html": 1
     },
-    "2026-11-25": {}
+    "2026-11-25": {
+      "/playground.html": 1,
+      "/pyrxd/api/glyph.html": 1
+    },
+    "2026-11-26": {}
   },
   "visits": {
     "2026-11-09": {
@@ -225,6 +229,10 @@
       "/pyrxd/api/pyrxd.html": 1,
       "/pyrxd/reference/mutation-survivors/network.html": 1
     },
-    "2026-11-25": {}
+    "2026-11-25": {
+      "/playground.html": 1,
+      "/pyrxd/api/glyph.html": 1
+    },
+    "2026-11-26": {}
   }
 }
