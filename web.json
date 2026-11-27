@@ -115,7 +115,12 @@
       "/playground.html": 1,
       "/pyrxd/api/glyph.html": 1
     },
-    "2026-11-26": {}
+    "2026-11-26": {
+      "/pyrxd/how-to/mutation-testing.html": 1,
+      "/pyrxd/index.html": 1,
+      "/pyrxd/solutions/integration-issues/local-ci-parity-via-task-ci-and-pre-push-hook.html": 1
+    },
+    "2026-11-27": {}
   },
   "visits": {
     "2026-11-09": {
@@ -233,6 +238,11 @@
       "/playground.html": 1,
       "/pyrxd/api/glyph.html": 1
     },
-    "2026-11-26": {}
+    "2026-11-26": {
+      "/pyrxd/how-to/mutation-testing.html": 1,
+      "/pyrxd/index.html": 1,
+      "/pyrxd/solutions/integration-issues/local-ci-parity-via-task-ci-and-pre-push-hook.html": 1
+    },
+    "2026-11-27": {}
   }
 }
