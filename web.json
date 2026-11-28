@@ -120,7 +120,32 @@
       "/pyrxd/index.html": 1,
       "/pyrxd/solutions/integration-issues/local-ci-parity-via-task-ci-and-pre-push-hook.html": 1
     },
-    "2026-11-27": {}
+    "2026-11-27": {},
+    "2026-11-28": {
+      "/playground": 7,
+      "/pyrxd/concepts/index.html": 1,
+      "/pyrxd/how-to/broadcast-a-transaction.html": 1,
+      "/pyrxd/how-to/create-a-token-collection.html": 1,
+      "/pyrxd/how-to/export-a-watch-only-descriptor.html": 1,
+      "/pyrxd/how-to/index.html": 2,
+      "/pyrxd/how-to/receive-and-check-balance.html": 1,
+      "/pyrxd/how-to/recover-funds-across-wallet-paths.html": 1,
+      "/pyrxd/how-to/scan-address-for-glyphs.html": 1,
+      "/pyrxd/how-to/start-a-project.html": 1,
+      "/pyrxd/how-to/transfer-a-glyph-token.html": 1,
+      "/pyrxd/how-to/use-the-public-testnet.html": 1,
+      "/pyrxd/how-to/use-the-signing-agent.html": 1,
+      "/pyrxd/index.html": 3,
+      "/pyrxd/showcase.html": 2,
+      "/pyrxd/tutorials/cross-chain-swap.html": 1,
+      "/pyrxd/tutorials/index.html": 1,
+      "/pyrxd/tutorials/inspect-a-radiant-transaction.html": 1,
+      "/pyrxd/tutorials/mint-a-glyph-ft.html": 1,
+      "/pyrxd/tutorials/mint-a-glyph-nft.html": 1,
+      "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 1,
+      "/pyrxd/tutorials/quickstart.html": 1,
+      "/pyrxd/tutorials/your-first-radiant-transaction.html": 1
+    }
   },
   "visits": {
     "2026-11-09": {
@@ -243,6 +268,31 @@
       "/pyrxd/index.html": 1,
       "/pyrxd/solutions/integration-issues/local-ci-parity-via-task-ci-and-pre-push-hook.html": 1
     },
-    "2026-11-27": {}
+    "2026-11-27": {},
+    "2026-11-28": {
+      "/playground": 7,
+      "/pyrxd/concepts/index.html": 0,
+      "/pyrxd/how-to/broadcast-a-transaction.html": 0,
+      "/pyrxd/how-to/create-a-token-collection.html": 0,
+      "/pyrxd/how-to/export-a-watch-only-descriptor.html": 0,
+      "/pyrxd/how-to/index.html": 0,
+      "/pyrxd/how-to/receive-and-check-balance.html": 0,
+      "/pyrxd/how-to/recover-funds-across-wallet-paths.html": 0,
+      "/pyrxd/how-to/scan-address-for-glyphs.html": 0,
+      "/pyrxd/how-to/start-a-project.html": 0,
+      "/pyrxd/how-to/transfer-a-glyph-token.html": 0,
+      "/pyrxd/how-to/use-the-public-testnet.html": 0,
+      "/pyrxd/how-to/use-the-signing-agent.html": 0,
+      "/pyrxd/index.html": 3,
+      "/pyrxd/showcase.html": 0,
+      "/pyrxd/tutorials/cross-chain-swap.html": 0,
+      "/pyrxd/tutorials/index.html": 0,
+      "/pyrxd/tutorials/inspect-a-radiant-transaction.html": 0,
+      "/pyrxd/tutorials/mint-a-glyph-ft.html": 0,
+      "/pyrxd/tutorials/mint-a-glyph-nft.html": 0,
+      "/pyrxd/tutorials/mint-from-a-dmint-contract.html": 0,
+      "/pyrxd/tutorials/quickstart.html": 0,
+      "/pyrxd/tutorials/your-first-radiant-transaction.html": 0
+    }
   }
 }
